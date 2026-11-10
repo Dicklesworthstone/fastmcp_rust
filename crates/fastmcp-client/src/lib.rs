@@ -6300,36 +6300,64 @@ impl WebSocketConnectDeadline {
     where
         F: Future,
     {
-        let deadline = idle.map_or(self.absolute, |idle| idle.min(self.absolute));
-        let mut future = std::pin::pin!(future);
-        loop {
-            self.check(cx, idle)?;
-            // A caller's factory need not register for Cx cancellation. Keep
-            // its one future pinned while periodically observing its owner.
-            let wake = cx
-                .now()
-                .saturating_add_nanos(WEBSOCKET_CANCELLED_RECV_POLL_NANOS)
-                .min(deadline);
-            let wake = cx.budget().deadline.map_or(wake, |caller| caller.min(wake));
-            let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(wake));
-            let output = std::future::poll_fn(|task_cx| {
-                let _current = Cx::set_current(Some(cx.clone()));
-                if let Err(error) = self.check(cx, idle) {
-                    return std::task::Poll::Ready(Err(error));
+        use fastmcp_core::runtime::{CallerContextFuture, with_caller_context};
+
+        let caller = with_caller_context(cx, || {
+            Cx::current().expect("WebSocket connection caller is installed")
+        });
+        let cx = &caller;
+        // Own the timer registrations as well as the caller's operation:
+        // their retained wakers can execute user cleanup when released.
+        CallerContextFuture::new(cx, async {
+            let deadline = idle.map_or(self.absolute, |idle| idle.min(self.absolute));
+            let mut future = std::pin::pin!(future);
+            loop {
+                self.check(cx, idle)?;
+                // A caller's factory need not register for Cx cancellation.
+                // Keep its one future pinned while observing its owner.
+                let wake = cx
+                    .now()
+                    .saturating_add_nanos(WEBSOCKET_CANCELLED_RECV_POLL_NANOS)
+                    .min(deadline);
+                let wake = cx.budget().deadline.map_or(wake, |caller| caller.min(wake));
+                let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(wake));
+                let output = std::future::poll_fn(|task_cx| {
+                    with_caller_context(cx, || {
+                        if let Err(error) = self.check(cx, idle) {
+                            return std::task::Poll::Ready(Err(error));
+                        }
+                        if let std::task::Poll::Ready(output) = future.as_mut().poll(task_cx) {
+                            return std::task::Poll::Ready(
+                                self.check(cx, idle).map(|()| Some(output)),
+                            );
+                        }
+                        // Ready work needs no timer. Pending work must not
+                        // borrow the host's driver or use Sleep's fallback.
+                        let current =
+                            Cx::current().expect("WebSocket connection caller is installed");
+                        if !current.capabilities().time {
+                            return std::task::Poll::Ready(Err(McpError::internal_error(
+                                "WebSocket connection wait requires caller time capability",
+                            )));
+                        }
+                        if current.timer_driver().is_none() {
+                            return std::task::Poll::Ready(Err(McpError::internal_error(
+                                "WebSocket connection wait requires caller timer driver",
+                            )));
+                        }
+                        if elapsed.as_mut().poll(task_cx).is_ready() {
+                            return std::task::Poll::Ready(Ok(None));
+                        }
+                        std::task::Poll::Pending
+                    })
+                })
+                .await?;
+                if let Some(output) = output {
+                    return Ok(output);
                 }
-                if let std::task::Poll::Ready(output) = future.as_mut().poll(task_cx) {
-                    return std::task::Poll::Ready(self.check(cx, idle).map(|()| Some(output)));
-                }
-                if elapsed.as_mut().poll(task_cx).is_ready() {
-                    return std::task::Poll::Ready(Ok(None));
-                }
-                std::task::Poll::Pending
-            })
-            .await?;
-            if let Some(output) = output {
-                return Ok(output);
             }
-        }
+        })
+        .await
     }
 }
 
@@ -6398,6 +6426,11 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     /// Negotiates a native, already-established async WebSocket transport.
+    ///
+    /// Pending wire operations and handshake cleanup require the explicit
+    /// caller's timer driver and effective TIME capability. Immediately ready
+    /// work needs neither. The connection retains every capability restriction
+    /// encountered while negotiating, including restrictions on resumed polls.
     pub async fn connect_with_cx(
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
@@ -6454,192 +6487,194 @@ where
         deadline: WebSocketConnectDeadline,
         transport: AsyncWsClientTransport<IO>,
     ) -> McpResult<Self> {
-        validate_protocol_plan_feature(&protocol_plan)?;
-        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-        match protocol_plan.policy() {
-            ProtocolPolicy::LegacyOnly => {
-                reverse_request_handlers.derive_legacy_capabilities(&mut client_capabilities);
-                reverse_request_handlers.validate_legacy_capabilities(&client_capabilities)?;
+        use fastmcp_core::runtime::{CallerContextFuture, with_caller_context};
+
+        let caller = with_caller_context(cx, || {
+            Cx::current().expect("WebSocket connection caller is installed")
+        });
+        let cx = &caller;
+        // Restrictions observed in one phase also govern later phases,
+        // teardown, and the connection returned to the caller.
+        CallerContextFuture::new(cx, async move {
+            validate_protocol_plan_feature(&protocol_plan)?;
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            match protocol_plan.policy() {
+                ProtocolPolicy::LegacyOnly => {
+                    reverse_request_handlers.derive_legacy_capabilities(&mut client_capabilities);
+                    reverse_request_handlers.validate_legacy_capabilities(&client_capabilities)?;
+                }
+                ProtocolPolicy::ModernOnly if !reverse_request_handlers.is_empty() => {
+                    return Err(McpError::invalid_params(
+                        "MCP 2026-07-28 does not support exact-2024 reverse request handlers",
+                    ));
+                }
+                ProtocolPolicy::ModernOnly => {
+                    reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
+                }
+                ProtocolPolicy::Auto => {}
             }
-            ProtocolPolicy::ModernOnly if !reverse_request_handlers.is_empty() => {
+            if matches!(protocol_plan.policy(), ProtocolPolicy::Auto) {
                 return Err(McpError::invalid_params(
-                    "MCP 2026-07-28 does not support exact-2024 reverse request handlers",
+                    "WebSocket Auto requires connect_auto_with_cx with a fresh transport factory",
                 ));
             }
-            ProtocolPolicy::ModernOnly => {
-                reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
-            }
-            ProtocolPolicy::Auto => {}
-        }
-        if matches!(protocol_plan.policy(), ProtocolPolicy::Auto) {
-            return Err(McpError::invalid_params(
-                "WebSocket Auto requires connect_auto_with_cx with a fresh transport factory",
-            ));
-        }
 
-        let (mut receiver, mut sender) = transport.into_split();
-        let handshake = match protocol_plan.policy() {
-            ProtocolPolicy::ModernOnly => {
-                async_websocket_discover(
+            let (mut receiver, mut sender) = transport.into_split();
+            let handshake = match protocol_plan.policy() {
+                ProtocolPolicy::ModernOnly => {
+                    async_websocket_discover(
+                        &mut receiver,
+                        &mut sender,
+                        cx,
+                        deadline,
+                        &client_info,
+                        &client_capabilities,
+                        mcp_apps_settings.as_ref(),
+                        client_extension_runtime.as_deref(),
+                        1,
+                    )
+                    .await
+                }
+                ProtocolPolicy::LegacyOnly => async_websocket_initialize(
                     &mut receiver,
                     &mut sender,
                     cx,
                     deadline,
                     &client_info,
                     &client_capabilities,
-                    mcp_apps_settings.as_ref(),
-                    client_extension_runtime.as_deref(),
                     1,
                 )
                 .await
-            }
-            ProtocolPolicy::LegacyOnly => async_websocket_initialize(
-                &mut receiver,
-                &mut sender,
-                cx,
-                deadline,
-                &client_info,
-                &client_capabilities,
-                1,
-            )
-            .await
-            .map(WebSocketInitialization::Legacy),
-            ProtocolPolicy::Auto => unreachable!("Auto was rejected before transport ownership"),
-        };
-        let initialization = match handshake {
-            Ok(initialization) => initialization,
-            Err(WebSocketHandshakeError::UncommittedSend(error)) => {
-                // Closing would flush a possibly partial application frame.
-                // Dropping both owned halves retires the I/O without replay.
-                return Err(error);
-            }
-            Err(error) => {
-                let error = match (protocol_plan.policy(), error) {
-                    (ProtocolPolicy::ModernOnly, WebSocketHandshakeError::MethodNotFound) => {
-                        McpError::method_not_found(SERVER_DISCOVER_METHOD)
-                    }
-                    (ProtocolPolicy::LegacyOnly, WebSocketHandshakeError::MethodNotFound) => {
-                        McpError::invalid_request(
-                            "WebSocket initialize was not supported by the peer",
-                        )
-                    }
-                    (_, WebSocketHandshakeError::Mcp(error)) => error,
-                    (_, WebSocketHandshakeError::UncommittedSend(_)) => {
-                        unreachable!("uncommitted sends retire without a wire close")
-                    }
-                    (ProtocolPolicy::Auto, _) => {
-                        unreachable!("Auto was rejected before transport ownership")
-                    }
-                };
-                return combine_operation_with_cleanup_async(
-                    Err(error),
-                    async {
+                .map(WebSocketInitialization::Legacy),
+                ProtocolPolicy::Auto => unreachable!("Auto was rejected before transport ownership"),
+            };
+            let initialization = match handshake {
+                Ok(initialization) => initialization,
+                Err(WebSocketHandshakeError::UncommittedSend(error)) => {
+                    // Closing would flush a possibly partial application frame.
+                    // Dropping both owned halves retires the I/O without replay.
+                    return Err(error);
+                }
+                Err(error) => {
+                    let error = match (protocol_plan.policy(), error) {
+                        (ProtocolPolicy::ModernOnly, WebSocketHandshakeError::MethodNotFound) => {
+                            McpError::method_not_found(SERVER_DISCOVER_METHOD)
+                        }
+                        (ProtocolPolicy::LegacyOnly, WebSocketHandshakeError::MethodNotFound) => {
+                            McpError::invalid_request(
+                                "WebSocket initialize was not supported by the peer",
+                            )
+                        }
+                        (_, WebSocketHandshakeError::Mcp(error)) => error,
+                        (_, WebSocketHandshakeError::UncommittedSend(_)) => {
+                            unreachable!("uncommitted sends retire without a wire close")
+                        }
+                        (ProtocolPolicy::Auto, _) => {
+                            unreachable!("Auto was rejected before transport ownership")
+                        }
+                    };
+                    return combine_operation_with_cleanup_async(Err(error), async {
                         close_async_websocket_halves(&mut receiver, &mut sender, cx)
                             .await
                             .map_err(transport_error_to_mcp)
-                    },
-                )
-                .await;
-            }
-        };
-
-        if matches!(initialization, WebSocketInitialization::Legacy(_)) {
-            let initialized = JsonRpcMessage::Request(JsonRpcRequest::initialized_notification());
-            match deadline
-                .wait(
-                    cx,
-                    None,
-                    sender.send(cx, &initialized),
-                )
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(transport_error_to_mcp(error)),
-                Err(error) => return Err(error),
-            }
-        }
-
-        // Once the WebSocket halves are split, every later admission error
-        // must use the same close-and-settle exit as handshake failures. In
-        // particular, incompatible generic extensions/Apps must not leak an
-        // open native connection after discovery succeeded.
-        let session = (|| {
-            let mut session = match initialization {
-                WebSocketInitialization::Legacy(result) => ClientSession::try_new(
-                    client_info,
-                    client_capabilities,
-                    // Exact 2024-11-05 requires `serverInfo` on the result.
-                    Some(result.server_info),
-                    result.capabilities,
-                    result.protocol_version,
-                )
-                .map(|session| session.with_legacy_instructions(result.instructions)),
-                WebSocketInitialization::Modern {
-                    server_info,
-                    discovery,
-                } => ClientSession::try_new(
-                    client_info,
-                    client_capabilities,
-                    server_info,
-                    ServerCapabilities::default(),
-                    MODERN_PROTOCOL_VERSION.to_owned(),
-                )
-                .map(|session| session.with_server_discovery(discovery)),
-            }
-            .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?;
-            if let Some(implementation) = client_implementation {
-                session = session.with_client_implementation(implementation);
-            }
-            session = session
-                .with_mcp_apps_settings(mcp_apps_settings)
-                .with_client_extension_runtime(client_extension_runtime);
-            session.negotiate_client_extensions_after_discovery()?;
-            let apps_activation_receipt = if session.generic_mcp_apps_configured() {
-                session.generic_mcp_apps_activation_receipt()
-            } else {
-                session.server_discovery().and_then(|discovery| {
-                    mcp_apps_activation_receipt(session.mcp_apps_settings(), discovery)
-                })
+                    })
+                    .await;
+                }
             };
-            session.set_mcp_apps_activation_receipt(apps_activation_receipt);
-            session.try_with_protocol_plan(protocol_plan).map_err(|_| {
-                McpError::internal_error("Configured protocol policy rejects the negotiated era")
+
+            if matches!(initialization, WebSocketInitialization::Legacy(_)) {
+                let initialized = JsonRpcMessage::Request(JsonRpcRequest::initialized_notification());
+                match deadline.wait(cx, None, sender.send(cx, &initialized)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(transport_error_to_mcp(error)),
+                    Err(error) => return Err(error),
+                }
+            }
+
+            // Once the WebSocket halves are split, every later admission error
+            // must use the same close-and-settle exit as handshake failures. In
+            // particular, incompatible generic extensions/Apps must not leak an
+            // open native connection after discovery succeeded.
+            let session = (|| {
+                let mut session = match initialization {
+                    WebSocketInitialization::Legacy(result) => ClientSession::try_new(
+                        client_info,
+                        client_capabilities,
+                        // Exact 2024-11-05 requires `serverInfo` on the result.
+                        Some(result.server_info),
+                        result.capabilities,
+                        result.protocol_version,
+                    )
+                    .map(|session| session.with_legacy_instructions(result.instructions)),
+                    WebSocketInitialization::Modern {
+                        server_info,
+                        discovery,
+                    } => ClientSession::try_new(
+                        client_info,
+                        client_capabilities,
+                        server_info,
+                        ServerCapabilities::default(),
+                        MODERN_PROTOCOL_VERSION.to_owned(),
+                    )
+                    .map(|session| session.with_server_discovery(discovery)),
+                }
+                .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?;
+                if let Some(implementation) = client_implementation {
+                    session = session.with_client_implementation(implementation);
+                }
+                session = session
+                    .with_mcp_apps_settings(mcp_apps_settings)
+                    .with_client_extension_runtime(client_extension_runtime);
+                session.negotiate_client_extensions_after_discovery()?;
+                let apps_activation_receipt = if session.generic_mcp_apps_configured() {
+                    session.generic_mcp_apps_activation_receipt()
+                } else {
+                    session.server_discovery().and_then(|discovery| {
+                        mcp_apps_activation_receipt(session.mcp_apps_settings(), discovery)
+                    })
+                };
+                session.set_mcp_apps_activation_receipt(apps_activation_receipt);
+                session.try_with_protocol_plan(protocol_plan).map_err(|_| {
+                    McpError::internal_error("Configured protocol policy rejects the negotiated era")
+                })
+            })();
+            let session = deadline.check(cx, None).and(session);
+            let session =
+                admit_websocket_session_or_close(&mut receiver, &mut sender, cx, session).await?;
+
+            let connection_cx = Cx::current().expect("WebSocket connection caller is installed");
+            let sender = Arc::new(AsyncMutex::with_name("websocket-client-send", Some(sender)));
+            let reverse_callback_pool =
+                WebSocketReverseCallbackPool::new(Arc::clone(&sender), connection_cx.clone());
+
+            Ok(Self {
+                receiver: Some(receiver),
+                sender,
+                connection_cx,
+                session,
+                reverse_request_handlers,
+                reverse_callback_pool,
+                request_timeout_policy: deadline.policy,
+                subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
+                final_server_notifications: VecDeque::new(),
+                final_progress_notifications: VecDeque::new(),
+                tools_list_generation: 0,
+                resources_list_generation: 0,
+                prompts_list_generation: 0,
+                legacy_server_notifications: VecDeque::new(),
+                retired_requests: VecDeque::new(),
+                transient_request: None,
+                live_catalog_subscription: None,
+                #[cfg(feature = "tasks")]
+                live_task_subscription: None,
+                next_id: 2,
+                closed: false,
+                close_settled: false,
+                close_state: Arc::new(Mutex::new(WebSocketCloseState::default())),
+                final_log_level: None,
             })
-        })();
-        let session = deadline.check(cx, None).and(session);
-        let session =
-            admit_websocket_session_or_close(&mut receiver, &mut sender, cx, session).await?;
-
-        let sender = Arc::new(AsyncMutex::with_name("websocket-client-send", Some(sender)));
-        let reverse_callback_pool =
-            WebSocketReverseCallbackPool::new(Arc::clone(&sender), cx.clone());
-
-        Ok(Self {
-            receiver: Some(receiver),
-            sender,
-            connection_cx: cx.clone(),
-            session,
-            reverse_request_handlers,
-            reverse_callback_pool,
-            request_timeout_policy: deadline.policy,
-            subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
-            final_server_notifications: VecDeque::new(),
-            final_progress_notifications: VecDeque::new(),
-            tools_list_generation: 0,
-            resources_list_generation: 0,
-            prompts_list_generation: 0,
-            legacy_server_notifications: VecDeque::new(),
-            retired_requests: VecDeque::new(),
-            transient_request: None,
-            live_catalog_subscription: None,
-            #[cfg(feature = "tasks")]
-            live_task_subscription: None,
-            next_id: 2,
-            closed: false,
-            close_settled: false,
-            close_state: Arc::new(Mutex::new(WebSocketCloseState::default())),
-            final_log_level: None,
         })
+        .await
     }
 
     /// Negotiates Auto over at most two fresh caller-owned transports.
@@ -6647,6 +6682,10 @@ where
     /// The factory is invoked once for final discovery and, only after its
     /// correlated `MethodNotFound` refusal, once more for exact-2024
     /// initialization. No request is replayed on the refused connection.
+    /// Pending factory, wire, and cleanup work require the explicit caller's
+    /// timer driver and effective TIME capability. Both factory invocations,
+    /// their futures, and the returned connection retain restrictions observed
+    /// during earlier polls; a broader resumed host cannot restore authority.
     pub async fn connect_auto_with_cx<F, Fut>(
         cx: &Cx,
         client_info: ClientInfo,
@@ -6707,60 +6746,78 @@ where
         F: FnMut(&Cx) -> Fut,
         Fut: Future<Output = McpResult<AsyncWsClientTransport<IO>>>,
     {
-        let auto_plan = ClientProtocolPlan::websocket(ProtocolPolicy::Auto);
-        validate_protocol_plan_feature(&auto_plan)?;
-        let deadline = WebSocketConnectDeadline::new(cx, timeout_policy)?;
-        deadline.check(cx, None)?;
-        // Modern MRTR callbacks belong to the selected modern connection.
-        // Keep exact-2024 reverse RPC handlers out of that constructor while
-        // retaining the original configuration for a fresh legacy fallback.
-        let modern_handlers = ReverseRequestHandlers {
-            sampling_create_message: None,
-            roots_list: None,
-            ..reverse_request_handlers.clone()
-        };
-        let first = deadline.wait(cx, None, fresh_transport(cx)).await??;
-        match Self::connect_with_builder_configuration_with_cx(
-            cx,
-            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
-            client_info.clone(),
-            None,
-            client_capabilities.clone(),
-            modern_handlers,
-            mcp_apps_settings.clone(),
-            client_extension_runtime.clone(),
-            deadline,
-            first,
-        )
-        .await
-        {
-            Ok(mut client) => {
-                client.session.set_protocol_plan(auto_plan.clone());
-                Ok(client)
-            }
-            Err(error)
-                if error.code == McpErrorCode::MethodNotFound && !is_cleanup_unverified(&error) =>
+        use fastmcp_core::runtime::{CallerContextFuture, with_caller_context};
+
+        let caller = with_caller_context(cx, || {
+            Cx::current().expect("WebSocket connection caller is installed")
+        });
+        let cx = &caller;
+        CallerContextFuture::new(cx, async move {
+            let auto_plan = ClientProtocolPlan::websocket(ProtocolPolicy::Auto);
+            validate_protocol_plan_feature(&auto_plan)?;
+            let deadline = WebSocketConnectDeadline::new(cx, timeout_policy)?;
+            deadline.check(cx, None)?;
+            // Modern MRTR callbacks belong to the selected modern connection.
+            // Keep exact-2024 reverse RPC handlers out of that constructor while
+            // retaining the original configuration for a fresh legacy fallback.
+            let modern_handlers = ReverseRequestHandlers {
+                sampling_create_message: None,
+                roots_list: None,
+                ..reverse_request_handlers.clone()
+            };
+            let first = with_caller_context(cx, || {
+                let factory_cx = Cx::current().expect("WebSocket factory caller is installed");
+                fresh_transport(&factory_cx)
+            });
+            let first = deadline.wait(cx, None, first).await??;
+            match Self::connect_with_builder_configuration_with_cx(
+                cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                client_info.clone(),
+                None,
+                client_capabilities.clone(),
+                modern_handlers,
+                mcp_apps_settings.clone(),
+                client_extension_runtime.clone(),
+                deadline,
+                first,
+            )
+            .await
             {
-                deadline.check(cx, None)?;
-                let fresh_legacy = deadline.wait(cx, None, fresh_transport(cx)).await??;
-                let mut client = Self::connect_with_builder_configuration_with_cx(
-                    cx,
-                    ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
-                    client_info,
-                    None,
-                    client_capabilities,
-                    reverse_request_handlers,
-                    mcp_apps_settings,
-                    client_extension_runtime,
-                    deadline,
-                    fresh_legacy,
-                )
-                .await?;
-                client.session.set_protocol_plan(auto_plan);
-                Ok(client)
+                Ok(mut client) => {
+                    client.session.set_protocol_plan(auto_plan.clone());
+                    Ok(client)
+                }
+                Err(error)
+                    if error.code == McpErrorCode::MethodNotFound
+                        && !is_cleanup_unverified(&error) =>
+                {
+                    deadline.check(cx, None)?;
+                    let fresh_legacy = with_caller_context(cx, || {
+                        let factory_cx = Cx::current().expect("WebSocket factory caller is installed");
+                        fresh_transport(&factory_cx)
+                    });
+                    let fresh_legacy = deadline.wait(cx, None, fresh_legacy).await??;
+                    let mut client = Self::connect_with_builder_configuration_with_cx(
+                        cx,
+                        ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+                        client_info,
+                        None,
+                        client_capabilities,
+                        reverse_request_handlers,
+                        mcp_apps_settings,
+                        client_extension_runtime,
+                        deadline,
+                        fresh_legacy,
+                    )
+                    .await?;
+                    client.session.set_protocol_plan(auto_plan);
+                    Ok(client)
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        }
+        })
+        .await
     }
 
     /// Returns the immutable session established by the handshake.
@@ -12084,30 +12141,52 @@ async fn close_async_websocket_halves<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
+    use fastmcp_core::runtime::{CallerContextFuture, with_caller_context};
+
     // Handshake teardown has no client value to retain it for a later retry.
     // Give it the same bounded wire-close allowance as an established client;
     // the owning constructor drops both halves when this attempt terminates.
-    let deadline = cx.now().saturating_add_nanos(WEBSOCKET_CLOSE_TIMEOUT_NANOS);
-    let mut close = std::pin::pin!(async {
-        let sender_result = sender.close(cx).await;
-        let receiver_result = receiver.close(cx).await;
-        sender_result.and(receiver_result)
+    let caller = with_caller_context(cx, || {
+        Cx::current().expect("WebSocket handshake cleanup caller is installed")
     });
-    let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(deadline));
-    std::future::poll_fn(|task_cx| {
-        let _current = Cx::set_current(Some(cx.clone()));
-        cx.masked(|| {
-            if cx.now() >= deadline {
-                return std::task::Poll::Ready(Err(TransportError::Timeout));
-            }
-            if let std::task::Poll::Ready(result) = close.as_mut().poll(task_cx) {
-                return std::task::Poll::Ready(result);
-            }
-            if elapsed.as_mut().poll(task_cx).is_ready() {
-                return std::task::Poll::Ready(Err(TransportError::Timeout));
-            }
-            std::task::Poll::Pending
+    let cx = &caller;
+    CallerContextFuture::new(cx, async {
+        let deadline = cx.now().saturating_add_nanos(WEBSOCKET_CLOSE_TIMEOUT_NANOS);
+        let mut close = std::pin::pin!(async {
+            let sender_result = sender.close(cx).await;
+            let receiver_result = receiver.close(cx).await;
+            sender_result.and(receiver_result)
+        });
+        let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(deadline));
+        std::future::poll_fn(|task_cx| {
+            with_caller_context(cx, || {
+                cx.masked(|| {
+                    if cx.now() >= deadline {
+                        return std::task::Poll::Ready(Err(TransportError::Timeout));
+                    }
+                    if let std::task::Poll::Ready(result) = close.as_mut().poll(task_cx) {
+                        return std::task::Poll::Ready(result);
+                    }
+                    let current =
+                        Cx::current().expect("WebSocket handshake cleanup caller is installed");
+                    if !current.capabilities().time {
+                        return std::task::Poll::Ready(Err(TransportError::Io(io::Error::other(
+                            "WebSocket handshake cleanup requires caller time capability",
+                        ))));
+                    }
+                    if current.timer_driver().is_none() {
+                        return std::task::Poll::Ready(Err(TransportError::Io(io::Error::other(
+                            "WebSocket handshake cleanup requires caller timer driver",
+                        ))));
+                    }
+                    if elapsed.as_mut().poll(task_cx).is_ready() {
+                        return std::task::Poll::Ready(Err(TransportError::Timeout));
+                    }
+                    std::task::Poll::Pending
+                })
+            })
         })
+        .await
     })
     .await
 }
@@ -28810,6 +28889,689 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
     use fastmcp_core::block_on;
+
+    #[cfg(all(feature = "websocket-experimental", not(target_arch = "wasm32")))]
+    mod websocket_connect_context {
+        use super::*;
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use std::task::{Context, Poll, Waker};
+
+        fn with_effects(cx: &Cx, io: bool, time: bool) -> Cx {
+            let mask = match (io, time) {
+                (true, true) => CapSet::<true, true, true, true, true>::MASK,
+                (true, false) => CapSet::<true, false, true, true, true>::MASK,
+                (false, true) => CapSet::<true, true, true, false, true>::MASK,
+                (false, false) => CapSet::<true, false, true, false, true>::MASK,
+            };
+            let _installed = Cx::set_current(Some(cx.clone()));
+            let _restricted = Cx::push_restriction(mask);
+            Cx::current().unwrap()
+        }
+
+        fn io_is_permitted() -> bool {
+            let socket = asupersync::net::TcpSocket::new_v4().unwrap();
+            socket
+                .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .unwrap();
+            match socket.listen(1) {
+                Ok(listener) => {
+                    assert!(listener.local_addr().unwrap().ip().is_loopback());
+                    true
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                    assert!(
+                        error
+                            .get_ref()
+                            .and_then(|source| {
+                                source.downcast_ref::<asupersync::cx::IoCapabilityDenied>()
+                            })
+                            .is_some(),
+                        "the runtime's capability gate must reject the effect: {error}"
+                    );
+                    false
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct Probe {
+            observations: Mutex<Vec<(&'static str, bool, bool)>>,
+        }
+
+        struct ObservedFuture {
+            caller: Cx,
+            probe: Arc<Probe>,
+            polls: usize,
+            ready_after: usize,
+        }
+
+        impl ObservedFuture {
+            fn new(caller: &Cx, probe: &Arc<Probe>, ready_after: usize) -> Self {
+                Self {
+                    caller: caller.clone(),
+                    probe: Arc::clone(probe),
+                    polls: 0,
+                    ready_after,
+                }
+            }
+
+            fn observe(&self, event: &'static str) {
+                let current = Cx::current().expect("the explicit caller is installed");
+                assert_eq!(current.task_id(), self.caller.task_id());
+                assert_eq!(current.region_id(), self.caller.region_id());
+                let io = io_is_permitted();
+                assert_eq!(io, current.capabilities().io);
+                self.probe.observations.lock().unwrap().push((
+                    event,
+                    io,
+                    current.capabilities().time,
+                ));
+            }
+        }
+
+        impl Future for ObservedFuture {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                let this = self.get_mut();
+                this.observe("poll");
+                this.polls += 1;
+                if this.polls >= this.ready_after {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        impl Drop for ObservedFuture {
+            fn drop(&mut self) {
+                self.observe("drop");
+            }
+        }
+
+        #[test]
+        fn websocket_connect_wait_retains_initial_effects_for_ready_work_and_early_error() {
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            let ambient = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let foreign_timer = ambient.timer_driver().unwrap();
+            let mut task = Context::from_waker(Waker::noop());
+            for caller_io in [true, false] {
+                for host_io in [true, false] {
+                    for time in [true, false] {
+                        let caller = with_effects(&Cx::for_testing(), caller_io, time);
+                        let host = with_effects(&ambient, host_io, time);
+                        let installed = Cx::set_current(Some(host.clone()));
+                        let deadline = WebSocketConnectDeadline::new(
+                            &caller,
+                            RequestTimeoutPolicy::default(),
+                        )
+                        .unwrap();
+                        let probe = Arc::new(Probe::default());
+                        let mut waiting = Box::pin(deadline.wait(
+                            &caller,
+                            None,
+                            ObservedFuture::new(&caller, &probe, 1),
+                        ));
+                        assert!(matches!(
+                            waiting.as_mut().poll(&mut task),
+                            Poll::Ready(Ok(()))
+                        ));
+                        drop(waiting);
+                        assert_eq!(
+                            *probe.observations.lock().unwrap(),
+                            [
+                                ("poll", caller_io && host_io, time),
+                                ("drop", caller_io && host_io, time)
+                            ]
+                        );
+                        assert_eq!(Cx::current().unwrap().task_id(), host.task_id());
+                        assert_eq!(Cx::current().unwrap().capabilities().io, host_io);
+
+                        // The outer deadline check can reject before the user
+                        // future's first poll; its destruction still owns the ceiling.
+                        let expired = WebSocketConnectDeadline {
+                            absolute: caller.now(),
+                            policy: RequestTimeoutPolicy::default(),
+                        };
+                        let probe = Arc::new(Probe::default());
+                        let mut waiting = Box::pin(expired.wait(
+                            &caller,
+                            None,
+                            ObservedFuture::new(&caller, &probe, 1),
+                        ));
+                        assert!(matches!(
+                            waiting.as_mut().poll(&mut task),
+                            Poll::Ready(Err(error))
+                                if error.data.as_ref().unwrap()["timeoutSource"] == "absolute"
+                        ));
+                        drop(waiting);
+                        assert_eq!(
+                            *probe.observations.lock().unwrap(),
+                            [("drop", caller_io && host_io, time)]
+                        );
+                        assert_eq!(foreign_timer.pending_count(), 0);
+                        assert!(caller.checkpoint().is_ok());
+                        drop(installed);
+                    }
+                }
+            }
+            drop(ambient);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn websocket_connect_wait_latches_later_restrictions_for_resume_and_drop() {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(clock);
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let foreign_clock = Arc::new(VirtualClock::new());
+            let foreign_timer = TimerDriverHandle::with_virtual_clock(foreign_clock);
+            let foreign_runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(foreign_timer.clone())
+                .build()
+                .unwrap();
+            let host = foreign_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let installed = Cx::set_current(Some(host.clone()));
+            let mut task = Context::from_waker(Waker::noop());
+            for complete in [true, false] {
+                let probe = Arc::new(Probe::default());
+                let deadline =
+                    WebSocketConnectDeadline::new(&caller, RequestTimeoutPolicy::default()).unwrap();
+                let mut waiting = Box::pin(deadline.wait(
+                    &caller,
+                    None,
+                    ObservedFuture::new(&caller, &probe, if complete { 3 } else { usize::MAX }),
+                ));
+                assert!(waiting.as_mut().poll(&mut task).is_pending());
+                assert_eq!(timer.pending_count(), 1);
+                assert_eq!(foreign_timer.pending_count(), 0);
+                let restriction =
+                    Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+                assert!(waiting.as_mut().poll(&mut task).is_pending());
+                assert!(!Cx::current().unwrap().capabilities().io);
+                drop(restriction);
+                assert!(Cx::current().unwrap().capabilities().io);
+                if complete {
+                    assert!(matches!(
+                        waiting.as_mut().poll(&mut task),
+                        Poll::Ready(Ok(()))
+                    ));
+                }
+                drop(waiting);
+                let expected = if complete {
+                    vec![
+                        ("poll", true, true),
+                        ("poll", false, true),
+                        ("poll", false, true),
+                        ("drop", false, true),
+                    ]
+                } else {
+                    vec![
+                        ("poll", true, true),
+                        ("poll", false, true),
+                        ("drop", false, true),
+                    ]
+                };
+                assert_eq!(*probe.observations.lock().unwrap(), expected);
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(foreign_timer.pending_count(), 0);
+                assert_eq!(Cx::current().unwrap().task_id(), host.task_id());
+                assert!(Cx::current().unwrap().capabilities().io);
+            }
+            assert!(caller.checkpoint().is_ok());
+            assert!(host.checkpoint().is_ok());
+            drop(installed);
+            drop(caller);
+            drop(host);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn websocket_connect_wait_drops_timer_waker_under_retained_caller_ceiling() {
+            use std::task::Wake;
+
+            struct TimerWake {
+                caller: Cx,
+                drops: Arc<Mutex<Vec<bool>>>,
+            }
+
+            impl Wake for TimerWake {
+                fn wake(self: Arc<Self>) {}
+
+                fn wake_by_ref(self: &Arc<Self>) {}
+            }
+
+            impl Drop for TimerWake {
+                fn drop(&mut self) {
+                    let current = Cx::current().expect("timer cleanup has its explicit caller");
+                    assert_eq!(current.task_id(), self.caller.task_id());
+                    assert_eq!(current.region_id(), self.caller.region_id());
+                    self.drops.lock().unwrap().push(io_is_permitted());
+                }
+            }
+
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(clock);
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let host = Cx::for_testing();
+            let installed = Cx::set_current(Some(host.clone()));
+            let deadline =
+                WebSocketConnectDeadline::new(&caller, RequestTimeoutPolicy::default()).unwrap();
+            let mut waiting = Box::pin(deadline.wait(&caller, None, std::future::pending::<()>()));
+            let drops = Arc::new(Mutex::new(Vec::new()));
+            let waker = Waker::from(Arc::new(TimerWake {
+                caller: caller.clone(),
+                drops: Arc::clone(&drops),
+            }));
+            let restriction =
+                Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+            {
+                let mut task = Context::from_waker(&waker);
+                assert!(waiting.as_mut().poll(&mut task).is_pending());
+            }
+            assert_eq!(timer.pending_count(), 1);
+            // Only the timer now owns this foreign waker. Its last reference
+            // must be destroyed inside the wait's retained caller scope.
+            drop(waker);
+            assert!(drops.lock().unwrap().is_empty());
+            drop(restriction);
+            assert!(Cx::current().unwrap().capabilities().io);
+            drop(waiting);
+
+            assert_eq!(*drops.lock().unwrap(), [false]);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(Cx::current().unwrap().task_id(), host.task_id());
+            assert!(Cx::current().unwrap().capabilities().io);
+            assert!(caller.checkpoint().is_ok());
+            drop(installed);
+            drop(caller);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn websocket_connect_wait_rejects_missing_or_denied_caller_timer_after_pending() {
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            let full_caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let timer = full_caller.timer_driver().unwrap();
+            let foreign_runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            let full_host = foreign_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let foreign_timer = full_host.timer_driver().unwrap();
+            let mut task = Context::from_waker(Waker::noop());
+            for case in 0..3 {
+                let caller = match case {
+                    0 => Cx::for_testing(),
+                    1 => with_effects(&full_caller, true, false),
+                    _ => full_caller.clone(),
+                };
+                let host = with_effects(&full_host, true, case != 2);
+                let installed = Cx::set_current(Some(host));
+                let deadline =
+                    WebSocketConnectDeadline::new(&caller, RequestTimeoutPolicy::default()).unwrap();
+                let mut ready = Box::pin(deadline.wait(&caller, None, std::future::ready(42)));
+                assert!(matches!(
+                    ready.as_mut().poll(&mut task),
+                    Poll::Ready(Ok(42))
+                ));
+                drop(ready);
+                let probe = Arc::new(Probe::default());
+                let mut pending = Box::pin(deadline.wait(
+                    &caller,
+                    None,
+                    ObservedFuture::new(&caller, &probe, usize::MAX),
+                ));
+                let expected_error = if case == 0 {
+                    "WebSocket connection wait requires caller timer driver"
+                } else {
+                    "WebSocket connection wait requires caller time capability"
+                };
+                assert!(matches!(
+                    pending.as_mut().poll(&mut task),
+                    Poll::Ready(Err(error))
+                        if error.code == McpErrorCode::InternalError
+                            && error.message == expected_error
+                ));
+                drop(pending);
+                assert_eq!(
+                    *probe.observations.lock().unwrap(),
+                    [("poll", true, case == 0), ("drop", true, case == 0)]
+                );
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(foreign_timer.pending_count(), 0);
+                assert!(caller.checkpoint().is_ok());
+                drop(installed);
+            }
+            drop(full_caller);
+            drop(full_host);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn websocket_connect_auto_factory_retains_initial_caller_and_host_effects() {
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            let full_caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let timer = full_caller.timer_driver().unwrap();
+            let host = Cx::for_testing();
+            let installed = Cx::set_current(Some(host.clone()));
+            let mut task = Context::from_waker(Waker::noop());
+            for caller_io in [true, false] {
+                for host_io in [true, false] {
+                    let caller = with_effects(&full_caller, caller_io, true);
+                    let restriction = (!host_io).then(|| {
+                        Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
+                    });
+                    let probe = Arc::new(Probe::default());
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let factory_calls = Arc::clone(&calls);
+                    let factory_probe = Arc::clone(&probe);
+                    let expected_io = caller_io && host_io;
+                    let mut connecting = Box::pin(
+                        ClientBuilder::new()
+                            .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::Auto))
+                            .connect_websocket_auto_with_cx(&caller, move |factory_cx| {
+                                factory_calls.fetch_add(1, Ordering::SeqCst);
+                                assert_eq!(factory_cx.capabilities().io, expected_io);
+                                assert_eq!(io_is_permitted(), expected_io);
+                                let operation = ObservedFuture::new(factory_cx, &factory_probe, 2);
+                                async move {
+                                    operation.await;
+                                    Err::<
+                                        AsyncWsClientTransport<
+                                            asupersync::net::tcp::VirtualTcpStream,
+                                        >,
+                                        _,
+                                    >(McpError::internal_error(
+                                        "factory completed under retained caller",
+                                    ))
+                                }
+                            }),
+                    );
+                    assert!(connecting.as_mut().poll(&mut task).is_pending());
+                    drop(restriction);
+                    assert!(Cx::current().unwrap().capabilities().io);
+                    assert!(matches!(
+                        connecting.as_mut().poll(&mut task),
+                        Poll::Ready(Err(error))
+                            if error.message == "factory completed under retained caller"
+                    ));
+                    drop(connecting);
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        *probe.observations.lock().unwrap(),
+                        [
+                            ("poll", expected_io, true),
+                            ("poll", expected_io, true),
+                            ("drop", expected_io, true)
+                        ]
+                    );
+                    assert_eq!(timer.pending_count(), 0);
+                    assert_eq!(Cx::current().unwrap().task_id(), host.task_id());
+                }
+            }
+            drop(installed);
+            drop(full_caller);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn websocket_connect_late_restriction_survives_discovery_fallback_and_ownership() {
+            struct ObservedIo {
+                inner: asupersync::net::tcp::VirtualTcpStream,
+                caller: Cx,
+                phase: &'static str,
+                writes: Arc<Mutex<Vec<(&'static str, u8, bool)>>>,
+            }
+
+            impl AsyncRead for ObservedIo {
+                fn poll_read(
+                    self: Pin<&mut Self>,
+                    task: &mut Context<'_>,
+                    buf: &mut ReadBuf<'_>,
+                ) -> Poll<io::Result<()>> {
+                    Pin::new(&mut self.get_mut().inner).poll_read(task, buf)
+                }
+            }
+
+            impl AsyncWrite for ObservedIo {
+                fn poll_write(
+                    self: Pin<&mut Self>,
+                    task: &mut Context<'_>,
+                    bytes: &[u8],
+                ) -> Poll<io::Result<usize>> {
+                    let this = self.get_mut();
+                    let current = Cx::current().expect("wire writes have the explicit caller");
+                    assert_eq!(current.task_id(), this.caller.task_id());
+                    if let Some(first) = bytes.first() {
+                        this.writes.lock().unwrap().push((
+                            this.phase,
+                            first & 0x0F,
+                            io_is_permitted(),
+                        ));
+                    }
+                    // The protocol exchange itself uses only memory. The
+                    // listener probe separately exercises real I/O admission.
+                    Pin::new(&mut this.inner).poll_write(task, bytes)
+                }
+
+                fn poll_flush(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    Pin::new(&mut self.get_mut().inner).poll_flush(task)
+                }
+
+                fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    Pin::new(&mut self.get_mut().inner).poll_shutdown(task)
+                }
+            }
+
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(clock);
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let host = Cx::for_testing();
+            let installed = Cx::set_current(Some(host.clone()));
+            let mut task = Context::from_waker(Waker::noop());
+            for policy in [ProtocolPolicy::ModernOnly, ProtocolPolicy::Auto] {
+                let writes = Arc::new(Mutex::new(Vec::new()));
+                let (modern_io, modern_peer) = async_websocket_pair();
+                let (legacy_io, legacy_peer) = async_websocket_pair();
+                let mut modern_peer = AsyncWsServerTransport::from_upgraded(modern_peer);
+                let mut legacy_peer = AsyncWsServerTransport::from_upgraded(legacy_peer);
+                let mut transports = VecDeque::from([
+                    ObservedIo {
+                        inner: modern_io,
+                        caller: caller.clone(),
+                        phase: "modern",
+                        writes: Arc::clone(&writes),
+                    },
+                    ObservedIo {
+                        inner: legacy_io,
+                        caller: caller.clone(),
+                        phase: "legacy",
+                        writes: Arc::clone(&writes),
+                    },
+                ]);
+                let factories = Arc::new(Mutex::new(Vec::new()));
+                let factory_observations = Arc::clone(&factories);
+                let builder =
+                    ClientBuilder::new().protocol_plan(ClientProtocolPlan::websocket(policy));
+                let mut connecting: Pin<
+                    Box<dyn Future<Output = McpResult<WebSocketClient<ObservedIo>>> + '_>,
+                > = if policy == ProtocolPolicy::Auto {
+                    Box::pin(builder.connect_websocket_auto_with_cx(&caller, move |factory_cx| {
+                        let allowed = io_is_permitted();
+                        assert_eq!(factory_cx.capabilities().io, allowed);
+                        factory_observations.lock().unwrap().push(allowed);
+                        let io = transports.pop_front().expect("at most two fresh transports");
+                        std::future::ready(Ok(AsyncWsClientTransport::from_upgraded(io)))
+                    }))
+                } else {
+                    Box::pin(builder.connect_websocket_with_cx(
+                        &caller,
+                        AsyncWsClientTransport::from_upgraded(transports.pop_front().unwrap()),
+                    ))
+                };
+
+                // Discovery begins with full authority. Restrict a later
+                // pending poll, then deliver all remaining frames from a
+                // broader host so subsequent phases must retain that ceiling.
+                assert!(connecting.as_mut().poll(&mut task).is_pending());
+                assert_eq!(timer.pending_count(), 1);
+                let restriction =
+                    Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+                assert!(connecting.as_mut().poll(&mut task).is_pending());
+                drop(restriction);
+                assert!(Cx::current().unwrap().capabilities().io);
+                let response: JsonRpcMessage = if policy == ProtocolPolicy::Auto {
+                    serde_json::from_str(
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"discovery unavailable"}}"#,
+                    )
+                    .unwrap()
+                } else {
+                    serde_json::from_slice(&websocket_test_modern_discovery_frame(1)).unwrap()
+                };
+                let mut send = Box::pin(modern_peer.send(&host, &response));
+                assert!(matches!(
+                    send.as_mut().poll(&mut task),
+                    Poll::Ready(Ok(()))
+                ));
+                drop(send);
+                if policy == ProtocolPolicy::Auto {
+                    let initialized: JsonRpcMessage = serde_json::from_str(
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"retained-legacy","version":"1"}}}"#,
+                    )
+                    .unwrap();
+                    let mut send = Box::pin(legacy_peer.send(&host, &initialized));
+                    assert!(matches!(
+                        send.as_mut().poll(&mut task),
+                        Poll::Ready(Ok(()))
+                    ));
+                    drop(send);
+                }
+                let Poll::Ready(result) = connecting.as_mut().poll(&mut task) else {
+                    panic!("buffered negotiation and cleanup must finish synchronously");
+                };
+                let client = result.expect("allowed protocol negotiation retains narrowed effects");
+                drop(connecting);
+                assert!(!client.connection_cx.capabilities().io);
+                assert!(!client.reverse_callback_pool.cx.capabilities().io);
+                assert_eq!(client.connection_cx.task_id(), caller.task_id());
+                assert_eq!(timer.pending_count(), 0);
+                let observed = writes.lock().unwrap();
+                assert_eq!(observed[0], ("modern", 0x01, true));
+                assert!(observed.iter().skip(1).all(|(_, _, allowed)| !allowed));
+                if policy == ProtocolPolicy::Auto {
+                    assert_eq!(*factories.lock().unwrap(), [true, false]);
+                    assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+                    assert_eq!(
+                        observed
+                            .iter()
+                            .filter(|(phase, opcode, _)| *phase == "modern" && *opcode == 0x08)
+                            .count(),
+                        1,
+                        "refused discovery closes under the retained ceiling"
+                    );
+                    assert_eq!(
+                        observed
+                            .iter()
+                            .filter(|(phase, opcode, _)| *phase == "legacy" && *opcode == 0x01)
+                            .count(),
+                        2,
+                        "fallback initialize and initialized both retain the ceiling"
+                    );
+                } else {
+                    assert!(factories.lock().unwrap().is_empty());
+                    assert_eq!(client.selected_protocol_era(), ProtocolEra::Modern2026);
+                    assert_eq!(observed.len(), 1);
+                }
+                drop(observed);
+                drop(client);
+                assert_eq!(Cx::current().unwrap().task_id(), host.task_id());
+                assert!(io_is_permitted());
+            }
+            assert!(caller.checkpoint().is_ok());
+            drop(installed);
+            drop(caller);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn websocket_connect_selected_era_retains_initial_caller_and_host_effects() {
+            let caller = Cx::for_testing();
+            let host = Cx::for_testing();
+            let installed = Cx::set_current(Some(host.clone()));
+            let mut task = Context::from_waker(Waker::noop());
+            for caller_io in [true, false] {
+                for host_io in [true, false] {
+                    let caller = with_effects(&caller, caller_io, true);
+                    let (client_io, peer_io) = async_websocket_pair();
+                    let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                    let discovery: JsonRpcMessage =
+                        serde_json::from_slice(&websocket_test_modern_discovery_frame(1)).unwrap();
+                    let mut send = Box::pin(peer.send(&host, &discovery));
+                    assert!(matches!(
+                        send.as_mut().poll(&mut task),
+                        Poll::Ready(Ok(()))
+                    ));
+                    drop(send);
+                    let restriction = (!host_io).then(|| {
+                        Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
+                    });
+                    let mut connecting = Box::pin(
+                        ClientBuilder::new()
+                            .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                            .connect_websocket_with_cx(
+                                &caller,
+                                AsyncWsClientTransport::from_upgraded(client_io),
+                            ),
+                    );
+                    let Poll::Ready(Ok(client)) = connecting.as_mut().poll(&mut task) else {
+                        panic!("buffered virtual discovery requires no timer or native I/O");
+                    };
+                    drop(connecting);
+                    drop(restriction);
+                    assert_eq!(client.connection_cx.capabilities().io, caller_io && host_io);
+                    assert_eq!(client.connection_cx.task_id(), caller.task_id());
+                    assert_eq!(client.selected_protocol_era(), ProtocolEra::Modern2026);
+                    assert!(Cx::current().unwrap().capabilities().io);
+                    drop(client);
+                }
+            }
+            drop(installed);
+        }
+    }
 
     #[test]
     fn mrtr_operation_watchdog_uses_only_the_explicit_callers_timer() {
