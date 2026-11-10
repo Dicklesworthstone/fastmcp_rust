@@ -18,6 +18,7 @@ use asupersync::channel::mpsc::{self, Receiver, Sender};
 use asupersync::combinator::select::{Either, Select};
 use asupersync::time::Sleep;
 use asupersync::types::Time;
+use fastmcp_core::runtime::{CallerContextFuture, with_caller_context};
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 use fastmcp_protocol::{
     MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeAdmission,
@@ -1507,7 +1508,7 @@ impl WireHostDeadline {
         let now = cx.now();
         let absolute = now.saturating_add_nanos(30 * 60 * 1_000_000_000);
         Self {
-            owner: cx.clone(),
+            owner: wire_caller_snapshot(cx),
             idle: now.saturating_add_nanos(60 * 1_000_000_000),
             absolute: cx
                 .budget()
@@ -1525,6 +1526,15 @@ impl WireHostDeadline {
     fn progress(&mut self) {
         self.idle = self.owner.now().saturating_add_nanos(60 * 1_000_000_000);
     }
+}
+
+// Retain the supplied owner's identity, drivers and cancellation while keeping
+// the current effect ceiling. A later poll on a broader runtime thread must not
+// restore an effect denied when this operation or its original request began.
+fn wire_caller_snapshot(cx: &Cx) -> Cx {
+    with_caller_context(cx, || {
+        Cx::current().expect("the Apps wire caller is installed during capture")
+    })
 }
 
 enum WireHostRequestState {
@@ -1848,10 +1858,15 @@ impl WireServerCatalogs {
             })
             .transpose()?;
         let cursor = if let Some(upstream) = upstream {
+            let entropy_allowed = with_caller_context(cx, || {
+                wire_caller_snapshot(&request.deadline.owner)
+                    .capabilities()
+                    .entropy
+            });
             if request.pages + 1 >= MAX_APPS_CATALOG_PAGES
                 || self.cursors.len() - usize::from(request.previous.is_some())
                     >= MAX_APPS_CATALOG_CURSORS
-                || !cx.capabilities().entropy
+                || !entropy_allowed
             {
                 return Err(wire_policy_denied());
             }
@@ -2157,6 +2172,7 @@ async fn receive_wire_host_frame<T: McpAppsWireBridgeTransport>(
     staged: &Option<StagedViewTools>,
     teardown: &Option<(McpAppsJsonRpcRequestId, WireHostDeadline)>,
 ) -> Result<Option<String>, McpAppsHostError> {
+    let mut owner = wire_caller_snapshot(cx);
     let mut timers: Vec<_> = requests
         .values()
         .filter(|entry| !matches!(entry.state, WireHostRequestState::Complete(_)))
@@ -2185,40 +2201,49 @@ async fn receive_wire_host_frame<T: McpAppsWireBridgeTransport>(
         .budget()
         .deadline
         .map(|deadline| Box::pin(Sleep::new(deadline)));
-    let mut incoming = pin!(transport.receive_from_view(cx));
+    // An async trait may use a synchronous future factory. Defer that factory
+    // too, so construction cannot precede the caller's authority boundary.
+    let mut incoming = pin!(CallerContextFuture::new(
+        &owner,
+        async { transport.receive_from_view(cx).await }
+    ));
     poll_fn(|task| {
-        for (owner, timer) in &mut timers {
-            if owner.now() >= timer.deadline() {
-                return Poll::Ready(Ok(None));
-            }
-            if owner.timer_driver().is_some() {
-                let _caller = Cx::set_current(Some(owner.clone()));
-                if timer.as_mut().poll(task).is_ready() {
+        owner = wire_caller_snapshot(&owner);
+        with_caller_context(&owner, || {
+            let mut request_timers_available = true;
+            for (clock_owner, timer) in &mut timers {
+                if clock_owner.now() >= timer.deadline() {
+                    return Poll::Ready(Ok(None));
+                }
+                if with_caller_context(clock_owner, || {
+                    let available = Cx::current().is_some_and(|cx| cx.timer_driver().is_some());
+                    request_timers_available &= available;
+                    available && timer.as_mut().poll(task).is_ready()
+                }) {
                     return Poll::Ready(Ok(None));
                 }
             }
-        }
-        let _caller = Cx::set_current(Some(cx.clone()));
-        if cx.checkpoint().is_err()
-            || cancelled.as_mut().poll(task).is_ready()
-            || caller_timer.as_mut().is_some_and(|timer| {
-                cx.timer_driver().is_some() && timer.as_mut().poll(task).is_ready()
-            })
-        {
-            return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
-        }
-        match incoming.as_mut().poll(task) {
-            Poll::Ready(result) => Poll::Ready(result.map(Some)),
-            Poll::Pending
-                if timers
-                    .iter()
-                    .any(|(owner, _)| owner.timer_driver().is_none())
-                    || (caller_timer.is_some() && cx.timer_driver().is_none()) =>
+            let caller_timer_available =
+                Cx::current().is_some_and(|cx| cx.timer_driver().is_some());
+            if cx.checkpoint().is_err()
+                || cancelled.as_mut().poll(task).is_ready()
+                || caller_timer.as_mut().is_some_and(|timer| {
+                    caller_timer_available && timer.as_mut().poll(task).is_ready()
+                })
             {
-                Poll::Ready(Err(McpAppsHostError::TimerUnavailable))
+                return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
             }
-            Poll::Pending => Poll::Pending,
-        }
+            match incoming.as_mut().poll(task) {
+                Poll::Ready(result) => Poll::Ready(result.map(Some)),
+                Poll::Pending
+                    if !request_timers_available
+                        || (caller_timer.is_some() && !caller_timer_available) =>
+                {
+                    Poll::Ready(Err(McpAppsHostError::TimerUnavailable))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        })
     })
     .await
 }
@@ -2228,47 +2253,65 @@ async fn await_wire_operation<T>(
     deadline: &WireHostDeadline,
     operation: impl Future<Output = Result<T, McpAppsHostError>>,
 ) -> Result<T, McpAppsHostError> {
-    let mut operation = pin!(operation);
-    let mut timer = pin!(Sleep::new(deadline.next()));
-    let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
-    let mut cancelled = pin!(receiver.recv(&deadline.owner));
-    let (_caller_sender, mut caller_receiver) = asupersync::channel::oneshot::channel::<()>();
-    let mut caller_cancelled = pin!(caller_receiver.recv(caller));
-    let mut caller_timer = caller
-        .budget()
-        .deadline
-        .map(|deadline| Box::pin(Sleep::new(deadline)));
-    poll_fn(|task| {
-        {
-            let _current_caller = Cx::set_current(Some(caller.clone()));
-            if caller.checkpoint().is_err()
-                || caller_cancelled.as_mut().poll(task).is_ready()
-                || caller_timer.as_mut().is_some_and(|timer| {
-                    caller.timer_driver().is_some() && timer.as_mut().poll(task).is_ready()
-                })
-            {
-                return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
-            }
-        }
-        let _caller = Cx::set_current(Some(deadline.owner.clone()));
-        if deadline.expired() {
-            return Poll::Ready(Err(McpAppsHostError::DeadlineExceeded));
-        }
-        if deadline.owner.checkpoint().is_err() || cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
-        }
-        if deadline.owner.timer_driver().is_some() && timer.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(McpAppsHostError::DeadlineExceeded));
-        }
-        match operation.as_mut().poll(task) {
-            Poll::Pending
-                if deadline.owner.timer_driver().is_none()
-                    || (caller_timer.is_some() && caller.timer_driver().is_none()) =>
-            {
-                Poll::Ready(Err(McpAppsHostError::TimerUnavailable))
-            }
-            other => other,
-        }
+    // Call sites defer external callback factories in async blocks so their
+    // synchronous construction also runs inside the retained caller context.
+    // A catalog continuation can retain an older, broader deadline owner.
+    // The current waiter and live ambient frame can only narrow its effects.
+    let owner = with_caller_context(caller, || {
+        wire_caller_snapshot(&deadline.owner)
+    });
+    // Own the complete wait, including timers and their retained wakers, so
+    // abandoning an outbound send cannot widen any destructor's authority.
+    CallerContextFuture::new(&owner, async {
+        let mut owner = wire_caller_snapshot(&owner);
+        let mut operation = pin!(operation);
+        let mut timer = pin!(Sleep::new(deadline.next()));
+        let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+        let mut cancelled = pin!(receiver.recv(&deadline.owner));
+        let (_caller_sender, mut caller_receiver) = asupersync::channel::oneshot::channel::<()>();
+        let mut caller_cancelled = pin!(caller_receiver.recv(caller));
+        let mut caller_timer = caller
+            .budget()
+            .deadline
+            .map(|deadline| Box::pin(Sleep::new(deadline)));
+        poll_fn(|task| {
+            owner = wire_caller_snapshot(&owner);
+            with_caller_context(&owner, || {
+                let mut caller_timer_available = false;
+                if with_caller_context(caller, || {
+                    caller_timer_available =
+                        Cx::current().is_some_and(|cx| cx.timer_driver().is_some());
+                    caller.checkpoint().is_err()
+                        || caller_cancelled.as_mut().poll(task).is_ready()
+                        || caller_timer.as_mut().is_some_and(|timer| {
+                            caller_timer_available && timer.as_mut().poll(task).is_ready()
+                        })
+                }) {
+                    return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
+                }
+                if deadline.expired() {
+                    return Poll::Ready(Err(McpAppsHostError::DeadlineExceeded));
+                }
+                if deadline.owner.checkpoint().is_err() || cancelled.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
+                }
+                let owner_timer_available =
+                    Cx::current().is_some_and(|cx| cx.timer_driver().is_some());
+                if owner_timer_available && timer.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(McpAppsHostError::DeadlineExceeded));
+                }
+                match operation.as_mut().poll(task) {
+                    Poll::Pending
+                        if !owner_timer_available
+                            || (caller_timer.is_some() && !caller_timer_available) =>
+                    {
+                        Poll::Ready(Err(McpAppsHostError::TimerUnavailable))
+                    }
+                    other => other,
+                }
+            })
+        })
+        .await
     })
     .await
 }
@@ -2627,18 +2670,21 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     /// native cleanup for the next drive; it does not itself commit a View
     /// cancellation or release an outstanding View correlation.
     pub async fn process_next(&mut self, cx: &Cx) -> Result<(), McpAppsHostError> {
-        let cleanup = self.policy.transport_cleanup().settle().await;
-        if let Err(error) = cleanup {
-            self.disconnect_view();
-            return Err(error);
-        }
-        let result = self.process_next_frame(cx).await;
-        let cleanup = self.policy.transport_cleanup().settle().await;
-        if cleanup.is_err() {
-            self.disconnect_view();
-        }
-        // Preserve the original operation error if its cleanup also failed.
-        result.and(cleanup)
+        CallerContextFuture::new(cx, async {
+            let cleanup = self.policy.transport_cleanup().settle().await;
+            if let Err(error) = cleanup {
+                self.disconnect_view();
+                return Err(error);
+            }
+            let result = self.process_next_frame(cx).await;
+            let cleanup = self.policy.transport_cleanup().settle().await;
+            if cleanup.is_err() {
+                self.disconnect_view();
+            }
+            // Preserve the original operation error if its cleanup also failed.
+            result.and(cleanup)
+        })
+        .await
     }
 
     async fn process_next_frame(&mut self, cx: &Cx) -> Result<(), McpAppsHostError> {
@@ -3321,7 +3367,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     await_wire_operation(
                         cx,
                         &request.deadline,
-                        self.transport.send_to_view(cx, frame),
+                        async { self.transport.send_to_view(cx, frame).await },
                     )
                     .await?;
                     if let Some(previous) = request.previous {
@@ -3403,7 +3449,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 let sampled = await_wire_operation(
                     cx,
                     &deadline,
-                    policy.sampling_create_message(cx, cancellation, &params),
+                    async { policy.sampling_create_message(cx, cancellation, &params).await },
                 )
                 .await?;
                 wire_policy_checkpoint(cx, cancellation)?;
@@ -3597,7 +3643,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     await_wire_operation(
                         cx,
                         &callback_deadline,
-                        self.policy.progress(&request_id, &params),
+                        async { self.policy.progress(&request_id, &params).await },
                     )
                     .await?;
                 }
@@ -3739,7 +3785,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 await_wire_operation(
                     cx,
                     &operation_deadline,
-                    self.policy.approve_view_tool_call(cx, &tool, params),
+                    async { self.policy.approve_view_tool_call(cx, &tool, params).await },
                 )
                 .await?;
                 if cx.checkpoint().is_err() {
@@ -3803,8 +3849,10 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             disconnected: &mut self.disconnected,
             id: Some(id.clone()),
         };
-        let sent =
-            await_wire_operation(cx, &deadline, self.transport.send_to_view(cx, frame)).await;
+        let sent = await_wire_operation(cx, &deadline, async {
+            self.transport.send_to_view(cx, frame).await
+        })
+        .await;
         if sent.is_ok() {
             guard.id = None;
         }
@@ -3948,8 +3996,10 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             .map_err(McpAppsHostError::Bridge)?;
         let deadline = WireHostDeadline::new(cx);
         self.teardown_request = Some((id.clone(), deadline.clone()));
-        let sent =
-            await_wire_operation(cx, &deadline, self.transport.send_to_view(cx, frame)).await;
+        let sent = await_wire_operation(cx, &deadline, async {
+            self.transport.send_to_view(cx, frame).await
+        })
+        .await;
         if sent.is_err() {
             self.teardown_request = None;
             self.admission
@@ -3994,7 +4044,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         await_wire_operation(
             cx,
             &WireHostDeadline::new(cx),
-            self.transport.send_to_view(cx, frame),
+            async { self.transport.send_to_view(cx, frame).await },
         )
         .await
     }
@@ -9918,6 +9968,816 @@ exec sleep 10
     }
 
     const VIEW_OPERATION_IDLE_NANOS: u64 = 60 * 1_000_000_000;
+
+    #[derive(Clone, Copy)]
+    enum WireAuthorityBoundary {
+        Receive,
+        ModelContext,
+        CatalogContinuation,
+    }
+
+    #[derive(Default)]
+    struct WireAuthorityObservations {
+        constructed: Vec<bool>,
+        polls: Vec<bool>,
+        dropped: Vec<bool>,
+        commits: usize,
+    }
+
+    #[derive(Clone)]
+    struct WireAuthorityProbe {
+        owner: Cx,
+        observations: Arc<Mutex<WireAuthorityObservations>>,
+    }
+
+    struct WireAuthorityDrop(WireAuthorityProbe);
+
+    fn attempt_wire_callback_io() -> std::io::Result<()> {
+        // TcpSocket's configuration is inert. Its public listen constructor
+        // checks ambient I/O authority before creating or binding the socket.
+        let socket = asupersync::net::TcpSocket::new_v4()?;
+        socket.bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?;
+        let listener = socket.listen(1)?;
+        assert!(listener.local_addr()?.ip().is_loopback());
+        Ok(())
+    }
+
+    impl Drop for WireAuthorityDrop {
+        fn drop(&mut self) {
+            let allowed = match attempt_wire_callback_io() {
+                Ok(()) => true,
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    false
+                }
+            };
+            self.0.observations.lock().unwrap().dropped.push(allowed);
+        }
+    }
+
+    impl WireAuthorityProbe {
+        fn new(owner: &Cx) -> Self {
+            Self {
+                owner: owner.clone(),
+                observations: Arc::new(Mutex::new(WireAuthorityObservations::default())),
+            }
+        }
+
+        async fn before_commit(&self) -> Result<(), McpAppsHostError> {
+            let _cleanup = WireAuthorityDrop(self.clone());
+            let mut remaining_yields = 2;
+            poll_fn(|_| {
+                let current = Cx::current().expect("wire callback has its caller context");
+                assert_eq!(current.task_id(), self.owner.task_id());
+                assert_eq!(current.region_id(), self.owner.region_id());
+                assert_eq!(current.budget().deadline, self.owner.budget().deadline);
+                assert_eq!(
+                    current.timer_driver().is_some(),
+                    self.owner.timer_driver().is_some()
+                );
+                assert_eq!(
+                    current.is_cancel_requested(),
+                    self.owner.is_cancel_requested()
+                );
+                let mut observed = self.observations.lock().unwrap();
+                observed.polls.push(current.capabilities().io);
+                if remaining_yields > 0 {
+                    remaining_yields -= 1;
+                    return Poll::Pending;
+                }
+                // Neither a carrier dequeue nor a policy state commit may
+                // precede admission at the real runtime I/O constructor.
+                if let Err(error) = attempt_wire_callback_io() {
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert!(
+                        error
+                            .get_ref()
+                            .and_then(|source| {
+                                source.downcast_ref::<asupersync::cx::IoCapabilityDenied>()
+                            })
+                            .is_some()
+                    );
+                    return Poll::Ready(Err(wire_policy_denied()));
+                }
+                observed.commits += 1;
+                Poll::Ready(Ok(()))
+            })
+            .await
+        }
+    }
+
+    struct AuthorityWireTransport {
+        inner: McpAppsInMemoryWireHostTransport,
+        receive_probe: Option<WireAuthorityProbe>,
+    }
+
+    impl McpAppsWireBridgeTransport for AuthorityWireTransport {
+        async fn send_to_view(&mut self, cx: &Cx, frame: String) -> Result<(), McpAppsHostError> {
+            self.inner.send_to_view(cx, frame).await
+        }
+
+        #[allow(
+            clippy::manual_async_fn,
+            reason = "the synchronous trait-future constructor is the tested authority boundary"
+        )]
+        fn receive_from_view(
+            &mut self,
+            cx: &Cx,
+        ) -> impl Future<Output = Result<String, McpAppsHostError>> {
+            if let Some(probe) = &self.receive_probe {
+                let current = Cx::current().unwrap();
+                assert_eq!(current.task_id(), probe.owner.task_id());
+                let allowed = match attempt_wire_callback_io() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                        false
+                    }
+                };
+                probe.observations.lock().unwrap().constructed.push(allowed);
+            }
+            async move {
+                if let Some(probe) = self.receive_probe.take() {
+                    probe.before_commit().await?;
+                }
+                self.inner.receive_from_view(cx).await
+            }
+        }
+    }
+
+    struct AuthorityWirePolicy {
+        probe: Option<WireAuthorityProbe>,
+    }
+
+    impl McpAppsWireHostPolicy for AuthorityWirePolicy {
+        async fn update_model_context(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            _params: &McpAppsUpdateModelContextParams,
+        ) -> Result<(), McpAppsHostError> {
+            self.probe.as_ref().unwrap().before_commit().await
+        }
+
+        async fn dispatch_reused_request(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            method: McpAppsRoutedMethod,
+            params: Option<Value>,
+        ) -> Result<Value, McpAppsHostError> {
+            if params
+                .as_ref()
+                .is_some_and(|params| params.get("cursor").is_some())
+            {
+                self.probe.as_ref().unwrap().before_commit().await?;
+                Ok(catalog_page(method, None))
+            } else {
+                Ok(catalog_page(method, Some("upstream-authority-page")))
+            }
+        }
+    }
+
+    async fn authority_wire_host(
+        cx: &Cx,
+        boundary: WireAuthorityBoundary,
+        probe: WireAuthorityProbe,
+    ) -> (
+        McpAppsWireHost<AuthorityWireTransport, AuthorityWirePolicy>,
+        McpAppsInMemoryWireViewTransport,
+    ) {
+        let (inner, mut view) = mcp_apps_in_memory_wire_pair(8);
+        let mut host = McpAppsWireHost::new_negotiated(
+            AuthorityWireTransport {
+                inner,
+                receive_probe: None,
+            },
+            stateful_wire_configuration(),
+            AuthorityWirePolicy { probe: None },
+            activation_proof(),
+        );
+        host.bind_server_catalogs(catalog_binding(), true).unwrap();
+        activate_stateful_wire_host(&mut host, &mut view, cx, None).await;
+        let (method, params) = match boundary {
+            WireAuthorityBoundary::Receive => {
+                host.transport.receive_probe = Some(probe);
+                ("ping", json!({}))
+            }
+            WireAuthorityBoundary::ModelContext => {
+                host.policy.probe = Some(probe);
+                (
+                    "ui/update-model-context",
+                    json!({"content":[{"type":"text","text":"accepted context"}]}),
+                )
+            }
+            WireAuthorityBoundary::CatalogContinuation => {
+                let page = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    cx,
+                    "first-page",
+                    "resources/list",
+                    json!({}),
+                )
+                .await;
+                let cursor = page["result"]["nextCursor"].as_str().unwrap();
+                host.policy.probe = Some(probe);
+                ("resources/list", json!({"cursor":cursor}))
+            }
+        };
+        view.send_to_host(
+            cx,
+            json!({"jsonrpc":"2.0","id":"authority","method":method,"params":params})
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        (host, view)
+    }
+
+    fn poll_wire_authority<F: Future>(
+        future: Pin<&mut F>,
+        foreign: &Cx,
+        allow_io: bool,
+    ) -> Poll<F::Output> {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        let _foreign = Cx::set_current(Some(foreign.clone()));
+        let _restriction = (!allow_io)
+            .then(|| Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK));
+        let depth = Cx::restriction_depth();
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        let result = future.poll(&mut task);
+        let restored = Cx::current().unwrap();
+        assert_eq!(restored.task_id(), foreign.task_id());
+        assert_eq!(restored.budget().deadline, foreign.budget().deadline);
+        assert_eq!(restored.is_cancel_requested(), foreign.is_cancel_requested());
+        assert_eq!(restored.capabilities().io, allow_io);
+        assert_eq!(Cx::restriction_depth(), depth);
+        result
+    }
+
+    #[test]
+    fn closed_wire_callbacks_preserve_caller_and_host_authority_across_pending() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+            foreign.set_cancel_requested(true);
+            for boundary in [
+                WireAuthorityBoundary::Receive,
+                WireAuthorityBoundary::ModelContext,
+                WireAuthorityBoundary::CatalogContinuation,
+            ] {
+                for (caller_io, initial_io, resumed_io) in [
+                    (true, true, true),
+                    (false, true, true),
+                    (true, false, true),
+                    (true, true, false),
+                ] {
+                    let caller = {
+                        let _restriction = (!caller_io).then(|| {
+                            Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
+                        });
+                        Cx::current().unwrap()
+                    };
+                    let probe = WireAuthorityProbe::new(&cx);
+                    let (mut host, mut view) =
+                        authority_wire_host(&cx, boundary, probe.clone()).await;
+                    let mut operation = Box::pin(host.process_next(&caller));
+                    assert!(
+                        poll_wire_authority(operation.as_mut(), &foreign, initial_io).is_pending()
+                    );
+                    assert!(
+                        poll_wire_authority(operation.as_mut(), &foreign, resumed_io).is_pending()
+                    );
+                    let Poll::Ready(result) =
+                        poll_wire_authority(operation.as_mut(), &foreign, true)
+                    else {
+                        panic!("the bounded callback must finish on its third poll");
+                    };
+                    drop(operation);
+                    let allowed = caller_io && initial_io && resumed_io;
+                    {
+                        let observed = probe.observations.lock().unwrap();
+                        assert_eq!(
+                            observed.constructed,
+                            if matches!(boundary, WireAuthorityBoundary::Receive) {
+                                vec![caller_io && initial_io]
+                            } else {
+                                Vec::new()
+                            }
+                        );
+                        assert_eq!(
+                            observed.polls,
+                            vec![caller_io && initial_io, allowed, allowed]
+                        );
+                        assert_eq!(observed.dropped, vec![allowed]);
+                        assert_eq!(observed.commits, usize::from(allowed));
+                    }
+                    if matches!(boundary, WireAuthorityBoundary::Receive) && !allowed {
+                        assert!(result.is_err());
+                        let queued = host
+                            .transport
+                            .inner
+                            .receive_from_view(&cx)
+                            .await
+                            .unwrap();
+                        let queued: Value = serde_json::from_str(&queued).unwrap();
+                        assert_eq!(
+                            queued["id"], "authority",
+                            "denial must not consume a frame"
+                        );
+                    } else {
+                        result.unwrap();
+                        let response: Value = serde_json::from_str(
+                            &view.receive_from_host(&cx).await.unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(response["id"], "authority");
+                        assert_eq!(response.get("result").is_some(), allowed);
+                        assert_eq!(response.get("error").is_some(), !allowed);
+                    }
+                    assert_eq!(
+                        host.state.model_context.is_some(),
+                        allowed && matches!(boundary, WireAuthorityBoundary::ModelContext)
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_abandoned_callbacks_keep_narrower_resumed_cleanup_authority() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+            foreign.set_cancel_requested(true);
+            for boundary in [
+                WireAuthorityBoundary::Receive,
+                WireAuthorityBoundary::ModelContext,
+                WireAuthorityBoundary::CatalogContinuation,
+            ] {
+                let probe = WireAuthorityProbe::new(&cx);
+                let (mut host, _view) = authority_wire_host(&cx, boundary, probe.clone()).await;
+                let mut operation = Box::pin(host.process_next(&cx));
+                assert!(poll_wire_authority(operation.as_mut(), &foreign, true).is_pending());
+                assert!(poll_wire_authority(operation.as_mut(), &foreign, false).is_pending());
+                assert!(Cx::current().unwrap().capabilities().io);
+                drop(operation);
+                let observed = probe.observations.lock().unwrap();
+                assert_eq!(
+                    observed.constructed,
+                    if matches!(boundary, WireAuthorityBoundary::Receive) {
+                        vec![true]
+                    } else {
+                        Vec::new()
+                    }
+                );
+                assert_eq!(observed.polls, vec![true, false]);
+                assert_eq!(observed.dropped, vec![false]);
+                assert_eq!(observed.commits, 0);
+                assert!(host.state.model_context.is_none());
+                assert!(Cx::current().unwrap().capabilities().io);
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_receive_requires_effective_time_only_when_waiting() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(clock);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for (caller_time, ambient_time) in [(true, true), (false, true), (true, false)] {
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    wire_configuration(),
+                    WirePolicy,
+                    activation_proof(),
+                );
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let id = host
+                    .send_host_request(
+                        &cx,
+                        McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                view.receive_from_host(&cx).await.unwrap();
+                let caller = {
+                    let _restriction = (!caller_time).then(|| {
+                        Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK)
+                    });
+                    Cx::current().unwrap()
+                };
+                assert_eq!(timer.pending_count(), 0);
+                let mut operation = Box::pin(host.process_next(&caller));
+                let polled = {
+                    let _restriction = (!ambient_time).then(|| {
+                        Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK)
+                    });
+                    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                    operation.as_mut().poll(&mut task)
+                };
+                if caller_time && ambient_time {
+                    assert!(polled.is_pending());
+                    assert!(timer.pending_count() > 0);
+                } else {
+                    assert!(matches!(
+                        polled,
+                        Poll::Ready(Err(McpAppsHostError::TimerUnavailable))
+                    ));
+                    assert_eq!(timer.pending_count(), 0);
+                }
+                drop(operation);
+                assert_eq!(timer.pending_count(), 0);
+
+                // The original request stays live, and an already-arrived
+                // response needs no timer even under the same denied ceiling.
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string(),
+                )
+                .await
+                .unwrap();
+                let mut operation = Box::pin(host.process_next(&caller));
+                let polled = {
+                    let _restriction =
+                        Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                    operation.as_mut().poll(&mut task)
+                };
+                assert!(matches!(polled, Poll::Ready(Ok(()))));
+                drop(operation);
+                assert!(matches!(
+                    host.take_host_response(&id).unwrap().outcome,
+                    McpAppsHostRequestOutcome::Ping
+                ));
+                assert_eq!(timer.pending_count(), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_policy_never_borrows_fallback_time_from_a_broader_caller() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(clock);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for (caller_time, ambient_time) in [(true, true), (false, true), (true, false)] {
+                let policy = DeadlineWirePolicy::new(McpAppsRoutedMethod::UpdateModelContext, None);
+                let entered = Arc::clone(&policy.entered);
+                let committed = Arc::clone(&policy.committed);
+                let dropped = Arc::clone(&policy.dropped);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    stateful_wire_configuration(),
+                    policy,
+                    activation_proof(),
+                );
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc":"2.0","id":"no-time","method":"ui/update-model-context",
+                        "params":{"content":[{"type":"text","text":"pending context"}]}})
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+                let caller = {
+                    let _restriction = (!caller_time).then(|| {
+                        Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK)
+                    });
+                    Cx::current().unwrap()
+                };
+                let mut operation = Box::pin(host.process_next(&caller));
+                let polled = {
+                    let _restriction = (!ambient_time).then(|| {
+                        Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK)
+                    });
+                    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                    operation.as_mut().poll(&mut task)
+                };
+                if caller_time && ambient_time {
+                    assert!(polled.is_pending());
+                    assert!(timer.pending_count() > 0);
+                } else {
+                    assert!(matches!(polled, Poll::Ready(Ok(()))));
+                    assert_eq!(timer.pending_count(), 0);
+                }
+                drop(operation);
+                assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(committed.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(host.state.model_context.is_none());
+                assert_eq!(timer.pending_count(), 0);
+                if !caller_time || !ambient_time {
+                    let response: Value =
+                        serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                    assert_eq!(response["id"], "no-time");
+                    assert!(response.get("error").is_some());
+                }
+
+                // Immediate policy work remains usable without TIME authority.
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc":"2.0","id":"immediate","method":"ping","params":{}})
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+                let mut operation = Box::pin(host.process_next(&caller));
+                let polled = {
+                    let _restriction =
+                        Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                    operation.as_mut().poll(&mut task)
+                };
+                assert!(matches!(polled, Poll::Ready(Ok(()))));
+                drop(operation);
+                let response: Value =
+                    serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                assert_eq!(response["id"], "immediate");
+                assert_eq!(response["result"], json!({}));
+                assert_eq!(timer.pending_count(), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_outbound_wait_drops_timer_wakers_under_retained_authority() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        struct HeldSendTransport {
+            inner: McpAppsInMemoryWireHostTransport,
+            hold_send: bool,
+        }
+
+        impl McpAppsWireBridgeTransport for HeldSendTransport {
+            async fn send_to_view(&mut self, cx: &Cx, frame: String) -> Result<(), McpAppsHostError> {
+                if self.hold_send {
+                    std::future::pending::<()>().await;
+                }
+                self.inner.send_to_view(cx, frame).await
+            }
+
+            async fn receive_from_view(&mut self, cx: &Cx) -> Result<String, McpAppsHostError> {
+                self.inner.receive_from_view(cx).await
+            }
+        }
+
+        struct TimerWake {
+            caller: Cx,
+            dropped: Arc<Mutex<Vec<bool>>>,
+        }
+
+        impl std::task::Wake for TimerWake {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        impl Drop for TimerWake {
+            fn drop(&mut self) {
+                let current = Cx::current().unwrap();
+                assert_eq!(current.task_id(), self.caller.task_id());
+                assert_eq!(current.region_id(), self.caller.region_id());
+                let allowed = match attempt_wire_callback_io() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                        false
+                    }
+                };
+                self.dropped.lock().unwrap().push(allowed);
+            }
+        }
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(clock);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for resumed_io in [true, false] {
+                let (inner, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    HeldSendTransport {
+                        inner,
+                        hold_send: false,
+                    },
+                    wire_configuration(),
+                    WirePolicy,
+                    activation_proof(),
+                );
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                host.transport.hold_send = true;
+                let dropped = Arc::new(Mutex::new(Vec::new()));
+                let waker = std::task::Waker::from(Arc::new(TimerWake {
+                    caller: cx.clone(),
+                    dropped: Arc::clone(&dropped),
+                }));
+                let mut operation = Box::pin(host.send_host_request(
+                    &cx,
+                    McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()),
+                    None,
+                ));
+                {
+                    let mut task = std::task::Context::from_waker(&waker);
+                    assert!(operation.as_mut().poll(&mut task).is_pending());
+                    let _restriction = (!resumed_io).then(|| {
+                        Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
+                    });
+                    assert!(operation.as_mut().poll(&mut task).is_pending());
+                }
+                assert_eq!(timer.pending_count(), 1);
+                drop(waker);
+                assert!(dropped.lock().unwrap().is_empty());
+                let foreign = Cx::for_testing();
+                let _foreign = Cx::set_current(Some(foreign.clone()));
+                let depth = Cx::restriction_depth();
+                drop(operation);
+                assert_eq!(*dropped.lock().unwrap(), vec![resumed_io]);
+                assert_eq!(timer.pending_count(), 0);
+                assert!(host.disconnected);
+                assert_eq!(Cx::current().unwrap().task_id(), foreign.task_id());
+                assert!(Cx::current().unwrap().capabilities().io);
+                assert_eq!(Cx::restriction_depth(), depth);
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_catalog_cursor_draw_honors_the_active_entropy_ceiling() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        block_on(async {
+            let cx = Cx::current().unwrap();
+            for (caller_entropy, ambient_entropy) in [(true, true), (false, true), (true, false)] {
+                let (mut host, mut view) = catalog_host(&cx).await;
+                host.policy.responses.push_back(Ok(catalog_page(
+                    McpAppsRoutedMethod::ResourcesList,
+                    Some("upstream-entropy-page"),
+                )));
+                let caller = {
+                    let _restriction = (!caller_entropy).then(|| {
+                        Cx::push_restriction(CapSet::<true, true, false, true, true>::MASK)
+                    });
+                    Cx::current().unwrap()
+                };
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc":"2.0","id":"entropy","method":"resources/list","params":{}})
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+                let mut operation = Box::pin(host.process_next(&caller));
+                let polled = {
+                    let _restriction = (!ambient_entropy).then(|| {
+                        Cx::push_restriction(CapSet::<true, true, false, true, true>::MASK)
+                    });
+                    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                    operation.as_mut().poll(&mut task)
+                };
+                assert!(matches!(polled, Poll::Ready(Ok(()))));
+                drop(operation);
+                let response: Value =
+                    serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                let allowed = caller_entropy && ambient_entropy;
+                assert_eq!(response.get("result").is_some(), allowed);
+                assert_eq!(response.get("error").is_some(), !allowed);
+                assert_eq!(host.server_catalogs.cursors.len(), usize::from(allowed));
+                assert_eq!(host.policy.observed.len(), 1);
+                if allowed {
+                    assert!(response["result"]["nextCursor"].is_string());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_catalog_postprocessing_retains_a_narrower_pending_poll() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        struct YieldingCatalogPolicy {
+            observed: Arc<Mutex<Vec<bool>>>,
+        }
+
+        impl McpAppsWireHostPolicy for YieldingCatalogPolicy {
+            async fn dispatch_reused_request(
+                &mut self,
+                _cx: &Cx,
+                _cancellation: &McpRequestCancellation,
+                method: McpAppsRoutedMethod,
+                _params: Option<Value>,
+            ) -> Result<Value, McpAppsHostError> {
+                let mut remaining_yields = 2;
+                poll_fn(|_| {
+                    self.observed
+                        .lock()
+                        .unwrap()
+                        .push(Cx::current().unwrap().capabilities().entropy);
+                    if remaining_yields > 0 {
+                        remaining_yields -= 1;
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
+                })
+                .await;
+                Ok(catalog_page(method, Some("private-next-page")))
+            }
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for middle_poll_entropy in [true, false] {
+                let observed = Arc::new(Mutex::new(Vec::new()));
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    wire_configuration(),
+                    YieldingCatalogPolicy {
+                        observed: Arc::clone(&observed),
+                    },
+                    activation_proof(),
+                );
+                host.bind_server_catalogs(catalog_binding(), true).unwrap();
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc":"2.0","id":"yielded-catalog","method":"resources/list","params":{}})
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+                let mut operation = Box::pin(host.process_next(&cx));
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(operation.as_mut().poll(&mut task).is_pending());
+                {
+                    let _restriction = (!middle_poll_entropy).then(|| {
+                        Cx::push_restriction(CapSet::<true, true, false, true, true>::MASK)
+                    });
+                    assert!(operation.as_mut().poll(&mut task).is_pending());
+                }
+                assert!(Cx::current().unwrap().capabilities().entropy);
+                assert!(matches!(
+                    operation.as_mut().poll(&mut task),
+                    Poll::Ready(Ok(()))
+                ));
+                drop(operation);
+                assert_eq!(
+                    *observed.lock().unwrap(),
+                    vec![true, middle_poll_entropy, middle_poll_entropy]
+                );
+                let response: Value =
+                    serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                assert_eq!(response["id"], "yielded-catalog");
+                assert_eq!(response.get("result").is_some(), middle_poll_entropy);
+                assert_eq!(response.get("error").is_some(), !middle_poll_entropy);
+                assert_eq!(
+                    host.server_catalogs.cursors.len(),
+                    usize::from(middle_poll_entropy)
+                );
+                assert!(!response.to_string().contains("private-next-page"));
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                assert!(Cx::current().unwrap().capabilities().entropy);
+            }
+        });
+    }
 
     #[test]
     fn closed_wire_sandbox_policy_controls_initialization_grants_and_is_frozen() {
