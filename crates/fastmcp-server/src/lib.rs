@@ -13307,6 +13307,13 @@ where
             return result;
         }
         if cx.is_cancel_requested() {
+            // A poll wait can elapse without polling the write, as when the
+            // caller's deadline passed during it. Settle that refusal first;
+            // a yield would only defer a failure that is already decided.
+            write_authority()?;
+            if cx.now() >= deadline {
+                return Err(());
+            }
             // Cancelled timer waits can be immediately ready. Preserve the
             // terminal's deadline without starving the sibling dispatches
             // that must also settle during listener shutdown.
