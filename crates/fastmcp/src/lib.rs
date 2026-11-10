@@ -736,12 +736,14 @@ pub use fastmcp_protocol::{
 pub use fastmcp_protocol::{
     MAX_MCP_APPS_CSP_DOMAIN_BYTES, MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE,
     MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES, MAX_MCP_APPS_UI_METADATA_MEMBERS,
-    MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY, McpAppsDisplayMode,
-    McpAppsLifecycleError, McpAppsMetadataError, McpAppsResourceBinding,
-    McpAppsResourceBindingError, McpAppsResourceCsp, McpAppsResourceMetadata,
-    McpAppsResourcePermission, McpAppsResourcePermissions, McpAppsResourceRead,
-    McpAppsResultProjectionError, McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility,
-    McpAppsViewLifecycle, project_final_core_tools_call_result,
+    MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY, McpAppsCspDirective,
+    McpAppsCspMode, McpAppsCspSource, McpAppsDisplayMode, McpAppsLifecycleError,
+    McpAppsMetadataError, McpAppsResourceBinding, McpAppsResourceBindingError, McpAppsResourceCsp,
+    McpAppsResourceMetadata, McpAppsResourcePermission, McpAppsResourcePermissions,
+    McpAppsResourceRead, McpAppsResultProjectionError, McpAppsSandboxHostPolicy,
+    McpAppsSandboxPermission, McpAppsSandboxPolicy, McpAppsSandboxPolicyError, McpAppsToolMetadata,
+    McpAppsToolResult, McpAppsToolVisibility, McpAppsViewLifecycle,
+    project_final_core_tools_call_result,
 };
 
 // Final extension vocabulary.
@@ -3263,12 +3265,11 @@ pub mod modern {
         McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
         McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
         McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
-        McpAppsMemoryClientWirePolicy,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
-        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
-        McpAppsWireHostConfiguration,
-        McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostWithEffects,
-        mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+        McpAppsMemoryClientWirePolicy, McpAppsWireBridgeTransport, McpAppsWireHost,
+        McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
+        McpAppsWireHostPolicy, McpAppsWireHostWithEffects, mcp_apps_in_memory_pair,
+        mcp_apps_in_memory_wire_pair,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
@@ -3298,12 +3299,14 @@ pub mod modern {
         MAX_MCP_APPS_CSP_DOMAIN_BYTES, MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE,
         MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES, MAX_MCP_APPS_UI_METADATA_MEMBERS,
         MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY,
-        McpAppsBridgeImplementation, McpAppsDisplayMode, McpAppsLifecycleError,
-        McpAppsMetadataError, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext,
-        McpAppsResourceBinding, McpAppsResourceBindingError, McpAppsResourceCsp,
-        McpAppsResourceMetadata, McpAppsResourcePermission, McpAppsResourcePermissions,
-        McpAppsResourceRead, McpAppsResultProjectionError, McpAppsSamplingCapability,
-        McpAppsSamplingParams, McpAppsSamplingResult, McpAppsToolMetadata, McpAppsToolResult,
+        McpAppsBridgeImplementation, McpAppsCspDirective, McpAppsCspMode, McpAppsCspSource,
+        McpAppsDisplayMode, McpAppsLifecycleError, McpAppsMetadataError,
+        McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext, McpAppsResourceBinding,
+        McpAppsResourceBindingError, McpAppsResourceCsp, McpAppsResourceMetadata,
+        McpAppsResourcePermission, McpAppsResourcePermissions, McpAppsResourceRead,
+        McpAppsResultProjectionError, McpAppsSamplingCapability, McpAppsSamplingParams,
+        McpAppsSamplingResult, McpAppsSandboxHostPolicy, McpAppsSandboxPermission,
+        McpAppsSandboxPolicy, McpAppsSandboxPolicyError, McpAppsToolMetadata, McpAppsToolResult,
         McpAppsToolVisibility, McpAppsViewLifecycle, project_final_core_tools_call_result,
     };
     #[cfg(feature = "apps")]
@@ -11952,6 +11955,8 @@ pub mod testing;
 /// use fastmcp_rust::prelude::*;
 /// ```
 pub mod prelude {
+    #[cfg(feature = "tasks")]
+    pub use crate::FinalTaskStreamWatch;
     pub use crate::{
         // Context and errors
         AccessToken,
@@ -12185,24 +12190,21 @@ pub mod prelude {
         validate_final_core_result,
     };
     #[cfg(feature = "tasks")]
-    pub use crate::FinalTaskStreamWatch;
-    #[cfg(feature = "tasks")]
     pub use crate::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
-        TaskExecutionAuthorizer,
-        FinalTask, FinalTaskAcceptedInput, FinalTaskCallToolResult, FinalTaskExecutionBudget,
-        FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId, FinalTaskInitialWork,
-        FinalTaskInputResponses, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
-        FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-        FinalTaskStatusNotification, FinalTaskStore, FinalTaskSupervisorFuture,
-        FinalTaskSupervisorHandoff, FinalTaskWatch, FinalTaskWatchEvent, FinalTaskWorkDescriptor,
-        FinalToolCallOutcome, FinalUpdateTaskResult, InMemoryFinalTaskStore,
-        OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver, TASK_UPDATE,
-        TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
-        TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
-        TaskRetentionTarget, official_tasks_descriptor, official_tasks_empty_settings,
-        register_official_tasks_extension, tasks_extension,
+        FinalTask, FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCallToolResult,
+        FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId,
+        FinalTaskInitialWork, FinalTaskInputResponses, FinalTaskNotificationEmitter,
+        FinalTaskOperation, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
+        FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStatusNotification,
+        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWatch,
+        FinalTaskWatchEvent, FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalUpdateTaskResult,
+        InMemoryFinalTaskStore, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        OfficialTasksNegotiationResolver, TASK_UPDATE, TaskAccessAction, TaskAccessAuthorizer,
+        TaskExecutionAuthorizer, TaskRetentionAdministrator, TaskRetentionAuditPage,
+        TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
+        TaskRetentionReclamation, TaskRetentionTarget, official_tasks_descriptor,
+        official_tasks_empty_settings, register_official_tasks_extension, tasks_extension,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use crate::{
@@ -12247,12 +12249,14 @@ pub mod prelude {
         MAX_MCP_APPS_CSP_DOMAIN_BYTES, MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE,
         MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES, MAX_MCP_APPS_UI_METADATA_MEMBERS,
         MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY,
-        McpAppsClientSettings, McpAppsDisplayMode, McpAppsLifecycleError, McpAppsMetadataError,
+        McpAppsClientSettings, McpAppsCspDirective, McpAppsCspMode, McpAppsCspSource,
+        McpAppsDisplayMode, McpAppsLifecycleError, McpAppsMetadataError,
         McpAppsNegotiationResolver, McpAppsResourceBinding, McpAppsResourceBindingError,
         McpAppsResourceCsp, McpAppsResourceMetadata, McpAppsResourcePermission,
         McpAppsResourcePermissions, McpAppsResourceRead, McpAppsResultProjectionError,
-        McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility, McpAppsViewLifecycle,
-        project_final_core_tools_call_result,
+        McpAppsSandboxHostPolicy, McpAppsSandboxPermission, McpAppsSandboxPolicy,
+        McpAppsSandboxPolicyError, McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility,
+        McpAppsViewLifecycle, project_final_core_tools_call_result,
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub use crate::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};

@@ -2,7 +2,7 @@
 //!
 //! Core types used in MCP communication.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::common_types::{
@@ -1215,6 +1215,583 @@ impl McpAppsResourceRead<'_> {
     pub const fn metadata(&self) -> Option<&McpAppsResourceMetadata> {
         self.metadata.as_ref()
     }
+
+    /// Compiles this exact document's effective CSP and permission requests
+    /// against an explicit Host ceiling. The result is renderer-neutral data;
+    /// it does not create a View, install browser policy or authorize a load.
+    pub fn compile_sandbox_policy(
+        &self,
+        host: &McpAppsSandboxHostPolicy,
+    ) -> Result<McpAppsSandboxPolicy, McpAppsSandboxPolicyError> {
+        McpAppsSandboxPolicy::compile(self.metadata(), host)
+    }
+}
+
+/// Origin policy for the Apps sandbox compiler. Cleartext loopback origins
+/// require an explicit development policy; the default accepts no cleartext.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum McpAppsCspMode {
+    #[default]
+    Production,
+    LocalDevelopment,
+}
+
+/// A CSP directive produced by the Apps sandbox compiler.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum McpAppsCspDirective {
+    DefaultSrc,
+    ScriptSrc,
+    StyleSrc,
+    ImgSrc,
+    FontSrc,
+    MediaSrc,
+    ConnectSrc,
+    FrameSrc,
+    BaseUri,
+    ObjectSrc,
+}
+
+impl McpAppsCspDirective {
+    const ALL: [Self; 10] = [
+        Self::DefaultSrc,
+        Self::ScriptSrc,
+        Self::StyleSrc,
+        Self::ImgSrc,
+        Self::FontSrc,
+        Self::MediaSrc,
+        Self::ConnectSrc,
+        Self::FrameSrc,
+        Self::BaseUri,
+        Self::ObjectSrc,
+    ];
+    const RESOURCES: [Self; 5] = [
+        Self::ScriptSrc,
+        Self::StyleSrc,
+        Self::ImgSrc,
+        Self::FontSrc,
+        Self::MediaSrc,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DefaultSrc => "default-src",
+            Self::ScriptSrc => "script-src",
+            Self::StyleSrc => "style-src",
+            Self::ImgSrc => "img-src",
+            Self::FontSrc => "font-src",
+            Self::MediaSrc => "media-src",
+            Self::ConnectSrc => "connect-src",
+            Self::FrameSrc => "frame-src",
+            Self::BaseUri => "base-uri",
+            Self::ObjectSrc => "object-src",
+        }
+    }
+}
+
+/// A canonical CSP source token. Its private representation prevents peer
+/// strings from being serialized as policy without source admission.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct McpAppsCspSource(String);
+
+impl McpAppsCspSource {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn is_external(&self) -> bool {
+        self.0 != "'self'" && self.0 != "'unsafe-inline'" && self.0 != "data:"
+    }
+}
+
+/// The four permission-policy features supported by the pinned Apps schema.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum McpAppsSandboxPermission {
+    Camera,
+    Microphone,
+    Geolocation,
+    ClipboardWrite,
+}
+
+impl McpAppsSandboxPermission {
+    const ALL: [Self; 4] = [
+        Self::Camera,
+        Self::Microphone,
+        Self::Geolocation,
+        Self::ClipboardWrite,
+    ];
+
+    /// Renderer-facing Permission Policy name, distinct from the wire's
+    /// camelCase `clipboardWrite` member.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Camera => "camera",
+            Self::Microphone => "microphone",
+            Self::Geolocation => "geolocation",
+            Self::ClipboardWrite => "clipboard-write",
+        }
+    }
+}
+
+/// Immutable Host ceilings for one sandbox compilation. The default denies
+/// every source and permission. Builders admit only bounded canonical CSP
+/// sources; a resource can request a subset but cannot expand this ceiling.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpAppsSandboxHostPolicy {
+    mode: McpAppsCspMode,
+    sources: BTreeMap<McpAppsCspDirective, BTreeSet<McpAppsCspSource>>,
+    supported: BTreeSet<McpAppsSandboxPermission>,
+    allowed: BTreeSet<McpAppsSandboxPermission>,
+    consent_required: BTreeSet<McpAppsSandboxPermission>,
+    consented: BTreeSet<McpAppsSandboxPermission>,
+}
+
+impl McpAppsSandboxHostPolicy {
+    /// Chooses the immutable origin policy before adding any source.
+    #[must_use]
+    pub fn new(mode: McpAppsCspMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
+    /// Allows the pinned local source tokens, without allowing external
+    /// domains, frames or browser permissions. The resource upper bound still
+    /// applies: absent CSP cannot gain `connect-src 'self'` from this ceiling.
+    #[must_use]
+    pub fn allow_pinned_local_sources(mut self) -> Self {
+        for directive in McpAppsCspDirective::RESOURCES {
+            let sources = self.sources.entry(directive).or_default();
+            sources.insert(McpAppsCspSource("'self'".to_owned()));
+            if matches!(
+                directive,
+                McpAppsCspDirective::ScriptSrc | McpAppsCspDirective::StyleSrc
+            ) {
+                sources.insert(McpAppsCspSource("'unsafe-inline'".to_owned()));
+            }
+            if matches!(
+                directive,
+                McpAppsCspDirective::ImgSrc | McpAppsCspDirective::MediaSrc
+            ) {
+                sources.insert(McpAppsCspSource("data:".to_owned()));
+            }
+        }
+        for directive in [
+            McpAppsCspDirective::ConnectSrc,
+            McpAppsCspDirective::BaseUri,
+        ] {
+            self.sources
+                .entry(directive)
+                .or_default()
+                .insert(McpAppsCspSource("'self'".to_owned()));
+        }
+        self
+    }
+
+    /// Adds one external source to one Host directive ceiling. Source syntax
+    /// is validated before storage; the unconditional default/object blocks
+    /// cannot be relaxed. Wildcards are confined to resource directives.
+    pub fn allow_source(
+        mut self,
+        directive: McpAppsCspDirective,
+        source: &str,
+    ) -> Result<Self, McpAppsSandboxPolicyError> {
+        let source = parse_apps_csp_source(source, directive, self.mode)?;
+        let sources = self.sources.entry(directive).or_default();
+        if !sources.contains(&source)
+            && sources.iter().filter(|source| source.is_external()).count()
+                >= MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE
+        {
+            return Err(McpAppsSandboxPolicyError::TooManySources);
+        }
+        sources.insert(source);
+        Ok(self)
+    }
+
+    /// Adds a resource origin to each of script/style/image/font/media.
+    pub fn allow_resource_source(
+        mut self,
+        source: &str,
+    ) -> Result<Self, McpAppsSandboxPolicyError> {
+        for directive in McpAppsCspDirective::RESOURCES {
+            self = self.allow_source(directive, source)?;
+        }
+        Ok(self)
+    }
+
+    /// Installs the Host's four independent permission layers. Resource
+    /// markers are requests; a grant also needs installed support, deployment
+    /// approval, and consent whenever the Host requires it.
+    #[must_use]
+    pub fn with_permissions(
+        mut self,
+        supported: impl IntoIterator<Item = McpAppsSandboxPermission>,
+        allowed: impl IntoIterator<Item = McpAppsSandboxPermission>,
+        consent_required: impl IntoIterator<Item = McpAppsSandboxPermission>,
+        consented: impl IntoIterator<Item = McpAppsSandboxPermission>,
+    ) -> Self {
+        self.supported = supported.into_iter().collect();
+        self.allowed = allowed.into_iter().collect();
+        self.consent_required = consent_required.into_iter().collect();
+        self.consented = consented.into_iter().collect();
+        self
+    }
+}
+
+/// Effective, monotonically restrictable sandbox policy. All directives are
+/// explicit, including empty directives serialized as `'none'`. This is data
+/// for an external renderer, not proof that browser enforcement is installed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpAppsSandboxPolicy {
+    directives: BTreeMap<McpAppsCspDirective, BTreeSet<McpAppsCspSource>>,
+    permissions: BTreeSet<McpAppsSandboxPermission>,
+}
+
+impl McpAppsSandboxPolicy {
+    /// Compiles bounded, validated resource requests and intersects them with
+    /// the Host ceiling. Omitted CSP and present-empty CSP keep their distinct
+    /// pinned defaults. Domain identifiers, HTML conformance, user warnings,
+    /// and browser installation remain separate Host responsibilities.
+    pub fn compile(
+        resource: Option<&McpAppsResourceMetadata>,
+        host: &McpAppsSandboxHostPolicy,
+    ) -> Result<Self, McpAppsSandboxPolicyError> {
+        if resource
+            .and_then(|resource| resource.domain.as_deref())
+            .is_some_and(|domain| domain.is_empty() || domain.len() > MAX_MCP_APPS_CSP_DOMAIN_BYTES)
+        {
+            return Err(McpAppsSandboxPolicyError::InvalidMetadata);
+        }
+        let csp = resource.and_then(|resource| resource.csp.as_ref());
+        let mut directives: BTreeMap<_, BTreeSet<_>> = McpAppsCspDirective::ALL
+            .into_iter()
+            .map(|directive| (directive, BTreeSet::new()))
+            .collect();
+        let local = McpAppsSandboxHostPolicy::default().allow_pinned_local_sources();
+        for (directive, sources) in local.sources {
+            if !matches!(
+                directive,
+                McpAppsCspDirective::ConnectSrc | McpAppsCspDirective::FontSrc
+            ) || csp.is_some()
+            {
+                directives.insert(directive, sources);
+            }
+        }
+        if let Some(csp) = csp {
+            for (domains, targets) in [
+                (
+                    csp.connect_domains.as_deref(),
+                    &[McpAppsCspDirective::ConnectSrc][..],
+                ),
+                (
+                    csp.resource_domains.as_deref(),
+                    &McpAppsCspDirective::RESOURCES[..],
+                ),
+                (
+                    csp.frame_domains.as_deref(),
+                    &[McpAppsCspDirective::FrameSrc][..],
+                ),
+                (
+                    csp.base_uri_domains.as_deref(),
+                    &[McpAppsCspDirective::BaseUri][..],
+                ),
+            ] {
+                if domains
+                    .is_some_and(|domains| domains.len() > MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE)
+                {
+                    return Err(McpAppsSandboxPolicyError::TooManySources);
+                }
+                if targets == [McpAppsCspDirective::BaseUri]
+                    && domains.is_some_and(|domains| !domains.is_empty())
+                {
+                    directives
+                        .get_mut(&McpAppsCspDirective::BaseUri)
+                        .expect("all directives installed")
+                        .clear();
+                }
+                for domain in domains.unwrap_or(&[]) {
+                    for directive in targets {
+                        let source = parse_apps_csp_source(domain, *directive, host.mode)?;
+                        directives
+                            .get_mut(directive)
+                            .expect("all directives installed")
+                            .insert(source);
+                    }
+                }
+            }
+        }
+        for (directive, sources) in &mut directives {
+            sources.retain(|source| {
+                host.sources
+                    .get(directive)
+                    .is_some_and(|allowed| allowed.contains(source))
+            });
+        }
+        let requested = resource.and_then(|resource| resource.permissions.as_ref());
+        let permissions = McpAppsSandboxPermission::ALL
+            .into_iter()
+            .filter(|permission| {
+                requested.is_some_and(|requested| match permission {
+                    McpAppsSandboxPermission::Camera => requested.camera.is_some(),
+                    McpAppsSandboxPermission::Microphone => requested.microphone.is_some(),
+                    McpAppsSandboxPermission::Geolocation => requested.geolocation.is_some(),
+                    McpAppsSandboxPermission::ClipboardWrite => requested.clipboard_write.is_some(),
+                }) && host.supported.contains(permission)
+                    && host.allowed.contains(permission)
+                    && (!host.consent_required.contains(permission)
+                        || host.consented.contains(permission))
+            })
+            .collect();
+        Ok(Self {
+            directives,
+            permissions,
+        })
+    }
+
+    /// Removes sources from an already compiled upper bound. Reapplying a
+    /// more permissive predicate cannot restore a removed origin or keyword.
+    #[must_use]
+    pub fn restrict_sources(
+        mut self,
+        mut allow: impl FnMut(McpAppsCspDirective, &McpAppsCspSource) -> bool,
+    ) -> Self {
+        for (directive, sources) in &mut self.directives {
+            sources.retain(|source| allow(*directive, source));
+        }
+        self
+    }
+
+    /// Withdraws effective grants without being able to add a new grant.
+    #[must_use]
+    pub fn restrict_permissions(
+        mut self,
+        mut allow: impl FnMut(McpAppsSandboxPermission) -> bool,
+    ) -> Self {
+        self.permissions.retain(|permission| allow(*permission));
+        self
+    }
+
+    pub fn sources(
+        &self,
+        directive: McpAppsCspDirective,
+    ) -> impl Iterator<Item = &McpAppsCspSource> {
+        self.directives.get(&directive).into_iter().flatten()
+    }
+
+    #[must_use]
+    pub fn permission_granted(&self, permission: McpAppsSandboxPermission) -> bool {
+        self.permissions.contains(&permission)
+    }
+
+    /// Canonical CSP header value containing only compiler-owned directive
+    /// names and admitted tokens. Empty sets are never omitted.
+    #[must_use]
+    pub fn csp_header_value(&self) -> String {
+        self.directives
+            .iter()
+            .map(|(directive, sources)| {
+                let sources = if sources.is_empty() {
+                    "'none'".to_owned()
+                } else {
+                    sources
+                        .iter()
+                        .map(McpAppsCspSource::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                format!("{} {sources}", directive.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Exact wire grant set for this View. It is derived from the same
+    /// intersection as renderer-facing permission queries.
+    #[must_use]
+    pub fn granted_permissions(&self) -> McpAppsResourcePermissions {
+        let marker = |permission| {
+            self.permission_granted(permission)
+                .then(McpAppsResourcePermission::default)
+        };
+        McpAppsResourcePermissions {
+            camera: marker(McpAppsSandboxPermission::Camera),
+            microphone: marker(McpAppsSandboxPermission::Microphone),
+            geolocation: marker(McpAppsSandboxPermission::Geolocation),
+            clipboard_write: marker(McpAppsSandboxPermission::ClipboardWrite),
+        }
+    }
+
+    /// Canonical external domains approved for the wire's four domain groups.
+    /// A resource domain is advertised only if it survives in all five of its
+    /// directives. The full CSP value remains the renderer's authority for
+    /// local sources and restrictions that this domain-only schema cannot express.
+    #[must_use]
+    pub fn approved_domains(&self) -> McpAppsResourceCsp {
+        let external = |directive| {
+            self.sources(directive)
+                .filter(|source| source.is_external())
+                .map(|source| source.0.clone())
+                .collect::<Vec<_>>()
+        };
+        let resources = self
+            .sources(McpAppsCspDirective::ScriptSrc)
+            .filter(|source| {
+                source.is_external()
+                    && McpAppsCspDirective::RESOURCES.iter().all(|directive| {
+                        self.directives
+                            .get(directive)
+                            .is_some_and(|sources| sources.contains(*source))
+                    })
+            })
+            .map(|source| source.0.clone())
+            .collect();
+        McpAppsResourceCsp {
+            connect_domains: Some(external(McpAppsCspDirective::ConnectSrc)),
+            resource_domains: Some(resources),
+            frame_domains: Some(external(McpAppsCspDirective::FrameSrc)),
+            base_uri_domains: Some(external(McpAppsCspDirective::BaseUri)),
+        }
+    }
+}
+
+/// Redacted compilation failures; raw origins, HTML and permission claims are
+/// never embedded in diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsSandboxPolicyError {
+    InvalidSource,
+    TooManySources,
+    InvalidMetadata,
+}
+
+impl fmt::Display for McpAppsSandboxPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidSource => "invalid MCP Apps sandbox source",
+            Self::TooManySources => "MCP Apps sandbox source limit exceeded",
+            Self::InvalidMetadata => "invalid MCP Apps sandbox metadata",
+        })
+    }
+}
+
+impl std::error::Error for McpAppsSandboxPolicyError {}
+
+fn parse_apps_csp_source(
+    value: &str,
+    directive: McpAppsCspDirective,
+    mode: McpAppsCspMode,
+) -> Result<McpAppsCspSource, McpAppsSandboxPolicyError> {
+    let invalid = || McpAppsSandboxPolicyError::InvalidSource;
+    if value.is_empty()
+        || value.len() > MAX_MCP_APPS_CSP_DOMAIN_BYTES
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || matches!(
+            directive,
+            McpAppsCspDirective::DefaultSrc | McpAppsCspDirective::ObjectSrc
+        )
+    {
+        return Err(invalid());
+    }
+    let (scheme, authority) = value.split_once("://").ok_or_else(invalid)?;
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.contains(['/', '@', '?', '#', '\\', '%', ';', '\'']) {
+        return Err(invalid());
+    }
+    let (raw_host, port) = if authority.starts_with('[') {
+        let end = authority.find(']').ok_or_else(invalid)?;
+        let suffix = &authority[end + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':').ok_or_else(invalid)?)
+        };
+        (&authority[..=end], port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    let (wildcard, host) = raw_host
+        .strip_prefix("*.")
+        .map_or((false, raw_host), |host| (true, host));
+    let host = if let Some(literal) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        let address: std::net::Ipv6Addr = literal.parse().map_err(|_| invalid())?;
+        if wildcard || address.to_string() != literal {
+            return Err(invalid());
+        }
+        format!("[{address}]")
+    } else if let Ok(address) = host.parse::<std::net::Ipv4Addr>() {
+        if wildcard || address.to_string() != host {
+            return Err(invalid());
+        }
+        address.to_string()
+    } else {
+        let host = host.to_ascii_lowercase();
+        let last = host.rsplit('.').next().ok_or_else(invalid)?;
+        let numeric = !last.is_empty()
+            && (last.bytes().all(|byte| byte.is_ascii_digit())
+                || last
+                    .strip_prefix("0x")
+                    .is_some_and(|value| value.bytes().all(|byte| byte.is_ascii_hexdigit())));
+        if numeric
+            || host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with("xn--")
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
+            return Err(invalid());
+        }
+        host
+    };
+    let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]");
+    let connect = directive == McpAppsCspDirective::ConnectSrc;
+    let secure = scheme == "https" || (connect && scheme == "wss");
+    let development = mode == McpAppsCspMode::LocalDevelopment
+        && loopback
+        && !wildcard
+        && (scheme == "http" || (connect && scheme == "ws"));
+    if !(secure || development)
+        || (wildcard && (scheme != "https" || !McpAppsCspDirective::RESOURCES.contains(&directive)))
+    {
+        return Err(invalid());
+    }
+    let port = port
+        .map(|port| {
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            port.parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    let default_port = if secure { 443 } else { 80 };
+    let port = port
+        .filter(|port| *port != default_port)
+        .map_or_else(String::new, |port| format!(":{port}"));
+    Ok(McpAppsCspSource(format!(
+        "{scheme}://{}{host}{port}",
+        if wildcard { "*." } else { "" }
+    )))
 }
 
 impl fmt::Debug for McpAppsResourceRead<'_> {
@@ -5037,6 +5614,342 @@ mod tests {
             serde_json::to_value(&baseline).expect("baseline result re-encodes"),
             accepted,
             "the rejected Tasks-shaped member cannot mutate the complete Apps result"
+        );
+    }
+
+    #[test]
+    fn apps_sandbox_compilation_preserves_omission_defaults_and_host_ceiling() {
+        use McpAppsCspDirective as D;
+        let host = McpAppsSandboxHostPolicy::default().allow_pinned_local_sources();
+        let absent = McpAppsSandboxPolicy::compile(None, &host).unwrap();
+        let empty =
+            McpAppsResourceMetadata::try_new(Some(McpAppsResourceCsp::default()), None, None, None)
+                .unwrap();
+        let present = McpAppsSandboxPolicy::compile(Some(&empty), &host).unwrap();
+        assert_eq!(absent.sources(D::ConnectSrc).count(), 0);
+        assert_eq!(
+            present
+                .sources(D::ConnectSrc)
+                .map(McpAppsCspSource::as_str)
+                .collect::<Vec<_>>(),
+            ["'self'"]
+        );
+        assert_eq!(absent.sources(D::FontSrc).count(), 0);
+        for policy in [&absent, &present] {
+            assert!(policy.csp_header_value().contains("default-src 'none'"));
+            assert!(policy.csp_header_value().contains("object-src 'none'"));
+            assert!(policy.csp_header_value().contains("frame-src 'none'"));
+            assert!(policy.csp_header_value().contains("base-uri 'self'"));
+        }
+        let deny =
+            McpAppsSandboxPolicy::compile(Some(&empty), &McpAppsSandboxHostPolicy::default())
+                .unwrap();
+        assert!(
+            McpAppsCspDirective::ALL
+                .into_iter()
+                .all(|directive| deny.sources(directive).count() == 0)
+        );
+        let removed = present
+            .restrict_sources(|_, _| false)
+            .restrict_sources(|_, _| true);
+        assert_eq!(
+            removed, deny,
+            "a permissive second restriction cannot restore removed sources"
+        );
+    }
+
+    #[test]
+    fn apps_sandbox_sources_are_canonical_and_confined_to_their_directives() {
+        use McpAppsCspDirective as D;
+        let resource = McpAppsResourceMetadata::try_new(
+            Some(
+                McpAppsResourceCsp::try_new(
+                    Some(vec!["WSS://API.EXAMPLE:443/".into()]),
+                    Some(vec!["HTTPS://*.CDN.EXAMPLE:443/".into()]),
+                    Some(vec!["https://frames.example".into()]),
+                    Some(vec!["https://base.example:8443".into()]),
+                )
+                .unwrap(),
+            ),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let host = McpAppsSandboxHostPolicy::default()
+            .allow_pinned_local_sources()
+            .allow_source(D::ConnectSrc, "wss://api.example")
+            .unwrap()
+            .allow_resource_source("https://*.cdn.example")
+            .unwrap()
+            .allow_source(D::FrameSrc, "https://frames.example")
+            .unwrap()
+            .allow_source(D::BaseUri, "https://base.example:8443")
+            .unwrap();
+        let policy = McpAppsSandboxPolicy::compile(Some(&resource), &host).unwrap();
+        for directive in D::RESOURCES {
+            assert!(
+                policy
+                    .sources(directive)
+                    .any(|source| source.as_str() == "https://*.cdn.example")
+            );
+            assert!(
+                !policy
+                    .sources(directive)
+                    .any(|source| source.as_str() == "wss://api.example")
+            );
+        }
+        assert_eq!(
+            policy
+                .sources(D::BaseUri)
+                .map(McpAppsCspSource::as_str)
+                .collect::<Vec<_>>(),
+            ["https://base.example:8443"]
+        );
+        assert_eq!(
+            policy.approved_domains().resource_domains,
+            Some(vec!["https://*.cdn.example".into()])
+        );
+        let restricted = policy.restrict_sources(|directive, source| {
+            directive != D::ScriptSrc || !source.is_external()
+        });
+        assert_eq!(restricted.approved_domains().resource_domains, Some(vec![]));
+        let none =
+            McpAppsSandboxPolicy::compile(Some(&resource), &McpAppsSandboxHostPolicy::default())
+                .unwrap();
+        assert!(
+            !none.csp_header_value().contains("example"),
+            "a resource cannot grant a host-absent source"
+        );
+    }
+
+    #[test]
+    fn apps_sandbox_origin_admission_rejects_injection_idna_and_ambiguous_hosts() {
+        use McpAppsCspDirective as D;
+        for source in [
+            "https://example.test/path",
+            "https://example.test//",
+            "https://user@example.test",
+            "https://example.test?query",
+            "https://example.test#fragment",
+            "https://example.test:0",
+            "https://example.test:65536",
+            "https://example.test:",
+            "https://example.test.",
+            "https://xn--bcher-kva.test",
+            "https://XN--BCHER-KVA.test",
+            "https://bücher.test",
+            "https://example.test;script-src *",
+            "https://example.test\n",
+            "'unsafe-eval'",
+            "https://127.1",
+            "https://2130706433",
+            "https://0177.0.0.1",
+            "https://0x7f.0.0.1",
+            "https://0x",
+            "https://0.0.0.0x",
+            "https://*.0x",
+            "https://[0:0:0:0:0:0:0:1]",
+            "https://[2001:DB8::1]",
+            "https://::1",
+            "https://*.127.0.0.1",
+            "https://*",
+            "https://ex*ample.test",
+            "https://*.a.*.test",
+            "https://-example.test",
+            "https://example-.test",
+            "https://example..test",
+        ] {
+            assert!(
+                McpAppsSandboxHostPolicy::default()
+                    .allow_resource_source(source)
+                    .is_err(),
+                "{source}"
+            );
+            let resource = McpAppsResourceMetadata {
+                csp: Some(McpAppsResourceCsp {
+                    resource_domains: Some(vec![source.to_owned()]),
+                    ..McpAppsResourceCsp::default()
+                }),
+                ..McpAppsResourceMetadata::default()
+            };
+            assert!(
+                McpAppsSandboxPolicy::compile(
+                    Some(&resource),
+                    &McpAppsSandboxHostPolicy::default()
+                )
+                .is_err(),
+                "an invalid resource declaration must fail even when the Host grants no sources"
+            );
+        }
+        for source in [
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://[2001:db8::1]:8443",
+            "https://a-b.example",
+        ] {
+            assert!(
+                McpAppsSandboxHostPolicy::default()
+                    .allow_resource_source(source)
+                    .is_ok(),
+                "{source}"
+            );
+        }
+        assert!(
+            McpAppsSandboxHostPolicy::default()
+                .allow_source(D::ConnectSrc, "https://*.example.test")
+                .is_err()
+        );
+        assert!(
+            McpAppsSandboxHostPolicy::default()
+                .allow_source(D::FrameSrc, "wss://example.test")
+                .is_err()
+        );
+        assert!(
+            McpAppsSandboxHostPolicy::default()
+                .allow_source(D::ObjectSrc, "https://example.test")
+                .is_err()
+        );
+        for source in ["http://localhost", "http://127.0.0.1", "http://[::1]:8080"] {
+            assert!(
+                McpAppsSandboxHostPolicy::default()
+                    .allow_resource_source(source)
+                    .is_err()
+            );
+            assert!(
+                McpAppsSandboxHostPolicy::new(McpAppsCspMode::LocalDevelopment)
+                    .allow_resource_source(source)
+                    .is_ok()
+            );
+        }
+        for source in [
+            "http://localhost.example",
+            "http://127.0.0.2",
+            "http://*.localhost",
+        ] {
+            assert!(
+                McpAppsSandboxHostPolicy::new(McpAppsCspMode::LocalDevelopment)
+                    .allow_resource_source(source)
+                    .is_err()
+            );
+        }
+        assert!(
+            McpAppsSandboxHostPolicy::new(McpAppsCspMode::LocalDevelopment)
+                .allow_source(D::ConnectSrc, "ws://localhost:8080")
+                .is_ok()
+        );
+        assert!(
+            McpAppsSandboxHostPolicy::new(McpAppsCspMode::LocalDevelopment)
+                .allow_resource_source("ws://localhost")
+                .is_err()
+        );
+        let excessive = McpAppsResourceMetadata {
+            csp: Some(McpAppsResourceCsp {
+                resource_domains: Some(vec![
+                    "https://example.test".to_owned();
+                    MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE + 1
+                ]),
+                ..McpAppsResourceCsp::default()
+            }),
+            ..McpAppsResourceMetadata::default()
+        };
+        assert_eq!(
+            McpAppsSandboxPolicy::compile(Some(&excessive), &McpAppsSandboxHostPolicy::default()),
+            Err(McpAppsSandboxPolicyError::TooManySources)
+        );
+        let mut host = McpAppsSandboxHostPolicy::default().allow_pinned_local_sources();
+        for index in 0..MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE {
+            host = host
+                .allow_resource_source(&format!("https://source-{index}.example"))
+                .unwrap();
+        }
+        let baseline = host.clone();
+        assert_eq!(
+            host.clone()
+                .allow_resource_source("https://one-more.example"),
+            Err(McpAppsSandboxPolicyError::TooManySources)
+        );
+        assert_eq!(
+            host.clone()
+                .allow_resource_source("https://SOURCE-0.EXAMPLE:443/")
+                .unwrap(),
+            baseline,
+            "a canonical duplicate consumes no extra source slot"
+        );
+        assert_eq!(
+            host, baseline,
+            "denial cannot mutate a previously compiled Host ceiling"
+        );
+    }
+
+    #[test]
+    fn apps_sandbox_permissions_require_every_host_layer_and_do_not_resurrect_listing() {
+        use McpAppsSandboxPermission as P;
+        for permission in P::ALL {
+            for bits in 0_u8..32 {
+                let included = |bit| {
+                    if bits & (1 << bit) != 0 {
+                        vec![permission]
+                    } else {
+                        vec![]
+                    }
+                };
+                let marker = McpAppsResourcePermission::default();
+                let mut requested = McpAppsResourcePermissions::default();
+                if bits & 1 != 0 {
+                    match permission {
+                        P::Camera => requested.camera = Some(marker),
+                        P::Microphone => requested.microphone = Some(marker),
+                        P::Geolocation => requested.geolocation = Some(marker),
+                        P::ClipboardWrite => requested.clipboard_write = Some(marker),
+                    }
+                }
+                let metadata =
+                    McpAppsResourceMetadata::try_new(None, Some(requested), None, None).unwrap();
+                let host = McpAppsSandboxHostPolicy::default().with_permissions(
+                    included(1),
+                    included(2),
+                    included(3),
+                    included(4),
+                );
+                let policy = McpAppsSandboxPolicy::compile(Some(&metadata), &host).unwrap();
+                let expected = bits & 7 == 7 && (bits & 8 == 0 || bits & 16 != 0);
+                assert_eq!(
+                    policy.permission_granted(permission),
+                    expected,
+                    "{permission:?} bits={bits}"
+                );
+                let wire = serde_json::to_value(policy.granted_permissions()).unwrap();
+                let key = if permission == P::ClipboardWrite {
+                    "clipboardWrite"
+                } else {
+                    permission.as_str()
+                };
+                assert_eq!(wire.get(key).is_some(), expected);
+                assert!(
+                    !policy
+                        .restrict_permissions(|_| false)
+                        .restrict_permissions(|_| true)
+                        .permission_granted(permission)
+                );
+            }
+        }
+        let binding = apps_read_binding();
+        let mut listed = apps_read_listing();
+        listed.meta =
+            Some(serde_json::from_value(json!({"ui":{"permissions":{"camera":{}}}})).unwrap());
+        let mut item = apps_read_item();
+        item["_meta"] = json!({"ui":{}});
+        let read = apps_read_result(vec![item]);
+        let host =
+            McpAppsSandboxHostPolicy::default().with_permissions([P::Camera], [P::Camera], [], []);
+        let selected = binding.resolve_read_result(&read, Some(&listed)).unwrap();
+        assert!(
+            !selected
+                .compile_sandbox_policy(&host)
+                .unwrap()
+                .permission_granted(P::Camera),
+            "present-empty read metadata cannot resurrect listing permission requests"
         );
     }
 

@@ -1422,6 +1422,7 @@ pub struct McpAppsWireHost<T, P> {
     admission: McpAppsBridgeAdmission,
     next_host_id: McpAppsHostIdAllocator,
     configuration: McpAppsWireHostConfiguration,
+    sandbox_policy: Option<fastmcp_protocol::McpAppsSandboxPolicy>,
     policy: P,
     state: McpAppsWireHostState,
     /// Frames received while an admitted View request is still executing.
@@ -2342,6 +2343,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             admission,
             next_host_id: McpAppsHostIdAllocator::default(),
             configuration,
+            sandbox_policy: None,
             policy,
             state: McpAppsWireHostState::default(),
             deferred_view_frames: VecDeque::new(),
@@ -2381,6 +2383,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             admission: self.admission,
             next_host_id: self.next_host_id,
             configuration: self.configuration,
+            sandbox_policy: self.sandbox_policy,
             policy: McpAppsWireHostWithEffects {
                 forwarding: self.policy,
                 effects,
@@ -2395,6 +2398,37 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             server_catalogs: self.server_catalogs,
             disconnected: self.disconnected,
         }
+    }
+
+    /// Installs the exact compiled sandbox before View initialization. Its
+    /// grant set must match the initialization callback's sandbox response;
+    /// inconsistent callbacks fail before any initialization result is sent.
+    /// Resource declarations cannot grant permissions outside the policy
+    /// supplied to the external renderer. Once initialization begins, policy
+    /// changes require a fresh View.
+    ///
+    /// This does not render HTML, install browser CSP, validate document
+    /// conformance, or replace the Host's external-domain warning requirement.
+    pub fn with_sandbox_policy(
+        mut self,
+        policy: fastmcp_protocol::McpAppsSandboxPolicy,
+    ) -> Result<Self, McpAppsHostError> {
+        if self.disconnected || self.lifecycle() != McpAppsBridgeLifecycle::New {
+            return Err(McpAppsHostError::Bridge(
+                McpAppsBridgeError::InvalidLifecycle,
+            ));
+        }
+        self.configuration.host_capabilities.sandbox = Some(
+            fastmcp_protocol::McpAppsSandboxCapabilities::from_policy(&policy),
+        );
+        self.sandbox_policy = Some(policy);
+        Ok(self)
+    }
+
+    /// Returns the immutable renderer-facing policy retained for this View.
+    #[must_use]
+    pub fn sandbox_policy(&self) -> Option<&fastmcp_protocol::McpAppsSandboxPolicy> {
+        self.sandbox_policy.as_ref()
     }
 
     /// Authorizes catalog forwarding for this exact admitted View and MCP
@@ -3209,6 +3243,20 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     ) -> Result<(), McpAppsHostError> {
         let mut prepared_catalog = None;
         let result = result.and_then(|result| {
+            if method == McpAppsRoutedMethod::Initialize {
+                if let Some(policy) = &self.sandbox_policy {
+                    McpAppsJsonRpcEnvelope::validate_response_for(method, &result)
+                        .map_err(McpAppsHostError::Bridge)?;
+                    let initialized: McpAppsPinnedInitializeResult =
+                        decode_params(Some(&result))?;
+                    let expected = Some(
+                        fastmcp_protocol::McpAppsSandboxCapabilities::from_policy(policy),
+                    );
+                    if initialized.host_capabilities.sandbox != expected {
+                        return Err(wire_policy_denied());
+                    }
+                }
+            }
             let result = if let Some(request) = &catalog {
                 let prepared = self.server_catalogs.prepare_page(
                     cx,
@@ -9414,6 +9462,101 @@ exec sleep 10
     }
 
     const VIEW_OPERATION_IDLE_NANOS: u64 = 60 * 1_000_000_000;
+
+    #[test]
+    fn closed_wire_sandbox_policy_controls_initialization_grants_and_is_frozen() {
+        use fastmcp_protocol::{
+            McpAppsCspDirective, McpAppsResourceMetadata, McpAppsSandboxHostPolicy,
+            McpAppsSandboxPermission, McpAppsSandboxPolicy,
+        };
+        block_on(async {
+            let cx = Cx::for_testing();
+            for (consented, override_policy) in [(true, false), (false, false), (true, true)] {
+                let metadata: McpAppsResourceMetadata = serde_json::from_value(json!({
+                    "csp": {"connectDomains": ["https://api.example.test"]},
+                    "permissions": {"camera": {}, "microphone": {}}
+                }))
+                .unwrap();
+                let host_policy = McpAppsSandboxHostPolicy::default()
+                    .allow_pinned_local_sources()
+                    .allow_source(McpAppsCspDirective::ConnectSrc, "https://api.example.test")
+                    .unwrap()
+                    .with_permissions(
+                        [McpAppsSandboxPermission::Camera],
+                        [McpAppsSandboxPermission::Camera],
+                        [McpAppsSandboxPermission::Camera],
+                        consented.then_some(McpAppsSandboxPermission::Camera),
+                    );
+                let compiled =
+                    McpAppsSandboxPolicy::compile(Some(&metadata), &host_policy).unwrap();
+                let expected = compiled.clone();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let mut callback = state_recording_policy();
+                if override_policy {
+                    callback.advertised = Some(
+                        serde_json::from_value(json!({
+                            "sandbox": {
+                                "permissions": {"camera": {}, "microphone": {}, "clipboardWrite": {}},
+                                "csp": {"connectDomains": ["https://unapproved.example.test"]}
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                }
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    wire_configuration(),
+                    callback,
+                    activation_proof(),
+                )
+                .with_sandbox_policy(compiled)
+                .unwrap()
+                .with_effects(());
+                assert_eq!(host.sandbox_policy(), Some(&expected));
+                let response = stateful_wire_request(
+                    &mut host, &mut view, &cx, "sandbox-init", "ui/initialize",
+                    json!({
+                        "appInfo": {"name": "sandbox-view", "version": "1"},
+                        "appCapabilities": {}, "protocolVersion": MCP_APPS_HOST_VIEW_PROTOCOL_VERSION
+                    }),
+                ).await;
+                if override_policy {
+                    assert!(response.get("error").is_some());
+                    assert!(response.get("result").is_none());
+                    assert!(host.state.capabilities.is_none());
+                    assert!(!response.to_string().contains("unapproved"));
+                    assert_eq!(host.sandbox_policy(), Some(&expected));
+                    continue;
+                }
+                let sandbox = &response["result"]["hostCapabilities"]["sandbox"];
+                assert_eq!(sandbox["permissions"].get("camera").is_some(), consented);
+                assert!(sandbox["permissions"].get("microphone").is_none());
+                assert!(sandbox["permissions"].get("clipboardWrite").is_none());
+                assert_eq!(
+                    sandbox["csp"]["connectDomains"],
+                    json!(["https://api.example.test"])
+                );
+                assert!(!response.to_string().contains("unapproved"));
+                assert_eq!(
+                    host.state
+                        .capabilities
+                        .as_ref()
+                        .unwrap()
+                        .sandbox
+                        .as_ref()
+                        .unwrap()
+                        .permissions,
+                    Some(expected.granted_permissions())
+                );
+                assert!(matches!(
+                    host.with_sandbox_policy(expected),
+                    Err(McpAppsHostError::Bridge(
+                        McpAppsBridgeError::InvalidLifecycle
+                    ))
+                ));
+            }
+        });
+    }
 
     struct ViewOperationDrop(Arc<std::sync::atomic::AtomicUsize>);
 
