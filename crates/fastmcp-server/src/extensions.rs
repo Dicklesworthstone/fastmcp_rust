@@ -197,6 +197,7 @@ trait ErasedExtensionHandler: Send + Sync {
         negotiated: &'a NegotiatedExtension,
         parameters: Value,
         id: RequestId,
+        _handler_admission: Option<crate::FinalHandlerAdmission>,
     ) -> BoxFuture<'a, McpResult<JsonRpcResponse>> {
         Box::pin(async move {
             self.invoke_admitted_async(context, negotiated, parameters)
@@ -266,6 +267,7 @@ where
         _negotiated: &'a NegotiatedExtension,
         parameters: Value,
         id: RequestId,
+        _handler_admission: Option<crate::FinalHandlerAdmission>,
     ) -> BoxFuture<'a, McpResult<JsonRpcResponse>> {
         Box::pin(async move {
             let request = serde_json::from_value(parameters)
@@ -304,6 +306,7 @@ where
         _negotiated: &'a NegotiatedExtension,
         parameters: Value,
         id: RequestId,
+        _handler_admission: Option<crate::FinalHandlerAdmission>,
     ) -> BoxFuture<'a, McpResult<JsonRpcResponse>> {
         Box::pin(async move {
             let request = serde_json::from_value(parameters)
@@ -1214,6 +1217,7 @@ impl ExtensionHandlerRegistry {
         protocol_era: ProtocolEra,
         extension_id: &ExtensionId,
         request: &JsonRpcRequest,
+        handler_admission: Option<crate::FinalHandlerAdmission>,
     ) -> Result<JsonRpcResponse, ExtensionHandlerInvocationError> {
         let handler = self.admitted_handler(negotiated, protocol_era, extension_id, request)?;
         let admitted = negotiated.active(extension_id).ok_or_else(|| {
@@ -1236,6 +1240,7 @@ impl ExtensionHandlerRegistry {
                 admitted,
                 request.params.clone().unwrap_or_else(|| serde_json::json!({})),
                 id,
+                handler_admission,
             )
             .await
             .map_err(ExtensionHandlerInvocationError::Handler)?;

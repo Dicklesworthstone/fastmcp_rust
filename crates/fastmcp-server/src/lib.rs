@@ -11346,10 +11346,19 @@ impl ServerHttpSession {
             ));
         }
 
-        if request.method == SUBSCRIPTIONS_LISTEN {
+        let subscription_request = request.method == SUBSCRIPTIONS_LISTEN;
+        if subscription_request
+            || self
+                .server
+                .modern_request_has_extension_notifications(&request)
+        {
             let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
                 return Ok(ServerHttpEndpointResponse::Immediate(
-                    HttpResponse::bad_request(),
+                    if subscription_request {
+                        HttpResponse::bad_request()
+                    } else {
+                        HttpResponse::new(HttpStatus::NOT_ACCEPTABLE)
+                    },
                 ));
             };
             let sender = sse.sender();
@@ -11363,6 +11372,23 @@ impl ServerHttpSession {
                 &self.modern_connection,
                 transport_authorization,
             );
+            let inbound = if subscription_request {
+                inbound
+            } else {
+                match http_parameter_headers {
+                    Some(headers) => inbound.with_http_parameter_headers(headers),
+                    None => inbound,
+                }
+            };
+            // Subscriptions retain their existing asynchronously returned body.
+            // An ordinary extension must elect its HTTP representation after
+            // typed handler admission or its final pre-admission refusal.
+            let (outcome_gate, outcome_receiver) = if subscription_request {
+                (None, None)
+            } else {
+                let (gate, receiver) = ModernSseOutcomeGate::new();
+                (Some(gate), Some(receiver))
+            };
             let dispatch = spawn_modern_sse_dispatch(
                 cx,
                 Arc::clone(&self.server),
@@ -11373,7 +11399,7 @@ impl ServerHttpSession {
                 auth_receipt,
                 sender,
                 Arc::clone(&terminal_delivery),
-                None,
+                outcome_gate,
             )?;
             self.modern_dispatches
                 .lock()
@@ -11383,6 +11409,35 @@ impl ServerHttpSession {
                     request_cancellation: request_cancellation.clone(),
                     task: dispatch,
                 });
+            // Retain the dispatch in the session before any cancellation point.
+            // If this future or a refusal path drops the body, its exact
+            // producer is cancelled; session close still owns task settlement.
+            if let Some(mut receiver) = outcome_receiver {
+                match await_modern_sse_dispatch_election(cx, &request_cancellation, &mut receiver)
+                    .await
+                {
+                    Ok(ModernSseDispatchElection::Stream) => {}
+                    Ok(ModernSseDispatchElection::Immediate(response)) => {
+                        return Ok(ServerHttpEndpointResponse::Immediate(response));
+                    }
+                    Ok(ModernSseDispatchElection::Failed) => {
+                        terminal_delivery.mark_failed();
+                        request_cancellation.cancel();
+                        return Err(DualEraHttpEndpointError::Transport(TransportError::Io(
+                            std::io::Error::other(
+                                "modern HTTP extension response admission failed",
+                            ),
+                        )));
+                    }
+                    Err(()) => {
+                        terminal_delivery.mark_failed();
+                        request_cancellation.cancel();
+                        return Err(DualEraHttpEndpointError::Transport(
+                            TransportError::Cancelled,
+                        ));
+                    }
+                }
+            }
             return Ok(ServerHttpEndpointResponse::ModernSse(
                 ServerHttpSseResponse::new(sse, request_cancellation, terminal_delivery),
             ));
@@ -16378,26 +16433,56 @@ impl Server {
         request: &JsonRpcRequest,
         admission: Option<&ServerExtensionRequestAdmission>,
         transport: InboundRequestTransport,
+        modern_http_owner: Option<u64>,
         cancellation: McpRequestCancellation,
         sender: NotificationSender,
     ) -> McpContext {
-        if !matches!(transport, InboundRequestTransport::Stdio | InboundRequestTransport::Memory) {
+        if !matches!(
+            transport,
+            InboundRequestTransport::Stdio | InboundRequestTransport::Memory
+        ) && !(transport == InboundRequestTransport::Http && modern_http_owner.is_some())
+        {
             return context;
         }
-        let Some(admission) = admission else { return context; };
-        let Some(runtime) = self.extension_runtime.as_ref() else { return context; };
-        let Some(schema) = runtime.handlers.request_notification_schema(&admission.extension_id) else {
+        let Some(admission) = admission else {
             return context;
         };
-        let Some(descriptor) = runtime.handlers.descriptor_registry().descriptor(&admission.extension_id) else {
+        let Some(runtime) = self.extension_runtime.as_ref() else {
             return context;
         };
-        let Some(notification) = descriptor.notification.as_ref() else { return context; };
-        let Some(correlation) = descriptor.stdio_correlation.as_ref() else { return context; };
-        let Some(request_id) = request.id.clone() else { return context; };
-        let Ok(owner_key) = request_id.correlation_key() else { return context; };
+        let Some(schema) = runtime
+            .handlers
+            .request_notification_schema(&admission.extension_id)
+        else {
+            return context;
+        };
+        let Some(descriptor) = runtime
+            .handlers
+            .descriptor_registry()
+            .descriptor(&admission.extension_id)
+        else {
+            return context;
+        };
+        let Some(notification) = descriptor.notification.as_ref() else {
+            return context;
+        };
+        let metadata_key = if transport == InboundRequestTransport::Http {
+            // This capability retains one admitted HTTP response owner. Its
+            // body supplies correlation; stdio metadata must not appear on it.
+            None
+        } else {
+            let Some(correlation) = descriptor.stdio_correlation.as_ref() else {
+                return context;
+            };
+            Some(correlation.metadata_key.clone())
+        };
+        let Some(request_id) = request.id.clone() else {
+            return context;
+        };
+        let Ok(owner_key) = request_id.correlation_key() else {
+            return context;
+        };
         let method = notification.name.clone();
-        let metadata_key = correlation.metadata_key.clone();
         let extension_id = admission.extension_id.clone();
         let negotiated = admission.negotiated.clone();
         let runtime = Arc::clone(runtime);
@@ -16419,25 +16504,53 @@ impl Server {
             schema.validate(&parameters).map_err(|_| {
                 McpError::invalid_params("Extension notification does not satisfy its registered schema")
             })?;
-            let wire_id = serde_json::to_value(&request_id).map_err(|_| {
-                McpError::internal_error("Extension notification correlation could not be encoded")
-            })?;
-            parameters.as_object_mut().expect("object checked above").insert(
-                "_meta".to_owned(),
-                serde_json::Value::Object(serde_json::Map::from_iter([(metadata_key.clone(), wire_id)])),
-            );
+            if let Some(metadata_key) = &metadata_key {
+                let wire_id = serde_json::to_value(&request_id).map_err(|_| {
+                    McpError::internal_error("Extension notification correlation could not be encoded")
+                })?;
+                parameters.as_object_mut().expect("object checked above").insert(
+                    "_meta".to_owned(),
+                    serde_json::Value::Object(serde_json::Map::from_iter([
+                        (metadata_key.clone(), wire_id),
+                    ])),
+                );
+            }
             let notification = JsonRpcRequest::notification(method.clone(), Some(parameters));
-            let capsule = negotiated.admit_stdio_notification(
-                runtime.handlers.descriptor_registry(),
-                ProtocolEra::Modern2026,
-                &extension_id,
-                &notification,
-                None,
-            ).map_err(|_| McpError::invalid_params(
+            // Validate the complete wire envelope after framework metadata is
+            // stamped. Parameters alone start one level shallower, and the
+            // hidden context emitter can bypass the typed payload encoder.
+            let codec = Codec::new();
+            let source = codec.encode_request(&notification).map_err(|_| {
+                McpError::invalid_params("Extension notification exceeds its wire budget")
+            })?;
+            fastmcp_protocol::jsonrpc::admit_raw_jsonrpc_document(
+                &source,
+                codec.max_message_size(),
+            ).map_err(|_| {
+                McpError::invalid_params("Extension notification fails wire protocol admission")
+            })?;
+            let outside_contract = || McpError::invalid_params(
                 "Extension notification is outside its admitted request contract",
-            ))?;
-            if capsule.correlation_key() != &owner_key {
-                return Err(McpError::invalid_request("Extension notification owner mismatch"));
+            );
+            if metadata_key.is_some() {
+                let capsule = negotiated.admit_stdio_notification(
+                    runtime.handlers.descriptor_registry(),
+                    ProtocolEra::Modern2026,
+                    &extension_id,
+                    &notification,
+                    None,
+                ).map_err(|_| outside_contract())?;
+                if capsule.correlation_key() != &owner_key {
+                    return Err(McpError::invalid_request("Extension notification owner mismatch"));
+                }
+            } else {
+                negotiated.admit_notification(
+                    runtime.handlers.descriptor_registry(),
+                    ProtocolEra::Modern2026,
+                    &extension_id,
+                    &notification.method,
+                    fastmcp_protocol::ExtensionDirection::ServerToClient,
+                ).map_err(|_| outside_contract())?;
             }
             // Serialization and schema validation can run application code.
             // Recheck immediately before entering the transport's bounded,
@@ -16569,7 +16682,7 @@ impl Server {
                 "Extension request is not admitted",
             ));
         }
-        self.invoke_negotiated_extension_async(request_ctx, &current, extension_id, request)
+        self.invoke_negotiated_extension_async(request_ctx, &current, extension_id, request, None)
             .await
             .and_then(|response| {
                 response.result.ok_or_else(|| {
@@ -16617,6 +16730,7 @@ impl Server {
         negotiated: &fastmcp_protocol::extensions::NegotiatedExtensionSet,
         extension_id: &ExtensionId,
         request: &JsonRpcRequest,
+        handler_admission: Option<FinalHandlerAdmission>,
     ) -> McpResult<JsonRpcResponse> {
         let mut request = request.clone();
         remove_modern_protocol_metadata(&mut request);
@@ -16632,6 +16746,7 @@ impl Server {
                 ProtocolEra::Modern2026,
                 extension_id,
                 &request,
+                handler_admission,
             )
             .await
             .map_err(|error| match error {
@@ -16661,6 +16776,7 @@ impl Server {
             request,
             admission.as_ref(),
             retained_response,
+            None,
         )
         .await
     }
@@ -16671,6 +16787,7 @@ impl Server {
         request: &JsonRpcRequest,
         admission: Option<&ServerExtensionRequestAdmission>,
         retained_response: &mut Option<JsonRpcResponse>,
+        handler_admission: Option<FinalHandlerAdmission>,
     ) -> McpResult<serde_json::Value> {
         require_exact_modern_extension_metadata(request)?;
         request_ctx.ensure_live()?;
@@ -16681,6 +16798,7 @@ impl Server {
                 &admission.negotiated,
                 &admission.extension_id,
                 request,
+                handler_admission,
             )
             .await?;
         let value = response.result.clone().ok_or_else(|| {
@@ -17126,6 +17244,7 @@ impl Server {
                             &admission_request,
                             extension_admission.as_ref(),
                             &mut retained_extension_response,
+                            None,
                         )
                         .await
                     }
@@ -17452,12 +17571,13 @@ impl Server {
                 Err(error) => (None, Some(Err(error))),
             };
         #[cfg(feature = "extension-authoring")]
-        {
+        if inbound.transport() != InboundRequestTransport::Http {
             request_ctx = self.attach_request_extension_notification_sender(
                 request_ctx,
                 &request,
                 extension_admission.as_ref(),
                 inbound.transport(),
+                modern_http_owner,
                 request_cancellation.clone(),
                 Arc::clone(&notification_sender),
             );
@@ -17499,6 +17619,21 @@ impl Server {
                     break;
                 }
             }
+        }
+        #[cfg(feature = "extension-authoring")]
+        if inbound.transport() == InboundRequestTransport::Http && middleware_result.is_none() {
+            // Middleware cannot enqueue extension frames into the pre-handler
+            // HTTP staging buffer. The typed adapter opens the bounded output
+            // gate only after parameter and settings validation succeeds.
+            request_ctx = self.attach_request_extension_notification_sender(
+                request_ctx,
+                &request,
+                extension_admission.as_ref(),
+                inbound.transport(),
+                modern_http_owner,
+                request_cancellation.clone(),
+                Arc::clone(&notification_sender),
+            );
         }
         // Bound the dispatch state and its Send proof before the progress
         // timer and transport futures wrap it. The same owner still polls
@@ -17547,7 +17682,7 @@ impl Server {
                         )
                         .map(Arc::<str>::from),
                         inbound.mrtr_continuation_cancellation().unwrap_or_default(),
-                        handler_admission,
+                        handler_admission.clone(),
                     )
                     .await
                 {
@@ -17557,6 +17692,7 @@ impl Server {
                             &request,
                             extension_admission.as_ref(),
                             &mut retained_extension_response,
+                            handler_admission,
                         )
                         .await
                     }
@@ -24599,11 +24735,38 @@ impl Server {
         )
     }
 
+    fn modern_request_has_extension_notifications(&self, request: &JsonRpcRequest) -> bool {
+        #[cfg(feature = "extension-authoring")]
+        {
+            request.id.is_some()
+                && !request.method.starts_with("notifications/")
+                && self
+                    .registered_extension_handler_id(&request.method)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|extension_id| {
+                        self.extension_runtime.as_ref().is_some_and(|runtime| {
+                            runtime
+                                .handlers
+                                .request_notification_schema(extension_id)
+                                .is_some()
+                        })
+                    })
+        }
+        #[cfg(not(feature = "extension-authoring"))]
+        {
+            let _ = request;
+            false
+        }
+    }
+
     fn modern_request_requires_owned_sse(&self, request: &JsonRpcRequest) -> bool {
         if request.id.is_none() || request.method.starts_with("notifications/") {
             return false;
         }
-        if Self::request_progress_marker(request).is_some() {
+        if Self::request_progress_marker(request).is_some()
+            || self.modern_request_has_extension_notifications(request)
+        {
             return true;
         }
         self.final_request_log_level(request)
