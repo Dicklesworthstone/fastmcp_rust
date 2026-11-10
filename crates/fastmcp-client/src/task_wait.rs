@@ -16,6 +16,7 @@ use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 
 #[cfg(feature = "websocket-experimental")]
 use crate::WebSocketClient;
+use crate::http_auth::caller::with_caller;
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
 #[cfg(unix)]
 use crate::Client;
@@ -95,7 +96,7 @@ pub enum FinalTaskWaitOutcome {
     PollLimitReached,
     /// Local observation was cancelled. This says nothing about remote work.
     ObservationCancelled,
-    /// The caller supplied no timer driver, so bounded waiting could not start.
+    /// The caller's effective context supplied no usable timer driver.
     TimerUnavailable,
 }
 
@@ -282,6 +283,8 @@ impl FinalTaskHandle {
         if self.is_terminal() {
             return Ok(&self.task);
         }
+        let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+        let cx = &caller;
         let result = guard_websocket_task_operation(
             cx,
             cancellation,
@@ -338,6 +341,8 @@ impl FinalTaskHandle {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+        let cx = &caller;
         checkpoint_task_operation(cx, cancellation)?;
         admit_task_input(&self.task, &input_responses)?;
         // Retiring a previous dropped read may await a bounded control write.
@@ -745,6 +750,8 @@ async fn open_task_stream_watch<'client, 'handle, T: TaskWatchTransport>(
     if terminal {
         return Ok(watch);
     }
+    let caller = with_caller(cx, || Cx::current().expect("Task watch caller is installed"));
+    let cx = &caller;
     let budget = WaitBudget::new(cx, watch.client.watch_timeout(), watch.handle.task())?;
     if let Some(reason) = budget.stop(cx, cancellation) {
         watch.stop_reason = Some(reason);
@@ -808,6 +815,8 @@ async fn next_task_stream_event<T: TaskWatchTransport>(
     cx: &Cx,
     cancellation: &McpRequestCancellation,
 ) -> McpResult<Option<FinalTaskWatchEvent>> {
+    let caller = with_caller(cx, || Cx::current().expect("Task watch caller is installed"));
+    let cx = &caller;
     let result = next_task_stream_event_inner(watch, cx, cancellation).await;
     if result.is_err() {
         watch.observing = false;
@@ -992,6 +1001,8 @@ where
         cancellation: &McpRequestCancellation,
         task_id: FinalTaskId,
     ) -> McpResult<FinalTaskHandle> {
+        let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+        let cx = &caller;
         guard_websocket_task_operation(cx, cancellation, self.get_task_final(cx, task_id))
             .await
             .map(|result| FinalTaskHandle::new(result.task))
@@ -1007,6 +1018,8 @@ async fn guard_websocket_task_operation<T>(
     cancellation: &McpRequestCancellation,
     operation: impl Future<Output = McpResult<T>>,
 ) -> McpResult<T> {
+    let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+    let cx = &caller;
     let mut operation = std::pin::pin!(operation);
     let mut cancelled = std::pin::pin!(cancellation.cancelled());
     // A backpressured send may have no I/O wake before the caller's deadline
@@ -1022,25 +1035,35 @@ async fn guard_websocket_task_operation<T>(
         .timer_driver()
         .map(|_| Box::pin(asupersync::time::sleep(cx.now(), checkpoint_delay())));
     std::future::poll_fn(|task_cx| {
-        let _current = Cx::set_current(Some(cx.clone()));
-        if let Err(error) = checkpoint_task_operation(cx, cancellation) {
-            return Poll::Ready(Err(error));
-        }
-        if cancelled.as_mut().poll(task_cx).is_ready() {
-            return Poll::Ready(Err(McpError::request_cancelled()));
-        }
-        let result = operation.as_mut().poll(task_cx);
-        if let Err(error) = checkpoint_task_operation(cx, cancellation) {
-            return Poll::Ready(Err(error));
-        }
-        if result.is_pending()
-            && let Some(wake) = wake.as_mut()
-            && wake.as_mut().poll(task_cx).is_ready()
-        {
-            wake.set(asupersync::time::sleep(cx.now(), checkpoint_delay()));
-            task_cx.waker().wake_by_ref();
-        }
-        result
+        with_caller(cx, || {
+            if let Err(error) = checkpoint_task_operation(cx, cancellation) {
+                return Poll::Ready(Err(error));
+            }
+            if cancelled.as_mut().poll(task_cx).is_ready() {
+                return Poll::Ready(Err(McpError::request_cancelled()));
+            }
+            if !Cx::current()
+                .expect("Task operation caller is installed")
+                .capabilities()
+                .time
+            {
+                return Poll::Ready(Err(McpError::internal_error(
+                    "Final Task operation wait requires caller time capability",
+                )));
+            }
+            let result = operation.as_mut().poll(task_cx);
+            if let Err(error) = checkpoint_task_operation(cx, cancellation) {
+                return Poll::Ready(Err(error));
+            }
+            if result.is_pending()
+                && let Some(wake) = wake.as_mut()
+                && wake.as_mut().poll(task_cx).is_ready()
+            {
+                wake.set(asupersync::time::sleep(cx.now(), checkpoint_delay()));
+                task_cx.waker().wake_by_ref();
+            }
+            result
+        })
     })
     .await
 }
@@ -1412,6 +1435,8 @@ impl WaitBudget {
         cancellation: &McpRequestCancellation,
         operation: impl Future<Output = T>,
     ) -> Result<T, FinalTaskWaitOutcome> {
+        let caller = with_caller(cx, || Cx::current().expect("Task wait caller is installed"));
+        let cx = &caller;
         let mut operation = std::pin::pin!(operation);
         let mut cancelled = std::pin::pin!(cancellation.cancelled());
         let checkpoint_slice = Duration::from_millis(20);
@@ -1420,27 +1445,37 @@ impl WaitBudget {
             self.remaining(cx).min(checkpoint_slice),
         ));
         std::future::poll_fn(|task_cx| {
-            let _current = Cx::set_current(Some(cx.clone()));
-            if let Some(reason) = self.stop(cx, cancellation) {
-                return Poll::Ready(Err(reason));
-            }
-            if cancelled.as_mut().poll(task_cx).is_ready() {
-                return Poll::Ready(Err(FinalTaskWaitOutcome::ObservationCancelled));
-            }
-            let result = operation.as_mut().poll(task_cx);
-            // A completing read cannot publish a result after its caller was
-            // cancelled, retention expired, or the original budget elapsed.
-            if let Some(reason) = self.stop(cx, cancellation) {
-                return Poll::Ready(Err(reason));
-            }
-            if result.is_pending() && wake.as_mut().poll(task_cx).is_ready() {
-                wake.set(asupersync::time::sleep(
-                    cx.now(),
-                    self.remaining(cx).min(checkpoint_slice),
-                ));
-                task_cx.waker().wake_by_ref();
-            }
-            result.map(Ok)
+            with_caller(cx, || {
+                if let Some(reason) = self.stop(cx, cancellation) {
+                    return Poll::Ready(Err(reason));
+                }
+                if cancelled.as_mut().poll(task_cx).is_ready() {
+                    return Poll::Ready(Err(FinalTaskWaitOutcome::ObservationCancelled));
+                }
+                // The operation may itself be a Sleep. Refuse before polling
+                // it when the effective caller cannot authorize its timer.
+                if Cx::current()
+                    .expect("Task wait caller is installed")
+                    .timer_driver()
+                    .is_none()
+                {
+                    return Poll::Ready(Err(FinalTaskWaitOutcome::TimerUnavailable));
+                }
+                let result = operation.as_mut().poll(task_cx);
+                // A completing read cannot publish a result after its caller was
+                // cancelled, retention expired, or the original budget elapsed.
+                if let Some(reason) = self.stop(cx, cancellation) {
+                    return Poll::Ready(Err(reason));
+                }
+                if result.is_pending() && wake.as_mut().poll(task_cx).is_ready() {
+                    wake.set(asupersync::time::sleep(
+                        cx.now(),
+                        self.remaining(cx).min(checkpoint_slice),
+                    ));
+                    task_cx.waker().wake_by_ref();
+                }
+                result.map(Ok)
+            })
         })
         .await
     }
@@ -1460,6 +1495,9 @@ async fn wait_for_task<T: TaskWaitTransport>(
     {
         return Ok(outcome);
     }
+    // Retain the first poll's effect ceiling across delays and later reads.
+    let caller = with_caller(cx, || Cx::current().expect("Task wait caller is installed"));
+    let cx = &caller;
     let mut budget = WaitBudget::new(cx, policy.timeout, handle.task())?;
     if let Some(outcome) = budget.stop(cx, cancellation) {
         return Ok(outcome);

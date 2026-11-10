@@ -492,3 +492,300 @@ fn shared_wait_retention_extension_does_not_restart_the_caller_timeout() {
             assert!(cx.checkpoint().is_ok());
         });
 }
+
+mod caller_authority {
+    use super::*;
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+    use asupersync::time::{TimerDriverHandle, VirtualClock};
+    use std::cell::Cell;
+    use std::pin::Pin;
+
+    const NO_IO: CapMask = CapSet::<true, true, true, false, true>::MASK;
+    const NO_TIME: CapMask = CapSet::<true, false, true, true, true>::MASK;
+
+    fn runtime() -> (
+        asupersync::runtime::Runtime,
+        Cx,
+        Arc<VirtualClock>,
+        TimerDriverHandle,
+    ) {
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        (runtime, caller, clock, timer)
+    }
+
+    fn restricted(cx: &Cx, mask: CapMask) -> Cx {
+        let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(mask);
+        Cx::current().unwrap()
+    }
+
+    fn poll_as<F: Future + ?Sized>(future: Pin<&mut F>, ambient: &Cx) -> Poll<F::Output> {
+        let _ambient = Cx::set_current(Some(ambient.clone()));
+        let depth = Cx::restriction_depth();
+        let result = future.poll(&mut Context::from_waker(Waker::noop()));
+        let restored = Cx::current().unwrap();
+        assert_eq!(restored.task_id(), ambient.task_id());
+        assert_eq!(restored.capabilities().io, ambient.capabilities().io);
+        assert_eq!(restored.capabilities().time, ambient.capabilities().time);
+        assert_eq!(Cx::restriction_depth(), depth);
+        result
+    }
+
+    fn context_probe(caller: &Cx, io_allowed: bool) -> impl Future<Output = McpResult<u8>> {
+        let caller = caller.clone();
+        let mut polled = false;
+        std::future::poll_fn(move |_| {
+            let active = Cx::current().unwrap();
+            assert_eq!(active.capabilities().io, io_allowed);
+            assert_eq!(active.region_id(), caller.region_id());
+            assert_eq!(active.task_id(), caller.task_id());
+            assert_eq!(active.budget(), caller.budget());
+            assert_eq!(active.now(), caller.now());
+            assert!(active.timer_driver().is_some());
+            assert!(!active.is_cancel_requested());
+            if polled {
+                Poll::Ready(Ok(7))
+            } else {
+                polled = true;
+                Poll::Pending
+            }
+        })
+    }
+
+    #[test]
+    fn task_wait_guard_intersects_and_retains_effects_without_borrowing_ambient_identity() {
+        let (runtime, owner, _, timer) = runtime();
+        let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+        foreign.set_cancel_requested(true);
+        for held_io in [true, false] {
+            for ambient_io in [true, false] {
+                let caller = restricted(
+                    &owner,
+                    if held_io { CapMask::all() } else { NO_IO },
+                );
+                let ambient = restricted(
+                    &foreign,
+                    if ambient_io { CapMask::all() } else { NO_IO },
+                );
+                let budget = WaitBudget::new(
+                    &caller,
+                    Duration::from_secs(60),
+                    &task("working", None, 1),
+                )
+                .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let mut wait = Box::pin(budget.guard(
+                    &caller,
+                    &cancellation,
+                    context_probe(&caller, held_io && ambient_io),
+                ));
+                assert!(poll_as(wait.as_mut(), &ambient).is_pending());
+                assert_eq!(timer.pending_count(), 1);
+                // A wider second poll cannot restore an effect denied at admission.
+                assert!(matches!(
+                    poll_as(wait.as_mut(), &owner),
+                    Poll::Ready(Ok(Ok(7)))
+                ));
+                drop(wait);
+                assert_eq!(timer.pending_count(), 0);
+
+                let mut dropped = Box::pin(budget.guard(
+                    &caller,
+                    &cancellation,
+                    std::future::pending::<()>(),
+                ));
+                assert!(poll_as(dropped.as_mut(), &ambient).is_pending());
+                assert_eq!(timer.pending_count(), 1);
+                drop(dropped);
+                assert_eq!(timer.pending_count(), 0);
+            }
+        }
+        drop(owner);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn task_wait_refuses_missing_time_authority_before_polling_the_operation() {
+        let (runtime, owner, _, timer) = runtime();
+        for source in ["allowed", "held", "ambient"] {
+            let caller = restricted(
+                &owner,
+                if source == "held" { NO_TIME } else { CapMask::all() },
+            );
+            let ambient = restricted(
+                &owner,
+                if source == "ambient" { NO_TIME } else { CapMask::all() },
+            );
+            let budget = WaitBudget::new(
+                &caller,
+                Duration::from_secs(60),
+                &task("working", None, 1),
+            )
+            .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let polled = Cell::new(false);
+            let mut wait = Box::pin(budget.guard(&caller, &cancellation, async {
+                polled.set(true);
+                7
+            }));
+            let result = poll_as(wait.as_mut(), &ambient);
+            if source == "allowed" {
+                assert!(matches!(result, Poll::Ready(Ok(7))));
+                assert!(polled.get());
+            } else {
+                assert!(matches!(
+                    result,
+                    Poll::Ready(Err(FinalTaskWaitOutcome::TimerUnavailable))
+                ));
+                assert!(!polled.get());
+            }
+            drop(wait);
+            assert_eq!(timer.pending_count(), 0);
+        }
+
+        let budget =
+            WaitBudget::new(&owner, Duration::from_secs(60), &task("working", None, 1)).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        let polls = Cell::new(0);
+        let operation = std::future::poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::<()>::Pending
+        });
+        let mut wait = Box::pin(budget.guard(&owner, &cancellation, operation));
+        assert!(poll_as(wait.as_mut(), &owner).is_pending());
+        assert_eq!(timer.pending_count(), 1);
+        let denied = restricted(&owner, NO_TIME);
+        assert!(matches!(
+            poll_as(wait.as_mut(), &denied),
+            Poll::Ready(Err(FinalTaskWaitOutcome::TimerUnavailable))
+        ));
+        assert_eq!(polls.get(), 1);
+        drop(wait);
+        assert_eq!(timer.pending_count(), 0);
+
+        drop(owner);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    struct ReadProbe {
+        io_allowed: bool,
+        reads: usize,
+    }
+
+    impl TaskWaitTransport for ReadProbe {
+        type Error = McpError;
+
+        async fn read_task(
+            &mut self,
+            cx: &Cx,
+            _: &McpRequestCancellation,
+            _: FinalTaskId,
+        ) -> McpResult<FinalTask> {
+            assert_eq!(cx.capabilities().io, self.io_allowed);
+            assert_eq!(Cx::current().unwrap().capabilities().io, self.io_allowed);
+            self.reads += 1;
+            Ok(task("completed", None, 1))
+        }
+    }
+
+    #[test]
+    fn task_wait_retains_effect_ceiling_between_delay_and_authoritative_read() {
+        let (runtime, owner, clock, timer) = runtime();
+        for io_allowed in [true, false] {
+            let ambient = restricted(
+                &owner,
+                if io_allowed { CapMask::all() } else { NO_IO },
+            );
+            let mut handle = FinalTaskHandle::new(task("working", None, 1));
+            let mut transport = ReadProbe { io_allowed, reads: 0 };
+            let cancellation = McpRequestCancellation::new();
+            let policy = FinalTaskWaitPolicy::new(
+                Duration::from_secs(60),
+                1,
+                Duration::from_millis(1),
+            )
+            .unwrap();
+            let mut wait = Box::pin(wait_for_task(
+                &mut handle,
+                &owner,
+                &mut transport,
+                &cancellation,
+                policy,
+            ));
+            assert!(poll_as(wait.as_mut(), &ambient).is_pending());
+            assert!(timer.pending_count() > 0);
+            clock.advance(1_000_000);
+            let _ = timer.process_timers();
+            // This poll finishes the delay and starts a distinct read guard.
+            assert!(matches!(
+                poll_as(wait.as_mut(), &owner),
+                Poll::Ready(Ok(FinalTaskWaitOutcome::Completed)),
+            ));
+            drop(wait);
+            assert_eq!(transport.reads, 1);
+            assert!(handle.is_terminal());
+            assert_eq!(timer.pending_count(), 0);
+        }
+        drop(owner);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_task_guard_retains_effects_and_refuses_time_denial_before_work() {
+        let (runtime, owner, _, timer) = runtime();
+        let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+        foreign.set_cancel_requested(true);
+        let cancellation = McpRequestCancellation::new();
+        for io_allowed in [true, false] {
+            let ambient = restricted(
+                &foreign,
+                if io_allowed { CapMask::all() } else { NO_IO },
+            );
+            let mut wait = Box::pin(guard_websocket_task_operation(
+                &owner,
+                &cancellation,
+                context_probe(&owner, io_allowed),
+            ));
+            assert!(poll_as(wait.as_mut(), &ambient).is_pending());
+            assert_eq!(timer.pending_count(), 1);
+            assert!(matches!(poll_as(wait.as_mut(), &owner), Poll::Ready(Ok(7))));
+            drop(wait);
+            assert_eq!(timer.pending_count(), 0);
+        }
+        for time_allowed in [true, false] {
+            let ambient = restricted(
+                &owner,
+                if time_allowed { CapMask::all() } else { NO_TIME },
+            );
+            let polled = Cell::new(false);
+            let mut wait = Box::pin(guard_websocket_task_operation(
+                &owner,
+                &cancellation,
+                async {
+                    polled.set(true);
+                    Ok(7)
+                },
+            ));
+            let result = poll_as(wait.as_mut(), &ambient);
+            if time_allowed {
+                assert!(matches!(result, Poll::Ready(Ok(7))));
+                assert!(polled.get());
+            } else {
+                assert!(matches!(result, Poll::Ready(Err(_))));
+                assert!(!polled.get());
+            }
+            drop(wait);
+            assert_eq!(timer.pending_count(), 0);
+        }
+        drop(owner);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+}
