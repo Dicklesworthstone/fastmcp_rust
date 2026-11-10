@@ -188,6 +188,124 @@ async fn extension_result(
 }
 
 #[test]
+fn memory_extension_current_waiter_cancellation_precedes_buffered_progress() {
+    run(|cx| async move {
+        for terminal_before_wait in [false, true] {
+            for cause in ["live", "token", "caller", "deadline"] {
+                let (mut client, mut peer, _) = connected(&cx).await;
+                let original = McpRequestCancellation::new();
+                let live = McpRequestCancellation::new();
+                let observer = McpRequestCancellation::new();
+                let mut owner = client
+                    .execute_final_extension(
+                        &cx,
+                        &original,
+                        &id(),
+                        METHOD,
+                        json!({"_meta":{"progressToken":"buffered"}}),
+                    )
+                    .await
+                    .unwrap();
+                receive(&cx, &mut peer, METHOD, Some(2)).await;
+                let mut sibling = client
+                    .execute_final_extension(&cx, &live, &id(), METHOD, json!({}))
+                    .await
+                    .unwrap();
+                receive(&cx, &mut peer, METHOD, Some(3)).await;
+                peer.send_async(
+                    &cx,
+                    &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/progress",
+                        Some(json!({"progressToken":"buffered","progress":1})),
+                    )),
+                )
+                .await
+                .unwrap();
+                client.drive_once(&cx, &live).await.unwrap();
+                if terminal_before_wait {
+                    peer.send_async(&cx, &response(2, json!({"resultType":RESULT,"value":7})))
+                        .await
+                        .unwrap();
+                    client.drive_once(&cx, &live).await.unwrap();
+                }
+                let waiter = match cause {
+                    "caller" => {
+                        let stopped = Cx::for_testing();
+                        stopped.set_cancel_requested(true);
+                        stopped
+                    }
+                    "deadline" => Cx::for_testing_with_budget(
+                        asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+                    ),
+                    _ => cx.clone(),
+                };
+                if cause == "token" {
+                    assert!(observer.cancel());
+                }
+                let event = client
+                    .next_extension_event(&waiter, &observer, &mut owner)
+                    .await;
+                if cause == "live" || terminal_before_wait {
+                    assert!(matches!(
+                        event.unwrap(),
+                        Some(MemoryExtensionEvent::Notification(_))
+                    ));
+                    if !terminal_before_wait {
+                        peer.send_async(&cx, &response(2, json!({"resultType":RESULT,"value":7})))
+                            .await
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        extension_result(&cx, &mut client, &mut owner).await.unwrap()["value"],
+                        7
+                    );
+                    assert!(owner.raw_result_source().is_some());
+                    assert!(client.take_cancellation_events().is_empty());
+                } else {
+                    assert_eq!(
+                        event.unwrap_err().code,
+                        McpErrorCode::RequestCancelled,
+                        "{cause}"
+                    );
+                    assert!(
+                        client
+                            .next_extension_event(&waiter, &observer, &mut owner)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(owner.notifications.is_empty());
+                    assert!(owner.raw_result_source().is_none());
+                    let events = client.take_cancellation_events();
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(events[0].request_id, RequestId::Number(2));
+                    assert_eq!(
+                        events[0].reason,
+                        crate::ExecutionTerminalReason::CallerCancelled
+                    );
+                    client.drive_once(&cx, &live).await.unwrap();
+                    let control =
+                        receive(&cx, &mut peer, "notifications/cancelled", None).await;
+                    assert_eq!(control.params.unwrap()["requestId"], 2);
+                }
+                peer.send_async(&cx, &response(3, json!({"resultType":RESULT,"value":9})))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    extension_result(&cx, &mut client, &mut sibling).await.unwrap()["value"],
+                    9
+                );
+                assert!(!original.is_cancel_requested());
+                assert!(!live.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+                assert!(client.executor.terminal_error().is_none());
+                client.close(&cx).unwrap();
+            }
+        }
+    });
+}
+
+#[test]
 fn memory_extensions_preserve_owned_progress_exact_source_and_reordered_siblings() {
     run(|cx| async move {
         let (mut client, mut peer, _) = connected(&cx).await;

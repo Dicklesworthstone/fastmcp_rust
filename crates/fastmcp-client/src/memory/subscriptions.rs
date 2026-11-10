@@ -656,6 +656,8 @@ impl MemoryClient {
     /// Dropping this future preserves the handle and all partially admitted
     /// events. Local cancellation or timeout yields one error, peer completion
     /// or cancellation yields one `Terminal`, and later reads return `None`.
+    /// A stopped current waiter retires a pending listener before buffered
+    /// events are returned. An already elected terminal outcome is preserved.
     pub async fn next_subscription_event(
         &mut self,
         cx: &Cx,
@@ -665,23 +667,33 @@ impl MemoryClient {
         self.ensure_subscription_owner(execution)?;
         loop {
             let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
-            match lock(&execution.state).take_event(&self.executor)? {
+            let event = {
+                let mut state = lock(&execution.state);
+                if checkpoint(cx, cancellation).is_err() {
+                    let cancelled = self.executor.cancel(cx, &mut state.inner);
+                    if state.inner.terminal_error().is_none() {
+                        cancelled?;
+                    }
+                }
+                state.take_event(&self.executor)?
+            };
+            match event {
                 SubscriptionPoll::Event(event) => return Ok(Some(event)),
                 SubscriptionPoll::Finished => return Ok(None),
                 SubscriptionPoll::Pending => {}
             }
             maintenance?;
-            if checkpoint(cx, cancellation).is_err() {
-                self.executor.cancel(cx, &mut lock(&execution.state).inner)?;
-                continue;
-            }
             self.ensure_open()?;
             if let Err(error) = self.drive_once(cx, cancellation).await {
                 if lock(&execution.state).inner.terminal_reason().is_some() {
                     continue;
                 }
                 if error.code == McpErrorCode::RequestCancelled {
-                    self.executor.cancel(cx, &mut lock(&execution.state).inner)?;
+                    let mut state = lock(&execution.state);
+                    let cancelled = self.executor.cancel(cx, &mut state.inner);
+                    if state.inner.terminal_error().is_none() {
+                        cancelled?;
+                    }
                     continue;
                 }
                 return Err(error);
@@ -981,42 +993,227 @@ mod tests {
     }
 
     #[test]
-    fn memory_subscription_idle_absolute_and_origin_cancellation_beat_buffered_events() {
+    fn memory_subscription_cancellation_and_timeouts_beat_buffered_events() {
         run(|cx| async move {
-            for cause in ["idle", "absolute", "origin"] {
+            for cause in [
+                "idle",
+                "absolute",
+                "origin",
+                "waiter-token",
+                "waiter-caller",
+                "waiter-deadline",
+            ] {
                 let (mut client, mut peer) = connected(&cx).await;
                 let origin = McpRequestCancellation::new();
                 let live = McpRequestCancellation::new();
-                let policy = SubscriptionTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(6)).unwrap();
-                let mut owner = client.subscribe_with_timeout_policy(&cx, &origin, tools_filter(), policy).await.unwrap();
+                let observer = McpRequestCancellation::new();
+                let policy =
+                    SubscriptionTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(6))
+                        .unwrap();
+                let mut owner = client
+                    .subscribe_with_timeout_policy(&cx, &origin, tools_filter(), policy)
+                    .await
+                    .unwrap();
                 receive(&cx, &mut peer, "subscriptions/listen").await;
-                peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true}))).await.unwrap();
+                peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true})))
+                    .await
+                    .unwrap();
                 client.drive_once(&cx, &live).await.unwrap();
-                let record = client.executor.pending_records().into_iter().find(|record| record.request_id == RequestId::Number(2)).unwrap();
+                let record = client
+                    .executor
+                    .pending_records()
+                    .into_iter()
+                    .find(|record| record.request_id == RequestId::Number(2))
+                    .unwrap();
                 match cause {
-                    "idle" => client.executor.poll_timeouts_at(&cx, record.idle_deadline).unwrap(),
-                    "absolute" => client.executor.poll_timeouts_at(&cx, record.absolute_deadline).unwrap(),
-                    // `McpRequestCancellation::cancel` returns bool (did this
-                    // call perform the transition), while the two timeout arms
-                    // are (). Asserting it rather than discarding it keeps the
-                    // arm honest: a `false` here would mean the token was
-                    // ALREADY cancelled, so the refusal asserted below would
-                    // not have been caused by this line, and the test would be
-                    // passing for a reason it does not name.
-                    _ => assert!(
+                    "idle" => client
+                        .executor
+                        .poll_timeouts_at(&cx, record.idle_deadline)
+                        .unwrap(),
+                    "absolute" => client
+                        .executor
+                        .poll_timeouts_at(&cx, record.absolute_deadline)
+                        .unwrap(),
+                    "origin" => assert!(
                         origin.cancel(),
                         "the origin token must still be live for this arm to be the cause"
                     ),
+                    "waiter-token" => assert!(observer.cancel()),
+                    "waiter-caller" | "waiter-deadline" => {}
+                    _ => unreachable!(),
                 }
-                let error = client.next_subscription_event(&cx, &live, &mut owner).await.unwrap_err();
+                let waiter = match cause {
+                    "waiter-caller" => {
+                        let stopped = Cx::for_testing();
+                        stopped.set_cancel_requested(true);
+                        stopped
+                    }
+                    "waiter-deadline" => Cx::for_testing_with_budget(
+                        asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+                    ),
+                    _ => cx.clone(),
+                };
+                let error = client
+                    .next_subscription_event(&waiter, &observer, &mut owner)
+                    .await
+                    .unwrap_err();
                 assert_eq!(error.code, McpErrorCode::RequestCancelled);
-                if cause != "origin" {
+                if matches!(cause, "idle" | "absolute") {
                     assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], cause);
                 }
+                assert_eq!(origin.is_cancel_requested(), cause == "origin");
                 assert!(owner.terminal_result().is_none());
+                assert!(
+                    client
+                        .next_subscription_event(&waiter, &observer, &mut owner)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
                 client.drive_once(&cx, &live).await.unwrap();
                 receive(&cx, &mut peer, "notifications/cancelled").await;
                 ordinary_survives(&cx, &mut client, &mut peer).await;
+            }
+        });
+    }
+
+
+    #[test]
+    fn memory_subscription_current_waiter_cancellation_preserves_elected_completion() {
+        run(|cx| async move {
+            for cause in ["live", "token", "caller", "deadline"] {
+                let (mut client, mut peer) = connected(&cx).await;
+                let original = McpRequestCancellation::new();
+                let live = McpRequestCancellation::new();
+                let observer = McpRequestCancellation::new();
+                let mut owner = open(&cx, &mut client, &mut peer, &original).await;
+                peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true})))
+                    .await
+                    .unwrap();
+                client.drive_once(&cx, &live).await.unwrap();
+                peer.send_async(
+                    &cx,
+                    &response(
+                        2,
+                        json!({
+                            "resultType":"complete",
+                            "_meta":{"io.modelcontextprotocol/subscriptionId":2},
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+                client.drive_once(&cx, &live).await.unwrap();
+                let waiter = match cause {
+                    "caller" => {
+                        let stopped = Cx::for_testing();
+                        stopped.set_cancel_requested(true);
+                        stopped
+                    }
+                    "deadline" => Cx::for_testing_with_budget(
+                        asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+                    ),
+                    _ => cx.clone(),
+                };
+                if cause == "token" {
+                    assert!(observer.cancel());
+                }
+                assert!(matches!(
+                    client
+                        .next_subscription_event(&waiter, &observer, &mut owner)
+                        .await
+                        .unwrap(),
+                    Some(MemorySubscriptionEvent::Acknowledged { .. })
+                ));
+                assert!(matches!(
+                    client
+                        .next_subscription_event(&waiter, &observer, &mut owner)
+                        .await
+                        .unwrap(),
+                    Some(MemorySubscriptionEvent::Terminal)
+                ));
+                assert!(owner.terminal_result().is_some());
+                assert!(
+                    client
+                        .next_subscription_event(&waiter, &observer, &mut owner)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(client.take_cancellation_events().is_empty());
+                assert!(!original.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+                ordinary_survives(&cx, &mut client, &mut peer).await;
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn memory_subscription_waiter_cancellation_survives_control_saturation() {
+        run(|cx| async move {
+            for buffered in [false, true] {
+                let (mut client, mut peer) = connected(&cx).await;
+                let original = McpRequestCancellation::new();
+                let live = McpRequestCancellation::new();
+                let observer = McpRequestCancellation::new();
+                // Leave the real outgoing request queued, filling its one slot.
+                let mut owner = client
+                    .subscribe(&cx, &original, tools_filter())
+                    .await
+                    .unwrap();
+                if buffered {
+                    peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true})))
+                        .await
+                        .unwrap();
+                    client.drive_once(&cx, &live).await.unwrap();
+                }
+                let rejected = serde_json::to_vec(&JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "roots/list",
+                    Some(json!({})),
+                    2,
+                )))
+                .unwrap();
+                for _ in 0..crate::execution::DEFAULT_MAX_IN_FLIGHT_EXECUTIONS {
+                    client
+                        .executor
+                        .drive_frame(&cx, ReceivedTransportFrame::admit(rejected.clone()).unwrap())
+                        .unwrap();
+                }
+                assert!(client.executor.terminal_error().is_none());
+                let error = if buffered {
+                    assert!(observer.cancel());
+                    client
+                        .next_subscription_event(&cx, &observer, &mut owner)
+                        .await
+                        .unwrap_err()
+                } else {
+                    let mut waiting =
+                        pin!(client.next_subscription_event(&cx, &observer, &mut owner));
+                    poll_fn(|task| {
+                        assert!(waiting.as_mut().poll(task).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    assert!(observer.cancel());
+                    waiting.await.unwrap_err()
+                };
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert!(client.executor.terminal_error().is_some());
+                assert!(client.executor.pending_records().is_empty());
+                assert!(!client.executor.has_external_controls(&cx).unwrap());
+                assert!(owner.terminal_result().is_none());
+                assert!(
+                    client
+                        .next_subscription_event(&cx, &observer, &mut owner)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(client.take_cancellation_events().len(), 1);
+                assert!(!original.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+                client.close(&cx).unwrap();
             }
         });
     }

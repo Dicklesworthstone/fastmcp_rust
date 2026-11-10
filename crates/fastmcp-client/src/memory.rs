@@ -864,6 +864,8 @@ impl MemoryClient {
     /// Drives this connection until one event for the selected handle is ready.
     /// Other handles retain their correlated outcomes. Dropping this *wait*
     /// preserves the execution; dropping the execution itself cancels it.
+    /// A stopped current waiter retires a pending execution before buffered
+    /// events are returned. An already elected terminal outcome is preserved.
     pub async fn next_event(
         &mut self,
         cx: &Cx,
@@ -876,6 +878,14 @@ impl MemoryClient {
         }
         loop {
             let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
+            // Reconcile this waiter's lifetime before yielding buffered events.
+            // Cancellation cannot replace an already elected terminal outcome.
+            if checkpoint(cx, cancellation).is_err() {
+                let cancelled = self.executor.cancel(cx, &mut execution.inner);
+                if execution.inner.terminal_error().is_none() {
+                    cancelled?;
+                }
+            }
             if let Some(error) = execution.inner.terminal_error() {
                 execution.notifications.clear();
                 execution.finished = true;
@@ -912,13 +922,6 @@ impl MemoryClient {
                 return Ok(Some(MemoryRequestEvent::Result(Box::new(result.0))));
             }
             maintenance?;
-            if checkpoint(cx, cancellation).is_err() {
-                let cancelled = self.executor.cancel(cx, &mut execution.inner);
-                if execution.inner.terminal_error().is_none() {
-                    cancelled?;
-                }
-                continue;
-            }
             self.ensure_open()?;
             // One drive turn always returns after a frame or maintenance
             // tick. Even a blocked cancellation write cannot hide a result
@@ -948,6 +951,8 @@ impl MemoryClient {
     /// publication, including ownership of non-core result discriminators.
     /// A result or terminal error is consumed once; subsequent calls return
     /// `None`. Dropping this wait preserves the execution and sibling results.
+    /// A stopped current waiter retires a pending execution before buffered
+    /// events are returned. An already elected terminal outcome is preserved.
     pub async fn next_extension_event(
         &mut self,
         cx: &Cx,
@@ -960,6 +965,14 @@ impl MemoryClient {
         }
         loop {
             let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
+            // Reconcile this waiter's lifetime before yielding buffered events.
+            // Cancellation cannot replace an already elected terminal outcome.
+            if checkpoint(cx, cancellation).is_err() {
+                let cancelled = self.executor.cancel(cx, &mut execution.inner);
+                if execution.inner.terminal_error().is_none() {
+                    cancelled?;
+                }
+            }
             if let Some(error) = execution.inner.terminal_error() {
                 execution.notifications.clear();
                 execution.finished = true;
@@ -990,13 +1003,6 @@ impl MemoryClient {
                 return Ok(Some(MemoryExtensionEvent::Result(result)));
             }
             maintenance?;
-            if checkpoint(cx, cancellation).is_err() {
-                let cancelled = self.executor.cancel(cx, &mut execution.inner);
-                if execution.inner.terminal_error().is_none() {
-                    cancelled?;
-                }
-                continue;
-            }
             self.ensure_open()?;
             if let Err(error) = self.drive_once(cx, cancellation).await {
                 if execution.inner.terminal_error().is_some() {
@@ -2404,6 +2410,123 @@ mod tests {
                 );
             }
             client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn memory_current_waiter_cancellation_precedes_buffered_progress() {
+        run(|cx| async move {
+            for handle_buffered in [false, true] {
+                for terminal_before_wait in [false, true] {
+                    for cause in ["live", "token", "caller", "deadline"] {
+                        let (mut client, mut peer) = connected(&cx).await;
+                        let original = McpRequestCancellation::new();
+                        let live = McpRequestCancellation::new();
+                        let observer = McpRequestCancellation::new();
+                        let mut owner = client
+                            .execute_core(
+                                &cx,
+                                &original,
+                                "tools/list",
+                                json!({"_meta":{"progressToken":"buffered"}}),
+                            )
+                            .await
+                            .unwrap();
+                        receive(&cx, &mut peer, "tools/list", Some(2)).await;
+                        let mut sibling = client
+                            .execute_core(&cx, &live, "tools/list", json!({}))
+                            .await
+                            .unwrap();
+                        receive(&cx, &mut peer, "tools/list", Some(3)).await;
+                        for progress in [1, 2] {
+                            peer.send_async(
+                                &cx,
+                                &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                    "notifications/progress",
+                                    Some(json!({"progressToken":"buffered","progress":progress})),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                            client.drive_once(&cx, &live).await.unwrap();
+                        }
+                        if handle_buffered {
+                            assert!(matches!(
+                                client.next_event(&cx, &live, &mut owner).await.unwrap(),
+                                Some(MemoryRequestEvent::Notification(_))
+                            ));
+                        }
+                        if terminal_before_wait {
+                            peer.send_async(&cx, &response(2, tools())).await.unwrap();
+                            client.drive_once(&cx, &live).await.unwrap();
+                        }
+                        let waiter = match cause {
+                            "caller" => {
+                                let stopped = Cx::for_testing();
+                                stopped.set_cancel_requested(true);
+                                stopped
+                            }
+                            "deadline" => Cx::for_testing_with_budget(
+                                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+                            ),
+                            _ => cx.clone(),
+                        };
+                        if cause == "token" {
+                            assert!(observer.cancel());
+                        }
+                        let event = client.next_event(&waiter, &observer, &mut owner).await;
+                        if cause == "live" || terminal_before_wait {
+                            assert!(matches!(
+                                event.unwrap(),
+                                Some(MemoryRequestEvent::Notification(_))
+                            ));
+                            if !terminal_before_wait {
+                                peer.send_async(&cx, &response(2, tools())).await.unwrap();
+                            }
+                            assert!(matches!(
+                                result(&cx, &mut client, &mut owner).await,
+                                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                            ));
+                            assert!(client.take_cancellation_events().is_empty());
+                        } else {
+                            assert_eq!(
+                                event.unwrap_err().code,
+                                McpErrorCode::RequestCancelled,
+                                "{cause}"
+                            );
+                            assert!(
+                                client
+                                    .next_event(&waiter, &observer, &mut owner)
+                                    .await
+                                    .unwrap()
+                                    .is_none()
+                            );
+                            assert!(owner.notifications.is_empty());
+                            let events = client.take_cancellation_events();
+                            assert_eq!(events.len(), 1);
+                            assert_eq!(events[0].request_id, RequestId::Number(2));
+                            assert_eq!(
+                                events[0].reason,
+                                crate::ExecutionTerminalReason::CallerCancelled
+                            );
+                            client.drive_once(&cx, &live).await.unwrap();
+                            let control =
+                                receive(&cx, &mut peer, "notifications/cancelled", None).await;
+                            assert_eq!(control.params.unwrap()["requestId"], 2);
+                        }
+                        peer.send_async(&cx, &response(3, tools())).await.unwrap();
+                        assert!(matches!(
+                            result(&cx, &mut client, &mut sibling).await,
+                            CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                        ));
+                        assert!(!original.is_cancel_requested());
+                        assert!(!live.is_cancel_requested());
+                        assert!(cx.checkpoint().is_ok());
+                        assert!(client.executor.terminal_error().is_none());
+                        client.close(&cx).unwrap();
+                    }
+                }
+            }
         });
     }
 
