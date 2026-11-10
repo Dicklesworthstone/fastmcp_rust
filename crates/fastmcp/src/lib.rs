@@ -393,9 +393,10 @@ pub mod core {
         NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, NonceDomainMaterial,
         NotificationSender, OperatorConnectionCapacity, OperatorConnectionCounters,
         OperatorCorrelationCapacity, OperatorExecutorCapacity, OperatorExecutorSnapshot,
-        OperatorExecutorState, OperatorHttpConnections, OperatorLifecycle, OperatorProfile,
-        OperatorReadiness, OperatorReason, OperatorRequestCapacity, OperatorSnapshot,
-        OperatorSnapshotError, OperatorSnapshotSource, Outcome, OutcomeExt,
+        OperatorExecutorState, OperatorHttpConnections, OperatorLifecycle, OperatorOutputCapacity,
+        OperatorOutputCounters, OperatorProfile, OperatorReadiness, OperatorReason,
+        OperatorRequestCapacity, OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource,
+        OperatorStdioOutput, OperatorStdioSnapshot, Outcome, OutcomeExt,
         PROTOCOL_LIMITS_INITIAL_GENERATION,
         ParseDurationError, PercentEncodingPolicy, PreAuthSourceBucketKey, ProgressReporter,
         PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole, ProtocolLimit,
@@ -457,7 +458,8 @@ pub mod server {
     pub use fastmcp_server::legacy_2024;
     pub use fastmcp_server::{
         AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
-        BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, DuplicateBehavior,
+        BoundHttpServer, BoundStdioServer, BoxFuture, CompletionHandler, ConsoleConfig,
+        DuplicateBehavior,
         ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
         FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
@@ -468,12 +470,15 @@ pub mod server {
         HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, LifespanHooks,
         LoggingConfig, Middleware, MiddlewareDecision, ModernConnection, MountResult,
         NotificationSender, OperatorConnectionCapacity, OperatorConnectionCounters,
-        OperatorLifecycle, OperatorProfile, OperatorReadiness, OperatorReason, OperatorSnapshot,
-        OperatorSnapshotError, OperatorSnapshotSource, PendingRequests, ProgressNotificationSender,
+        OperatorLifecycle, OperatorOutputCapacity, OperatorOutputCounters, OperatorProfile,
+        OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorSnapshotError,
+        OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot, PendingRequests,
+        ProgressNotificationSender,
         PromptHandler, RequestSender, ResourceHandler, Router, ServerExtensionConfigurationError,
         ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
         ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse,
         ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier, StatsSnapshot,
+        StdioOperatorHandle,
         TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolExecutionMode,
         ToolHandler, TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
         TransportSamplingSender, UriParams, caching, create_context_with_progress,
@@ -947,19 +952,20 @@ pub use fastmcp_transport::{NativePipeReader, NativePipeWriter, create_native_pi
 // unconditionally, so the feature equation in Cargo.toml is the whole wiring.
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
-    BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,
+    BoundHttpServer, BoundStdioServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,
     FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalRoots,
     FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
     FinalToolSchemaAuthority, HttpConnectionAdmissionError, HttpConnectionAdmissionPermit,
     HttpConnectionAdmissionProbe, HttpNonquiescentShutdown, HttpOperatorHandle, HttpServerConfig,
     HttpServerShutdown, HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport,
     Middleware, MiddlewareDecision, ModernConnection, MountResult, NotificationSender,
-    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorProfile,
-    OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorSnapshotError,
-    OperatorSnapshotSource, PendingRequests, ProgressNotificationSender, PromptHandler,
+    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorOutputCapacity,
+    OperatorOutputCounters, OperatorProfile, OperatorReadiness, OperatorReason, OperatorSnapshot,
+    OperatorSnapshotError, OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot,
+    PendingRequests, ProgressNotificationSender, PromptHandler,
     RequestSender, ResourceHandler, Router, ServerHttpEndpoint, ServerHttpEndpointError,
     ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
-    ServerHttpSseResponse, ServerStats, Session, StaticTokenVerifier, StatsSnapshot,
+    ServerHttpSseResponse, ServerStats, Session, StaticTokenVerifier, StatsSnapshot, StdioOperatorHandle,
     SubscriptionListenHandle, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind,
     ToolExecutionMode, ToolHandler, TrafficVerbosity, TransportElicitationSender,
     TransportRootsProvider, TransportSamplingSender, UriParams, create_context_with_progress,
@@ -2836,6 +2842,18 @@ pub mod auto {
             W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
         {
             self.inner.serve_stdio_io(cx, reader, writer).await
+        }
+
+        /// Binds native NDJSON endpoints with observations available before serving.
+        ///
+        /// Retain the bound server's operator handle, then call its `serve` method
+        /// on the caller's runtime. Capture observes retained output without I/O.
+        pub fn bind_stdio_io<R, W>(self, reader: R, writer: W) -> crate::BoundStdioServer<R, W>
+        where
+            R: asupersync::io::AsyncRead + Unpin + Send + 'static,
+            W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            self.inner.bind_stdio_io(reader, writer)
         }
 
         /// Runs this Auto server over stdio on the supplied caller-owned context.
@@ -8539,6 +8557,18 @@ pub mod modern {
             self.inner.serve_stdio_io(cx, reader, writer).await
         }
 
+        /// Binds native NDJSON endpoints with observations available before serving.
+        ///
+        /// Retain the bound server's operator handle, then call its `serve` method
+        /// on the caller's runtime. Capture observes retained output without I/O.
+        pub fn bind_stdio_io<R, W>(self, reader: R, writer: W) -> crate::BoundStdioServer<R, W>
+        where
+            R: asupersync::io::AsyncRead + Unpin + Send + 'static,
+            W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            self.inner.bind_stdio_io(reader, writer)
+        }
+
         /// Runs this final-only server over stdio on the supplied caller-owned context.
         ///
         /// The facade does not create a runtime or detach the stdio pump; the
@@ -9319,6 +9349,18 @@ pub mod legacy_2024 {
             W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
         {
             self.inner.serve_stdio_io(cx, reader, writer).await
+        }
+
+        /// Binds native NDJSON endpoints with observations available before serving.
+        ///
+        /// Retain the bound server's operator handle, then call its `serve` method
+        /// on the caller's runtime. Capture observes retained output without I/O.
+        pub fn bind_stdio_io<R, W>(self, reader: R, writer: W) -> crate::BoundStdioServer<R, W>
+        where
+            R: asupersync::io::AsyncRead + Unpin + Send + 'static,
+            W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            self.inner.bind_stdio_io(reader, writer)
         }
 
         /// Runs this exact-2024 server over stdio on the supplied caller-owned context.

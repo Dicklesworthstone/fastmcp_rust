@@ -390,17 +390,172 @@ struct OutputState {
     retained_bytes: usize,
     candidates: HashMap<u64, Weak<OutputOwner>>,
     failure: Option<&'static str>,
+    counters: OperatorOutputCounters,
+    started: bool,
+    draining: bool,
+    terminal_failure: bool,
     stopped: bool,
     subscription_drain_deadline: Option<asupersync::Time>,
 }
 
-#[derive(Default)]
 struct OutputQueue {
     state: Mutex<OutputState>,
     changed: Notify,
+    generation: Option<u64>,
+    profile: OperatorProfile,
+}
+
+static NEXT_STDIO_OPERATOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+impl Default for OutputQueue {
+    fn default() -> Self {
+        Self::new(ProtocolPolicy::ModernOnly)
+    }
+}
+
+/// Nonblocking, exporter-neutral observation of one native stdio output queue.
+///
+/// Capture copies fixed counters and actual retained frame/byte charges under
+/// the queue's admission lock. It never drains output, runs a callback, writes
+/// protocol bytes, or reserves capacity. The handle may outlive the serving
+/// future. It describes this writer only, not process or authentication health.
+#[derive(Clone)]
+pub struct StdioOperatorHandle {
+    output: Arc<OutputQueue>,
+}
+
+impl OperatorSnapshotSource<OperatorStdioOutput> for StdioOperatorHandle {
+    fn operator_snapshot(&self) -> Result<OperatorStdioSnapshot, OperatorSnapshotError> {
+        let generation = self
+            .output
+            .generation
+            .ok_or(OperatorSnapshotError::GenerationExhausted)?;
+        let state = match self.output.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(OperatorSnapshotError::Busy),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(OperatorSnapshotError::Poisoned);
+            }
+        };
+        let lifecycle = if state.stopped {
+            OperatorLifecycle::Stopped
+        } else if state.draining {
+            OperatorLifecycle::Stopping
+        } else if state.started {
+            OperatorLifecycle::Running
+        } else {
+            OperatorLifecycle::Starting
+        };
+        Ok(OperatorSnapshot::stdio_output(
+            Instant::now(),
+            generation,
+            self.output.profile,
+            lifecycle,
+            OperatorStdioOutput {
+                capacity: OperatorOutputCapacity {
+                    frame_limit: MAX_DISPATCH_QUEUE_DEPTH,
+                    byte_limit: MAX_DISPATCH_QUEUE_BYTES,
+                    retained_frames: state.retained_frames,
+                    retained_bytes: state.retained_bytes,
+                },
+                counters: state.counters,
+                failed: state.terminal_failure || state.failure.is_some(),
+            },
+        ))
+    }
+}
+
+/// One caller-supplied NDJSON connection with observations available before serving.
+///
+/// Binding does not start I/O, create an executor, or invoke lifecycle hooks.
+/// The selected server policy and output generation cannot change. Dropping a
+/// bound connection closes its endpoints and makes its observations stopped.
+pub struct BoundStdioServer<R, W> {
+    parts: Option<(Server, R, W)>,
+    output: Arc<OutputQueue>,
+}
+
+impl<R, W> BoundStdioServer<R, W> {
+    /// Returns a retained handle for this exact output generation.
+    #[must_use]
+    pub fn operator_handle(&self) -> StdioOperatorHandle {
+        StdioOperatorHandle {
+            output: Arc::clone(&self.output),
+        }
+    }
+}
+
+impl<R, W> BoundStdioServer<R, W>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    /// Serves with the same admission, cancellation, and drain contract as
+    /// [`Server::serve_stdio_io`]. The caller owns the runtime and endpoints.
+    pub async fn serve(mut self, cx: &Cx) -> McpResult<()> {
+        let (server, reader, writer) = self.parts.take().expect("one owned stdio connection");
+        let result = server
+            .serve_stdio_io_with_output(cx, reader, writer, Arc::clone(&self.output))
+            .await;
+        if result.is_err() {
+            self.output.record_failure(false);
+        }
+        result
+    }
+}
+
+impl<R, W> Drop for BoundStdioServer<R, W> {
+    fn drop(&mut self) {
+        self.output.stop();
+    }
 }
 
 impl OutputQueue {
+    fn new(policy: ProtocolPolicy) -> Self {
+        Self {
+            state: Mutex::new(OutputState::default()),
+            changed: Notify::new(),
+            generation: NEXT_STDIO_OPERATOR_GENERATION
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .ok(),
+            profile: match policy {
+                ProtocolPolicy::Auto => OperatorProfile::Auto,
+                ProtocolPolicy::ModernOnly => OperatorProfile::Modern,
+                ProtocolPolicy::LegacyOnly => OperatorProfile::Legacy2024,
+            },
+        }
+    }
+
+    fn start(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .started = true;
+    }
+
+    fn begin_drain(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .draining = true;
+    }
+
+    fn record_failure(&self, writer: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Observational only. In particular, terminal opening refusals must
+        // remain writable while their failure is visible to the operator.
+        state.terminal_failure = true;
+        if writer {
+            let counters = &mut state.counters;
+            increment_operator_counter(&mut counters.writer_failures, &mut counters.overflowed);
+        }
+    }
+
     fn begin_subscription_drain(&self, deadline: asupersync::Time) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.subscription_drain_deadline = Some(
@@ -491,6 +646,8 @@ impl OutputQueue {
         {
             state.retained_frames += 1;
             state.retained_bytes += bytes;
+            let counters = &mut state.counters;
+            increment_operator_counter(&mut counters.enqueued, &mut counters.overflowed);
             state.frames.push_back(OutputFrame {
                 message,
                 owner,
@@ -500,6 +657,8 @@ impl OutputQueue {
             true
         } else {
             state.failure = Some("output_capacity");
+            let counters = &mut state.counters;
+            increment_operator_counter(&mut counters.rejected_capacity, &mut counters.overflowed);
             false
         };
         drop(state);
@@ -612,6 +771,8 @@ impl OutputQueue {
             *bytes <= MAX_DISPATCH_QUEUE_BYTES.saturating_sub(retained_without_frame)
         }) else {
             state.failure = Some("output_capacity");
+            let counters = &mut state.counters;
+            increment_operator_counter(&mut counters.rejected_capacity, &mut counters.overflowed);
             drop(state);
             self.changed.notify_waiters();
             return Err(TransportError::Io(io::Error::other(
@@ -641,6 +802,8 @@ impl OutputQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.retained_frames = state.retained_frames.saturating_sub(1);
         state.retained_bytes = state.retained_bytes.saturating_sub(bytes);
+        let counters = &mut state.counters;
+        increment_operator_counter(&mut counters.released, &mut counters.overflowed);
     }
 
     /// Release uncommitted frames whose request cancellation has won, even
@@ -675,6 +838,8 @@ impl OutputQueue {
                 if discard(&frame) {
                     state.retained_frames = state.retained_frames.saturating_sub(1);
                     state.retained_bytes = state.retained_bytes.saturating_sub(frame.bytes);
+                    let counters = &mut state.counters;
+                    increment_operator_counter(&mut counters.released, &mut counters.overflowed);
                     discarded.push(frame);
                 } else {
                     state.frames.push_back(frame);
@@ -715,7 +880,14 @@ impl OutputQueue {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.stopped = true;
-            std::mem::take(&mut state.frames)
+            let frames = std::mem::take(&mut state.frames);
+            for frame in &frames {
+                state.retained_frames = state.retained_frames.saturating_sub(1);
+                state.retained_bytes = state.retained_bytes.saturating_sub(frame.bytes);
+                let counters = &mut state.counters;
+                increment_operator_counter(&mut counters.released, &mut counters.overflowed);
+            }
+            frames
         };
         // Dropping reservations can acquire the admission mutex. Never do so
         // inside the output queue's bounded critical section.
@@ -869,6 +1041,22 @@ fn write<W: ConnectionWriter>(
     frame: OutputFrame,
     output: Arc<OutputQueue>,
 ) -> WriteWork<W> {
+    // Create the charge before constructing the future, so even an unpolled
+    // write releases its retained capacity when the serving owner drops it.
+    struct OutputWriteCharge {
+        output: Arc<OutputQueue>,
+        bytes: usize,
+    }
+    impl Drop for OutputWriteCharge {
+        fn drop(&mut self) {
+            self.output.finish(self.bytes);
+        }
+    }
+    #[allow(unused_mut)] // Timeout-response replacement is feature-gated.
+    let mut charge = OutputWriteCharge {
+        output: Arc::clone(&output),
+        bytes: frame.bytes,
+    };
     Box::pin(async move {
         #[cfg(feature = "legacy-2024-11-05")]
         let mut frame = frame;
@@ -876,7 +1064,10 @@ fn write<W: ConnectionWriter>(
             if let Some(delivery) = frame.terminal_delivery() {
                 delivery.mark_failed();
             }
-            return (writer, Ok(()), frame.bytes);
+            let bytes = frame.bytes;
+            drop(frame);
+            drop(charge);
+            return (writer, Ok(()), bytes);
         }
         let write_deadline = cx.now().saturating_add_nanos(
             u64::try_from(STDIO_OUTPUT_COMMIT_TIMEOUT.as_nanos()).unwrap_or(u64::MAX),
@@ -914,6 +1105,7 @@ fn write<W: ConnectionWriter>(
                 } else {
                     match output.replace_expired_legacy_response(&mut frame) {
                         Ok(keep_response) => {
+                            charge.bytes = frame.bytes;
                             output.discard_cancelled();
                             if keep_response {
                                 match send_frame(&mut writer, &cx, &frame, &output, timeout.as_mut(), write_deadline, false)
@@ -956,7 +1148,10 @@ fn write<W: ConnectionWriter>(
                 let _ = owner.reservation.cancellation.begin_finalization();
             }
         }
-        (writer, result, frame.bytes)
+        let bytes = frame.bytes;
+        drop(frame);
+        drop(charge);
+        (writer, result, bytes)
     })
 }
 
@@ -2431,6 +2626,37 @@ impl Server {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        self.bind_stdio_io(reader, writer).serve(cx).await
+    }
+
+    /// Binds caller-owned NDJSON endpoints without starting them.
+    ///
+    /// Retain [`BoundStdioServer::operator_handle`] before calling
+    /// [`BoundStdioServer::serve`] to inspect real output backpressure and
+    /// lifecycle from another task. Snapshot collection emits no protocol bytes.
+    pub fn bind_stdio_io<R, W>(self, reader: R, writer: W) -> BoundStdioServer<R, W>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let output = Arc::new(OutputQueue::new(self.protocol_policy));
+        BoundStdioServer {
+            parts: Some((self, reader, writer)),
+            output,
+        }
+    }
+
+    async fn serve_stdio_io_with_output<R, W>(
+        self,
+        cx: &Cx,
+        reader: R,
+        writer: W,
+        output: Arc<OutputQueue>,
+    ) -> McpResult<()>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         #[cfg(not(feature = "legacy-2024-11-05"))]
         if self.protocol_policy != ProtocolPolicy::ModernOnly {
             return Err(server_run_error(
@@ -2478,6 +2704,7 @@ impl Server {
             reader,
             writer,
             ConnectionBinding::stdio(),
+            output,
             #[cfg(feature = "tasks")]
             hosted_tasks.as_ref(),
         )
@@ -2573,6 +2800,7 @@ impl Server {
             None => None,
         };
         let (reader, writer) = transport.into_split();
+        let output = Arc::new(OutputQueue::new(server.protocol_policy));
         let (result, request_regions_quiescent) = Self::serve_modern_connection(
             Arc::clone(&server),
             cx,
@@ -2584,6 +2812,7 @@ impl Server {
                 auth_custody: None,
                 auth_generation: None,
             },
+            output,
             #[cfg(feature = "tasks")]
             hosted_tasks.as_ref(),
         )
@@ -2634,6 +2863,7 @@ impl Server {
                 auth_custody: Some(AuthDispatchCustody::WebSocket(auth_custody)),
                 auth_generation: Some(connection_generation),
             },
+            Arc::new(OutputQueue::default()),
             #[cfg(feature = "tasks")]
             None,
         )
@@ -2647,6 +2877,7 @@ impl Server {
         reader: R,
         writer: W,
         binding: ConnectionBinding,
+        output: Arc<OutputQueue>,
         #[cfg(feature = "tasks")] hosted_tasks: Option<&tasks::HostedTaskService>,
     ) -> (McpResult<()>, bool) {
         #[cfg(feature = "tasks")]
@@ -2663,9 +2894,10 @@ impl Server {
             server: Arc::clone(&server),
             connection: ModernConnection::new(),
             admission: Arc::new(DispatchQueueState::default()),
-            output: Arc::new(OutputQueue::default()),
+            output,
             binding,
         };
+        lifetime.output.start();
         #[cfg(feature = "legacy-2024-11-05")]
         let mut protocol = NativeProtocol::new(
             if matches!(
@@ -2921,11 +3153,11 @@ impl Server {
                         }
                     }
                 }
-                Event::Written(writer, result, bytes) => {
+                Event::Written(writer, result, _bytes) => {
                     writing = None;
                     available_writer = Some(writer);
-                    lifetime.output.finish(bytes);
                     if let Err(failure) = result {
+                        lifetime.output.record_failure(true);
                         error.get_or_insert(transport_run_error("send", &failure));
                         stop = true;
                     }
@@ -2964,6 +3196,14 @@ impl Server {
                     ));
                     stop = true;
                 }
+            }
+            if reading.is_none() || stop {
+                lifetime.output.begin_drain();
+            }
+            if error.is_some() {
+                // Observe the cause before cancellation or region settlement
+                // can yield, without suppressing any queued refusal response.
+                lifetime.output.record_failure(false);
             }
             if stop && !stopping {
                 #[cfg(feature = "legacy-2024-11-05")]
@@ -3034,9 +3274,11 @@ impl Server {
             match close {
                 Ok(Ok(())) => {}
                 Ok(Err(failure)) => {
+                    lifetime.output.record_failure(true);
                     error.get_or_insert(transport_run_error("close", &failure));
                 }
                 Err(_) => {
+                    lifetime.output.record_failure(true);
                     error.get_or_insert(transport_run_error("close", &TransportError::Timeout));
                 }
             }
@@ -3967,6 +4209,204 @@ mod tests {
     }
 
     #[test]
+    fn stdio_operator_observes_real_backpressure_and_eof_drain() {
+        run(|cx| async move {
+            let gate = Arc::new(Gate::default());
+            let io = Arc::new(IoProbe::default());
+            let bound = server(&gate).bind_stdio_io(
+                ProbeReader(Arc::clone(&io)),
+                ProbeWriter(Arc::clone(&io)),
+            );
+            let operator = bound.operator_handle();
+            let starting = OperatorSnapshot::capture(&operator).unwrap();
+            assert_eq!(starting.readiness(), OperatorReadiness::Starting);
+            assert_eq!(starting.profile(), OperatorProfile::Modern);
+            let mut serving = cx
+                .spawn(move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .unwrap();
+            io.feed(&encoded(&discover(1)));
+            until(&cx, || io.0.lock().unwrap().writes != 0).await;
+            let blocked = OperatorSnapshot::capture(&operator).unwrap();
+            assert_eq!(blocked.readiness(), OperatorReadiness::Ready);
+            assert_eq!(blocked.contributor().capacity.retained_frames, 1);
+            assert!(blocked.contributor().capacity.retained_bytes > 0);
+            assert_eq!(blocked.contributor().counters.enqueued, 1);
+            assert_eq!(blocked.contributor().counters.released, 0);
+            assert!(
+                io.messages().is_empty(),
+                "observation must not unblock output"
+            );
+
+            io.feed(&encoded(&discover(2)));
+            until(&cx, || {
+                OperatorSnapshot::capture(&operator)
+                    .is_ok_and(|snapshot| snapshot.contributor().counters.enqueued == 2)
+            })
+            .await;
+            let queued = OperatorSnapshot::capture(&operator).unwrap();
+            assert_eq!(queued.contributor().capacity.retained_frames, 2);
+            assert!(
+                queued.contributor().capacity.retained_bytes
+                    > blocked.contributor().capacity.retained_bytes
+            );
+            io.eof();
+            until(&cx, || {
+                OperatorSnapshot::capture(&operator)
+                    .is_ok_and(|snapshot| snapshot.lifecycle() == OperatorLifecycle::Stopping)
+            })
+            .await;
+            let draining = OperatorSnapshot::capture(&operator).unwrap();
+            assert_eq!(draining.contributor().capacity.retained_frames, 2);
+            // Only granting the writer bytes changes backpressure. Capturing
+            // repeatedly cannot release queued or in-flight capacity.
+            io.allow(usize::MAX);
+            serving.join(&cx).await.unwrap().unwrap();
+            let first = io.response(1).unwrap();
+            let second = io.response(2).unwrap();
+            assert!(first.error.is_none());
+            assert!(second.error.is_none());
+            let first_bytes = encoded(&JsonRpcMessage::Response(first)).len();
+            let second_bytes = encoded(&JsonRpcMessage::Response(second)).len();
+            assert_eq!(blocked.contributor().capacity.retained_bytes, first_bytes);
+            assert_eq!(
+                queued.contributor().capacity.retained_bytes,
+                first_bytes + second_bytes,
+            );
+            let stopped = OperatorSnapshot::capture(&operator).unwrap();
+            assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+            assert_eq!(stopped.readiness(), OperatorReadiness::NotReady);
+            assert_eq!(stopped.contributor().capacity.retained_frames, 0);
+            assert_eq!(stopped.contributor().capacity.retained_bytes, 0);
+            assert_eq!(stopped.contributor().counters.released, 2);
+            assert!(!stopped.contributor().failed);
+            assert_eq!(
+                stopped.configuration_generation(),
+                starting.configuration_generation(),
+            );
+            assert_eq!(
+                blocked.contributor().capacity.retained_frames,
+                1,
+                "captured values are immutable",
+            );
+        });
+    }
+
+    #[test]
+    fn stdio_operator_drop_releases_an_unfinished_write() {
+        run(|cx| async move {
+            for poll_serving in [false, true] {
+                let gate = Arc::new(Gate::default());
+                let io = Arc::new(IoProbe::default());
+                let bound = server(&gate).bind_stdio_io(
+                    ProbeReader(Arc::clone(&io)),
+                    ProbeWriter(Arc::clone(&io)),
+                );
+                let operator = bound.operator_handle();
+                let mut serving = Box::pin(bound.serve(&cx));
+                io.feed(&encoded(&discover(1)));
+                if poll_serving {
+                    asupersync::time::timeout(cx.now(), Duration::from_secs(3), async {
+                        while io.0.lock().unwrap().writes == 0 {
+                            assert!(
+                                poll_fn(|task| Poll::Ready(serving.as_mut().poll(task)))
+                                    .await
+                                    .is_pending()
+                            );
+                            asupersync::runtime::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                let retained = OperatorSnapshot::capture(&operator).unwrap();
+                assert_eq!(
+                    retained.contributor().capacity.retained_frames,
+                    usize::from(poll_serving),
+                );
+                drop(serving);
+                let stopped = OperatorSnapshot::capture(&operator).unwrap();
+                assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+                assert_eq!(stopped.contributor().capacity.retained_frames, 0);
+                assert_eq!(stopped.contributor().capacity.retained_bytes, 0);
+                assert_eq!(
+                    stopped.contributor().counters.released,
+                    u64::from(poll_serving),
+                );
+                let io = io.0.lock().unwrap();
+                assert!(io.outbound.is_empty());
+                assert!(io.reader_dropped && io.writer_dropped);
+            }
+        });
+    }
+
+    #[test]
+    fn stdio_operator_capacity_failure_and_capture_contention_are_explicit() {
+        let output = Arc::new(OutputQueue::default());
+        let operator = StdioOperatorHandle {
+            output: Arc::clone(&output),
+        };
+        output.start();
+        let held = output.state.lock().unwrap();
+        assert_eq!(
+            OperatorSnapshot::capture(&operator),
+            Err(OperatorSnapshotError::Busy),
+        );
+        drop(held);
+        let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+            RequestId::Number(1),
+            serde_json::json!({"private": "not-an-operator-label"}),
+        ));
+        for _ in 0..MAX_DISPATCH_QUEUE_DEPTH {
+            assert!(output.enqueue(message.clone(), None));
+        }
+        let in_flight = output.pop().unwrap();
+        let full = OperatorSnapshot::capture(&operator).unwrap();
+        assert!(full.contributor().capacity.frames_saturated());
+        assert_eq!(
+            full.contributor().capacity.retained_frames,
+            MAX_DISPATCH_QUEUE_DEPTH,
+        );
+        assert_eq!(full.readiness(), OperatorReadiness::Ready);
+        assert!(!format!("{full:?}").contains("not-an-operator-label"));
+
+        // A protocol-opening failure still owes its queued refusal. Making
+        // that failure observable must not fence the existing writer.
+        output.record_failure(false);
+        assert!(output.admits_write(&in_flight));
+        assert!(output.failure().is_none());
+        let observed_failure = OperatorSnapshot::capture(&operator).unwrap();
+        assert!(observed_failure.contributor().failed);
+        assert_eq!(observed_failure.contributor().counters.writer_failures, 0);
+
+        assert!(!output.enqueue(message, None));
+        let failed = OperatorSnapshot::capture(&operator).unwrap();
+        assert_eq!(failed.readiness(), OperatorReadiness::NotReady);
+        assert!(failed.contributor().failed);
+        assert_eq!(failed.contributor().counters.rejected_capacity, 1);
+        let io = Arc::new(IoProbe::default());
+        let (_reader, writer) = AsyncStdioTransport::from_io(
+            ProbeReader(Arc::clone(&io)),
+            ProbeWriter(Arc::clone(&io)),
+        )
+        .into_split();
+        let writing = write(writer, Cx::for_testing(), in_flight, Arc::clone(&output));
+        output.stop();
+        let stopping = OperatorSnapshot::capture(&operator).unwrap();
+        assert_eq!(stopping.contributor().capacity.retained_frames, 1);
+        // The guard exists before the writer's first poll. Queue stop releases
+        // only queued charges; abandoning this unpolled write releases its own.
+        drop(writing);
+        assert_eq!(io.0.lock().unwrap().writes, 0);
+        let stopped = OperatorSnapshot::capture(&operator).unwrap();
+        assert_eq!(stopped.contributor().capacity.retained_bytes, 0);
+        assert_eq!(
+            stopped.contributor().counters.enqueued,
+            stopped.contributor().counters.released,
+        );
+        assert_eq!(stopped.reasons()[0], Some(OperatorReason::OutputFailed));
+    }
+
+    #[test]
     fn async_stdio_server_native_tcp_multiplexes_without_blocking_pool() {
         run(|cx| async move {
             let gate = Arc::new(Gate::default());
@@ -4649,10 +5089,9 @@ mod tests {
                     cx.clone(), output.pop().unwrap(), Arc::clone(&output),
                 );
                 let caller = Cx::set_current(Some(cx.clone()));
-                let Poll::Ready((writer, result, bytes)) = writing.as_mut().poll(
+                let Poll::Ready((writer, result, _bytes)) = writing.as_mut().poll(
                     &mut Context::from_waker(Waker::noop()),
                 ) else { panic!("the ready writer must settle in one poll: {case:?}") };
-                output.finish(bytes);
                 assert_eq!(writer.sends, 1);
                 assert_eq!(result.is_ok(), matches!(case, GuardCase::Live), "{case:?}");
                 assert_eq!(delivery.state.load(Ordering::Acquire),

@@ -102,6 +102,7 @@ mod extension_result_tests;
 #[cfg(test)]
 mod tests;
 
+pub use async_stdio::{BoundStdioServer, StdioOperatorHandle};
 pub use auth::{
     AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, StaticTokenVerifier, TokenAuthProvider,
     TokenVerifier,
@@ -116,9 +117,10 @@ pub use extensions::{
 #[cfg(feature = "console")]
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_core::stats::{
-    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorProfile,
-    OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorSnapshotError,
-    OperatorSnapshotSource, ServerStats, StatsSnapshot,
+    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorOutputCapacity,
+    OperatorOutputCounters, OperatorProfile, OperatorReadiness, OperatorReason, OperatorSnapshot,
+    OperatorSnapshotError, OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot,
+    ServerStats, StatsSnapshot,
 };
 use fastmcp_protocol::{
     MAX_CLIENT_REGISTRATION_BYTES, SecurityDocumentKind, admit_security_document,
