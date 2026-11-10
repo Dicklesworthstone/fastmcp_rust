@@ -6245,10 +6245,12 @@ impl ClientHttpConnection {
 
     /// Starts the exact-2024 reader owned by a ready high-level HTTP client.
     ///
-    /// Initialization remains request-owned so its response cannot race this
-    /// receiver. Once ready, one structured child exclusively drains the SSE
-    /// stream, retains bounded notifications, and services eligible reverse
-    /// requests even while no ordinary client request is pending.
+    /// One structured child exclusively drains the SSE stream during
+    /// initialization and ordinary requests, retains bounded notifications,
+    /// and services eligible reverse requests even while no ordinary client
+    /// request is pending. The supplied context must carry its own runtime,
+    /// I/O, timer and spawn authority. An ambient runtime never substitutes
+    /// for that owner. Failed caller checks leave the stream with the connection.
     #[cfg(feature = "legacy-2024-11-05")]
     pub fn start_legacy_receive_pump(&mut self, cx: &Cx) -> Result<(), ClientHttpConnectionError> {
         let Self::LegacySse(LegacySseConnection {
@@ -6265,12 +6267,16 @@ impl ClientHttpConnection {
         if persistent_receiver.is_some() {
             return Ok(());
         }
+        reverse_request_handlers
+            .validate_legacy_capabilities(client_capabilities)
+            .map_err(ClientHttpConnectionError::LegacyCallbackConfiguration)?;
+        let caller = legacy_receive_pump_caller(cx)?;
         let reader = client
             .take_reader()
             .ok_or(ClientHttpConnectionError::LegacyPersistentReceiverUnavailable)?;
         let outbound = client.outbound();
         *persistent_receiver = Some(Arc::new(LegacySsePersistentReceiver::start(
-            cx,
+            &caller,
             reader,
             outbound,
             client_capabilities.clone(),
@@ -11152,6 +11158,30 @@ pub struct LegacySsePersistentReceiver {
     reverse_callbacks: LegacySseReverseCallbackDispatcher,
 }
 
+/// Capture only the ambient effect ceiling, never its runtime or identity.
+/// Admission runs before taking the connection's reader so a denied caller
+/// cannot consume the live SSE generation or its buffered ingress.
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_receive_pump_caller(cx: &Cx) -> Result<Cx, ClientHttpConnectionError> {
+    let caller = crate::http_auth::caller::with_caller(cx, || {
+        Cx::current().expect("legacy receive-pump caller is installed")
+    });
+    check_modern_http_effects(&caller)
+        .map_err(LegacySseHttpClientError::Executor)
+        .map_err(ClientHttpConnectionError::Legacy)?;
+    if !caller.capabilities().spawn {
+        return Err(ClientHttpConnectionError::Legacy(
+            LegacySseHttpClientError::Executor(ModernHttpExecutorError::CapabilityDenied {
+                capability: "SPAWN",
+            }),
+        ));
+    }
+    if caller.io().is_none() || caller.timer_driver().is_none() {
+        return Err(ClientHttpConnectionError::LegacyReceiverNeedsRuntimeCx);
+    }
+    Ok(caller)
+}
+
 #[cfg(feature = "legacy-2024-11-05")]
 impl LegacySsePersistentReceiver {
     fn start(
@@ -11162,9 +11192,6 @@ impl LegacySsePersistentReceiver {
         reverse_request_handlers: ReverseRequestHandlers,
         request_timeout_policy: RequestTimeoutPolicy,
     ) -> Result<Self, ClientHttpConnectionError> {
-        reverse_request_handlers
-            .validate_legacy_capabilities(&client_capabilities)
-            .map_err(ClientHttpConnectionError::LegacyCallbackConfiguration)?;
         let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
         outbound.generation = Some(Arc::clone(
             &state
@@ -11180,21 +11207,16 @@ impl LegacySsePersistentReceiver {
             state: Arc::clone(&reverse_callbacks.state),
             tasks: Arc::clone(&reverse_callbacks.tasks),
         };
-        // A runtime-wired caller owns this long-lived reader even when a sync
-        // adapter temporarily installs a different ambient runtime. This is
-        // essential for proxy construction: the gateway Cx must keep driving
-        // reverse sampling/roots after the nested `block_on` returns. Detached
-        // test/request contexts have no I/O driver, so only those fall back to
-        // the ambient runtime. `spawn` remains the fail-closed authority check.
-        let task_cx = if cx.has_io() {
-            cx.clone()
-        } else {
-            Cx::current().unwrap_or_else(|| cx.clone())
-        };
+        // The admitted caller owns the reader even when another runtime is
+        // currently polling the connector. Its cancellation stays observable
+        // while the child is parked on an otherwise silent SSE connection.
+        let task_cx = cx.clone();
+        let owner_cx = task_cx.clone();
         let task = task_cx
             .spawn(move |child_cx| async move {
+                let mut owner_cancelled = std::pin::pin!(owner_cx.cancelled());
                 loop {
-                    if child_cx.checkpoint().is_err() {
+                    if child_cx.checkpoint().is_err() || owner_cx.checkpoint().is_err() {
                         stop_legacy_persistent_state(
                             &task_state,
                             Some(LegacySseHttpClientError::Cancelled),
@@ -11215,7 +11237,24 @@ impl LegacySsePersistentReceiver {
                     {
                         break;
                     }
-                    let message = match next_legacy_sse_message(&mut reader, &child_cx).await {
+                    let received = {
+                        let mut receive =
+                            std::pin::pin!(next_legacy_sse_message(&mut reader, &child_cx));
+                        poll_fn(|task_cx| {
+                            if owner_cancelled.as_mut().poll(task_cx).is_ready()
+                                || owner_cx.checkpoint().is_err()
+                            {
+                                return Poll::Ready(Err(LegacySseHttpClientError::Cancelled));
+                            }
+                            let result = receive.as_mut().poll(task_cx);
+                            if owner_cx.checkpoint().is_err() {
+                                return Poll::Ready(Err(LegacySseHttpClientError::Cancelled));
+                            }
+                            result
+                        })
+                        .await
+                    };
+                    let message = match received {
                         Ok(Some(message)) => message,
                         Ok(None) => {
                             stop_legacy_persistent_state(
@@ -15107,6 +15146,239 @@ mod tests {
 
     fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
         HTTP_TEST_RUNTIME.with(|runtime| runtime.block_on(future))
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    mod legacy_receive_pump_authority_tests {
+        use super::*;
+        use asupersync::Budget;
+        use asupersync::cx::{CapMask, CapSet, CapSetRuntimeMask};
+
+        const NO_IO: CapMask = CapSet::<true, true, true, false, true>::MASK;
+        const NO_TIME: CapMask = CapSet::<true, false, true, true, true>::MASK;
+        const NO_SPAWN: CapMask = CapSet::<false, true, true, true, true>::MASK;
+
+        fn narrowed(cx: &Cx, mask: CapMask) -> Cx {
+            let _caller = Cx::set_current(Some(cx.clone()));
+            let _restriction = Cx::push_restriction(mask);
+            Cx::current().unwrap()
+        }
+
+        fn connection() -> (
+            Runtime,
+            Cx,
+            ClientHttpConnection,
+            mpsc::SyncSender<()>,
+            thread::JoinHandle<()>,
+        ) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let sse_target = format!("http://{address}/legacy-sse");
+            let message_target = format!("http://{address}/legacy-message");
+            let advertised = message_target.clone();
+            let (done, stopped) = mpsc::sync_channel(1);
+            let peer = thread::spawn(move || {
+                let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+                let Some(mut sse) = accept_legacy_test_peer(&listener, &stopped, deadline).unwrap()
+                else {
+                    return;
+                };
+                assert!(read_request(&mut sse).head.starts_with("GET /legacy-sse "));
+                begin_chunked_sse(&mut sse);
+                write_chunked_sse_event(
+                    &mut sse,
+                    &format!(
+                        "event: endpoint\ndata: {advertised}\n\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\n"
+                    ),
+                );
+                let Some(mut post) = accept_legacy_test_peer(&listener, &stopped, deadline).unwrap()
+                else {
+                    return;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&read_request(&mut post).body).unwrap();
+                assert_eq!(request["id"], 1);
+                assert_eq!(request["method"], "ping");
+                write_response(&mut post, 202, "application/json", b"");
+                write_chunked_sse_event(
+                    &mut sse,
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"owner\":true}}\n\n",
+                );
+                let mut byte = [0];
+                match sse.read(&mut byte) {
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) => {}
+                    other => panic!("owner cancellation must release its SSE stream: {other:?}"),
+                }
+                assert!(matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+            });
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+            let connection = runtime
+                .block_on(ClientHttpConnection::connect(
+                    &caller,
+                    plan(
+                        "http://127.0.0.1:9/mcp",
+                        &sse_target,
+                        &message_target,
+                        ProtocolPolicy::LegacyOnly,
+                    ),
+                    ClientInfo {
+                        name: "explicit-receive-owner".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                ))
+                .unwrap();
+            (runtime, caller, connection, done, peer)
+        }
+
+        fn assert_stream_retained(connection: &ClientHttpConnection) {
+            let ClientHttpConnection::LegacySse(connection) = connection else {
+                panic!("fixture opened exact legacy SSE");
+            };
+            assert!(connection.persistent_receiver.is_none());
+            let stream = connection.client.stream.as_ref().expect("reader was not taken");
+            assert!(stream.response.is_some(), "live generation was not closed");
+            assert_eq!(stream.awaiting_responses, 0);
+        }
+
+        fn ping_and_cancel(runtime: &Runtime, caller: &Cx, connection: &mut ClientHttpConnection) {
+            let receiver = connection.legacy_persistent_receiver().unwrap();
+            assert_eq!(receiver.clock_cx.task_id(), caller.task_id());
+            assert_eq!(receiver.clock_cx.region_id(), caller.region_id());
+            assert_eq!(receiver.clock_cx.budget(), caller.budget());
+            let response = runtime
+                .block_on(connection.request_json(
+                    caller,
+                    "ping",
+                    serde_json::json!({}),
+                    RequestId::Number(1),
+                    4_096,
+                ))
+                .unwrap();
+            assert_eq!(response.result, Some(serde_json::json!({"owner": true})));
+            assert_eq!(
+                connection.take_legacy_notification().unwrap().method,
+                "notifications/tools/list_changed",
+                "the original buffered notification survives refused admission",
+            );
+            assert!(connection.take_legacy_notification().is_none());
+
+            let sibling = runtime.request_cx_with_budget(Budget::INFINITE);
+            caller.cancel_with(CancelKind::User, Some("stop the explicit SSE owner"));
+            runtime.block_on(async {
+                let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+                while !receiver.state.lock().unwrap().stopped {
+                    assert!(
+                        Instant::now() < deadline,
+                        "owner cancellation must wake the reader"
+                    );
+                    asupersync::time::sleep(sibling.now(), Duration::from_millis(1)).await;
+                }
+            });
+            let state = receiver.state.lock().unwrap();
+            assert!(state.pending.is_empty());
+            assert!(matches!(
+                state.stopped_error(),
+                ClientHttpConnectionError::LegacyPersistentReceiverFailed(ref error)
+                    if matches!(error.as_ref(), LegacySseHttpClientError::Cancelled)
+            ));
+            assert!(
+                sibling.checkpoint().is_ok(),
+                "one owner cannot cancel its sibling"
+            );
+        }
+
+        #[test]
+        fn legacy_receive_pump_retains_explicit_caller_runtime_and_cancellation() {
+            let (runtime, caller, mut connection, done, peer) = connection();
+            let foreign_runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let foreign = foreign_runtime.request_cx_with_budget(Budget::ZERO);
+            foreign.cancel_with(CancelKind::User, Some("unrelated ambient owner"));
+            {
+                let _ambient = Cx::set_current(Some(foreign.clone()));
+                connection.start_legacy_receive_pump(&caller).unwrap();
+                assert_eq!(Cx::current().unwrap().task_id(), foreign.task_id());
+            }
+            ping_and_cancel(&runtime, &caller, &mut connection);
+            drop(connection);
+            peer.join().unwrap();
+            drop(done);
+        }
+
+        #[test]
+        fn legacy_receive_pump_rejects_driverless_caller_without_borrowing_ambient_runtime() {
+            let (runtime, caller, mut connection, done, peer) = connection();
+            let driverless = Cx::for_testing();
+            assert!(!driverless.has_io());
+            assert!(driverless.timer_driver().is_none());
+            {
+                let _ambient = Cx::set_current(Some(caller.clone()));
+                assert!(matches!(
+                    connection.start_legacy_receive_pump(&driverless),
+                    Err(ClientHttpConnectionError::LegacyReceiverNeedsRuntimeCx)
+                ));
+                assert_eq!(Cx::current().unwrap().task_id(), caller.task_id());
+            }
+            assert_stream_retained(&connection);
+            connection.start_legacy_receive_pump(&caller).unwrap();
+            ping_and_cancel(&runtime, &caller, &mut connection);
+            drop(connection);
+            peer.join().unwrap();
+            drop(done);
+        }
+
+        #[test]
+        fn legacy_receive_pump_refuses_cancelled_and_restricted_callers_before_taking_stream() {
+            let (runtime, caller, mut connection, done, peer) = connection();
+            let cancelled = runtime.request_cx_with_budget(Budget::INFINITE);
+            cancelled.cancel_with(CancelKind::User, Some("cancel before receive admission"));
+            {
+                let _ambient = Cx::set_current(Some(caller.clone()));
+                assert!(matches!(
+                    connection.start_legacy_receive_pump(&cancelled),
+                    Err(ClientHttpConnectionError::Legacy(
+                        LegacySseHttpClientError::Executor(ModernHttpExecutorError::Cancelled)
+                    ))
+                ));
+            }
+            assert_stream_retained(&connection);
+            for (mask, expected) in [(NO_IO, "IO"), (NO_TIME, "TIME"), (NO_SPAWN, "SPAWN")] {
+                let restricted = narrowed(&caller, mask);
+                for restrict_ambient in [false, true] {
+                    let (owner, ambient) = if restrict_ambient {
+                        (&caller, &restricted)
+                    } else {
+                        (&restricted, &caller)
+                    };
+                    let _ambient = Cx::set_current(Some(ambient.clone()));
+                    assert!(matches!(
+                        connection.start_legacy_receive_pump(owner),
+                        Err(ClientHttpConnectionError::Legacy(
+                            LegacySseHttpClientError::Executor(
+                                ModernHttpExecutorError::CapabilityDenied { capability }
+                            )
+                        )) if capability == expected
+                    ));
+                    assert_stream_retained(&connection);
+                }
+            }
+            connection.start_legacy_receive_pump(&caller).unwrap();
+            ping_and_cancel(&runtime, &caller, &mut connection);
+            drop(connection);
+            peer.join().unwrap();
+            drop(done);
+        }
     }
 
     /// Accepts one local peer connection without allowing a pre-connect
@@ -23516,7 +23788,8 @@ mod tests {
             finish_chunked_sse(&mut sse);
         });
 
-        let cx = Cx::for_request();
+        let cx = HTTP_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
         let mut client = runtime_block_on(
             ClientBuilder::new()
                 .client_info("public-http-client", "1.0.0")
@@ -23618,7 +23891,8 @@ mod tests {
             Ok(true)
         });
 
-        let cx = Cx::for_request();
+        let cx = HTTP_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
         let connection_result = runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(plan(
@@ -24687,7 +24961,8 @@ mod tests {
             Ok(true)
         });
 
-        let cx = Cx::for_request();
+        let cx = HTTP_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
         let builder = ClientBuilder::new().protocol_plan(plan(
             &modern_target,
             &sse_target,
@@ -24882,7 +25157,8 @@ mod tests {
                 })
             }
         });
-        let cx = Cx::for_request();
+        let cx = HTTP_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
         let client = runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(plan(
@@ -25201,7 +25477,8 @@ mod tests {
             finish_chunked_sse(&mut sse);
         });
 
-        let cx = Cx::for_request();
+        let cx = HTTP_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
         let mut connection = runtime_block_on(async {
             let mut connection = ClientHttpConnection::connect(
                 &cx,
@@ -25369,7 +25646,8 @@ mod tests {
             finish_chunked_sse(&mut sse);
         });
 
-        let cx = Cx::for_request();
+        let cx = HTTP_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
         let mut connection = runtime_block_on(async {
             let mut connection = ClientHttpConnection::connect(
                 &cx,

@@ -44166,8 +44166,11 @@ exec sleep 2
             );
         });
 
-        let cx = Cx::for_request();
-        let result = http_test_runtime_block_on(async {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("legacy completion test runtime must build");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let result = runtime.block_on(async {
             let mut client = HttpClient::connect(
                 &cx,
                 legacy_completion_http_plan(&sse_target, &message_target),
@@ -44270,8 +44273,11 @@ exec sleep 2
             }
         });
 
-        let cx = Cx::for_request();
-        let mut client = http_test_runtime_block_on(HttpClient::connect(
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("legacy completion refusal test runtime must build");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let mut client = runtime.block_on(HttpClient::connect(
             &cx,
             legacy_completion_http_plan(&sse_target, &message_target),
             ClientInfo {
@@ -44291,7 +44297,8 @@ exec sleep 2
             title: "Deploy".to_owned(),
         };
 
-        let error = http_test_runtime_block_on(client.complete(&cx, title_only))
+        let error = runtime
+            .block_on(client.complete(&cx, title_only))
             .expect_err("changing only the title must reject before a legacy completion POST");
         assert!(matches!(
             error,
@@ -49952,8 +49959,11 @@ exec sleep 2
                 );
             }
         });
-        let cx = Cx::for_request();
-        let collection = http_test_runtime_block_on(async {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("legacy catalog test runtime must build");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let collection = runtime.block_on(async {
             let mut client = HttpClient::connect(
                 &cx,
                 legacy_completion_http_plan(&sse_target, &message_target),

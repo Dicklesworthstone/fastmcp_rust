@@ -1741,6 +1741,18 @@ fn final_tasks_runtime_block_on_bounded<F: Future>(cx: &Cx, future: F) -> F::Out
     })
 }
 
+fn final_tasks_owned_runtime_block_on_bounded<F: Future>(
+    runtime: &asupersync::runtime::Runtime,
+    cx: &Cx,
+    future: F,
+) -> F::Output {
+    runtime.block_on(async {
+        asupersync::time::timeout(cx.now(), FINAL_TASKS_E2E_BOUND, future)
+            .await
+            .expect("final Tasks public HTTP operation stays within its bound")
+    })
+}
+
 struct FinalTasksHttpFixture {
     address: SocketAddr,
     shutdown: mpsc::SyncSender<()>,
@@ -2931,14 +2943,22 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
     let legacy_builder = auto::client_builder()
         .client_info("final-tasks-e2e-client", "1.0.0")
         .protocol_plan(fixture.plan(ProtocolPolicy::LegacyOnly));
-    let legacy =
-        final_tasks_runtime_block_on_bounded(&cx, legacy_builder.connect_http_client_with_cx(&cx))
-            .expect("the real facade server retains its exact legacy route");
-    let legacy_error = final_tasks_runtime_block_on_bounded(
-        &cx,
+    let legacy_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("legacy Tasks E2E runtime builds");
+    let legacy_cx = legacy_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    let legacy = final_tasks_owned_runtime_block_on_bounded(
+        &legacy_runtime,
+        &legacy_cx,
+        legacy_builder.connect_http_client_with_cx(&legacy_cx),
+    )
+    .expect("the real facade server retains its exact legacy route");
+    let legacy_error = final_tasks_owned_runtime_block_on_bounded(
+        &legacy_runtime,
+        &legacy_cx,
         legacy
             .connection()
-            .get_task_final(&cx, RequestId::Number(8), task_id, 1 << 20),
+            .get_task_final(&legacy_cx, RequestId::Number(8), task_id, 1 << 20),
     )
     .expect_err("exact legacy selection rejects the official final Tasks method");
     assert!(matches!(
@@ -3834,18 +3854,24 @@ fn workflow_public_http_resource_and_prompt_mrtr_preserve_typed_state_and_bounds
     assert_eq!(prompt_initial.load(Ordering::SeqCst), 1);
     assert_eq!(prompt_resumed.load(Ordering::SeqCst), 1);
 
-    let mut legacy = final_tasks_runtime_block_on_bounded(
-        &cx,
+    let legacy_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("legacy MRTR E2E runtime builds");
+    let legacy_cx = legacy_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    let mut legacy = final_tasks_owned_runtime_block_on_bounded(
+        &legacy_runtime,
+        &legacy_cx,
         auto::client_builder()
             .client_info("public-resource-prompt-mrtr-legacy-client", "1.0.0")
             .protocol_plan(fixture.plan(ProtocolPolicy::LegacyOnly))
-            .connect_http_client_with_cx(&cx),
+            .connect_http_client_with_cx(&legacy_cx),
     )
     .expect("the fixture retains its exact legacy HTTP route");
-    let legacy_resource = final_tasks_runtime_block_on_bounded(
-        &cx,
+    let legacy_resource = final_tasks_owned_runtime_block_on_bounded(
+        &legacy_runtime,
+        &legacy_cx,
         legacy.read_resource_with_mrtr_retry(
-            &cx,
+            &legacy_cx,
             Instant::now() + FINAL_TASKS_E2E_BOUND,
             "file:///public-typed-mrtr-resource",
             SseLimits::new(1_024, 8_192, 8).expect("bounded legacy resource SSE limits"),
@@ -3858,10 +3884,11 @@ fn workflow_public_http_resource_and_prompt_mrtr_preserve_typed_state_and_bounds
         legacy_resource,
         auto::HttpClientError::Connection(ClientHttpConnectionError::MrtrRequiresModern)
     ));
-    let legacy_prompt = final_tasks_runtime_block_on_bounded(
-        &cx,
+    let legacy_prompt = final_tasks_owned_runtime_block_on_bounded(
+        &legacy_runtime,
+        &legacy_cx,
         legacy.get_prompt_with_mrtr_retry(
-            &cx,
+            &legacy_cx,
             Instant::now() + FINAL_TASKS_E2E_BOUND,
             "public-typed-mrtr-prompt",
             HashMap::new(),

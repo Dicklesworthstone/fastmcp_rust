@@ -1804,19 +1804,27 @@ thread_local! {
     static PUBLIC_HTTP_RUNTIME: OnceCell<asupersync::runtime::Runtime> = const { OnceCell::new() };
 }
 
-fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
+fn with_public_http_runtime<T>(operation: impl FnOnce(&asupersync::runtime::Runtime) -> T) -> T {
     PUBLIC_HTTP_RUNTIME.with(|runtime| {
-        runtime
-            .get_or_init(|| {
-                asupersync::runtime::RuntimeBuilder::current_thread()
-                    .with_reactor(
-                        asupersync::runtime::reactor::create_reactor()
-                            .expect("public HTTP application reactor initializes"),
-                    )
-                    .build()
-                    .expect("public HTTP application owns its runtime")
-            })
-            .block_on(future)
+        operation(runtime.get_or_init(|| {
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(
+                    asupersync::runtime::reactor::create_reactor()
+                        .expect("public HTTP application reactor initializes"),
+                )
+                .build()
+                .expect("public HTTP application owns its runtime")
+        }))
+    })
+}
+
+fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
+    with_public_http_runtime(|runtime| runtime.block_on(future))
+}
+
+fn public_http_caller() -> Cx {
+    with_public_http_runtime(|runtime| {
+        runtime.request_cx_with_budget(asupersync::Budget::INFINITE)
     })
 }
 
@@ -3492,7 +3500,7 @@ fn e2e_overlap_worker_timeout_releases_fixture_teardown() {
 
 #[test]
 fn e2e_public_http_typed_facades_invoke_real_handlers_in_each_exact_era() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
 
     let modern_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
     let modern = invoke_modern_public_handlers(&cx, modern_server.address());
@@ -3507,7 +3515,7 @@ fn e2e_public_http_typed_facades_invoke_real_handlers_in_each_exact_era() {
 
 #[test]
 fn e2e_public_sse_constructor_invokes_live_legacy_handlers() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
     let mut client = runtime_block_on_bounded(
         &cx,
@@ -3740,7 +3748,7 @@ fn assert_public_http_large_tool_text(tool: &serde_json::Value, lane: &str) {
 /// must carry a tool result far above the old 16 KiB line bound.
 #[test]
 fn e2e_public_sse_constructor_carries_a_tool_result_over_64_kib() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_large_result_http_server(ProtocolPolicy::LegacyOnly);
     let mut client = runtime_block_on_bounded(
         &cx,
@@ -4036,7 +4044,7 @@ fn spawn_legacy_compose_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_sse_compose_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_compose_http_server();
     let mut client = runtime_block_on_bounded(
         &cx,
@@ -4108,7 +4116,7 @@ fn e2e_public_sse_compose_nested_tool_and_resource() {
 
 #[test]
 fn e2e_public_sse_prompt_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_compose_http_server();
     let mut client = runtime_block_on_bounded(
         &cx,
@@ -4185,7 +4193,7 @@ fn e2e_public_sse_prompt_composes_nested_tool_and_resource() {
 
 #[test]
 fn e2e_public_sse_resource_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_compose_http_server();
     let mut client = runtime_block_on_bounded(
         &cx,
@@ -4351,7 +4359,7 @@ fn legacy_caps_text(result: &legacy_2024::CallToolResult) -> String {
 
 #[test]
 fn e2e_public_sse_handler_sees_initialized_client_capabilities() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let with_resources = spawn_legacy_caps_http_server(true);
     let without_resources = spawn_legacy_caps_http_server(false);
 
@@ -9393,7 +9401,7 @@ fn e2e_modern_facade_native_http_completion_returns_typed_result_and_rejects_und
 
 #[test]
 fn e2e_public_http_cross_era_refusals_leave_handler_observables_unchanged() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
 
     let modern_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
     let modern_before = invoke_modern_public_handlers(&cx, modern_server.address());
@@ -9601,7 +9609,7 @@ fn e2e_public_http_modern_only_selects_modern_and_refuses_legacy_only() {
 #[test]
 fn e2e_public_http_legacy_only_selects_legacy_and_refuses_modern_only() {
     let legacy_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let builder = auto::client_builder()
         .client_info("e2e-legacy-only-http-client", "1.0.0")
         .protocol_plan(plan(legacy_server.address(), ProtocolPolicy::LegacyOnly));
@@ -9659,7 +9667,7 @@ fn e2e_public_http_legacy_only_selects_legacy_and_refuses_modern_only() {
 #[test]
 fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
     let server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
 
     // This differs from the matched Auto-modern positive only in the live
     // server policy. The LegacyOnly endpoint returns its real modern-route
@@ -9727,7 +9735,7 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
         ProtocolEra::Modern2026
     );
 
-    let legacy_cx = Cx::for_request();
+    let legacy_cx = public_http_caller();
     let legacy_builder = auto::client_builder()
         .client_info("e2e-isolated-legacy-client", "1.0.0")
         .protocol_plan(plan_with_modern_post_path(
@@ -10770,7 +10778,7 @@ fn e2e_public_http_typed_verbs_honor_pre_send_cancellation() {
 
 #[test]
 fn e2e_public_http_legacy_typed_verbs_honor_pre_send_cancellation() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_instructions_http_server(false);
     let mut client = connect_legacy_http_client(
         &cx,
@@ -16132,7 +16140,7 @@ fn e2e_public_http_as_proxy_forwards_hide_as_request_local_on_stateless_http() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_hide_and_show_of_prefixed_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_hide_http_server();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -16277,7 +16285,7 @@ fn e2e_public_http_legacy_as_proxy_forwards_hide_and_show_of_prefixed_tool() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_hide_catalog_of_prefixed_resource_and_prompt() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_hide_catalog_http_server();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -16619,7 +16627,7 @@ fn e2e_public_http_as_proxy_mask_error_details_hides_upstream_resource_secret() 
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_mask_error_details_hides_upstream_resource_secret() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_leak_upstream();
     let masked_gateway =
         spawn_legacy_as_proxy_instructions_gateway_named(upstream.address(), None, true, None);
@@ -16785,7 +16793,7 @@ fn e2e_public_http_as_proxy_stdio_unmask_error_details_keeps_upstream_resource_s
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_mask_error_details_hides_upstream_resource_secret() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let masked_gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         true,
@@ -16942,7 +16950,7 @@ fn e2e_public_http_as_proxy_forwards_handler_timeout_of_prefixed_slow_tool() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_handler_timeout_of_prefixed_slow_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_timeout_upstream();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -17057,7 +17065,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_handler_timeout_of_prefixed_slow_tool
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_handler_timeout_of_prefixed_slow_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -17118,7 +17126,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_handler_timeout_of_prefixed_sl
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_include_tags_filters_prefixed_tools() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -17204,7 +17212,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_include_tags_filters_prefixed_tools() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_include_tags_filters_prefixed_tools() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_timeout_upstream();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -17344,7 +17352,7 @@ fn e2e_public_http_as_proxy_stdio_composes_nested_tool_and_resource() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -17476,7 +17484,7 @@ fn e2e_public_http_as_proxy_stdio_composes_nested_prompt() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_composes_nested_prompt() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -17589,7 +17597,7 @@ fn e2e_public_http_as_proxy_stdio_resource_composes_nested_tool_and_resource() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_resource_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -17730,7 +17738,7 @@ fn e2e_public_http_as_proxy_stdio_prompt_composes_nested_tool_and_resource() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_prompt_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -17882,7 +17890,7 @@ fn e2e_public_http_as_proxy_stdio_from_prompt_composes_nested_prompt() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_from_prompt_composes_nested_prompt() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -17962,7 +17970,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_from_prompt_composes_nested_prompt() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_inbound_completion_progress_marker() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -18104,7 +18112,7 @@ fn e2e_public_http_as_proxy_stdio_resource_composes_nested_prompt() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_resource_composes_nested_prompt() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -18246,7 +18254,7 @@ fn e2e_public_http_as_proxy_composes_nested_tool_and_resource() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_compose_http_server();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -18382,7 +18390,7 @@ fn e2e_public_http_as_proxy_composes_nested_prompt() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_composes_nested_prompt() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_compose_prompt_http_server();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -18507,7 +18515,7 @@ fn e2e_public_http_as_proxy_resource_composes_nested_tool_and_resource() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_resource_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_compose_http_server();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -18656,7 +18664,7 @@ fn e2e_public_http_as_proxy_prompt_composes_nested_tool_and_resource() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_prompt_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_compose_http_server();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -18811,7 +18819,7 @@ fn e2e_public_http_as_proxy_from_prompt_composes_nested_prompt() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_from_prompt_composes_nested_prompt() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_compose_prompt_http_server();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -18890,7 +18898,7 @@ fn e2e_public_http_legacy_as_proxy_from_prompt_composes_nested_prompt() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_inbound_completion_progress_marker() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_completion_progress_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -19031,7 +19039,7 @@ fn e2e_public_http_as_proxy_sanitizes_prefixed_handler_panic() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_sanitizes_prefixed_handler_panic() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_panic_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -19168,7 +19176,7 @@ fn e2e_public_http_as_proxy_stdio_sanitizes_prefixed_handler_panic() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_sanitizes_prefixed_handler_panic() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(vec![(
         "FASTMCP_PANIC_TOOL".to_owned(),
         "1".to_owned(),
@@ -19414,7 +19422,7 @@ fn e2e_public_http_as_proxy_sanitizes_prefixed_catalog_and_completion_panic() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_sanitizes_prefixed_catalog_and_completion_panic() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_panic_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -19795,7 +19803,7 @@ fn e2e_public_http_as_proxy_stdio_sanitizes_prefixed_catalog_and_completion_pani
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_sanitizes_prefixed_catalog_and_completion_panic() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(vec![
         ("FASTMCP_PANIC_CATALOG".to_owned(), "1".to_owned()),
         ("FASTMCP_PANIC_COMPLETE".to_owned(), "1".to_owned()),
@@ -20098,7 +20106,7 @@ fn e2e_public_http_as_proxy_gateway_cache_hits_prefixed_allowlisted_tool() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_gateway_cache_hits_prefixed_allowlisted_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_counting_upstream();
     let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
     let gateway = spawn_legacy_as_proxy_http_gateway_configured(
@@ -21032,7 +21040,7 @@ fn e2e_public_http_legacy_as_proxy_gateway_custom_verifier_refuses_missing_and_s
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_gateway_session_state_uses_shared_upstream_bag() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_state_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway_configured(
         upstream.address(),
@@ -21122,7 +21130,7 @@ fn e2e_public_http_legacy_as_proxy_gateway_session_state_uses_shared_upstream_ba
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_gateway_strict_input_refuses_unknown_property() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_counting_upstream();
     let strict_gateway = spawn_legacy_as_proxy_http_gateway_configured(
         upstream.address(),
@@ -21311,7 +21319,7 @@ fn e2e_public_http_as_proxy_gateway_list_page_size_pages_prefixed_tools() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_gateway_list_page_size_pages_prefixed_tools() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_counting_upstream();
     let paged = spawn_legacy_as_proxy_http_gateway_configured(
         upstream.address(),
@@ -21486,7 +21494,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_default_list_is_not_page_size_1() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_list_page_size_pages_prefixed_tools() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
@@ -21555,7 +21563,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_list_page_size_pages_prefixed_t
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_default_list_is_not_page_size_1() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(Vec::new());
     let mut client = connect_legacy_http_client(
         &cx,
@@ -21991,7 +21999,7 @@ fn spawn_legacy_as_proxy_http_duplicate_gateway(
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_gateway_on_duplicate_error_keeps_local_prefixed_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_counting_upstream();
     let gateway =
         spawn_legacy_as_proxy_http_duplicate_gateway(upstream.address(), DuplicateBehavior::Error);
@@ -22049,7 +22057,7 @@ fn e2e_public_http_legacy_as_proxy_gateway_on_duplicate_error_keeps_local_prefix
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_gateway_on_duplicate_replace_installs_proxied_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_counting_upstream();
     let gateway = spawn_legacy_as_proxy_http_duplicate_gateway(
         upstream.address(),
@@ -22094,7 +22102,7 @@ fn e2e_public_http_legacy_as_proxy_gateway_on_duplicate_replace_installs_proxied
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_session_state_uses_shared_upstream_bag() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(Vec::new());
     let mut client = connect_legacy_http_client(
         &cx,
@@ -22346,7 +22354,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_on_duplicate_replace_installs_echo() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_on_duplicate_error_keeps_local_echo() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_duplicate_gateway(DuplicateBehavior::Error);
     let mut client = connect_legacy_http_client(
         &cx,
@@ -22399,7 +22407,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_on_duplicate_error_keeps_local_
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_on_duplicate_replace_installs_echo() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_duplicate_gateway(DuplicateBehavior::Replace);
     let mut client = connect_legacy_http_client(
         &cx,
@@ -22533,7 +22541,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_lenient_input_admits_unknown_property(
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_strict_input_refuses_unknown_property() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
@@ -22600,7 +22608,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_strict_input_refuses_unknown_pr
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_lenient_input_admits_unknown_property() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
@@ -22644,7 +22652,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_lenient_input_admits_unknown_pr
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_gateway_sliding_window_refuses_second_prefixed_call() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_counting_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway_configured(
         upstream.address(),
@@ -22722,7 +22730,7 @@ fn e2e_public_http_legacy_as_proxy_gateway_sliding_window_refuses_second_prefixe
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_gateway_rate_limit_refuses_second_prefixed_call() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_counting_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway_configured(
         upstream.address(),
@@ -22873,7 +22881,7 @@ fn e2e_public_http_as_proxy_forwards_transformed_prefixed_tool() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_transformed_prefixed_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_transform_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway_configured(
         upstream.address(),
@@ -23041,7 +23049,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_cache_hits_prefixed_allowlisted_tool()
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_cache_hits_prefixed_allowlisted_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
@@ -23198,7 +23206,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_rate_limit_refuses_second_prefixed_cal
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_rate_limit_refuses_second_prefixed_call() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
@@ -23332,7 +23340,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_sliding_window_refuses_second_prefixed
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_gateway_sliding_window_refuses_second_prefixed_call() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
@@ -23833,7 +23841,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_transformed_prefixed_tool() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_transformed_prefixed_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(vec![(
         "FASTMCP_TRANSFORM_ECHO".to_owned(),
         "1".to_owned(),
@@ -23964,7 +23972,7 @@ fn e2e_public_http_as_proxy_resource_composes_nested_prompt() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_resource_composes_nested_prompt() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_compose_prompt_http_server();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -24115,7 +24123,7 @@ fn e2e_public_http_as_proxy_request_timeout_of_hold_tool_without_handler_timeout
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_request_timeout_of_hold_tool_without_handler_timeout() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_hold_upstream();
     let gateway =
         spawn_legacy_as_proxy_instructions_gateway_named(upstream.address(), None, false, Some(1));
@@ -24251,7 +24259,7 @@ fn e2e_public_http_as_proxy_stdio_request_timeout_of_hold_tool_without_handler_t
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_request_timeout_of_hold_tool_without_handler_timeout() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
         Vec::new(),
         false,
@@ -31928,7 +31936,7 @@ fn spawn_legacy_client_identity_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_http_legacy_client_info_is_visible_to_handler() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_client_identity_http_server();
     let mut identified_client = runtime_block_on_bounded(
         &cx,
@@ -32091,7 +32099,7 @@ fn spawn_legacy_instructions_http_server(with_instructions: bool) -> HttpServerF
 
 #[test]
 fn e2e_public_http_legacy_initialize_retains_instructions_and_peer_stays_bare() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let instructed = spawn_legacy_instructions_http_server(true);
     let bare = spawn_legacy_instructions_http_server(false);
     let instructed_client = runtime_block_on_bounded(
@@ -32245,7 +32253,7 @@ fn take_legacy_http_notifications_until(
 
 #[test]
 fn e2e_public_http_legacy_tools_list_changed_is_retained_on_sse() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_catalog_http_server();
     let mut client = runtime_block_on_bounded_named(
         &cx,
@@ -32431,7 +32439,7 @@ fn legacy_http_progress_meta(
 
 #[test]
 fn e2e_public_http_legacy_progress_marker_is_retained_on_sse() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_progress_http_server();
     let mut client = runtime_block_on_bounded_named(
         &cx,
@@ -32703,7 +32711,7 @@ fn legacy_http_log_message_is(
 
 #[test]
 fn e2e_public_http_legacy_ctx_info_is_retained_on_sse() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_log_http_server();
     let mut client = runtime_block_on_bounded_named(
         &cx,
@@ -32993,7 +33001,7 @@ fn legacy_disabled_tool_observable<E: std::fmt::Debug>(
 
 #[test]
 fn e2e_public_http_legacy_resource_updated_is_retained_on_sse() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_subscription_http_server();
     let mut client = connect_legacy_subscription_http_client(
         &cx,
@@ -33077,7 +33085,7 @@ fn e2e_public_http_legacy_resource_updated_is_retained_on_sse() {
 
 #[test]
 fn e2e_public_http_legacy_resource_unsubscribe_stops_updated_notifications() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_subscription_http_server();
     let mut client = connect_legacy_subscription_http_client(
         &cx,
@@ -33172,7 +33180,7 @@ fn e2e_public_http_legacy_resource_unsubscribe_stops_updated_notifications() {
 
 #[test]
 fn e2e_public_http_legacy_resource_and_prompt_list_changed_are_retained_on_sse() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_subscription_http_server();
     let mut client = connect_legacy_subscription_http_client(
         &cx,
@@ -33359,7 +33367,7 @@ fn spawn_legacy_filesystem_http_server() -> HttpServerFixture {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn e2e_public_http_legacy_filesystem_provider_lists_and_reads_live_file() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_filesystem_http_server();
     let mut client = runtime_block_on_bounded_named(
         &cx,
@@ -33762,7 +33770,7 @@ fn connect_legacy_http_client(cx: &Cx, address: SocketAddr, name: &str) -> legac
 
 #[test]
 fn e2e_public_http_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_is_refused() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let advertised = spawn_legacy_instructions_http_server(false);
     let omitted = spawn_legacy_instructions_http_server(false);
     let mut admitted = runtime_block_on_bounded_named(
@@ -33833,7 +33841,7 @@ fn e2e_public_http_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_i
 
 #[test]
 fn e2e_public_http_legacy_ping_is_admitted_and_missing_tool_stays_refused() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_instructions_http_server(false);
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-ping");
@@ -33871,7 +33879,7 @@ fn e2e_public_http_legacy_ping_is_admitted_and_missing_tool_stays_refused() {
 
 #[test]
 fn e2e_public_http_legacy_complete_is_retained_and_peer_without_handler_is_refused() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let advertised = spawn_legacy_complete_http_server();
     let omitted = spawn_legacy_instructions_http_server(false);
     let mut advertised_client =
@@ -33970,7 +33978,7 @@ fn e2e_public_http_legacy_complete_is_retained_and_peer_without_handler_is_refus
 
 #[test]
 fn e2e_public_http_legacy_sampling_callback_reaches_context() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_sample_http_server();
     let callback_calls = Arc::new(AtomicUsize::new(0));
     let mut client = runtime_block_on_bounded_named(
@@ -34039,7 +34047,7 @@ fn e2e_public_http_legacy_sampling_callback_reaches_context() {
 /// with that count (bd-6rfrg). The count separates "the reverse request never
 /// went out" (0) from "it was answered" (1), which a sanitized error cannot.
 fn bd_6rfrg_http_sampling_round(tool: &str) -> (legacy_2024::CallToolResult, usize) {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_sample_http_server();
     let callback_calls = Arc::new(AtomicUsize::new(0));
     let mut client = runtime_block_on_bounded_named(
@@ -34132,7 +34140,7 @@ fn e2e_public_http_bd_6rfrg_driver_bridge_is_diagnosed_not_hung() {
 
 #[test]
 fn e2e_public_http_legacy_sampling_without_capability_has_no_callback_authority() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_sample_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-sample-bare");
@@ -34303,7 +34311,7 @@ fn spawn_legacy_roots_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_http_legacy_roots_callback_reaches_context() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_roots_http_server();
     let callback_calls = Arc::new(AtomicUsize::new(0));
     let mut client = runtime_block_on_bounded_named(
@@ -34370,7 +34378,7 @@ fn e2e_public_http_legacy_roots_callback_reaches_context() {
 
 #[test]
 fn e2e_public_http_legacy_roots_without_capability_has_no_callback_authority() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_roots_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-roots-bare");
@@ -34555,7 +34563,7 @@ fn legacy_http_content_value(result: &legacy_2024::CallToolResult) -> serde_json
 
 #[test]
 fn e2e_public_http_legacy_handler_timeout_refuses_late_tool_and_admits_fast_peer() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_timeout_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-timeout");
@@ -34602,7 +34610,7 @@ fn e2e_public_http_legacy_handler_timeout_refuses_late_tool_and_admits_fast_peer
 
 #[test]
 fn e2e_public_http_legacy_handler_panic_is_sanitized_and_admits_fast_peer() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_panic_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-panic");
@@ -34653,7 +34661,7 @@ fn e2e_public_http_legacy_handler_panic_is_sanitized_and_admits_fast_peer() {
 
 #[test]
 fn e2e_public_http_legacy_catalog_panic_is_sanitized_and_admits_fast_peer() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_panic_http_server();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -34755,7 +34763,7 @@ fn e2e_public_http_legacy_catalog_panic_is_sanitized_and_admits_fast_peer() {
 
 #[test]
 fn e2e_public_http_legacy_completion_panic_is_sanitized_and_admits_fast_peer() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_panic_http_server();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -34833,7 +34841,7 @@ fn e2e_public_http_legacy_completion_panic_is_sanitized_and_admits_fast_peer() {
 #[test]
 fn e2e_public_http_legacy_resource_template_completion_is_retained_and_unregistered_template_is_refused()
  {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_template_completion_http_server();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -35014,7 +35022,7 @@ fn e2e_public_http_composes_nested_prompt_and_refuses_missing_name() {
 
 #[test]
 fn e2e_public_http_legacy_composes_nested_prompt_and_refuses_missing_name() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_compose_prompt_http_server();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -35184,7 +35192,7 @@ fn e2e_public_http_resource_and_prompt_compose_nested_prompt_and_refuse_missing_
 
 #[test]
 fn e2e_public_http_legacy_resource_and_prompt_compose_nested_prompt_and_refuse_missing_name() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_compose_prompt_http_server();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -35299,7 +35307,7 @@ fn e2e_public_http_legacy_resource_and_prompt_compose_nested_prompt_and_refuse_m
 
 #[test]
 fn e2e_public_http_legacy_default_parameter_is_injected_and_overridable() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_surface_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-default");
@@ -35400,7 +35408,7 @@ fn e2e_public_http_legacy_default_parameter_is_injected_and_overridable() {
 
 #[test]
 fn e2e_public_http_legacy_output_schema_is_listed_and_call_stays_unstructured() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_surface_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-output");
@@ -35474,7 +35482,7 @@ fn e2e_public_http_legacy_output_schema_is_listed_and_call_stays_unstructured() 
 
 #[test]
 fn e2e_public_http_legacy_rich_content_retains_image_and_peer_stays_text() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_surface_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-rich");
@@ -35563,7 +35571,7 @@ fn spawn_legacy_lifespan_http_server(
 
 #[test]
 fn e2e_public_http_legacy_lifespan_hooks_run_once_and_peer_stays_unhooked() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let hooked_startup = Arc::new(AtomicBool::new(false));
     let hooked_shutdown = Arc::new(AtomicBool::new(false));
     let bare_startup = Arc::new(AtomicBool::new(false));
@@ -35639,7 +35647,7 @@ fn spawn_legacy_state_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_http_legacy_session_state_is_retained_across_sse_calls() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_state_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-state");
@@ -35741,7 +35749,7 @@ fn spawn_legacy_strict_validation_http_server(strict: bool) -> HttpServerFixture
 
 #[test]
 fn e2e_public_http_legacy_mask_error_details_hides_resource_execution_secret() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let masked_server = spawn_legacy_mask_http_server(true);
     let mut masked_client =
         connect_legacy_http_client(&cx, masked_server.address(), "e2e-public-http-legacy-mask");
@@ -35798,7 +35806,7 @@ fn e2e_public_http_legacy_mask_error_details_hides_resource_execution_secret() {
 
 #[test]
 fn e2e_public_http_legacy_rate_limit_refuses_second_same_method_and_admits_another() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_rate_limit_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-rate-limit");
@@ -35859,7 +35867,7 @@ fn e2e_public_http_legacy_rate_limit_refuses_second_same_method_and_admits_anoth
 
 #[test]
 fn e2e_public_http_legacy_sliding_window_refuses_second_same_method_and_admits_another() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_sliding_window_http_server();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -35924,7 +35932,7 @@ fn e2e_public_http_legacy_sliding_window_refuses_second_same_method_and_admits_a
 #[test]
 fn e2e_public_http_legacy_strict_input_validation_refuses_unknown_property_and_admits_declared_args()
  {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let strict_server = spawn_legacy_strict_validation_http_server(true);
     let mut strict_client = connect_legacy_http_client(
         &cx,
@@ -36701,7 +36709,7 @@ fn e2e_public_http_legacy_cancel_stops_in_flight_tools_call_and_peer_stays_admit
     );
 
     drop(sse);
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-cancel-peer");
     let peer = legacy_http_call(
@@ -36755,7 +36763,7 @@ fn spawn_legacy_cache_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_http_legacy_on_duplicate_error_refuses_the_build_and_replace_installs_second() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
 
     // Error refuses the duplicate, so no server is built at all.
     let refused = ServerBuilder::new("facade-http-legacy-duplicate", "1.0.0")
@@ -36798,7 +36806,7 @@ fn e2e_public_http_legacy_on_duplicate_error_refuses_the_build_and_replace_insta
 
 #[test]
 fn e2e_public_http_legacy_response_cache_hits_same_allowlisted_call_and_misses_changed_args() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_cache_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-cache");
@@ -36896,7 +36904,7 @@ fn spawn_legacy_transform_hide_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_http_legacy_transformed_tool_renames_argument_and_keeps_parent_unknown() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_transform_rename_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-transform");
@@ -36961,7 +36969,7 @@ fn e2e_public_http_legacy_transformed_tool_renames_argument_and_keeps_parent_unk
 
 #[test]
 fn e2e_public_http_legacy_transformed_tool_hides_argument_and_injects_default() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_transform_hide_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-hide-arg");
@@ -37041,7 +37049,7 @@ fn spawn_legacy_mounted_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_http_legacy_mount_prefixes_tool_prompt_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_mounted_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-mount");
@@ -37196,7 +37204,7 @@ fn spawn_legacy_catalog_metadata_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_http_legacy_list_tools_retains_version_tags_and_annotations() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_catalog_metadata_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-catalog");
@@ -37251,7 +37259,7 @@ fn spawn_legacy_two_client_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_http_legacy_two_clients_call_the_same_tool_independently() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_two_client_http_server();
     let mut first =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-two-a");
@@ -37310,7 +37318,7 @@ fn spawn_legacy_cursor_http_server() -> HttpServerFixture {
 
 #[test]
 fn e2e_public_http_legacy_tools_list_cursor_continues_and_rejects_query_or_kind_change() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_cursor_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-cursor");
@@ -37418,7 +37426,7 @@ const PUBLIC_HTTP_CURSOR_PROMPT_B_NAME: &str = "public-http-e2e-cursor-prompt-b"
 
 #[test]
 fn e2e_public_http_legacy_resources_and_prompts_list_cursor_continues() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_cursor_http_server();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -37596,7 +37604,7 @@ fn e2e_public_http_legacy_resources_and_prompts_list_cursor_continues() {
 
 #[test]
 fn e2e_public_http_legacy_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_compose_http_server();
     let mut client =
         connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-compose");
@@ -37655,7 +37663,7 @@ fn e2e_public_http_legacy_composes_nested_tool_and_resource() {
 
 #[test]
 fn e2e_public_http_legacy_prompt_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_compose_http_server();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -37734,7 +37742,7 @@ fn e2e_public_http_legacy_prompt_composes_nested_tool_and_resource() {
 
 #[test]
 fn e2e_public_http_legacy_resource_composes_nested_tool_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let server = spawn_legacy_compose_http_server();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -38614,7 +38622,7 @@ fn spawn_legacy_as_proxy_http_gateway_configured(
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_prefixes_tool_prompt_and_resource() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_upstream_http_server();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client =
@@ -38759,7 +38767,7 @@ fn e2e_public_http_legacy_as_proxy_prefixes_tool_prompt_and_resource() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_resource_template_completion() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_template_completion_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -38841,7 +38849,7 @@ fn e2e_public_http_legacy_as_proxy_forwards_resource_template_completion() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_advertises_completions_when_upstream_supports() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_template_completion_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -38887,7 +38895,7 @@ fn e2e_public_http_legacy_as_proxy_advertises_completions_when_upstream_supports
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_omits_completions_when_upstream_has_none() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_counting_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -38932,7 +38940,7 @@ fn e2e_public_http_legacy_as_proxy_omits_completions_when_upstream_has_none() {
 #[cfg(all(feature = "proxy", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_filesystem_template() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_filesystem_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -39047,7 +39055,7 @@ fn spawn_legacy_as_proxy_subscription_upstream() -> HttpServerFixture {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_resource_updated_on_subscribe() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_subscription_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -39179,7 +39187,7 @@ fn e2e_public_http_legacy_as_proxy_forwards_resource_updated_on_subscribe() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_inbound_log_level() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_subscription_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -39284,7 +39292,7 @@ fn e2e_public_http_legacy_as_proxy_forwards_inbound_log_level() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_inbound_progress_marker() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_subscription_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let mut client = connect_legacy_http_client(
@@ -39475,7 +39483,7 @@ fn e2e_public_http_legacy_as_proxy_forwards_inbound_progress_marker() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_inbound_sampling_and_roots() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_legacy_as_proxy_subscription_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
     let sample_calls = Arc::new(AtomicUsize::new(0));
@@ -39637,7 +39645,7 @@ fn e2e_public_http_legacy_as_proxy_forwards_inbound_sampling_and_roots() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_inbound_sampling_and_roots() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let sample_calls = Arc::new(AtomicUsize::new(0));
     let roots_calls = Arc::new(AtomicUsize::new(0));
@@ -39799,7 +39807,7 @@ const ECHO_SERVER_INSTRUCTIONS: &str =
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_retains_upstream_instructions() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let client = connect_legacy_http_client(
         &cx,
@@ -39818,7 +39826,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_retains_upstream_instructions() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_bare_upstream_omits_instructions() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(vec![(
         "FASTMCP_NO_INSTRUCTIONS".to_owned(),
         "1".to_owned(),
@@ -39996,7 +40004,7 @@ fn spawn_legacy_as_proxy_instructions_gateway_named(
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_retains_upstream_instructions() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let instructed_upstream = spawn_legacy_upstream_http_server_with_instructions();
     let instructed_gateway =
         spawn_legacy_as_proxy_instructions_gateway(instructed_upstream.address());
@@ -40036,7 +40044,7 @@ fn e2e_public_http_legacy_as_proxy_retains_upstream_instructions() {
 #[cfg(feature = "proxy")]
 #[test]
 fn e2e_public_http_legacy_as_proxy_bare_upstream_omits_instructions() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let bare_upstream = spawn_legacy_upstream_http_server();
     let gateway = spawn_legacy_as_proxy_instructions_gateway(bare_upstream.address());
     let client = connect_legacy_http_client(
@@ -40057,7 +40065,7 @@ fn e2e_public_http_legacy_as_proxy_bare_upstream_omits_instructions() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_inbound_log_level() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -40154,7 +40162,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_inbound_log_level() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_hide_and_show_of_prefixed_tool() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -40294,7 +40302,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_hide_and_show_of_prefixed_tool
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_hide_catalog_of_prefixed_resource_and_prompt() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -40480,7 +40488,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_hide_catalog_of_prefixed_resou
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_inbound_progress_marker() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -40669,7 +40677,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_inbound_progress_marker() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_resource_updated_on_subscribe() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -40828,7 +40836,7 @@ fn spawn_legacy_http_stdio_as_proxy_filesystem_gateway() -> HttpServerFixture {
 #[cfg(all(unix, feature = "proxy", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_filesystem_template() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_filesystem_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -40917,7 +40925,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_filesystem_template() {
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_forwards_resource_template_completion() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -41022,7 +41030,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_resource_template_completion()
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_advertises_completions_when_echo_supports() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
     let mut client = connect_legacy_http_client(
         &cx,
@@ -41067,7 +41075,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_advertises_completions_when_echo_suppor
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_omits_completions_when_echo_has_none() {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(vec![(
         "FASTMCP_NO_COMPLETIONS".to_owned(),
         "1".to_owned(),
