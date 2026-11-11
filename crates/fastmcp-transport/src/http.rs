@@ -991,6 +991,10 @@ impl HttpResponse {
     }
 
     /// Sets CORS headers for cross-origin requests.
+    ///
+    /// The caller must admit `origin` against its explicit allowlist first.
+    /// The fixed header grant supports ordinary modern MCP requests; custom
+    /// parameter headers require a separately configured security policy.
     #[must_use]
     pub fn with_cors(mut self, origin: &str) -> Self {
         if !is_valid_http_field_value("origin", origin) {
@@ -1006,12 +1010,46 @@ impl HttpResponse {
         );
         self.headers.insert(
             "access-control-allow-headers".to_string(),
-            "Content-Type, Authorization".to_string(),
+            MCP_CORS_REQUEST_HEADERS.join(", "),
         );
         self.headers.insert(
-            "vary".to_string(),
-            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers".to_string(),
+            "access-control-expose-headers".to_string(),
+            "WWW-Authenticate, MCP-Protocol-Version, Retry-After".to_string(),
         );
+        // CORS adds variance; it cannot erase an application's representation
+        // selection (for example Accept) or weaken an existing wildcard.
+        let mut vary = String::new();
+        self.headers.retain(|name, value| {
+            if !name.eq_ignore_ascii_case("vary") {
+                return true;
+            }
+            if !vary.is_empty() {
+                vary.push_str(", ");
+            }
+            vary.push_str(value);
+            false
+        });
+        if vary.split(',').any(|name| name.trim() == "*") {
+            vary.clear();
+            vary.push('*');
+        } else {
+            for required in [
+                "Origin",
+                "Access-Control-Request-Method",
+                "Access-Control-Request-Headers",
+            ] {
+                if !vary
+                    .split(',')
+                    .any(|name| name.trim().eq_ignore_ascii_case(required))
+                {
+                    if !vary.is_empty() {
+                        vary.push_str(", ");
+                    }
+                    vary.push_str(required);
+                }
+            }
+        }
+        self.headers.insert("vary".to_string(), vary);
         self
     }
 }
@@ -3291,6 +3329,47 @@ impl<'a> Iterator for AcceptQuotedParts<'a> {
 // HTTP Request Handler
 // =============================================================================
 
+// Keep preflight admission and the response grant in one fixed vocabulary.
+// Origin permission alone must not authorize arbitrary browser-selected
+// routing, proxy, credential, or schema-derived parameter headers.
+const MCP_CORS_REQUEST_HEADERS: [&str; 6] = [
+    "Accept",
+    "Authorization",
+    "Content-Type",
+    "MCP-Protocol-Version",
+    "Mcp-Method",
+    "Mcp-Name",
+];
+const MAX_CORS_REQUESTED_HEADERS: usize = 32;
+const MAX_CORS_REQUESTED_HEADER_NAME_BYTES: usize = 128;
+
+fn admit_cors_requested_headers(value: Option<&str>) -> Result<(), HttpStatus> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.len() > MAX_CORS_REQUESTED_HEADERS * (MAX_CORS_REQUESTED_HEADER_NAME_BYTES + 2) {
+        return Err(HttpStatus::BAD_REQUEST);
+    }
+    let mut names = HashSet::new();
+    for name in value.split(',') {
+        let name = name.trim_matches([' ', '\t']);
+        if names.len() >= MAX_CORS_REQUESTED_HEADERS
+            || name.len() > MAX_CORS_REQUESTED_HEADER_NAME_BYTES
+            || !is_http_token(name)
+            || !names.insert(name.to_ascii_lowercase())
+        {
+            return Err(HttpStatus::BAD_REQUEST);
+        }
+        if !MCP_CORS_REQUEST_HEADERS
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        {
+            return Err(HttpStatus::FORBIDDEN);
+        }
+    }
+    Ok(())
+}
+
 /// Configuration for the HTTP request handler.
 #[derive(Debug, Clone)]
 pub struct HttpHandlerConfig {
@@ -3427,7 +3506,11 @@ impl HttpRequestHandler {
         &self.config
     }
 
-    /// Handles a CORS preflight OPTIONS request.
+    /// Handles a bodyless CORS preflight for the configured MCP POST endpoint.
+    ///
+    /// Only explicitly allowed origins and the standard MCP request headers
+    /// receive a grant. Authentication and application dispatch do not run on
+    /// this path; the actual POST still undergoes their ordinary admission.
     #[must_use]
     pub fn handle_options(&self, request: &HttpRequest) -> HttpResponse {
         if validate_http_request_headers(request).is_err() {
@@ -3453,6 +3536,24 @@ impl HttpRequestHandler {
 
         if !allowed {
             return HttpResponse::new(HttpStatus::FORBIDDEN);
+        }
+
+        if !request.body.is_empty()
+            || request.header("transfer-encoding").is_some()
+            || request.header("content-length").is_some_and(|value| {
+                let value = value.trim_matches([' ', '\t']);
+                value.is_empty() || !value.bytes().all(|byte| byte == b'0')
+            })
+            || request
+                .header("access-control-request-private-network")
+                .is_some()
+        {
+            return HttpResponse::new(HttpStatus::BAD_REQUEST);
+        }
+        if let Err(status) =
+            admit_cors_requested_headers(request.header("access-control-request-headers"))
+        {
+            return HttpResponse::new(status);
         }
 
         HttpResponse::new(HttpStatus::OK)
@@ -6966,6 +7067,11 @@ impl DualEraHttpSession {
         let legacy_sse_target = request.path == self.legacy_sse_path;
         let legacy_post_target = request.path == self.legacy_message_path;
 
+        if modern_target && request.method == HttpMethod::Options {
+            return Ok(DualEraHttpEndpointResponse::Immediate(
+                self.handler.handle_options(&request),
+            ));
+        }
         if modern_target && request.method == HttpMethod::Post {
             return self.handle_modern(cx, request);
         }
@@ -7005,9 +7111,12 @@ impl DualEraHttpSession {
             HttpResponseRepresentation::Json => {
                 self.modern_ingress.push_request(cx, json_rpc.clone())?;
                 let Some(request_id) = json_rpc.id else {
-                    return Ok(DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
-                        HttpStatus::ACCEPTED,
-                    )));
+                    return Ok(DualEraHttpEndpointResponse::Immediate(
+                        self.handler.with_allowed_origin(
+                            HttpResponse::new(HttpStatus::ACCEPTED),
+                            origin.as_deref(),
+                        ),
+                    ));
                 };
                 Ok(DualEraHttpEndpointResponse::ModernJson(
                     DualEraHttpJsonResponse {
@@ -7023,7 +7132,10 @@ impl DualEraHttpSession {
                 self.modern_ingress.push_request(cx, json_rpc)?;
                 Ok(DualEraHttpEndpointResponse::ModernSse(
                     DualEraHttpSseResponse {
-                        response: sse_http_response(Vec::new()),
+                        response: self.handler.with_allowed_origin(
+                            sse_http_response(Vec::new()),
+                            origin.as_deref(),
+                        ),
                         body,
                         codec: Codec::new(),
                     },
@@ -9759,6 +9871,46 @@ X/aCEJ5+hA==
     }
 
     #[test]
+    fn cors_response_preserves_existing_vary_and_wildcard() {
+        let response = HttpResponse::ok()
+            .with_header("Vary", "Accept, origin")
+            .with_cors("https://trusted.example");
+        assert_eq!(
+            response.headers["vary"],
+            "Accept, origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+        );
+        let wildcard = HttpResponse::ok()
+            .with_header("Vary", "*")
+            .with_cors("https://trusted.example");
+        assert_eq!(wildcard.headers["vary"], "*");
+        let mut wildcard = HttpResponse::ok().with_header("vary", "*");
+        wildcard.headers.insert("Vary".to_owned(), "Accept".to_owned());
+        assert_eq!(wildcard.with_cors("https://trusted.example").headers["vary"], "*");
+
+        let mut duplicated = HttpResponse::ok().with_header("vary", "Accept-Encoding, ORIGIN");
+        duplicated.headers.insert("Vary".to_owned(), "Accept".to_owned());
+        let response = duplicated.with_cors("https://trusted.example");
+        assert_eq!(
+            response.headers.keys().filter(|name| name.eq_ignore_ascii_case("vary")).count(),
+            1
+        );
+        let tokens = response.headers["vary"]
+            .split(',')
+            .map(|name| name.trim().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        assert_eq!(tokens.len(), 5);
+        for expected in [
+            "accept",
+            "accept-encoding",
+            "origin",
+            "access-control-request-method",
+            "access-control-request-headers",
+        ] {
+            assert!(tokens.contains(expected));
+        }
+    }
+
+    #[test]
     fn default_http_handler_rejects_cross_origin_preflight() {
         let handler = HttpRequestHandler::new();
         let request = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
@@ -9767,6 +9919,188 @@ X/aCEJ5+hA==
 
         let response = handler.handle_options(&request);
         assert_eq!(response.status, HttpStatus::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn cors_preflight_admits_modern_mcp_headers_and_exposes_auth_challenges() {
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://trusted.example".to_owned()],
+            ..HttpHandlerConfig::default()
+        });
+        let preflight = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
+            .with_header("Origin", "https://trusted.example")
+            .with_header("Access-Control-Request-Method", "POST")
+            .with_header(
+                "Access-Control-Request-Headers",
+                "accept, AUTHORIZATION, content-type, mcp-protocol-version, Mcp-Method,\tMcp-Name ",
+            )
+            .with_header("Content-Length", "0");
+        let response = handler.handle_options(&preflight);
+        assert_eq!(response.status, HttpStatus::OK);
+        assert!(response.body.is_empty());
+        assert_eq!(
+            response.headers.get("access-control-allow-origin").map(String::as_str),
+            Some("https://trusted.example")
+        );
+        let granted = response.headers["access-control-allow-headers"]
+            .split(',')
+            .map(|name| name.trim().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let expected = [
+            "accept",
+            "authorization",
+            "content-type",
+            "mcp-protocol-version",
+            "mcp-method",
+            "mcp-name",
+        ]
+        .map(str::to_owned)
+        .into_iter()
+        .collect::<HashSet<_>>();
+        assert_eq!(granted, expected, "the browser can send every MCP routing field");
+        assert!(!response.headers.contains_key("access-control-allow-credentials"));
+
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
+            .with_header("Origin", "https://trusted.example")
+            .with_header("Content-Type", "application/json")
+            .with_header("Accept", "application/json, text/event-stream")
+            .with_header("Authorization", "Bearer browser-token")
+            .with_header("MCP-Protocol-Version", "2026-07-28")
+            .with_header("Mcp-Method", "tools/call")
+            .with_header("Mcp-Name", "echo")
+            .with_body(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": {
+                        "name": "echo", "arguments": {},
+                        "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+                    }
+                }))
+                .unwrap(),
+            );
+        assert_eq!(
+            handler.admit_modern_request(&request).unwrap().request().method,
+            "tools/call",
+            "the approved browser headers reach ordinary MCP admission"
+        );
+        let challenge = HttpResponse::new(HttpStatus::UNAUTHORIZED)
+            .with_header("WWW-Authenticate", "Bearer resource_metadata=\"https://mcp.example/metadata\"")
+            .with_header("Retry-After", "1")
+            .with_cors("https://trusted.example");
+        assert_eq!(
+            challenge.headers.get("access-control-expose-headers").map(String::as_str),
+            Some("WWW-Authenticate, MCP-Protocol-Version, Retry-After")
+        );
+        assert_eq!(challenge.headers["retry-after"], "1");
+        assert!(challenge.headers["www-authenticate"].starts_with("Bearer "));
+        assert!(!challenge.headers.contains_key("access-control-allow-credentials"));
+    }
+
+    #[test]
+    fn cors_preflight_refuses_unconfigured_headers_without_grant() {
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://trusted.example".to_owned()],
+            ..HttpHandlerConfig::default()
+        });
+        let accepted = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
+            .with_header("Origin", "https://trusted.example")
+            .with_header("Access-Control-Request-Method", "POST")
+            .with_header("Access-Control-Request-Headers", "content-type, mcp-method");
+        assert_eq!(handler.handle_options(&accepted).status, HttpStatus::OK);
+        for forbidden in [
+            "*",
+            "Cookie",
+            "Proxy-Authorization",
+            "X-Forwarded-Host",
+            "Mcp-Param-Routing",
+            "Mcp-Session-Id",
+        ] {
+            let rejected = accepted.clone().with_header(
+                "Access-Control-Request-Headers",
+                format!("content-type, mcp-method, {forbidden}"),
+            );
+            let response = handler.handle_options(&rejected);
+            assert_eq!(response.status, HttpStatus::FORBIDDEN, "{forbidden}");
+            assert!(response.body.is_empty());
+            assert!(!response.headers.contains_key("access-control-allow-origin"));
+            assert!(!response.headers.contains_key("access-control-allow-headers"));
+        }
+        assert_eq!(
+            handler.handle_options(&accepted).status,
+            HttpStatus::OK,
+            "refused header variants do not change the configured grant"
+        );
+    }
+
+    #[test]
+    fn cors_preflight_rejects_malformed_and_oversized_header_lists() {
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://trusted.example".to_owned()],
+            ..HttpHandlerConfig::default()
+        });
+        let accepted = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
+            .with_header("Origin", "https://trusted.example")
+            .with_header("Access-Control-Request-Method", "POST");
+        for invalid in [
+            String::new(),
+            "content-type,".to_owned(),
+            ",content-type".to_owned(),
+            "content-type,,mcp-method".to_owned(),
+            "Content-Type, content-type".to_owned(),
+            "content type".to_owned(),
+            "mcp-name=echo".to_owned(),
+            "x-caf\u{e9}".to_owned(),
+            "x".repeat(MAX_CORS_REQUESTED_HEADER_NAME_BYTES + 1),
+            "x".repeat(
+                MAX_CORS_REQUESTED_HEADERS * (MAX_CORS_REQUESTED_HEADER_NAME_BYTES + 2) + 1,
+            ),
+        ] {
+            let response = handler.handle_options(
+                &accepted.clone().with_header("Access-Control-Request-Headers", invalid),
+            );
+            assert_eq!(response.status, HttpStatus::BAD_REQUEST);
+            assert!(!response.headers.contains_key("access-control-allow-origin"));
+        }
+        let mut duplicate = accepted.clone();
+        duplicate.headers.insert(
+            "Access-Control-Request-Headers".to_owned(),
+            "content-type".to_owned(),
+        );
+        duplicate.headers.insert(
+            "access-control-request-headers".to_owned(),
+            "mcp-method".to_owned(),
+        );
+        assert_eq!(handler.handle_options(&duplicate).status, HttpStatus::BAD_REQUEST);
+        assert_eq!(handler.handle_options(&accepted).status, HttpStatus::OK);
+    }
+
+    #[test]
+    fn cors_preflight_rejects_bodies_framing_and_private_network_access() {
+        let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://trusted.example".to_owned()],
+            ..HttpHandlerConfig::default()
+        });
+        let accepted = HttpRequest::new(HttpMethod::Options, "/mcp/v1")
+            .with_header("Origin", "https://trusted.example")
+            .with_header("Access-Control-Request-Method", "POST")
+            .with_header("Access-Control-Request-Headers", "content-type");
+        for rejected in [
+            accepted.clone().with_body("x"),
+            accepted.clone().with_header("Content-Length", "1"),
+            accepted.clone().with_header("Content-Length", "+0"),
+            accepted.clone().with_header("Content-Length", "invalid"),
+            accepted.clone().with_header("Transfer-Encoding", "chunked"),
+            accepted.clone().with_header("Access-Control-Request-Private-Network", "true"),
+        ] {
+            let response = handler.handle_options(&rejected);
+            assert_eq!(response.status, HttpStatus::BAD_REQUEST);
+            assert!(!response.headers.contains_key("access-control-allow-origin"));
+        }
+        assert_eq!(handler.handle_options(&accepted).status, HttpStatus::OK);
     }
 
     #[test]
@@ -13391,6 +13725,110 @@ Content-Length: {}\r\n\
         let config =
             DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test");
         DualEraHttpEndpoint::new(handler, config).expect("dual-era endpoint configuration is valid")
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn cors_dual_era_endpoint() -> DualEraHttpEndpoint {
+        DualEraHttpEndpoint::new(
+            HttpRequestHandler::with_config(HttpHandlerConfig {
+                base_path: "/mcp".to_owned(),
+                allow_cors: true,
+                cors_origins: vec!["https://trusted.example".to_owned()],
+                ..HttpHandlerConfig::default()
+            }),
+            DualEraHttpEndpointConfig::new(
+                "/legacy/sse",
+                "/legacy/messages",
+                "http://legacy.test",
+            ),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn dual_era_cors_preflight_does_not_admit_protocol_work() {
+        let mut session = cors_dual_era_endpoint().open_session().unwrap();
+        let session_id = session.session_id().to_owned();
+        let cx = Cx::for_testing();
+        let accepted = HttpRequest::new(HttpMethod::Options, "/mcp")
+            .with_header("Origin", "https://trusted.example")
+            .with_header("Access-Control-Request-Method", "POST")
+            .with_header(
+                "Access-Control-Request-Headers",
+                "authorization, content-type, mcp-protocol-version, mcp-method, mcp-name",
+            );
+        for (request, status) in [
+            (accepted.clone(), HttpStatus::OK),
+            (
+                accepted.clone().with_header("Access-Control-Request-Headers", "cookie"),
+                HttpStatus::FORBIDDEN,
+            ),
+            (
+                accepted.clone().with_header("Origin", "https://foreign.example"),
+                HttpStatus::FORBIDDEN,
+            ),
+            (
+                HttpRequest::new(HttpMethod::Options, "/legacy/sse")
+                    .with_header("Origin", "https://trusted.example")
+                    .with_header("Access-Control-Request-Method", "POST"),
+                HttpStatus::METHOD_NOT_ALLOWED,
+            ),
+            (accepted, HttpStatus::OK),
+        ] {
+            let response = session.handle(&cx, request).unwrap();
+            let DualEraHttpEndpointResponse::Immediate(response) = response else {
+                panic!("preflight must not open a protocol response stream");
+            };
+            assert_eq!(response.status, status);
+            assert!(response.body.is_empty());
+            assert_eq!(session.session_id(), session_id);
+            assert_eq!(session.legacy_stream_generation, 0);
+            assert!(!session.legacy_lifecycle().is_live());
+            assert_eq!(session.modern_transport.pending_requests(), 0);
+            assert_eq!(session.modern_transport.pending_responses(), 0);
+            assert!(session.take_legacy_request().is_none());
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn dual_era_cors_grant_reaches_json_and_sse_response_heads() {
+        let cx = Cx::for_testing();
+        for media_type in ["application/json", "text/event-stream"] {
+            let mut session = cors_dual_era_endpoint().open_session().unwrap();
+            let request = dual_era_modern_sse_request(904)
+                .with_header("Origin", "https://trusted.example")
+                .with_header("Accept", media_type);
+            let response = session.handle(&cx, request).unwrap();
+            assert_eq!(session.recv_modern_request(&cx).unwrap().method, "tools/call");
+            let completed = JsonRpcResponse::success(
+                RequestId::Number(904),
+                serde_json::json!({"ok": true}),
+            );
+            let response = match response {
+                DualEraHttpEndpointResponse::ModernJson(response) => {
+                    session.send_modern_json_response(&cx, completed).unwrap();
+                    response.try_response().unwrap().unwrap()
+                }
+                DualEraHttpEndpointResponse::ModernSse(response) => {
+                    session
+                        .send_modern_sse_response(&cx, &response.cancellation(), completed)
+                        .unwrap();
+                    assert!(response.recv_event(&cx).unwrap().data.contains("true"));
+                    response.response().clone()
+                }
+                _ => panic!("the actual POST must retain its selected response representation"),
+            };
+            assert_eq!(response.status, HttpStatus::OK);
+            assert_eq!(response.headers["content-type"], media_type);
+            assert_eq!(response.headers["access-control-allow-origin"], "https://trusted.example");
+            assert_eq!(
+                response.headers["access-control-expose-headers"],
+                "WWW-Authenticate, MCP-Protocol-Version, Retry-After"
+            );
+            assert!(!response.headers.contains_key("access-control-allow-credentials"));
+        }
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

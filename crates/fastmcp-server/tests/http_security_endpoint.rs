@@ -1,6 +1,7 @@
-//! Exercises the public secured embedding entry against the actual HTTP server,
-//! authentication provider, and registered tool. These are not live socket/TLS
-//! proofs. No cfg(test) seam substitutes for the production dispatch entry.
+//! Exercises secured embedding and configured browser CORS through the public
+//! HTTP server, authentication provider, and registered tool. The browser tests
+//! also use the default native listener over loopback sockets; they do not prove
+//! TLS or browser-engine behavior. No cfg(test) seam replaces production dispatch.
 
 // bd-pf5n7: the default 128 is exceeded resolving this crate's async blocks through
 // `handle_secured_async` -> `await_dispatch` in fastmcp-server PRODUCTION source
@@ -40,10 +41,10 @@ use fastmcp_server::http_admission::security::HttpSecurityPolicy;
 use fastmcp_server::http_admission::security::endpoint::SecuredHttpEndpointError;
 use fastmcp_server::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
 use fastmcp_server::{
-    AuthProvider, AuthRequest, Server, ServerHttpEndpoint, ServerHttpEndpointResponse,
-    StaticTokenVerifier, TokenAuthProvider, ToolHandler,
+    AuthProvider, AuthRequest, HttpServerConfig, HttpServerShutdown, Server, ServerHttpEndpoint,
+    ServerHttpEndpointResponse, StaticTokenVerifier, TokenAuthProvider, ToolHandler,
 };
-use fastmcp_transport::http::{HttpMethod, HttpRequest};
+use fastmcp_transport::http::{HttpHandlerConfig, HttpMethod, HttpRequest};
 use serde_json::json;
 
 #[derive(Clone)]
@@ -382,4 +383,261 @@ fn secured_http_returned_sse_retains_its_session_until_explicit_close() {
             "stream close cannot cancel the parent task"
         );
     });
+}
+
+
+fn browser_server(probe: &Probe, protocol: ProtocolPolicy) -> Server {
+    Server::new("browser-http", "1.0.0")
+        .protocol_policy(protocol)
+        .unwrap()
+        .http_config(HttpServerConfig::new().handler_config(HttpHandlerConfig {
+            base_path: "/browser/mcp".to_owned(),
+            allow_cors: true,
+            cors_origins: vec!["https://app.example".to_owned()],
+            ..HttpHandlerConfig::default()
+        }))
+        .auth_provider(probe.clone())
+        .tool(probe.clone())
+        .build()
+}
+
+fn browser_preflight() -> HttpRequest {
+    HttpRequest::new(HttpMethod::Options, "/browser/mcp")
+        .with_header("origin", "https://app.example")
+        .with_header("access-control-request-method", "POST")
+        .with_header(
+            "access-control-request-headers",
+            "authorization, content-type, mcp-protocol-version, mcp-method, mcp-name",
+        )
+}
+
+#[test]
+fn native_http_embedding_preflight_does_not_authenticate_or_dispatch() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let server = browser_server(&probe, ProtocolPolicy::ModernOnly);
+        #[cfg(feature = "legacy-2024-11-05")]
+        let endpoint = server.into_http_endpoint("http://service.example").unwrap();
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let endpoint = server.into_http_endpoint().unwrap();
+        let mut session = endpoint.open_session(&cx).unwrap();
+        for (request, status) in [
+            (browser_preflight(), 200),
+            (
+                browser_preflight()
+                    .with_header("access-control-request-headers", "x-unreviewed"),
+                403,
+            ),
+            (
+                browser_preflight().with_header("origin", "https://untrusted.example"),
+                403,
+            ),
+        ] {
+            let ServerHttpEndpointResponse::Immediate(response) =
+                session.handle_async(&cx, request).await.unwrap()
+            else {
+                panic!("preflight must not create an MCP response stream")
+            };
+            assert_eq!(response.status.0, status);
+            assert!(response.body.is_empty());
+            assert_eq!(probe.counts(), (0, 0));
+            assert_eq!(
+                response.headers.contains_key("access-control-allow-origin"),
+                status == 200
+            );
+        }
+        session.close(&cx).await;
+    });
+}
+
+async fn browser_exchange(
+    cx: &Cx,
+    address: std::net::SocketAddr,
+    request: HttpRequest,
+) -> Result<Vec<u8>, String> {
+    use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+    let operation = async {
+        let mut stream = asupersync::net::TcpStream::connect(address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut wire = format!(
+            "{} {} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n",
+            request.method.as_str(),
+            request.path,
+            request.body.len(),
+        );
+        for (name, value) in &request.headers {
+            if !name.eq_ignore_ascii_case("host") {
+                wire.push_str(&format!("{name}: {value}\r\n"));
+            }
+        }
+        wire.push_str("\r\n");
+        stream
+            .write_all(wire.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+        stream
+            .write_all(&request.body)
+            .await
+            .map_err(|error| error.to_string())?;
+        stream.flush().await.map_err(|error| error.to_string())?;
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(response)
+    };
+    asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), operation)
+        .await
+        .map_err(|_| "browser HTTP exchange timed out".to_owned())?
+}
+
+fn browser_response(
+    response: &[u8],
+) -> (u16, std::collections::HashMap<String, String>, &[u8]) {
+    let boundary = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap();
+    let head = std::str::from_utf8(&response[..boundary]).unwrap();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let headers = lines
+        .map(|line| {
+            let (name, value) = line.split_once(':').unwrap();
+            (name.to_ascii_lowercase(), value.trim().to_owned())
+        })
+        .collect();
+    (status, headers, &response[boundary + 4..])
+}
+
+fn native_http_browser_round_trip(protocol: ProtocolPolicy) {
+    run(move |cx| async move {
+        let probe = Probe::new();
+        let bound = browser_server(&probe, protocol)
+            .bind_http(&cx, "127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = bound.local_addr().unwrap();
+        let observing = probe.clone();
+        let shutdown_cx = cx.clone();
+        let mut client = cx
+            .spawn(move |client_cx| async move {
+                let result = async {
+                    let mut responses = Vec::new();
+                    for preflight in [
+                        browser_preflight(),
+                        browser_preflight()
+                            .with_header("access-control-request-headers", "x-unreviewed"),
+                        browser_preflight().with_header("origin", "https://untrusted.example"),
+                        browser_preflight().with_body(b"unexpected".to_vec()),
+                    ] {
+                        responses.push(browser_exchange(&client_cx, address, preflight).await?);
+                        if observing.counts() != (0, 0) {
+                            return Err("preflight invoked authentication or application code".to_owned());
+                        }
+                    }
+                    for accept in ["application/json", "text/event-stream"] {
+                        let mut post = request()
+                            .with_header("origin", "https://app.example")
+                            .with_header("accept", accept);
+                        post.path = "/browser/mcp".to_owned();
+                        responses.push(browser_exchange(&client_cx, address, post).await?);
+                    }
+                    for accept in ["application/json", "text/event-stream"] {
+                        for authorization in [None, Some("Bearer rejected-browser-token")] {
+                            let mut post = request()
+                                .with_header("origin", "https://app.example")
+                                .with_header("accept", accept);
+                            post.path = "/browser/mcp".to_owned();
+                            post.headers.remove("authorization");
+                            if let Some(authorization) = authorization {
+                                post = post.with_header("authorization", authorization);
+                            }
+                            responses.push(browser_exchange(&client_cx, address, post).await?);
+                            if observing.counts().1 != 2 {
+                                return Err("rejected credentials reached application code".to_owned());
+                            }
+                        }
+                    }
+                    Ok(responses)
+                }
+                .await;
+                // Always stop the listener, including failed network exchanges.
+                shutdown_cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("browser probes complete"),
+                );
+                result
+            })
+            .unwrap();
+        let shutdown = bound.serve(&cx).await.unwrap();
+        let responses = client.join(&cx).await.unwrap().unwrap();
+        match shutdown {
+            HttpServerShutdown::Quiescent => {}
+            HttpServerShutdown::Nonquiescent(mut pending) => {
+                let settled = pending.settle_for(std::time::Duration::from_secs(1)).await;
+                panic!("browser HTTP listener did not quiesce: {settled:?}");
+            }
+        }
+        assert_eq!(responses.len(), 10);
+        for (index, response) in responses.iter().enumerate() {
+            let (status, headers, body) = browser_response(response);
+            let allowed = index == 0 || index >= 4;
+            assert_eq!(
+                status,
+                match index {
+                    1 | 2 => 403,
+                    3 => 400,
+                    6..=9 => 401,
+                    _ => 200,
+                }
+            );
+            assert_eq!(headers.contains_key("access-control-allow-origin"), allowed);
+            if allowed {
+                assert_eq!(headers["access-control-allow-origin"], "https://app.example");
+                assert!(
+                    headers["access-control-expose-headers"]
+                        .to_ascii_lowercase()
+                        .contains("www-authenticate")
+                );
+            }
+            if index < 4 {
+                assert!(body.is_empty());
+            } else if index == 4 {
+                let result: serde_json::Value = serde_json::from_slice(body).unwrap();
+                assert_eq!(result["result"]["content"][0]["text"], "verified-subject");
+            } else if index == 5 {
+                assert_eq!(headers["content-type"], "text/event-stream");
+                assert!(std::str::from_utf8(body).unwrap().contains("verified-subject"));
+            } else {
+                assert!(body.is_empty());
+                assert_eq!(headers["www-authenticate"], "Bearer");
+                assert!(!headers.contains_key("access-control-allow-credentials"));
+            }
+        }
+        // Missing credentials fail before the provider. Each rejected bearer
+        // reaches authentication once, and neither refusal dispatches the tool.
+        assert_eq!(probe.counts(), (4, 2));
+    });
+}
+
+#[test]
+fn native_http_modern_listener_serves_browser_preflight_json_and_sse() {
+    native_http_browser_round_trip(ProtocolPolicy::ModernOnly);
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn native_http_auto_listener_serves_browser_preflight_json_and_sse() {
+    native_http_browser_round_trip(ProtocolPolicy::Auto);
 }

@@ -439,9 +439,13 @@ mod modern_http_only {
                 HttpResponseRepresentation::Json => {
                     self.ingress.push_request(cx, json_rpc.clone())?;
                     let Some(request_id) = json_rpc.id else {
-                        return Ok(DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
-                            HttpStatus::ACCEPTED,
-                        )));
+                        let mut response = HttpResponse::new(HttpStatus::ACCEPTED);
+                        if let Some(origin) = origin.as_deref()
+                            && self.handler.is_origin_allowed(origin)
+                        {
+                            response = response.with_cors(origin);
+                        }
+                        return Ok(DualEraHttpEndpointResponse::Immediate(response));
                     };
                     Ok(DualEraHttpEndpointResponse::ModernJson(
                         DualEraHttpJsonResponse {
@@ -455,15 +459,17 @@ mod modern_http_only {
                 HttpResponseRepresentation::Sse => {
                     let body = admission.bind_sse_response_body(&self.responses)?;
                     self.ingress.push_request(cx, json_rpc)?;
+                    let mut response = HttpResponse::new(HttpStatus::OK)
+                        .with_header("content-type", "text/event-stream")
+                        .with_header("cache-control", "no-cache")
+                        .with_header("connection", "keep-alive");
+                    if let Some(origin) = origin.as_deref()
+                        && self.handler.is_origin_allowed(origin)
+                    {
+                        response = response.with_cors(origin);
+                    }
                     Ok(DualEraHttpEndpointResponse::ModernSse(
-                        DualEraHttpSseResponse {
-                            response: HttpResponse::new(HttpStatus::OK)
-                                .with_header("content-type", "text/event-stream")
-                                .with_header("cache-control", "no-cache")
-                                .with_header("connection", "keep-alive")
-                                .with_body(Vec::new()),
-                            body,
-                        },
+                        DualEraHttpSseResponse { response, body },
                     ))
                 }
             }
@@ -10867,6 +10873,9 @@ impl ServerHttpSession {
         if self.closed {
             return Err(DualEraHttpEndpointError::Closed);
         }
+        if let Some(response) = self.server.http_preflight_response(&request) {
+            return Ok(ServerHttpEndpointResponse::Immediate(response));
+        }
         let mut request = request;
         if request.path == self.server.http_config.health_path && request.method == HttpMethod::Get
         {
@@ -10953,7 +10962,11 @@ impl ServerHttpSession {
                 modern_request_cancellation.as_ref(),
             ).await {
                 Ok(receipt) => Some(AuthDispatchCustody::Http(receipt)),
-                Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+                Err(response) => {
+                    return Ok(ServerHttpEndpointResponse::Immediate(
+                        self.server.http_response_with_allowed_origin(&request, response),
+                    ));
+                }
             };
         }
         #[cfg(feature = "legacy-2024-11-05")]
@@ -11806,7 +11819,7 @@ impl ServerHttpSession {
             Ok(receipt) => AuthDispatchCustody::Http(receipt),
             Err(response) => {
                 return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(
-                    response,
+                    self.server.http_response_with_allowed_origin(&request, response),
                 ))));
             }
         };
@@ -15294,6 +15307,11 @@ async fn serve_http_connection(
         }
     };
 
+    if let Some(response) = endpoint.server.http_preflight_response(&request) {
+        let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
+        return;
+    }
+
     let is_legacy_sse = request.method == HttpMethod::Get
         && request.path == endpoint.server.http_config.legacy_sse_path;
     let is_modern_sse = request.method == HttpMethod::Post
@@ -15691,6 +15709,10 @@ async fn serve_modern_http_connection(
             return;
         }
     };
+    if let Some(response) = endpoint.server.http_preflight_response(&request) {
+        let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
+        return;
+    }
     let is_modern_sse = request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.handler_config.base_path
         && !http_request_is_notification(&request, http_config.max_body_size)
@@ -20294,6 +20316,34 @@ impl Server {
 
     fn configured_http_request_handler(&self) -> HttpRequestHandler {
         HttpRequestHandler::with_config(self.http_config.handler_config.clone())
+    }
+
+    /// Preflight grants use only the explicit browser-origin policy. They do
+    /// not authenticate, parse an MCP body, or allocate a request/session.
+    fn http_preflight_response(&self, request: &HttpRequest) -> Option<HttpResponse> {
+        if request.method != HttpMethod::Options
+            || request.path != self.http_config.handler_config.base_path
+            || matches!(self.protocol_policy, ProtocolPolicy::LegacyOnly)
+        {
+            return None;
+        }
+        Some(self.configured_http_request_handler().handle_options(request))
+    }
+
+    /// Makes native authentication refusals readable only to explicitly allowed
+    /// browser origins, preserving the status, body, and authentication headers.
+    fn http_response_with_allowed_origin(
+        &self,
+        request: &HttpRequest,
+        response: HttpResponse,
+    ) -> HttpResponse {
+        if let Some(origin) = request.header("origin")
+            && self.configured_http_request_handler().is_origin_allowed(origin)
+        {
+            response.with_cors(origin)
+        } else {
+            response
+        }
     }
 
     /// Runs the startup lifecycle hook, if configured.
