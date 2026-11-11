@@ -13,6 +13,8 @@
 //! separate stateless domain for standalone middleware use and tests.
 //! Responses whose context emitted progress, logging, or change notifications
 //! bypass memoization: replaying only their result would omit those effects.
+//! A modern cache hit advertises only its remaining whole-millisecond TTL;
+//! replaying it cannot renew freshness in a downstream client or gateway.
 //!
 //! # Cached Methods
 //!
@@ -654,6 +656,35 @@ fn method_requires_protocol_cache_hints(method: &str) -> bool {
             | "resources/read"
             | "resources/templates/list"
     )
+}
+
+/// A replay is older than its original result. Preserve every result member
+/// except the top-level protocol TTL, which must not outlive the stored entry.
+/// Legacy and non-cacheable result shapes never gain protocol cache hints.
+fn cap_cached_protocol_ttl(method: &str, response: &mut serde_json::Value, remaining: Duration) {
+    if !method_requires_protocol_cache_hints(method)
+        || !(response
+            .get("resultType")
+            .and_then(serde_json::Value::as_str)
+            == Some("complete")
+            || (method == SERVER_DISCOVER_METHOD && is_final_discovery_result(response)))
+    {
+        return;
+    }
+    let Some(original_ms) = response
+        .get("ttlMs")
+        .cloned()
+        .and_then(|ttl| serde_json::from_value::<CacheTtl>(ttl).ok())
+        .and_then(|ttl| ttl.try_as_millis().ok())
+    else {
+        return;
+    };
+    // Round down: rounding up would grant a downstream cache time beyond
+    // this entry's expiry. Sub-millisecond freshness is delivered as zero.
+    let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+    if remaining_ms < original_ms {
+        response["ttlMs"] = serde_json::Value::from(remaining_ms);
+    }
 }
 
 /// Configuration for caching specific methods.
@@ -1492,7 +1523,7 @@ impl Middleware for ResponseCachingMiddleware {
         };
 
         if let Some(entry) = entry {
-            if let Some(value) = decode_cached_json(&entry.encoded) {
+            if let Some(mut value) = decode_cached_json(&entry.encoded) {
                 // Invalidation may win after lookup releases the cache lock
                 // or while the retained bytes are decoded. Admit delivery
                 // under the same lock used to advance the fill epoch.
@@ -1516,6 +1547,15 @@ impl Middleware for ResponseCachingMiddleware {
                 if !context_cache_commit_is_admissible(ctx) {
                     return Ok(MiddlewareDecision::Continue);
                 }
+                let Some(remaining) = entry
+                    .expires_at
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                else {
+                    self.record_miss();
+                    return Ok(MiddlewareDecision::Continue);
+                };
+                cap_cached_protocol_ttl(&request.method, &mut value, remaining);
                 if !ctx.mark_response_cache_hit(self.instance_id) {
                     self.record_miss();
                     return Ok(MiddlewareDecision::Continue);
@@ -1770,6 +1810,18 @@ mod tests {
         })
     }
 
+    fn assert_replay_preserves_result_within_ttl(
+        original: &serde_json::Value,
+        replay: &serde_json::Value,
+        maximum_ttl_ms: u64,
+    ) {
+        let ttl_ms = replay["ttlMs"].as_u64().expect("bounded replay TTL");
+        assert!(ttl_ms <= maximum_ttl_ms, "replay must not renew freshness");
+        let mut expected = original.clone();
+        expected["ttlMs"] = serde_json::Value::from(ttl_ms);
+        assert_eq!(&expected, replay, "only the protocol TTL may change");
+    }
+
     // ========================================
     // LruCache tests
     // ========================================
@@ -1966,6 +2018,135 @@ mod tests {
     // ResponseCachingMiddleware tests
     // ========================================
 
+    #[test]
+    fn cached_final_results_advertise_remaining_freshness_without_refilling() {
+        for (method, member) in [
+            (SERVER_DISCOVER_METHOD, None),
+            ("tools/list", Some("tools")),
+            ("resources/list", Some("resources")),
+            ("resources/templates/list", Some("resourceTemplates")),
+            ("prompts/list", Some("prompts")),
+            ("resources/read", Some("contents")),
+        ] {
+            let middleware = ResponseCachingMiddleware::new();
+            let request = test_request(method, None);
+            let ctx = test_context();
+            let mut response = match member {
+                None => final_discovery_response(120_000, "private"),
+                Some(member) => {
+                    let mut response = serde_json::json!({
+                        "resultType": "complete",
+                        "ttlMs": 120_000,
+                        "cacheScope": "private",
+                    });
+                    response[member] = serde_json::json!([]);
+                    response
+                }
+            };
+            response["extra"] = serde_json::from_str(
+                r#"{"ttlMs":123456,"amount":7.30e-2,"wide":123456789012345678901234567890}"#,
+            )
+            .unwrap();
+            assert!(matches!(
+                middleware.on_request(&ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            assert_eq!(
+                middleware
+                    .on_response(&ctx, &request, response.clone())
+                    .unwrap(),
+                response,
+                "fresh handler results keep their full wire TTL"
+            );
+
+            // Advance the stored age without a sleep or a test-only clock in
+            // the product. The positive and expired negative differ only in
+            // the entry's remaining lifetime.
+            let (expiry, retained) = {
+                let mut cache = middleware.cache.lock().unwrap();
+                let entry = cache.entries.values_mut().next().unwrap();
+                entry.expires_at = Instant::now() + Duration::from_secs(60);
+                (entry.expires_at, entry.encoded.clone())
+            };
+            let mut previous_ttl_ms = 60_000;
+            for _ in 0..2 {
+                let hit_ctx = test_context();
+                let MiddlewareDecision::Respond(replay) =
+                    middleware.on_request(&hit_ctx, &request).unwrap()
+                else {
+                    panic!("fresh {method} entry must be reusable");
+                };
+                assert_replay_preserves_result_within_ttl(&response, &replay, previous_ttl_ms);
+                previous_ttl_ms = replay["ttlMs"].as_u64().unwrap();
+                assert_eq!(
+                    middleware
+                        .on_response(&hit_ctx, &request, replay.clone())
+                        .unwrap(),
+                    replay,
+                    "the response hook must not renew a cache hit"
+                );
+                let cache = middleware.cache.lock().unwrap();
+                let entry = cache.entries.values().next().unwrap();
+                assert_eq!(entry.expires_at, expiry);
+                assert_eq!(entry.encoded, retained);
+            }
+
+            middleware
+                .cache
+                .lock()
+                .unwrap()
+                .entries
+                .values_mut()
+                .next()
+                .unwrap()
+                .expires_at = Instant::now();
+            assert!(matches!(
+                middleware.on_request(&test_context(), &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            assert_eq!(middleware.stats().entries, 0);
+        }
+    }
+
+    #[test]
+    fn cached_final_ttl_rounds_down_without_changing_nested_members() {
+        let original: serde_json::Value = serde_json::from_str(
+            r#"{"resultType":"complete","tools":[],"ttlMs":1000,"cacheScope":"private","extra":{"ttlMs":99,"amount":7.30e-2}}"#,
+        )
+        .unwrap();
+        for (remaining, expected) in [
+            (Duration::from_micros(999), 0),
+            (Duration::from_micros(1_999), 1),
+            (Duration::from_millis(999), 999),
+            (Duration::from_secs(2), 1000),
+        ] {
+            let mut replay = original.clone();
+            cap_cached_protocol_ttl("tools/list", &mut replay, remaining);
+            assert_eq!(replay["ttlMs"], serde_json::json!(expected));
+            assert_replay_preserves_result_within_ttl(&original, &replay, expected);
+        }
+
+        for method in ["tools/call", "prompts/get", "tasks/get"] {
+            let mut response = original.clone();
+            cap_cached_protocol_ttl(method, &mut response, Duration::ZERO);
+            assert_eq!(
+                response, original,
+                "non-cacheable methods are not rewritten"
+            );
+        }
+        for response in [
+            serde_json::json!({"tools": [], "extra": {"ttlMs": 99}}),
+            serde_json::json!({"resultType": "inputRequired", "ttlMs": 1000}),
+        ] {
+            let mut replay = response.clone();
+            cap_cached_protocol_ttl("tools/list", &mut replay, Duration::ZERO);
+            assert_eq!(
+                replay, response,
+                "legacy and noncomplete results are unchanged"
+            );
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum FillInvalidation {
         None,
@@ -2059,10 +2240,14 @@ mod tests {
             let lookup = middleware.on_request(&test_context(), &request).unwrap();
             if invalidation == FillInvalidation::None {
                 assert_eq!(middleware.stats().entries, 1);
-                assert!(matches!(
-                    lookup,
-                    MiddlewareDecision::Respond(value) if value == response
-                ));
+                let MiddlewareDecision::Respond(value) = lookup else {
+                    panic!("{method}: an unchanged generation must allow a hit");
+                };
+                if method_requires_protocol_cache_hints(method) {
+                    assert_replay_preserves_result_within_ttl(&response, &value, 30_000);
+                } else {
+                    assert_eq!(value, response);
+                }
                 continue;
             }
             assert_eq!(
@@ -2098,10 +2283,16 @@ mod tests {
                 .on_response(&handler_ctx, &request, response)
                 .unwrap();
             assert_eq!(middleware.stats(), before_late_retry);
-            assert!(matches!(
-                middleware.on_request(&test_context(), &request).unwrap(),
-                MiddlewareDecision::Respond(value) if value == fresh
-            ));
+            let MiddlewareDecision::Respond(value) =
+                middleware.on_request(&test_context(), &request).unwrap()
+            else {
+                panic!("{method}: the successor's response must remain cached");
+            };
+            if method_requires_protocol_cache_hints(method) {
+                assert_replay_preserves_result_within_ttl(&fresh, &value, 30_000);
+            } else {
+                assert_eq!(value, fresh);
+            }
         }
     }
 
@@ -2605,7 +2796,7 @@ mod tests {
                     let MiddlewareDecision::Respond(cached) = next else {
                         panic!("silent {notification} control must hit");
                     };
-                    assert_eq!(cached, response);
+                    assert_replay_preserves_result_within_ttl(&response, &cached, 300_000);
                 }
             }
         }
@@ -4242,12 +4433,13 @@ mod tests {
         );
         drop(cache);
 
-        assert!(matches!(
-            middleware
-                .on_request(&ctx, &request)
-                .expect("final discovery lookup is safe"),
-            MiddlewareDecision::Respond(value) if value == response
-        ));
+        let MiddlewareDecision::Respond(value) = middleware
+            .on_request(&ctx, &request)
+            .expect("final discovery lookup is safe")
+        else {
+            panic!("private final discovery remains cached");
+        };
+        assert_replay_preserves_result_within_ttl(&response, &value, 30_000);
     }
 
     #[test]
@@ -4336,12 +4528,13 @@ mod tests {
             before,
             "changing only the TTL to a fractional value leaves cached state unchanged"
         );
-        assert!(matches!(
-            middleware
-                .on_request(&ctx, &request)
-                .expect("baseline cache lookup is safe"),
-            MiddlewareDecision::Respond(value) if value == cached
-        ));
+        let MiddlewareDecision::Respond(value) = middleware
+            .on_request(&ctx, &request)
+            .expect("baseline cache lookup is safe")
+        else {
+            panic!("unrepresentable TTLs must preserve the existing entry");
+        };
+        assert_replay_preserves_result_within_ttl(&cached, &value, 30_000);
     }
 
     #[test]
@@ -4428,11 +4621,12 @@ mod tests {
         let after_legacy = middleware.stats();
         assert_eq!(after_legacy.entries, before_legacy.entries);
         assert_eq!(after_legacy.size_bytes, before_legacy.size_bytes);
-        assert!(matches!(
-            middleware
-                .on_request(&final_ctx, &final_request)
-                .expect("final lookup remains safe"),
-            MiddlewareDecision::Respond(value) if value == response
-        ));
+        let MiddlewareDecision::Respond(value) = middleware
+            .on_request(&final_ctx, &final_request)
+            .expect("final lookup remains safe")
+        else {
+            panic!("legacy refusal must preserve the modern entry");
+        };
+        assert_replay_preserves_result_within_ttl(&response, &value, 30_000);
     }
 }
