@@ -1952,10 +1952,13 @@ const DIRECT_CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// stdin is closed. MCP stdio shutdown closes the server's input first and
 /// signals only a server that does not exit; signalling at once cuts off a
 /// server that is still flushing its final state. The reference SDKs wait
-/// 2 s (the Python SDK's `PROCESS_TERMINATION_TIMEOUT`). The group kill
-/// that follows also ends the server's own children, so a server that
-/// closes its upstream stdio servers on EOF needs this long on a loaded
-/// host for them to see EOF instead of the signal.
+/// 2 s (the Python SDK's `PROCESS_TERMINATION_TIMEOUT`). With
+/// `owned_process_group`, the group kill that follows also ends the server's
+/// own children, so a server that closes its upstream stdio servers on EOF
+/// needs this long on a loaded host for them to see EOF instead of the
+/// signal. A direct child is signalled alone. Dropping a `Client` does not
+/// wait: it closes stdin and signals a server that is still running at once,
+/// so an owner whose server has work to do on EOF calls `close`.
 const STDIO_EOF_EXIT_GRACE: Duration = Duration::from_secs(2);
 const PROCESS_CLEANUP_CALLER_DEADLINE_ERROR: &str =
     "Subprocess cleanup exceeded the caller deadline";
