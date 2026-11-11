@@ -64,7 +64,7 @@ impl JwksRefreshPolicy {
     ) -> Result<Self, JwksRefreshError> {
         if refresh_after.is_zero()
             || refresh_after >= maximum_age
-            || maximum_age > Duration::from_secs(86_400)
+            || maximum_age > Duration::from_hours(24)
             || retry_after.is_zero()
             || retry_after > refresh_after
             || attempt_timeout.is_zero()

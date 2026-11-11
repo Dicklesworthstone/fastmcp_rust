@@ -62,7 +62,7 @@ pub mod replay;
 pub mod restore;
 #[cfg_attr(
     not(feature = "test-runtime"),
-    doc = r#"
+    doc = r"
 Ordinary consumers retain process-generation and caller-context APIs:
 
 ```
@@ -83,7 +83,7 @@ use fastmcp_core::block_on;
 ```compile_fail,E0432
 use fastmcp_core::runtime::block_on;
 ```
-"#
+"
 )]
 pub mod runtime;
 mod state;

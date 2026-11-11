@@ -252,19 +252,18 @@ pub(super) async fn serve(
                     ))
                     .await
                 }
-                None => session
-                    .begin_modern_sse(
-                        cx,
-                        request.clone(),
-                        authorization.clone(),
-                        Some(opening_cancellation.clone()),
-                    )
-                    .await
-                    .map(|opening| {
-                        opening.map(|(request, response, raw, receipt)| {
-                            (request, response, raw, receipt, None)
-                        })
-                    }),
+                None => Box::pin(session.begin_modern_sse(
+                    cx,
+                    request.clone(),
+                    authorization.clone(),
+                    Some(opening_cancellation.clone()),
+                ))
+                .await
+                .map(|opening| {
+                    opening.map(|(request, response, raw, receipt)| {
+                        (request, response, raw, receipt, None)
+                    })
+                }),
             }
         },
     )

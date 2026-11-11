@@ -4,7 +4,7 @@
 
 use super::*;
 use std::collections::BTreeMap;
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Waker};
 
 use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 
@@ -436,14 +436,8 @@ fn refused<T>(result: Result<T, RestoreError>, expected: RestoreError) {
     assert_eq!(result.err(), Some(expected));
 }
 
-struct Noop;
-impl Wake for Noop {
-    fn wake(self: Arc<Self>) {}
-}
-
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    let waker = Waker::from(Arc::new(Noop));
-    future.poll(&mut Context::from_waker(&waker))
+    future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
 #[test]
@@ -509,16 +503,17 @@ fn stable_binding_is_independent_of_transient_ids_and_store_fence_versions() {
         assert_ne!(second.operation_id(), first_id);
         assert_eq!(second.binding_digest(), binding);
         assert_eq!(second.store_fence_generation(), 2);
-        let state = authority.state.lock().unwrap();
-        let currents: Vec<_> = state
-            .requests
-            .iter()
-            .filter(|entry| entry.0 == Phase::Current)
-            .collect();
-        assert_eq!(currents.len(), 2);
-        assert_ne!(currents[0].1, currents[1].1);
-        assert_ne!(currents[0].2, currents[1].2);
-        drop(state);
+        {
+            let state = authority.state.lock().unwrap();
+            let currents: Vec<_> = state
+                .requests
+                .iter()
+                .filter(|entry| entry.0 == Phase::Current)
+                .collect();
+            assert_eq!(currents.len(), 2);
+            assert_ne!(currents[0].1, currents[1].1);
+            assert_ne!(currents[0].2, currents[1].2);
+        }
         finish(&cx, &store, &authority, second).await;
         assert!(!facade.is_quarantined());
     });
@@ -1242,12 +1237,13 @@ fn preparation_dispatch_deadline_cannot_outlive_the_write_intent() {
                 .unwrap();
         let store = facade.store("replay").unwrap();
         let fence = store.prepare_write(&cx, [1; 32], Time::MAX).await.unwrap();
-        let observations = capture.observed.lock().unwrap();
-        assert_eq!(observations.len(), 1);
-        let (dispatch_at, lifetime, deadline) = observations[0];
+        let (dispatch_at, lifetime, deadline) = {
+            let observations = capture.observed.lock().unwrap();
+            assert_eq!(observations.len(), 1);
+            observations[0]
+        };
         assert!(deadline <= add_time(dispatch_at, lifetime).unwrap());
         assert!(deadline <= fence.expires_at());
-        drop(observations);
         finish(&cx, &store, &authority, fence).await;
     });
 }

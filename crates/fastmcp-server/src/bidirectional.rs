@@ -1819,6 +1819,10 @@ impl Serialize for MrtrInputRequired {
 }
 
 /// The outcome of consuming one final MRTR retry.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public MRTR retry outcome intentionally exposes owned completed inputs by value"
+)]
 #[derive(Debug, Clone)]
 pub enum MrtrRetry {
     /// More client input is needed; only unsatisfied keys are reissued with a

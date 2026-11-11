@@ -464,12 +464,14 @@ mod subscriptions {
     const RESOURCE: &str = "memory://subscriptions/observed";
 
     #[resource(uri = "memory://subscriptions/observed")]
+    #[allow(clippy::unused_async)]
     async fn memory_observed(ctx: &McpContext) -> McpResult<String> {
         ctx.checkpoint()?;
         Ok("current resource value".to_owned())
     }
 
     #[tool]
+    #[allow(clippy::unused_async)]
     async fn memory_emit(ctx: &McpContext, category: String) -> McpResult<bool> {
         ctx.checkpoint()?;
         match category.as_str() {
@@ -666,6 +668,7 @@ mod interactions {
     // code must not be able to bind some other same-named type. Same spelling
     // as macro_expansion.rs:1690.
     #[tool]
+    #[allow(clippy::unused_async)]
     async fn memory_interactive_tool(
         ctx: &McpContext,
         subject: String,
@@ -701,6 +704,7 @@ mod interactions {
     }
 
     #[resource(uri = "memory://interactive/{subject}")]
+    #[allow(clippy::unused_async)]
     async fn memory_interactive_resource(
         ctx: &McpContext,
         subject: String,
@@ -731,6 +735,7 @@ mod interactions {
     }
 
     #[prompt]
+    #[allow(clippy::unused_async)]
     async fn memory_interactive_prompt(
         ctx: &McpContext,
         subject: String,
@@ -886,9 +891,11 @@ mod interactions {
                     } else {
                         for result in [tool, resource, prompt] {
                             let required = match result {
-                                CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. })
-                                | CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. })
-                                | CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }) => result,
+                                CoreResult::Final(
+                                    FinalCoreResult::ToolsCallInputRequired { result, .. }
+                                    | FinalCoreResult::ResourcesReadInputRequired { result, .. }
+                                    | FinalCoreResult::PromptsGetInputRequired { result, .. },
+                                ) => result,
                                 _ => panic!("without handlers the typed input-required result remains caller-owned"),
                             };
                             assert!(required.request_state().is_some());

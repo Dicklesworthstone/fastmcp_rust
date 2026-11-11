@@ -831,7 +831,7 @@ const MAX_RELAYED_FINAL_TASKS: usize = 128;
 /// promised longer finite lifetime is preserved, but subsequent reads and
 /// aliases cannot restart this local locator-retention clock.
 #[cfg(feature = "tasks")]
-const RELAYED_FINAL_TASK_RECOVERY_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const RELAYED_FINAL_TASK_RECOVERY_LIFETIME: Duration = Duration::from_hours(30 * 24);
 
 /// Maximum independently configured upstream routes in one Tasks broker.
 #[cfg(feature = "tasks")]

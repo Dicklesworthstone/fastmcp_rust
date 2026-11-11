@@ -2,10 +2,11 @@
 //! These are conformance fixtures, not claims of durable provider qualification.
 
 use super::*;
+use crate::restore::*;
 use crate::runtime::block_on;
 use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
 use std::collections::BTreeMap;
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Waker};
 
 #[derive(Clone, Copy)]
 enum FactKind {
@@ -165,7 +166,7 @@ impl RestoreStoreRecovery for Store {
             let observer = ObserveDrop(Arc::clone(&self.drop_effects));
             return Box::pin(async move {
                 let _observer = observer;
-                let _resolution = resolution;
+                let _ = resolution;
                 std::future::pending().await
             });
         }
@@ -901,13 +902,8 @@ fn invalid_recovery_limits_do_not_retire_a_healthy_facade() {
     }
 }
 
-struct Noop;
-impl Wake for Noop {
-    fn wake(self: Arc<Self>) {}
-}
-
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut Context::from_waker(&Waker::from(Arc::new(Noop))))
+    future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
 #[test]

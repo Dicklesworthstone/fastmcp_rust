@@ -11,7 +11,15 @@
 //! linearization, snapshot retention and proof verification remain obligations
 //! of the named authority/store adapters and their independent persistence.
 
-use super::*;
+use super::{
+    Arc, BTreeSet, CallAccess, CounterLease, Cx, DurableRestoreCommitReceipt, Duration, Future,
+    InitialAdmission, MAX_COMMIT_PROOF, Ordering, Pin, RegisteredRestoreStore,
+    RestoreAuthorityOperation, RestoreAuthorityOutcome, RestoreDispatch, RestoreEpochAuthority,
+    RestoreEpochBinding, RestoreEpochConfiguration, RestoreEpochFacade, RestoreError,
+    RestoreStoreDeclaration, RestoreWriteFence, Shared, Time, UncertainMutation, add_time,
+    duration_between, encode_bytes, encode_store, hash, require_caller, with_caller,
+    with_operation_caller, within_access,
+};
 
 #[cfg(test)]
 mod tests;

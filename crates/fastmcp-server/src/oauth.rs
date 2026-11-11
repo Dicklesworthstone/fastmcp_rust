@@ -4160,6 +4160,13 @@ impl OAuthServer {
         Ok(DevelopmentIntrospectionClockSample { unix, monotonic })
     }
 
+    #[cfg_attr(
+        not(feature = "builtin-auth-server"),
+        allow(
+            clippy::unnecessary_wraps,
+            reason = "Result is load-bearing when feature builtin-auth-server is enabled"
+        )
+    )]
     fn token_issuance_clock(&self) -> Result<TokenIssuanceClock, OAuthError> {
         #[cfg(feature = "builtin-auth-server")]
         if self.config.development_introspection_profile

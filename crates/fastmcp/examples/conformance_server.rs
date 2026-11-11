@@ -38,6 +38,7 @@
 //! scenarios this 2026-07-28 server does not claim.
 
 #![allow(clippy::needless_pass_by_value)]
+#![recursion_limit = "256"]
 
 use std::process::ExitCode;
 use std::sync::Arc;

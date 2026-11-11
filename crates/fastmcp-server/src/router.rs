@@ -743,6 +743,10 @@ fn admit_mrtr_raw_json_value(value: &serde_json::Value, max_bytes: usize) -> Mcp
         .map_err(|_| McpError::invalid_params("MRTR JSON exceeds its byte limit"))
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "transient per-dispatch enum on stack"
+)]
 enum FinalMrtrDispatch {
     Fresh,
     Resume(MrtrCompletedInputs),

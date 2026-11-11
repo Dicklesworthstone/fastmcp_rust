@@ -383,6 +383,7 @@ fn assert_http_notice(
 fn typed_request_notifications_reach_native_http_without_stdio_metadata() {
     use fastmcp_rust::{ModernHttpExtensionEvent, ModernHttpFinalCoreListenError, SseLimits};
 
+    let limits = SseLimits::new(64 * 1024, 64 * 1024, 64).expect("bounded SSE limits");
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);
     let runtime = RuntimeBuilder::current_thread()
@@ -394,10 +395,10 @@ fn typed_request_notifications_reach_native_http_without_stdio_metadata() {
         asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
             let (client, id, server_cx, mut serving) = start_http_producer(&cx, producer(calls)).await;
             let mut first = client.execute_final_extension(
-                &cx, &id, METHOD, json!({"value": 7}), SseLimits::default(),
+                &cx, &id, METHOD, json!({"value": 7}), limits,
             ).unwrap();
             let mut second = client.execute_final_extension(
-                &cx, &id, METHOD, json!({"value": 9}), SseLimits::default(),
+                &cx, &id, METHOD, json!({"value": 9}), limits,
             ).unwrap();
             assert_ne!(first.request_id(), second.request_id());
             for (execution, value) in [(&mut second, 27), (&mut first, 21)] {
@@ -408,7 +409,7 @@ fn typed_request_notifications_reach_native_http_without_stdio_metadata() {
             }
             for value in [10, 11, 12] {
                 let mut invalid = client.execute_final_extension(
-                    &cx, &id, METHOD, json!({"value": value}), SseLimits::default(),
+                    &cx, &id, METHOD, json!({"value": value}), limits,
                 ).unwrap();
                 assert!(matches!(invalid.next_event(&cx).await,
                     Err(ModernHttpFinalCoreListenError::RemoteError { code, .. })
@@ -417,7 +418,7 @@ fn typed_request_notifications_reach_native_http_without_stdio_metadata() {
                 assert!(invalid.next_event(&cx).await.unwrap().is_none());
             }
             let mut sibling = client.execute_final_extension(
-                &cx, &id, METHOD, json!({"value": 5}), SseLimits::default(),
+                &cx, &id, METHOD, json!({"value": 5}), limits,
             ).unwrap();
             assert_http_notice(sibling.next_event(&cx).await.unwrap(), json!({"value": 15}));
             assert!(matches!(sibling.next_event(&cx).await.unwrap(),
@@ -436,6 +437,7 @@ fn typed_request_notifications_reach_native_http_without_stdio_metadata() {
 fn typed_http_notification_arrives_before_pending_handler_and_cancel_keeps_sibling() {
     use fastmcp_rust::{ModernHttpExtensionEvent, ModernHttpFinalCoreListenError, SseLimits};
 
+    let limits = SseLimits::new(64 * 1024, 64 * 1024, 64).expect("bounded SSE limits");
     let refused = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&refused);
     let runtime = RuntimeBuilder::current_thread()
@@ -451,7 +453,7 @@ fn typed_http_notification_arrives_before_pending_handler_and_cancel_keeps_sibli
                 .unwrap().build().unwrap();
             let (client, id, server_cx, mut serving) = start_http_producer(&cx, registration).await;
             let mut pending = client.execute_final_extension(
-                &cx, &id, METHOD, json!({"value": 7}), SseLimits::default(),
+                &cx, &id, METHOD, json!({"value": 7}), limits,
             ).unwrap();
             // The handler never returns: this requires the exact typed-handler
             // admission hook to commit SSE and flush the live notification.
@@ -461,7 +463,7 @@ fn typed_http_notification_arrives_before_pending_handler_and_cancel_keeps_sibli
                 Err(ModernHttpFinalCoreListenError::CallerCancelled { .. })));
             assert!(pending.next_event(&cx).await.unwrap().is_none());
             let mut sibling = client.execute_final_extension(
-                &cx, &id, METHOD, json!({"value": 5}), SseLimits::default(),
+                &cx, &id, METHOD, json!({"value": 5}), limits,
             ).unwrap();
             assert_http_notice(sibling.next_event(&cx).await.unwrap(), json!({"value": 15}));
             assert!(matches!(sibling.next_event(&cx).await.unwrap(),
@@ -623,6 +625,7 @@ fn typed_http_notification_bounds_include_the_complete_wire_envelope() {
     fn nested_object(containers: u32) -> fastmcp_rust::JsonValue {
         (1..containers).fold(json!({}), |value, _| json!({"child": value}))
     }
+    let limits = SseLimits::new(64 * 1024, 64 * 1024, 64).expect("bounded SSE limits");
     let runtime = RuntimeBuilder::current_thread()
         .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
         .build()
@@ -646,7 +649,7 @@ fn typed_http_notification_bounds_include_the_complete_wire_envelope() {
             let (client, id, server_cx, mut serving) = start_http_producer(&cx, registration).await;
             for value in [63, 64, 65, 63] {
                 let mut execution = client.execute_final_extension(
-                    &cx, &id, METHOD, json!({"value": value}), SseLimits::default(),
+                    &cx, &id, METHOD, json!({"value": value}), limits,
                 ).unwrap();
                 if value == 63 {
                     assert_http_notice(execution.next_event(&cx).await.unwrap(), nested_object(value));

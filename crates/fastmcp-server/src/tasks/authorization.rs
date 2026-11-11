@@ -4,7 +4,13 @@
 //! binding. It is deliberately not a recoverable execution grant. A future
 //! persistent backend needs its own protected durable authorization contract.
 
-use super::*;
+use super::{
+    Arc, AssertUnwindSafe, FinalTaskId, FinalTaskRuntime, FinalTaskSnapshot,
+    FinalTaskStatusNotification, McpContext, McpError, McpResult, Sha256Digest, Weak,
+    catch_unwind, final_tasks_match_exactly, task_request_principal,
+};
+#[cfg(feature = "proxy")]
+use super::{BTreeMap, Cx};
 use std::fmt;
 
 const MAX_TASK_ACCESS_AUTHORIZERS: usize = 16;
@@ -634,6 +640,7 @@ mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::*;
     use crate::TestHttpEndpoint;
     use crate::http_admission::security::scope_policy::request::ScopeRequestPolicy;
     use crate::http_admission::security::scope_policy::request::operation::{

@@ -3361,11 +3361,9 @@ impl InMemoryFinalTaskStore {
                 payload_accounting: InMemoryFinalTaskPayloadAccounting {
                     limit: max_payload_bytes,
                     max_tasks_per_owner: (max_tasks / 2)
-                        .max(1)
-                        .min(Self::DEFAULT_MAX_TASKS_PER_OWNER),
+                        .clamp(1, Self::DEFAULT_MAX_TASKS_PER_OWNER),
                     max_bytes_per_owner: (max_payload_bytes / 2)
-                        .max(1)
-                        .min(Self::DEFAULT_MAX_PAYLOAD_BYTES),
+                        .clamp(1, Self::DEFAULT_MAX_PAYLOAD_BYTES),
                     ..InMemoryFinalTaskPayloadAccounting::default()
                 },
                 ..InMemoryFinalTaskState::default()
@@ -6974,7 +6972,7 @@ impl FinalTaskRuntime {
             store,
             config,
             application_notification_emitter: Arc::new(move |notification, _principal| {
-                notification_emitter(notification)
+                notification_emitter(notification);
             }),
             notification_emitters: Arc::new(Mutex::new(Vec::new())),
             service_signal: Arc::new(Mutex::new(None)),

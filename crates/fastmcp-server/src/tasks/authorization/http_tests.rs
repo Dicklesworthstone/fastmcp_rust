@@ -1,6 +1,7 @@
 //! Composition of HTTP request admission with detached Task authorization.
 
 use super::*;
+use crate::tasks::*;
 use crate::http_admission::security::HttpSecurityPolicy;
 use crate::http_admission::security::scope_policy::request::ScopeRequestPolicy;
 use crate::http_admission::security::scope_policy::request::operation::{

@@ -14,6 +14,7 @@
 
 // MCP handlers receive String from JSON deserialization, so this is intentional.
 #![allow(clippy::needless_pass_by_value)]
+#![recursion_limit = "256"]
 
 use std::collections::{BTreeMap, HashMap};
 use std::process::ExitCode;

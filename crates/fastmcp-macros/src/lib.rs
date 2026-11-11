@@ -5061,7 +5061,7 @@ mod tool_input_schema_override_tests {
     #[test]
     fn tool_input_schema_parsing_preserves_defaults_and_output_metadata() {
         let attrs = syn::parse_str::<ToolAttrs>(
-            r#"input_schema = self::arguments_schema(), defaults(limit = 3), output_schema = Response, error_mapper = errors::map"#,
+            r"input_schema = self::arguments_schema(), defaults(limit = 3), output_schema = Response, error_mapper = errors::map",
         )
         .expect("input and output overrides are independent");
         assert!(attrs.input_schema.is_some());

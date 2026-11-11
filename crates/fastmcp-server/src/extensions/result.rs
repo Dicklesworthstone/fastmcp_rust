@@ -112,8 +112,7 @@ fn encode_result(value: &Value) -> McpResult<String> {
             if required > self.0.capacity() {
                 let capacity = required
                     .max(self.0.capacity().saturating_mul(2))
-                    .max(256)
-                    .min(MAX_RESULT_ENCODED_BYTES);
+                    .clamp(256, MAX_RESULT_ENCODED_BYTES);
                 self.0
                     .try_reserve_exact(capacity - self.0.len())
                     .map_err(|_| io::Error::other("extension result allocation refused"))?;

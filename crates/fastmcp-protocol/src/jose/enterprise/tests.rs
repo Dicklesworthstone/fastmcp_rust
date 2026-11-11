@@ -317,8 +317,8 @@ fn signed_claims_and_headers_cannot_cross_the_closed_enterprise_profiles() {
     );
     let mut corrupted = signed("oidc_base").to_owned();
     let signature = corrupted.rfind('.').unwrap() + 1;
-    let changed = if &corrupted[signature..signature + 1] == "A" { "B" } else { "A" };
-    corrupted.replace_range(signature..signature + 1, changed);
+    let changed = if &corrupted[signature..=signature] == "A" { "B" } else { "A" };
+    corrupted.replace_range(signature..=signature, changed);
     assert_eq!(
         verify_oidc_id_token(&corrupted, &oidc_keys(), &oidc_expected(), now()).unwrap_err(),
         EnterpriseVerificationError::InvalidToken,

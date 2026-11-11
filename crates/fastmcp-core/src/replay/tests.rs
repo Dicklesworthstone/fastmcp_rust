@@ -3,6 +3,7 @@
 use super::*;
 use crate::crypto::{HmacSha256Key, HmacSha256Tag};
 use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Wake, Waker};
 
@@ -50,7 +51,10 @@ fn rejected<T>(result: Result<T, ReplayDigestError>) -> ReplayDigestError {
     }
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, byte| {
+        let _ = write!(acc, "{byte:02x}");
+        acc
+    })
 }
 fn aliases(set: &PersistentReplayAliasSet) -> Vec<(String, u64, [u8; 32])> {
     set.aliases()

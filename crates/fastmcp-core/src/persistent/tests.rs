@@ -10,7 +10,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Waker};
 
 use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
 use chacha20poly1305::{
@@ -51,7 +51,8 @@ impl Gate {
                 *waker = Some(cx.waker().clone());
                 Poll::Pending
             }
-        }).await
+        })
+        .await;
     }
     fn release(&self) {
         self.released.store(true, Ordering::Release);
@@ -629,11 +630,8 @@ fn revision_for_envelope(
     encoded[66..].copy_from_slice(&fingerprint(envelope));
     PersistentBlobRevision::decode(&encoded).unwrap()
 }
-struct Noop;
-impl Wake for Noop { fn wake(self: Arc<Self>) {} }
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    let waker = Waker::from(Arc::new(Noop));
-    future.poll(&mut Context::from_waker(&waker))
+    future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
 #[test]

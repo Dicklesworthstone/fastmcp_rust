@@ -16821,7 +16821,7 @@ impl Server {
         if !matches!(
             transport,
             InboundRequestTransport::Stdio | InboundRequestTransport::Memory
-        ) && !(transport == InboundRequestTransport::Http && modern_http_owner.is_some())
+        ) && (transport != InboundRequestTransport::Http || modern_http_owner.is_none())
         {
             return context;
         }

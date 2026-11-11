@@ -5233,7 +5233,7 @@ mod tests {
             ]);
             let before = serde_json::to_value(&result).unwrap();
             let read = binding.resolve_read_result(&result, None).unwrap();
-            assert!(std::ptr::eq(read.contents(), &result.contents[1]));
+            assert!(std::ptr::eq(read.contents(), &raw const result.contents[1]));
             assert_eq!(serde_json::to_value(read.contents()).unwrap(), selected);
             assert_eq!(
                 read.metadata(),
