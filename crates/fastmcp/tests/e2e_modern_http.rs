@@ -8463,6 +8463,28 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         serde_json::to_value(page).expect("a typed final tools page retains an exact JSON identity")
     }
 
+    fn assert_cached_page_identity(
+        original: &serde_json::Value,
+        replay: serde_json::Value,
+        previous_ttl_ms: u64,
+        context: &str,
+    ) -> u64 {
+        let remaining_ttl_ms = replay["ttlMs"]
+            .as_u64()
+            .expect("a replay retains its bounded integer TTL");
+        assert!(
+            remaining_ttl_ms <= previous_ttl_ms,
+            "{context}: replay freshness must never increase"
+        );
+        let mut expected = original.clone();
+        expected["ttlMs"] = json!(remaining_ttl_ms);
+        assert_eq!(
+            replay, expected,
+            "{context}: only the top-level TTL may age"
+        );
+        remaining_ttl_ms
+    }
+
     fn cache_key(partition: &str) -> FinalCacheKey {
         FinalCacheKey::new(
             "live-catalog-endpoint",
@@ -8553,10 +8575,11 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         )
         .expect("an identical public list request reuses the cached page"),
     );
-    assert_eq!(
+    let mut first_remaining_ttl_ms = assert_cached_page_identity(
+        &first_identity,
         typed_page_identity(&replay),
-        first_identity,
-        "a cache hit retains the exact page, TTL and opaque cursor bytes"
+        first_ttl,
+        "a cache hit retains the exact page and opaque cursor bytes",
     );
     assert_eq!(requests.load(Ordering::SeqCst), before_first + 1);
     assert_eq!(client.final_result_cache_stats().fills, 1);
@@ -8594,7 +8617,12 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         )
         .expect("a continuation page has its own reusable cache identity"),
     );
-    assert_eq!(typed_page_identity(&second_replay), second_identity);
+    assert_cached_page_identity(
+        &second_identity,
+        typed_page_identity(&second_replay),
+        second.ttl_ms.try_as_millis().unwrap(),
+        "a continuation page retains its independent cached identity",
+    );
     assert_eq!(requests.load(Ordering::SeqCst), before_first + 2);
     assert_eq!(client.final_result_cache_stats().fills, 2);
     assert_eq!(client.final_result_cache_stats().hits, 2);
@@ -8658,12 +8686,15 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
     // moves the counter, which the single-rejection negative below asserts
     // directly. `evictions > 0` would still refute the whole reading and send
     // the search back to capacity. bd-gt6za.
-    assert_eq!(
+    first_remaining_ttl_ms = assert_cached_page_identity(
+        &first_identity,
         typed_page_identity(&unchanged_retry),
-        first_identity,
-        "rejected cursor variations must leave the original cached page \
-         byte-identical; cache counters at this point were {:?}",
-        client.final_result_cache_stats()
+        first_remaining_ttl_ms,
+        &format!(
+            "rejected cursor variations must preserve the cached page; \
+             cache counters at this point were {:?}",
+            client.final_result_cache_stats()
+        ),
     );
     assert_eq!(requests.load(Ordering::SeqCst), before_unchanged_requests);
     assert_eq!(
@@ -8720,12 +8751,15 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         )
         .expect("one rejected cursor variation preserves the original cached page"),
     );
-    assert_eq!(
+    assert_cached_page_identity(
+        &first_identity,
         typed_page_identity(&single_retry),
-        first_identity,
-        "a SINGLE rejected cursor variation must leave the original cached page \
-         byte-identical; cache counters at this point were {:?}",
-        client.final_result_cache_stats()
+        first_remaining_ttl_ms,
+        &format!(
+            "a SINGLE rejected cursor variation must preserve the cached page; \
+             cache counters at this point were {:?}",
+            client.final_result_cache_stats()
+        ),
     );
     assert_eq!(
         requests.load(Ordering::SeqCst),
@@ -8800,8 +8834,14 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         panic!("the exact caller's stored page must remain fresh before expiry");
     };
     assert_eq!(
-        typed_page_identity(&tools_page(before_expiry)),
-        first_identity
+        assert_cached_page_identity(
+            &first_identity,
+            typed_page_identity(&tools_page(before_expiry)),
+            first_ttl,
+            "the fresh page just before expiry retains every non-TTL member",
+        ),
+        0,
+        "a sub-millisecond remainder must not grant another millisecond of freshness"
     );
     assert!(matches!(
         expiry_cache.lookup_at(&key, expiry),

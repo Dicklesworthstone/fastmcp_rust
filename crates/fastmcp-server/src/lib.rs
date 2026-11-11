@@ -13615,10 +13615,80 @@ enum ModernSseDispatchElection {
     Failed,
 }
 
+#[derive(Default)]
+struct ModernSsePendingNotifications {
+    notifications: VecDeque<(JsonRpcRequest, usize)>,
+    retained_events: usize,
+    retained_bytes: usize,
+}
+
+impl ModernSsePendingNotifications {
+    fn try_push(
+        &mut self,
+        notification: JsonRpcRequest,
+        capacity: usize,
+        max_bytes: usize,
+        acknowledgement: bool,
+    ) -> bool {
+        if self.retained_events >= capacity {
+            return false;
+        }
+        let Some(bytes) = modern_sse_notification_bytes(
+            &notification,
+            max_bytes.saturating_sub(self.retained_bytes),
+        ) else {
+            return false;
+        };
+        self.retained_events += 1;
+        self.retained_bytes += bytes;
+        if acknowledgement {
+            self.notifications.push_front((notification, bytes));
+        } else {
+            self.notifications.push_back((notification, bytes));
+        }
+        true
+    }
+}
+
+/// Count the exact retained wire representation without allocating a second
+/// encoded copy. Raw parameter whitespace, escapes and numeric lexemes count
+/// toward the same byte budget as the downstream response mailbox.
+fn modern_sse_notification_bytes(notification: &JsonRpcRequest, limit: usize) -> Option<usize> {
+    struct BoundedSize {
+        bytes: usize,
+        limit: usize,
+    }
+
+    impl std::io::Write for BoundedSize {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes) {
+                return Err(std::io::Error::other(
+                    "deferred SSE notification byte limit exceeded",
+                ));
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut size = BoundedSize { bytes: 0, limit };
+    serde_json::to_writer(&mut size, notification).ok()?;
+    // The response mailbox charges the codec's complete encoded record,
+    // including its trailing line feed.
+    std::io::Write::write_all(&mut size, b"\n").ok()?;
+    Some(size.bytes)
+}
+
 enum ModernSseNotificationDelivery {
-    Pending(Vec<JsonRpcRequest>),
+    Pending(ModernSsePendingNotifications),
     Admitted,
+    Draining(ModernSsePendingNotifications),
     Streaming,
+    Failed,
 }
 
 /// A transport-owned signal invoked only after final router handler admission.
@@ -13627,12 +13697,17 @@ pub(crate) type FinalHandlerAdmission = Arc<dyn Fn() + Send + Sync>;
 
 struct ModernSseNotificationGate {
     delivery: Mutex<ModernSseNotificationDelivery>,
+    finalizing: AtomicBool,
+    drain_waiter: Mutex<Option<std::task::Waker>>,
+    capacity: usize,
+    max_queued_bytes: usize,
     subscription_request: bool,
     outcome_gate: Option<Arc<ModernSseOutcomeGate>>,
     terminal_delivery: Arc<FinalSubscriptionTerminalDelivery>,
     committed_sender: NotificationSender,
     commit_failed: Arc<AtomicBool>,
     stream_admitted: Arc<AtomicBool>,
+    request_cancellation: McpRequestCancellation,
 }
 
 impl ModernSseNotificationGate {
@@ -13644,40 +13719,65 @@ impl ModernSseNotificationGate {
             .delivery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &mut *delivery {
-            ModernSseNotificationDelivery::Streaming => {
-                drop(delivery);
-                (self.committed_sender)(notification);
-                return;
-            }
-            ModernSseNotificationDelivery::Admitted => {
-                (self.committed_sender)(notification);
-            }
-            ModernSseNotificationDelivery::Pending(pending) => {
-                let acknowledgement = self.subscription_request
-                    && final_subscription_acknowledgement_notification(&notification);
-                if !acknowledgement {
-                    pending.push(notification);
-                    return;
-                }
-                let deferred = std::mem::take(pending);
-                // Keep concurrent publishers behind the acknowledgement and
-                // the frames already waiting for that subscription boundary.
-                (self.committed_sender)(notification);
-                if !self.finish_stream_admission(&mut delivery) {
-                    return;
-                }
-                for notification in deferred {
-                    (self.committed_sender)(notification);
-                }
-                return;
-            }
+        if self.finalizing.load(Ordering::Acquire) {
+            return;
         }
-        self.finish_stream_admission(&mut delivery);
+        if self.commit_failed.load(Ordering::Acquire) {
+            *delivery = ModernSseNotificationDelivery::Failed;
+            return;
+        }
+        let acknowledgement = matches!(&*delivery, ModernSseNotificationDelivery::Pending(_))
+            && self.subscription_request
+            && final_subscription_acknowledgement_notification(&notification);
+        let start_draining = match &*delivery {
+            ModernSseNotificationDelivery::Pending(_) => acknowledgement,
+            ModernSseNotificationDelivery::Admitted | ModernSseNotificationDelivery::Streaming => {
+                *delivery = ModernSseNotificationDelivery::Draining(
+                    ModernSsePendingNotifications::default(),
+                );
+                true
+            }
+            ModernSseNotificationDelivery::Draining(_) => false,
+            ModernSseNotificationDelivery::Failed => return,
+        };
+        match &mut *delivery {
+            ModernSseNotificationDelivery::Pending(pending)
+            | ModernSseNotificationDelivery::Draining(pending) => {
+                if !pending.try_push(
+                    notification,
+                    self.capacity,
+                    self.max_queued_bytes,
+                    acknowledgement,
+                ) {
+                    // Seal publication before releasing the mutex. No racing
+                    // publisher can retain more bytes or reach the downstream
+                    // sender between clearing this queue and waking dispatch.
+                    self.commit_failed.store(true, Ordering::Release);
+                    *delivery = ModernSseNotificationDelivery::Failed;
+                    drop(delivery);
+                    self.settle_failure();
+                    return;
+                }
+                if !start_draining {
+                    return;
+                }
+                let pending = std::mem::take(pending);
+                *delivery = ModernSseNotificationDelivery::Draining(pending);
+            }
+            _ => unreachable!("only deferred delivery retains notifications"),
+        }
+        drop(delivery);
+        self.drain_notifications();
     }
 
     fn admit_handler(&self) {
-        if self.subscription_request || self.commit_failed.load(Ordering::Acquire) {
+        if !self.subscription_request {
+            self.drain_pending();
+        }
+    }
+
+    fn drain_pending(&self) {
+        if self.commit_failed.load(Ordering::Acquire) {
             return;
         }
         let mut delivery = self
@@ -13687,35 +13787,133 @@ impl ModernSseNotificationGate {
         let ModernSseNotificationDelivery::Pending(pending) = &mut *delivery else {
             return;
         };
-        if pending.is_empty() {
+        if pending.notifications.is_empty() {
             // Admission alone does not commit an HTTP representation. A
             // canonical error can still elect JSON 400 until a frame exists.
             *delivery = ModernSseNotificationDelivery::Admitted;
             return;
         }
-        let mut deferred = std::mem::take(pending).into_iter();
-        if let Some(notification) = deferred.next() {
+        let pending = std::mem::take(pending);
+        *delivery = ModernSseNotificationDelivery::Draining(pending);
+        drop(delivery);
+        self.drain_notifications();
+    }
+
+    fn drain_notifications(&self) {
+        loop {
+            let next = {
+                let mut delivery = self
+                    .delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let ModernSseNotificationDelivery::Draining(pending) = &mut *delivery else {
+                    return;
+                };
+                let Some(next) = pending.notifications.pop_front() else {
+                    *delivery = ModernSseNotificationDelivery::Streaming;
+                    drop(delivery);
+                    self.wake_drain_waiter();
+                    return;
+                };
+                next
+            };
+            // Keep this in-flight event charged until the callback returns.
+            // Concurrent or reentrant publishers join the same bounded FIFO;
+            // no callback or arbitrary waker runs under the delivery mutex.
+            let (notification, bytes) = next;
             (self.committed_sender)(notification);
-        }
-        // The writer must be able to drain its bounded queue before the
-        // remainder is committed. Admission still follows one real frame.
-        if !self.finish_stream_admission(&mut delivery) {
-            return;
-        }
-        for notification in deferred {
-            (self.committed_sender)(notification);
+            if !self.finish_stream_admission() {
+                self.commit_failed.store(true, Ordering::Release);
+                *self
+                    .delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    ModernSseNotificationDelivery::Failed;
+                self.settle_failure();
+                return;
+            }
+            let mut delivery = self
+                .delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let ModernSseNotificationDelivery::Draining(pending) = &mut *delivery {
+                pending.retained_events -= 1;
+                pending.retained_bytes -= bytes;
+            }
         }
     }
 
-    fn finish_stream_admission(&self, delivery: &mut ModernSseNotificationDelivery) -> bool {
-        if self.commit_failed.load(Ordering::Acquire) {
-            self.terminal_delivery.mark_failed();
-            if let Some(outcome_gate) = &self.outcome_gate {
-                outcome_gate.elect(ModernSseDispatchElection::Failed);
+    /// Seal publication and join the current drainer before the terminal
+    /// response claims its mailbox slot. A retained callback may run on a
+    /// publisher thread; waiting for it must not block this runtime worker.
+    async fn finish_notifications(&self, retain_cancelled: bool) -> bool {
+        {
+            let _delivery = self
+                .delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.finalizing.store(true, Ordering::Release);
+        }
+        self.drain_pending();
+        let mut cancelled = std::pin::pin!(self.request_cancellation.cancelled());
+        std::future::poll_fn(|task_cx| {
+            // Cancellation registration and RawWaker clone/drop callbacks
+            // can reenter publication, so perform them outside both locks.
+            let cancelled = !retain_cancelled && cancelled.as_mut().poll(task_cx).is_ready();
+            let mut next_waiter = Some(task_cx.waker().clone());
+            let mut failed = false;
+            let (outcome, previous_waiter) = {
+                let mut delivery = self
+                    .delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !matches!(&*delivery, ModernSseNotificationDelivery::Draining(_)) {
+                    (
+                        std::task::Poll::Ready(!self.commit_failed.load(Ordering::Acquire)),
+                        None,
+                    )
+                } else if cancelled {
+                    self.commit_failed.store(true, Ordering::Release);
+                    *delivery = ModernSseNotificationDelivery::Failed;
+                    failed = true;
+                    (std::task::Poll::Ready(false), None)
+                } else {
+                    let previous_waiter = self
+                        .drain_waiter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .replace(next_waiter.take().expect("one waiter per poll"));
+                    (std::task::Poll::Pending, previous_waiter)
+                }
+            };
+            drop(previous_waiter);
+            drop(next_waiter);
+            if failed {
+                self.settle_failure();
             }
+            outcome
+        })
+        .await
+    }
+
+    fn wake_drain_waiter(&self) {
+        let waiter = self
+            .drain_waiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
+    }
+
+    fn finish_stream_admission(&self) -> bool {
+        if self.commit_failed.load(Ordering::Acquire) {
             return false;
         }
-        *delivery = ModernSseNotificationDelivery::Streaming;
+        if self.stream_admitted.load(Ordering::Acquire) {
+            return true;
+        }
         let elected = self
             .outcome_gate
             .as_ref()
@@ -13731,17 +13929,13 @@ impl ModernSseNotificationGate {
         elected
     }
 
-    fn take_pending(&self) -> Vec<JsonRpcRequest> {
-        match &mut *self
-            .delivery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            ModernSseNotificationDelivery::Pending(pending) => std::mem::take(pending),
-            ModernSseNotificationDelivery::Admitted | ModernSseNotificationDelivery::Streaming => {
-                Vec::new()
-            }
+    fn settle_failure(&self) {
+        self.terminal_delivery.mark_failed();
+        self.request_cancellation.cancel();
+        if let Some(outcome_gate) = &self.outcome_gate {
+            outcome_gate.elect(ModernSseDispatchElection::Failed);
         }
+        self.wake_drain_waiter();
     }
 }
 
@@ -13932,13 +14126,20 @@ fn spawn_modern_sse_dispatch(
         // and parameter-header rejections ahead of the first SSE frame.
         let deferred_notifications = (subscription_request || outcome_gate.is_some()).then(|| {
             Arc::new(ModernSseNotificationGate {
-                delivery: Mutex::new(ModernSseNotificationDelivery::Pending(Vec::new())),
+                delivery: Mutex::new(ModernSseNotificationDelivery::Pending(
+                    ModernSsePendingNotifications::default(),
+                )),
+                finalizing: AtomicBool::new(false),
+                drain_waiter: Mutex::new(None),
+                capacity: response_sender.capacity(),
+                max_queued_bytes: response_sender.max_queued_bytes(),
                 subscription_request,
                 outcome_gate: outcome_gate.clone(),
                 terminal_delivery: Arc::clone(&terminal_delivery),
                 committed_sender: Arc::clone(&committed_notification_sender),
                 commit_failed: Arc::clone(&notification_commit_failed),
                 stream_admitted: Arc::clone(&stream_admitted),
+                request_cancellation: cancellation.clone(),
             })
         });
         let notification_sender: NotificationSender = match &deferred_notifications {
@@ -14007,10 +14208,19 @@ fn spawn_modern_sse_dispatch(
             // same one-terminal-response obligation as a live Stream body.
             canonical_after_stream_admission = true;
         }
+        let elected_terminal_response = response
+            .as_ref()
+            .is_some_and(final_subscription_completion_response)
+            || canonical_after_stream_admission;
         if let Some(deferred_notifications) = deferred_notifications {
-            for notification in deferred_notifications.take_pending() {
-                committed_notification_sender(notification);
-            }
+            // The subscription registry publishes its elected cancellation
+            // control before waking dispatch. It may still be queued behind
+            // another publisher, and must survive that sanctioned cancel.
+            let retain_cancelled = elected_terminal_response
+                || subscription_request && response.is_none() && terminal_delivery.is_committed();
+            deferred_notifications
+                .finish_notifications(retain_cancelled)
+                .await;
         }
         if notification_commit_failed.load(Ordering::Acquire) {
             terminal_delivery.mark_failed();
@@ -14021,8 +14231,6 @@ fn spawn_modern_sse_dispatch(
         }
         let mut terminal_commit_failed = false;
         if let Some(response) = response {
-            let graceful_completion = final_subscription_completion_response(&response);
-            let elected_terminal_response = graceful_completion || canonical_after_stream_admission;
             // The server-side graceful election cancels this request as its
             // dispatch wake, which claims the finalization race; its elected
             // terminal response is the sanctioned final frame and must still
@@ -34351,13 +34559,20 @@ mod lib_unit_tests {
             })
         };
         let gate = ModernSseNotificationGate {
-            delivery: Mutex::new(ModernSseNotificationDelivery::Pending(Vec::new())),
+            delivery: Mutex::new(ModernSseNotificationDelivery::Pending(
+                ModernSsePendingNotifications::default(),
+            )),
+            finalizing: AtomicBool::new(false),
+            drain_waiter: Mutex::new(None),
+            capacity: 2,
+            max_queued_bytes: 1024,
             subscription_request: false,
             outcome_gate: Some(Arc::clone(&outcome_gate)),
             terminal_delivery: Arc::new(FinalSubscriptionTerminalDelivery::default()),
             committed_sender,
             commit_failed: Arc::clone(&failed),
             stream_admitted: Arc::new(AtomicBool::new(false)),
+            request_cancellation: McpRequestCancellation::new(),
         };
         let first = JsonRpcRequest::notification(
             "notifications/progress",
@@ -34392,6 +34607,324 @@ mod lib_unit_tests {
             serde_json::to_string(&*delivered.lock().unwrap()).unwrap(),
             serde_json::to_string(&[first, second]).unwrap(),
         );
+    }
+
+    fn bounded_modern_sse_test_gate(
+        capacity: usize,
+        max_queued_bytes: usize,
+        committed_sender: NotificationSender,
+    ) -> (
+        Arc<ModernSseNotificationGate>,
+        oneshot::Receiver<ModernSseDispatchElection>,
+    ) {
+        let (outcome_gate, receiver) = ModernSseOutcomeGate::new();
+        (
+            Arc::new(ModernSseNotificationGate {
+                delivery: Mutex::new(ModernSseNotificationDelivery::Pending(
+                    ModernSsePendingNotifications::default(),
+                )),
+                finalizing: AtomicBool::new(false),
+                drain_waiter: Mutex::new(None),
+                capacity,
+                max_queued_bytes,
+                subscription_request: false,
+                outcome_gate: Some(outcome_gate),
+                terminal_delivery: Arc::new(FinalSubscriptionTerminalDelivery::default()),
+                committed_sender,
+                commit_failed: Arc::new(AtomicBool::new(false)),
+                stream_admitted: Arc::new(AtomicBool::new(false)),
+                request_cancellation: McpRequestCancellation::new(),
+            }),
+            receiver,
+        )
+    }
+
+    #[test]
+    fn modern_sse_pending_notification_count_limit_cancels_only_overflowing_owner() {
+        let notification = |value| {
+            JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(serde_json::json!({"progressToken": "bounded", "progress": value})),
+            )
+        };
+        for overflow in [true, false] {
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let collected = Arc::clone(&delivered);
+            let (gate, mut receiver) = bounded_modern_sse_test_gate(
+                2,
+                1024,
+                Arc::new(move |notification| collected.lock().unwrap().push(notification)),
+            );
+            gate.publish(notification(1));
+            gate.publish(notification(2));
+            assert!(delivered.lock().unwrap().is_empty());
+            {
+                let delivery = gate.delivery.lock().unwrap();
+                let ModernSseNotificationDelivery::Pending(pending) = &*delivery else {
+                    panic!("two events fit the configured pre-admission count");
+                };
+                assert_eq!(pending.retained_events, 2);
+                assert_eq!(pending.notifications.len(), 2);
+            }
+            if overflow {
+                gate.publish(notification(3));
+            }
+            gate.admit_handler();
+            gate.drain_pending();
+            let election = block_on(await_modern_sse_dispatch_election(
+                &Cx::for_testing(),
+                &gate.request_cancellation,
+                &mut receiver,
+            ))
+            .expect("the owning response writer always receives its election");
+            if overflow {
+                assert!(matches!(election, ModernSseDispatchElection::Failed));
+                assert!(gate.request_cancellation.is_cancel_requested());
+                assert!(gate.commit_failed.load(Ordering::Acquire));
+                assert!(!gate.stream_admitted.load(Ordering::Acquire));
+                assert!(matches!(
+                    &*gate.delivery.lock().unwrap(),
+                    ModernSseNotificationDelivery::Failed
+                ));
+                gate.publish(notification(4));
+                assert!(delivered.lock().unwrap().is_empty());
+            } else {
+                assert!(matches!(election, ModernSseDispatchElection::Stream));
+                assert!(!gate.request_cancellation.is_cancel_requested());
+                assert!(!gate.commit_failed.load(Ordering::Acquire));
+                assert_eq!(
+                    serde_json::to_value(&*delivered.lock().unwrap()).unwrap(),
+                    serde_json::to_value([notification(1), notification(2)]).unwrap(),
+                    "an independent owner remains ordered and usable after overflow",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modern_sse_pending_notification_byte_limit_counts_exact_raw_source() {
+        let notification = JsonRpcRequest::notification_with_raw_params(
+            "com.example/changed",
+            r#"{   "payload" : "\u0061", "value" : 1.000e+00   }"#.to_owned(),
+            1024,
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&notification).unwrap();
+        let mailbox_bytes = fastmcp_transport::Codec::new()
+            .encode_request(&notification)
+            .unwrap()
+            .len();
+        let compact = serde_json::to_vec(&serde_json::to_value(&notification).unwrap()).unwrap();
+        assert!(encoded.len() > compact.len());
+        assert_eq!(
+            modern_sse_notification_bytes(&notification, mailbox_bytes),
+            Some(mailbox_bytes),
+        );
+        assert_eq!(
+            modern_sse_notification_bytes(&notification, mailbox_bytes - 1),
+            None,
+        );
+        for (limit, success) in [
+            (2 * mailbox_bytes, true),
+            (2 * mailbox_bytes - 1, false),
+            (mailbox_bytes - 1, false),
+        ] {
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let collected = Arc::clone(&delivered);
+            let (gate, _receiver) = bounded_modern_sse_test_gate(
+                8,
+                limit,
+                Arc::new(move |notification| collected.lock().unwrap().push(notification)),
+            );
+            gate.publish(notification.clone());
+            gate.publish(notification.clone());
+            if success {
+                let delivery = gate.delivery.lock().unwrap();
+                let ModernSseNotificationDelivery::Pending(pending) = &*delivery else {
+                    panic!("the exact byte boundary must remain admitted");
+                };
+                assert_eq!(pending.retained_bytes, limit);
+            }
+            gate.admit_handler();
+            assert_eq!(gate.commit_failed.load(Ordering::Acquire), !success);
+            assert_eq!(gate.request_cancellation.is_cancel_requested(), !success);
+            if success {
+                let delivered = delivered.lock().unwrap();
+                assert_eq!(delivered.len(), 2);
+                for notification in delivered.iter() {
+                    assert_eq!(serde_json::to_vec(notification).unwrap(), encoded);
+                }
+            } else {
+                assert!(delivered.lock().unwrap().is_empty());
+                assert!(matches!(
+                    &*gate.delivery.lock().unwrap(),
+                    ModernSseNotificationDelivery::Failed
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn modern_sse_pending_notification_drain_keeps_in_flight_capacity_and_allows_reentry() {
+        for capacity in [2, 3] {
+            let retained_gate =
+                Arc::new(OnceLock::<std::sync::Weak<ModernSseNotificationGate>>::new());
+            let callback_gate = Arc::clone(&retained_gate);
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let collected = Arc::clone(&delivered);
+            let (gate, _receiver) = bounded_modern_sse_test_gate(
+                capacity,
+                1024,
+                Arc::new(move |notification| {
+                    let value = notification.params.as_ref().unwrap()["value"]
+                        .as_u64()
+                        .unwrap();
+                    collected.lock().unwrap().push(value);
+                    if value == 1 {
+                        let gate = callback_gate.get().unwrap().upgrade().unwrap();
+                        assert!(
+                            gate.delivery.try_lock().is_ok(),
+                            "the downstream callback must run without the gate mutex",
+                        );
+                        gate.publish(JsonRpcRequest::notification(
+                            "com.example/changed",
+                            Some(serde_json::json!({"value": 3})),
+                        ));
+                    }
+                }),
+            );
+            assert!(retained_gate.set(Arc::downgrade(&gate)).is_ok());
+            for value in [1, 2] {
+                gate.publish(JsonRpcRequest::notification(
+                    "com.example/changed",
+                    Some(serde_json::json!({"value": value})),
+                ));
+            }
+            gate.admit_handler();
+            if capacity == 2 {
+                assert_eq!(&*delivered.lock().unwrap(), &[1]);
+                assert!(gate.request_cancellation.is_cancel_requested());
+                assert!(!gate.stream_admitted.load(Ordering::Acquire));
+                assert!(matches!(
+                    &*gate.delivery.lock().unwrap(),
+                    ModernSseNotificationDelivery::Failed
+                ));
+            } else {
+                assert_eq!(&*delivered.lock().unwrap(), &[1, 2, 3]);
+                assert!(!gate.request_cancellation.is_cancel_requested());
+                assert!(gate.stream_admitted.load(Ordering::Acquire));
+                assert!(matches!(
+                    &*gate.delivery.lock().unwrap(),
+                    ModernSseNotificationDelivery::Streaming
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn modern_sse_notification_finalization_joins_drainer_and_preserves_elected_control() {
+        struct DrainWake {
+            gate: std::sync::Weak<ModernSseNotificationGate>,
+            wakes: AtomicUsize,
+        }
+
+        impl std::task::Wake for DrainWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                if let Some(gate) = self.gate.upgrade() {
+                    assert!(
+                        gate.delivery.try_lock().is_ok(),
+                        "drain and cancellation wakers run outside the gate lock",
+                    );
+                }
+                self.wakes.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        for (cancel, retain_cancelled) in [(false, false), (true, false), (true, true)] {
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let collected = Arc::clone(&delivered);
+            let (entered, first_callback) = std::sync::mpsc::sync_channel(1);
+            let (release, resume) = std::sync::mpsc::sync_channel(1);
+            let resume = Mutex::new(resume);
+            let (gate, _receiver) = bounded_modern_sse_test_gate(
+                3,
+                1024,
+                Arc::new(move |notification| {
+                    let value = notification.params.as_ref().unwrap()["value"]
+                        .as_u64()
+                        .unwrap();
+                    collected.lock().unwrap().push(value);
+                    if value == 1 {
+                        entered.send(()).unwrap();
+                        resume
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(30))
+                            .expect("the test releases its paused callback");
+                    }
+                }),
+            );
+            let notification = |value| {
+                JsonRpcRequest::notification(
+                    "com.example/changed",
+                    Some(serde_json::json!({"value": value})),
+                )
+            };
+            gate.publish(notification(1));
+            gate.publish(notification(2));
+            let draining_gate = Arc::clone(&gate);
+            let drainer = std::thread::spawn(move || draining_gate.admit_handler());
+            first_callback
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the first callback reaches its deterministic pause");
+
+            let wake = Arc::new(DrainWake {
+                gate: Arc::downgrade(&gate),
+                wakes: AtomicUsize::new(0),
+            });
+            let waker = std::task::Waker::from(Arc::clone(&wake));
+            let mut task = std::task::Context::from_waker(&waker);
+            let mut finish = Box::pin(gate.finish_notifications(retain_cancelled));
+            assert!(finish.as_mut().poll(&mut task).is_pending());
+            gate.publish(notification(3));
+            assert_eq!(
+                &*delivered.lock().unwrap(),
+                &[1],
+                "terminal preparation must wait and seal later publication",
+            );
+            if cancel {
+                gate.request_cancellation.cancel();
+            }
+            let cancelled_poll = finish.as_mut().poll(&mut task);
+            if cancel && !retain_cancelled {
+                assert_eq!(cancelled_poll, std::task::Poll::Ready(false));
+            } else {
+                assert!(cancelled_poll.is_pending());
+            }
+            release.send(()).unwrap();
+            drainer.join().unwrap();
+            if cancel && !retain_cancelled {
+                assert_eq!(&*delivered.lock().unwrap(), &[1]);
+                assert!(gate.commit_failed.load(Ordering::Acquire));
+            } else {
+                assert_eq!(
+                    finish.as_mut().poll(&mut task),
+                    std::task::Poll::Ready(true)
+                );
+                delivered.lock().unwrap().push(99);
+                assert_eq!(
+                    &*delivered.lock().unwrap(),
+                    &[1, 2, 99],
+                    "every retained notification precedes the terminal response",
+                );
+                assert!(!gate.commit_failed.load(Ordering::Acquire));
+            }
+            assert!(wake.wakes.load(Ordering::Acquire) > 0);
+        }
     }
 
     #[test]

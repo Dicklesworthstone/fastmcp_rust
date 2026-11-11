@@ -5242,6 +5242,24 @@ impl StreamableHttpRequestResponseStream {
 }
 
 impl StreamableHttpRequestResponseSender {
+    /// Returns the configured message-count limit of this response queue.
+    ///
+    /// An adapter that defers notifications before choosing an HTTP
+    /// representation must apply this same bound to its retained messages.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.responses.capacity
+    }
+
+    /// Returns the configured serialized-byte limit of this response queue.
+    ///
+    /// This includes the complete JSON-RPC envelope, including any retained
+    /// raw parameter source, rather than just the decoded parameter values.
+    #[must_use]
+    pub fn max_queued_bytes(&self) -> usize {
+        self.responses.max_queued_bytes
+    }
+
     /// Returns the request cancellation domain paired with this producer.
     #[must_use]
     pub fn request_cancellation(&self) -> McpRequestCancellation {
@@ -12370,6 +12388,23 @@ Content-Length: {}\r\n\
             Err(TransportError::Codec(CodecError::Json(_)))
         ));
         assert_eq!(transport.pending_responses(), 0);
+    }
+
+    #[test]
+    fn streamable_http_response_sender_exposes_configured_retention_limits() {
+        for (capacity, max_bytes) in [(1, 257), (7, 1024)] {
+            let mut transport = StreamableHttpTransport::with_queue_limits(capacity, max_bytes)
+                .expect("valid non-default response limits");
+            let responses = transport.response_stream().unwrap();
+            let response = responses
+                .for_request(fastmcp_protocol::RequestId::Number(1))
+                .unwrap();
+            let sender = response.sender();
+            assert_eq!(sender.capacity(), capacity);
+            assert_eq!(sender.max_queued_bytes(), max_bytes);
+            assert_eq!(sender.clone().capacity(), capacity);
+            assert_eq!(sender.clone().max_queued_bytes(), max_bytes);
+        }
     }
 
     #[test]
