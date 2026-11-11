@@ -136,13 +136,14 @@ different things:
   **more than an adapter profile**, which is worth stating precisely because
   the cheap-sounding estimate is wrong. The HTTPS requirement is not one check
   in the conformance adapter: a census of `crates/fastmcp-client/src`, with
-  `cfg(test)` modules excluded, finds **24 production HTTPS enforcement points
-  across 19 files**: 22 independent `scheme() != "https"` or
+  `cfg(test)` modules excluded, finds **29 production HTTPS enforcement points
+  across 22 files**: 27 independent `scheme() != "https"` or
   `starts_with("https://")` refusals in `http_auth.rs`, `device/wire.rs`,
   `challenge.rs`,
   `private_key_jwt.rs`, `metadata_document.rs`, `dpop.rs`,
   `dpop/native/core/stream/task_subscription/watch/checkpoint.rs`, `driver.rs`,
-  `redirect.rs`, `http_client.rs`, `managed/client.rs`, `resume.rs`,
+  `redirect.rs`, `enterprise/identity.rs`, `enterprise/oidc.rs`,
+  `enterprise/policy.rs`, `http_client.rs`, `managed/client.rs`, `resume.rs`,
   `oauth.rs`, `revocation.rs`, `recovery.rs`, `repair.rs`, `http_executor.rs`
   and `parameter_headers.rs`, plus the two central helpers `validate_https`
   and `https_url` in `discovery.rs`. Thirteen further call sites — in
