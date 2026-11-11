@@ -26,6 +26,8 @@ use fastmcp_core::{
     runtime::ProcessGenerationGuard,
 };
 
+mod authorization;
+
 // Deliberately opaque-service doubles, not production encryption or a durable
 // independent anchor. Real files, file locks, coordinator and blocking runtime
 // are used. Tokens and access lifetimes are native fixture credentials.

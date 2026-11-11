@@ -5,6 +5,8 @@
 //! still decides transfer, tombstone, quarantine and commit disposition. There
 //! is no split load/decrypt/take sequence between separately admitted workers.
 
+/// Initial browser or hosted login committed before managed access is delivered.
+pub mod authorization;
 /// Transfer an existing managed login's refresh ownership into protected storage.
 pub mod capture;
 /// Explicit revocation of stored refresh grants and persistent logout custody.
