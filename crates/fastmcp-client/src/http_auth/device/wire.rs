@@ -451,6 +451,7 @@ mod refresh_tests {
         .unwrap()
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn reply(status: u16, body: Value) -> Result<ExchangeResponse, Error> {
         Ok(ExchangeResponse {
             status,

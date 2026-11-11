@@ -48,13 +48,13 @@ struct NoReads;
 impl TaskWaitTransport for NoReads {
     type Error = McpError;
 
-    async fn read_task(
+    fn read_task(
         &mut self,
         _: &Cx,
         _: &McpRequestCancellation,
         _: FinalTaskId,
-    ) -> McpResult<FinalTask> {
-        panic!("this disposition must not issue a Task request")
+    ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
+        std::future::poll_fn(|_| panic!("this disposition must not issue a Task request"))
     }
 }
 
@@ -339,15 +339,15 @@ struct ReadyRead {
 impl TaskWaitTransport for ReadyRead {
     type Error = McpError;
 
-    async fn read_task(
+    fn read_task(
         &mut self,
         _: &Cx,
         _: &McpRequestCancellation,
         task_id: FinalTaskId,
-    ) -> McpResult<FinalTask> {
+    ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
         assert_eq!(&task_id, &self.result.base().task_id);
         self.calls += 1;
-        Ok(self.result.clone())
+        std::future::ready(Ok(self.result.clone()))
     }
 }
 
@@ -402,19 +402,19 @@ struct RetentionUpdates {
 impl TaskWaitTransport for RetentionUpdates {
     type Error = McpError;
 
-    async fn read_task(
+    fn read_task(
         &mut self,
         _: &Cx,
         _: &McpRequestCancellation,
         task_id: FinalTaskId,
-    ) -> McpResult<FinalTask> {
+    ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
         let next = self
             .snapshots
             .pop_front()
             .expect("no extra reconciliation read");
         assert_eq!(&task_id, &next.base().task_id);
         self.calls += 1;
-        Ok(next)
+        std::future::ready(Ok(next))
     }
 }
 
@@ -682,16 +682,16 @@ mod caller_authority {
     impl TaskWaitTransport for ReadProbe {
         type Error = McpError;
 
-        async fn read_task(
+        fn read_task(
             &mut self,
             cx: &Cx,
             _: &McpRequestCancellation,
             _: FinalTaskId,
-        ) -> McpResult<FinalTask> {
+        ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
             assert_eq!(cx.capabilities().io, self.io_allowed);
             assert_eq!(Cx::current().unwrap().capabilities().io, self.io_allowed);
             self.reads += 1;
-            Ok(task("completed", None, 1))
+            std::future::ready(Ok(task("completed", None, 1)))
         }
     }
 

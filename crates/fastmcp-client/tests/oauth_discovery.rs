@@ -960,7 +960,7 @@ fn invalid_resource_identity_or_untrusted_issuer_stops_before_issuer_contact() {
                     peer.serve(path, 200, &document.to_string()).await;
                 }
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err()
             else {
                 panic!("both unusable resource candidates must retain their admission causes");
@@ -1015,7 +1015,7 @@ fn each_discovery_leg_requires_its_own_tls_trust_before_sending_a_get() {
                     );
                 }
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             if trust_resource {
                 let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.unwrap_err()
                 else {
@@ -1115,7 +1115,7 @@ fn metadata_location_exhaustion_is_bounded_and_precancellation_has_no_contact() 
                 peer.serve(path, 404, "").await;
             }
         };
-        let ((), result) = pair(server, plan.discover(&cx)).await;
+        let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
         let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.unwrap_err() else {
             panic!("issuer exhaustion expected")
         };
@@ -1326,7 +1326,7 @@ fn cross_origin_registration_requires_its_own_write_grant_over_tls() {
                     .await;
                 }
             };
-            let ((), result) = pair(server, owner.register(&cx)).await;
+            let ((), result) = Box::pin(pair(server, owner.register(&cx))).await;
             if permitted {
                 assert_eq!(result.unwrap().client_id(), "separate-client");
             } else {
@@ -1426,7 +1426,7 @@ fn registration_checks_the_complete_code_flow_before_creating_remote_state() {
                     }
                 }
             };
-            let ((), result) = pair(server, peer.registration().register(&cx)).await;
+            let ((), result) = Box::pin(pair(server, peer.registration().register(&cx))).await;
             assert!(result.is_err());
             assert_eq!(
                 peer.paths.lock().unwrap().len(),
@@ -1458,7 +1458,7 @@ fn registration_status_redirect_and_lost_response_never_retry_the_post() {
                 // In the lost-response case, the registration might already
                 // exist remotely. Dropping the socket must not provoke a retry.
             };
-            let ((), result) = pair(server, peer.registration().register(&cx)).await;
+            let ((), result) = Box::pin(pair(server, peer.registration().register(&cx))).await;
             match status {
                 Some(status) => assert!(
                     matches!(result, Err(OAuthRegistrationError::HttpStatus { status: actual }) if actual == status)
@@ -1492,7 +1492,8 @@ fn initial_registration_credential_cannot_be_sent_to_a_different_endpoint() {
                 .unwrap(),
             )
             .unwrap();
-        let ((), result) = pair(peer.registration_discovery(&document), owner.register(&cx)).await;
+        let ((), result) =
+            Box::pin(pair(peer.registration_discovery(&document), owner.register(&cx))).await;
         assert!(matches!(
             result,
             Err(OAuthRegistrationError::InitialCredentialRejected)
@@ -1550,7 +1551,7 @@ fn registration_deadline_covers_the_post_and_precancellation_has_no_contact() {
             let mut byte = [0];
             assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0));
         };
-        let ((), result) = pair(server, owner.register(&cx)).await;
+        let ((), result) = Box::pin(pair(server, owner.register(&cx))).await;
         assert!(matches!(
             result,
             Err(OAuthRegistrationError::Discovery(

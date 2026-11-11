@@ -53,7 +53,7 @@ async fn connect(cx: &Cx, script: &str) -> (Client, FinalTaskHandle) {
     let mut client = ClientBuilder::new()
         .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
         .capabilities(fastmcp_protocol::ClientCapabilities {
-            roots: Some(Default::default()),
+            roots: Some(fastmcp_protocol::RootsCapability::default()),
             ..fastmcp_protocol::ClientCapabilities::default()
         })
         .request_timeout_policy(

@@ -1042,7 +1042,22 @@ fn trybuild_active_features() -> Vec<&'static str> {
 }
 
 fn prepare_trybuild_worker_arg0() -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
+    let temp_root = {
+        let dir = std::env::temp_dir();
+        #[cfg(target_os = "macos")]
+        {
+            if dir.starts_with("/Volumes/") && std::path::Path::new("/var/tmp").is_dir() {
+                PathBuf::from("/var/tmp")
+            } else {
+                dir
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            dir
+        }
+    };
+    let base = temp_root.join(format!(
         "fastmcp-trybuild-fingerprint-{}",
         std::process::id()
     ));

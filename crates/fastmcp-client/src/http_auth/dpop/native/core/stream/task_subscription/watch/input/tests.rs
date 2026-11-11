@@ -47,7 +47,7 @@ fn input_policy_has_finite_independent_snapshot_update_key_state_and_time_limits
         assert!(DpopTaskWatchDriverPolicy::new(1, 1, 1, 64, timeout).is_err());
     }
     assert!(DpopTaskWatchDriverPolicy::new(1024, 128, 4096, 4 * 1024 * 1024,
-        Duration::from_secs(86_400)).is_ok());
+        Duration::from_hours(24)).is_ok());
     assert!(DpopTaskWatchDriverPolicy::new(1, 0, 0, 1, Duration::from_secs(1)).is_ok());
 }
 

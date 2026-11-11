@@ -58649,7 +58649,7 @@ IFS= read -r second || exit 91
                     serde_json::to_string(cursor).unwrap(),
                 )),
                 None => {
-                    script.push_str("case \"$request\" in *'\"cursor\":'*) exit 11 ;; *) ;; esac\n")
+                    script.push_str("case \"$request\" in *'\"cursor\":'*) exit 11 ;; *) ;; esac\n");
                 }
             }
             script.push_str(&format!(

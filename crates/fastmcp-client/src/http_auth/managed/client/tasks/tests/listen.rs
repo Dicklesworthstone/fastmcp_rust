@@ -96,7 +96,7 @@ fn managed_task_listen_delivers_before_eof_and_retains_exact_requested_ids() {
             }
             ControlFlow::Continue(())
         };
-        let (result, ()) = pair(
+        let (result, ()) = Box::pin(pair(
             client.listen_task_events(
                 &cx,
                 vec![id(), id(), FinalTaskId::parse("task-2").unwrap()],
@@ -131,7 +131,7 @@ fn managed_task_listen_delivers_before_eof_and_retains_exact_requested_ids() {
                 stream.write_all(rest.as_bytes()).await.unwrap();
                 let _ = stream.shutdown().await;
             },
-        )
+        ))
         .await;
         assert!(matches!(
             result.unwrap(),
@@ -447,7 +447,7 @@ fn managed_task_listen_idle_cancellation_logout_and_deadline_release_the_respons
                 observed.take().unwrap().send_blocking(()).unwrap();
                 ControlFlow::Continue(())
             };
-            let (result, ()) = pair(
+            let (result, ()) = Box::pin(pair(
                 client.listen_task_events_with_cancellation(
                     &cx,
                     &cancellation,
@@ -477,7 +477,7 @@ fn managed_task_listen_idle_cancellation_logout_and_deadline_release_the_respons
                     }
                     assert_released(&mut stream).await;
                 },
-            )
+            ))
             .await;
             match cause {
                 0 => assert!(matches!(

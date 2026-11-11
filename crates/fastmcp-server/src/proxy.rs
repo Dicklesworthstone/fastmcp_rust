@@ -20035,7 +20035,18 @@ IFS= read -r end
                         peer_received.store(attempts + 1, Ordering::Release);
                         if released.recv_timeout(Duration::from_secs(10)).unwrap() {
                             let mut byte = [0];
-                            assert!(matches!(post.read(&mut byte), Ok(0)));
+                            match post.read(&mut byte) {
+                                Ok(0) => {}
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::ConnectionReset
+                                            | std::io::ErrorKind::BrokenPipe
+                                    ) => {}
+                                other => {
+                                    panic!("abandoned post must close its native socket: {other:?}")
+                                }
+                            }
                             break;
                         }
                     }

@@ -85,7 +85,7 @@ mod memory {
             version: "1".to_owned(),
         })
         .capabilities(ClientCapabilities {
-            roots: Some(Default::default()),
+            roots: Some(fastmcp_protocol::RootsCapability::default()),
             ..ClientCapabilities::default()
         })
         .with_tasks()
@@ -769,20 +769,20 @@ fn task(status: &str, poll: Option<u64>) -> Value {
         "input_required" => {
             task["inputRequests"] = json!({
                 "roots": {"method": "roots/list"}
-            })
+            });
         }
         "completed" => {
             task["result"] = json!({
                 "content": [{"type": "text", "text": "finished"}],
                 "opaque": {"x": [1, true, "kept"]}
-            })
+            });
         }
         "failed" => {
             task["error"] = json!({
                 "code": -32000,
                 "message": "application failed",
                 "opaque": [false, 7]
-            })
+            });
         }
         _ => {}
     }
@@ -1001,7 +1001,7 @@ fn run(
                     version: "1".to_owned(),
                 },
                 ClientCapabilities {
-                    roots: Some(Default::default()),
+                    roots: Some(fastmcp_protocol::RootsCapability::default()),
                     ..ClientCapabilities::default()
                 },
             )
@@ -1507,7 +1507,7 @@ fn public_http_task_input_expiry_refuses_before_request_allocation() {
                         version: "1".to_owned(),
                     },
                     ClientCapabilities {
-                        roots: Some(Default::default()),
+                        roots: Some(fastmcp_protocol::RootsCapability::default()),
                         ..Default::default()
                     },
                 )
@@ -1545,20 +1545,20 @@ fn task_wait_policy_and_missing_timer_fail_before_transport_activity() {
         assert!(FinalTaskWaitPolicy::new(timeout, polls, fallback).is_err());
     }
     assert!(
-        FinalTaskWaitPolicy::new(Duration::from_secs(86400), 4096, Duration::from_secs(300),)
+        FinalTaskWaitPolicy::new(Duration::from_hours(24), 4096, Duration::from_mins(5),)
             .is_ok()
     );
 
     struct NoReads;
     impl TaskWaitTransport for NoReads {
         type Error = McpError;
-        async fn read_task(
+        fn read_task(
             &mut self,
             _: &Cx,
             _: &McpRequestCancellation,
             _: FinalTaskId,
-        ) -> McpResult<FinalTask> {
-            panic!("unavailable timer must refuse before a transport read")
+        ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
+            std::future::poll_fn(|_| panic!("unavailable timer must refuse before a transport read"))
         }
     }
     let cx = Cx::for_request();

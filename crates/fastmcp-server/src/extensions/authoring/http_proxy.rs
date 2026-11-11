@@ -9,7 +9,15 @@ use fastmcp_core::{Cx, DEFAULT_JSON_RPC_MAX_BODY_BYTES};
 use fastmcp_protocol::extensions::ClientExtensionDiscovery;
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 
-use super::*;
+use super::{
+    Arc, BTreeMap, BoxFuture, DeserializeOwned, ErasedExtensionHandler, ExtensionBuilder,
+    ExtensionDescriptor, ExtensionNegotiationError, ExtensionRegistration, ExtensionSettings,
+    ExtensionSettingsCompatibilityResolver, HandlerBinding, JsonSchemaType,
+    MAX_AUTHORING_SETTINGS_BYTES, MAX_SCHEMA_INSTANCE_BYTES, McpContext, McpError, McpResult,
+    NegotiatedExtension, PendingMethod, PhantomData, ProtocolDescriptor, Serialize,
+    SettingsResolver, Value, encode_value, ensure_live, poll_live, retain_schema_identity,
+    unbound_handler,
+};
 
 // Progress and core notifications are admitted by the client but not relayed.
 // Bound the total work even when a peer keeps sending valid nonterminal events.
@@ -17,7 +25,7 @@ const MAX_INTERMEDIATE_EVENTS: usize = 64;
 
 /// A negotiated HTTP upstream for one complete authored extension contract.
 ///
-/// Construct this handle with [ExtensionRegistration::connect_http_upstream].
+/// Construct this handle with [`ExtensionRegistration::connect_http_upstream`].
 /// Clones share bounded request accounting and a fresh request ID allocator.
 /// They expose no client, credentials, registry, resolver, or execution control.
 /// Each forwarded request owns its response stream and cancellation lifetime.
@@ -82,10 +90,16 @@ impl ExtensionRegistration {
     ///
     /// This consumes the registration without invoking its handlers. Build a
     /// second registration with the same complete contract for the gateway,
-    /// using [ExtensionBuilder::typed_http_proxy_request] for routed methods.
+    /// using [`ExtensionBuilder::typed_http_proxy_request`] for routed methods.
     /// All methods and schemas, including their order and descriptor version,
     /// must match. Neither client nor server notification declarations are
     /// supported by this request/result route.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the declaration includes notifications, the client
+    /// builder does not select a modern-only HTTP plan, client settings fail
+    /// validation, or the upstream connection fails to negotiate the extension.
     pub async fn connect_http_upstream<ClientSettings>(
         self,
         cx: &Cx,
@@ -172,6 +186,11 @@ where
     /// Adding a notification or changing a schema after this call fails build.
     /// A cancelled/dropped downstream request drops only its owned upstream
     /// execution; sibling requests remain usable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upstream does not own the request-only extension
+    /// method or if method schema registration fails.
     pub fn typed_http_proxy_request<Request, Response>(
         mut self,
         method: impl Into<String>,

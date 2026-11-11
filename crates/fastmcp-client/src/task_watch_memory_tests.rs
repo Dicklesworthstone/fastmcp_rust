@@ -703,17 +703,17 @@ mod watch_caller_lifetime {
     impl TaskWaitTransport for Probe {
         type Error = McpError;
 
-        async fn read_task(
+        fn read_task(
             &mut self,
             cx: &Cx,
             _: &McpRequestCancellation,
             _: FinalTaskId,
-        ) -> McpResult<FinalTask> {
+        ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
             self.record("read", cx);
             if let Some(cancellation) = &self.cancel_on_read {
                 cancellation.cancel();
             }
-            Ok(serde_json::from_value(task("completed", None, 2)).unwrap())
+            std::future::ready(Ok(serde_json::from_value(task("completed", None, 2)).unwrap()))
         }
     }
 
@@ -727,16 +727,16 @@ mod watch_caller_lifetime {
             None
         }
 
-        async fn open_watch(
+        fn open_watch(
             &mut self,
             cx: &Cx,
             _: &McpRequestCancellation,
             _: SubscriptionFilter,
             owner: &mut Option<RequestId>,
-        ) -> McpResult<()> {
+        ) -> impl std::future::Future<Output = McpResult<()>> {
             self.record("open", cx);
             *owner = Some(RequestId::Number(17));
-            Ok(())
+            std::future::ready(Ok(()))
         }
 
         async fn next_watch_event(
@@ -752,9 +752,13 @@ mod watch_caller_lifetime {
             }
         }
 
-        async fn cancel_watch(&mut self, _: &Cx, _: &mut RequestId) -> McpResult<()> {
+        fn cancel_watch(
+            &mut self,
+            _: &Cx,
+            _: &mut RequestId,
+        ) -> impl std::future::Future<Output = McpResult<()>> {
             self.observed.lock().unwrap().cancelled += 1;
-            Ok(())
+            std::future::ready(Ok(()))
         }
 
         fn abandon_watch(&mut self, _: RequestId) {

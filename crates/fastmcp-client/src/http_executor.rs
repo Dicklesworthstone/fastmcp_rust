@@ -14987,7 +14987,7 @@ mod tests {
                 &mut polled,
             );
             if invalidate {
-                let error = result.err().expect("stopped generation refuses the poll");
+                let error = result.expect_err("stopped generation refuses the poll");
                 assert!(matches!(
                     error.error,
                     LegacySseHttpClientError::StreamGenerationEnded
@@ -16764,7 +16764,7 @@ mod tests {
                     Some(
                         r#"{"requiredCapabilities":{"roots":{}},"numbers":[7.30e-2,1.20e+4,123456789012345678901234567890],"detail":"owned-error-data"}"#,
                     ),
-                    Some(r#"[7.30e-2,1.20e+4,123456789012345678901234567890]"#),
+                    Some(r"[7.30e-2,1.20e+4,123456789012345678901234567890]"),
                     None,
                 ] {
                     let data_field = data_source
@@ -18792,7 +18792,7 @@ mod tests {
                 "roots-a":{"method":"roots/list"},
                 "roots-b":{"method":"roots/list"},
             });
-            let retained: fastmcp_protocol::FinalTask =
+            let retained: crate::FinalTask =
                 serde_json::from_value(initial.clone()).unwrap();
             let before = serde_json::to_vec(&retained).unwrap();
 
@@ -23592,6 +23592,7 @@ mod tests {
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
+    #[allow(clippy::fn_params_excessive_bools)]
     fn assert_http_auto_callback_capabilities(
         ready_client: bool,
         fallback: bool,

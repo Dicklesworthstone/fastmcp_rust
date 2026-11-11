@@ -958,21 +958,21 @@ mod tests {
             ("method", |key| key.method = "resources/list".to_owned()),
             ("query", |key| key.semantic_projection.push('x')),
             ("unknown cursor", |key| {
-                key.cursor = Some("foreign".to_owned())
+                key.cursor = Some("foreign".to_owned());
             }),
             ("empty cursor", |key| key.cursor = Some(String::new())),
             ("absent cursor", |key| key.cursor = None),
             ("policy", |key| key.policy_revision += 1),
             ("extension revision", |key| key.extension_revision += 1),
             ("representation", |key| {
-                key.representation_policy_revision += 1
+                key.representation_policy_revision += 1;
             }),
             ("limits", |key| key.limits_policy_revision += 1),
             ("partition", |key| {
-                key.partition = CachePartitionKey::new("credential-b")
+                key.partition = CachePartitionKey::new("credential-b");
             }),
             ("result set", |key| {
-                key.result_set = FinalCacheResultSet::Resources
+                key.result_set = FinalCacheResultSet::Resources;
             }),
         ];
         for (dimension, mutate) in variations {

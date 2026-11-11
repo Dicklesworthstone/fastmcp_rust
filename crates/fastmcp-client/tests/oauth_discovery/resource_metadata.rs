@@ -442,7 +442,7 @@ fn registration_reaches_one_write_after_root_metadata_wins() {
             )
             .await;
         };
-        let ((), registered) = pair(server, owner.register(&cx)).await;
+        let ((), registered) = Box::pin(pair(server, owner.register(&cx))).await;
         assert_eq!(registered.unwrap().client_id(), "root-discovered-client");
         assert_eq!(
             *peer.paths.lock().unwrap(),

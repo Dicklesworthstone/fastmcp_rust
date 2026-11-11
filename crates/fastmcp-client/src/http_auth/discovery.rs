@@ -1342,7 +1342,7 @@ mod tests {
                     let _neutral = Cx::set_current(None);
                     runtime.block_on(async {
                         clock.advance(1_000_000_000);
-                        timer.process_timers();
+                        let _ = timer.process_timers();
                     });
                 }
                 assert!(wakes.0.load(Ordering::SeqCst) > previous_wakes);

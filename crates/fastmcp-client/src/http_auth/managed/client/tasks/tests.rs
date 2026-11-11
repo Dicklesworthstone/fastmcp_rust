@@ -808,7 +808,7 @@ fn managed_task_input_expiring_during_discovery_never_reaches_update_dispatch() 
             Duration::from_secs(2),
         ));
         let before = serde_json::to_vec(&snapshot).unwrap();
-        let (result, ()) = pair(
+        let (result, ()) = Box::pin(pair(
             client.update_task_final(&cx, &snapshot, responses(json!({"roots":{"roots":[]}}))),
             async {
                 let (mut stream, request) = peer.request("server/discover", "access-one").await;
@@ -827,7 +827,7 @@ fn managed_task_input_expiring_during_discovery_never_reaches_update_dispatch() 
                 .await;
                 peer.no_more(&cx).await;
             },
-        )
+        ))
         .await;
         assert!(matches!(
             result,

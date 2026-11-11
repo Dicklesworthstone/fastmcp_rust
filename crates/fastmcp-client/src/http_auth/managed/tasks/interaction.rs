@@ -1193,18 +1193,17 @@ mod tests {
                 let cx = Cx::current().unwrap();
                 let (operation, bearer) = pending_interaction();
                 let calls = Cell::new(0);
-                let outcome = operation
-                    .drive(
-                        &cx,
-                        |input| {
-                            calls.set(calls.get() + 1);
-                            assert_eq!(input.request_state(), Some("sealed-original"));
-                            std::future::ready(Ok(ManagedTaskInputAction::Pause))
-                        },
-                        |_| panic!("no notification was received"),
-                    )
-                    .await
-                    .unwrap();
+                let outcome = Box::pin(operation.drive(
+                    &cx,
+                    |input| {
+                        calls.set(calls.get() + 1);
+                        assert_eq!(input.request_state(), Some("sealed-original"));
+                        std::future::ready(Ok(ManagedTaskInputAction::Pause))
+                    },
+                    |_| panic!("no notification was received"),
+                ))
+                .await
+                .unwrap();
                 let ManagedTaskDriveOutcome::Paused(mut operation) = outcome else {
                     panic!("host pause")
                 };
@@ -1243,23 +1242,22 @@ mod tests {
                 for invalid in [false, true] {
                     let (operation, bearer) = pending_interaction();
                     let calls = Cell::new(0);
-                    let result = operation
-                        .drive(
-                            &cx,
-                            |_| {
-                                calls.set(calls.get() + 1);
-                                std::future::ready(if invalid {
-                                    Ok(ManagedTaskInputAction::Respond {
-                                        ids: ids(3, 4),
-                                        input_responses: Some(answers(json!({}))),
-                                    })
-                                } else {
-                                    Err(ManagedInteractionError::AbortedByHost.into())
+                    let result = Box::pin(operation.drive(
+                        &cx,
+                        |_| {
+                            calls.set(calls.get() + 1);
+                            std::future::ready(if invalid {
+                                Ok(ManagedTaskInputAction::Respond {
+                                    ids: ids(3, 4),
+                                    input_responses: Some(answers(json!({}))),
                                 })
-                            },
-                            |_| Ok(()),
-                        )
-                        .await;
+                            } else {
+                                Err(ManagedInteractionError::AbortedByHost.into())
+                            })
+                        },
+                        |_| Ok(()),
+                    ))
+                    .await;
                     assert!(matches!(
                         result,
                         Err(ManagedTaskInteractionError::Interaction(_))

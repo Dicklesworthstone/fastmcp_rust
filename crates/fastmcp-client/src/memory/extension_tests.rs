@@ -759,10 +759,10 @@ fn memory_extension_notifications_publish_fresh_proof_without_request_state() {
             let mut conflicting = json!({});
             match location {
                 NotificationActivationProofLocation::Params => {
-                    conflicting[PROOF] = json!({"mode":"forged"})
+                    conflicting[PROOF] = json!({"mode":"forged"});
                 }
                 NotificationActivationProofLocation::Metadata => {
-                    conflicting["_meta"] = json!({(PROOF):{"mode":"forged"}})
+                    conflicting["_meta"] = json!({(PROOF):{"mode":"forged"}});
                 }
             }
             assert_eq!(

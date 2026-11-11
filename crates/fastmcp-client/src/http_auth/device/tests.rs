@@ -32,9 +32,11 @@ fn token() -> Value {
         "refresh_token":"refresh-secret", "scope":"read"})
 }
 fn bytes(value: &Value) -> Vec<u8> { serde_json::to_vec(value).unwrap() }
+#[allow(clippy::unnecessary_wraps)]
 fn reply(status: u16, value: Value) -> Result<ExchangeResponse, Error> {
     Ok(ExchangeResponse { status, body: bytes(&value) })
 }
+#[allow(clippy::manual_async_fn)]
 fn verify(_: DeviceVerification) -> impl Future<Output = Result<(), Error>> { async { Ok(()) } }
 fn once<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
     f.poll(&mut Context::from_waker(Waker::noop()))

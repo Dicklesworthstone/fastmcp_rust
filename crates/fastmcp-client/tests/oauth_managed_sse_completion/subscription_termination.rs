@@ -43,7 +43,10 @@ async fn open_stream(peer: &Peer, frames: &[Value]) -> TlsStream<TcpStream> {
         request["params"]["_meta"],
         serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap()
     );
-    let body: String = frames.iter().map(|value| format!("data: {value}\n\n")).collect();
+    let body = frames.iter().fold(String::new(), |mut acc, value| {
+        let _ = std::fmt::Write::write_fmt(&mut acc, format_args!("data: {value}\n\n"));
+        acc
+    });
     socket.write_all(format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{body}\r\n",
         body.len()

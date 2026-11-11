@@ -1382,7 +1382,7 @@ mod native_tests {
                         "changed" => "different descriptor", "keys" => "input-key budget", _ => "byte budget",
                     }));
                     assert!(!driver.input_resolution_interrupted());
-                    assert_eq!(calls.load(Ordering::SeqCst), if case == "bytes" { 0 } else { 1 });
+                    assert_eq!(calls.load(Ordering::SeqCst), usize::from(case != "bytes"));
                     client.list_tools(&cx, &McpRequestCancellation::new(), None).await.unwrap();
                     let _peer = server.join(&cx).await.unwrap();
                     client.close(&cx).unwrap();
@@ -2362,7 +2362,10 @@ case "$request" in *'"inputResponses":{}'*) ;; *) exit 85 ;; esac
                 frame(&mut peer, 4, snapshot(inputs())).await;
                 frame(&mut peer, 5, completed()).await;
                 frame(&mut peer, 6, catalog()).await;
-                let handle = client.attach_final_task(&cx, id()).await.unwrap();
+                let handle = client
+                    .attach_final_task(&cx, &McpRequestCancellation::new(), id())
+                    .await
+                    .unwrap();
                 let mut driver = handle.into_driver(drive_policy(4, 1, 3));
                 assert_eq!(driver.drive_with_websocket(&cx, &mut client, &McpRequestCancellation::new()).await.unwrap(),
                     FinalTaskWaitOutcome::Completed);

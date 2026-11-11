@@ -403,7 +403,7 @@ fn registration_recovers_issuer_transport_failure_then_writes_only_once() {
             )
             .await;
         };
-        let ((), result) = pair(server, owner.register(&cx)).await;
+        let ((), result) = Box::pin(pair(server, owner.register(&cx))).await;
         assert_eq!(result.unwrap().client_id(), "recovered-native");
         assert_eq!(*peer.paths.lock().unwrap(), [PRM, A, B, "/register"]);
         peer.assert_no_extra_connections();

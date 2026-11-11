@@ -14,6 +14,7 @@
 //! not change later matched-era handler observables. It is not an aggregate
 //! MCP 2026-07-28 conformance claim.
 
+#![recursion_limit = "256"]
 #![allow(
     clippy::default_trait_access,
     clippy::fn_params_excessive_bools,
@@ -705,6 +706,21 @@ enum AsProxyGatewayAuth {
     None,
     Static,
     Custom,
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+struct AsProxyGatewayTaskAccessPolicy;
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+impl fastmcp_rust::TaskAccessAuthorizer for AsProxyGatewayTaskAccessPolicy {
+    fn authorize(
+        &self,
+        _ctx: &McpContext,
+        _action: fastmcp_rust::TaskAccessAction,
+        _original: &fastmcp_rust::FinalTaskOperation,
+    ) -> McpResult<()> {
+        Ok(())
+    }
 }
 
 /// Sends one bounded native HTTP POST with optional Authorization plus the
@@ -4963,6 +4979,7 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
                 Arc::new(|_| {}),
             );
             let server = modern::ServerBuilder::new("facade-http-task", "1.0.0")
+                .resource(PublicHttpWatchResource)
                 .tool(PublicHttpTaskTool)
                 .tool(PublicHttpTouchTool)
                 .tool(PublicHttpHideTool)
@@ -5684,6 +5701,7 @@ fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixtu
                     .with_allowed_schemes(["Bearer"])
                     .expect("the task proxy gateway bearer scheme is valid"),
                 ))
+                .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy))
                 .as_proxy_typed("ext", proxy, catalog)
                 .map_err(|error| format!("as_proxy_typed task install failed: {error}"))?
                 .build();
@@ -6622,11 +6640,14 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                     .expect("the deterministic stdio as_proxy gateway bearer verifier is valid")
                     .with_allowed_schemes(["Bearer"])
                     .expect("the stdio as_proxy gateway bearer scheme allowlist is valid");
-                    builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+                    builder = builder
+                        .auth_provider(TokenAuthProvider::new(verifier))
+                        .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy));
                 }
                 AsProxyGatewayAuth::Custom => {
-                    builder =
-                        builder.auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier));
+                    builder = builder
+                        .auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier))
+                        .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy));
                 }
             }
             if strict_input {
@@ -15581,11 +15602,14 @@ fn spawn_modern_http_identity_proxy_gateway_configured_with_auth(
                     .expect("the deterministic as_proxy gateway bearer verifier is valid")
                     .with_allowed_schemes(["Bearer"])
                     .expect("the as_proxy gateway bearer scheme allowlist is valid");
-                    builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+                    builder = builder
+                        .auth_provider(TokenAuthProvider::new(verifier))
+                        .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy));
                 }
                 AsProxyGatewayAuth::Custom => {
-                    builder =
-                        builder.auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier));
+                    builder = builder
+                        .auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier))
+                        .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy));
                 }
             }
             if strict_input {
@@ -24984,7 +25008,7 @@ fn as_proxy_http_follow_roots(
     Result<FinalReadResourceResult, modern::HttpClientError>,
     Result<FinalGetPromptResult, modern::HttpClientError>,
 ) {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let upstream = spawn_modern_sampling_http_server();
     let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
     let mut client = as_proxy_roots_follow_client(&cx, gateway.address(), refuse);
@@ -25225,7 +25249,7 @@ fn e2e_public_http_as_proxy_recomputes_upstream_parameter_headers_planted_negati
 fn as_proxy_http_stdio_follow_roots(
     refuse: bool,
 ) -> Result<FinalReadResourceResult, modern::HttpClientError> {
-    let cx = Cx::for_request();
+    let cx = public_http_caller();
     let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
     let mut client = as_proxy_roots_follow_client(&cx, gateway.address(), refuse);
     let resource = runtime_block_on_bounded(&cx, client.read_resource(&cx, "info://mrtr-resource"));
@@ -44614,6 +44638,7 @@ mod live_websocket_bind {
                     .with_allowed_schemes(["Bearer"])
                     .expect("the WebSocket Tasks relay bearer scheme is valid"),
                 ))
+                .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy))
                 .as_proxy_typed("ext", proxy, catalog)
                 .expect("modern as_proxy_typed Tasks install must succeed")
                 .build();
@@ -45019,6 +45044,7 @@ mod live_websocket_bind {
                     .with_allowed_schemes(["Bearer"])
                     .expect("the WebSocket dual-listen bearer scheme is valid"),
                 ))
+                .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy))
                 .as_proxy_typed("ext", proxy, catalog)
                 .expect("modern as_proxy_typed dual-listen install must succeed")
                 .build();
@@ -45281,6 +45307,7 @@ mod live_websocket_bind {
                     .with_allowed_schemes(["Bearer"])
                     .expect("the WebSocket Task creation bearer scheme is valid"),
                 ))
+                .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy))
                 .as_proxy_typed("ext", proxy, catalog)
                 .expect("modern as_proxy_typed Tasks install must succeed")
                 .build();
@@ -48299,6 +48326,7 @@ mod live_websocket_bind {
             .expect("the as_proxy WebSocket bearer scheme allowlist is valid");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-auth-gateway", "1.0.0")
                 .auth_provider(TokenAuthProvider::new(verifier))
+                .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy))
                 .as_proxy_typed("ext", proxy, catalog)
                 .expect("modern as_proxy_typed auth install must succeed")
                 .build();
@@ -48437,6 +48465,7 @@ mod live_websocket_bind {
                 .expect("live modern HTTP counting proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-custom-auth-gateway", "1.0.0")
                 .auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier))
+                .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy))
                 .as_proxy_typed("ext", proxy, catalog)
                 .expect("modern as_proxy_typed custom-auth install must succeed")
                 .build();
@@ -51140,6 +51169,7 @@ mod live_websocket_bind {
                         .with_allowed_schemes(["Bearer"])
                         .expect("the WebSocket Task progress bearer scheme is valid"),
                     ))
+                    .task_access_authorizer(Arc::new(AsProxyGatewayTaskAccessPolicy))
                     .as_proxy_typed("ext", proxy, catalog)
                     .expect("modern as_proxy_typed Tasks install must succeed")
                     .build();

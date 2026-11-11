@@ -3084,7 +3084,7 @@ mod tests {
                 assert_eq!(credentials.scopes, ["tools:read".to_owned()]);
                 Ok::<_, OAuthError>(())
             };
-            let (server, application) = within(&cx, deadline, async { Ok(Box::pin(pair(server, application)).await) }).await.unwrap();
+            let (server, application) = Box::pin(within(&cx, deadline, async { Ok(Box::pin(pair(server, application)).await) })).await.unwrap();
             assert_eq!(server, Ok(()));
             assert_eq!(application, Ok(()));
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -3548,7 +3548,7 @@ mod tests {
                     // server rotated the refresh token. The connection is lost.
                     Ok(())
                 });
-                let (server, result) = pair(server, client.refresh(&cx, &mut credentials)).await;
+                let (server, result) = Box::pin(pair(server, client.refresh(&cx, &mut credentials))).await;
                 assert_eq!(server, Ok(()));
                 assert_eq!(result, Err(if redirect { OAuthError::TokenEndpointRejected } else { OAuthError::TransportFailed }));
                 assert!(original.is_revoked());

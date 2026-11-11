@@ -950,7 +950,7 @@ async fn open_ready_legacy(cx: &Cx, peer: &Peer) -> ClientHttpConnection {
         cx,
         peer,
         ProtocolPolicy::Auto,
-        RequestTimeoutPolicy::new(Duration::from_secs(90), Duration::from_secs(900))
+        RequestTimeoutPolicy::new(Duration::from_secs(90), Duration::from_mins(15))
             .expect("the request policy leaves the stream guard independently observable"),
     )
     .await

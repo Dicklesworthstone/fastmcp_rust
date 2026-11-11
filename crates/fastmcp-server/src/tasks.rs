@@ -12335,10 +12335,12 @@ mod tests {
             fixture.probe.state.lock().unwrap().live.len() == concurrency
         }).await;
         assert!(fixture.runtime.is_task_service_ready());
-        let state = fixture.probe.state.lock().unwrap();
-        assert_eq!(state.started.len(), concurrency);
-        assert_eq!(state.live.len(), concurrency);
-        assert_eq!(state.peak_live, concurrency);
+        {
+            let state = fixture.probe.state.lock().unwrap();
+            assert_eq!(state.started.len(), concurrency);
+            assert_eq!(state.live.len(), concurrency);
+            assert_eq!(state.peak_live, concurrency);
+        }
         assert_eq!(
             serde_json::to_value(fixture.store.get_task(&fixture.task_ids[1]).unwrap()).unwrap(),
             serde_json::to_value(before).unwrap(),
@@ -12355,7 +12357,6 @@ mod tests {
                     .contains_key(&fixture.task_ids[1])
             );
         }
-        drop(state);
         drop(service);
         wait_task_test_condition(&cx, "bounded service children restore after drop", || {
             fixture.store.active_task_count() == 0
