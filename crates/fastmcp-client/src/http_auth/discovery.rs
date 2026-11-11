@@ -30,6 +30,7 @@ use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId};
 use fastmcp_protocol::{SecurityDocumentKind, admit_security_document};
 use serde::{Deserialize, Deserializer};
 
+use super::caller::with_caller;
 use super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
 use super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError, endpoint_resource_policy};
 
@@ -1003,30 +1004,40 @@ fn check_context(cx: &Cx, deadline: Time) -> Result<(), OAuthDiscoveryError> {
 }
 
 fn discovery_deadline(cx: &Cx, timeout: Duration) -> Result<Time, OAuthDiscoveryError> {
-    // A caller whose budget deadline has already passed timed out; its
-    // checkpoint would fail too, but that is not a cancellation.
-    if let Some(parent) = cx.budget().deadline {
-        check_context(cx, parent)?;
-    }
-    if cx.checkpoint().is_err() {
-        return Err(OAuthDiscoveryError::Cancelled);
-    }
-    if !cx.capabilities().io || cx.timer_driver().is_none() {
+    with_caller(cx, || {
+        // A caller whose budget deadline has already passed timed out; its
+        // checkpoint would fail too, but that is not a cancellation.
+        if let Some(parent) = cx.budget().deadline {
+            check_context(cx, parent)?;
+        }
+        if cx.checkpoint().is_err() {
+            return Err(OAuthDiscoveryError::Cancelled);
+        }
+        require_discovery_runtime(cx)?;
+        let nanos =
+            u64::try_from(timeout.as_nanos()).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        let end = cx
+            .now()
+            .as_nanos()
+            .checked_add(nanos)
+            .ok_or(OAuthDiscoveryError::InvalidPolicy)?;
+        Ok(cx
+            .budget()
+            .deadline
+            .map_or(Time::from_nanos(end), |parent| {
+                parent.min(Time::from_nanos(end))
+            }))
+    })
+}
+
+// Call only inside with_caller: the effective context retains the explicit
+// caller's identity and drivers while intersecting the host's effect ceiling.
+fn require_discovery_runtime(cx: &Cx) -> Result<(), OAuthDiscoveryError> {
+    let active = Cx::current().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
+    if !active.capabilities().io || !active.capabilities().time || cx.timer_driver().is_none() {
         return Err(OAuthDiscoveryError::RuntimeUnavailable);
     }
-    let nanos =
-        u64::try_from(timeout.as_nanos()).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
-    let end = cx
-        .now()
-        .as_nanos()
-        .checked_add(nanos)
-        .ok_or(OAuthDiscoveryError::InvalidPolicy)?;
-    Ok(cx
-        .budget()
-        .deadline
-        .map_or(Time::from_nanos(end), |parent| {
-            parent.min(Time::from_nanos(end))
-        }))
+    Ok(())
 }
 
 async fn within<T>(
@@ -1034,28 +1045,36 @@ async fn within<T>(
     deadline: Time,
     future: impl Future<Output = Result<T, OAuthDiscoveryError>>,
 ) -> Result<T, OAuthDiscoveryError> {
-    // Public Sleep resolves the driver when polled. The caller guard below
-    // binds every registration and time read to this exact discovery owner,
-    // even when a different/no Cx was ambient at future construction.
-    if cx.timer_driver().is_none() {
-        return Err(OAuthDiscoveryError::RuntimeUnavailable);
-    }
+    let deadline = cx
+        .budget()
+        .deadline
+        .map_or(deadline, |parent| parent.min(deadline));
+    with_caller(cx, || {
+        check_context(cx, deadline)?;
+        require_discovery_runtime(cx)
+    })?;
+    // Sleep resolves its driver when polled. Install the explicit caller only
+    // inside a non-widening scope, including after a suspended operation resumes
+    // under stricter host permissions. This guard also covers registration,
+    // client-credential signing, and token exchange consumers of discovery.
     let mut sleep = std::pin::pin!(Sleep::new(deadline));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
     let mut future = std::pin::pin!(future);
     poll_fn(|task| {
-        check_context(cx, deadline)?;
-        let _caller = Cx::set_current(Some(cx.clone()));
-        if cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(OAuthDiscoveryError::Cancelled));
-        }
-        if sleep.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(OAuthDiscoveryError::TimedOut));
-        }
-        let result = future.as_mut().poll(task);
-        check_context(cx, deadline)?;
-        result
+        with_caller(cx, || {
+            check_context(cx, deadline)?;
+            require_discovery_runtime(cx)?;
+            if cancelled.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(OAuthDiscoveryError::Cancelled));
+            }
+            if sleep.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(OAuthDiscoveryError::TimedOut));
+            }
+            let result = future.as_mut().poll(task);
+            check_context(cx, deadline)?;
+            result
+        })
     })
     .await
 }
@@ -1115,6 +1134,234 @@ async fn fetch_metadata(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    mod runtime_admission {
+        use super::*;
+        use std::cell::Cell;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Wake, Waker};
+
+        use asupersync::Budget;
+        use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+        use asupersync::runtime::{Runtime, RuntimeBuilder};
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+
+        const NO_IO: CapMask = CapSet::<true, true, true, false, true>::MASK;
+        const NO_TIME: CapMask = CapSet::<true, false, true, true, true>::MASK;
+
+        fn runtime() -> (Runtime, Cx, Arc<VirtualClock>, TimerDriverHandle) {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+            (runtime, caller, clock, timer)
+        }
+
+        fn narrowed(cx: &Cx, mask: CapMask) -> Cx {
+            let _caller = Cx::set_current(Some(cx.clone()));
+            let _restriction = Cx::push_restriction(mask);
+            Cx::current().unwrap()
+        }
+
+        #[test]
+        fn discovery_runtime_guard_rejects_held_and_host_denials_before_effects() {
+            let (runtime, caller, _clock, timer) = runtime();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let plan = OAuthDiscoveryPlan::new(
+                url(&format!("https://{}/mcp", listener.local_addr().unwrap())),
+                vec![TrustedOAuthIssuer::new("https://issuer.example").unwrap()],
+                "registered-client",
+                vec![],
+            )
+            .unwrap();
+            for mask in [NO_IO, NO_TIME] {
+                let restricted = narrowed(&caller, mask);
+                for deny_held in [false, true] {
+                    let (held, host) = if deny_held {
+                        (&restricted, &caller)
+                    } else {
+                        (&caller, &restricted)
+                    };
+                    let _host = Cx::set_current(Some(host.clone()));
+                    let depth = Cx::restriction_depth();
+                    let polls = Cell::new(0);
+                    let mut guarded = Box::pin(within(held, Time::from_secs(5), async {
+                        polls.set(polls.get() + 1);
+                        Ok(())
+                    }));
+                    assert!(matches!(
+                        guarded.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Ready(Err(OAuthDiscoveryError::RuntimeUnavailable))
+                    ));
+                    assert_eq!(polls.get(), 0);
+                    let mut discover = Box::pin(plan.discover(held));
+                    assert!(matches!(
+                        discover.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Ready(Err(OAuthDiscoveryError::RuntimeUnavailable))
+                    ));
+                    assert!(matches!(listener.accept(), Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock));
+                    assert_eq!(Cx::restriction_depth(), depth);
+                    assert_eq!(Cx::current().unwrap().capabilities(), host.capabilities());
+                }
+            }
+            assert_eq!(timer.pending_count(), 0);
+            drop(caller);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn discovery_runtime_guard_preserves_caller_identity_and_unrelated_restrictions() {
+            let (runtime, caller, clock, timer) = runtime();
+            clock.advance(73);
+            let foreign = Cx::for_testing_with_budget(Budget::ZERO);
+            foreign.set_cancel_requested(true);
+            let host = narrowed(&foreign, CapSet::<false, true, false, true, false>::MASK);
+            for ambient in [None, Some(host)] {
+                let _host = Cx::set_current(ambient.clone());
+                let depth = Cx::restriction_depth();
+                let deadline = discovery_deadline(&caller, Duration::from_secs(5)).unwrap();
+                assert_eq!(deadline, Time::from_nanos(5_000_000_073));
+                let polls = Cell::new(0);
+                let mut guarded = Box::pin(within(&caller, deadline, async {
+                    polls.set(polls.get() + 1);
+                    let active = Cx::current().unwrap();
+                    assert_eq!(active.task_id(), caller.task_id());
+                    assert_eq!(active.region_id(), caller.region_id());
+                    assert_eq!(active.budget(), caller.budget());
+                    assert_eq!(active.now(), Time::from_nanos(73));
+                    assert!(active.timer_driver().is_some());
+                    assert!(!active.is_cancel_requested());
+                    let capabilities = active.capabilities();
+                    assert!(capabilities.io && capabilities.time);
+                    if ambient.is_some() {
+                        assert!(!capabilities.spawn && !capabilities.entropy && !capabilities.remote);
+                    }
+                    Ok(42)
+                }));
+                assert!(matches!(
+                    guarded.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Ok(42))
+                ));
+                assert_eq!(polls.get(), 1);
+                assert_eq!(Cx::restriction_depth(), depth);
+                match &ambient {
+                    Some(host) => {
+                        let restored = Cx::current().unwrap();
+                        assert_eq!(restored.task_id(), host.task_id());
+                        assert_eq!(restored.capabilities(), host.capabilities());
+                        assert!(restored.is_cancel_requested());
+                    }
+                    None => assert!(Cx::current().is_none()),
+                }
+            }
+            assert_eq!(timer.pending_count(), 0);
+            drop(caller);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn discovery_runtime_guard_rechecks_host_ceiling_after_suspension() {
+            let (runtime, caller, _clock, timer) = runtime();
+            for mask in [NO_IO, NO_TIME] {
+                let polls = Cell::new(0);
+                let mut guarded = Box::pin(within(
+                    &caller,
+                    Time::from_secs(5),
+                    poll_fn(|_| {
+                        polls.set(polls.get() + 1);
+                        Poll::<Result<(), OAuthDiscoveryError>>::Pending
+                    }),
+                ));
+                {
+                    let _host = Cx::set_current(None);
+                    assert!(guarded.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                }
+                assert_eq!(polls.get(), 1);
+                assert_eq!(timer.pending_count(), 1);
+                {
+                    let host = narrowed(&caller, mask);
+                    let _host = Cx::set_current(Some(host.clone()));
+                    assert!(matches!(
+                        guarded.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Ready(Err(OAuthDiscoveryError::RuntimeUnavailable))
+                    ));
+                    assert_eq!(Cx::current().unwrap().capabilities(), host.capabilities());
+                }
+                assert_eq!(polls.get(), 1);
+                drop(guarded);
+                assert_eq!(timer.pending_count(), 0);
+            }
+            drop(caller);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        struct WakeCounter(AtomicUsize);
+        impl Wake for WakeCounter {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn discovery_runtime_guard_wakes_for_explicit_cancellation_and_parent_deadline() {
+            for cancel in [false, true] {
+                let (runtime, base, clock, timer) = runtime();
+                let caller = runtime.request_cx_with_budget(
+                    Budget::INFINITE.with_deadline(Time::from_secs(1)),
+                );
+                let foreign = Cx::for_testing_with_budget(Budget::ZERO);
+                foreign.set_cancel_requested(true);
+                let host_guard = Cx::set_current(Some(foreign));
+                let wakes = Arc::new(WakeCounter(AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wakes));
+                let mut task = Context::from_waker(&waker);
+                let polls = Cell::new(0);
+                let mut guarded = Box::pin(within(
+                    &caller,
+                    Time::from_secs(30),
+                    poll_fn(|_| {
+                        polls.set(polls.get() + 1);
+                        Poll::<Result<(), OAuthDiscoveryError>>::Pending
+                    }),
+                ));
+                assert!(guarded.as_mut().poll(&mut task).is_pending());
+                let previous_wakes = wakes.0.load(Ordering::SeqCst);
+                if cancel {
+                    caller.set_cancel_requested(true);
+                } else {
+                    let _neutral = Cx::set_current(None);
+                    runtime.block_on(async {
+                        clock.advance(1_000_000_000);
+                        timer.process_timers();
+                    });
+                }
+                assert!(wakes.0.load(Ordering::SeqCst) > previous_wakes);
+                let result = guarded.as_mut().poll(&mut task);
+                assert!(matches!(&result,
+                    Poll::Ready(Err(OAuthDiscoveryError::Cancelled)) if cancel)
+                    || matches!(&result,
+                        Poll::Ready(Err(OAuthDiscoveryError::TimedOut)) if !cancel));
+                assert_eq!(polls.get(), 1);
+                assert!(Cx::current().unwrap().is_cancel_requested());
+                drop(guarded);
+                assert_eq!(timer.pending_count(), 0);
+                drop(caller);
+                drop(base);
+                drop(host_guard);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+    }
 
     fn url(value: &str) -> CanonicalHttpUrl {
         CanonicalHttpUrl::parse(value).unwrap()
