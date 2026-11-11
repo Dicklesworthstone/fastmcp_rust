@@ -4841,6 +4841,10 @@ impl FinalSubscriptionTerminalDelivery {
         )
     }
 
+    fn cancellation_pending(&self) -> bool {
+        self.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
+    }
+
     #[cfg(test)]
     fn is_drained(&self) -> bool {
         self.state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
@@ -5151,6 +5155,55 @@ fn retry_http_sse_commit<T, E>(
                 std::thread::yield_now();
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+/// A subscription's elected cancellation retains its already-admitted FIFO
+/// until the terminal control reaches the response mailbox. The registry can
+/// cancel the request while another callback still owns that FIFO, so check
+/// this exact pending receipt again for every attempt and contention retry.
+/// If election races an unmasked attempt, the exact body guard distinguishes
+/// caller cancellation from a dropped or finished response. A cancellation
+/// from an already-masked attempt and other hard transport errors never retry.
+fn retry_http_sse_subscription_notification_commit<T>(
+    cx: &Cx,
+    transport_cancellation: &StreamableHttpRequestCancellation,
+    terminal_delivery: &FinalSubscriptionTerminalDelivery,
+    mut commit: impl FnMut() -> Result<T, TransportError>,
+) -> Result<T, TransportError> {
+    let request_cancellation = transport_cancellation.request_cancellation();
+    let retains_cancelled = || {
+        terminal_delivery.cancellation_pending() && !request_cancellation.is_peer_cancel_requested()
+    };
+    let mut retries = 0;
+    loop {
+        let retained_before_attempt = retains_cancelled();
+        let result = if retained_before_attempt {
+            cx.masked(&mut commit)
+        } else {
+            commit()
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let retryable = if retryable_http_sse_transport_error(&error) {
+                    retains_cancelled()
+                        || !request_cancellation.is_cancel_requested() && cx.checkpoint().is_ok()
+                } else {
+                    !retained_before_attempt
+                        && matches!(&error, TransportError::Cancelled)
+                        && retains_cancelled()
+                        && !transport_cancellation.is_cancelled()
+                        && !transport_cancellation.is_terminal_committed()
+                        && cx.is_cancel_requested()
+                };
+                if !retryable || retries >= MAX_HTTP_SSE_COMMIT_RETRIES {
+                    return Err(error);
+                }
+                retries += 1;
+                std::thread::yield_now();
+            }
         }
     }
 }
@@ -11451,6 +11504,7 @@ impl ServerHttpSession {
                 raw_params,
                 auth_receipt,
                 sender,
+                sse.cancellation(),
                 Arc::clone(&terminal_delivery),
                 outcome_gate,
             )?;
@@ -13729,6 +13783,9 @@ impl ModernSseNotificationGate {
         let acknowledgement = matches!(&*delivery, ModernSseNotificationDelivery::Pending(_))
             && self.subscription_request
             && final_subscription_acknowledgement_notification(&notification);
+        let terminal_control = self.subscription_request
+            && self.terminal_delivery.cancellation_pending()
+            && final_subscription_terminal_notification(&notification);
         let start_draining = match &*delivery {
             ModernSseNotificationDelivery::Pending(_) => acknowledgement,
             ModernSseNotificationDelivery::Admitted | ModernSseNotificationDelivery::Streaming => {
@@ -13757,6 +13814,13 @@ impl ModernSseNotificationGate {
                     drop(delivery);
                     self.settle_failure();
                     return;
+                }
+                if terminal_control {
+                    // The registry cancels only after this callback returns.
+                    // Seal the FIFO now, after successful bounded admission,
+                    // so a racing publisher cannot append behind its sole
+                    // terminal control and turn a successful drain into Closed.
+                    self.finalizing.store(true, Ordering::Release);
                 }
                 if !start_draining {
                     return;
@@ -14029,6 +14093,7 @@ fn spawn_modern_sse_dispatch(
     raw_params: Option<Arc<str>>,
     auth_receipt: Option<AuthDispatchCustody>,
     response_sender: StreamableHttpRequestResponseSender,
+    transport_cancellation: StreamableHttpRequestCancellation,
     terminal_delivery: Arc<FinalSubscriptionTerminalDelivery>,
     outcome_gate: Option<Arc<ModernSseOutcomeGate>>,
 ) -> Result<asupersync::runtime::TaskHandle<()>, DualEraHttpEndpointError> {
@@ -14082,30 +14147,28 @@ fn spawn_modern_sse_dispatch(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let commit = || {
+                if terminal_control {
+                    notification_response_sender
+                        .send_subscription_cancellation(&notification_cx, notification.clone())
+                } else {
+                    notification_response_sender
+                        .send_notification(&notification_cx, notification.clone())
+                }
+            };
+            let sent = if subscription_request {
+                retry_http_sse_subscription_notification_commit(
+                    &notification_cx,
+                    &transport_cancellation,
+                    &notification_terminal_delivery,
+                    commit,
+                )
+            } else {
                 retry_http_sse_commit(
                     &notification_cx,
                     &notification_cancellation,
-                    || {
-                        if terminal_control {
-                            notification_response_sender.send_subscription_cancellation(
-                                &notification_cx,
-                                notification.clone(),
-                            )
-                        } else {
-                            notification_response_sender
-                                .send_notification(&notification_cx, notification.clone())
-                        }
-                    },
+                    commit,
                     retryable_http_sse_transport_error,
                 )
-            };
-            let sent = if terminal_control {
-                // The registry elected this control before cancellation of
-                // its request. Listener shutdown may already have cancelled
-                // the caller Cx; only the bounded terminal commit is masked.
-                notification_cx.masked(commit)
-            } else {
-                commit()
             };
             if sent.is_err() {
                 // Exhausted transient contention is a delivery failure just as a
@@ -14341,6 +14404,7 @@ async fn send_modern_sse_stream(
         raw_params,
         auth_receipt,
         sender,
+        response.cancellation(),
         Arc::clone(&terminal_delivery),
         Some(Arc::clone(&outcome_gate)),
     ) {
@@ -68041,6 +68105,376 @@ mod lib_unit_tests {
             MAX_HTTP_SSE_COMMIT_RETRIES + 1,
             "the initial attempt plus the configured retry bound are exact",
         );
+    }
+
+    #[test]
+    fn http_sse_subscription_elected_fifo_survives_cancellation_and_seals_terminal() {
+        use fastmcp_transport::http::{
+            StreamableHttpRequestResponseMessage, StreamableHttpTransport,
+        };
+
+        let cx = Cx::for_testing();
+        let subscription_id = RequestId::from(934_i64);
+        let mut transport = StreamableHttpTransport::with_capacity(2).unwrap();
+        let body = Arc::new(
+            transport
+                .response_stream()
+                .unwrap()
+                .for_request(subscription_id.clone())
+                .unwrap(),
+        );
+        let sender = body.sender();
+        let transport_cancellation = body.cancellation();
+        let request_cancellation = sender.request_cancellation();
+        let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+        let commit_failed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let elected = Arc::new(AtomicBool::new(false));
+        let notification = |value| {
+            JsonRpcRequest::notification(
+                "com.example/changed",
+                Some(serde_json::json!({ "value": value })),
+            )
+        };
+        let first = notification(0);
+        let second = notification(1);
+        let in_flight = notification(2);
+        sender.send_notification(&cx, first.clone()).unwrap();
+        sender.send_notification(&cx, second.clone()).unwrap();
+        let gate = Arc::new_cyclic(|weak: &std::sync::Weak<ModernSseNotificationGate>| {
+            let weak = weak.clone();
+            let sender = sender.clone();
+            let cx = cx.clone();
+            let body = Arc::clone(&body);
+            let cancellation = request_cancellation.clone();
+            let transport_cancellation = transport_cancellation.clone();
+            let delivery = Arc::clone(&terminal_delivery);
+            let failed = Arc::clone(&commit_failed);
+            let observed = Arc::clone(&observed);
+            let attempts = Arc::clone(&attempts);
+            let elected = Arc::clone(&elected);
+            let subscription_id = subscription_id.clone();
+            ModernSseNotificationGate {
+                delivery: Mutex::new(ModernSseNotificationDelivery::Streaming),
+                finalizing: AtomicBool::new(false),
+                drain_waiter: Mutex::new(None),
+                capacity: sender.capacity(),
+                max_queued_bytes: sender.max_queued_bytes(),
+                subscription_request: true,
+                outcome_gate: None,
+                terminal_delivery: Arc::clone(&delivery),
+                committed_sender: Arc::new(move |notification| {
+                    let terminal = final_subscription_terminal_notification(&notification);
+                    let result = retry_http_sse_subscription_notification_commit(
+                        &cx,
+                        &transport_cancellation,
+                        &delivery,
+                        || {
+                            attempts.fetch_add(1, Ordering::AcqRel);
+                            let result = if terminal {
+                                sender.send_subscription_cancellation(&cx, notification.clone())
+                            } else {
+                                sender.send_notification(&cx, notification.clone())
+                            };
+                            if result
+                                .as_ref()
+                                .is_err_and(retryable_http_sse_transport_error)
+                            {
+                                if !elected.swap(true, Ordering::AcqRel) {
+                                    let gate = weak.upgrade().unwrap();
+                                    let cancellation_for_sender = cancellation.clone();
+                                    let terminal_sender: NotificationSender =
+                                        Arc::new(move |control| {
+                                            gate.publish(control);
+                                            assert!(gate.finalizing.load(Ordering::Acquire));
+                                            assert!(!cancellation_for_sender.is_cancel_requested());
+                                            // A publisher can race before the registry cancels.
+                                            gate.publish(JsonRpcRequest::notification(
+                                                "com.example/changed",
+                                                Some(serde_json::json!({ "value": 99 })),
+                                            ));
+                                        });
+                                    let election = FinalSubscriptionElection::opening();
+                                    *election.phase.lock().unwrap() =
+                                        FinalSubscriptionPhase::ServerTerminated;
+                                    assert!(complete_final_subscription_server_termination(
+                                        &election,
+                                        &subscription_id,
+                                        Some(&delivery),
+                                        &terminal_sender,
+                                        &cancellation,
+                                    ));
+                                    assert!(cancellation.is_cancel_requested());
+                                    cx.cancel_with(CancelKind::Shutdown, None);
+                                }
+                                // Release actual mailbox pressure only after the failed
+                                // attempt; the next attempt must use the new receipt.
+                                let StreamableHttpRequestResponseMessage::Notification(previous) =
+                                    body.pop_message().unwrap().unwrap()
+                                else {
+                                    panic!("the bounded mailbox contains the notification prefix");
+                                };
+                                observed.lock().unwrap().push(previous);
+                            }
+                            result
+                        },
+                    );
+                    if result.is_err() {
+                        failed.store(true, Ordering::Release);
+                        delivery.mark_failed();
+                        cancellation.cancel();
+                    }
+                }),
+                commit_failed: Arc::clone(&commit_failed),
+                stream_admitted: Arc::new(AtomicBool::new(true)),
+                request_cancellation: request_cancellation.clone(),
+            }
+        });
+
+        gate.publish(in_flight.clone());
+        assert!(block_on(gate.finish_notifications(true)));
+        assert!(!commit_failed.load(Ordering::Acquire));
+        assert_eq!(attempts.load(Ordering::Acquire), 4);
+        assert!(
+            cx.checkpoint().is_err(),
+            "only individual elected attempts are masked"
+        );
+        for _ in 0..2 {
+            let StreamableHttpRequestResponseMessage::Notification(message) =
+                body.pop_message().unwrap().unwrap()
+            else {
+                panic!("data and the elected control remain notifications");
+            };
+            observed.lock().unwrap().push(message);
+        }
+        assert!(body.is_finished());
+        assert_eq!(
+            serde_json::to_value(&*observed.lock().unwrap()).unwrap(),
+            serde_json::to_value([
+                first,
+                second,
+                in_flight,
+                subscription_cancellation_notification(&subscription_id).unwrap(),
+            ])
+            .unwrap(),
+            "the retained prefix drains before the sole control, with no late publication",
+        );
+    }
+
+    #[test]
+    fn http_sse_subscription_election_during_unmasked_attempt_rechecks_exact_body() {
+        use fastmcp_transport::http::StreamableHttpTransport;
+
+        for case in [
+            "elected",
+            "body_drop",
+            "already_masked",
+            "unelected",
+            "peer",
+        ] {
+            let cx = Cx::for_testing();
+            let mut transport = StreamableHttpTransport::with_capacity(1).unwrap();
+            let responses = transport.response_stream().unwrap();
+            let mut body = Some(responses.for_request(937_i64.into()).unwrap());
+            let sender = body.as_ref().unwrap().sender();
+            let transport_cancellation = body.as_ref().unwrap().cancellation();
+            let cancellation = sender.request_cancellation();
+            let delivery = FinalSubscriptionTerminalDelivery::default();
+            if case == "already_masked" {
+                assert!(delivery.mark_cancellation_enqueued());
+                cancellation.cancel();
+                cx.cancel_with(CancelKind::Shutdown, None);
+            }
+            let mut attempts = 0;
+            let result = retry_http_sse_subscription_notification_commit(
+                &cx,
+                &transport_cancellation,
+                &delivery,
+                || {
+                    attempts += 1;
+                    if attempts == 1 {
+                        // Election wins after the helper's pre-attempt snapshot,
+                        // but before the real transport's first Cx checkpoint.
+                        if !matches!(case, "already_masked" | "unelected") {
+                            assert!(delivery.mark_cancellation_enqueued());
+                        }
+                        if case == "peer" {
+                            cancellation.cancel_by_peer();
+                        } else {
+                            cancellation.cancel();
+                        }
+                        cx.cancel_with(CancelKind::Shutdown, None);
+                        if matches!(case, "body_drop" | "already_masked") {
+                            drop(body.take());
+                        }
+                    }
+                    let result = sender.send_notification(
+                        &cx,
+                        JsonRpcRequest::notification("com.example/changed", None),
+                    );
+                    if attempts == 1 {
+                        assert!(matches!(&result, Err(TransportError::Cancelled)));
+                    }
+                    result
+                },
+            );
+            if case == "elected" {
+                result.expect("the newly elected live body retains this in-flight notification");
+                assert_eq!(attempts, 2);
+                assert!(body.as_ref().unwrap().pop_message().unwrap().is_some());
+            } else {
+                assert!(matches!(result, Err(TransportError::Cancelled)), "{case}");
+                assert_eq!(attempts, 1, "{case} cannot revive the failed attempt");
+            }
+            assert!(cx.checkpoint().is_err(), "attempt masking must be scoped");
+        }
+    }
+
+    #[test]
+    fn http_sse_subscription_retry_requires_a_live_owned_terminal_receipt() {
+        use fastmcp_transport::http::StreamableHttpTransport;
+
+        for case in [
+            "ordinary",
+            "unelected",
+            "response",
+            "drained",
+            "failed",
+            "peer",
+        ] {
+            let cx = Cx::for_testing();
+            let mut transport = StreamableHttpTransport::with_capacity(1).unwrap();
+            let body = transport
+                .response_stream()
+                .unwrap()
+                .for_request(935_i64.into())
+                .unwrap();
+            let sender = body.sender();
+            let transport_cancellation = body.cancellation();
+            let cancellation = sender.request_cancellation();
+            let delivery = FinalSubscriptionTerminalDelivery::default();
+            match case {
+                "unelected" => {}
+                "response" => delivery.mark_control_not_required(),
+                _ => {
+                    assert!(delivery.mark_cancellation_enqueued());
+                    if case == "drained" {
+                        delivery.mark_drained();
+                    } else if case == "failed" {
+                        delivery.mark_failed();
+                    }
+                }
+            }
+            let notification = JsonRpcRequest::notification("com.example/changed", None);
+            sender.send_notification(&cx, notification.clone()).unwrap();
+            if case == "peer" {
+                cancellation.cancel_by_peer();
+            } else {
+                cancellation.cancel();
+            }
+            let mut attempts = 0;
+            let commit = || {
+                attempts += 1;
+                let result = sender.send_notification(&cx, notification.clone());
+                if result
+                    .as_ref()
+                    .is_err_and(retryable_http_sse_transport_error)
+                {
+                    assert!(body.pop_message().unwrap().is_some());
+                }
+                result
+            };
+            let result = if case == "ordinary" {
+                retry_http_sse_commit(
+                    &cx,
+                    &cancellation,
+                    commit,
+                    retryable_http_sse_transport_error,
+                )
+            } else {
+                retry_http_sse_subscription_notification_commit(
+                    &cx,
+                    &transport_cancellation,
+                    &delivery,
+                    commit,
+                )
+            };
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(retryable_http_sse_transport_error),
+                "{case} cancellation cannot authorize a retry after real mailbox contention",
+            );
+            assert_eq!(attempts, 1, "{case} must not inherit an elected drain");
+            assert!(body.pop_message().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn http_sse_subscription_elected_retry_keeps_transport_failure_and_attempt_bounds() {
+        use fastmcp_transport::http::StreamableHttpTransport;
+
+        for case in ["exhausted", "body_drop", "owner_closed"] {
+            let cx = Cx::for_testing();
+            let subscription_id = RequestId::from(936_i64);
+            let mut transport = StreamableHttpTransport::with_capacity(1).unwrap();
+            let responses = transport.response_stream().unwrap();
+            let mut body = Some(responses.for_request(subscription_id.clone()).unwrap());
+            let sender = body.as_ref().unwrap().sender();
+            let transport_cancellation = body.as_ref().unwrap().cancellation();
+            let cancellation = sender.request_cancellation();
+            let delivery = FinalSubscriptionTerminalDelivery::default();
+            sender
+                .send_notification(
+                    &cx,
+                    JsonRpcRequest::notification("com.example/changed", None),
+                )
+                .unwrap();
+            assert!(delivery.mark_cancellation_enqueued());
+            cancellation.cancel();
+            cx.cancel_with(CancelKind::Shutdown, None);
+            let control = subscription_cancellation_notification(&subscription_id).unwrap();
+            let mut attempts = 0;
+            let error = retry_http_sse_subscription_notification_commit(
+                &cx,
+                &transport_cancellation,
+                &delivery,
+                || {
+                    attempts += 1;
+                    let result = sender.send_subscription_cancellation(&cx, control.clone());
+                    if attempts == 1 {
+                        assert!(
+                            result
+                                .as_ref()
+                                .is_err_and(retryable_http_sse_transport_error)
+                        );
+                        if case == "body_drop" {
+                            drop(body.take());
+                        } else if case == "owner_closed" {
+                            responses.close();
+                        }
+                    }
+                    result
+                },
+            )
+            .expect_err("an elected receipt cannot revive a closed or permanently full body");
+            match case {
+                "exhausted" => {
+                    assert!(retryable_http_sse_transport_error(&error));
+                    assert_eq!(attempts, MAX_HTTP_SSE_COMMIT_RETRIES + 1);
+                }
+                "body_drop" => {
+                    assert!(matches!(error, TransportError::Cancelled));
+                    assert_eq!(attempts, 2, "body cancellation is not retried");
+                }
+                "owner_closed" => {
+                    assert!(matches!(error, TransportError::Closed));
+                    assert_eq!(attempts, 2, "owner closure is not retried");
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
