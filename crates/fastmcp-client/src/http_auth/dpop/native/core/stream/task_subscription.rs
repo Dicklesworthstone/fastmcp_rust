@@ -71,6 +71,10 @@ impl DpopTaskSubscription {
 /// accepted filter and metadata; Tasks retain the protocol's lossless inlined
 /// result representation. These values are peer-controlled application data,
 /// not diagnostics, and the observer owns their disclosure policy.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public event enum exposes owned TaskStatusNotification by value"
+)]
 #[derive(Debug, Clone)]
 pub enum DpopTaskSubscriptionEvent {
     Acknowledged(FinalSubscriptionsAcknowledgedNotificationParams),

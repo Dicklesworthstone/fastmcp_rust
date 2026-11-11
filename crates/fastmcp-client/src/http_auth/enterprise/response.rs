@@ -158,7 +158,7 @@ impl Default for EnterpriseResponsePolicy {
             id_jag_lifetime: Duration::from_secs(300),
             access_token_lifetime: Duration::from_secs(3600),
             clock_skew: Duration::from_secs(60),
-            maximum_step_up_age: Duration::from_secs(86_400),
+            maximum_step_up_age: Duration::from_hours(24),
         }
     }
 }
@@ -170,11 +170,11 @@ impl EnterpriseResponsePolicy {
         clock_skew: Duration,
         maximum_step_up_age: Duration,
     ) -> Result<Self, EnterpriseResponseError> {
-        if id_token_lifetime.is_zero() || id_token_lifetime > Duration::from_secs(86_400)
-            || id_jag_lifetime.is_zero() || id_jag_lifetime > Duration::from_secs(900)
-            || access_token_lifetime.is_zero() || access_token_lifetime > Duration::from_secs(86_400)
+        if id_token_lifetime.is_zero() || id_token_lifetime > Duration::from_hours(24)
+            || id_jag_lifetime.is_zero() || id_jag_lifetime > Duration::from_mins(15)
+            || access_token_lifetime.is_zero() || access_token_lifetime > Duration::from_hours(24)
             || clock_skew > Duration::from_secs(300)
-            || maximum_step_up_age > Duration::from_secs(86_400)
+            || maximum_step_up_age > Duration::from_hours(24)
             || maximum_step_up_age.subsec_nanos() != 0
         {
             return Err(EnterpriseResponseError::InvalidPolicy);

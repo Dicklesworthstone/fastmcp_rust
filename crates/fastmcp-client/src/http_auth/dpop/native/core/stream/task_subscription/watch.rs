@@ -4,6 +4,8 @@
 //! notifications are only hints: neither their order nor their embedded Task
 //! can roll back a newer snapshot or manufacture a successful Task outcome.
 
+#![allow(clippy::wildcard_imports)]
+
 /// Bounded, observation-only checkpoints for explicit host-owned restart.
 pub mod checkpoint;
 /// Event-driven input resolution using the shared acknowledged-input ledger.
@@ -621,10 +623,10 @@ impl DpopHttpClient {
             return Err(DpopHttpError::Cancelled.into());
         }
         let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
-        self.watch_task_using(
+        Box::pin(self.watch_task_using(
             cx, cancellation, credential, metadata, task, id_prefix,
             policy, limits, bounds, (0, 0), None::<NoInput>,
-        ).await
+        )).await
     }
 
     // Observation and input driving share the same live response owner. Only
@@ -707,16 +709,11 @@ impl DpopHttpClient {
             let mut live = LiveListen::new(response.body, kind, decoder, idle, task.clone(),
                 limits, self.policy.max_body_bytes, budget)?;
             let owner = ReadOwner::new(cx, cancellation, &self.session, credential, bounds);
-            loop {
-                match live.next(&owner).await? {
-                    LiveStep::Hint => {
-                        if let Some(result) = self.watch_live_snapshot(
-                            &metadata, &task, &mut state, &mut input, may_update, &mut live, &owner,
-                        ).await? {
-                            return Ok(result);
-                        }
-                    }
-                    LiveStep::Closed => break,
+            while let LiveStep::Hint = live.next(&owner).await? {
+                if let Some(result) = self.watch_live_snapshot(
+                    &metadata, &task, &mut state, &mut input, may_update, &mut live, &owner,
+                ).await? {
+                    return Ok(result);
                 }
             }
             state.usage = live.budget.usage()?;

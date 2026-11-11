@@ -1,5 +1,7 @@
 //! Incremental subscription ownership on the existing Memory ingress driver.
 
+#![allow(clippy::wildcard_imports)]
+
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, Weak};
 
@@ -481,6 +483,7 @@ fn active_filter(filter: &SubscriptionFilter) -> SubscriptionFilter {
     filter
 }
 
+#[cfg_attr(not(feature = "tasks"), allow(clippy::unnecessary_wraps))]
 fn unsupported_filter(
     requested: &SubscriptionFilter,
     accepted: &SubscriptionFilter,

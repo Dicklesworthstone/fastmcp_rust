@@ -270,9 +270,9 @@ impl DpopHttpClient {
             // A new idle allowance is per network round, never a new absolute
             // lifetime. Local serialization and discovery spend it too.
             idle = Idle::new(cx.now(), limits.stream.idle);
-            prepared = Box::new(conversation.prepare(
+            *prepared = conversation.prepare(
                 self.resource().as_str(), self.policy.max_body_bytes,
-            )?);
+            )?;
         }
     }
 }

@@ -4,6 +4,8 @@
 //! This owner composes their existing engines, never translates one into the
 //! other and never restarts a creating request after an uncertain response.
 
+#![allow(clippy::wildcard_imports)]
+
 use std::future::Future;
 
 use fastmcp_protocol::tasks_extension::{Task, TaskInputRequests};

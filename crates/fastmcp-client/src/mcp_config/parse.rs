@@ -112,10 +112,18 @@ pub(super) struct NativeServerConfig {
     args: Option<Vec<String>>,
     #[serde(default, deserialize_with = "present_field")]
     env: Option<HashMap<String, String>>,
+    #[allow(
+        clippy::option_option,
+        reason = "distinguishes absent JSON field (None) from explicit null/present value"
+    )]
     #[serde(default, deserialize_with = "present_field")]
     cwd: Option<Option<String>>,
     #[serde(default)]
     disabled: bool,
+    #[allow(
+        clippy::option_option,
+        reason = "distinguishes absent JSON field (None) from explicit null/present value"
+    )]
     #[serde(default, deserialize_with = "present_field")]
     http: Option<Option<HttpEndpointConfig>>,
 }

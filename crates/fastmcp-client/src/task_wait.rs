@@ -60,10 +60,10 @@ impl FinalTaskWaitPolicy {
         fallback_poll_interval: Duration,
     ) -> McpResult<Self> {
         if timeout.is_zero()
-            || timeout > Duration::from_secs(24 * 60 * 60)
+            || timeout > Duration::from_hours(24)
             || !(1..=4096).contains(&maximum_polls)
             || fallback_poll_interval.is_zero()
-            || fallback_poll_interval > Duration::from_secs(300)
+            || fallback_poll_interval > Duration::from_mins(5)
         {
             return Err(McpError::invalid_params("Invalid final Task wait policy"));
         }
@@ -537,7 +537,7 @@ where
         cx: &Cx,
         cancellation: &McpRequestCancellation,
     ) -> McpResult<Option<FinalTaskWatchEvent>> {
-        next_task_stream_event(self, cx, cancellation).await
+        Box::pin(next_task_stream_event(self, cx, cancellation)).await
     }
 }
 
@@ -609,8 +609,12 @@ impl TaskWatchTransport for MemoryClient {
         }
     }
 
-    async fn cancel_watch(&mut self, cx: &Cx, owner: &mut Self::Owner) -> McpResult<()> {
-        self.cancel_subscription(cx, owner)
+    fn cancel_watch(
+        &mut self,
+        cx: &Cx,
+        owner: &mut Self::Owner,
+    ) -> impl std::future::Future<Output = McpResult<()>> {
+        std::future::ready(self.cancel_subscription(cx, owner))
     }
 
     fn abandon_watch(&mut self, owner: Self::Owner) {
@@ -656,14 +660,20 @@ impl TaskWatchTransport for Client {
             .await
     }
 
-    async fn cancel_watch(&mut self, _cx: &Cx, request_id: &mut Self::Owner) -> McpResult<()> {
-        if self
+    fn cancel_watch(
+        &mut self,
+        _cx: &Cx,
+        request_id: &mut Self::Owner,
+    ) -> impl std::future::Future<Output = McpResult<()>> {
+        let result = if self
             .live_watch_id()
             .is_some_and(|owned| owned.correlates_with(request_id))
         {
-            self.cancel_live_final_task_subscription(&self.cx.clone())?;
-        }
-        Ok(())
+            self.cancel_live_final_task_subscription(&self.cx.clone())
+        } else {
+            Ok(())
+        };
+        std::future::ready(result)
     }
 
     fn abandon_watch(&mut self, request_id: Self::Owner) {

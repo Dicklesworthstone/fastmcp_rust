@@ -1293,11 +1293,12 @@ impl MemoryClient {
                         return Err(error);
                     }
                 }
-                Some(Ok(Err(TransportError::Cancelled)))
-                | Some(Err(Err(TransportError::Cancelled))) => {
+                Some(
+                    Ok(Err(TransportError::Cancelled)) | Err(Err(TransportError::Cancelled)),
+                ) => {
                     return Err(McpError::request_cancelled());
                 }
-                Some(Ok(Err(error))) | Some(Err(Err(error))) => {
+                Some(Ok(Err(error)) | Err(Err(error))) => {
                     return Err(fail_transport(&self.executor, error));
                 }
                 Some(Err(Ok(frame))) => {
@@ -1397,11 +1398,10 @@ async fn reserve_capacity<'a>(
         }));
         match wait_turn(cx, cancellation, Some(deadline), progress.as_mut()).await? {
             Some(Ok(Ok(permit))) => return Ok(permit),
-            Some(Ok(Err(TransportError::Cancelled)))
-            | Some(Err(Err(TransportError::Cancelled))) => {
+            Some(Ok(Err(TransportError::Cancelled)) | Err(Err(TransportError::Cancelled))) => {
                 return Err(McpError::request_cancelled());
             }
-            Some(Ok(Err(error))) | Some(Err(Err(error))) => {
+            Some(Ok(Err(error)) | Err(Err(error))) => {
                 return Err(fail_transport(executor, error));
             }
             Some(Err(Ok(frame))) => admit_frame(executor, subscriptions, cx, frame)?,

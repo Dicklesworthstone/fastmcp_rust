@@ -657,12 +657,11 @@ pub(crate) fn admit_http_notification(
         ServerNotification::Cancelled(_) | ServerNotification::SubscriptionsAcknowledged(_) => {
             return Err(ManagedCoreError::UnexpectedNotification);
         }
-        ServerNotification::Progress(progress) => {
+        ServerNotification::Progress(progress)
             if progress_marker != Some(&progress.progress_token)
-                || last_progress.is_some_and(|previous| progress.progress.cmp(previous).is_le())
-            {
-                return Err(ManagedCoreError::InvalidProgress);
-            }
+                || last_progress.is_some_and(|previous| progress.progress.cmp(previous).is_le()) =>
+        {
+            return Err(ManagedCoreError::InvalidProgress);
         }
         _ => {}
     }

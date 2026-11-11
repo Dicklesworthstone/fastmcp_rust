@@ -1963,6 +1963,10 @@ pub enum ModernHttpExtensionEvent {
     Terminal(serde_json::Value),
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "internal stream event enum holds owned protocol result on stack"
+)]
 enum ModernHttpOwnedEvent {
     Progress(FinalProgressNotificationParams),
     Notification(ServerNotification),
@@ -1989,6 +1993,10 @@ impl From<ModernHttpFinalCoreEvent> for ModernHttpOwnedEvent {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "internal listener dispatch enum holds owned state machine on stack"
+)]
 enum ModernHttpOwnedListener {
     Core(ModernHttpFinalCoreListener),
     Extension(ModernHttpExtensionListener),
@@ -6278,6 +6286,7 @@ impl ClientHttpConnection {
         *persistent_receiver = Some(Arc::new(LegacySsePersistentReceiver::start(
             &caller,
             reader,
+            &mut client.stream,
             outbound,
             client_capabilities.clone(),
             reverse_request_handlers.clone(),
@@ -9663,9 +9672,9 @@ impl ModernHttpClient {
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
             ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed)
         })?;
-        let prepared_parameters = wire_request.params.ok_or_else(|| {
-            ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed)
-        })?;
+        let prepared_parameters = wire_request
+            .params
+            .ok_or(ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed))?;
         let core_request =
             CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&prepared_parameters))
                 .map_err(|error| {
@@ -11176,7 +11185,7 @@ fn legacy_receive_pump_caller(cx: &Cx) -> Result<Cx, ClientHttpConnectionError> 
             }),
         ));
     }
-    if caller.io().is_none() || caller.timer_driver().is_none() {
+    if caller.timer_driver().is_none() {
         return Err(ClientHttpConnectionError::LegacyReceiverNeedsRuntimeCx);
     }
     Ok(caller)
@@ -11187,6 +11196,7 @@ impl LegacySsePersistentReceiver {
     fn start(
         cx: &Cx,
         mut reader: LegacySseResponseStream,
+        reader_slot: &mut Option<LegacySseResponseStream>,
         mut outbound: LegacySseHttpOutbound,
         client_capabilities: ClientCapabilities,
         reverse_request_handlers: ReverseRequestHandlers,
@@ -11200,6 +11210,8 @@ impl LegacySsePersistentReceiver {
                 .post_gate,
         ));
         reader.persistent_state = Some(Arc::clone(&state));
+        let shared_reader = Arc::new(std::sync::Mutex::new(Some(reader)));
+        let task_reader = Arc::clone(&shared_reader);
         let task_state = Arc::clone(&state);
         let task_outbound = outbound.clone();
         let reverse_callbacks = LegacySseReverseCallbackDispatcher::new();
@@ -11212,10 +11224,16 @@ impl LegacySsePersistentReceiver {
         // while the child is parked on an otherwise silent SSE connection.
         let task_cx = cx.clone();
         let owner_cx = task_cx.clone();
-        let task = task_cx
-            .spawn(move |child_cx| async move {
-                let mut owner_cancelled = std::pin::pin!(owner_cx.cancelled());
-                loop {
+        let task = match task_cx.spawn(move |child_cx| async move {
+            let Some(mut reader) = task_reader
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            else {
+                return;
+            };
+            let mut owner_cancelled = std::pin::pin!(owner_cx.cancelled());
+            loop {
                     if child_cx.checkpoint().is_err() || owner_cx.checkpoint().is_err() {
                         stop_legacy_persistent_state(
                             &task_state,
@@ -11414,13 +11432,25 @@ impl LegacySsePersistentReceiver {
                 }
                 stop_legacy_persistent_state(&task_state, None);
                 task_reverse_callbacks.close();
-            })
-            .map_err(|error| match error {
-                asupersync::runtime::SpawnError::RuntimeUnavailable => {
-                    ClientHttpConnectionError::LegacyReceiverNeedsRuntimeCx
+            }) {
+            Ok(task) => task,
+            Err(error) => {
+                if let Some(mut reader) = shared_reader
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    reader.persistent_state = None;
+                    *reader_slot = Some(reader);
                 }
-                _ => ClientHttpConnectionError::LegacyPersistentReceiverUnavailable,
-            })?;
+                return Err(match error {
+                    asupersync::runtime::SpawnError::RuntimeUnavailable => {
+                        ClientHttpConnectionError::LegacyReceiverNeedsRuntimeCx
+                    }
+                    _ => ClientHttpConnectionError::LegacyPersistentReceiverUnavailable,
+                });
+            }
+        };
         Ok(Self {
             state,
             task,

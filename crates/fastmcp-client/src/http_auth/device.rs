@@ -75,11 +75,11 @@ impl DeviceAuthorizationPolicy {
         maximum_polls: u16,
         maximum_token_lifetime: Duration,
     ) -> Result<Self, DeviceAuthorizationError> {
-        if timeout.is_zero() || timeout > Duration::from_secs(3600)
-            || exchange_timeout.is_zero() || exchange_timeout > Duration::from_secs(120)
+        if timeout.is_zero() || timeout > Duration::from_hours(1)
+            || exchange_timeout.is_zero() || exchange_timeout > Duration::from_mins(2)
             || maximum_polls == 0 || maximum_polls > 1024
             || maximum_token_lifetime.is_zero()
-            || maximum_token_lifetime > Duration::from_secs(86_400)
+            || maximum_token_lifetime > Duration::from_hours(24)
         {
             return Err(DeviceAuthorizationError::InvalidConfiguration);
         }

@@ -470,7 +470,7 @@ impl ManagedOAuthSession {
                 if !state.credentials.has_refresh_token() {
                     return Err(OAuthSessionError::LoginRequired);
                 }
-                renewal::refresh(self, cx, cancellation, state).await?;
+                Box::pin(renewal::refresh(self, cx, cancellation, state)).await?;
             }
             if Instant::now() >= state.credentials.expires_at() {
                 return Err(OAuthSessionError::LoginRequired);
@@ -525,8 +525,7 @@ impl ManagedOAuthSession {
                 snapshot.expires_at,
                 &snapshot.credential.revoked,
                 async {
-                    executor
-                        .execute_with_cancellation(cx, cancellation, &request)
+                    Box::pin(executor.execute_with_cancellation(cx, cancellation, &request))
                         .await
                         .map_err(OAuthSessionError::Http)
                 },

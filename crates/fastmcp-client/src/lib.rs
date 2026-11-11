@@ -7575,13 +7575,13 @@ where
             subscription.lifetime.observe_activity(received_at);
             match notification {
                 ServerNotification::ToolsListChanged(_) => {
-                    self.record_websocket_catalog_change("notifications/tools/list_changed")
+                    self.record_websocket_catalog_change("notifications/tools/list_changed");
                 }
                 ServerNotification::ResourcesListChanged(_) => {
-                    self.record_websocket_catalog_change("notifications/resources/list_changed")
+                    self.record_websocket_catalog_change("notifications/resources/list_changed");
                 }
                 ServerNotification::PromptsListChanged(_) => {
-                    self.record_websocket_catalog_change("notifications/prompts/list_changed")
+                    self.record_websocket_catalog_change("notifications/prompts/list_changed");
                 }
                 _ => {}
             }
@@ -12177,14 +12177,18 @@ where
                     let current =
                         Cx::current().expect("WebSocket handshake cleanup caller is installed");
                     if !current.capabilities().time {
-                        return std::task::Poll::Ready(Err(TransportError::Io(io::Error::other(
-                            "WebSocket handshake cleanup requires caller time capability",
-                        ))));
+                        return std::task::Poll::Ready(Err(TransportError::Io(
+                            std::io::Error::other(
+                                "WebSocket handshake cleanup requires caller time capability",
+                            ),
+                        )));
                     }
                     if current.timer_driver().is_none() {
-                        return std::task::Poll::Ready(Err(TransportError::Io(io::Error::other(
-                            "WebSocket handshake cleanup requires caller timer driver",
-                        ))));
+                        return std::task::Poll::Ready(Err(TransportError::Io(
+                            std::io::Error::other(
+                                "WebSocket handshake cleanup requires caller timer driver",
+                            ),
+                        )));
                     }
                     if elapsed.as_mut().poll(task_cx).is_ready() {
                         return std::task::Poll::Ready(Err(TransportError::Timeout));
@@ -14569,14 +14573,14 @@ impl HttpClient {
         client_capabilities: ClientCapabilities,
     ) -> Result<Self, HttpClientError> {
         validate_protocol_plan_feature(&protocol_plan).map_err(HttpClientError::CoreResult)?;
-        Self::connect_with_mcp_apps(
+        Box::pin(Self::connect_with_mcp_apps(
             cx,
             protocol_plan,
             client_info,
             client_capabilities,
             None,
             ReverseRequestHandlers::new(),
-        )
+        ))
         .await
     }
 
@@ -62105,8 +62109,8 @@ while IFS= read -r unexpected; do exit 23; done
                         })
                         .request_timeout_policy(
                             RequestTimeoutPolicy::new(
-                                Duration::from_secs(5),
-                                Duration::from_secs(5),
+                                Duration::from_secs(30),
+                                Duration::from_secs(30),
                             )
                             .unwrap(),
                         )
@@ -64147,8 +64151,8 @@ while IFS= read -r unexpected; do exit 22; done
                         })
                         .request_timeout_policy(
                             RequestTimeoutPolicy::new(
-                                Duration::from_secs(5),
-                                Duration::from_secs(5),
+                                Duration::from_secs(30),
+                                Duration::from_secs(30),
                             )
                             .unwrap(),
                         )

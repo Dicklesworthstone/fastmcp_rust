@@ -32,7 +32,7 @@ use super::policy::EnterpriseProfile;
 /// Each imported table and global client inventory has a finite cardinality.
 pub const MAX_ENTERPRISE_SUBJECT_MAPPINGS: usize = 4096;
 /// A local review is never accepted indefinitely, even if assertions expire.
-pub const MAX_ENTERPRISE_IDENTITY_REVIEW_LIFETIME: Duration = Duration::from_secs(366 * 86_400);
+pub const MAX_ENTERPRISE_IDENTITY_REVIEW_LIFETIME: Duration = Duration::from_hours(366 * 24);
 const MAX_REDIRECTS: usize = 16;
 const MAX_IDENTIFIER_BYTES: usize = 1024;
 const MAX_TENANT_BYTES: usize = 256;
@@ -369,6 +369,7 @@ impl EnterpriseIdentitySnapshotKey {
     pub const fn digest(&self) -> Sha256Digest { self.digest }
 }
 
+#[allow(clippy::struct_field_names)]
 struct MappingRecord {
     resource_subject: String,
     audience_subject: Option<String>,

@@ -3,6 +3,8 @@
 //! Only a fully admitted creation snapshot can enter the driver. The original
 //! tool request is consumed once and never appears in its get/update loop.
 
+#![allow(clippy::wildcard_imports)]
+
 use fastmcp_protocol::FinalCoreResult;
 
 use super::*;

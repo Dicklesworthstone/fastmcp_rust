@@ -68,6 +68,7 @@ pub(super) struct Body {
     sub_id: Presence,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(super) enum AdmittedBody {
     Success(Body),
     Denied(EnterpriseOAuthDenial),

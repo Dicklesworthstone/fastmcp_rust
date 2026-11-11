@@ -41,7 +41,7 @@ const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 const MAX_CALLBACK_FIELDS: usize = 32;
 const MAX_FIELD_BYTES: usize = 4096;
 const MAX_CODE_FORM_BYTES: usize = 32 * 1024;
-const MAX_FLOW_LIFETIME: Duration = Duration::from_secs(900);
+const MAX_FLOW_LIFETIME: Duration = Duration::from_mins(15);
 
 /// Fixed errors retain no callback, authorization URL, code, nonce or peer text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,7 +249,7 @@ impl OidcCodeFlowConfiguration {
         maximum_authentication_age: Option<Duration>,
     ) -> Result<Self, OidcCodeFlowError> {
         if maximum_authentication_age.is_some_and(|age| {
-            age > Duration::from_secs(86_400) || age.subsec_nanos() != 0
+            age > Duration::from_hours(24) || age.subsec_nanos() != 0
         }) {
             return Err(OidcCodeFlowError::InvalidConfiguration);
         }
@@ -449,6 +449,7 @@ pub enum OidcAuthorizationError {
     RegistrationNotSupported, Extension,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum OidcCallbackOutcome {
     Code(OidcCodeGrant),
     Denied(OidcAuthorizationError),

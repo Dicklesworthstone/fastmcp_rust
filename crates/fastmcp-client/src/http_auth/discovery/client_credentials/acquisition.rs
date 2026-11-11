@@ -197,7 +197,7 @@ pub(super) async fn credential(
 
             let token = unless_revoked(
                 flight.previous_revocation.as_ref(),
-                request_grant(client, cx, deadline, cancellation),
+                Box::pin(request_grant(client, cx, deadline, cancellation)),
             )
             .await?;
             let mut state = OwnedMutexGuard::lock(Arc::clone(&client.inner.state), cx)

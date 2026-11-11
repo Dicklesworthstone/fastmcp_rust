@@ -258,9 +258,9 @@ impl DpopHttpClient {
         let prepared = prepared?;
         let progress = progress_marker(&prepared.operation_wire, limits.core.request_bytes())?;
         check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-        let response = self.post_resource_with_bounds(
+        let response = Box::pin(self.post_resource_with_bounds(
             cx, cancellation, credential, &prepared.discovery_wire, idle.bounds(bounds),
-        ).await?;
+        )).await?;
         check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
         let discovery_bytes = response.body().len();
         let admitted = prepared.admit(response);
@@ -272,10 +272,10 @@ impl DpopHttpClient {
             budget.charge((discovery_bytes, 0))?;
         }
         let decoder = Budgeted::new(decoder, budget);
-        self.execute_prepared_core_stream(
+        Box::pin(self.execute_prepared_core_stream(
             cx, cancellation, credential,
             PreparedStream { wire, decoder, limits, bounds, idle }, observer,
-        ).await
+        )).await
     }
 }
 

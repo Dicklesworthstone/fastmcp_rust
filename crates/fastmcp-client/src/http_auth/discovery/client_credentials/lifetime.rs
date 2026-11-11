@@ -84,6 +84,10 @@ pub(super) enum RevocationTarget {
     Endpoint(CanonicalHttpUrl),
 }
 
+#[allow(
+    clippy::struct_field_names,
+    reason = "fields match exact RFC 8414 / OIDC discovery JSON property names"
+)]
 #[derive(Deserialize)]
 struct RevocationMetadata {
     #[serde(default, deserialize_with = "present")]
