@@ -69,6 +69,13 @@ const COMMITTED_EXCLUSIONS: &[&str] = &[
     "secrets.cfg",
     "secrets.properties",
     "secrets.xml",
+    ".ntm/",
+    ".beads-recovery/",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+    ".netrc",
     // --- from the repository's own .rchignore ---
     "target-*/",
     ".rch-target-*/",
@@ -77,6 +84,10 @@ const COMMITTED_EXCLUSIONS: &[&str] = &[
     ".wm-verify2/",
     ".grok/",
     "crates/fastmcp/test_traces/",
+    "/rich_rust",
+    ".doctor/",
+    "/legacy_fastmcp/CLAUDE.md",
+    "/legacy_fastmcp/.github/copilot-instructions.md",
 ];
 
 /// Compile-time file-reading macros. `include!` is deliberately included: it reads a

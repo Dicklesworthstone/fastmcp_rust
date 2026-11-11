@@ -19,7 +19,7 @@ schema = "fnd-02-authoritative-sources-v1"
 [[source]]
 id = "campaign-plan"
 path = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md"
-blob_sha1 = "83defe4464066d1fac1280c319e99a6f23a26dcc"
+blob_sha1 = "cbf9be2e597838856c444b9c56dc54a8e6bcbf01"
 role = "canonical package corpus and work-package ownership"
 
 [[source]]
