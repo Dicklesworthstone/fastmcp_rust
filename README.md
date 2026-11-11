@@ -1781,6 +1781,63 @@ for response deadlines and the finite send-admission timeout.
 
 ---
 
+### Forwarding typed extension requests over HTTP
+
+With both `extension-authoring` and `proxy` enabled, a typed gateway can forward
+request/result extension methods to an independently configured modern HTTP
+upstream. Reuse the same complete extension declaration on both legs. The
+declaration's schema and contract checks remain inside the framework.
+
+Within an asynchronous serving setup, the following uses `Settings`, `Message`,
+and `EchoExtension` from the example above. Supply your caller-owned `cx` and
+canonical upstream `endpoint`:
+
+```rust
+let make_builder = || {
+    ExtensionBuilder::<Settings, Settings, Settings>::new(
+        "com.example/typed-echo",
+        1,
+        "empty-settings-v1",
+        "empty-settings-v1",
+        Settings {},
+        |_client, server| Ok(server),
+    )
+};
+let declaration = EchoExtension.register(make_builder()?)?.build()?;
+let upstream = modern::ClientBuilder::new()
+    .connect_extension_http_upstream_with_cx(
+        cx,
+        endpoint,
+        declaration,
+        &Settings {},
+    )
+    .await?;
+let registration = make_builder()?
+    .typed_http_proxy_request::<Message, Message>(
+        "com.example/echo",
+        "echo-params-v1",
+        "echo-result-v1",
+        upstream,
+    )?
+    .build()?;
+let gateway = modern::ServerBuilder::new("typed-gateway", "1.0")
+    .extension(registration)?
+    .try_build()?;
+```
+
+The connection helper consumes the declaration to configure discovery and typed
+settings negotiation; its local request callbacks are not invoked. Configure the
+upstream client builder's identity, credentials, TLS, and timeout policy before
+connecting. The gateway uses that configured upstream identity. Each forwarded
+call must match the registered contract and independently negotiated effective
+settings, and its request and result pass the typed schema checks.
+
+This request/result surface rejects extension notification declarations.
+Core progress and log events are consumed within a 64-event budget and are
+not relayed. Downstream framework metadata is not application payload or an
+upstream activation proof. Cancelling a forwarded request drops its owned
+upstream execution without cancelling sibling requests.
+
 ## Client executor observations
 
 `OperatorExecutorSnapshot` captures the selected protocol profile, lifecycle,

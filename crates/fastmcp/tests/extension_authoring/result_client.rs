@@ -1,5 +1,9 @@
 //! Real typed extension producers and the shipped HTTP and memory clients.
 
+#[cfg(feature = "proxy")]
+#[path = "result_client/http_proxy.rs"]
+mod http_proxy;
+
 #[cfg(unix)]
 #[path = "result_client/stdio.rs"]
 mod stdio;

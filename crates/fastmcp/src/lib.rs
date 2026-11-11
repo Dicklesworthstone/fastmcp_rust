@@ -3152,6 +3152,8 @@ pub mod modern {
                 ExtensionNotification, ExtensionNotificationContext, ExtensionNotificationHandler,
                 ExtensionRegistration, ExtensionRequestNotification,
             };
+            #[cfg(feature = "proxy")]
+            pub use fastmcp_server::extensions::authoring::ExtensionHttpUpstream;
         }
 
         pub use fastmcp_protocol::extensions::{
@@ -3508,6 +3510,35 @@ pub mod modern {
             self.inner
                 .extension_registry(descriptors, client_discovery, resolver_factory)
                 .map(|inner| Self { inner })
+        }
+
+        /// Connects a sealed authored extension to an independent HTTP upstream.
+        ///
+        /// The supplied registration contributes its complete typed contract
+        /// and settings resolver; none of its handlers run. The returned opaque
+        /// handle installs with ExtensionBuilder::typed_http_proxy_request.
+        /// Identity, credentials, TLS and timeout configuration belong to this
+        /// upstream builder. Notification declarations are rejected.
+        #[cfg(all(feature = "extension-authoring", feature = "proxy"))]
+        pub async fn connect_extension_http_upstream_with_cx<ClientSettings>(
+            self,
+            cx: &Cx,
+            endpoint: CanonicalHttpUrl,
+            registration: extensions::authoring::ExtensionRegistration,
+            client_settings: &ClientSettings,
+        ) -> McpResult<extensions::authoring::ExtensionHttpUpstream>
+        where
+            ClientSettings: serde::Serialize + Sync + ?Sized,
+        {
+            let plan = modern_http_plan(endpoint).map_err(|_| {
+                McpError::invalid_params("invalid modern HTTP extension upstream endpoint")
+            })?;
+            Box::pin(registration.connect_http_upstream(
+                cx,
+                self.inner.protocol_plan(plan),
+                client_settings,
+            ))
+            .await
         }
 
         /// Sets the working directory for the final-only stdio subprocess.

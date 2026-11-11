@@ -44,6 +44,11 @@ use crate::BoxFuture;
 
 pub use fastmcp_protocol::{ExtensionDirection, ExtensionFallbackPolicy};
 
+#[cfg(feature = "proxy")]
+mod http_proxy;
+#[cfg(feature = "proxy")]
+pub use http_proxy::ExtensionHttpUpstream;
+
 /// Maximum request and notification entries retained by one registration.
 pub const MAX_AUTHORING_METHODS: usize = 64;
 /// Aggregate encoded schema budget for one registration, including settings.
@@ -587,6 +592,8 @@ pub struct ExtensionBuilder<ClientSettings, ServerSettings, Settings> {
     schema_bytes: usize,
     schema_identities: BTreeMap<String, [u8; 32]>,
     pending: Vec<PendingMethod>,
+    #[cfg(feature = "proxy")]
+    proxy_contracts: Vec<ProtocolDescriptor>,
     pending_notification: Option<PendingNotification>,
     request_notification_schema: Option<CompiledSchema>,
     marker: PhantomData<fn(ClientSettings, ServerSettings) -> Settings>,
@@ -693,6 +700,8 @@ where
             schema_bytes,
             schema_identities,
             pending: Vec::new(),
+            #[cfg(feature = "proxy")]
+            proxy_contracts: Vec::new(),
             pending_notification: None,
             request_notification_schema: None,
             marker: PhantomData,
@@ -760,6 +769,12 @@ impl<ClientSettings, ServerSettings, Settings>
                 }
             }),
         };
+        #[cfg(feature = "proxy")]
+        if self.proxy_contracts.iter().any(|upstream| upstream != &protocol) {
+            return Err(McpError::invalid_params(
+                "HTTP proxy requires the same complete typed extension contract on both legs",
+            ));
+        }
         let mut descriptors = ExtensionDescriptorRegistry::new();
         descriptors.register(protocol.clone()).map_err(|_| {
             McpError::invalid_params("extension descriptor conflicts with the protocol registry")
@@ -816,6 +831,8 @@ impl<ClientSettings, ServerSettings, Settings>
             descriptor,
             handlers,
             discovery,
+            #[cfg(feature = "proxy")]
+            client_schema: self.client_schema.admitted,
             resolver: AuthoringSettingsResolver {
                 descriptor: protocol,
                 resolve: self.resolve,
@@ -1319,6 +1336,8 @@ pub struct ExtensionRegistration {
     handlers: ExtensionHandlerRegistry,
     discovery: ServerExtensionDiscovery,
     resolver: AuthoringSettingsResolver,
+    #[cfg(feature = "proxy")]
+    client_schema: Arc<AdmittedSchema>,
 }
 
 impl ExtensionRegistration {
