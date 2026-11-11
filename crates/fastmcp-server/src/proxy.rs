@@ -6992,11 +6992,18 @@ impl std::fmt::Debug for ProxyHttpClient {
 }
 
 impl ProxyHttpClient {
-    const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+    // A gateway must carry the same LIMIT-01 JSON-RPC body admitted by the
+    // direct client. A smaller proxy-only cap rejects valid resource and
+    // multimodal tool results before their method-owned limits can run.
+    const MAX_RESPONSE_BYTES: usize = fastmcp_core::DEFAULT_JSON_RPC_MAX_BODY_BYTES;
 
     fn sse_limits() -> SseLimits {
-        SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
-            .expect("nonzero HTTP proxy SSE bounds are valid")
+        SseLimits::new(
+            Self::MAX_RESPONSE_BYTES + b"data: \r\n".len(),
+            fastmcp_client::http_executor::MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES,
+            256,
+        )
+        .expect("nonzero HTTP proxy SSE bounds are valid")
     }
 
     fn new(
@@ -32107,6 +32114,248 @@ expect_request notifications/initialized '' absent
                 .expect("modern catalog request must be JSON")["id"],
             serde_json::json!(2),
         );
+    }
+
+    fn proxy_http_large_results_probe(content_type: &'static str) {
+        use base64::Engine as _;
+
+        // Literal LIMIT-01 boundaries keep these probes independent of the
+        // proxy's configured constants. The method-owned results remain below
+        // their 6 MiB bound; padding changes only the JSON-RPC envelope size.
+        const MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let subject = format!("large-proxy-{}", address.port());
+        let resource_uri = format!("memory://{subject}/body");
+        let tool_result = serde_json::json!({
+            "resultType": "complete",
+            "content": [{
+                "type": "image",
+                "data": base64::engine::general_purpose::STANDARD
+                    .encode(vec![0xa5; 2 * 1024 * 1024]),
+                "mimeType": "image/png"
+            }]
+        });
+        let resource_result = serde_json::json!({
+            "resultType": "complete",
+            "contents": [{
+                "uri": resource_uri,
+                "mimeType": "text/plain",
+                "text": format!("{subject}:{}", "r".repeat(3 * 1024 * 1024))
+            }],
+            "ttlMs": 0,
+            "cacheScope": "private"
+        });
+        let tool_wire = serde_json::to_string(&tool_result).unwrap();
+        let resource_wire = serde_json::to_string(&resource_result).unwrap();
+        assert!(tool_wire.len() > 2 * 1024 * 1024);
+        assert!(resource_wire.len() > 2 * 1024 * 1024);
+        let methods = [
+            "tools/call",
+            "resources/read",
+            "tools/call",
+            "tools/call",
+            "resources/read",
+        ];
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .expect("caller runtime with native reactor");
+
+        thread::scope(|scope| {
+            let peer = scope.spawn(move || {
+                let accept = || {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                stream
+                                    .set_read_timeout(Some(Duration::from_secs(30)))
+                                    .unwrap();
+                                stream
+                                    .set_write_timeout(Some(Duration::from_secs(30)))
+                                    .unwrap();
+                                return stream;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "large-result peer accept is bounded"
+                                );
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("large-result peer accept: {error}"),
+                        }
+                    }
+                };
+                let mut discovery = accept();
+                let opening: serde_json::Value =
+                    serde_json::from_slice(&read_http_request(&mut discovery).body).unwrap();
+                assert_eq!(opening["method"], "server/discover");
+                write_http_discovery_response(
+                    &mut discovery,
+                    &serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": opening["id"], "result": {
+                            "supportedVersions": ["2026-07-28"],
+                            "capabilities": {"tools": {}, "resources": {}},
+                            "ttlMs": 0, "cacheScope": "private"
+                        }
+                    }))
+                    .unwrap(),
+                );
+                drop(discovery);
+
+                let mut requests = Vec::new();
+                for (index, method) in methods.into_iter().enumerate() {
+                    let mut stream = accept();
+                    let captured = read_http_request(&mut stream);
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&captured.body).unwrap();
+                    assert_eq!(request["method"], method);
+                    assert!(captured.head.contains(&format!("Mcp-Method: {method}\r\n")));
+                    let result = if method == "tools/call" {
+                        &tool_wire
+                    } else {
+                        &resource_wire
+                    };
+                    let mut response = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{result}}}"#,
+                        request["id"],
+                    );
+                    if index == 2 || index == 3 {
+                        let bytes = MESSAGE_BYTES + usize::from(index == 2);
+                        response.push_str(&" ".repeat(bytes - response.len()));
+                        assert_eq!(response.len(), bytes);
+                    }
+                    let body = if content_type == "text/event-stream" {
+                        format!("data: {response}\r\n\r\n")
+                    } else {
+                        response
+                    };
+                    let written = (|| -> std::io::Result<()> {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len(),
+                        )?;
+                        stream.write_all(body.as_bytes())?;
+                        stream.flush()
+                    })();
+                    if let Err(error) = written {
+                        // Refusing an oversized body may close the socket
+                        // before its sender finishes. That closure is the
+                        // behavior under test, not a fixture failure.
+                        assert_eq!(index, 2, "an admitted response must be fully delivered");
+                        assert!(matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ));
+                    }
+                    requests.push(request);
+                }
+                requests
+            });
+
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+            let results = runtime.block_on(async {
+                let plan = ClientProtocolPlan::http(
+                    ProtocolPolicy::ModernOnly,
+                    Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+                    None,
+                    None,
+                    subject.clone(),
+                    subject.clone(),
+                    subject.clone(),
+                    1,
+                    1,
+                    0,
+                )
+                .unwrap();
+                let mut bindings = ProxyClient::upstream_binding_registry();
+                let proxy = bindings
+                    .connect_http_with_protocol_plan(
+                        &cx,
+                        &subject,
+                        &subject,
+                        1,
+                        plan,
+                        proxy_http_client_info(),
+                        ClientCapabilities::default(),
+                    )
+                    .await
+                    .expect("modern discovery opens the public large-result proxy");
+                let binding = proxy.upstream_binding();
+                assert_eq!(binding.unwrap().era(), ProtocolEra::Modern2026);
+                let sibling = proxy.clone();
+                let mut results = Vec::new();
+                for (index, method) in methods.into_iter().enumerate() {
+                    let context = McpContext::new(cx.clone(), 8400 + index as u64);
+                    let (client, target) = if method == "resources/read" {
+                        (&sibling, resource_uri.as_str())
+                    } else {
+                        (&proxy, subject.as_str())
+                    };
+                    results.push(
+                        asupersync::time::timeout(
+                            cx.now(),
+                            Duration::from_secs(30),
+                            invoke_public_typed_proxy_request(
+                                client, &context, method, target, &subject,
+                            ),
+                        )
+                        .await
+                        .expect("large-result forwarding has a bounded caller-owned wait"),
+                    );
+                    assert_eq!(proxy.upstream_binding(), binding);
+                    context.ensure_live().unwrap();
+                    assert!(!cx.is_cancel_requested());
+                }
+                results
+            });
+            let requests = peer.join().expect("large-result peer retires");
+            assert_eq!(requests.len(), 5);
+            for (index, (request, result)) in requests.into_iter().zip(results).enumerate() {
+                assert_eq!(request["id"], serde_json::json!(index as i64 + 2));
+                if index == 2 {
+                    let error =
+                        result.expect_err("one byte beyond the shared message bound is refused");
+                    if content_type == "application/json" {
+                        assert_eq!(error.code, McpErrorCode::InternalError);
+                        assert!(error.message.contains("8388608-byte limit"));
+                    } else {
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                        assert!(error.message.contains("SSE event was not JSON-RPC"));
+                    }
+                    continue;
+                }
+                let result = result.expect("valid large results and post-refusal siblings survive");
+                let observed: serde_json::Value =
+                    serde_json::from_str(&result.encode().unwrap()).unwrap();
+                let expected = if methods[index] == "tools/call" {
+                    &tool_result
+                } else {
+                    &resource_result
+                };
+                assert_eq!(
+                    &observed, expected,
+                    "the complete upstream payload is preserved"
+                );
+            }
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_http_json_large_results_preserve_payload_and_message_bound() {
+        proxy_http_large_results_probe("application/json");
+    }
+
+    #[test]
+    fn proxy_http_sse_large_results_preserve_payload_and_message_bound() {
+        proxy_http_large_results_probe("text/event-stream");
     }
 
     #[test]
