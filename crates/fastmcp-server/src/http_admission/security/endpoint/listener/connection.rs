@@ -761,6 +761,7 @@ async fn sse(
         raw_params,
         receipt,
         sender,
+        response.cancellation(),
         Arc::clone(&terminal),
         Some(gate),
     )
