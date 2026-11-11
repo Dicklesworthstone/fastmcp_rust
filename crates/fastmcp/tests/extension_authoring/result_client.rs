@@ -323,7 +323,7 @@ fn typed_extension_http_interruption_settles_handler_and_preserves_client(
                         .is_pending(),
                     "the typed handler must start before request interruption"
                 );
-                asupersync::runtime::yield_now().await;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
             assert_eq!(observations.completed.load(Ordering::SeqCst), 0);
             assert_eq!(observations.abandoned.load(Ordering::SeqCst), 0);
@@ -391,7 +391,7 @@ fn typed_extension_http_interruption_settles_handler_and_preserves_client(
             assert!(!live.is_cancel_requested());
             asupersync::time::timeout(cx.now(), Duration::from_secs(2), async {
                 while observations.abandoned.load(Ordering::SeqCst) == 0 {
-                    asupersync::runtime::yield_now().await;
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
             })
             .await
@@ -653,7 +653,7 @@ fn typed_notification_modern_http_facade_acknowledges_completed_callbacks() {
                 .unwrap();
             let bound = server.bind_http(&cx, "127.0.0.1:0").await.unwrap();
             let endpoint =
-                CanonicalHttpUrl::parse(&format!("http://{}/mcp", bound.local_addr().unwrap(),))
+                CanonicalHttpUrl::parse(&format!("http://{}/mcp", bound.local_addr().unwrap()))
                     .unwrap();
             let (ready, mut receiver) = asupersync::channel::oneshot::channel();
             let mut serving = cx

@@ -91,6 +91,7 @@ fn consumer_with_stdio_correlation(
     (id, registry, discovery)
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn compatible(
     _descriptor: &ExtensionDescriptor,
     client: &ExtensionSettings,
@@ -469,7 +470,7 @@ fn typed_http_notification_arrives_before_pending_handler_and_cancel_keeps_sibli
             assert!(matches!(sibling.next_event(&cx).await.unwrap(),
                 Some(ModernHttpExtensionEvent::Terminal(result)) if result == json!({"value": 15})));
             while observed.load(Ordering::SeqCst) == 0 {
-                asupersync::runtime::yield_now().await;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
             assert_eq!(observed.load(Ordering::SeqCst), 1,
                 "body closure retires the producer before listener shutdown");
@@ -553,6 +554,8 @@ fn typed_http_endpoint_elects_after_admission_and_owns_the_pending_producer() {
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
                     .with_header("accept", accept)
+                    .with_header("mcp-protocol-version", "2026-07-28")
+                    .with_header("mcp-method", METHOD)
                     .with_body(
                         serde_json::to_vec(&request(id, Some(json!({"version": 1})), json!(value)))
                             .unwrap(),
@@ -595,7 +598,7 @@ fn typed_http_endpoint_elects_after_admission_and_owns_the_pending_producer() {
                 if let Some(event) = body.pop_event().unwrap() {
                     break event;
                 }
-                asupersync::runtime::yield_now().await;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             };
             let JsonRpcMessage::Request(notification) = serde_json::from_str(&event.data).unwrap()
             else {
@@ -606,7 +609,7 @@ fn typed_http_endpoint_elects_after_admission_and_owns_the_pending_producer() {
             assert!(!body.is_finished());
             drop(body);
             while refused.load(Ordering::SeqCst) == 0 {
-                asupersync::runtime::yield_now().await;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
             assert_eq!(refused.load(Ordering::SeqCst), 1);
             session.close(&cx).await;

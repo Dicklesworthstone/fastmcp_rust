@@ -15225,6 +15225,49 @@ async fn dispatch_http_request_async(
         })
 }
 
+async fn drive_modern_sse_opening<R, F, T>(
+    cx: &Cx,
+    listener_shutdown: &HttpListenerShutdown,
+    cancellation: &McpRequestCancellation,
+    mut peer_reader: R,
+    work: F,
+) -> (T, bool)
+where
+    R: asupersync::io::AsyncRead + Unpin,
+    F: Future<Output = T>,
+{
+    let mut work = std::pin::pin!(work);
+    let mut probe = [0_u8; 1];
+    let mut peer_read = std::pin::pin!(peer_reader.read(&mut probe));
+    let mut peer_read_finished = false;
+    let mut peer_departed = false;
+    let output = std::future::poll_fn(|task_cx| {
+        if listener_shutdown.is_requested() || cx.checkpoint().is_err() {
+            cancellation.cancel();
+        }
+        if !peer_read_finished {
+            match peer_read.as_mut().poll(task_cx) {
+                std::task::Poll::Ready(Ok(0)) => peer_read_finished = true,
+                std::task::Poll::Ready(Err(error))
+                    if error.kind() == std::io::ErrorKind::Interrupted
+                        && cx.is_cancel_requested() =>
+                {
+                    peer_read_finished = true;
+                }
+                std::task::Poll::Ready(_) => {
+                    peer_read_finished = true;
+                    peer_departed = true;
+                    cancellation.cancel();
+                }
+                std::task::Poll::Pending => {}
+            }
+        }
+        work.as_mut().poll(task_cx)
+    })
+    .await;
+    (output, peer_departed)
+}
+
 #[cfg(feature = "legacy-2024-11-05")]
 async fn serve_http_connection(
     cx: &Cx,
@@ -15343,11 +15386,29 @@ async fn serve_http_connection(
             }
         };
         let http_parameter_headers = http_admission::http_parameter_headers(&request.headers);
+        let opening_cancellation = McpRequestCancellation::new();
+        let (opening, peer_departed) = Box::pin(drive_modern_sse_opening(
+            cx,
+            &listener_shutdown,
+            &opening_cancellation,
+            framed.get_mut(),
+            Box::pin(session.begin_modern_sse(
+                cx,
+                request.clone(),
+                transport_authorization.clone(),
+                Some(opening_cancellation.clone()),
+            )),
+        ))
+        .await;
+        if peer_departed {
+            close_detached_modern_http_session(
+                &modern_sessions,
+                Arc::new(LiveModernHttpSession::new(session)),
+            );
+            return;
+        }
         let response = {
-            match session
-                .begin_modern_sse(cx, request.clone(), transport_authorization.clone(), None)
-                .await
-            {
+            match opening {
                 Ok(Ok((request, response, raw_params, auth_receipt))) => Ok(Ok((
                     InboundRequestContext::with_modern_connection_and_transport_authorization(
                         cx.clone(),
@@ -15742,11 +15803,29 @@ async fn serve_modern_http_connection(
             }
         };
         let http_parameter_headers = http_admission::http_parameter_headers(&request.headers);
+        let opening_cancellation = McpRequestCancellation::new();
+        let (opening, peer_departed) = Box::pin(drive_modern_sse_opening(
+            cx,
+            &listener_shutdown,
+            &opening_cancellation,
+            framed.get_mut(),
+            Box::pin(session.begin_modern_sse(
+                cx,
+                request.clone(),
+                transport_authorization.clone(),
+                Some(opening_cancellation.clone()),
+            )),
+        ))
+        .await;
+        if peer_departed {
+            close_detached_modern_http_session(
+                &modern_sessions,
+                Arc::new(LiveModernHttpSession::new(session)),
+            );
+            return;
+        }
         let response = {
-            match session
-                .begin_modern_sse(cx, request.clone(), transport_authorization.clone(), None)
-                .await
-            {
+            match opening {
                 Ok(Ok((request, response, raw_params, auth_receipt))) => Ok(Ok((
                     InboundRequestContext::with_modern_connection_and_transport_authorization(
                         cx.clone(),
@@ -19748,17 +19827,18 @@ impl Server {
     /// violate the hook's quiescence contract.
     pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
         let dispatch_cx = cx.clone();
-        let mut pump =
-            match cx.spawn_blocking(move |pump_cx| self.run_stdio_pump(&pump_cx, &dispatch_cx)) {
-                Ok(pump) => pump,
-                Err(error) => {
-                    error!(
-                        target: targets::SERVER,
-                        "Could not admit the stdio pump into the caller runtime: {error}"
-                    );
-                    std::process::exit(1);
-                }
-            };
+        let pump_task: Box<dyn FnOnce(Cx) -> i32 + Send> =
+            Box::new(move |pump_cx| self.run_stdio_pump(&pump_cx, &dispatch_cx));
+        let mut pump = match cx.spawn_blocking(pump_task) {
+            Ok(pump) => pump,
+            Err(error) => {
+                error!(
+                    target: targets::SERVER,
+                    "Could not admit the stdio pump into the caller runtime: {error}"
+                );
+                std::process::exit(1);
+            }
+        };
         let exit_code = match pump.join(cx).await {
             Ok(exit_code) => exit_code,
             Err(error) => {

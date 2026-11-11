@@ -717,6 +717,9 @@ async fn use_final_only_http_subscription_listener(
     filter: modern::SubscriptionFilter,
     limits: modern::SseLimits,
 ) -> Result<Option<modern::ModernHttpSubscriptionListenEvent>, modern::HttpClientError> {
+    let _: modern::ModernHttpSubscriptionListenCollector = client
+        .listen_subscriptions(cx, filter.clone(), limits)
+        .await?;
     let mut listener: modern::HttpSubscriptionListener<'_> = client
         .open_subscriptions_listener(cx, filter, limits)
         .await?;
@@ -811,8 +814,6 @@ fn assert_client_http_and_subscription_exports() {
     let _ = modern::HttpClient::read_resource_result_with_cancellation;
     let _ = modern::HttpClient::get_prompt_with_cancellation;
     let _ = modern::HttpClient::get_prompt_result_with_cancellation;
-    let _ = modern::HttpClient::open_subscriptions_listener;
-    let _ = modern::HttpClient::listen_subscriptions;
     let _ = modern::HttpClient::get_task;
     let _ = modern::HttpClient::update_task;
     let _ = modern::HttpClient::cancel_task;

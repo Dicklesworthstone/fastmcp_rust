@@ -1457,10 +1457,12 @@ where
     ) -> BoxFuture<'a, McpResult<Value>> {
         Box::pin(async move {
             let (request, settings) = self.binding.decode(context, negotiated, parameters)?;
-            let response = self
-                .handler
-                .handle(self.binding.context(context, &settings), request)
-                .await?;
+            let response = poll_live(
+                context,
+                self.handler
+                    .handle(self.binding.context(context, &settings), request),
+            )
+            .await?;
             self.binding.encode(context, &response)
         })
     }
@@ -1479,10 +1481,12 @@ where
                 admit();
                 ensure_live(context)?;
             }
-            let response = self
-                .handler
-                .handle(self.binding.context(context, &settings), request)
-                .await?;
+            let response = poll_live(
+                context,
+                self.handler
+                    .handle(self.binding.context(context, &settings), request),
+            )
+            .await?;
             self.binding
                 .encode(context, &response)
                 .map(|value| fastmcp_protocol::JsonRpcResponse::success(id, value))
@@ -1667,9 +1671,12 @@ where
     ) -> BoxFuture<'a, McpResult<Value>> {
         Box::pin(async move {
             let (notification, settings) = self.binding.prepare(context, negotiated, authorized)?;
-            self.handler
-                .handle(self.binding.context(context, &settings)?, notification)
-                .await?;
+            let notification_context = self.binding.context(context, &settings)?;
+            poll_live(
+                context,
+                self.handler.handle(notification_context, notification),
+            )
+            .await?;
             ensure_live(context)?;
             Ok(Value::Null)
         })
@@ -1719,6 +1726,55 @@ fn ensure_live(context: &McpContext) -> McpResult<()> {
     context
         .ensure_live()
         .map_err(|_| McpError::request_cancelled())
+}
+
+async fn poll_live<T, F>(context: &McpContext, future: F) -> McpResult<T>
+where
+    F: Future<Output = McpResult<T>>,
+{
+    let mut future = Some(Box::pin(future));
+    let mut cancelled = std::pin::pin!(context.request_cancelled());
+    let mut deadline = context
+        .budget()
+        .deadline
+        .map(asupersync::time::sleep_until)
+        .map(Box::pin);
+    std::future::poll_fn(move |task| {
+        if let Err(error) = ensure_live(context) {
+            future = None;
+            return std::task::Poll::Ready(Err(error));
+        }
+        if cancelled.as_mut().poll(task).is_ready() {
+            future = None;
+            return std::task::Poll::Ready(Err(McpError::request_cancelled()));
+        }
+        if let Some(deadline) = deadline.as_mut()
+            && deadline.as_mut().poll(task).is_ready()
+        {
+            future = None;
+            return std::task::Poll::Ready(Err(McpError::request_cancelled()));
+        }
+        match future
+            .as_mut()
+            .expect("live extension future remains present until completion")
+            .as_mut()
+            .poll(task)
+        {
+            std::task::Poll::Ready(output) => {
+                future = None;
+                std::task::Poll::Ready(output)
+            }
+            std::task::Poll::Pending => {
+                if let Err(error) = ensure_live(context) {
+                    future = None;
+                    std::task::Poll::Ready(Err(error))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        }
+    })
+    .await
 }
 
 fn checked_identity(value: String) -> McpResult<String> {

@@ -985,78 +985,135 @@ asupersync = {{ version = "{asupersync_requirement}", default-features = false }
     }
 }
 
+fn trybuild_active_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if cfg!(feature = "apps") {
+        features.push("apps");
+    }
+    if cfg!(feature = "builtin-auth-server") {
+        features.push("builtin-auth-server");
+    }
+    if cfg!(all(feature = "legacy-2024-11-05", feature = "tasks")) {
+        features.push("default");
+    }
+    if cfg!(feature = "enterprise-auth") {
+        features.push("enterprise-auth");
+    }
+    if cfg!(feature = "extension-authoring") {
+        features.push("extension-authoring");
+    }
+    if cfg!(feature = "fastmcp-console") {
+        features.push("fastmcp-console");
+    }
+    if cfg!(feature = "jwt-resource-auth") {
+        features.push("jwt-resource-auth");
+    }
+    if cfg!(feature = "legacy-2024-11-05") {
+        features.push("legacy-2024-11-05");
+    }
+    if cfg!(feature = "native-tls-roots") {
+        features.push("native-tls-roots");
+    }
+    if cfg!(feature = "oauth-client-credentials") {
+        features.push("oauth-client-credentials");
+    }
+    if cfg!(feature = "proxy") {
+        features.push("proxy");
+    }
+    if cfg!(feature = "proxy-legacy") {
+        features.push("proxy-legacy");
+    }
+    if cfg!(feature = "proxy-tasks") {
+        features.push("proxy-tasks");
+    }
+    if cfg!(feature = "tasks") {
+        features.push("tasks");
+    }
+    if cfg!(feature = "testing") {
+        features.push("testing");
+    }
+    if cfg!(feature = "testing-lab") {
+        features.push("testing-lab");
+    }
+    if cfg!(feature = "websocket-experimental") {
+        features.push("websocket-experimental");
+    }
+    features
+}
+
+fn prepare_trybuild_worker_arg0() -> PathBuf {
+    let base = std::env::temp_dir().join(format!(
+        "fastmcp-trybuild-fingerprint-{}",
+        std::process::id()
+    ));
+    let fingerprint_dir = base.join("fingerprint");
+    let out_dir = base.join("out");
+    fs::create_dir_all(&fingerprint_dir).expect("create synthetic trybuild fingerprint dir");
+    fs::create_dir_all(&out_dir).expect("create synthetic trybuild out dir");
+    let inner =
+        serde_json::to_string(&trybuild_active_features()).expect("serialize active features");
+    let payload = serde_json::json!({ "features": inner }).to_string();
+    fs::write(fingerprint_dir.join("features.json"), payload)
+        .expect("write synthetic trybuild features.json");
+    out_dir.join("trybuild_tests")
+}
+
 #[test]
 fn compile_fail_tests() {
     if std::env::var_os(TRYBUILD_WORKER_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
-        let tests = trybuild::TestCases::new();
-        tests.compile_fail("tests/trybuild/prompt_*.rs");
-        tests.compile_fail("tests/trybuild/resource_*.rs");
-        #[cfg(not(feature = "apps"))]
-        tests.compile_fail("tests/trybuild/tool_apps_ui_unsupported.rs");
-        tests.compile_fail("tests/trybuild/tool_invalid_timeout.rs");
-        tests.compile_fail("tests/trybuild/tool_typed_return.rs");
-        tests.compile_fail("tests/trybuild/tool_unknown_attr.rs");
-        tests.compile_fail("tests/trybuild/tool_zero_timeout.rs");
-        #[cfg(feature = "tasks")]
         {
-            tests.compile_fail("tests/trybuild/tool_tasks_incompatible_return.rs");
-            tests.compile_fail("tests/trybuild/tool_tasks_facade_outcome_required.rs");
-            tests.pass("tests/trybuild_pass/tool_tasks_enabled.rs");
-        }
-        #[cfg(not(feature = "tasks"))]
-        tests.compile_fail("tests/trybuild/tasks_disabled/tool_tasks_feature_disabled.rs");
-        #[cfg(feature = "websocket-experimental")]
-        {
-            // These must remain valid in ModernOnly, without the exact-2024
-            // adapter selected by a dependency or this crate's defaults.
+            let tests = trybuild::TestCases::new();
+            tests.compile_fail("tests/trybuild/prompt_*.rs");
+            tests.compile_fail("tests/trybuild/resource_*.rs");
+            #[cfg(not(feature = "apps"))]
+            tests.compile_fail("tests/trybuild/tool_apps_ui_unsupported.rs");
+            tests.compile_fail("tests/trybuild/tool_invalid_timeout.rs");
+            tests.compile_fail("tests/trybuild/tool_typed_return.rs");
+            tests.compile_fail("tests/trybuild/tool_unknown_attr.rs");
+            tests.compile_fail("tests/trybuild/tool_zero_timeout.rs");
+            #[cfg(feature = "tasks")]
+            {
+                tests.compile_fail("tests/trybuild/tool_tasks_incompatible_return.rs");
+                tests.compile_fail("tests/trybuild/tool_tasks_facade_outcome_required.rs");
+            }
+            #[cfg(not(feature = "tasks"))]
+            tests.compile_fail("tests/trybuild/tasks_disabled/tool_tasks_feature_disabled.rs");
+            // Macro-independent compile-fail control (bd-e06g9 item 3):
+            // `fastmcp_rust::client::websocket_experimental` is absent under
+            // every feature combination and invokes no derive/attribute macro,
+            // distinguishing trybuild diagnostic blindness from macro regressions.
             tests.compile_fail("tests/trybuild/websocket/client_namespace_escape.rs");
-            tests.compile_fail("tests/trybuild/websocket/modern_wrapper_escape.rs");
-            tests.pass("tests/trybuild_pass/websocket_experimental_consumer.rs");
+            #[cfg(feature = "websocket-experimental")]
+            {
+                // This must remain valid in ModernOnly, without the exact-2024
+                // adapter selected by a dependency or this crate's defaults.
+                tests.compile_fail("tests/trybuild/websocket/modern_wrapper_escape.rs");
+            }
+            #[cfg(all(feature = "websocket-experimental", feature = "legacy-2024-11-05"))]
+            {
+                tests.compile_fail("tests/trybuild/websocket/auto_wrapper_escape.rs");
+                tests.compile_fail("tests/trybuild/websocket/legacy_wrapper_escape.rs");
+            }
         }
-        #[cfg(all(feature = "websocket-experimental", feature = "legacy-2024-11-05"))]
+        #[cfg(any(
+            feature = "tasks",
+            feature = "websocket-experimental",
+            all(feature = "apps", feature = "legacy-2024-11-05")
+        ))]
         {
-            tests.compile_fail("tests/trybuild/websocket/auto_wrapper_escape.rs");
-            tests.compile_fail("tests/trybuild/websocket/legacy_wrapper_escape.rs");
+            let pass_tests = trybuild::TestCases::new();
+            #[cfg(feature = "tasks")]
+            pass_tests.pass("tests/trybuild_pass/tool_tasks_enabled.rs");
+            #[cfg(feature = "websocket-experimental")]
+            pass_tests.pass("tests/trybuild_pass/websocket_experimental_consumer.rs");
+            #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
+            pass_tests.pass("tests/trybuild_pass/facade_dual_era_consumer.rs");
         }
-        #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
-        tests.pass("tests/trybuild_pass/facade_dual_era_consumer.rs");
         return;
     }
 
     let _compile_probe_guard = compile_probe_guard();
 
-    // trybuild passes `--offline` unconditionally (its `cargo_with_rustflags`
-    // does `cmd.arg("--offline")`) and resolves the project it generates under
-    // CARGO_TARGET_DIR/tests/trybuild from the local cache alone. It copies
-    // THIS workspace's Cargo.lock in to do it (trybuild-1.0.122
-    // src/cargo.rs:80-88, falling back to `generate-lockfile` only when the
-    // workspace has no lock), so the pins it resolves against are ours while
-    // the cache it needs is the ambient one. Every other compile probe in this
-    // file guarantees that cache first and this one did not, so warming it is
-    // a real precondition for the probe.
-    //
-    // It is NOT, however, the explanation for bd-e06g9's five
-    // "Expected test case to fail to compile, but it succeeded" rows, and this
-    // call should not be read as fixing that. Two things in those rows rule the
-    // dependency graph out as their cause:
-    //
-    //   - they printed at all, which means `prepare`/`write` returned Ok, and
-    //     `build_dependencies` is called from inside `write` (run.rs:211) under
-    //     a closure whose `unwrap_or_else` prints `prepare_fail` and panics
-    //     "tests failed". A dependency-level failure yields NO case rows.
-    //   - they carry `[should fail to compile]`, which `Test::run` prints only
-    //     when `has_pass && has_compile_fail` (run.rs:406), while the batch
-    //     path hardcodes `show_expected = false` (run.rs:371). Under
-    //     `--all-features` this target registers three `tests.pass(...)`, so
-    //     has_pass is true, the per-case path ran, and the `--bins
-    //     --keep-going` batch build never executed.
-    //
-    // The blindness is real but it lives in the per-case path: `build_test`
-    // (cargo.rs:119-139) returns `.output()`, whose nonzero exit nobody reads,
-    // and `check_compile_fail` then branches on a `Stderr::default
-    // { success: true }` fallback, so "no diagnostic attributed to this file"
-    // is indistinguishable from "this file compiled". The live candidates are
-    // feature forwarding and src_path attribution; see bd-e06g9.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = workspace_root(manifest_dir);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
@@ -1065,10 +1122,17 @@ fn compile_fail_tests() {
     // trybuild owns nested Cargo processes internally and exposes no timeout.
     // Run the ordinary suite in an exact, recursively selected copy of this
     // test binary so the parent can bound and clean up the whole process group.
+    let worker_arg0 = prepare_trybuild_worker_arg0();
     let mut command = Command::new(std::env::current_exe().expect("resolve current test binary"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.arg0(&worker_arg0);
+    }
     command
         .args(["--exact", "compile_fail_tests", "--nocapture"])
         .env(TRYBUILD_WORKER_ENV, "1")
+        .env("COPYFILE_DISABLE", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     let status = run_bounded(command, "trybuild compile-fail worker", COMPILE_DEADLINE)
