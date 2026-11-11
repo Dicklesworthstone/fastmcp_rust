@@ -39,6 +39,10 @@ pub(crate) use catalog::CatalogCollector;
 use cursors::{CatalogKind, CursorLedger};
 #[cfg(feature = "tasks")]
 mod tasks;
+#[cfg(feature = "tasks")]
+pub(crate) use tasks::{
+    HttpTaskInputTransport, TaskInputTransport, resolve_snapshot_with_transport,
+};
 
 /// Sanitized high-level failures. The original session error remains available
 /// for typed handling, but formatting never includes transport or peer data.

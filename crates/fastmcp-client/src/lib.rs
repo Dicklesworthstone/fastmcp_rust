@@ -57,7 +57,9 @@ mod task_wait;
 #[cfg(feature = "tasks")]
 pub use task_wait::FinalTaskStreamWatch;
 #[cfg(feature = "tasks")]
-pub use task_wait::{FinalTaskWaitOutcome, FinalTaskWaitPolicy};
+pub use task_wait::{
+    FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskWaitOutcome, FinalTaskWaitPolicy,
+};
 pub mod http_auth;
 #[cfg_attr(
     not(feature = "legacy-2024-11-05"),

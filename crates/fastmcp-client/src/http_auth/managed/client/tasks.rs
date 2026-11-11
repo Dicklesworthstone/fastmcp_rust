@@ -20,6 +20,9 @@ use crate::{
 
 mod listen;
 mod resolve;
+pub(crate) use resolve::{
+    HttpTaskInputTransport, TaskInputTransport, resolve_snapshot_with_transport,
+};
 mod tool_events;
 
 const MAX_TASK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;

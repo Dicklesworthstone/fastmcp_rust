@@ -1,7 +1,8 @@
 //! Caller-owned, bounded observation of an existing final Task.
 //!
-//! Waiting only reads Tasks. Explicit input submission and reconciliation
-//! use the same caller-owned request machinery; neither replays uncertain work.
+//! Waiting only reads Tasks. Explicit input submission, reconciliation and
+//! opt-in automatic driving share caller-owned request and callback machinery.
+//! Reusable drivers retain input custody and never replay uncertain work.
 //! Remote cancellation, reconnects and persistence remain application actions.
 
 use std::future::Future;
@@ -17,6 +18,12 @@ use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 #[cfg(feature = "websocket-experimental")]
 use crate::WebSocketClient;
 use crate::http_auth::caller::with_caller;
+use crate::http_auth::managed::client::{
+    HttpTaskInputTransport, TaskInputTransport, resolve_snapshot_with_transport,
+};
+use crate::http_auth::managed::tasks::driver::{
+    DriverState, ManagedTaskDriverError, ManagedTaskDriverPolicy,
+};
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
 #[cfg(unix)]
 use crate::Client;
@@ -100,7 +107,204 @@ pub enum FinalTaskWaitOutcome {
     TimerUnavailable,
 }
 
+/// Bounds an opt-in automatic Task workflow and its retained input ledger.
+///
+/// The wait policy covers each complete invocation, including callbacks,
+/// updates, reconciliation and poll delays. Update limits apply per invocation;
+/// input-key and fingerprint-byte limits apply for the driver's entire life.
+/// Fingerprints are never evicted. Payload bytes bound the encoded descriptors
+/// plus keyed answers in each callback batch, not allocator overhead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinalTaskDrivePolicy {
+    wait: FinalTaskWaitPolicy,
+    maximum_updates: usize,
+    maximum_input_keys: usize,
+    maximum_state_bytes: usize,
+    maximum_payload_bytes: usize,
+}
+
+impl Default for FinalTaskDrivePolicy {
+    fn default() -> Self {
+        Self {
+            wait: FinalTaskWaitPolicy::default(),
+            maximum_updates: 32,
+            maximum_input_keys: 256,
+            maximum_state_bytes: 1024 * 1024,
+            maximum_payload_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+impl FinalTaskDrivePolicy {
+    /// Allows 0..=128 updates per invocation, 1..=4,096 lifetime input keys,
+    /// 1..=4 MiB of ledger bytes and 1..=8 MiB of payload per input batch.
+    /// Zero updates makes the driver stop at input-required without callbacks.
+    pub fn new(
+        wait: FinalTaskWaitPolicy,
+        maximum_updates: usize,
+        maximum_input_keys: usize,
+        maximum_state_bytes: usize,
+        maximum_payload_bytes: usize,
+    ) -> McpResult<Self> {
+        if maximum_updates > 128
+            || !(1..=4096).contains(&maximum_input_keys)
+            || !(1..=4 * 1024 * 1024).contains(&maximum_state_bytes)
+            || !(1..=8 * 1024 * 1024).contains(&maximum_payload_bytes)
+        {
+            return Err(McpError::invalid_params("Invalid final Task drive policy"));
+        }
+        Ok(Self {
+            wait,
+            maximum_updates,
+            maximum_input_keys,
+            maximum_state_bytes,
+            maximum_payload_bytes,
+        })
+    }
+
+    fn ledger_policy(self) -> ManagedTaskDriverPolicy {
+        ManagedTaskDriverPolicy {
+            minimum_poll_interval: self.wait.fallback_poll_interval,
+            timeout: self.wait.timeout,
+            maximum_polls: self.wait.maximum_polls,
+            maximum_updates: self.maximum_updates,
+            maximum_input_keys: self.maximum_input_keys,
+            maximum_state_bytes: self.maximum_state_bytes,
+        }
+    }
+}
+
+/// A reusable, caller-owned automatic workflow for one existing final Task.
+///
+/// Create it with [`FinalTaskHandle::into_driver`], then use the same client
+/// that attached the handle. Driving explicitly authorizes that client's
+/// installed roots, sampling and elicitation callbacks, followed by updates
+/// and authoritative reads until completion or a local bound. No worker,
+/// runtime, reconnect, Task creation or remote cancellation is implicit.
+///
+/// This owner is deliberately not `Clone`. Acknowledged input fingerprints
+/// survive repeated snapshots and subsequent drive calls; the same key cannot
+/// trigger another callback, and a changed descriptor for that key is an
+/// error. The finite lifetime ledger is never silently reset or evicted.
+/// Descriptor fingerprints preserve their serialized representation.
+///
+/// If a callback or update is interrupted, fails, or loses its acknowledgement,
+/// the owner retains an interruption latch. Further automatic driving refuses
+/// before another effect rather than guessing whether the Host or peer acted.
+/// Inspect [`Self::input_resolution_interrupted`] and explicitly hand off to
+/// manual reconciliation with [`Self::into_handle`]. This is in-process
+/// custody, not persistence or a crash-recovery/exactly-once guarantee.
+pub struct FinalTaskDriver {
+    handle: FinalTaskHandle,
+    policy: FinalTaskDrivePolicy,
+    inputs: DriverState,
+    input_resolution_interrupted: bool,
+}
+
+impl FinalTaskDriver {
+    /// The last fully admitted authoritative snapshot, including exact terminal
+    /// result data. An update acknowledgement alone never changes this snapshot.
+    #[must_use]
+    pub const fn task(&self) -> &FinalTask {
+        self.handle.task()
+    }
+
+    #[must_use]
+    pub fn task_id(&self) -> &FinalTaskId {
+        self.handle.task_id()
+    }
+
+    /// True means automatic input custody was interrupted and cannot be retried
+    /// safely. A read-only cancellation between input batches does not set it.
+    #[must_use]
+    pub const fn input_resolution_interrupted(&self) -> bool {
+        self.input_resolution_interrupted
+    }
+
+    /// Explicitly hands the retained Task back to manual control. This consumes
+    /// the automatic owner and discards its input fingerprints and interruption
+    /// latch. Creating another driver is a new disclosure decision: reconcile
+    /// uncertain Host and peer effects first; a new owner cannot deduplicate
+    /// the old owner's input keys.
+    #[must_use]
+    pub fn into_handle(self) -> FinalTaskHandle {
+        self.handle
+    }
+
+    /// Drives over the native HTTP client's existing connection and allocator.
+    /// The original invocation deadline covers callbacks, update ACKs and all
+    /// subsequent reads. A new invocation starts a new local observation budget
+    /// while preserving this owner's input ledger and interruption latch.
+    /// Update/key/byte exhaustion and changed descriptors return sanitized
+    /// request errors; local wait bounds return [`FinalTaskWaitOutcome`].
+    pub async fn drive(
+        &mut self,
+        cx: &Cx,
+        client: &mut HttpClient,
+        cancellation: &McpRequestCancellation,
+    ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+        drive_task(
+            self,
+            cx,
+            &mut HttpTaskInputTransport::native(client),
+            cancellation,
+        )
+        .await
+    }
+
+    /// Drives through the existing stdio dispatcher and installed callbacks.
+    /// It creates no competing reader or callback task.
+    #[cfg(unix)]
+    pub async fn drive_with_stdio(
+        &mut self,
+        cx: &Cx,
+        client: &mut Client,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<FinalTaskWaitOutcome> {
+        drive_task(self, cx, client, cancellation).await
+    }
+
+    /// Drives through the existing Memory dispatcher and installed callbacks.
+    /// Unrelated in-flight requests retain their own dispatcher custody.
+    pub async fn drive_with_memory(
+        &mut self,
+        cx: &Cx,
+        client: &mut MemoryClient,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<FinalTaskWaitOutcome> {
+        drive_task(self, cx, client, cancellation).await
+    }
+
+    /// Drives through the negotiated WebSocket dispatcher and callbacks.
+    #[cfg(feature = "websocket-experimental")]
+    pub async fn drive_with_websocket<IO>(
+        &mut self,
+        cx: &Cx,
+        client: &mut WebSocketClient<IO>,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<FinalTaskWaitOutcome>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        drive_task(self, cx, client, cancellation).await
+    }
+}
+
 impl FinalTaskHandle {
+    /// Transfers this handle into a reusable automatic input workflow.
+    /// Existing `wait`, `poll` and manual input methods remain observation or
+    /// explicit submission operations; only driving this new owner invokes
+    /// installed Host callbacks automatically.
+    #[must_use]
+    pub fn into_driver(self, policy: FinalTaskDrivePolicy) -> FinalTaskDriver {
+        FinalTaskDriver {
+            handle: self,
+            policy,
+            inputs: DriverState::default(),
+            input_resolution_interrupted: false,
+        }
+    }
+
     /// Polls until a terminal Task, an input-required pause, or a local bound.
     ///
     /// Every get uses this client's negotiated connection and request-ID
@@ -1622,6 +1826,157 @@ impl WaitBudget {
             })
         })
         .await
+    }
+}
+
+fn drive_ledger_error(error: ManagedTaskDriverError) -> McpError {
+    McpError::invalid_request(match error {
+        ManagedTaskDriverError::InputLimit => "Final Task lifetime input-key budget exhausted",
+        ManagedTaskDriverError::StateByteLimit => {
+            "Final Task lifetime input-fingerprint byte budget exhausted"
+        }
+        ManagedTaskDriverError::InputKeyReused => {
+            "Final Task reused an answered input key with a different descriptor"
+        }
+        _ => "Invalid final Task input fingerprint ledger",
+    })
+}
+
+async fn drive_task<T: TaskInputTransport>(
+    driver: &mut FinalTaskDriver,
+    cx: &Cx,
+    client: &mut T,
+    cancellation: &McpRequestCancellation,
+) -> Result<FinalTaskWaitOutcome, T::Error> {
+    // Already delivered results remain inspectable even after local expiry.
+    if let Some(outcome) = ready_outcome(driver.task())
+        && outcome != FinalTaskWaitOutcome::InputRequired
+    {
+        return Ok(outcome);
+    }
+    let caller = with_caller(cx, || Cx::current().expect("Task drive caller is installed"));
+    let cx = &caller;
+    let policy = driver.policy;
+    let mut budget = WaitBudget::new(cx, policy.wait.timeout, driver.task())?;
+    if let Some(outcome) = budget.stop(cx, cancellation) {
+        return Ok(outcome);
+    }
+    if driver.input_resolution_interrupted {
+        return Err(McpError::invalid_request(
+            "Final Task input resolution was interrupted; manual reconciliation is required",
+        )
+        .into());
+    }
+    if cx.timer_driver().is_none() {
+        return Ok(FinalTaskWaitOutcome::TimerUnavailable);
+    }
+
+    let mut polls = 0;
+    let mut updates = 0;
+    loop {
+        if let Some(outcome) = budget.stop(cx, cancellation) {
+            return Ok(outcome);
+        }
+        if let FinalTask::InputRequired { input_requests, .. } = driver.task() {
+            if policy.maximum_updates == 0 {
+                return Ok(FinalTaskWaitOutcome::InputRequired);
+            }
+            let (unanswered, fingerprints) = driver
+                .inputs
+                .unanswered(input_requests, policy.ledger_policy())
+                .map_err(drive_ledger_error)?;
+            if !unanswered.is_empty() {
+                if updates >= policy.maximum_updates {
+                    return Err(McpError::invalid_request(
+                        "Final Task input-update budget exhausted",
+                    )
+                    .into());
+                }
+                let keys: Vec<_> = unanswered.keys().cloned().collect();
+                // Reserve all ledger capacity before Host effects. No other
+                // borrower can change this owner before the ACK is recorded.
+                driver
+                    .inputs
+                    .answer_bytes(&keys, &fingerprints, policy.maximum_state_bytes)
+                    .map_err(drive_ledger_error)?;
+                let mut snapshot = driver.task().clone();
+                let FinalTask::InputRequired { input_requests, .. } = &mut snapshot else {
+                    unreachable!("the current snapshot requires input");
+                };
+                *input_requests = unanswered;
+                let interrupted = &mut driver.input_resolution_interrupted;
+                let resolution = resolve_snapshot_with_transport(
+                    cx,
+                    cancellation,
+                    client,
+                    &snapshot,
+                    policy.maximum_input_keys.min(
+                        fastmcp_protocol::tasks_extension::MAX_TASK_INPUT_MAP_ENTRIES,
+                    ),
+                    policy.maximum_payload_bytes,
+                    || *interrupted = true,
+                );
+                match budget.guard(cx, cancellation, resolution).await {
+                    Ok(result) => {
+                        result?;
+                    }
+                    Err(outcome) => return Ok(outcome),
+                }
+                // This synchronous handoff is the only place that clears the
+                // latch. Dropping either future before it runs retains the
+                // uncertainty, including a response lost after update dispatch.
+                driver
+                    .inputs
+                    .record_answers(&keys, &fingerprints, policy.maximum_state_bytes)
+                    .map_err(drive_ledger_error)?;
+                driver.input_resolution_interrupted = false;
+                updates += 1;
+            }
+        } else if let Some(outcome) = ready_outcome(driver.task()) {
+            return Ok(outcome);
+        }
+        if polls >= policy.wait.maximum_polls {
+            return Ok(FinalTaskWaitOutcome::PollLimitReached);
+        }
+        // Includes stale, already-acknowledged input snapshots: no busy loop,
+        // duplicate callbacks, effectless updates, or shortened peer minimum.
+        let delay = next_delay(driver.task(), policy.wait)?;
+        if delay >= budget.remaining(cx) {
+            return match budget
+                .guard(cx, cancellation, std::future::pending::<()>())
+                .await
+            {
+                Err(outcome) => Ok(outcome),
+                Ok(()) => unreachable!("a pending future cannot finish"),
+            };
+        }
+        if let Err(outcome) = budget
+            .guard(cx, cancellation, asupersync::time::sleep(cx.now(), delay))
+            .await
+        {
+            return Ok(outcome);
+        }
+        let task = match budget
+            .guard(
+                cx,
+                cancellation,
+                client.read(cx, cancellation, driver.task_id().clone()),
+            )
+            .await
+        {
+            Ok(result) => result?,
+            Err(outcome) => return Ok(outcome),
+        };
+        polls += 1;
+        admit_identity(driver.task(), &task)?;
+        if let Some(outcome) = budget.stop(cx, cancellation) {
+            return Ok(outcome);
+        }
+        budget.refresh_retention(cx, &task)?;
+        if let Some(outcome) = budget.stop(cx, cancellation) {
+            return Ok(outcome);
+        }
+        driver.handle.task = task;
     }
 }
 

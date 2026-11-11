@@ -329,7 +329,7 @@ async fn resolve_batch(
 
 // Only these adapters own wire admission. The engine below cannot create a
 // Task, reconstruct an authentication context, or repeat an uncertain update.
-trait TaskInputTransport {
+pub(crate) trait TaskInputTransport {
     type Error: From<McpError>;
 
     async fn read(
@@ -350,11 +350,20 @@ trait TaskInputTransport {
     ) -> Result<FinalUpdateTaskResult, Self::Error>;
 }
 
-struct HttpTaskInputTransport<'client> {
+pub(crate) struct HttpTaskInputTransport<'client> {
     client: &'client mut HttpClient,
     // Managed admission reserves the first ID before entering this operation.
     // Ordinary HTTP resolves it from the same allocator at its first read.
     request_id: Option<RequestId>,
+}
+
+impl<'client> HttpTaskInputTransport<'client> {
+    pub(crate) fn native(client: &'client mut HttpClient) -> Self {
+        Self {
+            client,
+            request_id: None,
+        }
+    }
 }
 
 impl TaskInputTransport for HttpTaskInputTransport<'_> {
@@ -524,7 +533,35 @@ async fn resolve_with_transport<T: TaskInputTransport>(
     let snapshot = transport.read(cx, cancellation, task_id).await?;
     asupersync::runtime::yield_now().await;
     checkpoint(cx, cancellation)?;
-    let retention = InputRetention::new(cx, &snapshot)?;
+    resolve_snapshot_with_transport(
+        cx,
+        cancellation,
+        transport,
+        &snapshot,
+        max_inputs,
+        max_payload_bytes,
+        || {},
+    )
+    .await
+}
+
+// The reusable native driver already owns an admitted snapshot and its
+// unanswered-key ledger. Share the one-shot engine without another read or a
+// second callback implementation. The hook runs after whole-batch admission,
+// before the first possible Host effect, so a dropped future can retain its
+// unresolved custody on the driver rather than accidentally repeating input.
+pub(crate) async fn resolve_snapshot_with_transport<T: TaskInputTransport>(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    transport: &mut T,
+    snapshot: &FinalTask,
+    max_inputs: usize,
+    max_payload_bytes: usize,
+    on_resolution_started: impl FnOnce(),
+) -> Result<FinalUpdateTaskResult, T::Error> {
+    admit_input_limits(max_inputs, max_payload_bytes)?;
+    checkpoint(cx, cancellation)?;
+    let retention = InputRetention::new(cx, snapshot)?;
     let (handlers, capabilities) = transport.input_context()?;
     let PreparedInputs {
         ledger,
@@ -532,7 +569,7 @@ async fn resolve_with_transport<T: TaskInputTransport>(
         mut budget,
         omitted_contexts,
     } = prepare_inputs(
-        &snapshot,
+        snapshot,
         &handlers,
         &capabilities,
         max_inputs,
@@ -543,6 +580,9 @@ async fn resolve_with_transport<T: TaskInputTransport>(
     if omitted_contexts != 0 {
         log::debug!("Unadvertised sampling context omitted from Task inputs");
     }
+    checkpoint(cx, cancellation)?;
+    retention.check(cx)?;
+    on_resolution_started();
     let (responses, owners) = resolve_batch(
         cx,
         cancellation,
@@ -559,7 +599,7 @@ async fn resolve_with_transport<T: TaskInputTransport>(
     checkpoint(cx, cancellation)?;
     retention.check(cx)?;
     let acknowledged = transport
-        .update(cx, cancellation, &snapshot, responses)
+        .update(cx, cancellation, snapshot, responses)
         .await?;
     asupersync::runtime::yield_now().await;
     checkpoint(cx, cancellation)?;
@@ -973,7 +1013,7 @@ impl ManagedHttpClient {
 #[cfg(test)]
 mod native_tests {
     use super::*;
-    use crate::RequestTimeoutPolicy;
+    use crate::{FinalTaskDrivePolicy, FinalTaskWaitOutcome, FinalTaskWaitPolicy, RequestTimeoutPolicy};
     #[cfg(any(unix, feature = "websocket-experimental"))]
     use crate::{ClientBuilder, ClientProtocolPlan, ProtocolPolicy};
     use fastmcp_core::McpErrorCode;
@@ -983,6 +1023,15 @@ mod native_tests {
     use std::time::Duration;
 
     const INPUT_BYTES: usize = 64 * 1024;
+
+    fn drive_policy(polls: usize, updates: usize, keys: usize) -> FinalTaskDrivePolicy {
+        FinalTaskDrivePolicy::new(
+            FinalTaskWaitPolicy::new(
+                Duration::from_secs(2), polls, Duration::from_millis(1),
+            ).unwrap(),
+            updates, keys, INPUT_BYTES, INPUT_BYTES,
+        ).unwrap()
+    }
 
     fn id() -> FinalTaskId {
         FinalTaskId::parse("task-1").unwrap()
@@ -1170,6 +1219,241 @@ mod native_tests {
             let client = builder.connect(cx, transport).await.unwrap();
             receive(cx, &mut peer, "server/discover", Some(1)).await;
             (client, peer)
+        }
+
+        async fn attach(
+            cx: &Cx,
+            client: &mut MemoryClient,
+            peer: &mut MemoryTransport,
+            initial: Value,
+        ) -> crate::FinalTaskHandle {
+            peer.send_async(cx, &response(2, initial)).await.unwrap();
+            let handle = client.attach_final_task(
+                cx, &McpRequestCancellation::new(), id(),
+            ).await.unwrap();
+            receive(cx, peer, "tasks/get", Some(2)).await;
+            handle
+        }
+
+        #[test]
+        fn public_memory_task_driver_retains_keys_across_runs_and_exact_completion() {
+            run(|cx| async move {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owners = Arc::new(Mutex::new(Vec::new()));
+                let (mut client, mut peer) = connect(&cx, builder(handlers(&calls, &owners))).await;
+                let mut working = snapshot(inputs());
+                working["status"] = json!("working");
+                working.as_object_mut().unwrap().remove("inputRequests");
+                let handle = attach(&cx, &mut client, &mut peer, working).await;
+                let live = McpRequestCancellation::new();
+                let mut sibling = client.execute_core(&cx, &live, "tools/list", json!({})).await.unwrap();
+                receive(&cx, &mut peer, "tools/list", Some(3)).await;
+                let mut terminal = completed();
+                terminal["result"]["lexeme"] = Value::Number(
+                    serde_json::Number::from_string_unchecked("1.20e+4".to_owned()),
+                );
+                terminal["result"]["zero"] = Value::Number(
+                    serde_json::Number::from_string_unchecked("-0".to_owned()),
+                );
+                let exact_result = serde_json::to_string(&terminal["result"]).unwrap();
+                let mut server = cx.spawn(move |peer_cx| async move {
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                    peer.send_async(&peer_cx, &response(3, catalog())).await.unwrap();
+                    peer.send_async(&peer_cx, &response(4, snapshot(inputs()))).await.unwrap();
+                    let update = receive(&peer_cx, &mut peer, "tasks/update", Some(5)).await;
+                    assert_eq!(update.params.unwrap()["inputResponses"], answers());
+                    peer.send_async(&peer_cx, &response(5, json!({"resultType":"complete"}))).await.unwrap();
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(6)).await;
+                    peer.send_async(&peer_cx, &response(6, snapshot(inputs()))).await.unwrap();
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(7)).await;
+                    let mut next = inputs();
+                    next["later-roots"] = json!({"method":"roots/list"});
+                    peer.send_async(&peer_cx, &response(7, snapshot(next))).await.unwrap();
+                    let update = receive(&peer_cx, &mut peer, "tasks/update", Some(8)).await;
+                    assert_eq!(update.params.unwrap()["inputResponses"], json!({"later-roots":{"roots":[]}}));
+                    peer.send_async(&peer_cx, &response(8, json!({"resultType":"complete"}))).await.unwrap();
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(9)).await;
+                    peer.send_async(&peer_cx, &response(9, terminal)).await.unwrap();
+                    receive(&peer_cx, &mut peer, "tools/list", Some(10)).await;
+                    peer.send_async(&peer_cx, &response(10, catalog())).await.unwrap();
+                    peer
+                }).unwrap();
+                let mut driver = handle.into_driver(drive_policy(1, 1, 4));
+                for expected_calls in [3, 3, 4] {
+                    assert_eq!(driver.drive_with_memory(&cx, &mut client, &live).await.unwrap(),
+                        FinalTaskWaitOutcome::PollLimitReached);
+                    assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+                    assert!(!driver.input_resolution_interrupted());
+                }
+                assert!(matches!(client.next_event(&cx, &live, &mut sibling).await.unwrap(),
+                    Some(MemoryRequestEvent::Result(_))));
+                assert_eq!(driver.drive_with_memory(&cx, &mut client, &live).await.unwrap(),
+                    FinalTaskWaitOutcome::Completed);
+                let FinalTask::Completed { result, .. } = driver.task() else {
+                    panic!("the authoritative completion must be retained");
+                };
+                assert_eq!(serde_json::to_string(result).unwrap(), exact_result);
+                assert_eq!(driver.drive_with_memory(&cx, &mut client, &live).await.unwrap(),
+                    FinalTaskWaitOutcome::Completed);
+                assert!(owners.lock().unwrap().iter().all(|owner| !owner.is_cancel_requested()));
+                client.list_tools(&cx, &live, None).await.unwrap();
+                let _peer = server.join(&cx).await.unwrap();
+                client.close(&cx).unwrap();
+            });
+        }
+
+        #[test]
+        fn public_memory_task_driver_keeps_interrupted_callback_custody_across_runs() {
+            run(|cx| async move {
+                for stop in ["cancel", "drop", "deadline"] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let drops = Arc::new(AtomicUsize::new(0));
+                    let (mut client, mut peer) = connect(&cx, builder(pending_roots(&calls, &drops))).await;
+                    let handle = attach(&cx, &mut client, &mut peer,
+                        snapshot(json!({"roots":{"method":"roots/list"}}))).await;
+                    let policy = FinalTaskDrivePolicy::new(
+                        FinalTaskWaitPolicy::new(Duration::from_millis(50), 2, Duration::from_millis(1)).unwrap(),
+                        1, 1, INPUT_BYTES, INPUT_BYTES,
+                    ).unwrap();
+                    let mut driver = handle.into_driver(policy);
+                    let cancellation = McpRequestCancellation::new();
+                    {
+                        let mut operation = std::pin::pin!(driver.drive_with_memory(&cx, &mut client, &cancellation));
+                        poll_fn(|task| {
+                            assert!(operation.as_mut().poll(task).is_pending());
+                            if calls.load(Ordering::SeqCst) == 1 { Poll::Ready(()) } else { Poll::Pending }
+                        }).await;
+                        if stop == "cancel" {
+                            cancellation.cancel();
+                            assert_eq!(operation.await.unwrap(), FinalTaskWaitOutcome::ObservationCancelled);
+                        } else if stop == "deadline" {
+                            assert_eq!(operation.await.unwrap(), FinalTaskWaitOutcome::DeadlineElapsed);
+                        }
+                    }
+                    assert!(driver.input_resolution_interrupted());
+                    assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    let error = driver.drive_with_memory(&cx, &mut client, &McpRequestCancellation::new()).await.unwrap_err();
+                    assert!(error.message.contains("manual reconciliation"));
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    // No callback retry, update, or request ID may be hidden in
+                    // the refused second run; ordinary client work still runs.
+                    peer.send_async(&cx, &response(3, catalog())).await.unwrap();
+                    client.list_tools(&cx, &McpRequestCancellation::new(), None).await.unwrap();
+                    receive(&cx, &mut peer, "tools/list", Some(3)).await;
+                    client.close(&cx).unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn public_memory_task_driver_refuses_changed_keys_and_lifetime_ledger_exhaustion() {
+            run(|cx| async move {
+                for case in ["changed", "keys", "bytes"] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let owners = Arc::new(Mutex::new(Vec::new()));
+                    let (mut client, mut peer) = connect(&cx, builder(handlers(&calls, &owners))).await;
+                    let handle = attach(&cx, &mut client, &mut peer,
+                        snapshot(json!({"a":{"method":"roots/list"}}))).await;
+                    let policy = FinalTaskDrivePolicy::new(
+                        FinalTaskWaitPolicy::new(Duration::from_secs(1), 2, Duration::from_millis(1)).unwrap(),
+                        2, 1, if case == "bytes" { 32 } else { INPUT_BYTES }, INPUT_BYTES,
+                    ).unwrap();
+                    let mut server = cx.spawn(move |peer_cx| async move {
+                        if case != "bytes" {
+                            let update = receive(&peer_cx, &mut peer, "tasks/update", Some(3)).await;
+                            assert_eq!(update.params.unwrap()["inputResponses"], json!({"a":{"roots":[]}}));
+                            peer.send_async(&peer_cx, &response(3, json!({"resultType":"complete"}))).await.unwrap();
+                            receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                            let next = if case == "changed" {
+                                json!({"a": inputs()["b-sampling"].clone()})
+                            } else {
+                                json!({"b":{"method":"roots/list"}})
+                            };
+                            peer.send_async(&peer_cx, &response(4, snapshot(next))).await.unwrap();
+                        }
+                        let next_id = if case == "bytes" { 3 } else { 5 };
+                        receive(&peer_cx, &mut peer, "tools/list", Some(next_id)).await;
+                        peer.send_async(&peer_cx, &response(next_id, catalog())).await.unwrap();
+                        peer
+                    }).unwrap();
+                    let mut driver = handle.into_driver(policy);
+                    let error = driver.drive_with_memory(&cx, &mut client, &McpRequestCancellation::new()).await.unwrap_err();
+                    assert!(error.message.contains(match case {
+                        "changed" => "different descriptor", "keys" => "input-key budget", _ => "byte budget",
+                    }));
+                    assert!(!driver.input_resolution_interrupted());
+                    assert_eq!(calls.load(Ordering::SeqCst), if case == "bytes" { 0 } else { 1 });
+                    client.list_tools(&cx, &McpRequestCancellation::new(), None).await.unwrap();
+                    let _peer = server.join(&cx).await.unwrap();
+                    client.close(&cx).unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn public_memory_task_driver_drop_distinguishes_acknowledged_and_uncertain_updates() {
+            run(|cx| async move {
+                for acknowledged in [false, true] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let owners = Arc::new(Mutex::new(Vec::new()));
+                    let (mut client, mut peer) = connect(&cx, builder(handlers(&calls, &owners))).await;
+                    let handle = attach(&cx, &mut client, &mut peer,
+                        snapshot(json!({"roots":{"method":"roots/list"}}))).await;
+                    let mut driver = handle.into_driver(drive_policy(4, 2, 2));
+                    let live = McpRequestCancellation::new();
+                    {
+                        let mut operation = std::pin::pin!(driver.drive_with_memory(&cx, &mut client, &live));
+                        {
+                            let mut reading = std::pin::pin!(receive(&cx, &mut peer, "tasks/update", Some(3)));
+                            let request = poll_fn(|task| {
+                                assert!(operation.as_mut().poll(task).is_pending());
+                                reading.as_mut().poll(task)
+                            }).await;
+                            assert_eq!(request.params.unwrap()["inputResponses"], json!({"roots":{"roots":[]}}));
+                        }
+                        if acknowledged {
+                            peer.send_async(&cx, &response(3, json!({"resultType":"complete"}))).await.unwrap();
+                            let mut reading = std::pin::pin!(receive(&cx, &mut peer, "tasks/get", Some(4)));
+                            poll_fn(|task| {
+                                assert!(operation.as_mut().poll(task).is_pending());
+                                reading.as_mut().poll(task)
+                            }).await;
+                        }
+                    }
+                    assert_eq!(driver.input_resolution_interrupted(), !acknowledged);
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert!(owners.lock().unwrap().iter().all(|owner|
+                        owner.is_cancel_requested() != acknowledged));
+                    let mut server = cx.spawn(move |peer_cx| async move {
+                        let cancelled = receive(&peer_cx, &mut peer, "notifications/cancelled", None).await;
+                        let abandoned_id = if acknowledged { 4 } else { 3 };
+                        assert_eq!(cancelled.params.unwrap()["requestId"], abandoned_id);
+                        let late = if acknowledged {
+                            snapshot(json!({"roots":{"method":"roots/list"}}))
+                        } else {
+                            json!({"resultType":"complete"})
+                        };
+                        peer.send_async(&peer_cx, &response(abandoned_id, late)).await.unwrap();
+                        let reconcile_id = abandoned_id + 1;
+                        receive(&peer_cx, &mut peer, "tasks/get", Some(reconcile_id)).await;
+                        peer.send_async(&peer_cx, &response(reconcile_id, completed())).await.unwrap();
+                        peer
+                    }).unwrap();
+                    if acknowledged {
+                        assert_eq!(driver.drive_with_memory(&cx, &mut client, &live).await.unwrap(),
+                            FinalTaskWaitOutcome::Completed);
+                    } else {
+                        let error = driver.drive_with_memory(&cx, &mut client, &live).await.unwrap_err();
+                        assert!(error.message.contains("manual reconciliation"));
+                        let mut manual = driver.into_handle();
+                        manual.poll_with_memory(&cx, &mut client, &live).await.unwrap();
+                        assert!(matches!(manual.task(), FinalTask::Completed { .. }));
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 1, "input callbacks must not repeat on resume");
+                    let _peer = server.join(&cx).await.unwrap();
+                    client.close(&cx).unwrap();
+                }
+            });
         }
 
         #[test]
@@ -1702,6 +1986,33 @@ mod native_tests {
         }
 
         #[test]
+        fn public_http_task_driver_resolves_inputs_skips_duplicates_and_completes() {
+            let (target, peer) = peer(vec![
+                ("tasks/get", Some(snapshot(inputs()))),
+                ("tasks/update", Some(json!({"resultType":"complete"}))),
+                ("tasks/get", Some(snapshot(inputs()))),
+                ("tasks/get", Some(completed())),
+                ("tools/list", Some(catalog())),
+            ]);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let owners = Arc::new(Mutex::new(Vec::new()));
+            run(async {
+                let cx = Cx::current().unwrap();
+                let mut client = connect(&cx, &target, handlers(&calls, &owners)).await;
+                let handle = client.attach_final_task(&cx, id()).await.unwrap();
+                let mut driver = handle.into_driver(drive_policy(4, 1, 3));
+                assert_eq!(driver.drive(&cx, &mut client, &McpRequestCancellation::new()).await.unwrap(),
+                    FinalTaskWaitOutcome::Completed);
+                assert_eq!(serde_json::to_value(driver.task()).unwrap()["result"]["futureResult"], json!({"kept":true}));
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert!(owners.lock().unwrap().iter().all(|owner| !owner.is_cancel_requested()));
+                client.list_tools(&cx, None).await.unwrap();
+            });
+            let requests = peer.join().unwrap();
+            assert_eq!(requests[2]["params"]["inputResponses"], answers());
+        }
+
+        #[test]
         fn public_http_task_inputs_resolve_all_kinds_then_reconcile_authoritatively() {
             let (target, peer) = peer(vec![
                 ("tasks/get", Some(snapshot(inputs()))),
@@ -1879,6 +2190,36 @@ printf '%s\n' '{response}'
         }
 
         #[test]
+        fn public_stdio_task_driver_resolves_inputs_skips_duplicates_and_completes() {
+            asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut script = exchange(1, "server/discover", discovery());
+                script.push_str(&exchange(2, "tasks/get", snapshot(inputs())));
+                script.push_str(&exchange(3, "tasks/update", json!({"resultType":"complete"})));
+                script.push_str(&format!(r#"
+case "$request" in *'"inputResponses":{}'*) ;; *) exit 85 ;; esac
+"#, answers()));
+                script.push_str(&exchange(4, "tasks/get", snapshot(inputs())));
+                script.push_str(&exchange(5, "tasks/get", completed()));
+                script.push_str(&exchange(6, "tasks/get", completed()));
+                script.push_str("exec sleep 10\n");
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owners = Arc::new(Mutex::new(Vec::new()));
+                let mut client = connect(&cx, &script, handlers(&calls, &owners)).await;
+                let live = McpRequestCancellation::new();
+                let handle = client.attach_final_task_with_cx(&cx, &live, id()).await.unwrap();
+                let mut driver = handle.into_driver(drive_policy(4, 1, 3));
+                assert_eq!(driver.drive_with_stdio(&cx, &mut client, &live).await.unwrap(),
+                    FinalTaskWaitOutcome::Completed);
+                assert_eq!(serde_json::to_value(driver.task()).unwrap()["result"]["futureResult"], json!({"kept":true}));
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert!(owners.lock().unwrap().iter().all(|owner| !owner.is_cancel_requested()));
+                client.get_task_final_with_cx(&cx, &live, id()).await.unwrap();
+                client.close_with_cx(&cx).await.unwrap();
+            });
+        }
+
+        #[test]
         fn public_stdio_task_inputs_resolve_all_kinds_then_reconcile_authoritatively() {
             asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
                 let cx = Cx::current().unwrap();
@@ -2008,6 +2349,30 @@ case "$request" in *'"inputResponses":{}'*) ;; *) exit 85 ;; esac
             }
             assert!(matches!(server.recv(cx).await, Err(TransportError::Closed)), "no update replay or remote Task cancellation");
             requests
+        }
+
+        #[test]
+        fn public_websocket_task_driver_resolves_inputs_skips_duplicates_and_completes() {
+            run_test(|| async {
+                let cx = Cx::current().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owners = Arc::new(Mutex::new(Vec::new()));
+                let (mut client, mut peer) = connect(&cx, snapshot(inputs()), handlers(&calls, &owners)).await;
+                frame(&mut peer, 3, json!({"resultType":"complete"})).await;
+                frame(&mut peer, 4, snapshot(inputs())).await;
+                frame(&mut peer, 5, completed()).await;
+                frame(&mut peer, 6, catalog()).await;
+                let handle = client.attach_final_task(&cx, id()).await.unwrap();
+                let mut driver = handle.into_driver(drive_policy(4, 1, 3));
+                assert_eq!(driver.drive_with_websocket(&cx, &mut client, &McpRequestCancellation::new()).await.unwrap(),
+                    FinalTaskWaitOutcome::Completed);
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert!(owners.lock().unwrap().iter().all(|owner| !owner.is_cancel_requested()));
+                client.list_tools(&cx, None).await.unwrap();
+                client.close(&cx).await.unwrap();
+                let requests = trace(&cx, peer, &["server/discover", "tasks/get", "tasks/update", "tasks/get", "tasks/get", "tools/list"]).await;
+                assert_eq!(requests[2]["params"]["inputResponses"], answers());
+            });
         }
 
         #[test]

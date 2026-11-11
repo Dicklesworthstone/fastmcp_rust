@@ -325,7 +325,8 @@ pub mod client {
     pub use crate::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use crate::{
-        FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
+        FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle,
+        FinalTaskInputResponses, FinalTaskStatusNotification,
         FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch, FinalTaskWatchEvent,
         FinalToolCallOutcome, FinalUpdateTaskResult, StdioTaskSubscriptionEvent,
     };
@@ -1125,7 +1126,8 @@ pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
 pub use fastmcp_client::FinalTaskStreamWatch;
 #[cfg(feature = "tasks")]
 pub use fastmcp_client::{
-    FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
+    FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle,
+    FinalTaskInputResponses, FinalTaskStatusNotification,
     FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch, FinalTaskWatchEvent,
     FinalToolCallOutcome, FinalUpdateTaskResult,
     StdioTaskSubscriptionEvent,
@@ -1265,7 +1267,8 @@ pub mod auto {
     pub use fastmcp_client::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::{
-        FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
+        FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle,
+        FinalTaskInputResponses, FinalTaskStatusNotification,
         FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalToolCallOutcome, FinalUpdateTaskResult,
     };
     #[cfg(all(feature = "apps", feature = "tasks"))]
@@ -3239,7 +3242,8 @@ pub mod modern {
     pub use fastmcp_client::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::{
-        FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
+        FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle,
+        FinalTaskInputResponses, FinalTaskStatusNotification,
         FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch, FinalTaskWatchEvent,
         FinalToolCallOutcome, FinalUpdateTaskResult,
     };
@@ -4534,6 +4538,24 @@ pub mod modern {
                 .await
         }
 
+        /// Drives an existing Task through this client's installed input
+        /// callbacks and authoritative reads. Keep the same driver across calls
+        /// to retain acknowledged keys and interrupted-input custody.
+        #[cfg(feature = "tasks")]
+        pub async fn drive_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            driver: &mut FinalTaskDriver,
+        ) -> McpResult<FinalTaskWaitOutcome>
+        where
+            IO: Send + 'static,
+        {
+            driver
+                .drive_with_websocket(cx, &mut self.inner, cancellation)
+                .await
+        }
+
         /// Watches one Task through this session's existing subscription owner.
         /// Local cancellation or dropping the watch retires its listen request
         /// without cancelling remote work or an independent catalog listener.
@@ -4948,6 +4970,21 @@ pub mod modern {
         ) -> McpResult<FinalTaskWaitOutcome> {
             handle
                 .wait_with_stdio(cx, &mut self.inner, cancellation, policy)
+                .await
+        }
+
+        /// Drives an existing Task through this client's installed input
+        /// callbacks and authoritative reads. Keep the same driver across calls
+        /// to retain acknowledged keys and interrupted-input custody.
+        #[cfg(all(feature = "tasks", unix))]
+        pub async fn drive_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            driver: &mut FinalTaskDriver,
+        ) -> McpResult<FinalTaskWaitOutcome> {
+            driver
+                .drive_with_stdio(cx, &mut self.inner, cancellation)
                 .await
         }
 
@@ -6627,6 +6664,19 @@ pub mod modern {
             policy: FinalTaskWaitPolicy,
         ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
             handle.wait(cx, &mut self.inner, cancellation, policy).await
+        }
+
+        /// Drives an existing Task through this client's installed input
+        /// callbacks and authoritative reads. Keep the same driver across calls
+        /// to retain acknowledged keys and interrupted-input custody.
+        #[cfg(feature = "tasks")]
+        pub async fn drive_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            driver: &mut FinalTaskDriver,
+        ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+            driver.drive(cx, &mut self.inner, cancellation).await
         }
 
         /// Supplies input for an `input_required` task handle.
@@ -12012,7 +12062,7 @@ pub mod testing;
 /// ```
 pub mod prelude {
     #[cfg(feature = "tasks")]
-    pub use crate::FinalTaskStreamWatch;
+    pub use crate::{FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskStreamWatch};
     pub use crate::{
         // Context and errors
         AccessToken,
