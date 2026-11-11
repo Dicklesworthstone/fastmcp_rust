@@ -901,20 +901,30 @@ impl SamplingSender for TransportSamplingSender {
                 system_prompt: request.system_prompt,
                 temperature: request.temperature,
                 stop_sequences: request.stop_sequences,
-                model_preferences: if request.model_hints.is_empty() {
-                    None
-                } else {
-                    Some(fastmcp_protocol::ModelPreferences {
-                        hints: request
-                            .model_hints
+                model_preferences: request.model_preferences.map(|preferences| {
+                    fastmcp_protocol::ModelPreferences {
+                        hints: preferences
+                            .hints
                             .into_iter()
-                            .map(|name| fastmcp_protocol::ModelHint { name: Some(name) })
+                            .map(|hint| fastmcp_protocol::ModelHint { name: hint.name })
                             .collect(),
-                        ..Default::default()
-                    })
-                },
-                include_context: None,
-                metadata: None,
+                        cost_priority: preferences.cost_priority,
+                        speed_priority: preferences.speed_priority,
+                        intelligence_priority: preferences.intelligence_priority,
+                    }
+                }),
+                include_context: request.include_context.map(|context| match context {
+                    fastmcp_core::SamplingIncludeContext::None => {
+                        fastmcp_protocol::IncludeContext::None
+                    }
+                    fastmcp_core::SamplingIncludeContext::ThisServer => {
+                        fastmcp_protocol::IncludeContext::ThisServer
+                    }
+                    fastmcp_core::SamplingIncludeContext::AllServers => {
+                        fastmcp_protocol::IncludeContext::AllServers
+                    }
+                }),
+                metadata: request.metadata,
                 meta: None,
             };
 
@@ -6273,7 +6283,9 @@ mod tests {
             system_prompt: Some("Be helpful".to_string()),
             temperature: Some(0.7),
             stop_sequences: vec!["STOP".to_string()],
-            model_hints: vec![],
+            model_preferences: None,
+            include_context: None,
+            metadata: None,
         };
 
         let future = SamplingSender::create_message(&sampling, request);
@@ -6347,7 +6359,9 @@ mod tests {
             system_prompt: None,
             temperature: None,
             stop_sequences: vec![],
-            model_hints: vec![],
+            model_preferences: None,
+            include_context: None,
+            metadata: None,
         };
 
         let future = SamplingSender::create_message(&sampling, request);
@@ -6384,7 +6398,14 @@ mod tests {
             system_prompt: None,
             temperature: None,
             stop_sequences: vec![],
-            model_hints: vec!["claude-3".to_string()],
+            model_preferences: Some(fastmcp_core::SamplingModelPreferences {
+                hints: vec![fastmcp_core::SamplingModelHint {
+                    name: Some("claude-3".to_owned()),
+                }],
+                ..Default::default()
+            }),
+            include_context: None,
+            metadata: None,
         };
 
         let future = SamplingSender::create_message(&sampling, request);
@@ -6393,6 +6414,105 @@ mod tests {
             result.stop_reason,
             SamplingStopReason::StopSequence
         ));
+    }
+
+    #[test]
+    fn transport_sampling_sender_preserves_sampling_options() {
+        use fastmcp_core::{
+            SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences,
+        };
+
+        for (include_context, expected_context) in [
+            (None, None),
+            (Some(SamplingIncludeContext::None), Some("none")),
+            (Some(SamplingIncludeContext::ThisServer), Some("thisServer")),
+            (Some(SamplingIncludeContext::AllServers), Some("allServers")),
+        ] {
+            for with_options in [false, true] {
+                let metadata = serde_json::json!({
+                    "provider": {"flags": [true, null], "opaque": "retained"},
+                    "wide": 9007199254740993_u64
+                });
+                let expected_metadata = metadata.clone();
+                let sender = make_sender_with_responder(move |request| {
+                    let params = request.params.as_ref().unwrap();
+                    assert_eq!(params["maxTokens"], 12);
+                    assert_eq!(params["messages"][0]["content"]["text"], "sample");
+                    match expected_context {
+                        Some(value) => assert_eq!(params["includeContext"], value),
+                        None => assert!(params.get("includeContext").is_none()),
+                    }
+                    if with_options {
+                        assert_eq!(params["modelPreferences"], serde_json::json!({
+                            "hints": [{"name": "preferred"}, {}, {"name": ""}],
+                            "costPriority": 0.0,
+                            "speedPriority": 0.5,
+                            "intelligencePriority": 1.0
+                        }));
+                        assert_eq!(params["metadata"], expected_metadata);
+                    } else {
+                        assert!(params.get("modelPreferences").is_none());
+                        assert!(params.get("metadata").is_none());
+                    }
+                    serde_json::json!({
+                        "content": {"type": "text", "text": "sampled"},
+                        "role": "assistant",
+                        "model": "chosen"
+                    })
+                });
+                let sampling =
+                    TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
+                let mut request = SamplingRequest::prompt("sample", 12);
+                request.include_context = include_context;
+                if with_options {
+                    request = request
+                        .with_model_preferences(SamplingModelPreferences {
+                            hints: vec![
+                                SamplingModelHint {
+                                    name: Some("preferred".to_owned()),
+                                },
+                                SamplingModelHint { name: None },
+                                SamplingModelHint {
+                                    name: Some(String::new()),
+                                },
+                            ],
+                            cost_priority: Some(0.0),
+                            speed_priority: Some(0.5),
+                            intelligence_priority: Some(1.0),
+                        })
+                        .with_metadata(metadata.as_object().unwrap().clone());
+                }
+                let result =
+                    fastmcp_core::block_on(SamplingSender::create_message(&sampling, request))
+                        .expect("supported sampling options must reach the client");
+                assert_eq!(result.text, "sampled");
+                assert_eq!(result.stop_reason, SamplingStopReason::Unspecified);
+            }
+        }
+    }
+
+    #[test]
+    fn transport_sampling_sender_preserves_explicit_empty_options() {
+        let sender = make_sender_with_responder(|request| {
+            let params = request.params.as_ref().unwrap();
+            assert_eq!(params.get("modelPreferences"), Some(&serde_json::json!({})));
+            assert_eq!(params.get("metadata"), Some(&serde_json::json!({})));
+            assert!(params.get("includeContext").is_none());
+            serde_json::json!({
+                "content": {"type": "text", "text": "sampled"},
+                "role": "assistant",
+                "model": "chosen"
+            })
+        });
+        let sampling =
+            TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
+        let request = SamplingRequest::prompt("sample", 12)
+            .with_model_preferences(fastmcp_core::SamplingModelPreferences::default())
+            .with_metadata(serde_json::Map::new());
+        let result = fastmcp_core::block_on(SamplingSender::create_message(&sampling, request))
+            .expect("explicit empty preferences and metadata remain present on the wire");
+        assert_eq!(result.text, "sampled");
+        assert_eq!(result.stop_reason, SamplingStopReason::Unspecified);
     }
 
     #[test]
@@ -6419,7 +6539,9 @@ mod tests {
             system_prompt: None,
             temperature: None,
             stop_sequences: vec![],
-            model_hints: vec![],
+            model_preferences: None,
+            include_context: None,
+            metadata: None,
         };
 
         let future = SamplingSender::create_message(&sampling, request);
@@ -6791,7 +6913,9 @@ mod tests {
             system_prompt: None,
             temperature: None,
             stop_sequences: vec![],
-            model_hints: vec![],
+            model_preferences: None,
+            include_context: None,
+            metadata: None,
         };
 
         let future = SamplingSender::create_message(&sampling, request);
@@ -6839,7 +6963,9 @@ mod tests {
             system_prompt: None,
             temperature: None,
             stop_sequences: vec![],
-            model_hints: vec![],
+            model_preferences: None,
+            include_context: None,
+            metadata: None,
         };
 
         let future = SamplingSender::create_message(&sampling, request);

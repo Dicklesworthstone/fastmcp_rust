@@ -585,7 +585,10 @@ impl ClientBuilder {
                         let response = inbound
                             .sample_with_request(stdio_sampling_request_from_params(params)?)
                             .await?;
-                        Ok(CreateMessageResult::text(response.text, response.model))
+                        let stop_reason = response.stop_reason.as_wire_value().map(str::to_owned);
+                        let mut result = CreateMessageResult::text(response.text, response.model);
+                        result.stop_reason = stop_reason;
+                        Ok(result)
                     })
                 }
             })
@@ -1932,6 +1935,28 @@ fn stdio_sampling_request_from_params(params: CreateMessageParams) -> McpResult<
     if !params.stop_sequences.is_empty() {
         request = request.with_stop_sequences(params.stop_sequences);
     }
+    request.model_preferences = params.model_preferences.map(|preferences| {
+        fastmcp_core::SamplingModelPreferences {
+            hints: preferences
+                .hints
+                .into_iter()
+                .map(|hint| fastmcp_core::SamplingModelHint { name: hint.name })
+                .collect(),
+            cost_priority: preferences.cost_priority,
+            speed_priority: preferences.speed_priority,
+            intelligence_priority: preferences.intelligence_priority,
+        }
+    });
+    request.include_context = params.include_context.map(|context| match context {
+        fastmcp_protocol::IncludeContext::None => fastmcp_core::SamplingIncludeContext::None,
+        fastmcp_protocol::IncludeContext::ThisServer => {
+            fastmcp_core::SamplingIncludeContext::ThisServer
+        }
+        fastmcp_protocol::IncludeContext::AllServers => {
+            fastmcp_core::SamplingIncludeContext::AllServers
+        }
+    });
+    request.metadata = params.metadata;
     Ok(request)
 }
 
@@ -1945,6 +1970,165 @@ impl Default for ClientBuilder {
 mod tests {
     use super::*;
     use fastmcp_core::{McpErrorCode, block_on};
+
+    #[test]
+    fn inbound_legacy_stdio_sampling_preserves_options_and_stop_reason() {
+        use fastmcp_core::{
+            SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences,
+            SamplingResponse, SamplingSender, SamplingStopReason,
+        };
+
+        struct RecordingSampler {
+            requests: Arc<Mutex<Vec<SamplingRequest>>>,
+            stop_reason: SamplingStopReason,
+        }
+
+        impl SamplingSender for RecordingSampler {
+            fn create_message(
+                &self,
+                request: SamplingRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = McpResult<SamplingResponse>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    self.requests.lock().unwrap().push(request);
+                    Ok(SamplingResponse {
+                        text: "sampled".to_owned(),
+                        model: "chosen".to_owned(),
+                        stop_reason: self.stop_reason.clone(),
+                    })
+                })
+            }
+        }
+
+        for stop_reason in [None, Some("maxTokens"), Some("provider_safety_limit")] {
+            for (include_context, expected_context) in [
+                (None, None),
+                (
+                    Some(fastmcp_protocol::IncludeContext::None),
+                    Some(SamplingIncludeContext::None),
+                ),
+                (
+                    Some(fastmcp_protocol::IncludeContext::ThisServer),
+                    Some(SamplingIncludeContext::ThisServer),
+                ),
+                (
+                    Some(fastmcp_protocol::IncludeContext::AllServers),
+                    Some(SamplingIncludeContext::AllServers),
+                ),
+            ] {
+                for with_options in [false, true] {
+                    let requests = Arc::new(Mutex::new(Vec::new()));
+                    let sampler = Arc::new(RecordingSampler {
+                        requests: Arc::clone(&requests),
+                        stop_reason: SamplingStopReason::from_wire_value(
+                            stop_reason.map(str::to_owned),
+                        ),
+                    });
+                    let builder = ClientBuilder::new().forward_inbound_legacy_reverse();
+                    let cx = Cx::for_testing();
+                    *builder.inbound_legacy_reverse.lock().unwrap() =
+                        Some(McpContext::new(cx.clone(), 1).with_sampling(sampler));
+                    let callback = builder
+                        .reverse_request_handlers
+                        .sampling_create_message
+                        .as_ref()
+                        .expect("forwarding installs the actual sampling callback");
+
+                    let metadata = serde_json::json!({
+                        "provider": {"nested": [null, true, "kept"]},
+                        "wide": 9007199254740993_u64
+                    });
+                    let mut params = CreateMessageParams::new(
+                        vec![fastmcp_protocol::SamplingMessage::user("sample")],
+                        fastmcp_protocol::JsonInteger::from(12_u64),
+                    )
+                    .with_system_prompt("system")
+                    .with_temperature(0.25)
+                    .with_stop_sequences(vec!["stop".to_owned()]);
+                    params.include_context = include_context;
+                    if with_options {
+                        params.model_preferences = Some(fastmcp_protocol::ModelPreferences {
+                            hints: vec![
+                                fastmcp_protocol::ModelHint {
+                                    name: Some("preferred".to_owned()),
+                                },
+                                fastmcp_protocol::ModelHint { name: None },
+                                fastmcp_protocol::ModelHint {
+                                    name: Some(String::new()),
+                                },
+                            ],
+                            cost_priority: Some(0.0),
+                            speed_priority: Some(0.5),
+                            intelligence_priority: Some(1.0),
+                        });
+                        params.metadata = Some(metadata.as_object().unwrap().clone());
+                    }
+                    let response = block_on(callback(
+                        &cx,
+                        crate::ReverseRequestCancellation::new(),
+                        params.clone(),
+                    ))
+                    .expect("supported sampling options cross the installed callback");
+                    assert_eq!(response.text_content(), Some("sampled"));
+                    assert_eq!(response.model, "chosen");
+                    assert_eq!(response.stop_reason.as_deref(), stop_reason);
+                    let wire = serde_json::to_value(response).unwrap();
+                    match stop_reason {
+                        Some(reason) => assert_eq!(wire["stopReason"], reason),
+                        None => assert!(wire.get("stopReason").is_none()),
+                    }
+                    assert!(wire.get("resultType").is_none());
+
+                    {
+                        let recorded = requests.lock().unwrap();
+                        assert_eq!(recorded.len(), 1);
+                        let request = &recorded[0];
+                        assert_eq!(request.messages[0].text, "sample");
+                        assert_eq!(request.max_tokens, 12);
+                        assert_eq!(request.system_prompt.as_deref(), Some("system"));
+                        assert_eq!(request.temperature, Some(0.25));
+                        assert_eq!(request.stop_sequences, vec!["stop"]);
+                        assert_eq!(request.include_context, expected_context);
+                        if with_options {
+                            assert_eq!(
+                                request.model_preferences,
+                                Some(SamplingModelPreferences {
+                                    hints: vec![
+                                        SamplingModelHint {
+                                            name: Some("preferred".to_owned()),
+                                        },
+                                        SamplingModelHint { name: None },
+                                        SamplingModelHint {
+                                            name: Some(String::new()),
+                                        },
+                                    ],
+                                    cost_priority: Some(0.0),
+                                    speed_priority: Some(0.5),
+                                    intelligence_priority: Some(1.0),
+                                })
+                            );
+                            assert_eq!(request.metadata.as_ref(), metadata.as_object());
+                        } else {
+                            assert!(request.model_preferences.is_none());
+                            assert!(request.metadata.is_none());
+                        }
+                    }
+
+                    *builder.inbound_legacy_reverse.lock().unwrap() =
+                        Some(McpContext::new(cx.clone(), 1));
+                    let error = block_on(callback(
+                        &cx,
+                        crate::ReverseRequestCancellation::new(),
+                        params,
+                    ))
+                    .expect_err("removing only sampling authority must refuse before the handler");
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    assert_eq!(requests.lock().unwrap().len(), 1);
+                }
+            }
+        }
+    }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn reverse_callback_test_runtime() -> asupersync::runtime::Runtime {

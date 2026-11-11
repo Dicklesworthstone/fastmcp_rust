@@ -1585,6 +1585,44 @@ standard streams are handles.
 
 ---
 
+## Legacy sampling options in proxies
+
+The exact-2024 stdio and HTTP reverse-request bridges carry text-sampling
+model preferences, context selection, and provider metadata to the downstream
+sampling handler. Returned stop reasons are preserved, including an omitted
+`stopReason` or a provider-defined value.
+
+```rust
+use fastmcp::{
+    SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences,
+    SamplingRequest,
+};
+
+let request = SamplingRequest::prompt("Summarize this result", 256)
+    .with_model_preferences(SamplingModelPreferences {
+        hints: vec![SamplingModelHint {
+            name: Some("preferred-model".to_owned()),
+        }],
+        cost_priority: Some(0.8),
+        speed_priority: Some(0.6),
+        intelligence_priority: Some(0.9),
+    })
+    .with_include_context(SamplingIncludeContext::ThisServer);
+```
+
+Pass the request to `ctx.sample_with_request(request).await`. Use
+`with_metadata` for a provider-specific JSON object. Leaving
+`include_context` unset differs from explicitly selecting
+`SamplingIncludeContext::None`; optional model preferences and metadata also
+retain their presence. The `with_model_hints` shorthand replaces only hints
+and retains any configured priorities.
+
+For callers constructing `SamplingRequest` directly, the former
+`model_hints` field is now `model_preferences`; initialize
+`include_context` and `metadata` as well, or use the constructors and
+builders. This is the text-sampling surface: image forwarding, wider token
+budgets, and exact wire metadata require the protocol-specific APIs.
+
 ## Typed extension handlers (opt-in, current source tree)
 
 The `extension-authoring` feature adds typed extension settings, request and

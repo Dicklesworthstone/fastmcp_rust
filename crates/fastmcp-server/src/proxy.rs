@@ -2113,6 +2113,28 @@ fn sampling_request_from_create_message_params(
     if !params.stop_sequences.is_empty() {
         request = request.with_stop_sequences(params.stop_sequences);
     }
+    request.model_preferences = params.model_preferences.map(|preferences| {
+        fastmcp_core::SamplingModelPreferences {
+            hints: preferences
+                .hints
+                .into_iter()
+                .map(|hint| fastmcp_core::SamplingModelHint { name: hint.name })
+                .collect(),
+            cost_priority: preferences.cost_priority,
+            speed_priority: preferences.speed_priority,
+            intelligence_priority: preferences.intelligence_priority,
+        }
+    });
+    request.include_context = params.include_context.map(|context| match context {
+        fastmcp_protocol::IncludeContext::None => fastmcp_core::SamplingIncludeContext::None,
+        fastmcp_protocol::IncludeContext::ThisServer => {
+            fastmcp_core::SamplingIncludeContext::ThisServer
+        }
+        fastmcp_protocol::IncludeContext::AllServers => {
+            fastmcp_core::SamplingIncludeContext::AllServers
+        }
+    });
+    request.metadata = params.metadata;
     Ok(request)
 }
 
@@ -7484,7 +7506,10 @@ impl ProxyHttpClient {
                     let response = inbound
                         .sample_with_request(sampling_request_from_create_message_params(params)?)
                         .await?;
-                    Ok(CreateMessageResult::text(response.text, response.model))
+                    let stop_reason = response.stop_reason.as_wire_value().map(str::to_owned);
+                    let mut result = CreateMessageResult::text(response.text, response.model);
+                    result.stop_reason = stop_reason;
+                    Ok(result)
                 })
             });
         }
@@ -31391,6 +31416,264 @@ expect_request notifications/initialized '' absent
         assert_eq!(messages[5]["id"], serde_json::json!(82));
         assert_eq!(messages[5]["error"]["code"], serde_json::json!(-32601));
         assert_eq!(messages[6]["id"], serde_json::json!(3));
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn proxy_legacy_http_sampling_preserves_options_and_stop_reason() {
+        use fastmcp_core::{
+            SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences,
+            SamplingRequest, SamplingResponse, SamplingSender, SamplingStopReason,
+        };
+
+        struct RecordingSampler {
+            requests: Arc<Mutex<Vec<SamplingRequest>>>,
+            stop_reason: SamplingStopReason,
+        }
+
+        impl SamplingSender for RecordingSampler {
+            fn create_message(
+                &self,
+                request: SamplingRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = fastmcp_core::McpResult<SamplingResponse>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async move {
+                    self.requests.lock().unwrap().push(request);
+                    Ok(SamplingResponse {
+                        text: "sampled".to_owned(),
+                        model: "chosen".to_owned(),
+                        stop_reason: self.stop_reason.clone(),
+                    })
+                })
+            }
+        }
+
+        for (stop_reason, include_context, expected_context, with_options) in [
+            (None, None, None, false),
+            (
+                Some("provider_safety_limit"),
+                Some("allServers"),
+                Some(SamplingIncludeContext::AllServers),
+                true,
+            ),
+            (
+                Some("maxTokens"),
+                Some("none"),
+                Some(SamplingIncludeContext::None),
+                true,
+            ),
+            (
+                None,
+                Some("thisServer"),
+                Some(SamplingIncludeContext::ThisServer),
+                true,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let legacy_sse_target = format!("http://{address}/legacy-sse");
+            let legacy_message_target = format!("http://{address}/legacy-message?session=sampling");
+            let advertised = legacy_message_target.clone();
+            let metadata = serde_json::json!({
+                "provider": {"nested": [null, true, "kept"]},
+                "wide": 9007199254740993_u64
+            });
+            let mut params = serde_json::json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "sample"}}],
+                "maxTokens": 12,
+                "systemPrompt": "system",
+                "temperature": 0.25,
+                "stopSequences": ["stop"]
+            });
+            if let Some(context) = include_context {
+                params["includeContext"] = serde_json::json!(context);
+            }
+            if with_options {
+                params["modelPreferences"] = serde_json::json!({
+                    "hints": [{"name": "preferred"}, {}, {"name": ""}],
+                    "costPriority": 0.0,
+                    "speedPriority": 0.5,
+                    "intelligencePriority": 1.0
+                });
+                params["metadata"] = metadata.clone();
+            }
+            let (finished, finish) = std::sync::mpsc::channel();
+            let server = thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let accept = || loop {
+                    assert!(Instant::now() < deadline, "sampling peer accept is bounded");
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                            break stream;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("sampling peer accept failed: {error}"),
+                    }
+                };
+                let mut sse = accept();
+                let opening = read_http_request(&mut sse);
+                assert!(opening.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+                write!(
+                    sse,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                ).unwrap();
+                write_chunked_sse_event(
+                    &mut sse, format!("event: endpoint\ndata: {advertised}\n\n").as_bytes(),
+                );
+                sse.flush().unwrap();
+
+                let mut initialize = accept();
+                let request = read_http_request(&mut initialize);
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(request["method"], "initialize");
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "result": {
+                        "protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "sampling-peer", "version": "1"}
+                    }
+                });
+                write_chunked_sse_event(
+                    &mut sse, format!("event: message\ndata: {response}\n\n").as_bytes(),
+                );
+                sse.flush().unwrap();
+                write_http_response(&mut initialize, 202, "application/json", b"");
+
+                let mut initialized = accept();
+                let request = read_http_request(&mut initialized);
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(request["method"], "notifications/initialized");
+                write_http_response(&mut initialized, 202, "application/json", b"");
+
+                let mut active_socket = accept();
+                let request = read_http_request(&mut active_socket);
+                let active: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(active["method"], "tools/call");
+                write_http_response(&mut active_socket, 202, "application/json", b"");
+                // The reverse request is emitted only after the tool call
+                // reaches the peer with its inbound context bound.
+                let sampling = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 80,
+                    "method": "sampling/createMessage", "params": params
+                });
+                write_chunked_sse_event(
+                    &mut sse, format!("event: message\ndata: {sampling}\n\n").as_bytes(),
+                );
+                sse.flush().unwrap();
+
+                let mut reply_socket = accept();
+                let request = read_http_request(&mut reply_socket);
+                let reply: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(reply["id"], 80);
+                write_http_response(&mut reply_socket, 202, "application/json", b"");
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0", "id": active["id"],
+                    "result": {"content": [{"type": "text", "text": "active-complete"}]}
+                });
+                write_chunked_sse_event(
+                    &mut sse, format!("event: message\ndata: {response}\n\n").as_bytes(),
+                );
+                sse.flush().unwrap();
+
+                let mut follow_up_socket = accept();
+                let request = read_http_request(&mut follow_up_socket);
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(request["method"], "tools/call");
+                write_http_response(&mut follow_up_socket, 202, "application/json", b"");
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "result": {"content": [{"type": "text", "text": "follow-up"}]}
+                });
+                write_chunked_sse_event(
+                    &mut sse, format!("event: message\ndata: {response}\n\n").as_bytes(),
+                );
+                sse.flush().unwrap();
+                finish.recv_timeout(Duration::from_secs(5))
+                    .expect("keep the SSE generation alive until both responses are consumed");
+                reply
+            });
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let sampler = Arc::new(RecordingSampler {
+                requests: Arc::clone(&requests),
+                stop_reason: SamplingStopReason::from_wire_value(stop_reason.map(str::to_owned)),
+            });
+            let proxy = ProxyClient::from_backend(legacy_http_proxy_client(
+                &legacy_sse_target,
+                &legacy_message_target,
+                ClientCapabilities {
+                    sampling: Some(fastmcp_protocol::SamplingCapability::default()),
+                    ..Default::default()
+                },
+            ));
+            let context = McpContext::new(caller_runtime_cx(), 330).with_sampling(sampler);
+            for (name, expected) in [("sample", "active-complete"), ("follow-up", "follow-up")] {
+                let result = proxy
+                    .call_tool_typed(&context, name, serde_json::json!({}))
+                    .expect("legacy sampling must retain the current and following tool calls");
+                let CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) = result else {
+                    panic!("legacy sampling must not change the selected protocol era");
+                };
+                assert_eq!(
+                    serde_json::to_value(result).unwrap()["content"][0]["text"],
+                    expected
+                );
+            }
+            finished.send(()).unwrap();
+            let reply = server.join().expect("sampling peer joins");
+            assert!(reply.get("error").is_none(), "{reply}");
+            assert_eq!(reply["result"]["content"]["text"], "sampled");
+            assert_eq!(reply["result"]["role"], "assistant");
+            assert_eq!(reply["result"]["model"], "chosen");
+            match stop_reason {
+                Some(reason) => assert_eq!(reply["result"]["stopReason"], reason),
+                None => assert!(reply["result"].get("stopReason").is_none()),
+            }
+            assert!(reply["result"].get("resultType").is_none());
+
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            let request = &recorded[0];
+            assert_eq!(request.messages[0].text, "sample");
+            assert_eq!(request.max_tokens, 12);
+            assert_eq!(request.system_prompt.as_deref(), Some("system"));
+            assert_eq!(request.temperature, Some(0.25));
+            assert_eq!(request.stop_sequences, vec!["stop"]);
+            assert_eq!(request.include_context, expected_context);
+            if with_options {
+                assert_eq!(
+                    request.model_preferences,
+                    Some(SamplingModelPreferences {
+                        hints: vec![
+                            SamplingModelHint {
+                                name: Some("preferred".to_owned()),
+                            },
+                            SamplingModelHint { name: None },
+                            SamplingModelHint {
+                                name: Some(String::new()),
+                            },
+                        ],
+                        cost_priority: Some(0.0),
+                        speed_priority: Some(0.5),
+                        intelligence_priority: Some(1.0),
+                    })
+                );
+                assert_eq!(request.metadata.as_ref(), metadata.as_object());
+            } else {
+                assert!(request.model_preferences.is_none());
+                assert!(request.metadata.is_none());
+            }
+        }
     }
 
     #[test]

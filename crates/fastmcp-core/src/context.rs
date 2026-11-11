@@ -389,7 +389,42 @@ pub trait SamplingSender: Send + Sync {
     >;
 }
 
-/// Parameters for a sampling request.
+/// A model-selection hint. An absent name remains distinct from an empty name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SamplingModelHint {
+    /// Optional model name or pattern.
+    pub name: Option<String>,
+}
+
+/// Model-selection preferences carried to the sampling client.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SamplingModelPreferences {
+    /// Ordered model hints, including hints without a name.
+    pub hints: Vec<SamplingModelHint>,
+    /// Optional priority for minimizing cost.
+    pub cost_priority: Option<f64>,
+    /// Optional priority for minimizing latency.
+    pub speed_priority: Option<f64>,
+    /// Optional priority for model intelligence.
+    pub intelligence_priority: Option<f64>,
+}
+
+/// Requested MCP context inclusion for sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingIncludeContext {
+    /// Explicitly request no MCP context.
+    None,
+    /// Request context from the current server.
+    ThisServer,
+    /// Request context from all connected servers.
+    AllServers,
+}
+
+/// Parameters for a text sampling request.
+///
+/// These options preserve the supported text-sampling surface. Images,
+/// arbitrary-width token budgets, and wire request metadata require their
+/// protocol-specific APIs.
 #[derive(Debug, Clone)]
 pub struct SamplingRequest {
     /// Conversation messages.
@@ -402,8 +437,12 @@ pub struct SamplingRequest {
     pub temperature: Option<f64>,
     /// Stop sequences to end generation.
     pub stop_sequences: Vec<String>,
-    /// Model hints for preference.
-    pub model_hints: Vec<String>,
+    /// Optional model-selection preferences.
+    pub model_preferences: Option<SamplingModelPreferences>,
+    /// Optional context-inclusion request, distinct from an explicit `None`.
+    pub include_context: Option<SamplingIncludeContext>,
+    /// Optional provider-specific metadata, retained without interpretation.
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl SamplingRequest {
@@ -416,7 +455,9 @@ impl SamplingRequest {
             system_prompt: None,
             temperature: None,
             stop_sequences: Vec::new(),
-            model_hints: Vec::new(),
+            model_preferences: None,
+            include_context: None,
+            metadata: None,
         }
     }
 
@@ -447,10 +488,36 @@ impl SamplingRequest {
         self
     }
 
-    /// Adds model hints.
+    /// Replaces model hints while retaining the other model preferences.
     #[must_use]
     pub fn with_model_hints(mut self, hints: Vec<String>) -> Self {
-        self.model_hints = hints;
+        self.model_preferences
+            .get_or_insert_with(SamplingModelPreferences::default)
+            .hints = hints
+            .into_iter()
+            .map(|name| SamplingModelHint { name: Some(name) })
+            .collect();
+        self
+    }
+
+    /// Sets all model-selection preferences.
+    #[must_use]
+    pub fn with_model_preferences(mut self, preferences: SamplingModelPreferences) -> Self {
+        self.model_preferences = Some(preferences);
+        self
+    }
+
+    /// Sets an explicit MCP context-inclusion request.
+    #[must_use]
+    pub fn with_include_context(mut self, context: SamplingIncludeContext) -> Self {
+        self.include_context = Some(context);
+        self
+    }
+
+    /// Sets provider-specific metadata without interpreting its members.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 }
@@ -6687,7 +6754,59 @@ mod tests {
         assert_eq!(req.system_prompt.as_deref(), Some("You are helpful"));
         assert_eq!(req.temperature, Some(0.7));
         assert_eq!(req.stop_sequences, vec!["STOP"]);
-        assert_eq!(req.model_hints, vec!["gpt-4"]);
+        assert_eq!(
+            req.model_preferences.as_ref().unwrap().hints,
+            vec![SamplingModelHint {
+                name: Some("gpt-4".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn sampling_options_keep_presence_and_one_model_preference_authority() {
+        let request = SamplingRequest::prompt("hello", 100);
+        assert!(request.model_preferences.is_none());
+        assert!(request.include_context.is_none());
+        assert!(request.metadata.is_none());
+
+        let preferences = SamplingModelPreferences {
+            hints: vec![SamplingModelHint { name: None }],
+            cost_priority: Some(0.0),
+            speed_priority: Some(0.5),
+            intelligence_priority: Some(1.0),
+        };
+        let metadata = serde_json::Map::from_iter([(
+            "provider".to_owned(),
+            serde_json::json!({"nested": [null, true, "value"]}),
+        )]);
+        let request = request
+            .with_model_preferences(preferences)
+            .with_include_context(SamplingIncludeContext::None)
+            .with_metadata(metadata.clone())
+            .with_model_hints(vec!["replacement".to_owned()]);
+        let preferences = request.model_preferences.as_ref().unwrap();
+        assert_eq!(
+            preferences.hints,
+            vec![SamplingModelHint {
+                name: Some("replacement".to_owned()),
+            }]
+        );
+        assert_eq!(preferences.cost_priority, Some(0.0));
+        assert_eq!(preferences.speed_priority, Some(0.5));
+        assert_eq!(preferences.intelligence_priority, Some(1.0));
+        assert_eq!(request.include_context, Some(SamplingIncludeContext::None));
+        assert_eq!(request.metadata, Some(metadata));
+
+        let empty = request.with_model_preferences(SamplingModelPreferences::default());
+        assert_eq!(
+            empty.model_preferences,
+            Some(SamplingModelPreferences::default())
+        );
+        let empty = empty.with_model_hints(Vec::new());
+        assert_eq!(
+            empty.model_preferences,
+            Some(SamplingModelPreferences::default())
+        );
     }
 
     #[test]
