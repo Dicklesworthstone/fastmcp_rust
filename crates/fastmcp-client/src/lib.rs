@@ -10888,6 +10888,7 @@ where
                     request: self.final_task_request_meta()?,
                     task_id: task_id.clone(),
                 },
+                None,
             )
             .await?;
         if result.task.base().task_id != task_id {
@@ -10902,6 +10903,12 @@ where
     }
 
     /// Supplies typed inputs for one retained input-required task.
+    ///
+    /// Phase, response kinds, matching keys, and retention are checked before
+    /// transport effects. Partial and mixed-key responses remain accepted, as
+    /// does an empty response map; a nonempty all-foreign map is rejected.
+    /// Retention is checked again after abandoned request cleanup and before
+    /// allocating the update's request ID.
     #[cfg(feature = "tasks")]
     pub async fn update_task_final(
         &mut self,
@@ -10913,31 +10920,16 @@ where
         IO: Send + 'static,
     {
         self.require_final_tasks_method(TASK_UPDATE)?;
-        let FinalTask::InputRequired {
-            base,
-            input_requests,
-        } = task
-        else {
-            return Err(McpError::invalid_params(
-                "tasks/update requires an input_required final task",
-            ));
-        };
-        TaskInputLedger::from_requests(input_requests)
-            .map_err(|_| McpError::invalid_params("Final task input requests are invalid"))?
-            .validate_responses(&input_responses)
-            .map_err(|_| {
-                McpError::invalid_params(
-                    "tasks/update inputResponses do not match the retained task input requests",
-                )
-            })?;
+        task_wait::admit_task_input(task, &input_responses)?;
         self.request_final_tasks(
             cx,
             TASK_UPDATE,
             FinalUpdateTaskParams {
                 request: self.final_task_request_meta()?,
-                task_id: base.task_id.clone(),
+                task_id: task.base().task_id.clone(),
                 input_responses,
             },
+            Some(task),
         )
         .await
     }
@@ -10960,6 +10952,7 @@ where
                 request: self.final_task_request_meta()?,
                 task_id,
             },
+            None,
         )
         .await
     }
@@ -11243,6 +11236,7 @@ where
         cx: &Cx,
         method: &str,
         parameters: P,
+        input_task: Option<&FinalTask>,
     ) -> McpResult<R>
     where
         P: serde::Serialize,
@@ -11255,6 +11249,13 @@ where
         let params = serde_json::to_value(parameters).map_err(|_| {
             McpError::invalid_params("Modern Tasks request parameters could not serialize")
         })?;
+        if let Some(task) = input_task {
+            // Allocation drains abandoned operations. Complete that potentially
+            // yielding work before the final retention check, so an expired
+            // snapshot spends neither a new ID nor a new update frame.
+            self.settle_abandoned_websocket_request().await?;
+            task_wait::admit_input_retention(task)?;
+        }
         let request_id = self.allocate_request_id().await?;
         let received = self
             .request_admitted_with_raw_result(
@@ -21675,7 +21676,12 @@ impl Client {
     /// result envelope. A malformed task response is a peer protocol
     /// contradiction and terminates this connection.
     #[cfg(feature = "tasks")]
-    fn send_final_task_request<P, R>(&mut self, method: &str, params: P) -> McpResult<R>
+    fn send_final_task_request<P, R>(
+        &mut self,
+        method: &str,
+        params: P,
+        input_task: Option<&FinalTask>,
+    ) -> McpResult<R>
     where
         P: serde::Serialize,
         R: serde::de::DeserializeOwned,
@@ -21683,6 +21689,9 @@ impl Client {
         let params = serde_json::to_value(params).map_err(|error| {
             McpError::internal_error(format!("Failed to serialize final Tasks request: {error}"))
         })?;
+        if let Some(task) = input_task {
+            task_wait::admit_input_retention(task)?;
+        }
         let result = self.send_prepared_request(method, params)?;
         let result_source = result.raw_result.as_deref().ok_or_else(|| {
             self.terminate_connection(McpError::invalid_request(
@@ -21705,6 +21714,7 @@ impl Client {
         cancellation: &McpRequestCancellation,
         method: &str,
         params: P,
+        input_task: Option<&FinalTask>,
     ) -> McpResult<R>
     where
         P: serde::Serialize,
@@ -21716,6 +21726,9 @@ impl Client {
         let params = serde_json::to_value(params).map_err(|error| {
             McpError::internal_error(format!("Failed to serialize final Tasks request: {error}"))
         })?;
+        if let Some(task) = input_task {
+            task_wait::admit_input_retention(task)?;
+        }
         let result = self.send_prepared_request_with_request_cancellation(
             cx,
             cancellation,
@@ -27770,7 +27783,7 @@ impl Client {
             request: self.final_task_request_meta()?,
             task_id: task_id.clone(),
         };
-        let result: FinalGetTaskResult = self.send_final_task_request(TASK_GET, params)?;
+        let result: FinalGetTaskResult = self.send_final_task_request(TASK_GET, params, None)?;
         if result.task.base().task_id != task_id {
             return Err(self.terminate_connection(McpError::invalid_request(
                 "tasks/get response taskId does not match the requested final task",
@@ -27793,7 +27806,7 @@ impl Client {
             task_id: task_id.clone(),
         };
         let result: FinalGetTaskResult =
-            self.send_final_task_request_with_cancellation(cx, cancellation, TASK_GET, params)?;
+            self.send_final_task_request_with_cancellation(cx, cancellation, TASK_GET, params, None)?;
         if result.task.base().task_id != task_id {
             return Err(self.terminate_connection(McpError::invalid_request(
                 "tasks/get response taskId does not match the requested final task",
@@ -27802,42 +27815,28 @@ impl Client {
         Ok(result)
     }
 
-    /// Supplies responses for the exact input requests retained by a final
+    /// Supplies responses for the input requests retained by a final
     /// `input_required` task.
     ///
     /// Passing the returned [`FinalTask`] retains the task identifier and
-    /// request ledger as one correlated unit. The client rejects a non-input
-    /// task or a response key/kind contradiction before sending `tasks/update`.
+    /// request ledger as one correlated unit. Phase, response kinds, matching
+    /// keys, and retention are checked before deferred initialization. Partial,
+    /// mixed-key, and empty responses remain accepted. Retention is checked
+    /// again after initialization and before allocating the update request ID.
     #[cfg(feature = "tasks")]
     pub fn update_task_final(
         &mut self,
         task: &FinalTask,
         input_responses: FinalTaskInputResponses,
     ) -> McpResult<FinalUpdateTaskResult> {
+        task_wait::admit_task_input(task, &input_responses)?;
         self.admit_final_tasks_method(TASK_UPDATE)?;
-        let FinalTask::InputRequired {
-            base,
-            input_requests,
-        } = task
-        else {
-            return Err(McpError::invalid_params(
-                "tasks/update requires an input_required final task",
-            ));
-        };
-        let ledger = TaskInputLedger::from_requests(input_requests).map_err(|_| {
-            McpError::invalid_params("Final task input requests are not an admitted ledger")
-        })?;
-        ledger.validate_responses(&input_responses).map_err(|_| {
-            McpError::invalid_params(
-                "tasks/update inputResponses do not match the retained task input requests",
-            )
-        })?;
         let params = FinalUpdateTaskParams {
             request: self.final_task_request_meta()?,
-            task_id: base.task_id.clone(),
+            task_id: task.base().task_id.clone(),
             input_responses,
         };
-        self.send_final_task_request(TASK_UPDATE, params)
+        self.send_final_task_request(TASK_UPDATE, params, Some(task))
     }
 
     /// Updates one input-required task under a request-local cancellation
@@ -27850,33 +27849,21 @@ impl Client {
         task: &FinalTask,
         input_responses: FinalTaskInputResponses,
     ) -> McpResult<FinalUpdateTaskResult> {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        task_wait::admit_task_input(task, &input_responses)?;
         self.admit_final_tasks_method(TASK_UPDATE)?;
-        let FinalTask::InputRequired {
-            base,
-            input_requests,
-        } = task
-        else {
-            return Err(McpError::invalid_params(
-                "tasks/update requires an input_required final task",
-            ));
-        };
-        let ledger = TaskInputLedger::from_requests(input_requests).map_err(|_| {
-            McpError::invalid_params("Final task input requests are not an admitted ledger")
-        })?;
-        ledger.validate_responses(&input_responses).map_err(|_| {
-            McpError::invalid_params(
-                "tasks/update inputResponses do not match the retained task input requests",
-            )
-        })?;
         self.send_final_task_request_with_cancellation(
             cx,
             cancellation,
             TASK_UPDATE,
             FinalUpdateTaskParams {
                 request: self.final_task_request_meta()?,
-                task_id: base.task_id.clone(),
+                task_id: task.base().task_id.clone(),
                 input_responses,
             },
+            Some(task),
         )
     }
 
@@ -27891,7 +27878,7 @@ impl Client {
             request: self.final_task_request_meta()?,
             task_id,
         };
-        self.send_final_task_request(TASK_CANCEL, params)
+        self.send_final_task_request(TASK_CANCEL, params, None)
     }
 
     /// Cancels one task under a request-local cancellation domain.
@@ -27911,6 +27898,7 @@ impl Client {
                 request: self.final_task_request_meta()?,
                 task_id,
             },
+            None,
         )
     }
 
@@ -38187,6 +38175,197 @@ exec sleep 2
                     ],
                 )
                 .await;
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_direct_task_updates_validate_input_before_transport_effects() {
+        use std::task::{Context, Poll, Waker};
+
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for case in ["wrong-kind", "expired", "wrong-phase", "foreign-only"] {
+                let initial = websocket_handle_task("input_required");
+                let (mut client, handle, mut peer_io) =
+                    websocket_handle_client(&cx, initial.clone()).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let mut invalid = initial;
+                if case == "expired" {
+                    invalid["ttlMs"] = serde_json::json!(1);
+                } else if case == "wrong-phase" {
+                    invalid["status"] = serde_json::json!("working");
+                    invalid.as_object_mut().unwrap().remove("inputRequests");
+                }
+                let invalid: FinalTask = serde_json::from_value(invalid).unwrap();
+                let responses = match case {
+                    "wrong-kind" => serde_json::json!({"roots-a":{"action":"accept"}}),
+                    "foreign-only" => serde_json::json!({"foreign":{"roots":[]}}),
+                    _ => serde_json::json!({"roots-a":{"roots":[]}}),
+                };
+                let mut rejected = Box::pin(client.update_task_final(
+                    &cx,
+                    &invalid,
+                    serde_json::from_value(responses).unwrap(),
+                ));
+                let mut task_cx = Context::from_waker(Waker::noop());
+                let Poll::Ready(Err(error)) = rejected.as_mut().poll(&mut task_cx) else {
+                    panic!("{case} must be refused before waiting on the peer");
+                };
+                assert_eq!(
+                    error.code,
+                    if case == "expired" {
+                        McpErrorCode::InvalidRequest
+                    } else {
+                        McpErrorCode::InvalidParams
+                    },
+                );
+                drop(rejected);
+                assert_eq!(client.next_id, 3);
+                assert!(client.transient_request.is_none());
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+
+                let accepted = [
+                    serde_json::json!({"roots-a":{"roots":[]}}),
+                    serde_json::json!({"roots-a":{"roots":[]},"foreign":{"roots":[]}}),
+                    serde_json::json!({}),
+                ];
+                for (index, responses) in accepted.iter().enumerate() {
+                    let id = 3 + i64::try_from(index).unwrap();
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &serde_json::json!({
+                            "jsonrpc":"2.0","id":id,"result":{"resultType":"complete"},
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                    let result = client
+                        .update_task_final(
+                            &cx,
+                            handle.task(),
+                            serde_json::from_value(responses.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(result).unwrap(),
+                        serde_json::json!({"resultType":"complete"}),
+                    );
+                    assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                }
+                client.close(&cx).await.unwrap();
+                let sent = websocket_handle_trace(
+                    &cx,
+                    peer_io,
+                    &[
+                        (SERVER_DISCOVER_METHOD, Some(1)),
+                        ("tasks/get", Some(2)),
+                        ("tasks/update", Some(3)),
+                        ("tasks/update", Some(4)),
+                        ("tasks/update", Some(5)),
+                    ],
+                )
+                .await;
+                for (request, expected) in sent[2..].iter().zip(accepted) {
+                    assert_eq!(request.params.as_ref().unwrap()["inputResponses"], expected);
+                }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_task_update_dispatch_rechecks_retention_after_abandoned_request_cleanup() {
+        use std::task::Poll;
+
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for expired_at_dispatch in [false, true] {
+                let initial = websocket_handle_task("input_required");
+                let (mut client, handle, mut peer_io) =
+                    websocket_handle_client(&cx, initial.clone()).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                {
+                    let mut abandoned =
+                        Box::pin(client.get_task_final(&cx, handle.task_id().clone()));
+                    assert!(
+                        std::future::poll_fn(|task_cx| {
+                            Poll::Ready(abandoned.as_mut().poll(task_cx))
+                        })
+                        .await
+                        .is_pending()
+                    );
+                }
+                assert_eq!(client.next_id, 4);
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_handle_response(3, initial.clone()),
+                )
+                .await;
+
+                // Exercise the final dispatch boundary with a snapshot that
+                // expired after the public method's initial admission. The
+                // fixed past timestamp avoids a wall-clock scheduling race.
+                let mut at_dispatch = initial;
+                if expired_at_dispatch {
+                    at_dispatch["ttlMs"] = serde_json::json!(1);
+                }
+                let at_dispatch: FinalTask = serde_json::from_value(at_dispatch).unwrap();
+                if !expired_at_dispatch {
+                    write_server_text_frame(
+                        &mut peer_io,
+                        r#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}"#,
+                    )
+                    .await;
+                }
+                let parameters = FinalUpdateTaskParams {
+                    request: client.final_task_request_meta().unwrap(),
+                    task_id: handle.task_id().clone(),
+                    input_responses: serde_json::from_value(
+                        serde_json::json!({"roots-a":{"roots":[]}}),
+                    )
+                    .unwrap(),
+                };
+                let result: McpResult<FinalUpdateTaskResult> = client
+                    .request_final_tasks(&cx, TASK_UPDATE, parameters, Some(&at_dispatch))
+                    .await;
+                let next_id = if expired_at_dispatch {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+                    4
+                } else {
+                    result.unwrap();
+                    5
+                };
+                assert_eq!(client.next_id, u64::try_from(next_id).unwrap());
+                assert!(client.transient_request.is_none());
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::to_string(&JsonRpcResponse::success(
+                        RequestId::Number(next_id),
+                        async_modern_tools_list_result(),
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                client.list_tools(&cx, None).await.unwrap();
+                assert!(client.retired_requests.is_empty());
+                client.close(&cx).await.unwrap();
+                let mut expected = vec![
+                    (SERVER_DISCOVER_METHOD, Some(1)),
+                    ("tasks/get", Some(2)),
+                    ("tasks/get", Some(3)),
+                    ("notifications/cancelled", None),
+                ];
+                if !expired_at_dispatch {
+                    expected.push(("tasks/update", Some(4)));
+                }
+                expected.push(("tools/list", Some(next_id)));
+                let sent = websocket_handle_trace(&cx, peer_io, &expected).await;
+                assert_eq!(sent[3].params.as_ref().unwrap()["requestId"], 3);
             }
         });
     }
@@ -61295,6 +61474,139 @@ while IFS= read -r unexpected; do exit 20; done
         assert!(cancellation.meta.is_none());
         assert!(cancellation.additional.is_empty());
         client.close().expect("modern Tasks client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn clt_tasks_direct_updates_share_input_admission_and_preserve_ids() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for cancellable in [false, true] {
+                let discovery =
+                    modern_tasks_discovery_response("task-admission-peer", serde_json::json!({}));
+                let script = format!(
+                    r#"IFS= read -r discovery || exit 90
+printf '%s\n' '{discovery}'
+for id in 2 3 4; do
+    IFS= read -r update || exit 91
+    case "$update" in *'"method":"tasks/update"'*) ;; *) exit 92 ;; esac
+    case "$update" in *'"id":'"$id"*) ;; *) exit 93 ;; esac
+    case "$id" in
+        2) case "$update" in *'"inputResponses":{{"roots-a":{{"roots":[]}}}}'*) ;; *) exit 94 ;; esac ;;
+        3) case "$update" in *'"inputResponses":{{"foreign":{{"roots":[]}},"roots-a":{{"roots":[]}}}}'*) ;; *) exit 95 ;; esac ;;
+        4) case "$update" in *'"inputResponses":{{}}'*) ;; *) exit 96 ;; esac ;;
+    esac
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"complete"}}}}\n' "$id"
+done
+if IFS= read -r unexpected; then exit 97; fi
+"#
+                );
+                let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    cx.clone(),
+                    "sh",
+                    &["-c", &script],
+                    ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+                )
+                .unwrap();
+                let initial = serde_json::json!({
+                    "taskId":"task-1","status":"input_required",
+                    "createdAt":"2026-07-28T00:00:00Z",
+                    "lastUpdatedAt":"2026-07-28T00:00:00Z",
+                    "ttlMs":null,
+                    "inputRequests":{
+                        "roots-a":{"method":"roots/list"},
+                        "roots-b":{"method":"roots/list"},
+                    },
+                });
+                let retained: FinalTask = serde_json::from_value(initial.clone()).unwrap();
+                let before = serde_json::to_vec(&retained).unwrap();
+                let cancellation = McpRequestCancellation::new();
+
+                for case in ["wrong-kind", "expired", "wrong-phase", "foreign-only"] {
+                    let mut invalid = initial.clone();
+                    if case == "expired" {
+                        invalid["ttlMs"] = serde_json::json!(1);
+                    } else if case == "wrong-phase" {
+                        invalid["status"] = serde_json::json!("working");
+                        invalid.as_object_mut().unwrap().remove("inputRequests");
+                    }
+                    let invalid = serde_json::from_value(invalid).unwrap();
+                    let responses = match case {
+                        "wrong-kind" => serde_json::json!({"roots-a":{"action":"accept"}}),
+                        "foreign-only" => serde_json::json!({"foreign":{"roots":[]}}),
+                        _ => serde_json::json!({"roots-a":{"roots":[]}}),
+                    };
+                    let responses = serde_json::from_value(responses).unwrap();
+                    let error = if cancellable {
+                        client.update_task_final_with_cancellation(
+                            &cx,
+                            &cancellation,
+                            &invalid,
+                            responses,
+                        )
+                    } else {
+                        client.update_task_final(&invalid, responses)
+                    }
+                    .unwrap_err();
+                    assert_eq!(
+                        error.code,
+                        if case == "expired" {
+                            McpErrorCode::InvalidRequest
+                        } else {
+                            McpErrorCode::InvalidParams
+                        },
+                    );
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
+                    assert_eq!(client.responses.pending_len(), 0);
+                    assert_eq!(serde_json::to_vec(&retained).unwrap(), before);
+                }
+                if cancellable {
+                    let cancelled = McpRequestCancellation::new();
+                    cancelled.cancel();
+                    assert_eq!(
+                        client
+                            .update_task_final_with_cancellation(
+                                &cx,
+                                &cancelled,
+                                &retained,
+                                BTreeMap::new(),
+                            )
+                            .unwrap_err()
+                            .code,
+                        McpErrorCode::RequestCancelled,
+                    );
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
+                    assert!(cx.checkpoint().is_ok());
+                }
+
+                for inputs in [
+                    serde_json::json!({"roots-a":{"roots":[]}}),
+                    serde_json::json!({"roots-a":{"roots":[]},"foreign":{"roots":[]}}),
+                    serde_json::json!({}),
+                ] {
+                    let inputs = serde_json::from_value(inputs).unwrap();
+                    let result = if cancellable {
+                        client.update_task_final_with_cancellation(
+                            &cx,
+                            &cancellation,
+                            &retained,
+                            inputs,
+                        )
+                    } else {
+                        client.update_task_final(&retained, inputs)
+                    }
+                    .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(result).unwrap(),
+                        serde_json::json!({"resultType":"complete"}),
+                    );
+                    assert_eq!(serde_json::to_vec(&retained).unwrap(), before);
+                }
+                assert_eq!(client.next_id.load(Ordering::SeqCst), 5);
+                client.close().unwrap();
+            }
+        });
     }
 
     #[cfg(unix)]

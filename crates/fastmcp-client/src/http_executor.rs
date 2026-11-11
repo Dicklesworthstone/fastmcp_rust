@@ -7926,6 +7926,8 @@ pub enum ModernHttpClientError {    /// A public constructor selected a protocol
     TasksUpdateRequiresInputRequired,
     /// `tasks/update` responses did not match the retained task input ledger.
     TasksUpdateInputMismatch,
+    /// Shared Tasks input admission rejected the response map or retention.
+    TasksUpdateAdmission(McpError),
     /// A final Tasks response body was not one strictly admitted JSON-RPC
     /// response envelope.
     InvalidTasksJsonRpcResponse {
@@ -8093,6 +8095,7 @@ impl fmt::Display for ModernHttpClientError {
             Self::TasksUpdateInputMismatch => formatter.write_str(
                 "tasks/update inputResponses do not match the retained task input requests",
             ),
+            Self::TasksUpdateAdmission(error) => error.fmt(formatter),
             Self::InvalidTasksJsonRpcResponse { method, error } => write!(
                 formatter,
                 "final HTTP {method} response failed JSON-RPC admission: {error}"
@@ -8161,6 +8164,7 @@ impl std::error::Error for ModernHttpClientError {
             #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(error) => Some(error),
             Self::InvalidTasksJsonRpcResponse { error, .. } => Some(error),
+            Self::TasksUpdateAdmission(error) => Some(error),
             Self::InvalidJsonRpcResponse(error) => Some(error),
             Self::TypedResult(error) => Some(error),
             Self::MissingModernPostTarget
@@ -10099,6 +10103,7 @@ impl ModernHttpClient {
                 parameters,
                 &client_extensions,
                 maximum_response_bytes,
+                None,
             )
             .await?;
         let actual = result.task.base().task_id.clone();
@@ -10114,9 +10119,10 @@ impl ModernHttpClient {
     /// Supplies responses for the exact input requests retained by one final
     /// `input_required` task through the official Tasks extension.
     ///
-    /// The request is rejected before a native POST unless the task is an
-    /// admitted input-required task and `inputResponses` exactly matches its
-    /// retained input ledger.
+    /// Phase, response kinds, matching keys, and retention are checked before
+    /// a native POST. Partial and mixed-key responses remain accepted, as does
+    /// an empty response map; a nonempty all-foreign map is rejected. Retention
+    /// is checked again immediately before native request execution.
     #[cfg(feature = "tasks")]
     pub async fn update_task_final(
         &self,
@@ -10136,9 +10142,8 @@ impl ModernHttpClient {
         };
         let ledger = TaskInputLedger::from_requests(input_requests)
             .map_err(|_| ModernHttpClientError::TasksUpdateInputMismatch)?;
-        ledger
-            .validate_responses(&input_responses)
-            .map_err(|_| ModernHttpClientError::TasksUpdateInputMismatch)?;
+        crate::task_wait::admit_task_input(task, &input_responses)
+            .map_err(ModernHttpClientError::TasksUpdateAdmission)?;
 
         let wire = TaskMethodRequest::new(
             request_id.clone(),
@@ -10172,6 +10177,7 @@ impl ModernHttpClient {
             parameters,
             &client_extensions,
             maximum_response_bytes,
+            Some(task),
         )
         .await
     }
@@ -10217,6 +10223,7 @@ impl ModernHttpClient {
             parameters,
             &client_extensions,
             maximum_response_bytes,
+            None,
         )
         .await
     }
@@ -10279,6 +10286,7 @@ impl ModernHttpClient {
         parameters: serde_json::Value,
         client_extensions: &BTreeMap<String, serde_json::Value>,
         maximum_response_bytes: usize,
+        input_task: Option<&FinalTask>,
     ) -> Result<R, ModernHttpClientError>
     where
         R: serde::de::DeserializeOwned,
@@ -10324,6 +10332,10 @@ impl ModernHttpClient {
             request_id.clone(),
             &client_extensions,
         )?;
+        if let Some(task) = input_task {
+            crate::task_wait::admit_input_retention(task)
+                .map_err(ModernHttpClientError::TasksUpdateAdmission)?;
+        }
         let response = self.execute_post_discovery_request(cx, &request).await?;
         let (mut response, result_source) = read_typed_http_jsonrpc_response(
             cx,
@@ -18739,6 +18751,158 @@ mod tests {
             "tasks/update" | "tasks/cancel" => serde_json::json!({"resultType": "complete"}),
             _ => panic!("unexpected Tasks fixture method"),
         }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_task_update_admission_precedes_post_and_preserves_partial_inputs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let discovery_listener = listener.try_clone().unwrap();
+        let discovery_peer = thread::spawn(move || {
+            let mut probe = accept_notification_test_peer(&discovery_listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut probe).body).unwrap();
+            assert_eq!(request["method"], "server/discover");
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                &modern_tasks_discovery_body(),
+            );
+        });
+        runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let connection = ClientBuilder::new()
+                .client_info("task-admission-client", "1.0.0")
+                .protocol_plan(plan(
+                    &target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx)
+                .await
+                .unwrap();
+            discovery_peer.join().unwrap();
+            let mut initial = public_http_tasks_success_result("tasks/get");
+            initial.as_object_mut().unwrap().remove("resultType");
+            initial["inputRequests"] = serde_json::json!({
+                "roots-a":{"method":"roots/list"},
+                "roots-b":{"method":"roots/list"},
+            });
+            let retained: fastmcp_protocol::FinalTask =
+                serde_json::from_value(initial.clone()).unwrap();
+            let before = serde_json::to_vec(&retained).unwrap();
+
+            for case in ["wrong-kind", "expired", "wrong-phase", "foreign-only"] {
+                let mut invalid = initial.clone();
+                if case == "expired" {
+                    invalid["ttlMs"] = serde_json::json!(1);
+                } else if case == "wrong-phase" {
+                    invalid["status"] = serde_json::json!("working");
+                    invalid.as_object_mut().unwrap().remove("inputRequests");
+                }
+                let invalid = serde_json::from_value(invalid).unwrap();
+                let responses = match case {
+                    "wrong-kind" => serde_json::json!({"roots-a":{"action":"accept"}}),
+                    "foreign-only" => serde_json::json!({"foreign":{"roots":[]}}),
+                    _ => serde_json::json!({"roots-a":{"roots":[]}}),
+                };
+                let mut rejected = Box::pin(connection.update_task_final(
+                    &cx,
+                    RequestId::Number(2),
+                    &invalid,
+                    serde_json::from_value(responses).unwrap(),
+                    4_096,
+                ));
+                let mut task_cx = Context::from_waker(Waker::noop());
+                let Poll::Ready(Err(error)) = rejected.as_mut().poll(&mut task_cx) else {
+                    panic!("{case} must be refused before waiting on the peer");
+                };
+                match error {
+                    ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::TasksUpdateRequiresInputRequired,
+                    ) => assert_eq!(case, "wrong-phase"),
+                    ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::TasksUpdateAdmission(error),
+                    ) => assert_eq!(
+                        error.code,
+                        if case == "expired" {
+                            fastmcp_core::McpErrorCode::InvalidRequest
+                        } else {
+                            fastmcp_core::McpErrorCode::InvalidParams
+                        },
+                    ),
+                    other => panic!("unexpected task admission error: {other}"),
+                }
+                drop(rejected);
+                assert!(
+                    matches!(
+                        listener.accept(),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    ),
+                    "rejected inputs must not open a native HTTP connection",
+                );
+                assert_eq!(serde_json::to_vec(&retained).unwrap(), before);
+            }
+
+            let accepted = [
+                serde_json::json!({"roots-a":{"roots":[]}}),
+                serde_json::json!({"roots-a":{"roots":[]},"foreign":{"roots":[]}}),
+                serde_json::json!({}),
+            ];
+            let expected = accepted.clone();
+            let peer = thread::spawn(move || {
+                for (index, expected_inputs) in expected.iter().enumerate() {
+                    let id = 2 + i64::try_from(index).unwrap();
+                    let mut stream = accept_notification_test_peer(&listener);
+                    let request = assert_public_http_tasks_lifecycle_request(
+                        read_request(&mut stream),
+                        "tasks/update",
+                        id,
+                    );
+                    assert_eq!(request["params"]["taskId"], "task-73");
+                    assert_eq!(request["params"]["inputResponses"], *expected_inputs);
+                    write_response(
+                        &mut stream,
+                        200,
+                        "application/json",
+                        &serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc":"2.0","id":id,"result":{"resultType":"complete"},
+                        }))
+                        .unwrap(),
+                    );
+                }
+                assert!(
+                    matches!(
+                        listener.accept(),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    ),
+                    "each accepted response map sends exactly one native POST",
+                );
+            });
+            for (index, inputs) in accepted.iter().enumerate() {
+                let id = 2 + i64::try_from(index).unwrap();
+                let result = connection
+                    .update_task_final(
+                        &cx,
+                        RequestId::Number(id),
+                        &retained,
+                        serde_json::from_value(inputs.clone()).unwrap(),
+                        4_096,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(result).unwrap(),
+                    serde_json::json!({"resultType":"complete"}),
+                );
+                assert_eq!(serde_json::to_vec(&retained).unwrap(), before);
+            }
+            peer.join().unwrap();
+        });
     }
 
     /// Sends one public Tasks operation after discovery. The peer stays open
