@@ -1211,6 +1211,16 @@ pub trait PromptCaller: Send + Sync {
 pub struct ClientCapabilityInfo {
     /// Whether the client supports sampling (LLM completions).
     pub sampling: bool,
+    /// Advertised modern sampling context-inclusion capability, if present.
+    ///
+    /// An empty object still declares support; `None` means it was absent.
+    /// Retain open settings so native gateways can forward the admitted
+    /// capability without replacing it with a bare sampling declaration.
+    pub sampling_context: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Advertised modern sampling tool-use capability, if present.
+    ///
+    /// This is independent of basic sampling support and context inclusion.
+    pub sampling_tools: Option<serde_json::Map<String, serde_json::Value>>,
     /// Whether the client supports elicitation (user input requests).
     pub elicitation: bool,
     /// Whether the client supports form-mode elicitation.
@@ -1236,6 +1246,22 @@ impl ClientCapabilityInfo {
     #[must_use]
     pub fn with_sampling(mut self) -> Self {
         self.sampling = true;
+        self
+    }
+
+    /// Enables sampling and retains its admitted modern sub-capabilities.
+    ///
+    /// Presence, including an empty object, declares the corresponding
+    /// capability. Basic sampling alone does not imply either capability.
+    #[must_use]
+    pub fn with_sampling_capabilities(
+        mut self,
+        context: Option<serde_json::Map<String, serde_json::Value>>,
+        tools: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Self {
+        self.sampling = true;
+        self.sampling_context = context;
+        self.sampling_tools = tools;
         self
     }
 
@@ -6314,11 +6340,30 @@ mod tests {
     fn test_client_capability_info_builders() {
         let caps = ClientCapabilityInfo::new();
         assert!(!caps.sampling);
+        assert!(caps.sampling_context.is_none());
+        assert!(caps.sampling_tools.is_none());
         assert!(!caps.elicitation);
         assert!(!caps.roots);
 
         let caps = caps.with_sampling();
         assert!(caps.sampling);
+        assert!(caps.sampling_context.is_none());
+        assert!(caps.sampling_tools.is_none());
+
+        let context = serde_json::json!({"futureContextSetting": ["caller"]})
+            .as_object()
+            .unwrap()
+            .clone();
+        let caps = ClientCapabilityInfo::new()
+            .with_sampling_capabilities(Some(context.clone()), Some(serde_json::Map::new()));
+        assert!(caps.sampling);
+        assert_eq!(caps.sampling_context, Some(context));
+        assert_eq!(caps.sampling_tools, Some(serde_json::Map::new()));
+
+        let caps = caps.with_sampling_capabilities(None, None);
+        assert!(caps.sampling);
+        assert!(caps.sampling_context.is_none());
+        assert!(caps.sampling_tools.is_none());
 
         let caps = ClientCapabilityInfo::new().with_elicitation(true, true);
         assert!(caps.elicitation);

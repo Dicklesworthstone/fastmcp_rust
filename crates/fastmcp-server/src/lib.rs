@@ -1985,10 +1985,10 @@ fn admitted_final_client_capability_info(
         });
     let capability_info =
         ClientCapabilityInfo::new().with_elicitation(elicitation_form, elicitation_url);
-    let capability_info = if capabilities.sampling.is_some() {
-        capability_info.with_sampling()
-    } else {
-        capability_info
+    let capability_info = match capabilities.sampling.as_ref() {
+        Some(sampling) => capability_info
+            .with_sampling_capabilities(sampling.context.clone(), sampling.tools.clone()),
+        None => capability_info,
     };
     let capability_info = match capabilities.roots.as_ref() {
         Some(roots) => capability_info.with_roots(roots.list_changed),
@@ -23267,8 +23267,9 @@ impl Server {
             });
         let mut info =
             ClientCapabilityInfo::new().with_elicitation(elicitation_form, elicitation_url);
-        if caps.sampling.is_some() {
-            info = info.with_sampling();
+        if let Some(sampling) = caps.sampling.as_ref() {
+            info = info
+                .with_sampling_capabilities(sampling.context.clone(), sampling.tools.clone());
         }
         if let Some(roots) = caps.roots.as_ref() {
             info = info.with_roots(roots.list_changed);

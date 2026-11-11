@@ -2166,7 +2166,10 @@ fn inbound_client_capabilities(ctx: &McpContext) -> Option<ClientCapabilities> {
     let inbound = ctx.client_capabilities()?;
     let mut capabilities = ClientCapabilities::default();
     if inbound.sampling {
-        capabilities.sampling = Some(SamplingCapability::default());
+        capabilities.sampling = Some(SamplingCapability {
+            context: inbound.sampling_context.clone(),
+            tools: inbound.sampling_tools.clone(),
+        });
     }
     if inbound.elicitation {
         capabilities.elicitation = Some(ElicitationCapability {
@@ -19016,6 +19019,230 @@ IFS= read -r end
                 .is_none(),
             "empty inbound capabilities must not invent sampling: {parameters:?}"
         );
+    }
+
+    fn sampling_capability_probe_cases() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({}),
+            serde_json::json!({"sampling": {}}),
+            serde_json::json!({"sampling": {"context": {}}}),
+            serde_json::json!({"sampling": {"tools": {}}}),
+            serde_json::json!({"sampling": {"context": {}, "tools": {}}}),
+            serde_json::json!({"sampling": {
+                "context": {"futureSetting": {"sources": ["caller"]}},
+                "tools": {"futureSetting": {"limit": 4}},
+            }}),
+        ]
+    }
+
+    fn admitted_sampling_probe_context(cx: Cx, capabilities: &serde_json::Value) -> McpContext {
+        let parameters = serde_json::json!({
+            "name": "sampling-capability-probe",
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": capabilities,
+            },
+        });
+        let request = fastmcp_protocol::CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "tools/call",
+            Some(&parameters),
+        )
+        .expect("the downstream capability document passes modern admission");
+        let info = crate::admitted_final_client_capability_info(Some(&request))
+            .unwrap()
+            .unwrap();
+        McpContext::new(cx, 1).with_client_capabilities(info)
+    }
+
+    #[test]
+    fn native_proxy_sampling_capabilities_preserve_admitted_presence_and_settings() {
+        for capabilities in sampling_capability_probe_cases() {
+            let ctx = admitted_sampling_probe_context(Cx::for_testing(), &capabilities);
+            let inbound = super::inbound_client_capabilities(&ctx).unwrap();
+            assert_eq!(serde_json::to_value(&inbound).unwrap(), capabilities);
+            let parameters = stdio_parameters_with_inbound_identity(
+                Some(ProtocolEra::Modern2026),
+                serde_json::json!({
+                    "name": "sampling-capability-probe",
+                    "arguments": {},
+                    "_meta": {
+                        "io.modelcontextprotocol/clientCapabilities": {
+                            "sampling": {"context": {}, "tools": {}},
+                            "experimental": {"proxyOwned": {}},
+                        },
+                    },
+                }),
+                None,
+                None,
+                Some(inbound.clone()),
+            );
+            let forwarded =
+                &parameters["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY];
+            assert_eq!(forwarded.get("sampling"), capabilities.get("sampling"));
+            assert_eq!(
+                forwarded["experimental"],
+                serde_json::json!({"proxyOwned": {}})
+            );
+
+            // Exact-2024 must not acquire reserved modern metadata, even
+            // when the incoming modern caller declared both sampling leaves.
+            let legacy_parameters = serde_json::json!({
+                "name": "sampling-capability-probe",
+                "arguments": {},
+                "_meta": {"progressToken": "legacy-probe"},
+            });
+            assert_eq!(
+                stdio_parameters_with_inbound_identity(
+                    Some(ProtocolEra::Legacy2024),
+                    legacy_parameters.clone(),
+                    None,
+                    None,
+                    Some(inbound),
+                ),
+                legacy_parameters,
+            );
+
+            let typed = serde_json::from_value(capabilities.clone()).unwrap();
+            let session_ctx = McpContext::new(Cx::for_testing(), 2).with_client_capabilities(
+                crate::Server::handler_visible_client_capabilities(&typed),
+            );
+            assert_eq!(
+                serde_json::to_value(super::inbound_client_capabilities(&session_ctx).unwrap())
+                    .unwrap(),
+                capabilities,
+                "session projection must retain the same admitted sampling leaves",
+            );
+        }
+    }
+
+    #[test]
+    fn native_http_proxy_preserves_sampling_capabilities_per_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StopPeer(Arc<AtomicBool>);
+        impl Drop for StopPeer {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let plan = ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+            None,
+            None,
+            "sampling-probe".to_owned(),
+            "sampling-probe".to_owned(),
+            "sampling-probe".to_owned(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        let stop = StopPeer(Arc::new(AtomicBool::new(false)));
+        let stopped = Arc::clone(&stop.0);
+        let peer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut observed = Vec::new();
+            while !stopped.load(Ordering::Acquire) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "sampling probe peer is bounded");
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("sampling probe accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let captured = read_http_request(&mut stream);
+                let request: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "server/discover" => serde_json::json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "ttlMs": 0,
+                        "cacheScope": "private",
+                        "_meta": {
+                            "io.modelcontextprotocol/serverInfo": {"name": "sampling-peer", "version": "1"},
+                        },
+                    }),
+                    "tools/call" => {
+                        observed.push(
+                            request["params"]["_meta"]
+                                [fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]
+                                .clone(),
+                        );
+                        serde_json::json!({"resultType": "complete", "content": []})
+                    }
+                    method => panic!("unexpected sampling probe method: {method}"),
+                };
+                write_http_response(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    &serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": result,
+                    }))
+                    .unwrap(),
+                );
+            }
+            observed
+        });
+        let cx = caller_runtime_cx();
+        let mut bindings = ProxyClient::upstream_binding_registry();
+        let proxy = poll_on_cx(
+            &cx,
+            bindings.connect_http_with_protocol_plan(
+                &cx,
+                "sampling-probe",
+                "sampling-probe",
+                1,
+                plan,
+                proxy_http_client_info(),
+                serde_json::from_value(serde_json::json!({
+                    "sampling": {"context": {}, "tools": {}},
+                }))
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        for capabilities in sampling_capability_probe_cases() {
+            let ctx = admitted_sampling_probe_context(cx.clone(), &capabilities);
+            // The synchronous backend rebuilds metadata; the asynchronous
+            // backend stamps a detached native handle. Both use this caller's
+            // leaves, with no inheritance from the route or previous caller.
+            proxy
+                .call_tool_typed(&ctx, "sampling-capability-probe", serde_json::json!({}))
+                .unwrap();
+            poll_on_cx(
+                &cx,
+                proxy.call_tool_typed_async(
+                    &ctx,
+                    "sampling-capability-probe",
+                    serde_json::json!({}),
+                ),
+            )
+            .unwrap();
+            expected.extend([capabilities.clone(), capabilities]);
+        }
+        drop(proxy);
+        drop(bindings);
+        drop(stop);
+        assert_eq!(peer.join().unwrap(), expected);
     }
 
     #[test]
