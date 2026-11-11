@@ -1951,8 +1951,12 @@ const DIRECT_CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// How long an explicit close lets a stdio server exit on its own once its
 /// stdin is closed. MCP stdio shutdown closes the server's input first and
 /// signals only a server that does not exit; signalling at once cuts off a
-/// server that is still flushing its final state.
-const STDIO_EOF_EXIT_GRACE: Duration = Duration::from_millis(500);
+/// server that is still flushing its final state. The reference SDKs wait
+/// 2 s (the Python SDK's `PROCESS_TERMINATION_TIMEOUT`). The group kill
+/// that follows also ends the server's own children, so a server that
+/// closes its upstream stdio servers on EOF needs this long on a loaded
+/// host for them to see EOF instead of the signal.
+const STDIO_EOF_EXIT_GRACE: Duration = Duration::from_secs(2);
 const PROCESS_CLEANUP_CALLER_DEADLINE_ERROR: &str =
     "Subprocess cleanup exceeded the caller deadline";
 const OWNED_PROCESS_GROUP_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
