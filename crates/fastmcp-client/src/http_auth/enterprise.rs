@@ -9,8 +9,9 @@
 //! Replay reservation composes persistent MAC aliases, a registered external
 //! restore authority and an atomic assertion-use store. Provider implementations
 //! remain deployment trust boundaries, with no built-in durability attestation.
+//! Explicit sector-document review uses a bounded credential-free guarded GET.
 //! These components do not activate the MCP extension, launch a browser,
-//! dispatch HTTP or install an MCP credential. Durable browser-flow custody,
+//! dispatch credential-bearing HTTP or install an MCP credential. Durable browser-flow custody,
 //! confidential credential providers and independently attested deployment/
 //! identity authority remain separate work. A local byte digest or subject
 //! lookup is not a launch, dispatch or authorization receipt.

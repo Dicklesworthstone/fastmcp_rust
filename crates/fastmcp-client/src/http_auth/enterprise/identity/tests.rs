@@ -614,3 +614,111 @@ fn disclosure_review_expiry_and_policy_identity_survive_subject_resolution() {
     assert!(table.resolve(&profile, &oidc, &closed_jag, table.snapshot(),
         policy.review_expires_at()).is_ok());
 }
+
+
+#[test]
+fn reviewed_sector_documents_bind_both_mapping_roles_and_resolve_signed_subjects() {
+    // Sector responses are unit fixtures; the consumer still verifies real
+    // RS256 token facts. This is not evidence of a public-network fetch.
+    let profile = profile();
+    let mut configuration = configuration(&profile);
+    configuration.client_relying_party.redirect_uris.push(
+        "https://alternate-client.example/callback".into(),
+    );
+    configuration.resource_as_relying_party.relying_party.redirect_uris.push(
+        "https://alternate-as.example/callback".into(),
+    );
+    assert!(EnterpriseSubjectMappingTable::from_trusted_configuration(
+        &profile, configuration.clone(), vec![row()], now(),
+    ).is_err());
+    let client = sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::Client, &configuration.client_relying_party,
+        "https://client-sector.example/redirects.json",
+        &["https://document-only.example/callback"],
+    );
+    let resource = sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::ResourceAuthorizationServer,
+        &configuration.resource_as_relying_party.relying_party,
+        "https://resource-sector.example/redirects.json", &[],
+    );
+    let table = EnterpriseSubjectMappingTable::from_trusted_configuration_with_sector_reviews(
+        &profile, configuration.clone(), vec![row()], Some(&client), Some(&resource), now(),
+    ).unwrap();
+    let (oidc, jag) = facts();
+    let resolved = table.resolve(&profile, &oidc, &jag, table.snapshot(), now()).unwrap();
+    assert_eq!(resolved.local_subject().as_str(), "preexisting-local-account");
+    assert_eq!(resolved.client_subject().subject().as_str(), "client-facing");
+    assert_eq!(resolved.enterprise_subject().subject().as_str(), "resource-facing");
+    assert_eq!(resolved.client_subject().namespace().sector_host(), Some("client-sector.example"));
+    assert_eq!(resolved.enterprise_subject().namespace().sector_host(), Some("resource-sector.example"));
+    assert_eq!(table.client_namespace().sector_review_digest(), Some(client.binding_digest()));
+    assert_eq!(table.resource_namespace().sector_review_digest(), Some(resource.binding_digest()));
+
+    let before = table.snapshot().clone();
+    let wrong_role = sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::ResourceAuthorizationServer,
+        &configuration.client_relying_party,
+        "https://client-sector.example/redirects.json", &[],
+    );
+    assert_eq!(EnterpriseSubjectMappingTable::from_trusted_configuration_with_sector_reviews(
+        &profile, configuration.clone(), vec![row()], Some(&wrong_role), Some(&resource), now(),
+    ).err(), Some(EnterpriseIdentityError::RegistrationMismatch));
+    for mutation in 0..3 {
+        let mut changed = configuration.clone();
+        match mutation {
+            0 => changed.resource_as_relying_party.relying_party.registration_generation += 1,
+            1 => { changed.resource_as_relying_party.relying_party.redirect_uris.pop(); }
+            2 => changed.client_relying_party.redirect_uris.push(
+                "https://document-only.example/callback".into(),
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(EnterpriseSubjectMappingTable::from_trusted_configuration_with_sector_reviews(
+            &profile, changed, vec![row()], Some(&client), Some(&resource), now(),
+        ).err(), Some(EnterpriseIdentityError::RegistrationMismatch));
+        assert_eq!(table.snapshot(), &before);
+    }
+    assert!(table.resolve(&profile, &oidc, &jag, &before, now()).is_ok());
+}
+
+#[test]
+fn reviewed_sector_content_and_final_url_changes_invalidate_the_identity_snapshot() {
+    let profile = profile();
+    let configuration = configuration(&profile);
+    let original = sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::Client, &configuration.client_relying_party,
+        "https://sector.example/redirects.json", &[],
+    );
+    let table = EnterpriseSubjectMappingTable::from_trusted_configuration_with_sector_reviews(
+        &profile, configuration.clone(), vec![row()], Some(&original), None, now(),
+    ).unwrap();
+    let (oidc, jag) = facts();
+    assert!(table.resolve(&profile, &oidc, &jag, table.snapshot(), now()).is_ok());
+    for changed in [
+        sector::tests::reviewed_fixture(
+            OidcSectorRegistrationRole::Client, &configuration.client_relying_party,
+            "https://sector.example/redirects.json", &["https://extra.example/callback"],
+        ),
+        sector::tests::reviewed_fixture(
+            OidcSectorRegistrationRole::Client, &configuration.client_relying_party,
+            "https://sector.example/other.json", &[],
+        ),
+    ] {
+        let revised = EnterpriseSubjectMappingTable::from_trusted_configuration_with_sector_reviews(
+            &profile, configuration.clone(), vec![row()], Some(&changed), None, now(),
+        ).unwrap();
+        assert_eq!(table.client_namespace().sector_host(), revised.client_namespace().sector_host());
+        assert_ne!(table.snapshot().digest(), revised.snapshot().digest());
+        assert_eq!(revised.resolve(&profile, &oidc, &jag, table.snapshot(), now()).err(),
+            Some(EnterpriseIdentityError::SnapshotMismatch));
+        assert!(revised.resolve(&profile, &oidc, &jag, revised.snapshot(), now()).is_ok());
+    }
+    let ordinary = EnterpriseSubjectMappingTable::from_trusted_configuration(
+        &profile, configuration.clone(), vec![row()], now(),
+    ).unwrap();
+    let no_reviews = EnterpriseSubjectMappingTable::from_trusted_configuration_with_sector_reviews(
+        &profile, configuration, vec![row()], None, None, now(),
+    ).unwrap();
+    assert_eq!(ordinary.snapshot(), no_reviews.snapshot());
+    assert!(ordinary.client_namespace().sector_review_digest().is_none());
+}

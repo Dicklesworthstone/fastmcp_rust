@@ -13,9 +13,10 @@
 //! In particular, callers must not interpret a successful lookup as proof of
 //! browser/nonce provenance or authorization to redeem either assertion.
 //!
-//! This bounded namespace subset supports public subjects and pairwise sectors
-//! derived from registered redirect hosts. A floating sector document is not an
-//! input; supporting it requires independently admitted guarded-fetch evidence.
+//! Public subjects and redirect-host pairwise sectors need no network input.
+//! Explicit sector documents are fetched once during preregistration review by
+//! the guarded producer, then pinned into the imported snapshot. Resolution
+//! never refetches a floating document.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -28,6 +29,9 @@ use fastmcp_protocol::jose::enterprise::{
 };
 
 use super::policy::EnterpriseProfile;
+
+pub mod sector;
+pub use sector::{OidcSectorDocumentReview, OidcSectorRegistrationRole, OidcSectorReviewError};
 
 /// Each imported table and global client inventory has a finite cardinality.
 pub const MAX_ENTERPRISE_SUBJECT_MAPPINGS: usize = 4096;
@@ -99,6 +103,7 @@ pub struct OidcSubjectNamespace {
     subject_type: EnterpriseOidcSubjectType,
     sector_host: Option<String>,
     registration_generation: Option<u64>,
+    sector_review_digest: Option<Sha256Digest>,
 }
 
 impl OidcSubjectNamespace {
@@ -144,7 +149,26 @@ impl OidcSubjectNamespace {
             subject_type,
             sector_host,
             registration_generation: generation,
+            sector_review_digest: None,
         })
+    }
+
+    /// Derives a pairwise namespace from a completed guarded document review.
+    ///
+    /// The issuer, tenant, client, registration generation, role and complete
+    /// redirect set must match the frozen review. No network call occurs here.
+    pub fn from_reviewed_sector(
+        registration: &EnterpriseOidcRelyingPartyConfiguration,
+        role: OidcSectorRegistrationRole,
+        review: &OidcSectorDocumentReview,
+    ) -> Result<Self, EnterpriseIdentityError> {
+        review.namespace_for(registration, role)
+    }
+
+    /// Identity of the exact document and guarded fetch evidence, when used.
+    #[must_use]
+    pub const fn sector_review_digest(&self) -> Option<Sha256Digest> {
+        self.sector_review_digest
     }
 
     #[must_use]
@@ -404,6 +428,25 @@ impl EnterpriseSubjectMappingTable {
         mappings: Vec<PreexistingEnterpriseSubjectMapping>,
         now: SystemTime,
     ) -> Result<Self, EnterpriseIdentityError> {
+        Self::from_trusted_configuration_with_sector_reviews(
+            profile, configuration, mappings, None, None, now,
+        )
+    }
+
+    /// Imports an immutable mapping snapshot with explicit reviewed sectors.
+    ///
+    /// Each supplied review belongs to its exact RP role and full registration.
+    /// Its document, final URL, transport policy and TLS observation enter the
+    /// snapshot digest. Omitting a review uses ordinary redirect-host derivation.
+    /// Import and all subsequent resolutions perform no document refetch.
+    pub fn from_trusted_configuration_with_sector_reviews(
+        profile: &EnterpriseProfile,
+        configuration: EnterpriseIdentityConfiguration,
+        mappings: Vec<PreexistingEnterpriseSubjectMapping>,
+        client_sector: Option<&OidcSectorDocumentReview>,
+        resource_sector: Option<&OidcSectorDocumentReview>,
+        now: SystemTime,
+    ) -> Result<Self, EnterpriseIdentityError> {
         admit_review(&configuration.snapshot, now)?;
         if configuration.profile_policy_generation != profile.policy_generation()
             || configuration.cross_domain_binding_generation == 0
@@ -461,15 +504,23 @@ impl EnterpriseSubjectMappingTable {
             return Err(EnterpriseIdentityError::RegistrationMismatch);
         }
         admit_client_id(&resource.relying_party.client_id)?;
-        let client_namespace = namespace(client)?;
-        let resource_namespace = namespace(&resource.relying_party)?;
+        let client_namespace = namespace(
+            client, OidcSectorRegistrationRole::Client, client_sector,
+        )?;
+        let resource_namespace = namespace(
+            &resource.relying_party,
+            OidcSectorRegistrationRole::ResourceAuthorizationServer, resource_sector,
+        )?;
         let inventory = admit_inventory(&configuration.client_id_model, profile, &resource_tenant)?;
         let scope = match &configuration.client_id_model {
             EnterpriseClientIdModel::Global { .. } => EnterpriseClientIdScope::Global,
             EnterpriseClientIdModel::TenantScoped => EnterpriseClientIdScope::TenantScoped,
         };
         let records = admit_mappings(mappings, resource_claim_tenant.is_some())?;
-        let digest = snapshot_digest(&configuration, profile_digest(profile)?, &inventory, &records)?;
+        let digest = snapshot_digest(
+            &configuration, profile_digest(profile)?, &inventory, &records,
+            client_sector, resource_sector,
+        )?;
         Ok(Self {
             profile: profile.clone(),
             snapshot: EnterpriseIdentitySnapshotKey {
@@ -686,11 +737,17 @@ impl<'a> ResolvedEnterpriseSubject<'a> {
 
 fn namespace(
     registration: &EnterpriseOidcRelyingPartyConfiguration,
+    role: OidcSectorRegistrationRole,
+    review: Option<&OidcSectorDocumentReview>,
 ) -> Result<OidcSubjectNamespace, EnterpriseIdentityError> {
-    OidcSubjectNamespace::from_preregistered_redirects(
-        &registration.issuer, registration.subject_type,
-        registration.registration_generation, &registration.redirect_uris,
-    )
+    if let Some(review) = review {
+        OidcSubjectNamespace::from_reviewed_sector(registration, role, review)
+    } else {
+        OidcSubjectNamespace::from_preregistered_redirects(
+            &registration.issuer, registration.subject_type,
+            registration.registration_generation, &registration.redirect_uris,
+        )
+    }
 }
 
 fn admit_mappings(
@@ -928,8 +985,15 @@ fn snapshot_digest(
     profile: Sha256Digest,
     inventory: &BTreeMap<String, (String, u64)>,
     records: &BTreeMap<String, MappingRecord>,
+    client_sector: Option<&OidcSectorDocumentReview>,
+    resource_sector: Option<&OidcSectorDocumentReview>,
 ) -> Result<Sha256Digest, EnterpriseIdentityError> {
-    let mut encoded = IdentityEncoding::new(b"fastmcp-enterprise-identity-snapshot-v1");
+    let has_sector = client_sector.is_some() || resource_sector.is_some();
+    let mut encoded = IdentityEncoding::new(if has_sector {
+        b"fastmcp-enterprise-identity-sector-snapshot-v1"
+    } else {
+        b"fastmcp-enterprise-identity-snapshot-v1"
+    });
     encoded.field(profile.as_bytes())?;
     encoded.text(&configuration.snapshot.id)?;
     encoded.number(configuration.snapshot.generation)?;
@@ -953,6 +1017,14 @@ fn snapshot_digest(
     })?;
     encode_rp(&mut encoded, &configuration.client_relying_party)?;
     encode_rp(&mut encoded, &configuration.resource_as_relying_party.relying_party)?;
+    if has_sector {
+        for review in [client_sector, resource_sector] {
+            encoded.field(&[u8::from(review.is_some())])?;
+            if let Some(review) = review {
+                encoded.field(review.binding_digest().as_bytes())?;
+            }
+        }
+    }
     encoded.text(&configuration.resource_as_relying_party.resource_as_issuer)?;
     encoded.text(&configuration.resource_as_relying_party.resource_as_tenant)?;
     encoded.optional(configuration.tenant_relationship.idp_tenant.as_deref())?;

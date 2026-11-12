@@ -1287,12 +1287,30 @@ cannot be enabled through this policy.
 
 These components do not yet perform OAuth token exchanges or complete
 enterprise sign-in, and they do not activate the MCP extension.
-The mapping table supports public and redirect-host pairwise OIDC subject
-namespaces. It rechecks the current profile, selected snapshot, signed token
-bindings and review/claim lifetimes on every lookup; results retain the exact
-token and snapshot digests. A local snapshot digest does not establish a
-rollback-resistant policy fence or prove that responses came from one exchange.
-Guarded sector-document retrieval remains separate work.
+The mapping table supports public, redirect-host pairwise, and explicitly
+reviewed sector-document OIDC subject namespaces. It rechecks the current
+profile, selected snapshot, signed token bindings and review/claim lifetimes on
+every lookup; results retain the exact token and snapshot digests. A local
+snapshot digest does not establish a rollback-resistant policy fence or prove
+that responses came from one exchange.
+
+For a preregistration that declares `sector_identifier_uri`, first call
+`identity::OidcSectorDocumentReview::fetch` with the complete relying-party
+registration, its explicit Client or ResourceAuthorizationServer role, and a
+`GuardedHttpFetcher` under the caller's context. This performs one bounded,
+credential-free HTTPS GET. The response must be an HTTP 200 JSON array containing
+every exact registered redirect URI. Additional document entries never authorize
+callbacks. The review binds the registration generation, issuer, tenant, client,
+role, redirect set, sector URL, exact document digest, fetch policy and observed
+TLS provenance.
+
+Use `oidc::OidcCodeFlowConfiguration::from_documents_with_sector_review` to select
+one callback from that complete reviewed registration, including registrations
+with multiple redirect hosts. Use
+`identity::EnterpriseSubjectMappingTable::from_trusted_configuration_with_sector_reviews`
+to bind the independently reviewed client and resource-AS sectors into the
+mapping snapshot. Both consumers retain the frozen evidence and perform no
+refetch during ordinary authorization flows.
 
 #### Protected persistent records
 

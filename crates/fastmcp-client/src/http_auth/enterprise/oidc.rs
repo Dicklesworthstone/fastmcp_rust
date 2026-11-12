@@ -24,7 +24,10 @@ use fastmcp_protocol::security_admission::{SecurityDocumentKind, admit_security_
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
-use super::identity::{EnterpriseOidcSubjectType, OidcSubjectNamespace};
+use super::identity::{
+    EnterpriseOidcRelyingPartyConfiguration, EnterpriseOidcSubjectType,
+    OidcSectorDocumentReview, OidcSectorRegistrationRole, OidcSubjectNamespace,
+};
 use super::policy::{EnterpriseProfile, RequestedEnterpriseScopeSet, TOKEN_EXCHANGE_GRANT};
 use super::response::{
     EnterpriseIdentityAssertion, EnterpriseResponseOutcome, EnterpriseResponsePolicy,
@@ -99,9 +102,10 @@ impl ConfiguredTenant {
 /// Immutable local code-flow policy. It contains no credential or pending flow.
 ///
 /// Metadata and preregistration are trusted inputs, not fetched provenance.
-/// Public and redirect-host pairwise subject namespaces are supported. An
-/// external sector_identifier_uri needs a separate reviewed fetch/evidence
-/// integration and is refused here rather than silently changing the sector.
+/// Public and redirect-host pairwise subject namespaces use local admission.
+/// An explicit sector_identifier_uri requires the separately completed guarded
+/// review supplied to Self::from_documents_with_sector_review. The resulting
+/// namespace retains that exact review digest without refetching its document.
 #[derive(Clone)]
 pub struct OidcCodeFlowConfiguration {
     profile: EnterpriseProfile,
@@ -129,6 +133,41 @@ impl OidcCodeFlowConfiguration {
         tenant: TenantExpectation<'_>,
         idp_metadata: &[u8],
         idp_registration: &[u8],
+    ) -> Result<Self, OidcCodeFlowError> {
+        Self::admit_documents(
+            profile, redirect_uri, subject_type, tenant,
+            idp_metadata, idp_registration, None,
+        )
+    }
+
+    /// Admits a pairwise code flow against an already fetched sector review.
+    ///
+    /// The selected callback must be one of the complete preregistered redirect
+    /// set frozen in the review. Additional entries in the remote document do
+    /// not authorize callbacks. Issuer, client, tenant, Client role, generation
+    /// and exact sector URL must match; this constructor performs no network I/O.
+    pub fn from_documents_with_sector_review(
+        profile: EnterpriseProfile,
+        redirect_uri: &str,
+        tenant: TenantExpectation<'_>,
+        idp_metadata: &[u8],
+        idp_registration: &[u8],
+        sector_review: &OidcSectorDocumentReview,
+    ) -> Result<Self, OidcCodeFlowError> {
+        Self::admit_documents(
+            profile, redirect_uri, EnterpriseOidcSubjectType::Pairwise, tenant,
+            idp_metadata, idp_registration, Some(sector_review),
+        )
+    }
+
+    fn admit_documents(
+        profile: EnterpriseProfile,
+        redirect_uri: &str,
+        subject_type: EnterpriseOidcSubjectType,
+        tenant: TenantExpectation<'_>,
+        idp_metadata: &[u8],
+        idp_registration: &[u8],
+        sector_review: Option<&OidcSectorDocumentReview>,
     ) -> Result<Self, OidcCodeFlowError> {
         let metadata = document(SecurityDocumentKind::OidcProviderMetadata, idp_metadata)?;
         let registration = document(SecurityDocumentKind::ClientRegistration, idp_registration)?;
@@ -188,8 +227,13 @@ impl OidcCodeFlowConfiguration {
                 return Err(OidcCodeFlowError::InvalidRegistration);
             }
         }
+        let registered_redirects = array(&registration, "redirect_uris")?;
         if array(&registration, "response_types")? != ["code"]
-            || array(&registration, "redirect_uris")? != [redirect_uri]
+            || if sector_review.is_some() {
+                !registered_redirects.contains(&redirect_uri)
+            } else {
+                registered_redirects != [redirect_uri]
+            }
         {
             return Err(OidcCodeFlowError::InvalidRegistration);
         }
@@ -213,13 +257,6 @@ impl OidcCodeFlowConfiguration {
                 return Err(OidcCodeFlowError::InvalidRegistration);
             }
         }
-        if registration.contains_key("sector_identifier_uri") {
-            return Err(OidcCodeFlowError::UnsupportedSubjectNamespace);
-        }
-        let subject_namespace = OidcSubjectNamespace::from_preregistered_redirects(
-            profile.idp_issuer(), subject_type, profile.idp_registration_generation(),
-            &[redirect_uri.to_owned()],
-        ).map_err(|_| OidcCodeFlowError::UnsupportedSubjectNamespace)?;
         let tenant = match tenant {
             TenantExpectation::SingleTenant => ConfiguredTenant::SingleTenant,
             TenantExpectation::Exact(value) => {
@@ -230,6 +267,33 @@ impl OidcCodeFlowConfiguration {
                 }
                 ConfiguredTenant::Exact(value.to_owned())
             }
+        };
+        let subject_namespace = if let Some(review) = sector_review {
+            if string(&registration, "sector_identifier_uri")? != review.sector_identifier_uri() {
+                return Err(OidcCodeFlowError::UnsupportedSubjectNamespace);
+            }
+            let relying_party = EnterpriseOidcRelyingPartyConfiguration {
+                issuer: profile.idp_issuer().to_owned(),
+                tenant: match &tenant {
+                    ConfiguredTenant::SingleTenant => None,
+                    ConfiguredTenant::Exact(value) => Some(value.clone()),
+                },
+                client_id: profile.idp_client_id().to_owned(),
+                registration_generation: profile.idp_registration_generation(),
+                subject_type,
+                redirect_uris: registered_redirects.into_iter().map(str::to_owned).collect(),
+            };
+            OidcSubjectNamespace::from_reviewed_sector(
+                &relying_party, OidcSectorRegistrationRole::Client, review,
+            ).map_err(|_| OidcCodeFlowError::UnsupportedSubjectNamespace)?
+        } else {
+            if registration.contains_key("sector_identifier_uri") {
+                return Err(OidcCodeFlowError::UnsupportedSubjectNamespace);
+            }
+            OidcSubjectNamespace::from_preregistered_redirects(
+                profile.idp_issuer(), subject_type, profile.idp_registration_generation(),
+                &[redirect_uri.to_owned()],
+            ).map_err(|_| OidcCodeFlowError::UnsupportedSubjectNamespace)?
         };
         Ok(Self {
             profile, authorization_endpoint, redirect_uri: redirect_uri.to_owned(),

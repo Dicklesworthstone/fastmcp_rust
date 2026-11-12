@@ -661,3 +661,158 @@ fn oidc_code_pipeline_returns_typed_denial_without_resurrecting_code() {
 }
 
 const SIGNED_CODE_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImVudGVycHJpc2UtcmZjNzUxNSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoiY2xpZW50LXN1YmplY3QiLCJhdWQiOiJuYXRpdmUtaWRwIiwiaWF0IjoyMDAwMDAwMDAwLCJleHAiOjIwMDAwMDAyNDAsIm5vbmNlIjoiSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSWlJaUlpSSIsImF0X2hhc2giOiJxSUJDX1p0VFlYdTJFbHY5OUQ5Qy1BIn0.XYRm25jK7AKhR4L17_3tQF_eN3I5mMhAhQ88HwcT2nkYN9pBqof1yAdTPMpN4c5vEmVsl_LlrStyqt-Rpq77SVJU0sOBO949TDn1qs9-Uz9VJZQ2LzGcciBwmcTUX0pAGTfGLzvCLxRoIgUJ101V92cBziPalTuRNoHUcnqftPcMsadbph8_JKoTBEjZjvKFzZz7QiswPCn4IcCnuKWkmB116wDv4DxRdEk91yawQrXu7pNPuidBUYQGQ95iqwHyTwV9tUl7TAUnfW9ldTbxJKXmkVtPCI6WTD8QGMvU_HLMfBBfOEhFQr-smHYGoml9jXCz0T4Gs9MG3R48sDVJqg";
+
+
+fn sector_documents() -> (EnterpriseProfile, [Value; 5], EnterpriseOidcRelyingPartyConfiguration) {
+    let (profile, mut documents) = profile_and_documents();
+    documents[3]["subject_type"] = json!("pairwise");
+    documents[3]["redirect_uris"] = json!([REDIRECT, "https://alternate.example/callback"]);
+    documents[3]["sector_identifier_uri"] = json!("https://sector.example/redirects.json");
+    let registration = EnterpriseOidcRelyingPartyConfiguration {
+        issuer: profile.idp_issuer().into(), tenant: None, client_id: profile.idp_client_id().into(),
+        registration_generation: profile.idp_registration_generation(),
+        subject_type: EnterpriseOidcSubjectType::Pairwise,
+        redirect_uris: vec![REDIRECT.into(), "https://alternate.example/callback".into()],
+    };
+    (profile, documents, registration)
+}
+
+fn admit_reviewed_configuration(
+    profile: EnterpriseProfile,
+    redirect: &str,
+    metadata: &Value,
+    registration: &Value,
+    review: &OidcSectorDocumentReview,
+) -> Result<OidcCodeFlowConfiguration, OidcCodeFlowError> {
+    OidcCodeFlowConfiguration::from_documents_with_sector_review(
+        profile, redirect, TenantExpectation::SingleTenant,
+        &serde_json::to_vec(metadata).unwrap(), &serde_json::to_vec(registration).unwrap(), review,
+    )
+}
+
+#[test]
+fn oidc_reviewed_sector_preserves_full_registration_and_selected_callback_through_code_form() {
+    // The review is synthetic response-admission evidence. Request generation,
+    // callback admission and code serialization use the shipped public consumers.
+    let (profile, documents, registration) = sector_documents();
+    let review = super::super::identity::sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::Client, &registration,
+        "https://sector.example/redirects.json", &["https://extra.example/callback"],
+    );
+    assert!(admit_configuration(
+        profile.clone(), &documents[0], &documents[3], EnterpriseOidcSubjectType::Pairwise,
+    ).is_err());
+    for selected in [REDIRECT, "https://alternate.example/callback"] {
+        let configuration = admit_reviewed_configuration(
+            profile.clone(), selected, &documents[0], &documents[3], &review,
+        ).unwrap();
+        assert_eq!(configuration.subject_namespace().sector_host(), Some("sector.example"));
+        assert_eq!(configuration.subject_namespace().sector_review_digest(), Some(review.binding_digest()));
+        let pending = configuration.prepare(&Cx::for_testing(), now(), Duration::from_secs(300)).unwrap();
+        let fields = callback_fields(pending.authorization_url().split_once('?').unwrap().1).unwrap();
+        assert_eq!(fields["redirect_uri"].as_str(), selected);
+        let callback = format!(
+            "{selected}?state={}&iss=https%3A%2F%2Fidp.example&code=reviewed-code",
+            pending.state.as_str(),
+        );
+        let grant = code(pending.admit_callback(&callback, now() + Duration::from_secs(1)).unwrap());
+        let mut output = Vec::new();
+        let owner = grant.write_token_form(&mut output, now() + Duration::from_secs(2)).unwrap();
+        let output = SecretString::from_string(String::from_utf8(output).unwrap());
+        let form = callback_fields(output.as_str()).unwrap();
+        assert_eq!(form["redirect_uri"].as_str(), selected);
+        assert_eq!(owner.configuration.subject_namespace().sector_review_digest(), Some(review.binding_digest()));
+
+        let pending = configuration.prepare(&Cx::for_testing(), now(), Duration::from_secs(300)).unwrap();
+        let wrong_route = if selected == REDIRECT { "https://alternate.example/callback" } else { REDIRECT };
+        let callback = format!(
+            "{wrong_route}?state={}&iss=https%3A%2F%2Fidp.example&code=reviewed-code",
+            pending.state.as_str(),
+        );
+        assert_eq!(pending.admit_callback(&callback, now()).err(), Some(OidcCodeFlowError::CallbackRejected));
+    }
+    let mut reordered = documents[3].clone();
+    reordered["redirect_uris"] = json!(["https://alternate.example/callback", REDIRECT]);
+    assert!(admit_reviewed_configuration(
+        profile, REDIRECT, &documents[0], &reordered, &review,
+    ).is_ok());
+}
+
+#[test]
+fn oidc_reviewed_sector_refuses_extra_callback_and_registration_binding_changes() {
+    let (profile, documents, registration) = sector_documents();
+    let review = super::super::identity::sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::Client, &registration,
+        "https://sector.example/redirects.json", &["https://extra.example/callback"],
+    );
+    assert!(admit_reviewed_configuration(
+        profile.clone(), REDIRECT, &documents[0], &documents[3], &review,
+    ).is_ok());
+    assert_eq!(admit_reviewed_configuration(
+        profile.clone(), "https://extra.example/callback", &documents[0], &documents[3], &review,
+    ).err(), Some(OidcCodeFlowError::InvalidRegistration));
+    for mutation in 0..5 {
+        let mut changed = documents[3].clone();
+        match mutation {
+            0 => changed["redirect_uris"] = json!([REDIRECT]),
+            1 => changed["redirect_uris"] = json!([
+                REDIRECT, "https://alternate.example/callback", "https://extra.example/callback",
+            ]),
+            2 => changed["sector_identifier_uri"] = json!("https://sector.example/other.json"),
+            3 => { changed.as_object_mut().unwrap().remove("sector_identifier_uri"); }
+            4 => changed["subject_type"] = json!("public"),
+            _ => unreachable!(),
+        }
+        assert!(admit_reviewed_configuration(
+            profile.clone(), REDIRECT, &documents[0], &changed, &review,
+        ).is_err(), "accepted preregistration mutation {mutation}");
+    }
+    let wrong_role = super::super::identity::sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::ResourceAuthorizationServer, &registration,
+        "https://sector.example/redirects.json", &[],
+    );
+    assert_eq!(admit_reviewed_configuration(
+        profile.clone(), REDIRECT, &documents[0], &documents[3], &wrong_role,
+    ).err(), Some(OidcCodeFlowError::UnsupportedSubjectNamespace));
+    let mut next_registration = registration.clone();
+    next_registration.registration_generation += 1;
+    let next_review = super::super::identity::sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::Client, &next_registration,
+        "https://sector.example/redirects.json", &[],
+    );
+    assert_eq!(admit_reviewed_configuration(
+        profile.clone(), REDIRECT, &documents[0], &documents[3], &next_review,
+    ).err(), Some(OidcCodeFlowError::UnsupportedSubjectNamespace));
+    assert_eq!(OidcCodeFlowConfiguration::from_documents_with_sector_review(
+        profile.clone(), REDIRECT, TenantExpectation::Exact("other-tenant"),
+        &serde_json::to_vec(&documents[0]).unwrap(), &serde_json::to_vec(&documents[3]).unwrap(),
+        &review,
+    ).err(), Some(OidcCodeFlowError::UnsupportedSubjectNamespace));
+    assert!(admit_reviewed_configuration(
+        profile, REDIRECT, &documents[0], &documents[3], &review,
+    ).is_ok());
+}
+
+#[test]
+fn oidc_reviewed_sector_content_is_frozen_independently_of_unchanged_registration_documents() {
+    let (profile, documents, registration) = sector_documents();
+    let original = super::super::identity::sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::Client, &registration,
+        "https://sector.example/redirects.json", &[],
+    );
+    let changed = super::super::identity::sector::tests::reviewed_fixture(
+        OidcSectorRegistrationRole::Client, &registration,
+        "https://sector.example/redirects.json", &["https://extra.example/callback"],
+    );
+    let first = admit_reviewed_configuration(
+        profile.clone(), REDIRECT, &documents[0], &documents[3], &original,
+    ).unwrap();
+    let second = admit_reviewed_configuration(
+        profile, REDIRECT, &documents[0], &documents[3], &changed,
+    ).unwrap();
+    assert_eq!(first.metadata_digest(), second.metadata_digest());
+    assert_eq!(first.registration_digest(), second.registration_digest());
+    assert_eq!(first.subject_namespace().sector_host(), second.subject_namespace().sector_host());
+    assert_ne!(first.subject_namespace().sector_review_digest(), second.subject_namespace().sector_review_digest());
+    assert_eq!(first.subject_namespace().sector_review_digest(), Some(original.binding_digest()));
+}
