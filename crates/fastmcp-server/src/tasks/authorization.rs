@@ -11,6 +11,7 @@ use super::{
 };
 #[cfg(feature = "proxy")]
 use super::{BTreeMap, Cx};
+use fastmcp_protocol::AdmittedSchema;
 use std::fmt;
 
 const MAX_TASK_ACCESS_AUTHORIZERS: usize = 16;
@@ -50,15 +51,27 @@ impl TaskAccessAction {
 /// across process restart and does not establish durable Task authorization.
 /// Its process generation is checked before access or execution policy callbacks,
 /// so an inherited registration cannot authorize a forked child's work.
+/// The admitted output schema is shared with that exact registration, so later
+/// metadata changes cannot change the contract of an already-created Task.
 #[derive(Clone)]
 pub struct FinalTaskOperation {
     process: TaskProcessGuard,
     tool_name: String,
     registration: Weak<()>,
+    output_schema: Option<Arc<AdmittedSchema>>,
 }
 
 impl FinalTaskOperation {
+    #[cfg(test)]
     pub(crate) fn for_tool(tool_name: &str, registration: &Arc<()>) -> McpResult<Self> {
+        Self::for_tool_with_output_schema(tool_name, registration, None)
+    }
+
+    pub(crate) fn for_tool_with_output_schema(
+        tool_name: &str,
+        registration: &Arc<()>,
+        output_schema: Option<Arc<AdmittedSchema>>,
+    ) -> McpResult<Self> {
         if tool_name.is_empty()
             || tool_name.len() > MAX_TASK_OPERATION_NAME_BYTES
             || tool_name.chars().any(char::is_control)
@@ -69,6 +82,7 @@ impl FinalTaskOperation {
             process: TaskProcessGuard::new()?,
             tool_name: tool_name.to_owned(),
             registration: Arc::downgrade(registration),
+            output_schema,
         })
     }
 
@@ -88,6 +102,14 @@ impl FinalTaskOperation {
 
     fn is_registered(&self) -> bool {
         self.process.verify().is_ok() && self.registration.strong_count() != 0
+    }
+
+    pub(super) fn validate_completed_result(
+        &self,
+        result: &super::FinalTaskCallToolResult,
+    ) -> McpResult<()> {
+        self.process.verify()?;
+        crate::router::validate_final_tool_output_schema(self.output_schema.as_deref(), &result.result)
     }
 
     /// Shares the same process-local admission boundary with proxied Tasks.
@@ -139,6 +161,11 @@ impl PartialEq for FinalTaskOperation {
         self.process == other.process
             && self.tool_name == other.tool_name
             && Weak::ptr_eq(&self.registration, &other.registration)
+            && match (&self.output_schema, &other.output_schema) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
     }
 }
 
@@ -3123,6 +3150,56 @@ mod tests {
             Some(&operation)
         );
         assert!(store.retained_payload_bytes() >= operation.retained_bytes());
+    }
+
+
+    #[test]
+    fn task_output_schema_identity_is_part_of_its_immutable_operation_binding() {
+        let registration = Arc::new(());
+        let schema = Arc::new(
+            fastmcp_protocol::admit_final_schema(serde_json::json!({"type": "object"})).unwrap(),
+        );
+        let original = FinalTaskOperation::for_tool_with_output_schema(
+            "schema-task",
+            &registration,
+            Some(schema.clone()),
+        )
+        .unwrap();
+        let same = original.clone();
+        assert_eq!(original, same);
+        let task = task("schema-binding");
+        let snapshot = FinalTaskSnapshot::new(task.clone(), 1)
+            .with_original_operation(Some(same));
+        let metadata = FinalTaskAccessMetadata::new(
+            task.base().task_id.clone(),
+            1,
+            1,
+            None,
+            Some(original.clone()),
+        );
+        assert!(metadata.admits_snapshot(&snapshot));
+
+        // A separately admitted but equal schema cannot substitute for the
+        // allocation bound to the original registration and Task generation.
+        let substituted = FinalTaskOperation::for_tool_with_output_schema(
+            "schema-task",
+            &registration,
+            Some(Arc::new((*schema).clone())),
+        )
+        .unwrap();
+        assert_ne!(original, substituted);
+        assert!(!metadata.admits_snapshot(
+            &snapshot.with_original_operation(Some(substituted)),
+        ));
+        assert_ne!(
+            original,
+            FinalTaskOperation::for_tool("schema-task", &registration).unwrap(),
+        );
+        assert_eq!(
+            original.retained_bytes(),
+            original.tool_name().len() + std::mem::size_of::<FinalTaskOperation>(),
+            "the shared schema handle is included in retained Task metadata",
+        );
     }
 
     #[test]

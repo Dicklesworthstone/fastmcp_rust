@@ -8514,6 +8514,11 @@ impl FinalTaskRuntime {
                 "Final task store returned a task under the wrong identifier",
             ));
         }
+        if let FinalTask::Completed { result, .. } = snapshot.task()
+            && let Some(original) = snapshot.original_operation()
+        {
+            original.validate_completed_result(result)?;
+        }
         Ok(snapshot)
     }
 
@@ -8692,7 +8697,13 @@ impl FinalTaskRuntime {
         notification: &FinalTaskStatusNotification,
     ) -> McpResult<()> {
         self.validate_new_task_write(task, notification)?;
-        validate_final_task_transition(expected.task(), task)
+        validate_final_task_transition(expected.task(), task)?;
+        if let FinalTask::Completed { result, .. } = task
+            && let Some(original) = expected.original_operation()
+        {
+            original.validate_completed_result(result)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -14889,6 +14900,293 @@ mod tests {
             "payload": {"fixture": "final-task"}
         }))
         .expect("non-null test work descriptor is valid")
+    }
+
+
+    mod task_output_schema_tests {
+        use super::*;
+
+        const VALID_RESULT: &str = r#"{"content":[],"structuredContent":{"answer":7},"vendor":{"number":1e+00}}"#;
+
+        fn output_schema() -> Arc<fastmcp_protocol::AdmittedSchema> {
+            Arc::new(
+                fastmcp_protocol::admit_final_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "answer": {"const": 7},
+                        "error": {"type": "string"}
+                    },
+                    "additionalProperties": false,
+                    "anyOf": [{"required": ["answer"]}, {"required": ["error"]}]
+                }))
+                .unwrap(),
+            )
+        }
+
+        fn result(wire: &str) -> FinalTaskCallToolResult {
+            serde_json::from_str(wire).unwrap()
+        }
+
+        struct CompletingSupervisor {
+            result: Mutex<FinalTaskCallToolResult>,
+            calls: AtomicUsize,
+        }
+
+        impl ApplicationTaskSupervisor for CompletingSupervisor {
+            fn resume<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                handoff: FinalTaskSupervisorHandoff,
+            ) -> FinalTaskSupervisorFuture<'a> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    let result = self.result.lock().unwrap().clone();
+                    match handoff {
+                        FinalTaskSupervisorHandoff::Initial(initial) => {
+                            initial.complete_task(result, None)?;
+                        }
+                        FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                            accepted.complete_task(result, None)?;
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
+
+        fn runtime(
+            store: Arc<InMemoryFinalTaskStore>,
+            emitted: Arc<Mutex<Vec<FinalTask>>>,
+        ) -> FinalTaskRuntime {
+            FinalTaskRuntime::new(
+                store,
+                FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+                Arc::new(move |notification| {
+                    emitted.lock().unwrap().push(notification.params.task.clone());
+                }),
+            )
+        }
+
+        #[test]
+        fn supervised_completion_accepts_schema_results_and_preserves_exact_wire() {
+            for (wire, declared) in [
+                (VALID_RESULT, true),
+                (r#"{"content":[],"isError":true,"structuredContent":{"error":"worker failed"}}"#, true),
+                (r#"{"content":[]}"#, false),
+            ] {
+                with_task_test_runtime(async {
+                    let cx = Cx::current().unwrap();
+                    let store = Arc::new(InMemoryFinalTaskStore::default());
+                    let emitted = Arc::new(Mutex::new(Vec::new()));
+                    let runtime = runtime(store.clone(), emitted.clone());
+                    let expected_wire = serde_json::to_string(&result(wire)).unwrap();
+                    let supervisor = Arc::new(CompletingSupervisor {
+                        result: Mutex::new(result(wire)),
+                        calls: AtomicUsize::new(0),
+                    });
+                    let mut runner = runtime.install_task_service(1, supervisor.clone()).unwrap();
+                    let mut service = Box::pin(runner.run_service(&cx));
+                    drive_task_test_until(&cx, service.as_mut(), "schema service is ready", || {
+                        runtime.is_task_service_ready()
+                    })
+                    .await;
+                    let registration = Arc::new(());
+                    let original = FinalTaskOperation::for_tool_with_output_schema(
+                        "schema-task",
+                        &registration,
+                        declared.then(output_schema),
+                    )
+                    .unwrap();
+                    let task = runtime
+                        .create_task_for_operation(
+                            &McpContext::new(cx.clone(), 1),
+                            original,
+                            final_test_work_descriptor(),
+                            None,
+                        )
+                        .unwrap()
+                        .task;
+                    let id = task.base().task_id.clone();
+                    drive_task_test_until(&cx, service.as_mut(), "schema completion is committed", || {
+                        matches!(store.get_task(&id).unwrap(), Some(FinalTask::Completed { .. }))
+                            && store.active_task_count() == 0
+                    })
+                    .await;
+                    let FinalTask::Completed { result, .. } = runtime.get_task(&id).unwrap().task else {
+                        panic!("the admitted output must complete");
+                    };
+                    assert_eq!(serde_json::to_string(&result).unwrap(), expected_wire);
+                    let emitted = emitted.lock().unwrap();
+                    let FinalTask::Completed { result, .. } = emitted.last().unwrap() else {
+                        panic!("the completion is published after validation");
+                    };
+                    assert_eq!(serde_json::to_string(result).unwrap(), expected_wire);
+                    assert_eq!(supervisor.calls.load(AtomicOrdering::SeqCst), 1);
+                    assert_final_task_payload_accounting(&store);
+                    drop(emitted);
+                    drop(service);
+                });
+            }
+        }
+
+        #[test]
+        fn rejected_supervised_completion_restores_work_for_valid_retry() {
+            for wire in [
+                r#"{"content":[]}"#,
+                r#"{"content":[],"isError":true}"#,
+                r#"{"content":[],"structuredContent":{"answer":8}}"#,
+                r#"{"content":[],"isError":true,"structuredContent":{"answer":8}}"#,
+            ] {
+                with_task_test_runtime(async {
+                    let cx = Cx::current().unwrap();
+                    let store = Arc::new(InMemoryFinalTaskStore::default());
+                    let emitted = Arc::new(Mutex::new(Vec::new()));
+                    let runtime = runtime(store.clone(), emitted.clone());
+                    let supervisor = Arc::new(CompletingSupervisor {
+                        result: Mutex::new(result(wire)),
+                        calls: AtomicUsize::new(0),
+                    });
+                    let mut runner = runtime.install_task_service(1, supervisor.clone()).unwrap();
+                    let mut service = Box::pin(runner.run_service(&cx));
+                    drive_task_test_until(&cx, service.as_mut(), "schema service is ready", || {
+                        runtime.is_task_service_ready()
+                    })
+                    .await;
+                    let registration = Arc::new(());
+                    let original = FinalTaskOperation::for_tool_with_output_schema(
+                        "schema-task",
+                        &registration,
+                        Some(output_schema()),
+                    )
+                    .unwrap();
+                    let work = final_test_work_descriptor();
+                    let created = runtime
+                        .create_task_for_operation(
+                            &McpContext::new(cx.clone(), 1),
+                            original,
+                            work.clone(),
+                            None,
+                        )
+                        .unwrap()
+                        .task;
+                    let id = created.base().task_id.clone();
+                    let before = store.get_task_snapshot(&id).unwrap().unwrap();
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        StdDuration::from_secs(5),
+                        service.as_mut(),
+                    )
+                    .await
+                    .unwrap()
+                    .expect_err("invalid output must propagate from the supervisor");
+                    drop(service);
+                    wait_task_test_condition(&cx, "rejected output settles its child", || {
+                        store.active_task_count() == 0
+                    })
+                    .await;
+                    assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+                    assert!(error.message.starts_with("tool output "));
+                    assert!(!runtime.is_task_service_ready());
+                    assert_exact_initial_work_is_recoverable(&store, &id, &work);
+                    let rejected = store.get_task_snapshot(&id).unwrap().unwrap();
+                    assert_eq!(rejected.generation(), before.generation());
+                    assert!(final_tasks_match_exactly(rejected.task(), before.task()).unwrap());
+                    assert!(emitted.lock().unwrap().iter().all(|task| {
+                        !matches!(task, FinalTask::Completed { .. })
+                    }));
+
+                    // The unchanged work is retried through the same retained
+                    // service owner, with a conforming application result.
+                    *supervisor.result.lock().unwrap() = result(VALID_RESULT);
+                    let mut retry = Box::pin(runner.run_service(&cx));
+                    drive_task_test_until(&cx, retry.as_mut(), "restored work completes on retry", || {
+                        matches!(store.get_task(&id).unwrap(), Some(FinalTask::Completed { .. }))
+                            && store.active_task_count() == 0
+                    })
+                    .await;
+                    assert_eq!(supervisor.calls.load(AtomicOrdering::SeqCst), 2);
+                    assert_eq!(
+                        emitted.lock().unwrap().iter().filter(|task| {
+                            matches!(task, FinalTask::Completed { .. })
+                        }).count(),
+                        1,
+                    );
+                    assert_final_task_payload_accounting(&store);
+                    drop(retry);
+                });
+            }
+        }
+
+        #[test]
+        fn custom_store_schema_boundary_rejects_writes_reads_and_false_receipts() {
+            let initial = final_working_task_without_ttl("custom-schema-task");
+            let id = initial.base().task_id.clone();
+            let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(initial.clone()));
+            let registration = Arc::new(());
+            let original = FinalTaskOperation::for_tool_with_output_schema(
+                "schema-task",
+                &registration,
+                Some(output_schema()),
+            )
+            .unwrap();
+            let bound = store.snapshot().with_original_operation(Some(original));
+            *store.snapshot.lock().unwrap() = bound;
+            let emitted = Arc::new(Mutex::new(Vec::<FinalTask>::new()));
+            let observed = emitted.clone();
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+                Arc::new(move |notification| {
+                    observed.lock().unwrap().push(notification.params.task.clone());
+                }),
+            );
+            let before = store.snapshot();
+            let valid = FinalTask::Completed {
+                base: transition_terminal_final_task_base(
+                    initial.base().clone(),
+                    FinalTaskStatus::Completed,
+                    None,
+                )
+                .unwrap(),
+                result: result(VALID_RESULT),
+            };
+            let mut invalid = valid.clone();
+            let FinalTask::Completed { result, .. } = &mut invalid else {
+                unreachable!();
+            };
+            result.result.structured_content = Some(serde_json::json!({"answer": 8}));
+            runtime
+                .persist_transition_clearing_input(&before, invalid.clone())
+                .expect_err("schema rejection must happen before a custom-store CAS");
+            assert_eq!(store.transition_write_calls.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(store.snapshot().generation(), before.generation());
+
+            // A trusted custom store may write directly, but its invalid
+            // result must still be refused by the public runtime read path.
+            store.replace_snapshot_for_read(invalid.clone());
+            runtime.get_task(&id).expect_err("invalid stored completion is not exposed");
+            assert!(emitted.lock().unwrap().is_empty());
+            store.replace_snapshot_for_read(initial.clone());
+
+            // A custom backend may also substitute an invalid committed
+            // receipt after receiving a valid candidate. Do not publish it.
+            *store.transition_result_override.lock().unwrap() = Some(invalid);
+            runtime
+                .persist_transition_clearing_input(&store.snapshot(), valid.clone())
+                .expect_err("an invalid backend receipt must not publish completion");
+            assert_eq!(store.transition_write_calls.load(AtomicOrdering::SeqCst), 1);
+            assert!(emitted.lock().unwrap().is_empty());
+
+            *store.transition_result_override.lock().unwrap() = None;
+            store.replace_snapshot_for_read(initial);
+            runtime
+                .persist_transition_clearing_input(&store.snapshot(), valid.clone())
+                .expect("the same custom store accepts a conforming completion");
+            let loaded = runtime.get_task(&id).unwrap().task;
+            assert!(final_tasks_match_exactly(&loaded, &valid).unwrap());
+            assert_eq!(emitted.lock().unwrap().len(), 1);
+            assert!(final_tasks_match_exactly(&emitted.lock().unwrap()[0], &valid).unwrap());
+        }
     }
 
     fn complete_final_task_handoff(handoff: FinalTaskSupervisorHandoff) -> McpResult<()> {

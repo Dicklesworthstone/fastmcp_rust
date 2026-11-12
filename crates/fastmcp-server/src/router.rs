@@ -921,26 +921,36 @@ fn require_final_tasks_capability(metadata: &OpenMetadata) -> McpResult<()> {
 #[derive(Clone)]
 struct FinalToolSchemas {
     input: Option<AdmittedSchema>,
-    output: Option<AdmittedSchema>,
+    output: Option<Arc<AdmittedSchema>>,
     errors: Option<FinalToolErrorStructuredContent>,
 }
 
 impl FinalToolSchemas {
     fn validate_complete_output(&self, result: &FinalCallToolResult) -> McpResult<()> {
-        if let Some(schema) = &self.output {
-            let structured_content = result.structured_content.as_ref().ok_or_else(|| {
-                McpError::internal_error(
-                    "tool output is missing structuredContent required by the declared output schema",
-                )
-            })?;
-            if schema.validate(structured_content).is_err() {
-                return Err(McpError::internal_error(
-                    "tool output does not match the declared output schema",
-                ));
-            }
-        }
-        Ok(())
+        validate_final_tool_output_schema(self.output.as_deref(), result)
     }
+}
+
+/// Applies the same admitted output contract to immediate and Task completion.
+/// Error results follow the strict server emission rule as well; only peer
+/// ingestion has a separate tolerance for nonconforming error payloads.
+pub(crate) fn validate_final_tool_output_schema(
+    schema: Option<&AdmittedSchema>,
+    result: &FinalCallToolResult,
+) -> McpResult<()> {
+    if let Some(schema) = schema {
+        let structured_content = result.structured_content.as_ref().ok_or_else(|| {
+            McpError::internal_error(
+                "tool output is missing structuredContent required by the declared output schema",
+            )
+        })?;
+        if schema.validate(structured_content).is_err() {
+            return Err(McpError::internal_error(
+                "tool output does not match the declared output schema",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1041,7 +1051,8 @@ fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
                 McpError::internal_error("tool declares an invalid final output schema")
             })
         })
-        .transpose()?;
+        .transpose()?
+        .map(Arc::new);
     let errors = output
         .as_ref()
         .map(|output| -> McpResult<FinalToolErrorStructuredContent> {
@@ -5324,7 +5335,14 @@ impl Router {
         let request_metadata = params.meta.clone();
         #[cfg(feature = "tasks")]
         let original_registration = self.tools.get(&params.name).map(|entry| {
-            (&entry.definition.name, &entry.task_operation_registration)
+            (
+                &entry.definition.name,
+                &entry.task_operation_registration,
+                entry
+                    .final_registration
+                    .as_ref()
+                    .and_then(|registration| registration.schemas.output.clone()),
+            )
         });
         let session_state = request_ctx
             .session_state()
@@ -5363,11 +5381,15 @@ impl Router {
                 work_descriptor,
                 status_message,
             } => {
-                let (original_name, original_registration) = original_registration.ok_or_else(|| {
-                    McpError::internal_error("Task original tool registration is missing")
-                })?;
-                let original =
-                    crate::FinalTaskOperation::for_tool(original_name, original_registration)?;
+                let (original_name, original_registration, output_schema) =
+                    original_registration.ok_or_else(|| {
+                        McpError::internal_error("Task original tool registration is missing")
+                    })?;
+                let original = crate::FinalTaskOperation::for_tool_with_output_schema(
+                    original_name,
+                    original_registration,
+                    output_schema,
+                )?;
                 #[cfg(all(feature = "proxy", feature = "tasks"))]
                 if let Some(relay) = self.final_task_relay.as_ref() {
                     // A relayed task is already durable upstream. Decode its
@@ -6125,9 +6147,10 @@ impl Router {
             // the exact originating operation before any upstream side effect.
             client.authorize_final_task_creation(
                 &ctx,
-                &crate::FinalTaskOperation::for_tool(
+                &crate::FinalTaskOperation::for_tool_with_output_schema(
                     &entry.definition.name,
                     &entry.task_operation_registration,
+                    final_registration.schemas.output.clone(),
                 )?,
             )?;
         }
@@ -23236,6 +23259,120 @@ mod router_tests {
         let fresh_context = request_context(&cx, 161, Budget::INFINITE, &fresh_state);
         assert!(runtime.task_for_request(&fresh_context, &task_id, crate::TaskAccessAction::Get).is_err(),
             "same-name replacement cannot inherit a Task's original registration");
+    }
+
+
+    #[cfg(feature = "tasks")]
+    struct SchemaTaskRouterTool {
+        revision: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "tasks")]
+    impl ToolHandler for SchemaTaskRouterTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "schema-task-router-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "answer": {"const": self.revision.load(Ordering::SeqCst)},
+                        "error": {"type": "string"}
+                    },
+                    "additionalProperties": false,
+                    "anyOf": [{"required": ["answer"]}, {"required": ["error"]}]
+                })),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn declares_final_tasks(&self) -> bool {
+            true
+        }
+
+        fn final_tool_error_structured_content(
+            &self,
+            kind: ToolErrorKind,
+        ) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "error": match kind {
+                    ToolErrorKind::InputValidation => "input-validation",
+                    ToolErrorKind::Handler => "handler",
+                }
+            }))
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(Vec::new())
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            Ok(FinalToolOutcome::CreateTask {
+                work_descriptor: FinalTaskWorkDescriptor::new(serde_json::json!({
+                    "operation": "schema-task-router-tool"
+                }))?,
+                status_message: None,
+            })
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn final_task_output_schema_is_frozen_with_its_original_registration() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = task_runtime_for_router(store.clone());
+        let runner = runtime.install_task_service(1, Arc::new(NoopFinalTaskSupervisor)).unwrap();
+        let service_cx = Cx::for_testing();
+        let mut service = Box::pin(runner.run(&service_cx));
+        let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(Future::poll(service.as_mut(), &mut poll).is_pending());
+        let mut router = Router::new();
+        router.set_final_task_runtime(Some(runtime.clone()));
+        let revision = Arc::new(AtomicUsize::new(7));
+        router.add_tool(SchemaTaskRouterTool { revision: revision.clone() }).unwrap();
+        // The handler's future definition calls change, while the admitted
+        // registration and every Task created from it retain schema 7.
+        revision.store(9, Ordering::SeqCst);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = request_context(&cx, 170, Budget::INFINITE, &state);
+        let mut request = final_task_capable_tool_request(170);
+        request.params.as_mut().unwrap()["name"] = serde_json::json!("schema-task-router-tool");
+        let first = block_on(router.dispatch_stateless(&ctx, &request)).unwrap();
+        let first_id = fastmcp_protocol::FinalTaskId::parse(first["taskId"].as_str().unwrap()).unwrap();
+        let completion = |answer| {
+            serde_json::from_value::<fastmcp_protocol::FinalTaskCallToolResult>(
+                serde_json::json!({"content": [], "structuredContent": {"answer": answer}}),
+            )
+            .unwrap()
+        };
+        runtime.complete_task(&first_id, completion(9), None)
+            .expect_err("mutating handler metadata cannot change an admitted Task schema");
+        assert!(matches!(runtime.get_task(&first_id).unwrap().task, fastmcp_protocol::FinalTask::Working(_)));
+        runtime.complete_task(&first_id, completion(7), None)
+            .expect("the originally admitted output still completes");
+
+        router.add_tool_with_behavior(
+            SchemaTaskRouterTool { revision },
+            crate::DuplicateBehavior::Replace,
+        ).unwrap();
+        assert!(runtime.task_for_request(&ctx, &first_id, crate::TaskAccessAction::Get).is_err(),
+            "a replacement registration cannot adopt its predecessor's Task");
+        let second = block_on(router.dispatch_stateless(&ctx, &request)).unwrap();
+        let second_id = fastmcp_protocol::FinalTaskId::parse(second["taskId"].as_str().unwrap()).unwrap();
+        runtime.complete_task(&second_id, completion(7), None)
+            .expect_err("new Tasks use the replacement's new admitted schema");
+        runtime.complete_task(&second_id, completion(9), None)
+            .expect("the replacement schema governs the new Task");
+        assert!(runtime.task_for_request(&ctx, &second_id, crate::TaskAccessAction::Get).is_ok());
     }
 
     #[cfg(feature = "tasks")]
