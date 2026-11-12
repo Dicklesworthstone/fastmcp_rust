@@ -1160,6 +1160,32 @@ own token acquisition and refresh. Credentials require HTTPS and a modern or
 auto protocol policy. Core-only builds omit Tasks from help and explain
 the required feature when a Tasks command is attempted.
 
+### Subscription-assisted Task driving (current source tree, optional)
+
+With `tasks` enabled, a retained `FinalTaskHandle` can become a
+`FinalTaskDriver` through `into_driver(FinalTaskDrivePolicy)`. Its
+`drive_watching` method combines native HTTP Task notifications with bounded
+polling and installed input callbacks. `drive_watching_with_memory` provides
+the same workflow through the Memory dispatcher. Configure the client's roots,
+sampling, and elicitation callbacks before connecting.
+
+The driver can answer newly requested input and observe completion directly
+from the subscription. Authoritative reads cover the attach/listen gap,
+acknowledged input updates, ambiguous notification timestamps, and silent
+streams. Reads respect the Task's latest `pollIntervalMs`. One invocation
+budget covers subscription setup, waiting, reads, callbacks, and updates;
+`with_maximum_notifications` also bounds repeated notifications.
+
+Keep the same driver when continuing a Task. Its lifetime input ledger prevents
+an already answered input key from invoking a callback again, including after
+a partial update or a switch between watching and polling. Dropping or
+cancelling input resolution preserves an interruption latch and requires
+explicit reconciliation before further automatic callbacks. An empty accepted
+filter or a normal subscription terminal falls back to bounded polling once;
+an interrupted or malformed stream returns its error. The driver never
+reconnects, replays an uncertain update, or cancels the remote Task merely
+because local observation ends.
+
 ### Authenticated HTTP clients (current source tree)
 
 The SDK accepts a caller-acquired bearer credential bound to one exact HTTPS

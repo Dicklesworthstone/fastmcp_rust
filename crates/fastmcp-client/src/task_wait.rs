@@ -121,6 +121,7 @@ pub struct FinalTaskDrivePolicy {
     maximum_input_keys: usize,
     maximum_state_bytes: usize,
     maximum_payload_bytes: usize,
+    maximum_notifications: usize,
 }
 
 impl Default for FinalTaskDrivePolicy {
@@ -131,6 +132,7 @@ impl Default for FinalTaskDrivePolicy {
             maximum_input_keys: 256,
             maximum_state_bytes: 1024 * 1024,
             maximum_payload_bytes: 8 * 1024 * 1024,
+            maximum_notifications: 4096,
         }
     }
 }
@@ -159,7 +161,25 @@ impl FinalTaskDrivePolicy {
             maximum_input_keys,
             maximum_state_bytes,
             maximum_payload_bytes,
+            maximum_notifications: 4096,
         })
+    }
+
+    /// Bounds admitted Task notifications in one subscription-assisted drive.
+    ///
+    /// The default is 4,096; 1..=65,536 are accepted. Repeated snapshots also
+    /// consume this budget, so a peer cannot keep a drive busy indefinitely by
+    /// repeating already answered input. Exhaustion returns a request error
+    /// and closes only this invocation's listener. Poll-only driving does not
+    /// consume this budget.
+    pub fn with_maximum_notifications(mut self, maximum: usize) -> McpResult<Self> {
+        if !(1..=65_536).contains(&maximum) {
+            return Err(McpError::invalid_params(
+                "Invalid final Task notification budget",
+            ));
+        }
+        self.maximum_notifications = maximum;
+        Ok(self)
     }
 
     fn ledger_policy(self) -> ManagedTaskDriverPolicy {
@@ -199,6 +219,10 @@ pub struct FinalTaskDriver {
     policy: FinalTaskDrivePolicy,
     inputs: DriverState,
     input_resolution_interrupted: bool,
+    // A listen gap, changed freshness hint or acknowledged update must not
+    // authorize another callback before an authoritative read, even if this
+    // invocation is dropped and the next invocation uses polling instead.
+    reconcile_before_input: bool,
 }
 
 impl FinalTaskDriver {
@@ -275,6 +299,53 @@ impl FinalTaskDriver {
         drive_task(self, cx, client, cancellation).await
     }
 
+    /// Drives with a native HTTP Task subscription and bounded reconciliation.
+    ///
+    /// Notifications can deliver input or completion before the next poll.
+    /// Authoritative reads still cover the attach/listen acknowledgement gap,
+    /// each input update, ambiguous timestamps and silent streams. Every read
+    /// respects the latest `pollIntervalMs`, or the configured fallback when
+    /// absent. Reads, callbacks and stream waits share the original invocation
+    /// deadline, retention bound, poll limit and lifetime input ledger.
+    ///
+    /// An empty accepted filter or a normal subscription completion/cancellation
+    /// retires this listener and continues with bounded polling. It never opens
+    /// a replacement subscription or repeats an uncertain update. Malformed or
+    /// interrupted streams return their transport error; use the retained
+    /// snapshot and interruption latch to decide an explicit next action.
+    pub async fn drive_watching(
+        &mut self,
+        cx: &Cx,
+        client: &mut HttpClient,
+        cancellation: &McpRequestCancellation,
+        limits: crate::sse::SseLimits,
+    ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+        drive_task_watching(
+            self,
+            cx,
+            &mut HttpTaskInputTransport::native(client),
+            cancellation,
+            limits,
+        )
+        .await
+    }
+
+    /// Drives with an independently owned Memory Task subscription.
+    ///
+    /// This has the same bounded fallback and input-custody rules as
+    /// [`Self::drive_watching`]. The existing Memory dispatcher owns all ingress;
+    /// ordinary requests and other listeners keep their independent custody.
+    /// Dropping or cancelling this future retires only its own listener and
+    /// any input operation currently owned by this driver.
+    pub async fn drive_watching_with_memory(
+        &mut self,
+        cx: &Cx,
+        client: &mut MemoryClient,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<FinalTaskWaitOutcome> {
+        drive_task_watching(self, cx, client, cancellation, ()).await
+    }
+
     /// Drives through the negotiated WebSocket dispatcher and callbacks.
     #[cfg(feature = "websocket-experimental")]
     pub async fn drive_with_websocket<IO>(
@@ -302,6 +373,7 @@ impl FinalTaskHandle {
             policy,
             inputs: DriverState::default(),
             input_resolution_interrupted: false,
+            reconcile_before_input: false,
         }
     }
 
@@ -1842,6 +1914,412 @@ fn drive_ledger_error(error: ManagedTaskDriverError) -> McpError {
     })
 }
 
+async fn resolve_driver_inputs<T: TaskInputTransport>(
+    driver: &mut FinalTaskDriver,
+    cx: &Cx,
+    client: &mut T,
+    cancellation: &McpRequestCancellation,
+    budget: &WaitBudget,
+    updates: &mut usize,
+) -> Result<Option<FinalTaskWaitOutcome>, T::Error> {
+    let FinalTask::InputRequired { input_requests, .. } = driver.task() else {
+        return Ok(ready_outcome(driver.task()));
+    };
+    let policy = driver.policy;
+    if policy.maximum_updates == 0 {
+        return Ok(Some(FinalTaskWaitOutcome::InputRequired));
+    }
+    if driver.reconcile_before_input {
+        return Ok(None);
+    }
+    let (unanswered, fingerprints) = driver
+        .inputs
+        .unanswered(input_requests, policy.ledger_policy())
+        .map_err(drive_ledger_error)?;
+    if unanswered.is_empty() {
+        return Ok(None);
+    }
+    if *updates >= policy.maximum_updates {
+        return Err(McpError::invalid_request("Final Task input-update budget exhausted").into());
+    }
+    let keys: Vec<_> = unanswered.keys().cloned().collect();
+    // Reserve all ledger capacity before Host effects. No other borrower can
+    // change this owner before the acknowledgement is recorded.
+    driver
+        .inputs
+        .answer_bytes(&keys, &fingerprints, policy.maximum_state_bytes)
+        .map_err(drive_ledger_error)?;
+    let mut snapshot = driver.task().clone();
+    let FinalTask::InputRequired { input_requests, .. } = &mut snapshot else {
+        unreachable!("the current snapshot requires input");
+    };
+    *input_requests = unanswered;
+    let interrupted = &mut driver.input_resolution_interrupted;
+    let resolution = resolve_snapshot_with_transport(
+        cx,
+        cancellation,
+        client,
+        &snapshot,
+        policy
+            .maximum_input_keys
+            .min(fastmcp_protocol::tasks_extension::MAX_TASK_INPUT_MAP_ENTRIES),
+        policy.maximum_payload_bytes,
+        || *interrupted = true,
+    );
+    match budget.guard(cx, cancellation, resolution).await {
+        Ok(result) => {
+            result?;
+        }
+        Err(outcome) => return Ok(Some(outcome)),
+    }
+    // This synchronous handoff is the only place that clears the latch.
+    // Dropping either future before it runs retains uncertainty, including
+    // a response lost after update dispatch. An ACK is never a new snapshot.
+    driver
+        .inputs
+        .record_answers(&keys, &fingerprints, policy.maximum_state_bytes)
+        .map_err(drive_ledger_error)?;
+    driver.input_resolution_interrupted = false;
+    driver.reconcile_before_input = true;
+    *updates += 1;
+    Ok(None)
+}
+
+/// Only transports whose event future retains partial ingress on its listener
+/// may implement this trait. A poll timer may drop that future while retaining
+/// the listener, then issue an authoritative read on the same client. In
+/// particular, the stdio singleton reader is not admitted by this contract.
+trait TaskDriveWatchTransport: TaskInputTransport {
+    type Listener;
+    type Options;
+
+    async fn open_drive_watch(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        filter: SubscriptionFilter,
+        options: Self::Options,
+    ) -> Result<Self::Listener, Self::Error>;
+
+    async fn next_drive_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        listener: &mut Self::Listener,
+    ) -> Result<StdioTaskSubscriptionEvent, Self::Error>;
+
+    fn abandon_drive_watch(&mut self, listener: Self::Listener);
+}
+
+impl TaskDriveWatchTransport for MemoryClient {
+    type Listener = MemorySubscriptionExecution;
+    type Options = ();
+
+    async fn open_drive_watch(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        filter: SubscriptionFilter,
+        (): (),
+    ) -> McpResult<Self::Listener> {
+        self.subscribe(cx, cancellation, filter).await
+    }
+
+    async fn next_drive_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        listener: &mut Self::Listener,
+    ) -> McpResult<StdioTaskSubscriptionEvent> {
+        TaskWatchTransport::next_watch_event(self, cx, cancellation, listener).await
+    }
+
+    fn abandon_drive_watch(&mut self, listener: Self::Listener) {
+        drop(listener);
+    }
+}
+
+impl TaskDriveWatchTransport for HttpTaskInputTransport<'_> {
+    type Listener = crate::ModernHttpSubscriptionListener;
+    type Options = crate::sse::SseLimits;
+
+    async fn open_drive_watch(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        filter: SubscriptionFilter,
+        limits: Self::Options,
+    ) -> Result<Self::Listener, HttpClientError> {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled().into());
+        }
+        self.client_mut()
+            .open_final_task_watch_listener(cx, filter, limits)
+            .await
+    }
+
+    async fn next_drive_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        listener: &mut Self::Listener,
+    ) -> Result<StdioTaskSubscriptionEvent, HttpClientError> {
+        use crate::ModernHttpSubscriptionListenEvent as Event;
+
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled().into());
+        }
+        let event = listener.next_event(cx).await.map_err(|error| {
+            HttpClientError::Connection(crate::ClientHttpConnectionError::SubscriptionsListen(error))
+        })?;
+        match event {
+            Some(Event::Acknowledged { accepted_filter }) => {
+                Ok(StdioTaskSubscriptionEvent::Acknowledged(accepted_filter))
+            }
+            Some(Event::TaskNotification(notification)) => {
+                Ok(StdioTaskSubscriptionEvent::Notification(notification))
+            }
+            Some(Event::Terminal { .. } | Event::Cancelled { .. }) | None => {
+                Ok(StdioTaskSubscriptionEvent::Terminal)
+            }
+            Some(Event::Notification(_)) => Err(McpError::invalid_request(
+                "Final Task watch received an unrequested core notification",
+            )
+            .into()),
+        }
+    }
+
+    fn abandon_drive_watch(&mut self, mut listener: Self::Listener) {
+        listener.cancel();
+    }
+}
+
+struct TaskDriveWatch<'client, T: TaskDriveWatchTransport> {
+    client: &'client mut T,
+    listener: Option<T::Listener>,
+}
+
+impl<T: TaskDriveWatchTransport> TaskDriveWatch<'_, T> {
+    fn retire(&mut self) {
+        if let Some(listener) = self.listener.take() {
+            self.client.abandon_drive_watch(listener);
+        }
+    }
+}
+
+impl<T: TaskDriveWatchTransport> Drop for TaskDriveWatch<'_, T> {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+/// Keep the complete peer suggestion without narrowing a large millisecond
+/// value through the runtime's u64 nanosecond clock. Each actual timer is met
+/// with the already bounded invocation budget before it is constructed.
+struct TaskPollSchedule {
+    wall_started: Instant,
+    runtime_started: Time,
+    delay: Duration,
+}
+
+impl TaskPollSchedule {
+    fn new(cx: &Cx, task: &FinalTask, policy: FinalTaskWaitPolicy) -> McpResult<Self> {
+        Ok(Self {
+            wall_started: Instant::now(),
+            runtime_started: cx.now(),
+            delay: next_delay(task, policy)?,
+        })
+    }
+
+    fn remaining(&self, cx: &Cx) -> Duration {
+        let elapsed = self.wall_started.elapsed().max(Duration::from_nanos(
+            cx.now().duration_since(self.runtime_started),
+        ));
+        self.delay.saturating_sub(elapsed)
+    }
+}
+
+async fn next_drive_watch_step<T: TaskDriveWatchTransport>(
+    watch: &mut TaskDriveWatch<'_, T>,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    schedule: &TaskPollSchedule,
+    budget: &WaitBudget,
+) -> Result<Option<StdioTaskSubscriptionEvent>, T::Error> {
+    let delay = schedule.remaining(cx).min(budget.remaining(cx));
+    let mut timer = std::pin::pin!(asupersync::time::sleep(cx.now(), delay));
+    let Some(listener) = watch.listener.as_mut() else {
+        timer.await;
+        return Ok(None);
+    };
+    let mut event = std::pin::pin!(watch.client.next_drive_event(cx, cancellation, listener));
+    std::future::poll_fn(|task_cx| {
+        // A stream of immediately ready duplicates cannot starve a due read.
+        if timer.as_mut().poll(task_cx).is_ready() {
+            return Poll::Ready(Ok(None));
+        }
+        event.as_mut().poll(task_cx).map(|result| result.map(Some))
+    })
+    .await
+}
+
+async fn drive_task_watching<T: TaskDriveWatchTransport>(
+    driver: &mut FinalTaskDriver,
+    cx: &Cx,
+    client: &mut T,
+    cancellation: &McpRequestCancellation,
+    options: T::Options,
+) -> Result<FinalTaskWaitOutcome, T::Error> {
+    if let Some(outcome) = ready_outcome(driver.task())
+        && outcome != FinalTaskWaitOutcome::InputRequired
+    {
+        return Ok(outcome);
+    }
+    let caller = with_caller(cx, || Cx::current().expect("Task drive caller is installed"));
+    let cx = &caller;
+    let policy = driver.policy;
+    let mut budget = WaitBudget::new(cx, policy.wait.timeout, driver.task())?;
+    if let Some(outcome) = budget.stop(cx, cancellation) {
+        return Ok(outcome);
+    }
+    if driver.input_resolution_interrupted {
+        return Err(McpError::invalid_request(
+            "Final Task input resolution was interrupted; manual reconciliation is required",
+        )
+        .into());
+    }
+    if cx.timer_driver().is_none() {
+        return Ok(FinalTaskWaitOutcome::TimerUnavailable);
+    }
+
+    let mut schedule = TaskPollSchedule::new(cx, driver.task(), policy.wait)?;
+    let mut filter = SubscriptionFilter::default();
+    fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![driver.task_id().clone()])
+        .map_err(|_| McpError::internal_error("Final Task watch filter could not be composed"))?;
+    // This fact survives future drop and a later switch to poll-only driving.
+    driver.reconcile_before_input = true;
+    let mut watch = TaskDriveWatch { client, listener: None };
+    watch.listener = Some(match budget
+        .guard(
+            cx,
+            cancellation,
+            watch.client.open_drive_watch(cx, cancellation, filter, options),
+        )
+        .await
+    {
+        Ok(result) => result?,
+        Err(outcome) => return Ok(outcome),
+    });
+
+    let mut polls = 0;
+    let mut updates = 0;
+    let mut notifications = 0;
+    loop {
+        if let Some(outcome) = budget.stop(cx, cancellation) {
+            return Ok(outcome);
+        }
+        let previous_updates = updates;
+        if let Some(outcome) = resolve_driver_inputs(
+            driver, cx, watch.client, cancellation, &budget, &mut updates,
+        )
+        .await?
+        {
+            return Ok(outcome);
+        }
+        if updates != previous_updates {
+            schedule = TaskPollSchedule::new(cx, driver.task(), policy.wait)?;
+        }
+        let event = match budget
+            .guard(
+                cx,
+                cancellation,
+                next_drive_watch_step(&mut watch, cx, cancellation, &schedule, &budget),
+            )
+            .await
+        {
+            Ok(result) => result?,
+            Err(outcome) => return Ok(outcome),
+        };
+        match event {
+            None => {
+                if polls >= policy.wait.maximum_polls {
+                    return Ok(FinalTaskWaitOutcome::PollLimitReached);
+                }
+                let task = match budget
+                    .guard(
+                        cx,
+                        cancellation,
+                        watch.client.read(cx, cancellation, driver.task_id().clone()),
+                    )
+                    .await
+                {
+                    Ok(result) => result?,
+                    Err(outcome) => return Ok(outcome),
+                };
+                polls += 1;
+                admit_identity(driver.task(), &task)?;
+                budget.refresh_retention(cx, &task)?;
+                if let Some(outcome) = budget.stop(cx, cancellation) {
+                    return Ok(outcome);
+                }
+                driver.handle.task = task;
+                driver.reconcile_before_input = false;
+                schedule = TaskPollSchedule::new(cx, driver.task(), policy.wait)?;
+            }
+            Some(StdioTaskSubscriptionEvent::Acknowledged(accepted_filter)) => {
+                let accepted = task_subscription_ids(&accepted_filter)
+                    .map_err(|_| McpError::invalid_request("Invalid final Task watch acknowledgement"))?
+                    .unwrap_or_default();
+                if accepted.iter().any(|id| id != driver.task_id()) {
+                    return Err(McpError::invalid_request(
+                        "Final Task watch acknowledgement widened the requested Task filter",
+                    )
+                    .into());
+                }
+                // Even if a silent listener allowed an earlier read, reconcile
+                // the gap ending at this acknowledgement before new callbacks.
+                driver.reconcile_before_input = true;
+                if accepted.is_empty() {
+                    watch.retire();
+                }
+            }
+            Some(StdioTaskSubscriptionEvent::Notification(notification)) => {
+                if notifications >= policy.maximum_notifications {
+                    return Err(McpError::invalid_request(
+                        "Final Task subscription notification budget exhausted",
+                    )
+                    .into());
+                }
+                notifications += 1;
+                let task = notification.params.task;
+                admit_identity(driver.task(), &task)?;
+                if driver.handle.snapshot_is_identical(&task).map_err(task_watch_comparison_error)? {
+                    asupersync::runtime::yield_now().await;
+                    continue;
+                }
+                if driver.handle.notification_needs_reconciliation(&task)
+                    .map_err(task_watch_comparison_error)?
+                {
+                    driver.reconcile_before_input = true;
+                    continue;
+                }
+                budget.refresh_retention(cx, &task)?;
+                if let Some(outcome) = budget.stop(cx, cancellation) {
+                    return Ok(outcome);
+                }
+                driver.handle.task = task;
+                schedule = TaskPollSchedule::new(cx, driver.task(), policy.wait)?;
+            }
+            Some(StdioTaskSubscriptionEvent::Terminal) => {
+                // Ending a subscription says nothing about the remote Task.
+                // Retire once and continue under the same finite read budget.
+                watch.retire();
+                driver.reconcile_before_input = true;
+            }
+        }
+    }
+}
+
 async fn drive_task<T: TaskInputTransport>(
     driver: &mut FinalTaskDriver,
     cx: &Cx,
@@ -1877,62 +2355,9 @@ async fn drive_task<T: TaskInputTransport>(
         if let Some(outcome) = budget.stop(cx, cancellation) {
             return Ok(outcome);
         }
-        if let FinalTask::InputRequired { input_requests, .. } = driver.task() {
-            if policy.maximum_updates == 0 {
-                return Ok(FinalTaskWaitOutcome::InputRequired);
-            }
-            let (unanswered, fingerprints) = driver
-                .inputs
-                .unanswered(input_requests, policy.ledger_policy())
-                .map_err(drive_ledger_error)?;
-            if !unanswered.is_empty() {
-                if updates >= policy.maximum_updates {
-                    return Err(McpError::invalid_request(
-                        "Final Task input-update budget exhausted",
-                    )
-                    .into());
-                }
-                let keys: Vec<_> = unanswered.keys().cloned().collect();
-                // Reserve all ledger capacity before Host effects. No other
-                // borrower can change this owner before the ACK is recorded.
-                driver
-                    .inputs
-                    .answer_bytes(&keys, &fingerprints, policy.maximum_state_bytes)
-                    .map_err(drive_ledger_error)?;
-                let mut snapshot = driver.task().clone();
-                let FinalTask::InputRequired { input_requests, .. } = &mut snapshot else {
-                    unreachable!("the current snapshot requires input");
-                };
-                *input_requests = unanswered;
-                let interrupted = &mut driver.input_resolution_interrupted;
-                let resolution = resolve_snapshot_with_transport(
-                    cx,
-                    cancellation,
-                    client,
-                    &snapshot,
-                    policy.maximum_input_keys.min(
-                        fastmcp_protocol::tasks_extension::MAX_TASK_INPUT_MAP_ENTRIES,
-                    ),
-                    policy.maximum_payload_bytes,
-                    || *interrupted = true,
-                );
-                match budget.guard(cx, cancellation, resolution).await {
-                    Ok(result) => {
-                        result?;
-                    }
-                    Err(outcome) => return Ok(outcome),
-                }
-                // This synchronous handoff is the only place that clears the
-                // latch. Dropping either future before it runs retains the
-                // uncertainty, including a response lost after update dispatch.
-                driver
-                    .inputs
-                    .record_answers(&keys, &fingerprints, policy.maximum_state_bytes)
-                    .map_err(drive_ledger_error)?;
-                driver.input_resolution_interrupted = false;
-                updates += 1;
-            }
-        } else if let Some(outcome) = ready_outcome(driver.task()) {
+        if let Some(outcome) =
+            resolve_driver_inputs(driver, cx, client, cancellation, &budget, &mut updates).await?
+        {
             return Ok(outcome);
         }
         if polls >= policy.wait.maximum_polls {
@@ -1977,6 +2402,7 @@ async fn drive_task<T: TaskInputTransport>(
             return Ok(outcome);
         }
         driver.handle.task = task;
+        driver.reconcile_before_input = false;
     }
 }
 

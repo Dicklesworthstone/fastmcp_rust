@@ -364,6 +364,11 @@ impl<'client> HttpTaskInputTransport<'client> {
             request_id: None,
         }
     }
+
+    /// Shares the same connection and allocator with a caller-owned listener.
+    pub(crate) fn client_mut(&mut self) -> &mut HttpClient {
+        self.client
+    }
 }
 
 impl TaskInputTransport for HttpTaskInputTransport<'_> {
@@ -1983,6 +1988,173 @@ mod native_tests {
                 .connect_http_client_with_cx(cx)
                 .await
                 .unwrap()
+        }
+
+        fn watch_reply(stream: &mut TcpStream, id: u64, result: Value) {
+            let body = serde_json::to_vec(&json!({
+                "jsonrpc":"2.0", "id":id, "result":result,
+            })).unwrap();
+            write!(stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            ).unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+        }
+
+        fn watch_event(stream: &mut TcpStream, method: &str, mut params: Value) {
+            params["_meta"] = json!({"io.modelcontextprotocol/subscriptionId":3});
+            let event = json!({"jsonrpc":"2.0", "method":method, "params":params});
+            write!(stream, "data: {event}\n\n").unwrap();
+            stream.flush().unwrap();
+        }
+
+        fn watch_request(listener: &TcpListener, method: &str, id: u64) -> (TcpStream, Value) {
+            let mut stream = accept(listener);
+            let request = read(&mut stream);
+            assert_eq!(request["method"], method, "watching must not replay or reconnect");
+            assert_eq!(request["id"], id);
+            (stream, request)
+        }
+
+        fn watch_peer(mode: &'static str) -> (String, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let peer = std::thread::spawn(move || {
+                let (mut stream, _) = watch_request(&listener, "server/discover", 1);
+                let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+                    &fastmcp_protocol::ServerBehaviorRegistry::from_behaviors([
+                        fastmcp_protocol::ServerBehavior::ToolsList,
+                        fastmcp_protocol::ServerBehavior::SubscriptionsListen,
+                    ]),
+                    std::collections::BTreeMap::from([(
+                        fastmcp_protocol::TASKS_EXTENSION.to_owned(), json!({}),
+                    )]),
+                ).unwrap();
+                let mut discovered = discovery();
+                discovered["capabilities"] = serde_json::to_value(capabilities).unwrap();
+                watch_reply(&mut stream, 1, discovered);
+                drop(stream);
+
+                let mut working = snapshot(json!({}));
+                working["status"] = json!("working");
+                working.as_object_mut().unwrap().remove("inputRequests");
+                let (mut stream, _) = watch_request(&listener, "tasks/get", 2);
+                watch_reply(&mut stream, 2, working.clone());
+                drop(stream);
+                let (mut events, request) = watch_request(&listener, "subscriptions/listen", 3);
+                assert_eq!(request["params"]["notifications"]["taskIds"], json!(["task-1"]));
+                write!(events,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                ).unwrap();
+                watch_event(&mut events, "notifications/subscriptions/acknowledged", json!({
+                    "notifications":{"taskIds":if mode == "empty" { json!([]) } else { json!(["task-1"]) }},
+                }));
+                if mode == "empty" {
+                    let mut byte = [0_u8; 1];
+                    assert_eq!(events.read(&mut byte).unwrap(), 0,
+                        "empty acceptance must release the listener before fallback");
+                }
+                let (mut stream, _) = watch_request(&listener, "tasks/get", 4);
+                let next_id = if mode == "empty" {
+                    watch_reply(&mut stream, 4, completed());
+                    5
+                } else {
+                    // A callback or terminal before this floor elapses must
+                    // have come from the still-owned notification stream.
+                    working["pollIntervalMs"] = json!(600_001);
+                    watch_reply(&mut stream, 4, working.clone());
+                    drop(stream);
+                    if mode == "eof" {
+                        drop(events);
+                        5
+                    } else {
+                        let mut input = snapshot(inputs());
+                        input.as_object_mut().unwrap().remove("resultType");
+                        input["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+                        watch_event(&mut events, "notifications/tasks", input.clone());
+                        let (mut stream, request) = watch_request(&listener, "tasks/update", 5);
+                        assert_eq!(request["params"]["inputResponses"], answers());
+                        watch_reply(&mut stream, 5, json!({"resultType":"complete"}));
+                        drop(stream);
+                        watch_event(&mut events, "notifications/tasks", input);
+                        let (mut stream, _) = watch_request(&listener, "tasks/get", 6);
+                        working["lastUpdatedAt"] = json!("2026-07-28T12:00:03Z");
+                        watch_reply(&mut stream, 6, working);
+                        drop(stream);
+                        let mut terminal = completed();
+                        terminal.as_object_mut().unwrap().remove("resultType");
+                        terminal["lastUpdatedAt"] = json!("2026-07-28T12:00:04Z");
+                        terminal["result"]["exact"] = Value::Number(
+                            serde_json::Number::from_string_unchecked("1.20e+4".to_owned()),
+                        );
+                        watch_event(&mut events, "notifications/tasks", terminal);
+                        7
+                    }
+                };
+                let (mut sentinel, _) = watch_request(&listener, "tools/list", next_id);
+                watch_reply(&mut sentinel, next_id, catalog());
+            });
+            (target, peer)
+        }
+
+        #[test]
+        fn public_http_task_watch_driver_resolves_notified_inputs_and_exact_completion() {
+            let (target, peer) = watch_peer("complete");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let owners = Arc::new(Mutex::new(Vec::new()));
+            run(async {
+                let cx = Cx::current().unwrap();
+                let mut client = connect(&cx, &target, handlers(&calls, &owners)).await;
+                let handle = client.attach_final_task(&cx, id()).await.unwrap();
+                let policy = FinalTaskDrivePolicy::new(
+                    FinalTaskWaitPolicy::new(Duration::from_secs(2), 8, Duration::from_millis(20)).unwrap(),
+                    2, 3, INPUT_BYTES, INPUT_BYTES,
+                ).unwrap();
+                let mut driver = handle.into_driver(policy);
+                assert_eq!(driver.drive_watching(
+                    &cx, &mut client, &McpRequestCancellation::new(), crate::sse::SseLimits::default(),
+                ).await.unwrap(), FinalTaskWaitOutcome::Completed);
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert!(!driver.input_resolution_interrupted());
+                assert!(serde_json::to_string(driver.task()).unwrap().contains("1.20e+4"));
+                assert!(owners.lock().unwrap().iter().all(|owner| !owner.is_cancel_requested()));
+                client.list_tools(&cx, None).await.unwrap();
+            });
+            peer.join().unwrap();
+        }
+
+        #[test]
+        fn public_http_task_watch_driver_empty_ack_falls_back_and_interrupted_eof_stops() {
+            for mode in ["empty", "eof"] {
+                let (target, peer) = watch_peer(mode);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owners = Arc::new(Mutex::new(Vec::new()));
+                run(async {
+                    let cx = Cx::current().unwrap();
+                    let mut client = connect(&cx, &target, handlers(&calls, &owners)).await;
+                    let handle = client.attach_final_task(&cx, id()).await.unwrap();
+                    let policy = FinalTaskDrivePolicy::new(
+                        FinalTaskWaitPolicy::new(Duration::from_secs(2), 4, Duration::from_millis(20)).unwrap(),
+                        1, 3, INPUT_BYTES, INPUT_BYTES,
+                    ).unwrap();
+                    let mut driver = handle.into_driver(policy);
+                    let result = driver.drive_watching(
+                        &cx, &mut client, &McpRequestCancellation::new(), crate::sse::SseLimits::default(),
+                    ).await;
+                    if mode == "empty" {
+                        assert_eq!(result.unwrap(), FinalTaskWaitOutcome::Completed);
+                    } else {
+                        assert!(result.is_err(), "EOF without a subscription terminal is not successful completion");
+                        assert!(matches!(driver.task(), FinalTask::Working(_)));
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert!(!driver.input_resolution_interrupted());
+                    client.list_tools(&cx, None).await.unwrap();
+                });
+                peer.join().unwrap();
+            }
         }
 
         #[test]
