@@ -68,17 +68,18 @@ use std::pin::Pin;
 
 #[cfg(test)]
 use asupersync::CancelKind;
-use asupersync::{Budget, CancelReason, Cx};
 use asupersync::channel::mpsc::{self, Receiver, Sender};
 use asupersync::cx::ChildRegionSpec;
 use asupersync::runtime::TaskHandle;
-use asupersync::types::CapabilityBudgetRequirements;
 #[cfg(test)]
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
+use asupersync::types::CapabilityBudgetRequirements;
+use asupersync::{Budget, CancelReason, Cx};
 use base64::Engine as _;
 use fastmcp_core::crypto::Sha256Digest;
 #[cfg(test)]
 use fastmcp_core::logging::{debug, info, targets, warn};
+use fastmcp_core::runtime::{ProcessGeneration, ProcessGenerationGuard};
 use fastmcp_core::{McpContext, McpError, McpResult, draw_security_identifier};
 use fastmcp_protocol::tasks_extension::TaskStatusNotificationParams as FinalTaskStatusNotificationParams;
 use fastmcp_protocol::{
@@ -2536,7 +2537,15 @@ const FINAL_TASK_CANCELLATION_RESERVE_BYTES: usize =
 /// Payload bounds measure encoded bytes, not decoded heap or application
 /// allocations. Execution limits bound admitted handoffs, not their memory.
 /// Neither limit establishes framework-wide memory or persistent-storage guarantees.
+///
+/// The store and its execution permits belong to the process generation that
+/// created them. Fallible operations reject an inherited store before locking
+/// its state or invoking its clock. Infallible state/clock accessors panic with
+/// a fixed diagnostic at that same boundary; they never report empty state for
+/// an unusable store. Dropping an inherited execution permit skips its pool
+/// lock. This detects a changed process identity, not same-PID memory snapshots.
 pub struct InMemoryFinalTaskStore {
+    process: TaskProcessGuard,
     max_tasks: usize,
     execution_limits: FinalTaskExecutionLimits,
     execution_admission: Arc<InMemoryFinalTaskExecutionAdmission>,
@@ -2977,10 +2986,46 @@ fn prepare_in_memory_final_task_input_key_history(
     Ok(Some(next))
 }
 
+/// Binds Task state and grants to the installed process generation.
+///
+/// Keep the recorded generation private. The public observed-identity type is
+/// useful for conformance tests, but cannot replace the installed live guard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TaskProcessGuard {
+    generation: ProcessGeneration,
+}
+
+const TASK_PROCESS_UNAVAILABLE: &str =
+    "Task state is unavailable outside its creating process generation";
+
+impl TaskProcessGuard {
+    fn new() -> McpResult<Self> {
+        let guard = ProcessGenerationGuard::install()
+            .map_err(|_| McpError::internal_error(TASK_PROCESS_UNAVAILABLE))?;
+        Ok(Self {
+            generation: guard.generation(),
+        })
+    }
+
+    fn verify(&self) -> McpResult<()> {
+        let guard = ProcessGenerationGuard::installed()
+            .ok_or_else(|| McpError::internal_error(TASK_PROCESS_UNAVAILABLE))?;
+        guard
+            .verify_current()
+            .and_then(|()| self.generation.admit(guard.generation()))
+            .map_err(|_| McpError::internal_error(TASK_PROCESS_UNAVAILABLE))
+    }
+
+    fn assert_current(&self) {
+        assert!(self.verify().is_ok(), "{TASK_PROCESS_UNAVAILABLE}");
+    }
+}
+
 /// Shared process-local execution capacity, independent of retained task
 /// records and renewable leases. Lock order is task state, then this pool;
 /// releasing a permit only locks the pool and never re-enters the store.
 struct InMemoryFinalTaskExecutionAdmission {
+    process: TaskProcessGuard,
     max_active: usize,
     max_active_per_owner: usize,
     state: Mutex<InMemoryFinalTaskExecutionAdmissionState>,
@@ -3011,8 +3056,9 @@ struct InMemoryFinalTaskExecutionPermit {
 }
 
 impl InMemoryFinalTaskExecutionAdmission {
-    fn new(max_active: usize, max_active_per_owner: usize) -> Self {
+    fn new(process: TaskProcessGuard, max_active: usize, max_active_per_owner: usize) -> Self {
         Self {
+            process,
             max_active,
             max_active_per_owner,
             state: Mutex::new(InMemoryFinalTaskExecutionAdmissionState::default()),
@@ -3025,6 +3071,7 @@ impl InMemoryFinalTaskExecutionAdmission {
         task_id: &FinalTaskId,
         principal: Option<Sha256Digest>,
     ) -> bool {
+        self.process.assert_current();
         state.reservations.len() < self.max_active
             && !state.reservations.contains_key(task_id)
             && state
@@ -3042,6 +3089,7 @@ impl InMemoryFinalTaskExecutionAdmission {
         owner_id: &str,
         principal: Option<Sha256Digest>,
     ) -> McpResult<Option<Arc<InMemoryFinalTaskExecutionPermit>>> {
+        self.process.verify()?;
         let mut state = self
             .state
             .lock()
@@ -3078,6 +3126,11 @@ impl InMemoryFinalTaskExecutionAdmission {
 
 impl Drop for InMemoryFinalTaskExecutionPermit {
     fn drop(&mut self) {
+        // An inherited mutex may have been locked by a thread that no longer
+        // exists. Destruction cannot reconcile the parent's reservations.
+        if self.admission.process.verify().is_err() {
+            return;
+        }
         let mut state = self
             .admission
             .state
@@ -3125,6 +3178,20 @@ const IN_MEMORY_FINAL_TASK_HANDOFF_LEASE: StdDuration = StdDuration::from_secs(3
 const IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT: StdDuration = StdDuration::from_secs(10);
 
 impl InMemoryFinalTaskStore {
+    /// The clock is application code and may change process identity. Recheck
+    /// its return boundary before the caller observes or mutates retained state.
+    fn sample_clock(&self) -> McpResult<Instant> {
+        self.process.verify()?;
+        let now = (self.clock)();
+        self.process.verify()?;
+        Ok(now)
+    }
+
+    fn sample_clock_or_panic(&self) -> Instant {
+        self.sample_clock()
+            .unwrap_or_else(|_| panic!("{TASK_PROCESS_UNAVAILABLE}"))
+    }
+
     /// Default maximum retained tasks in one immutable principal partition.
     pub const DEFAULT_MAX_TASKS_PER_OWNER: usize = 1_024;
     /// Maximum configurable retained tasks in one principal partition.
@@ -3156,6 +3223,7 @@ impl InMemoryFinalTaskStore {
         max_tasks_per_owner: usize,
         max_payload_bytes_per_owner: usize,
     ) -> McpResult<Self> {
+        self.process.verify()?;
         let state = self
             .state
             .get_mut()
@@ -3210,6 +3278,7 @@ impl InMemoryFinalTaskStore {
         max_active: usize,
         max_active_per_owner: usize,
     ) -> McpResult<Self> {
+        self.process.verify()?;
         let state = self
             .state
             .get_mut()
@@ -3229,6 +3298,7 @@ impl InMemoryFinalTaskStore {
             ));
         }
         self.execution_admission = Arc::new(InMemoryFinalTaskExecutionAdmission::new(
+            self.process,
             max_active,
             max_active_per_owner,
         ));
@@ -3253,6 +3323,8 @@ impl InMemoryFinalTaskStore {
     /// future keeps its slot until destruction even after lease expiry.
     #[must_use]
     pub fn active_task_count(&self) -> usize {
+        self.process.assert_current();
+        self.execution_admission.process.assert_current();
         self.execution_admission
             .state
             .lock()
@@ -3265,6 +3337,7 @@ impl InMemoryFinalTaskStore {
     /// This consumes an empty store, so policy cannot change underneath an
     /// installed administrator or invalidate an existing idempotency window.
     pub fn with_retention_policy(mut self, policy: TaskRetentionPolicy) -> McpResult<Self> {
+        self.process.verify()?;
         let state = self
             .state
             .get_mut()
@@ -3279,6 +3352,9 @@ impl InMemoryFinalTaskStore {
     }
 
     /// Creates a store with the system monotonic clock and bounded retention.
+    ///
+    /// Returns an error if process-generation initialization fails or the
+    /// installed guard was inherited from another process.
     pub fn new(max_tasks: usize) -> McpResult<Self> {
         Self::with_clock(max_tasks, Arc::new(Instant::now))
     }
@@ -3348,11 +3424,14 @@ impl InMemoryFinalTaskStore {
                 "In-memory final task payload capacity must be between 1 byte and 512 MiB",
             ));
         }
+        let process = TaskProcessGuard::new()?;
         let max_active = max_tasks.min(Self::DEFAULT_MAX_ACTIVE_TASKS);
         Ok(Self {
+            process,
             max_tasks,
             execution_limits,
             execution_admission: Arc::new(InMemoryFinalTaskExecutionAdmission::new(
+                process,
                 max_active,
                 max_active.min(Self::DEFAULT_MAX_ACTIVE_TASKS_PER_OWNER),
             )),
@@ -3374,6 +3453,7 @@ impl InMemoryFinalTaskStore {
     /// Returns the configured compact-JSON payload capacity.
     #[must_use]
     pub fn max_payload_bytes(&self) -> usize {
+        self.process.assert_current();
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3384,6 +3464,7 @@ impl InMemoryFinalTaskStore {
     /// Returns the immutable retained-record ceiling for each owner partition.
     #[must_use]
     pub fn max_tasks_per_owner(&self) -> usize {
+        self.process.assert_current();
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3394,6 +3475,7 @@ impl InMemoryFinalTaskStore {
     /// Returns each owner's encoded-payload ceiling, including terminal reserve.
     #[must_use]
     pub fn max_payload_bytes_per_owner(&self) -> usize {
+        self.process.assert_current();
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3406,11 +3488,12 @@ impl InMemoryFinalTaskStore {
     /// This reports payload bytes, excluding unused cancellation reservations.
     #[must_use]
     pub fn retained_payload_bytes(&self) -> usize {
+        self.process.assert_current();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, (self.clock)());
+        reclaim_expired_in_memory_final_tasks(&mut state, self.sample_clock_or_panic());
         state.payload_accounting.total
     }
 
@@ -3423,7 +3506,8 @@ impl InMemoryFinalTaskStore {
     /// Returns the current number of retained tasks.
     #[must_use]
     pub fn task_count(&self) -> usize {
-        let now = (self.clock)();
+        self.process.assert_current();
+        let now = self.sample_clock_or_panic();
         let mut state = self
             .state
             .lock()
@@ -3438,7 +3522,8 @@ impl InMemoryFinalTaskStore {
         &self,
         task_id: &FinalTaskId,
     ) -> Option<FinalTaskStatusNotification> {
-        let now = (self.clock)();
+        self.process.assert_current();
+        let now = self.sample_clock_or_panic();
         let mut state = self
             .state
             .lock()
@@ -3455,6 +3540,7 @@ impl InMemoryFinalTaskStore {
         principal: Option<Sha256Digest>,
         operation: Option<FinalTaskOperation>,
     ) -> McpResult<FinalTaskSnapshot> {
+        self.process.verify()?;
         let task_id = task.base().task_id.clone();
         validate_final_task_storage_shape(&task)?;
         ensure_final_task_notification_matches_task(&task, &notification)?;
@@ -3468,7 +3554,7 @@ impl InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         let expires_at = in_memory_final_task_expiry(&task, now)?;
         let execution_budget =
             new_in_memory_final_task_execution_budget(self.execution_limits, now)?;
@@ -3529,12 +3615,13 @@ impl InMemoryFinalTaskStore {
 impl Default for InMemoryFinalTaskStore {
     fn default() -> Self {
         Self::new(DEFAULT_IN_MEMORY_FINAL_TASKS)
-            .expect("the fixed default in-memory final task capacity is positive")
+            .expect("default Task storage requires a valid process generation and entropy")
     }
 }
 
 impl FinalTaskStore for InMemoryFinalTaskStore {
     fn retention_administration_policy(&self) -> McpResult<TaskRetentionPolicy> {
+        self.process.verify()?;
         Ok(self
             .state
             .lock()
@@ -3550,8 +3637,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         generation: u64,
         reason: TaskRetentionReason,
     ) -> McpResult<TaskRetentionReclamation> {
+        self.process.verify()?;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
@@ -3650,9 +3738,10 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         after: Option<u64>,
         limit: usize,
     ) -> McpResult<TaskRetentionAuditPage> {
+        self.process.verify()?;
         validate_task_retention_page_limit(limit)?;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
@@ -3681,6 +3770,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
+        self.process.verify()?;
         Ok(self.execution_limits)
     }
 
@@ -3688,11 +3778,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         &self,
         expected: &FinalTaskSnapshot,
     ) -> McpResult<Option<FinalTaskExecutionBudget>> {
+        self.process.verify()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, (self.clock)());
+        reclaim_expired_in_memory_final_tasks(&mut state, self.sample_clock()?);
         let task_id = &expected.task().base().task_id;
         if state.generations.get(task_id) != Some(&expected.generation()) {
             return Ok(None);
@@ -3711,11 +3802,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         &self,
         expected: &FinalTaskSnapshot,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.process.verify()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let task_id = &expected.task().base().task_id;
         if state.generations.get(task_id) != Some(&expected.generation()) {
@@ -3751,11 +3843,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.process.verify()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let Some(task_id) = state.tasks.keys().find(|task_id| {
             in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
@@ -3770,6 +3863,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         task: FinalTask,
         notification: FinalTaskStatusNotification,
     ) -> McpResult<()> {
+        self.process.verify()?;
         let task_id = task.base().task_id.clone();
         validate_final_task_storage_shape(&task)?;
         ensure_final_task_notification_matches_task(&task, &notification)?;
@@ -3778,7 +3872,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         let expires_at = in_memory_final_task_expiry(&task, now)?;
         let execution_budget =
             new_in_memory_final_task_execution_budget(self.execution_limits, now)?;
@@ -3861,8 +3955,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         &self,
         task_id: &FinalTaskId,
     ) -> McpResult<Option<FinalTaskAccessMetadata>> {
+        self.process.verify()?;
         let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         if state.expires_at.get(task_id).is_some_and(|deadline| *deadline <= now) {
             return Ok(None);
         }
@@ -3878,7 +3973,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
-        let now = (self.clock)();
+        self.process.verify()?;
+        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
@@ -3888,7 +3984,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
-        let now = (self.clock)();
+        self.process.verify()?;
+        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
@@ -3913,6 +4010,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         task: FinalTask,
         notification: FinalTaskStatusNotification,
     ) -> McpResult<()> {
+        self.process.verify()?;
         let task_id = task.base().task_id.clone();
         ensure_final_task_notification_matches_task(&task, &notification)?;
         validate_final_task_runtime_durations(&task)?;
@@ -3920,7 +4018,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if !state.tasks.contains_key(&task_id) {
             return Err(McpError::invalid_params("Task not found"));
@@ -3941,6 +4039,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         task: FinalTask,
         notification: FinalTaskStatusNotification,
     ) -> McpResult<bool> {
+        self.process.verify()?;
         let task_id = task.base().task_id.clone();
         if expected.task().base().task_id != task_id {
             return Err(McpError::invalid_params(
@@ -3956,7 +4055,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(false);
@@ -3978,6 +4077,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         notification: FinalTaskStatusNotification,
         input_responses: FinalTaskInputResponses,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.process.verify()?;
         let task_id = task.base().task_id.clone();
         if expected.task().base().task_id != task_id {
             return Err(McpError::invalid_params(
@@ -3993,7 +4093,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(None);
         }
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(None);
@@ -4014,6 +4114,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         task: FinalTask,
         notification: FinalTaskStatusNotification,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.process.verify()?;
         let task_id = task.base().task_id.clone();
         if expected.task().base().task_id != task_id {
             return Err(McpError::invalid_params(
@@ -4029,7 +4130,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(None);
         }
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(None);
@@ -4053,6 +4154,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         task: FinalTask,
         notification: FinalTaskStatusNotification,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.process.verify()?;
         if owner_id.is_empty() {
             return Err(McpError::invalid_params(
                 "Final task handoff owner must be non-empty",
@@ -4075,7 +4177,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_exact_dispatch = state.handoff_leases.get(&task_id).is_some_and(|lease| {
             lease.generation == expected.generation()
@@ -4126,6 +4228,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         expected: &FinalTaskSnapshot,
         owner_id: &str,
     ) -> McpResult<Option<FinalTaskAcceptedInputClaim>> {
+        self.process.verify()?;
         if owner_id.is_empty() {
             return Err(McpError::invalid_params(
                 "Final task handoff owner must be non-empty",
@@ -4136,7 +4239,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation())
             || !state
@@ -4186,12 +4289,13 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         &self,
         expected: &FinalTaskSnapshot,
     ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+        self.process.verify()?;
         let task_id = &expected.task().base().task_id;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation())
             || !state
@@ -4218,11 +4322,13 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         &self,
         after_task_id: Option<&FinalTaskId>,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.process.verify()?;
+        self.execution_admission.process.verify()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let admission = self
             .execution_admission
@@ -4294,6 +4400,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         expected: &FinalTaskSnapshot,
         owner_id: &str,
     ) -> McpResult<Option<FinalTaskInitialWorkClaim>> {
+        self.process.verify()?;
         if owner_id.is_empty() {
             return Err(McpError::invalid_params(
                 "Final task handoff owner must be non-empty",
@@ -4304,7 +4411,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation())
             || !state
@@ -4359,11 +4466,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         dispatch_fence: Option<u64>,
         work_descriptor: FinalTaskWorkDescriptor,
     ) -> McpResult<bool> {
+        self.process.verify()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_matching_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
             lease.generation == generation
@@ -4406,11 +4514,13 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         &self,
         after_task_id: Option<&FinalTaskId>,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.process.verify()?;
+        self.execution_admission.process.verify()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
 
         let admission = self
@@ -4476,6 +4586,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         dispatch_fence: Option<u64>,
         input_responses: FinalTaskInputResponses,
     ) -> McpResult<bool> {
+        self.process.verify()?;
         if input_responses.is_empty() {
             return Err(McpError::internal_error(
                 "Cannot restore an empty accepted-input handoff",
@@ -4485,7 +4596,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_matching_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
             lease.generation == generation
@@ -4540,6 +4651,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         generation: u64,
         owner_id: &str,
     ) -> McpResult<Option<u64>> {
+        self.process.verify()?;
         if owner_id.is_empty() {
             return Err(McpError::invalid_params(
                 "Final task handoff owner must be non-empty",
@@ -4549,7 +4661,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&generation)
             || !state
@@ -4590,11 +4702,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         owner_id: &str,
         dispatch_fence: u64,
     ) -> McpResult<bool> {
+        self.process.verify()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some() {
             return Ok(false);
@@ -4626,6 +4739,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
+        self.process.verify()?;
         Ok(IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT)
     }
 
@@ -4646,11 +4760,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         owner_id: &str,
         dispatch_fence: u64,
     ) -> McpResult<bool> {
+        self.process.verify()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some() {
             return Ok(false);
@@ -4706,11 +4821,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+        self.process.verify()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if !state.tasks.contains_key(task_id) {
             return Err(McpError::invalid_params("Task not found"));
@@ -4723,12 +4839,13 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+        self.process.verify()?;
         let task_id = &expected.task().base().task_id;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation()) {
             return Ok(false);
@@ -4746,6 +4863,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         cancelled_task: FinalTask,
         cancelled_notification: FinalTaskStatusNotification,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.process.verify()?;
         let task_id = &expected.task().base().task_id;
         if &cancelled_task.base().task_id != task_id {
             return Err(McpError::invalid_params(
@@ -4764,7 +4882,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = (self.clock)();
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation()) {
             return Ok(None);
@@ -4814,7 +4932,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
-        let now = (self.clock)();
+        self.process.verify()?;
+        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
@@ -4827,7 +4946,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn retention_clock_now(&self) -> Instant {
-        (self.clock)()
+        self.process.assert_current();
+        self.sample_clock_or_panic()
     }
 
     fn task_retention_deadline_if_current(
@@ -4835,7 +4955,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         task_id: &FinalTaskId,
         generation: u64,
     ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
-        let now = (self.clock)();
+        self.process.verify()?;
+        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
@@ -10512,7 +10633,8 @@ impl FinalTaskExecutionGuard {
         // A dead required receipt is different from a custom store's None:
         // it must never silently grant unaccounted application execution.
         let execution_permit = receipt.and_then(Weak::upgrade).filter(|permit| {
-            permit.task_id == task_id
+            permit.admission.process.verify().is_ok()
+                && permit.task_id == task_id
                 && permit.reservation.generation == generation
                 && permit.reservation.owner_id == owner_id
         });
@@ -11269,6 +11391,306 @@ mod tests {
         )
         .await
         .expect(description);
+    }
+
+    mod process_generation_tests {
+        use super::*;
+
+        fn changed_pid(process: TaskProcessGuard) -> TaskProcessGuard {
+            TaskProcessGuard {
+                generation: ProcessGeneration::observed(
+                    process.generation.pid() ^ 1,
+                    *process.generation.nonce(),
+                    process.generation.generation(),
+                ),
+            }
+        }
+
+        macro_rules! denied {
+            ($operation:expr) => {
+                match $operation {
+                    Err(error) => assert_eq!(error.message, TASK_PROCESS_UNAVAILABLE),
+                    Ok(_) => panic!("inherited Task state was admitted"),
+                }
+            };
+        }
+
+        #[test]
+        fn task_03_in_memory_process_generation_rejects_without_clock_or_state_effects() {
+            let now = Instant::now();
+            let clock_calls = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&clock_calls);
+            let mut store = InMemoryFinalTaskStore::with_clock(
+                2,
+                Arc::new(move || {
+                    calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    now
+                }),
+            )
+            .unwrap();
+            let task = final_working_task_without_ttl("process-owned-task");
+            let id = task.base().task_id.clone();
+            let descriptor = final_test_work_descriptor();
+            let snapshot = store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    descriptor.clone(),
+                )
+                .unwrap();
+            assert!(store.get_task(&id).unwrap().is_some());
+            assert_eq!(store.task_count(), 1);
+            assert!(store.retained_payload_bytes() > 0);
+            assert!(store.max_payload_bytes() > 0);
+            assert_eq!(store.max_tasks_per_owner(), 1);
+            assert!(store.max_payload_bytes_per_owner() > 0);
+            assert_eq!(store.active_task_count(), 0);
+            assert!(store.latest_notification(&id).is_some());
+            assert_eq!(store.retention_clock_now(), now);
+            let state_before = final_task_restoration_snapshot(&store, &id);
+            let budget_before = store.task_execution_budget_if_current(&snapshot).unwrap();
+            let process = store.process;
+            let mut changed_nonce = *process.generation.nonce();
+            changed_nonce[0] ^= 1;
+            let wrong_generations = [
+                changed_pid(process),
+                TaskProcessGuard {
+                    generation: ProcessGeneration::observed(
+                        process.generation.pid(),
+                        changed_nonce,
+                        process.generation.generation(),
+                    ),
+                },
+                TaskProcessGuard {
+                    generation: ProcessGeneration::observed(
+                        process.generation.pid(),
+                        *process.generation.nonce(),
+                        process.generation.generation() ^ 1,
+                    ),
+                },
+            ];
+            for stale in wrong_generations {
+                store.process = stale;
+                let calls_before = clock_calls.load(AtomicOrdering::SeqCst);
+                denied!(store.get_task(&id));
+                denied!(store.get_task_snapshot(&id));
+                denied!(store.get_task_access_metadata(&id));
+                denied!(store.create_task(task.clone(), final_task_notification(&task)));
+                denied!(store.create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    descriptor.clone(),
+                ));
+                denied!(store.replace_task_if_current(
+                    &snapshot,
+                    task.clone(),
+                    final_task_notification(&task),
+                ));
+                denied!(store.task_execution_budget_if_current(&snapshot));
+                denied!(store.expire_task_execution_if_current(&snapshot));
+                denied!(store.next_expired_execution_snapshot());
+                denied!(store.next_initial_work_snapshot());
+                denied!(store.next_accepted_input_snapshot());
+                denied!(store.take_initial_work_handoff_for_owner_if_current(&snapshot, "worker"));
+                denied!(store.take_input_handoff_for_owner_if_current(&snapshot, "worker"));
+                denied!(store.work_descriptor_if_current(&snapshot));
+                denied!(store.restore_initial_work_for_owner_if_current(
+                    &id,
+                    snapshot.generation(),
+                    "worker",
+                    None,
+                    descriptor.clone(),
+                ));
+                denied!(store.restore_input_for_owner_if_current(
+                    &id,
+                    snapshot.generation(),
+                    "worker",
+                    None,
+                    FinalTaskInputResponses::new(),
+                ));
+                denied!(store.begin_handoff_dispatch_for_owner_if_current(
+                    &id,
+                    snapshot.generation(),
+                    "worker",
+                ));
+                denied!(store.renew_handoff_dispatch_if_current(
+                    &id,
+                    snapshot.generation(),
+                    "worker",
+                    1,
+                ));
+                denied!(store.finish_handoff_dispatch_for_owner_if_current(
+                    &id,
+                    snapshot.generation(),
+                    "worker",
+                    1,
+                ));
+                denied!(store.request_cancellation(&id));
+                denied!(store.request_cancellation_if_current(&snapshot));
+                denied!(store.is_cancellation_requested(&id));
+                denied!(store.task_retention_deadline_if_current(&id, snapshot.generation()));
+                denied!(store.retention_administration_policy());
+                denied!(store.execution_limits());
+                denied!(store.handoff_dispatch_lease_heartbeat_interval());
+                let cx = Cx::for_testing();
+                denied!(store.task_retention_audit(&cx, None, 1));
+                denied!(store.reclaim_terminal_task_if_current(
+                    &cx,
+                    &id,
+                    snapshot.generation(),
+                    TaskRetentionReason::OperatorRequest,
+                ));
+                for accessor in [
+                    InMemoryFinalTaskStore::task_count,
+                    InMemoryFinalTaskStore::retained_payload_bytes,
+                    InMemoryFinalTaskStore::max_payload_bytes,
+                    InMemoryFinalTaskStore::max_tasks_per_owner,
+                    InMemoryFinalTaskStore::max_payload_bytes_per_owner,
+                    InMemoryFinalTaskStore::active_task_count,
+                ] {
+                    assert!(catch_unwind(AssertUnwindSafe(|| accessor(&store))).is_err());
+                }
+                assert!(catch_unwind(AssertUnwindSafe(|| store.latest_notification(&id))).is_err());
+                assert!(catch_unwind(AssertUnwindSafe(|| store.retention_clock_now())).is_err());
+                assert_eq!(clock_calls.load(AtomicOrdering::SeqCst), calls_before);
+                assert_eq!(final_task_restoration_snapshot(&store, &id), state_before);
+            }
+
+            // Restoring only the injected identity makes the same state usable;
+            // no rejection reclaimed work, charged an attempt, or lost an input.
+            store.process = process;
+            assert_eq!(
+                store.task_execution_budget_if_current(&snapshot).unwrap(),
+                budget_before
+            );
+            assert!(store.get_task(&id).unwrap().is_some());
+            let claim = store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "worker")
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.work_descriptor, descriptor);
+            assert_eq!(store.active_task_count(), 1);
+            assert!(
+                store
+                    .restore_initial_work_for_owner_if_current(
+                        &id,
+                        snapshot.generation(),
+                        "worker",
+                        None,
+                        descriptor,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(store.active_task_count(), 0);
+        }
+
+        #[test]
+        fn task_03_in_memory_process_generation_rejects_reconfiguration() {
+            let stale_store = || {
+                let mut store = InMemoryFinalTaskStore::new(1).unwrap();
+                store.process = changed_pid(store.process);
+                store
+            };
+            denied!(
+                stale_store()
+                    .with_owner_capacity(1, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,)
+            );
+            denied!(stale_store().with_execution_capacity(1, 1));
+            denied!(stale_store().with_retention_policy(TaskRetentionPolicy::default()));
+        }
+
+        #[test]
+        fn task_03_in_memory_process_rejection_precedes_held_store_and_pool_locks() {
+            let mut store = InMemoryFinalTaskStore::new(1).unwrap();
+            let task = final_working_task_without_ttl("locked-process-task");
+            let id = task.base().task_id.clone();
+            store
+                .create_task(task.clone(), final_task_notification(&task))
+                .unwrap();
+            let process = store.process;
+            store.process = changed_pid(process);
+            let state = store.state.lock().unwrap();
+            let pool = store.execution_admission.state.lock().unwrap();
+            thread::scope(|scope| {
+                let (sent, received) = std::sync::mpsc::sync_channel(1);
+                let store_ref = &store;
+                let task_id = &id;
+                let worker = scope.spawn(move || {
+                    let rejected = store_ref.get_task(task_id).is_err();
+                    let panicked =
+                        catch_unwind(AssertUnwindSafe(|| store_ref.active_task_count())).is_err();
+                    sent.send((rejected, panicked)).unwrap();
+                });
+                let result = received.recv_timeout(Duration::from_secs(2));
+                // Release even on timeout so a planted missing guard fails
+                // without leaving a permanently blocked test worker.
+                drop(pool);
+                drop(state);
+                worker.join().unwrap();
+                assert_eq!(
+                    result.expect("process rejection waited for an inherited lock"),
+                    (true, true)
+                );
+            });
+            store.process = process;
+            assert!(store.get_task(&id).unwrap().is_some());
+        }
+
+        #[test]
+        fn task_03_execution_permit_rejects_and_drops_before_inherited_pool_lock() {
+            let process = TaskProcessGuard::new().unwrap();
+            let id = FinalTaskId::parse("process-owned-permit").unwrap();
+            let live = Arc::new(InMemoryFinalTaskExecutionAdmission::new(process, 1, 1));
+            let permit = live.reserve(&id, 1, "worker", None).unwrap().unwrap();
+            assert_eq!(live.state.lock().unwrap().reservations.len(), 1);
+            drop(permit);
+            assert!(live.state.lock().unwrap().reservations.is_empty());
+
+            // Seed the same retained reservation under a divergent identity.
+            // Only the recorded generation changes; both operations must
+            // refuse before touching a lock held by the surviving parent.
+            let stale = Arc::new(InMemoryFinalTaskExecutionAdmission::new(
+                changed_pid(process),
+                1,
+                1,
+            ));
+            let reservation = InMemoryFinalTaskExecutionReservation {
+                permit_id: 1,
+                generation: 1,
+                owner_id: "worker".to_owned(),
+                principal: None,
+            };
+            {
+                let mut state = stale.state.lock().unwrap();
+                state.next_permit_id = 1;
+                state.reservations.insert(id.clone(), reservation.clone());
+                state.per_owner.insert(None, 1);
+            }
+            let permit = InMemoryFinalTaskExecutionPermit {
+                admission: Arc::clone(&stale),
+                task_id: id.clone(),
+                reservation: reservation.clone(),
+            };
+            let state = stale.state.lock().unwrap();
+            thread::scope(|scope| {
+                let (sent, received) = std::sync::mpsc::sync_channel(1);
+                let admission = &stale;
+                let task_id = &id;
+                let worker = scope.spawn(move || {
+                    let rejected = admission.reserve(task_id, 1, "worker", None).is_err();
+                    drop(permit);
+                    sent.send(rejected).unwrap();
+                });
+                let result = received.recv_timeout(Duration::from_secs(2));
+                drop(state);
+                worker.join().unwrap();
+                assert!(result.expect("permit admission or Drop waited for an inherited lock"));
+            });
+            let state = stale.state.lock().unwrap();
+            assert!(state.reservations.get(&id) == Some(&reservation));
+            assert_eq!(state.per_owner.get(&None), Some(&1));
+            assert_eq!(state.next_permit_id, 1);
+        }
     }
 
     mod execution_capacity_tests {

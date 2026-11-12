@@ -6,8 +6,8 @@
 
 use super::{
     Arc, AssertUnwindSafe, FinalTaskId, FinalTaskRuntime, FinalTaskSnapshot,
-    FinalTaskStatusNotification, McpContext, McpError, McpResult, Sha256Digest, Weak,
-    catch_unwind, final_tasks_match_exactly, task_request_principal,
+    FinalTaskStatusNotification, McpContext, McpError, McpResult, Sha256Digest, TaskProcessGuard,
+    Weak, catch_unwind, final_tasks_match_exactly, task_request_principal,
 };
 #[cfg(feature = "proxy")]
 use super::{BTreeMap, Cx};
@@ -48,8 +48,11 @@ impl TaskAccessAction {
 /// constructs it; a removed or replaced registration invalidates it even when
 /// another handler subsequently uses the same tool name. It cannot be restored
 /// across process restart and does not establish durable Task authorization.
+/// Its process generation is checked before access or execution policy callbacks,
+/// so an inherited registration cannot authorize a forked child's work.
 #[derive(Clone)]
 pub struct FinalTaskOperation {
+    process: TaskProcessGuard,
     tool_name: String,
     registration: Weak<()>,
 }
@@ -63,6 +66,7 @@ impl FinalTaskOperation {
             return Err(McpError::invalid_params("Invalid Task original operation"));
         }
         Ok(Self {
+            process: TaskProcessGuard::new()?,
             tool_name: tool_name.to_owned(),
             registration: Arc::downgrade(registration),
         })
@@ -83,7 +87,7 @@ impl FinalTaskOperation {
     }
 
     fn is_registered(&self) -> bool {
-        self.registration.strong_count() != 0
+        self.process.verify().is_ok() && self.registration.strong_count() != 0
     }
 
     /// Shares the same process-local admission boundary with proxied Tasks.
@@ -94,6 +98,7 @@ impl FinalTaskOperation {
         action: TaskAccessAction,
         authorizers: &[Arc<dyn TaskAccessAuthorizer>],
     ) -> McpResult<()> {
+        self.process.verify().map_err(|_| task_access_denied())?;
         ensure_current_task_authentication(ctx)?;
         if action == TaskAccessAction::Create && ctx.auth().is_some() && authorizers.is_empty() {
             return Err(McpError::invalid_request(
@@ -108,6 +113,7 @@ impl FinalTaskOperation {
                 authorizer.authorize(ctx, action, self)
             }))
             .is_ok_and(|result| result.is_ok());
+            self.process.verify().map_err(|_| task_access_denied())?;
             ensure_current_task_authentication(ctx)?;
             if !allowed || !self.is_visible(ctx) {
                 return Err(task_access_denied());
@@ -130,7 +136,9 @@ impl FinalTaskOperation {
 
 impl PartialEq for FinalTaskOperation {
     fn eq(&self, other: &Self) -> bool {
-        self.tool_name == other.tool_name && Weak::ptr_eq(&self.registration, &other.registration)
+        self.process == other.process
+            && self.tool_name == other.tool_name
+            && Weak::ptr_eq(&self.registration, &other.registration)
     }
 }
 
@@ -372,6 +380,12 @@ impl FinalTaskRuntime {
         &self,
         metadata: &FinalTaskAccessMetadata,
     ) -> McpResult<()> {
+        if metadata
+            .original_operation()
+            .is_some_and(|operation| !operation.is_registered())
+        {
+            return Err(task_execution_denied());
+        }
         let authorizers = self.execution_authorizers_snapshot();
         authorize_task_execution_with_policies(metadata, &authorizers)
     }
@@ -381,6 +395,12 @@ impl FinalTaskRuntime {
         &self,
         expected: &FinalTaskAccessMetadata,
     ) -> McpResult<()> {
+        if expected
+            .original_operation()
+            .is_some_and(|operation| !operation.is_registered())
+        {
+            return Err(task_execution_denied());
+        }
         let authorizers = self.execution_authorizers_snapshot();
         // Existing trusted embedding stores may have no request metadata API.
         // Only their anonymous, unbound, policy-free execution retains that
@@ -420,6 +440,9 @@ impl FinalTaskRuntime {
         action: TaskAccessAction,
         original: Option<&FinalTaskOperation>,
     ) -> McpResult<()> {
+        if original.is_some_and(|operation| !operation.is_registered()) {
+            return Err(task_access_denied());
+        }
         ensure_current_task_authentication(ctx)?;
         let authorizers = self
             .access_authorizers
@@ -946,6 +969,170 @@ mod tests {
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
         assert_eq!(error.message, "Task execution is no longer authorized");
         assert!(error.data.is_none());
+    }
+
+    #[derive(Default)]
+    struct ProcessPolicyProbe {
+        access_calls: AtomicUsize,
+        execution_calls: AtomicUsize,
+    }
+
+    impl TaskAccessAuthorizer for ProcessPolicyProbe {
+        fn authorize(
+            &self,
+            _: &McpContext,
+            _: TaskAccessAction,
+            _: &FinalTaskOperation,
+        ) -> McpResult<()> {
+            self.access_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl TaskExecutionAuthorizer for ProcessPolicyProbe {
+        fn authorize(&self, _: &FinalTaskAccessMetadata) -> McpResult<()> {
+            self.execution_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn original_operation_rejects_process_drift_before_access_and_execution_policies() {
+        use fastmcp_core::runtime::ProcessGeneration;
+
+        let registration = Arc::new(());
+        let original = FinalTaskOperation::for_tool("sensitive-tool", &registration).unwrap();
+        let ctx = context(&["invoke", "manage", "sensitive"]);
+        let probe = Arc::new(ProcessPolicyProbe::default());
+        let access: [Arc<dyn TaskAccessAuthorizer>; 1] = [probe.clone()];
+        let execution: [Arc<dyn TaskExecutionAuthorizer>; 1] = [probe.clone()];
+        let metadata = FinalTaskAccessMetadata::new(
+            FinalTaskId::parse("process-generation-operation").unwrap(),
+            1,
+            1,
+            task_request_principal(&ctx).unwrap(),
+            Some(original.clone()),
+        );
+
+        assert!(original.is_registered());
+        original
+            .authorize_access(&ctx, TaskAccessAction::Get, &access)
+            .unwrap();
+        authorize_task_execution_with_policies(&metadata, &execution).unwrap();
+        assert_eq!(probe.access_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.execution_calls.load(Ordering::SeqCst), 1);
+
+        // Alter only the recorded process claim. The real registration, owner,
+        // Task incarnation, request, and always-allow policies remain identical.
+        let current = original.process.generation;
+        let mut changed_nonce = *current.nonce();
+        changed_nonce[0] ^= 1;
+        for generation in [
+            ProcessGeneration::observed(
+                current.pid().wrapping_add(1),
+                *current.nonce(),
+                current.generation(),
+            ),
+            ProcessGeneration::observed(current.pid(), changed_nonce, current.generation()),
+            ProcessGeneration::observed(
+                current.pid(),
+                *current.nonce(),
+                current.generation().wrapping_add(1),
+            ),
+        ] {
+            let mut inherited = original.clone();
+            inherited.process.generation = generation;
+            assert!(!inherited.is_registered());
+            assert_ne!(inherited, original);
+            for action in [
+                TaskAccessAction::Create,
+                TaskAccessAction::Get,
+                TaskAccessAction::Update,
+                TaskAccessAction::Cancel,
+                TaskAccessAction::Listen,
+            ] {
+                let error = inherited
+                    .authorize_access(&ctx, action, &access)
+                    .unwrap_err();
+                assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+                assert_eq!(error.message, "Task not found");
+                assert!(error.data.is_none());
+            }
+            let mut inherited_metadata = metadata.clone();
+            inherited_metadata.operation = Some(inherited);
+            assert_execution_denied(authorize_task_execution_with_policies(
+                &inherited_metadata,
+                &execution,
+            ));
+            assert_eq!(probe.access_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.execution_calls.load(Ordering::SeqCst), 1);
+        }
+
+        // A refused inherited claim never invalidates the live parent's owner.
+        assert!(original.is_registered());
+        original
+            .authorize_access(&ctx, TaskAccessAction::Get, &access)
+            .unwrap();
+        authorize_task_execution_with_policies(&metadata, &execution).unwrap();
+        assert_eq!(probe.access_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.execution_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(Arc::strong_count(&registration), 1);
+    }
+
+    #[test]
+    fn inherited_original_operation_is_refused_before_runtime_policy_locks() {
+        use fastmcp_core::runtime::ProcessGeneration;
+
+        let (store, runtime, id, _registration) = fixture();
+        let metadata = store.inner.get_task_access_metadata(&id).unwrap().unwrap();
+        let policy = execution_policy(&runtime, &metadata);
+        runtime.authorize_task_execution(&metadata).unwrap();
+        runtime.revalidate_task_execution(&metadata).unwrap();
+        runtime
+            .authorize_original_operation(
+                &context(&["invoke", "manage", "sensitive"]),
+                TaskAccessAction::Get,
+                metadata.original_operation(),
+            )
+            .unwrap();
+
+        let mut inherited = metadata.clone();
+        let operation = inherited.operation.as_mut().unwrap();
+        let current = operation.process.generation;
+        operation.process.generation = ProcessGeneration::observed(
+            current.pid().wrapping_add(1),
+            *current.nonce(),
+            current.generation(),
+        );
+        let worker_runtime = runtime.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let held_access = runtime.access_authorizers.lock().unwrap();
+        let held_execution = runtime.execution_authorizers.lock().unwrap();
+        let worker = std::thread::spawn(move || {
+            let execution_denied = worker_runtime.authorize_task_execution(&inherited).is_err();
+            let revalidation_denied = worker_runtime
+                .revalidate_task_execution(&inherited)
+                .is_err();
+            let access_denied = worker_runtime
+                .authorize_original_operation(
+                    &context(&["invoke", "manage", "sensitive"]),
+                    TaskAccessAction::Get,
+                    inherited.original_operation(),
+                )
+                .is_err();
+            let _ = sender.send((execution_denied, revalidation_denied, access_denied));
+        });
+        // Release both locks before joining even if a regression tried to
+        // acquire one. A broken preflight fails this test instead of hanging it.
+        let observed = receiver.recv_timeout(StdDuration::from_secs(2));
+        drop(held_execution);
+        drop(held_access);
+        worker.join().unwrap();
+        assert_eq!(observed.unwrap(), (true, true, true));
+        assert_eq!(policy.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.payload_reads.load(Ordering::SeqCst), 0);
+        runtime.revalidate_task_execution(&metadata).unwrap();
+        assert_eq!(policy.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
