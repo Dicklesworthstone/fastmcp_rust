@@ -381,7 +381,14 @@ fn matching_brace_end(bytes: &[u8], from: usize) -> Option<usize> {
 fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
     if start > 0 {
         let previous = bytes[start - 1];
-        if previous.is_ascii_alphanumeric() || previous == b'_' {
+        if previous == b'b' || previous == b'c' {
+            if start > 1 {
+                let before_prefix = bytes[start - 2];
+                if before_prefix.is_ascii_alphanumeric() || before_prefix == b'_' {
+                    return false;
+                }
+            }
+        } else if previous.is_ascii_alphanumeric() || previous == b'_' {
             return false;
         }
     }
@@ -1041,8 +1048,9 @@ fn subcase_04_task_supervisor_ownership() -> SubcaseOutcome {
 // FND-04-B-05 dependency-feature
 // ===========================================================================
 
-/// The product dependency graph must not enable `asupersync/test-internals`.
+/// The product dependency graph must not enable `asupersync/test-internals` or `fastmcp-core/test-runtime`.
 fn subcase_05_dependency_feature() -> SubcaseOutcome {
+    const FORBIDDEN_CORE_FEATURE: &str = "test-runtime";
     let mut outcome = SubcaseOutcome::new("FND-04-B-05", "dependency-feature");
 
     let crates_dir = workspace_root().join("crates");
@@ -1082,6 +1090,20 @@ fn subcase_05_dependency_feature() -> SubcaseOutcome {
                     product_offenders.push(format!("{name}:[{table}].asupersync.features"));
                 }
             }
+            if let Some(dep) = parsed
+                .get(table)
+                .and_then(|value| value.get("fastmcp-core"))
+                .and_then(|value| value.get("features"))
+                .and_then(toml::Value::as_array)
+            {
+                if dep
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .any(|feature| feature == FORBIDDEN_CORE_FEATURE)
+                {
+                    product_offenders.push(format!("{name}:[{table}].fastmcp-core.features"));
+                }
+            }
         }
 
         if let Some(features) = parsed.get("features").and_then(toml::Value::as_table) {
@@ -1089,21 +1111,30 @@ fn subcase_05_dependency_feature() -> SubcaseOutcome {
                 let Some(values) = equation.as_array() else {
                     continue;
                 };
-                let forwards = values
+                let forwards_runtime = values
                     .iter()
                     .filter_map(toml::Value::as_str)
                     .any(|value| value == format!("asupersync/{FORBIDDEN_RUNTIME_FEATURE}"));
-                if !forwards {
-                    continue;
+                if forwards_runtime {
+                    // A feature forwarding test-internals is admissible only when
+                    // nothing in the default/product profile can select it. The
+                    // facade's `testing-lab` is the one audited opt-in profile.
+                    if feature_name == "testing-lab" {
+                        dev_only_uses.push(format!("{name}:[features].{feature_name}"));
+                    } else {
+                        product_offenders.push(format!(
+                            "{name}:[features].{feature_name} forwards test-internals"
+                        ));
+                    }
                 }
-                // A feature forwarding test-internals is admissible only when
-                // nothing in the default/product profile can select it. The
-                // facade's `testing-lab` is the one audited opt-in profile.
-                if feature_name == "testing-lab" {
-                    dev_only_uses.push(format!("{name}:[features].{feature_name}"));
-                } else {
+                let forwards_core_test_runtime =
+                    values.iter().filter_map(toml::Value::as_str).any(|value| {
+                        value == format!("fastmcp-core/{FORBIDDEN_CORE_FEATURE}")
+                            || (name == "fastmcp-core" && value == FORBIDDEN_CORE_FEATURE)
+                    });
+                if forwards_core_test_runtime {
                     product_offenders.push(format!(
-                        "{name}:[features].{feature_name} forwards test-internals"
+                        "{name}:[features].{feature_name} forwards {FORBIDDEN_CORE_FEATURE}"
                     ));
                 }
             }
@@ -1123,6 +1154,20 @@ fn subcase_05_dependency_feature() -> SubcaseOutcome {
         {
             dev_only_uses.push(format!("{name}:[dev-dependencies].asupersync.features"));
         }
+        if parsed
+            .get("dev-dependencies")
+            .and_then(|value| value.get("fastmcp-core"))
+            .and_then(|value| value.get("features"))
+            .and_then(toml::Value::as_array)
+            .is_some_and(|features| {
+                features
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .any(|feature| feature == FORBIDDEN_CORE_FEATURE)
+            })
+        {
+            dev_only_uses.push(format!("{name}:[dev-dependencies].fastmcp-core.features"));
+        }
     }
 
     // A default feature set that reaches test-internals is a product offender.
@@ -1141,9 +1186,9 @@ fn subcase_05_dependency_feature() -> SubcaseOutcome {
                 .collect()
         })
         .unwrap_or_default();
-    let default_selects_lab = default_features
-        .iter()
-        .any(|feature| feature == "testing-lab" || feature == "testing");
+    let default_selects_lab = default_features.iter().any(|feature| {
+        feature == "testing-lab" || feature == "testing" || feature == FORBIDDEN_CORE_FEATURE
+    });
 
     product_offenders.sort();
     dev_only_uses.sort();
@@ -1159,16 +1204,16 @@ fn subcase_05_dependency_feature() -> SubcaseOutcome {
         .observe("default_selects_lab_profile", default_selects_lab)
         .observe(
             "evaluator_own_graph_note",
-            "this test target unifies asupersync/test-internals through the facade's \
-             dev-dependencies; the product graph above is read from the manifests, never \
+            "this test target unifies asupersync/test-internals and fastmcp-core/test-runtime \
+             through dev-dependencies; the product graph above is read from the manifests, never \
              inferred from this binary's own features",
         );
 
     outcome.require(
         product_offenders.is_empty(),
         format!(
-            "no product dependency or feature equation may enable asupersync/{FORBIDDEN_RUNTIME_FEATURE}; \
-             offenders: {product_offenders:?}"
+            "no product dependency or feature equation may enable asupersync/{FORBIDDEN_RUNTIME_FEATURE} \
+             or fastmcp-core/{FORBIDDEN_CORE_FEATURE}; offenders: {product_offenders:?}"
         ),
     );
     outcome.require(
@@ -1292,6 +1337,335 @@ struct DenyHit {
     text: String,
 }
 
+/// Whether `path` is an out-of-line `#[cfg(test)]` module file rather than
+/// shipped library source.
+fn is_out_of_line_test_file(path: &str, shipped_by_path: &BTreeMap<String, String>) -> bool {
+    if path.contains("/tests/")
+        || path.contains("_tests/")
+        || path.ends_with("/tests.rs")
+        || path.ends_with("_tests.rs")
+        || path == "crates/fastmcp-core/src/limit_01_rows.rs"
+    {
+        return true;
+    }
+    if path.ends_with("/src/lib.rs") || path.ends_with("/src/main.rs") {
+        return false;
+    }
+    let file_path = Path::new(path);
+    let is_mod_rs = file_path.file_name().and_then(|n| n.to_str()) == Some("mod.rs");
+    let Some(stem) = (if is_mod_rs {
+        file_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+    } else {
+        file_path.file_stem().and_then(|n| n.to_str())
+    }) else {
+        return false;
+    };
+    let Some(parent_dir) = (if is_mod_rs {
+        file_path.parent().and_then(Path::parent)
+    } else {
+        file_path.parent()
+    }) else {
+        return false;
+    };
+    let parent_dir_str = parent_dir.to_string_lossy().replace('\\', "/");
+    let mut candidates = vec![
+        format!("{parent_dir_str}.rs"),
+        format!("{parent_dir_str}/mod.rs"),
+    ];
+    if parent_dir.file_name().and_then(|n| n.to_str()) == Some("src") {
+        candidates.push(format!("{parent_dir_str}/lib.rs"));
+        candidates.push(format!("{parent_dir_str}/main.rs"));
+    }
+    let mod_decl = format!("mod {stem};");
+    for candidate in candidates {
+        if let Some(parent_shipped) = shipped_by_path.get(&candidate) {
+            if is_out_of_line_test_file(&candidate, shipped_by_path) {
+                return true;
+            }
+            return !parent_shipped.contains(&mod_decl);
+        }
+    }
+    false
+}
+
+/// Whether `cfg_expr` inside `#[cfg(...)]` gates an item solely on `test` or
+/// `any(test, feature = "test-runtime")` (whose absence from the product graph
+/// is verified by `subcase_05_dependency_feature`).
+fn is_non_product_cfg_expr(cfg_expr: &str) -> bool {
+    let compact: String = cfg_expr
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect();
+    if compact == "test" || compact == r#"any(test,feature="test-runtime")"# {
+        return true;
+    }
+    if let Some(inner) = compact
+        .strip_prefix("all(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return inner.split(',').any(|part| part == "test");
+    }
+    false
+}
+
+/// Finds the byte index just past the Rust item starting at `from`.
+///
+/// Declaration-only items (`use`, `static`, `const` values, `type`, and
+/// out-of-line `mod foo;`) end at their top-level `;`; braced items (`mod`,
+/// `fn`, `impl`, `struct`, `enum`, `trait`) end at the closing `}` of their
+/// body.
+fn matching_item_end(bytes: &[u8], from: usize, ends_at_semicolon: bool) -> Option<usize> {
+    let mut index = from;
+    let mut depth = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            b'r' if is_raw_string_start(bytes, index) => {
+                index = skip_raw_string(bytes, index);
+                continue;
+            }
+            b'"' => {
+                index = skip_string_literal(bytes, index);
+                continue;
+            }
+            b'\'' => {
+                index = skip_char_or_lifetime(bytes, index);
+                continue;
+            }
+            b';' if depth == 0 => return Some(index + 1),
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && !ends_at_semicolon {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Strips inline `#[cfg(test)]`, `#[cfg(all(test, ..))]`, and
+/// `#[cfg(any(test, feature = "test-runtime"))]` items from Rust source.
+fn strip_non_product_items(source: &str) -> String {
+    const PREFIX: &str = "#[cfg(";
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+
+    while cursor < bytes.len() {
+        let Some(relative) = source[cursor..].find(PREFIX) else {
+            out.push_str(&source[cursor..]);
+            break;
+        };
+        let attribute_at = cursor + relative;
+        let expr_start = attribute_at + PREFIX.len();
+        let mut paren_depth = 1usize;
+        let mut index = expr_start;
+        while index < bytes.len() && paren_depth > 0 {
+            match bytes[index] {
+                b'(' => paren_depth += 1,
+                b')' => paren_depth -= 1,
+                b'"' => {
+                    index = skip_string_literal(bytes, index);
+                    continue;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        if paren_depth != 0 || bytes.get(index) != Some(&b']') {
+            out.push_str(&source[cursor..expr_start]);
+            cursor = expr_start;
+            continue;
+        }
+        let expr_end = index - 1;
+        let attr_end = index + 1;
+        if is_non_product_cfg_expr(&source[expr_start..expr_end]) {
+            let mut probe = attr_end;
+            loop {
+                while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+                    probe += 1;
+                }
+                if source[probe..].starts_with("//") {
+                    while probe < bytes.len() && bytes[probe] != b'\n' {
+                        probe += 1;
+                    }
+                    continue;
+                }
+                if source[probe..].starts_with("#[") {
+                    let mut bracket_depth = 0usize;
+                    while probe < bytes.len() {
+                        match bytes[probe] {
+                            b'[' => bracket_depth += 1,
+                            b']' => {
+                                bracket_depth -= 1;
+                                if bracket_depth == 0 {
+                                    probe += 1;
+                                    break;
+                                }
+                            }
+                            b'"' => {
+                                probe = skip_string_literal(bytes, probe);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        probe += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            let mut kw_probe = probe;
+            if source[kw_probe..].starts_with("pub") {
+                kw_probe += 3;
+                if bytes.get(kw_probe) == Some(&b'(') {
+                    if let Some(close) = source[kw_probe..].find(')') {
+                        kw_probe += close + 1;
+                    }
+                }
+                while kw_probe < bytes.len() && bytes[kw_probe].is_ascii_whitespace() {
+                    kw_probe += 1;
+                }
+            }
+            let rest = &source[kw_probe..];
+            let ends_at_semicolon = rest.starts_with("use ")
+                || rest.starts_with("static ")
+                || (rest.starts_with("const ") && !rest.starts_with("const fn "))
+                || rest.starts_with("type ");
+            let is_item = ends_at_semicolon
+                || [
+                    "mod ",
+                    "mod\t",
+                    "fn ",
+                    "async fn ",
+                    "const fn ",
+                    "impl ",
+                    "impl<",
+                    "struct ",
+                    "enum ",
+                    "trait ",
+                ]
+                .iter()
+                .any(|kw| rest.starts_with(kw));
+            if is_item {
+                if let Some(item_end) = matching_item_end(bytes, kw_probe, ends_at_semicolon) {
+                    out.push_str(&source[cursor..attribute_at]);
+                    cursor = item_end;
+                    continue;
+                }
+            }
+        }
+        out.push_str(&source[cursor..attr_end]);
+        cursor = attr_end;
+    }
+    out
+}
+
+/// Scans one shipped source file (after stripping test and `test-runtime` items)
+/// and appends any denied constructs to `hits`.
+fn scan_shipped_source_for_deny_inventory(path: &str, source: &str, hits: &mut Vec<DenyHit>) {
+    /// Paths permitted to construct and drive one explicit top-level runtime.
+    const APPLICATION_BOUNDARIES: [&str; 1] = ["crates/fastmcp-cli/src/"];
+
+    let is_application_boundary = APPLICATION_BOUNDARIES
+        .iter()
+        .any(|boundary| path.starts_with(boundary));
+    let shipped = strip_non_product_items(source);
+
+    for (index, line) in shipped.lines().enumerate() {
+        let line_number = index + 1;
+        let trimmed = line.trim_start();
+        // Doc comments describe the rule; they are not the rule's subject.
+        if trimmed.starts_with("//") {
+            continue;
+        }
+
+        if !is_application_boundary {
+            if trimmed.contains("RuntimeBuilder::") {
+                hits.push(DenyHit {
+                    dimension: "private-runtime",
+                    file: path.to_owned(),
+                    line: line_number,
+                    text: trimmed.to_owned(),
+                });
+            }
+            if trimmed.contains("std::thread::spawn") || trimmed.contains("thread::Builder::new") {
+                hits.push(DenyHit {
+                    dimension: "private-thread",
+                    file: path.to_owned(),
+                    line: line_number,
+                    text: trimmed.to_owned(),
+                });
+            }
+            if trimmed.contains(".block_on(") || trimmed.contains("block_on(") {
+                // `pub fn block_on` is the declaration; a call is the defect.
+                if !trimmed.contains("fn block_on") {
+                    hits.push(DenyHit {
+                        dimension: "production-block-on",
+                        file: path.to_owned(),
+                        line: line_number,
+                        text: trimmed.to_owned(),
+                    });
+                }
+            }
+        }
+
+        if !is_application_boundary
+            && ((trimmed.starts_with("pub use") && trimmed.contains("block_on"))
+                || trimmed.starts_with("pub fn block_on"))
+        {
+            // A library that exports a blocking bridge has published a way
+            // to create and enter a runtime, whatever its callers do with
+            // it. That is the reachability FND-04 is about, and it is not
+            // measured by counting call sites.
+            hits.push(DenyHit {
+                dimension: "public-runtime-bridge-export",
+                file: path.to_owned(),
+                line: line_number,
+                text: trimmed.to_owned(),
+            });
+        }
+
+        if trimmed.contains("Cx::for_testing") || trimmed.contains("Cx::detached_cancel_context") {
+            hits.push(DenyHit {
+                dimension: "out-of-band-cx",
+                file: path.to_owned(),
+                line: line_number,
+                text: trimmed.to_owned(),
+            });
+        }
+        if trimmed.contains("asupersync/test-internals") || trimmed.contains("LabRuntime::") {
+            hits.push(DenyHit {
+                dimension: "test-internals",
+                file: path.to_owned(),
+                line: line_number,
+                text: trimmed.to_owned(),
+            });
+        }
+    }
+}
+
 /// Static deny inventory over the shipped, non-`cfg(test)` sources.
 ///
 /// Denied dimensions, per the FND-04 acceptance list: production `block_on`,
@@ -1299,92 +1673,17 @@ struct DenyHit {
 /// runtime re-entry. The FastMCP CLI is the one application-owned binary
 /// boundary permitted to construct and drive a top-level runtime.
 fn collect_deny_inventory() -> Vec<DenyHit> {
-    /// Paths permitted to construct and drive one explicit top-level runtime.
-    const APPLICATION_BOUNDARIES: [&str; 1] = ["crates/fastmcp-cli/src/"];
-
+    let sources = shipped_source_files();
+    let shipped_by_path: BTreeMap<String, String> = sources
+        .iter()
+        .map(|(path, source)| (path.clone(), strip_non_product_items(source)))
+        .collect();
     let mut hits = Vec::new();
-    for (path, source) in shipped_source_files() {
-        let is_application_boundary = APPLICATION_BOUNDARIES
-            .iter()
-            .any(|boundary| path.starts_with(boundary));
-        let shipped = strip_cfg_test_modules(&source);
-
-        for (index, line) in shipped.lines().enumerate() {
-            let line_number = index + 1;
-            let trimmed = line.trim_start();
-            // Doc comments describe the rule; they are not the rule's subject.
-            if trimmed.starts_with("//") {
-                continue;
-            }
-
-            if !is_application_boundary {
-                if trimmed.contains("RuntimeBuilder::") {
-                    hits.push(DenyHit {
-                        dimension: "private-runtime",
-                        file: path.clone(),
-                        line: line_number,
-                        text: trimmed.to_owned(),
-                    });
-                }
-                if trimmed.contains("std::thread::spawn")
-                    || trimmed.contains("thread::Builder::new")
-                {
-                    hits.push(DenyHit {
-                        dimension: "private-thread",
-                        file: path.clone(),
-                        line: line_number,
-                        text: trimmed.to_owned(),
-                    });
-                }
-                if trimmed.contains(".block_on(") || trimmed.contains("block_on(") {
-                    // `pub fn block_on` is the declaration; a call is the defect.
-                    if !trimmed.contains("fn block_on") {
-                        hits.push(DenyHit {
-                            dimension: "production-block-on",
-                            file: path.clone(),
-                            line: line_number,
-                            text: trimmed.to_owned(),
-                        });
-                    }
-                }
-            }
-
-            if !is_application_boundary
-                && ((trimmed.starts_with("pub use") && trimmed.contains("block_on"))
-                    || trimmed.starts_with("pub fn block_on")
-                    || trimmed.starts_with("pub mod runtime;"))
-            {
-                // A library that exports a blocking bridge has published a way
-                // to create and enter a runtime, whatever its callers do with
-                // it. That is the reachability FND-04 is about, and it is not
-                // measured by counting call sites.
-                hits.push(DenyHit {
-                    dimension: "public-runtime-bridge-export",
-                    file: path.clone(),
-                    line: line_number,
-                    text: trimmed.to_owned(),
-                });
-            }
-
-            if trimmed.contains("Cx::for_testing")
-                || trimmed.contains("Cx::detached_cancel_context")
-            {
-                hits.push(DenyHit {
-                    dimension: "out-of-band-cx",
-                    file: path.clone(),
-                    line: line_number,
-                    text: trimmed.to_owned(),
-                });
-            }
-            if trimmed.contains("asupersync/test-internals") || trimmed.contains("LabRuntime::") {
-                hits.push(DenyHit {
-                    dimension: "test-internals",
-                    file: path.clone(),
-                    line: line_number,
-                    text: trimmed.to_owned(),
-                });
-            }
+    for (path, source) in &sources {
+        if is_out_of_line_test_file(path, &shipped_by_path) {
+            continue;
         }
+        scan_shipped_source_for_deny_inventory(path, source, &mut hits);
     }
     hits.sort();
     hits
@@ -1429,28 +1728,40 @@ fn subcase_07_production_deny_inventory() -> SubcaseOutcome {
     // The blocking bridge's reachability through the shipped public surface,
     // stated directly rather than left to be inferred from a site count.
     let core_lib = read_workspace_file("crates/fastmcp-core/src/lib.rs");
-    let core_shipped = strip_cfg_test_modules(&core_lib);
+    let core_shipped: String = strip_non_product_items(&core_lib)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let core_runtime = read_workspace_file("crates/fastmcp-core/src/runtime.rs");
+    let core_runtime_shipped: String = strip_non_product_items(&core_runtime)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let exports_block_on = core_shipped.contains("pub use runtime::block_on;");
-    let runtime_module_public = core_shipped.contains("pub mod runtime;");
+    let runtime_exports_private_bridge = core_runtime_shipped.contains("pub fn block_on")
+        || core_runtime_shipped.contains("RuntimeBuilder::");
 
     outcome
         .observe("total_denied_sites", hits.len())
         .observe("core_exports_block_on_unconditionally", exports_block_on)
-        .observe("core_runtime_module_public", runtime_module_public)
+        .observe(
+            "core_runtime_exports_private_bridge",
+            runtime_exports_private_bridge,
+        )
         .observe(
             "blocking_bridge_reaches_shipped_public_surface",
-            exports_block_on || runtime_module_public,
+            exports_block_on || runtime_exports_private_bridge,
         )
         .observe("sample", sample.trim_end_matches(" | "));
 
     outcome.require(
-        !(exports_block_on || runtime_module_public),
+        !(exports_block_on || runtime_exports_private_bridge),
         "fastmcp-core must not publish a blocking runtime bridge on its shipped public surface; \
-         `pub mod runtime;` and `pub use runtime::block_on;` in crates/fastmcp-core/src/lib.rs \
-         are both unconditional, so a downstream consumer can create and enter a runtime through \
-         a library whose premise is that FastMCP never creates its own. The macros no longer \
-         expand to it and the CLI asserts production never reaches it, so the export is now \
-         reachability without a production consumer",
+         `pub use runtime::block_on;` and `runtime::block_on` must remain gated behind \
+         `#[cfg(any(test, feature = \"test-runtime\"))]` so no downstream consumer can create \
+         and enter a private runtime through the shipped library surface",
     );
 
     outcome.require(
@@ -3256,4 +3567,72 @@ fn fnd_04_instrument_strip_cfg_test_modules_misses_two_kinds_of_test_module() {
         "GAP 2 is live: fastmcp-transport/src/sse.rs gates an inline test module \
          with a non-literal cfg(test) attribute"
     );
+}
+
+#[test]
+fn fnd_04_b_07_scanner_catches_ungated_block_on_and_runtime_builder_while_stripping_test_runtime() {
+    // Control (FND-04-B07-TEST-RUNTIME-STRIP-POS): items gated behind
+    // `#[cfg(any(test, feature = "test-runtime"))]` (after B-05 verifies
+    // `fastmcp-core/test-runtime` is absent from the product graph) and
+    // `#[cfg(test)] mod tests;` declarations produce zero hits and do not
+    // swallow the following shipped item.
+    let gated = concat!(
+        "#[cfg(test)]\n",
+        "mod tests;\n",
+        "pub mod runtime;\n",
+        "#[cfg(any(test, feature = \"test-runtime\"))]\n",
+        "pub use runtime::block_on;\n",
+        "#[cfg(any(test, feature = \"test-runtime\"))]\n",
+        "pub fn block_on() {\n",
+        "    let _ = RuntimeBuilder::current_thread();\n",
+        "}\n",
+    );
+    let mut gated_hits = Vec::new();
+    scan_shipped_source_for_deny_inventory(
+        "crates/fastmcp-core/src/lib.rs",
+        gated,
+        &mut gated_hits,
+    );
+    assert!(
+        gated_hits.is_empty(),
+        "test-runtime-gated bridge items must not be flagged as shipped: {gated_hits:?}"
+    );
+
+    // Planted negative 1 (FND-04-B07-TEST-RUNTIME-STRIP-NEG): an un-gated
+    // `pub use runtime::block_on;` after `#[cfg(test)] mod tests;` is caught
+    // immediately (and not swallowed by the preceding `mod tests;` declaration).
+    let ungated_reexport = concat!(
+        "#[cfg(test)]\n",
+        "mod tests;\n",
+        "pub mod runtime;\n",
+        "pub use runtime::block_on;\n",
+    );
+    let mut reexport_hits = Vec::new();
+    scan_shipped_source_for_deny_inventory(
+        "crates/fastmcp-core/src/lib.rs",
+        ungated_reexport,
+        &mut reexport_hits,
+    );
+    assert_eq!(reexport_hits.len(), 1);
+    assert_eq!(reexport_hits[0].dimension, "public-runtime-bridge-export");
+    assert_eq!(reexport_hits[0].text, "pub use runtime::block_on;");
+
+    // Planted negative 2 (FND-04-B07-TEST-RUNTIME-STRIP-NEG): an un-gated
+    // `RuntimeBuilder::current_thread()` inside the item immediately following
+    // `#[cfg(test)] mod tests;` is caught as `private-runtime`.
+    let ungated_runtime = concat!(
+        "#[cfg(test)]\n",
+        "mod tests;\n",
+        "pub fn leaked_bridge() {\n",
+        "    let _ = RuntimeBuilder::current_thread();\n",
+        "}\n",
+    );
+    let mut runtime_hits = Vec::new();
+    scan_shipped_source_for_deny_inventory(
+        "crates/fastmcp-core/src/runtime.rs",
+        ungated_runtime,
+        &mut runtime_hits,
+    );
+    assert_eq!(runtime_hits.len(), 1);
+    assert_eq!(runtime_hits[0].dimension, "private-runtime");
 }

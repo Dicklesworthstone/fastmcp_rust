@@ -2046,12 +2046,17 @@ impl Drop for HttpServerStartupGuard {
             return;
         };
         let mut shutdown_completion = None;
-        let settlement =
+        let mut settlement =
             await_http_server_shutdown(finished, &mut shutdown_completion, &mut self.join);
+        if settlement.is_err() && self.join.is_some() {
+            settlement =
+                await_http_server_shutdown(finished, &mut shutdown_completion, &mut self.join);
+        }
         if settlement.is_err() && self.join.is_some() {
             eprintln!(
                 "public HTTP server startup left a live unjoinable thread after bounded settlement"
             );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
             std::process::abort();
         }
     }
@@ -2524,8 +2529,13 @@ impl Drop for HttpServerFixture {
         if !self.retains_shutdown_ownership() {
             return;
         }
-        if let Err(error) = self.settle() {
+        let mut settlement = self.settle();
+        if settlement.is_err() && self.retains_shutdown_ownership() {
+            settlement = self.settle();
+        }
+        if let Err(error) = settlement {
             eprintln!("public HTTP server fixture drop failed: {error}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
             // A failed join can leave child ownership in the buffered report
             // even after consuming the thread handle. Never discard either
             // form of retained ownership after bounded settlement fails.
@@ -2919,6 +2929,7 @@ enum HttpFixtureDropCase {
     Quiescent,
     ReportedFailure,
     Unwinding,
+    DelayedOwnerRelease,
     LiveOwner,
 }
 
@@ -2930,20 +2941,33 @@ fn http_fixture_drop_case(name: &str, case: HttpFixtureDropCase) {
     if let Ok(selected) = std::env::var(CHILD) {
         assert_eq!(selected, name, "the child runs exactly its selected case");
         let (finished_tx, finished) = mpsc::sync_channel(1);
-        let (release, blocked) = mpsc::sync_channel::<()>(0);
+        let (release, blocked) = mpsc::sync_channel::<()>(1);
+        let delayed_release = matches!(case, HttpFixtureDropCase::DelayedOwnerRelease).then(|| {
+            let release = release.clone();
+            thread::spawn(move || {
+                thread::sleep(HTTP_SERVER_TEARDOWN_BOUND + Duration::from_millis(200));
+                let _ = release.send(());
+            })
+        });
         let exited = Arc::new(AtomicBool::new(false));
         let owner_exited = Arc::clone(&exited);
-        let completion = if matches!(case, HttpFixtureDropCase::Quiescent) {
+        let completion = if matches!(
+            case,
+            HttpFixtureDropCase::Quiescent | HttpFixtureDropCase::DelayedOwnerRelease
+        ) {
             Ok(HttpServerShutdown::Quiescent)
         } else {
             Err("planted joined-owner teardown failure".to_owned())
         };
         let join = thread::spawn(move || {
             finished_tx.send(completion).expect("report shutdown");
-            if matches!(case, HttpFixtureDropCase::LiveOwner) {
+            if matches!(
+                case,
+                HttpFixtureDropCase::DelayedOwnerRelease | HttpFixtureDropCase::LiveOwner
+            ) {
                 blocked
                     .recv()
-                    .expect("retain the live owner until process exit");
+                    .expect("retain the live owner until released or process exit");
             }
             owner_exited.store(true, Ordering::SeqCst);
         });
@@ -2962,12 +2986,18 @@ fn http_fixture_drop_case(name: &str, case: HttpFixtureDropCase) {
                 panic!("original owning test failure");
             }
         }));
+        if let Some(releaser) = delayed_release {
+            releaser.join().expect("join delayed owner release helper");
+        }
         // Keep the sender alive across Drop so the negative cannot accidentally
         // release its owner when the receiver observes disconnection.
         drop(release);
         match case {
-            HttpFixtureDropCase::Quiescent => {
-                assert!(outcome.is_ok(), "a quiescent owner drops successfully");
+            HttpFixtureDropCase::Quiescent | HttpFixtureDropCase::DelayedOwnerRelease => {
+                assert!(
+                    outcome.is_ok(),
+                    "a quiescent or retry-settled owner drops successfully"
+                );
             }
             HttpFixtureDropCase::ReportedFailure => {
                 let payload = outcome.expect_err("a joined shutdown failure still fails the test");
@@ -3035,6 +3065,15 @@ fn e2e_http_fixture_drop_quiescent_owner_still_succeeds() {
     http_fixture_drop_case(
         "e2e_http_fixture_drop_quiescent_owner_still_succeeds",
         HttpFixtureDropCase::Quiescent,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_http_fixture_drop_delayed_owner_settles_on_retry_without_abort() {
+    http_fixture_drop_case(
+        "e2e_http_fixture_drop_delayed_owner_settles_on_retry_without_abort",
+        HttpFixtureDropCase::DelayedOwnerRelease,
     );
 }
 
@@ -3384,8 +3423,13 @@ impl Drop for OverlapWorker {
         if self.join.is_none() {
             return;
         }
-        if let Err(error) = self.settle() {
+        let mut settlement = self.settle();
+        if settlement.is_err() && self.join.is_some() {
+            settlement = self.settle();
+        }
+        if let Err(error) = settlement {
             eprintln!("overlap worker settlement failed: {error}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
             if self.join.is_some() {
                 std::process::abort();
             }
@@ -3418,8 +3462,13 @@ impl Drop for StalledOverlapWorker {
         if self.worker.join.is_none() {
             return;
         }
-        if let Err(error) = self.settle() {
+        let mut settlement = self.settle();
+        if settlement.is_err() && self.worker.join.is_some() {
+            settlement = self.settle();
+        }
+        if let Err(error) = settlement {
             eprintln!("stalled overlap worker settlement failed: {error}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
             if self.worker.join.is_some() {
                 std::process::abort();
             }
@@ -42008,12 +42057,23 @@ mod live_websocket_bind {
     #[allow(dead_code)]
     impl Drop for WebSocketServerFixture {
         fn drop(&mut self) {
-            if self.join.is_none() && self.nonquiescent.is_none() {
+            if !self.retains_shutdown_ownership() {
                 return;
             }
-            if let Err(error) = self.settle() {
+            let mut settlement = self.settle();
+            if settlement.is_err() && self.retains_shutdown_ownership() {
+                settlement = self.settle();
+            }
+            if let Err(error) = settlement {
                 eprintln!("public WebSocket server fixture drop failed: {error}");
-                std::process::abort();
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                if self.retains_shutdown_ownership() {
+                    std::process::abort();
+                }
+                if thread::panicking() {
+                    return;
+                }
+                panic!("public WebSocket server fixture drop failed: {error}");
             }
         }
     }
@@ -42022,6 +42082,15 @@ mod live_websocket_bind {
     impl WebSocketServerFixture {
         fn address(&self) -> SocketAddr {
             self.address
+        }
+
+        fn retains_shutdown_ownership(&self) -> bool {
+            self.join.is_some()
+                || self.nonquiescent.is_some()
+                || matches!(
+                    self.shutdown_completion.as_ref(),
+                    Some(Ok(WebSocketServerShutdown::Nonquiescent(_)))
+                )
         }
 
         fn settle(&mut self) -> Result<(), String> {

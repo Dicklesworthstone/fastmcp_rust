@@ -21259,7 +21259,7 @@ impl Server {
         let worker_auth_custody_generation = auth_custody_generation;
         let worker_subscription_sender = io_mode.subscription_sender();
         let (worker_completion_sender, worker_completion_receiver) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = blocking_dispatch_pool().spawn(move || {
             // This dedicated thread is never the async driver: the receive
             // pump routes matched reverse responses into `pending_requests` on
             // its own thread. A handler that bridges sampling, elicitation or
@@ -22574,15 +22574,12 @@ impl Server {
             .recv_timeout(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
         {
             Ok(()) => {
-                if worker.join().is_err() {
-                    exit_code = 1;
-                }
+                worker.wait();
                 true
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                if worker.join().is_err() {
-                    exit_code = 1;
-                }
+                worker.wait();
+                exit_code = 1;
                 true
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -22596,6 +22593,7 @@ impl Server {
                     // after this return. Rust cannot safely preempt an
                     // arbitrary blocking handler; detaching is the only
                     // bounded process-exit fallback here.
+                    worker.cancel();
                     drop(worker);
                     false
                 } else {
@@ -22604,9 +22602,7 @@ impl Server {
                         "Returning server pump is waiting for dispatch-worker quiescence before running shutdown hooks"
                     );
                     let _ = worker_completion_receiver.recv();
-                    if worker.join().is_err() {
-                        exit_code = 1;
-                    }
+                    worker.wait();
                     true
                 }
             }
