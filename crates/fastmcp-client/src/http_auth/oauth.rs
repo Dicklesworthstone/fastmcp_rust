@@ -896,6 +896,16 @@ fn admit_host_redirect_callback(
         .strip_prefix(redirect_uri.as_str())
         .and_then(|suffix| suffix.strip_prefix('?'))
         .ok_or(OAuthError::CallbackRejected)?;
+    admit_callback_query(query, attempt, issuer)
+}
+
+/// Both callback transports admit the same authorization-code parameter union.
+/// Transport-specific route and header validation must precede this boundary.
+fn admit_callback_query(
+    query: &str,
+    attempt: &AuthorizationAttempt,
+    issuer: &str,
+) -> Result<String, OAuthError> {
     // Unknown response parameters are ignored only after bounded strict form
     // admission. Repeated unknown names remain inert; known names, including
     // escaped aliases and incompatible credential-bearing responses, are singletons.
@@ -1043,8 +1053,7 @@ fn admit_callback(
     if host != Some(address.to_string().as_str()) {
         return Err(OAuthError::CallbackRejected);
     }
-    let fields = decode_form(query)?;
-    admit_callback_fields(&fields, attempt, issuer)
+    admit_callback_query(query, attempt, issuer)
 }
 
 fn admit_callback_fields(
@@ -1940,6 +1949,97 @@ mod tests {
             fields["redirect_uri"],
             "http://127.0.0.1:43210/oauth/callback"
         );
+    }
+
+    #[test]
+    fn callback_transports_share_success_denial_and_singleton_admission() {
+        let configuration = config();
+        let attempt = AuthorizationAttempt::new().unwrap();
+        let state = attempt.state().unwrap();
+        let address: SocketAddr = "127.0.0.1:43210".parse().unwrap();
+        let redirect = url("https://app.example/oauth/return");
+        let admit_both = |query: &str| {
+            let request = format!(
+                "GET {CALLBACK_PATH}?{query} HTTP/1.1\r\nHost: {address}\r\n\r\n"
+            );
+            let callback = format!("{}?{query}", redirect.as_str());
+            (
+                admit_callback(request.as_bytes(), address, &attempt, &configuration.issuer),
+                admit_host_redirect_callback(
+                    &callback,
+                    &redirect,
+                    &attempt,
+                    &configuration.issuer,
+                ),
+            )
+        };
+        let success = encode_form(&[
+            ("state", &state),
+            ("iss", &configuration.issuer),
+            ("code", "code+/%"),
+        ])
+        .unwrap();
+        for suffix in ["", "&vendor=one&v%65ndor=two"] {
+            let (loopback, hosted) = admit_both(&format!("{success}{suffix}"));
+            assert_eq!(loopback, Ok("code+/%".to_owned()), "{suffix}");
+            assert_eq!(hosted, loopback, "{suffix}");
+        }
+        for suffix in [
+            "&access_token=private-canary",
+            "&refresh_token=private-canary",
+            "&id_token=",
+            "&token_type=Bearer",
+            "&client_secret=private-canary",
+            "&client_assertion=private-canary",
+            "&a%63cess_token=private-canary",
+            "&error_description=private-canary",
+            "&error_%75ri=private-canary",
+            "&code=other",
+            "&co%64e=other",
+            "&st%61te=other",
+            "&i%73s=other",
+            "&error=access_denied",
+            "&vendor=one&v%65ndor=two&co%64e=other",
+            "&unknown=%ff",
+            "&unknown=%",
+            "&unknown=%00",
+        ] {
+            let (loopback, hosted) = admit_both(&format!("{success}{suffix}"));
+            assert_eq!(loopback, Err(OAuthError::CallbackRejected), "{suffix}");
+            assert_eq!(hosted, loopback, "{suffix}");
+        }
+
+        let denial = encode_form(&[
+            ("state", &state),
+            ("iss", &configuration.issuer),
+            ("error", "access_denied"),
+        ])
+        .unwrap();
+        for suffix in [
+            "",
+            "&error_description=Denied&error_uri=https%3A%2F%2Fissuer.example%2Fhelp",
+            "&vendor=one&v%65ndor=two",
+        ] {
+            let (loopback, hosted) = admit_both(&format!("{denial}{suffix}"));
+            assert_eq!(loopback, Err(OAuthError::AuthorizationDenied), "{suffix}");
+            assert_eq!(hosted, loopback, "{suffix}");
+        }
+        for suffix in [
+            "&access_token=private-canary",
+            "&refresh_token=private-canary",
+            "&id_token=",
+            "&token_type=Bearer",
+            "&client_secret=private-canary",
+            "&client_assertion=private-canary",
+            "&client_%61ssertion=private-canary",
+            "&err%6Fr=access_denied",
+            "&error_description=one&error_%64escription=two",
+            "&error_uri=one&error_%75ri=two",
+        ] {
+            let (loopback, hosted) = admit_both(&format!("{denial}{suffix}"));
+            assert_eq!(loopback, Err(OAuthError::CallbackRejected), "{suffix}");
+            assert_eq!(hosted, loopback, "{suffix}");
+        }
     }
 
     #[test]
@@ -2964,6 +3064,165 @@ mod tests {
             assert_eq!(server, Ok(()));
             assert_eq!(application, Ok(()));
         });
+    }
+
+    #[test]
+    fn native_callback_refuses_mixed_credentials_before_one_valid_redemption() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+                let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+                let mut configuration = config()
+                    .with_extra_root_certificate(test_root())
+                    .unwrap()
+                    .with_authorization_timeout(Duration::from_secs(20))
+                    .unwrap();
+                configuration.token_endpoint =
+                    url(&format!("https://{}/token", listener.local_addr().unwrap()));
+                let client = OAuthClient::new(configuration.clone());
+                let acceptor = test_acceptor();
+                let valid_callback_sent = AtomicBool::new(false);
+                let token_posts = AtomicUsize::new(0);
+                let (launch_sender, mut launch_receiver) = oneshot::channel();
+                let application = client.authorize(&cx, |authorization| async move {
+                    launch_sender
+                        .send(authorization)
+                        .map_err(|_| OAuthError::BrowserLaunchFailed)?;
+                    Ok(())
+                });
+                let browser = within(&cx, deadline, async {
+                    let authorization: CanonicalHttpUrl = launch_receiver
+                        .recv(&cx)
+                        .await
+                        .map_err(|_| OAuthError::BrowserLaunchFailed)?;
+                    let fields = decode_form(authorization.query().unwrap())?;
+                    let callback = CanonicalHttpUrl::parse(&fields["redirect_uri"])
+                        .map_err(|_| OAuthError::CallbackRejected)?;
+                    let address: SocketAddr = callback
+                        .as_str()
+                        .strip_prefix("http://")
+                        .unwrap()
+                        .split('/')
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let query = encode_form(&[
+                        ("code", "issued-code"),
+                        ("iss", &configuration.issuer),
+                        ("state", &fields["state"]),
+                    ])?;
+                    let rejected = [
+                        "&access_token=private-canary",
+                        "&refresh_token=private-canary",
+                        "&id_token=private-canary",
+                        "&token_type=Bearer",
+                        "&client_secret=private-canary",
+                        "&client_assertion=private-canary",
+                        "&a%63cess_token=private-canary",
+                        "&error_description=private-canary",
+                        "&error_%75ri=private-canary",
+                    ];
+                    for suffix in rejected {
+                        let request = format!(
+                            "GET {CALLBACK_PATH}?{query}{suffix} HTTP/1.1\r\nHost: {address}\r\n\r\n"
+                        );
+                        let mut socket = TcpStream::connect(address)
+                            .await
+                            .map_err(|_| OAuthError::CallbackRejected)?;
+                        socket
+                            .write_all(request.as_bytes())
+                            .await
+                            .map_err(|_| OAuthError::CallbackRejected)?;
+                        let mut response = Vec::new();
+                        let mut buffer = [0_u8; 1024];
+                        loop {
+                            let count = socket
+                                .read(&mut buffer)
+                                .await
+                                .map_err(|_| OAuthError::CallbackRejected)?;
+                            if count == 0 {
+                                break;
+                            }
+                            if response.len() + count > 4096 {
+                                return Err(OAuthError::CallbackRejected);
+                            }
+                            response.extend_from_slice(&buffer[..count]);
+                        }
+                        let response = std::str::from_utf8(&response).unwrap();
+                        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{suffix}");
+                        assert!(!response.contains("private-canary"));
+                        assert!(!response.contains(&fields["state"]));
+                        assert_eq!(token_posts.load(Ordering::SeqCst), 0, "{suffix}");
+                    }
+                    // A rejected callback cannot consume the pending login.
+                    // Bounded inert duplicate fields on the valid callback
+                    // must not prevent its single code redemption.
+                    valid_callback_sent.store(true, Ordering::SeqCst);
+                    let request = format!(
+                        "GET {CALLBACK_PATH}?{query}&vendor=one&v%65ndor=two HTTP/1.1\r\nHost: {address}\r\n\r\n"
+                    );
+                    let mut socket = TcpStream::connect(address)
+                        .await
+                        .map_err(|_| OAuthError::CallbackRejected)?;
+                    socket
+                        .write_all(request.as_bytes())
+                        .await
+                        .map_err(|_| OAuthError::CallbackRejected)?;
+                    Ok(())
+                });
+                let server = within(&cx, deadline, async {
+                    let (socket, _) = listener
+                        .accept()
+                        .await
+                        .map_err(|_| OAuthError::TransportFailed)?;
+                    assert!(
+                        valid_callback_sent.load(Ordering::SeqCst),
+                        "a rejected callback must not contact the token endpoint",
+                    );
+                    let mut tls = acceptor
+                        .accept(socket)
+                        .await
+                        .map_err(|_| OAuthError::TransportFailed)?;
+                    let (head, form) = read_token_request(&mut tls).await?;
+                    assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
+                    assert_eq!(form["grant_type"], "authorization_code");
+                    assert_eq!(form["code"], "issued-code");
+                    assert_eq!(form["client_id"], "native-client");
+                    assert_eq!(form["resource"], configuration.resource.as_str());
+                    assert!(!form.contains_key("vendor"));
+                    assert!(!head.contains("private-canary"));
+                    assert!(form.values().all(|value| !value.contains("private-canary")));
+                    token_posts.fetch_add(1, Ordering::SeqCst);
+                    let body = r#"{"access_token":"live-access","token_type":"Bearer","expires_in":600}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    tls.write_all(response.as_bytes())
+                        .await
+                        .map_err(|_| OAuthError::TransportFailed)?;
+                    tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
+                    Ok(())
+                });
+                let (served, (authorized, browser)) =
+                    Box::pin(pair(server, Box::pin(pair(application, browser)))).await;
+                assert_eq!(served, Ok(()));
+                assert_eq!(browser, Ok(()));
+                let credentials = authorized.expect("the later valid callback must redeem once");
+                assert_eq!(
+                    credentials.access.authorization_for_target(&configuration.resource),
+                    Some("Bearer live-access".to_owned()),
+                );
+                assert_eq!(token_posts.load(Ordering::SeqCst), 1);
+                assert_listener_drained(&listener);
+            });
     }
 
     #[test]
