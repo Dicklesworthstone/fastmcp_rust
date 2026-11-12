@@ -1888,11 +1888,27 @@ own request ID for memory and stdio. A request without an output sink is refused
 before any upstream request is started.
 
 All intermediate events share a 64-event budget. Core progress and log events
-count toward the budget and are consumed without being relayed. Standalone
-client-to-server notification forwarding remains unsupported. Downstream framework
+count toward the budget and are consumed without being relayed. Downstream framework
 metadata is not application payload or an upstream activation proof. Cancelling
 or dropping a forwarded request closes its owned upstream execution while sibling
 requests continue independently.
+
+Standalone client-to-server notifications use
+`ExtensionBuilder::typed_http_proxy_notification::<Notification, _>`. Register the
+same notification method, schema identity, and activation-metadata key on both
+legs, supply an explicit typed authorization policy, and pass the independently
+connected `ExtensionHttpUpstream`. Request and notification routes may share one
+upstream when their complete contracts match.
+
+Each notification consumes its own downstream activation proof and the exact
+payload admitted by its authorization policy. The gateway checks typed
+serialization and effective-settings equality, then sends a fresh upstream
+notification with the upstream client's own proof and credentials. A change in
+the upstream resolver's effective settings is rejected before sending. Only an
+empty HTTP 202 acknowledges completion. The upstream handle admits at most 64
+concurrent notification POSTs across its clones; completion, cancellation, or
+Drop releases the permit. Notifications allocate no request ID or response
+waiter and are never retried automatically.
 
 ## Client executor observations
 

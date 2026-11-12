@@ -1,5 +1,8 @@
 //! Typed gateway routes use two real HTTP legs and ordinary scoped shutdown.
 
+#[path = "http_proxy/client_notifications.rs"]
+mod client_notifications;
+
 use std::future::Future;
 use std::sync::Mutex;
 use std::task::Poll;
@@ -501,7 +504,7 @@ fn typed_http_proxy_preserves_large_typed_results() {
 }
 
 #[test]
-fn typed_http_proxy_connection_requires_upstream_activation_and_request_only_contract() {
+fn typed_http_proxy_connection_requires_upstream_activation_for_requests_and_notifications() {
     let server = modern::ServerBuilder::new("no-authored-extension", "1.0");
     run_http_test(server, |cx, endpoint| async move {
         modern::ClientBuilder::new()
@@ -518,9 +521,8 @@ fn typed_http_proxy_connection_requires_upstream_activation_and_request_only_con
                 &ClientSettings { version: 1 },
             )
             .await
-            .expect_err("standalone client notification declarations are excluded before connecting");
-        assert_eq!(error.code, fastmcp_rust::McpErrorCode::InvalidParams);
-        assert!(error.message.contains("client notification declarations"));
+            .expect_err("a notification declaration also requires independent upstream activation");
+        assert_eq!(error.code, fastmcp_rust::McpErrorCode::InvalidRequest);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(observations.authorized.load(Ordering::SeqCst), 0);
         assert_eq!(observations.started.load(Ordering::SeqCst), 0);

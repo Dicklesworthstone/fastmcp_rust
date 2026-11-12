@@ -1,9 +1,11 @@
-//! Framework-owned typed HTTP forwarding for authored request contracts.
+//! Framework-owned typed HTTP forwarding for authored extension contracts.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use fastmcp_client::{
-    ClientBuilder, HttpClient, ModernHttpExtensionEvent, ModernHttpExtensionExecution,
+    ClientBuilder, ClientHttpConnection, HttpClient, ModernHttpExtensionEvent,
+    ModernHttpExtensionExecution,
 };
 use fastmcp_core::{Cx, DEFAULT_JSON_RPC_MAX_BODY_BYTES};
 use fastmcp_protocol::extensions::{
@@ -13,36 +15,41 @@ use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{AdmittedSchema, JsonRpcRequest};
 
 use super::{
-    Arc, BTreeMap, BoxFuture, DeserializeOwned, ErasedExtensionHandler, ExtensionBuilder,
-    ExtensionDescriptor, ExtensionNegotiationError, ExtensionRegistration, ExtensionSettings,
-    ExtensionSettingsCompatibilityResolver, HandlerBinding, JsonSchemaType,
-    MAX_AUTHORING_SETTINGS_BYTES, MAX_SCHEMA_INSTANCE_BYTES, McpContext, McpError, McpResult,
-    NegotiatedExtension, PendingMethod, PhantomData, ProtocolDescriptor, Serialize,
-    SettingsResolver, Value, compile_schema, encode_bytes, encode_value, ensure_live, poll_live,
+    Arc, AuthorizedNotificationPayload, BTreeMap, BoxFuture, DeserializeOwned,
+    ErasedExtensionHandler, ExtensionBuilder, ExtensionDescriptor, ExtensionNegotiationError,
+    ExtensionRegistration, ExtensionSettings, ExtensionSettingsCompatibilityResolver,
+    HandlerBinding, JsonSchemaType, MAX_AUTHORING_SETTINGS_BYTES, MAX_SCHEMA_INSTANCE_BYTES,
+    McpContext, McpError, McpResult, NegotiatedExtension, NotificationBinding, PendingMethod,
+    PendingNotification, PhantomData, ProtocolDescriptor, Serialize, SettingsResolver, Value,
+    compile_schema, encode_bytes, encode_value, ensure_live, notification_authorizer, poll_live,
     retain_schema_identity, unbound_handler,
 };
 
 // Progress and core notifications are admitted by the client but not relayed.
 // Bound the total work even when a peer keeps sending valid nonterminal events.
 const MAX_INTERMEDIATE_EVENTS: usize = 64;
+const MAX_PENDING_NOTIFICATIONS: usize = 64;
 
 /// A negotiated HTTP upstream for one complete authored extension contract.
 ///
 /// Construct this handle with [`ExtensionRegistration::connect_http_upstream`].
-/// Clones share bounded request accounting and a fresh request ID allocator.
+/// Clones share bounded request and notification accounting and a fresh request
+/// ID allocator. Notifications never allocate a request ID or response waiter.
 /// They expose no client, credentials, registry, resolver, or execution control.
 /// Each forwarded request owns its response stream and cancellation lifetime.
 ///
 /// Request-owned server notifications require the explicit typed notification
-/// route. Standalone client notifications are not supported. All intermediate
-/// events share a 64-event budget; core progress and log notifications are
-/// consumed without being forwarded to the downstream caller.
+/// route. Client notifications require their own typed forwarding route and
+/// fresh activation proof. At most 64 notification POSTs may run concurrently.
+/// All request intermediate events share a 64-event budget; core progress and
+/// log notifications are consumed without being forwarded to the caller.
 #[derive(Clone)]
 pub struct ExtensionHttpUpstream {
     client: Arc<Mutex<HttpClient>>,
     descriptor: Arc<ExtensionDescriptor>,
     protocol: ProtocolDescriptor,
     negotiated: NegotiatedExtension,
+    pending_notifications: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for ExtensionHttpUpstream {
@@ -65,6 +72,7 @@ impl ExtensionHttpUpstream {
 struct ProxySettingsResolver {
     descriptor: ProtocolDescriptor,
     resolve: Arc<SettingsResolver>,
+    effective: Arc<OnceLock<ExtensionSettings>>,
 }
 
 impl ExtensionSettingsCompatibilityResolver for ProxySettingsResolver {
@@ -79,7 +87,14 @@ impl ExtensionSettingsCompatibilityResolver for ProxySettingsResolver {
         if descriptor != &self.descriptor {
             return Err(rejected());
         }
-        (self.resolve)(client, server).map_err(|_| rejected())
+        let effective = (self.resolve)(client, server).map_err(|_| rejected())?;
+        // Notifications perform a new compatibility decision for every POST.
+        // Even a stateful application resolver cannot change the settings that
+        // the proxy compares with the independently admitted downstream leg.
+        if self.effective.get().is_some_and(|expected| expected != &effective) {
+            return Err(rejected());
+        }
+        Ok(effective)
     }
 }
 
@@ -94,17 +109,18 @@ impl ExtensionRegistration {
     ///
     /// This consumes the registration without invoking its handlers. Build a
     /// second registration with the same complete contract for the gateway,
-    /// using [`ExtensionBuilder::typed_http_proxy_request`] or
-    /// [`ExtensionBuilder::typed_http_proxy_request_with_notifications`].
+    /// using [`ExtensionBuilder::typed_http_proxy_request`],
+    /// [`ExtensionBuilder::typed_http_proxy_request_with_notifications`], or
+    /// [`ExtensionBuilder::typed_http_proxy_notification`].
     /// All methods and schemas, including their order and descriptor version,
-    /// must match. Request-owned server notifications require the latter typed
-    /// route. Standalone client notification declarations remain unsupported.
+    /// must match. Client notifications are admitted per message and receive
+    /// fresh upstream activation proof from these local client settings.
     ///
     /// # Errors
     ///
-    /// Returns an error if the declaration includes client notifications, the
-    /// builder does not select a modern-only HTTP plan, client settings fail
-    /// validation, or the upstream connection fails to negotiate the extension.
+    /// Returns an error if the builder does not select a modern-only HTTP plan,
+    /// client settings fail validation, or the upstream connection fails to
+    /// negotiate the extension.
     pub async fn connect_http_upstream<ClientSettings>(
         self,
         cx: &Cx,
@@ -114,11 +130,6 @@ impl ExtensionRegistration {
     where
         ClientSettings: Serialize + Sync + ?Sized,
     {
-        if self.descriptor.notification.is_some() {
-            return Err(McpError::invalid_params(
-                "HTTP extension proxy does not support client notification declarations",
-            ));
-        }
         if builder.selected_protocol_plan().policy() != ProtocolPolicy::ModernOnly
             || builder.selected_protocol_plan().modern_post_target().is_none()
         {
@@ -139,12 +150,16 @@ impl ExtensionRegistration {
         let protocol = self.resolver.descriptor;
         let resolver_protocol = protocol.clone();
         let resolve: Arc<SettingsResolver> = Arc::from(self.resolver.resolve);
+        let effective = Arc::new(OnceLock::new());
+        let resolver_effective = Arc::clone(&effective);
         // Each negotiation owns a fresh resolver. Only immutable callback
-        // configuration is shared, never a mutable resolver or its state.
+        // configuration is shared. The effective settings are sealed before
+        // the connected upstream becomes available for forwarding.
         let builder = builder.extension_registry(descriptors, discovery, move || {
             ProxySettingsResolver {
                 descriptor: resolver_protocol.clone(),
                 resolve: Arc::clone(&resolve),
+                effective: Arc::clone(&resolver_effective),
             }
         })?;
         // No application callback from the declaration survives into forwarding.
@@ -162,11 +177,15 @@ impl ExtensionRegistration {
             .ok_or_else(|| {
                 McpError::invalid_request("HTTP upstream did not activate the typed extension")
             })?;
+        effective
+            .set(negotiated.effective_settings().settings().clone())
+            .map_err(|_| McpError::internal_error("HTTP upstream settings are already sealed"))?;
         Ok(ExtensionHttpUpstream {
             client: Arc::new(Mutex::new(client)),
             descriptor: self.descriptor,
             protocol,
             negotiated,
+            pending_notifications: Arc::new(AtomicUsize::new(0)),
         })
     }
 }
@@ -186,14 +205,14 @@ where
     ///
     /// Build-time validation compares the complete compiled contract against
     /// the upstream declaration, including every schema digest and method.
-    /// Adding a notification or changing a schema after this call fails build.
+    /// Every declared client notification also needs the matching typed route.
     /// A cancelled/dropped downstream request drops only its owned upstream
     /// execution; sibling requests remain usable.
     ///
     /// # Errors
     ///
-    /// Returns an error if the upstream does not own the request-only extension
-    /// method or if method schema registration fails.
+    /// Returns an error if the upstream does not own the extension method or if
+    /// method schema registration fails.
     pub fn typed_http_proxy_request<Request, Response>(
         self,
         method: impl Into<String>,
@@ -240,7 +259,8 @@ where
     ///
     /// Returns an error if either notification declaration is missing or
     /// differs, the notification type has another schema, or request method
-    /// registration fails. Standalone client notifications are not forwarded.
+    /// registration fails. Use [`Self::typed_http_proxy_notification`] for
+    /// standalone client notifications.
     pub fn typed_http_proxy_request_with_notifications<Request, Response, Notification>(
         self,
         method: impl Into<String>,
@@ -287,6 +307,80 @@ where
         )
     }
 
+    /// Registers an authorized typed client notification forwarded to HTTP.
+    ///
+    /// The ordinary notification dispatcher authenticates the downstream
+    /// caller, validates this message's activation proof and typed parameters,
+    /// and runs `authorize` before forwarding. The exact authorized Rust value
+    /// is serialized once, bounded and revalidated; downstream metadata is
+    /// consumed locally and typed serialization cannot recreate it.
+    ///
+    /// Both legs must admit the same complete contract and effective settings.
+    /// The upstream client performs a fresh compatibility decision and adds
+    /// its own activation proof for each POST using its independently configured
+    /// credentials. Only an empty HTTP 202 acknowledges successful completion.
+    /// No request IDs, response waiters, automatic retries, or detached tasks
+    /// are created. Cancellation or dropping the dispatch releases its owned
+    /// POST and one of the upstream's 64 shared notification permits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upstream notification declaration differs,
+    /// another notification is already registered, or schema admission fails.
+    pub fn typed_http_proxy_notification<Notification, Authorize>(
+        mut self,
+        method: impl Into<String>,
+        parameter_schema_id: impl Into<String>,
+        activation_metadata_key: impl Into<String>,
+        authorize: Authorize,
+        upstream: ExtensionHttpUpstream,
+    ) -> McpResult<Self>
+    where
+        Notification: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+        Authorize: Fn(&Notification) -> McpResult<()> + Send + Sync + 'static,
+    {
+        let (notification, parameter_schema, total) = self.prepare_notification::<Notification>(
+            method.into(),
+            parameter_schema_id.into(),
+            activation_metadata_key.into(),
+        )?;
+        if upstream.descriptor.id != self.descriptor.id
+            || upstream.descriptor.notification.as_ref() != Some(&notification)
+        {
+            return Err(McpError::invalid_params(
+                "HTTP upstream does not own this typed client notification",
+            ));
+        }
+        retain_schema_identity(
+            &mut self.schema_identities,
+            &notification.parameter_schema_id,
+            parameter_schema.digest,
+        )?;
+        let effective_schema = Arc::clone(&self.effective_schema.admitted);
+        self.proxy_contracts.push(upstream.protocol.clone());
+        self.pending_notification = Some(PendingNotification {
+            parameter_digest: parameter_schema.digest,
+            authorize: notification_authorizer::<Notification, Authorize>(
+                Arc::clone(&parameter_schema.admitted),
+                authorize,
+            ),
+            factory: Box::new(move |descriptor| {
+                Box::new(TypedHttpProxyNotification::<Notification, Settings> {
+                    binding: NotificationBinding {
+                        descriptor,
+                        effective_schema,
+                    },
+                    parameter_schema: parameter_schema.admitted,
+                    upstream,
+                    marker: PhantomData,
+                })
+            }),
+        });
+        self.descriptor.notification = Some(notification);
+        self.schema_bytes = total;
+        Ok(self)
+    }
+
     fn register_http_proxy_request<Request, Response>(
         mut self,
         method: String,
@@ -301,10 +395,9 @@ where
     {
         if upstream.descriptor.id != self.descriptor.id
             || !upstream.descriptor.methods.iter().any(|entry| entry.name == method)
-            || self.descriptor.notification.is_some()
         {
             return Err(McpError::invalid_params(
-                "HTTP upstream does not own this request-only extension method",
+                "HTTP upstream does not own this extension method",
             ));
         }
         let (method, parameter_schema, result_schema, total) = self
@@ -355,6 +448,145 @@ struct TypedHttpProxyHandler<Request, Response, Settings> {
     upstream: ExtensionHttpUpstream,
     notification: Option<HttpProxyNotification>,
     marker: PhantomData<fn(Request, Settings) -> Response>,
+}
+
+struct HttpProxyNotificationPermit {
+    pending: Arc<AtomicUsize>,
+}
+
+impl HttpProxyNotificationPermit {
+    fn reserve(pending: &Arc<AtomicUsize>) -> McpResult<Self> {
+        pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_PENDING_NOTIFICATIONS).then_some(count + 1)
+            })
+            .map_err(|_| {
+                McpError::invalid_request("HTTP extension upstream notification capacity exceeded")
+            })?;
+        Ok(Self {
+            pending: Arc::clone(pending),
+        })
+    }
+}
+
+impl Drop for HttpProxyNotificationPermit {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct TypedHttpProxyNotification<Notification, Settings> {
+    binding: NotificationBinding,
+    parameter_schema: Arc<AdmittedSchema>,
+    upstream: ExtensionHttpUpstream,
+    marker: PhantomData<fn(Notification, Settings)>,
+}
+
+impl<Notification, Settings> TypedHttpProxyNotification<Notification, Settings>
+where
+    Notification: Serialize + Send + 'static,
+    Settings: DeserializeOwned,
+{
+    fn prepare(
+        &self,
+        context: &McpContext,
+        negotiated: &NegotiatedExtension,
+        authorized: AuthorizedNotificationPayload,
+    ) -> McpResult<Value> {
+        let (notification, _settings) = self.binding.prepare::<Notification, Settings>(
+            context, negotiated, authorized,
+        )?;
+        if negotiated.effective_settings().settings()
+            != self.upstream.negotiated.effective_settings().settings()
+        {
+            return Err(McpError::invalid_request(
+                "HTTP extension proxy requires identical effective settings on both legs",
+            ));
+        }
+        let source = encode_bytes(&notification, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)?;
+        fastmcp_protocol::admit_raw_jsonrpc_document(
+            &source,
+            MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
+        )
+        .map_err(|_| McpError::invalid_params("serialized proxy notification is invalid JSON"))?;
+        let parameters: Value = serde_json::from_slice(&source).map_err(|_| {
+            McpError::invalid_params("serialized proxy notification is invalid JSON")
+        })?;
+        if !parameters.is_object() || parameters.get("_meta").is_some() {
+            return Err(McpError::invalid_params(
+                "typed proxy notification serialization cannot supply framework metadata",
+            ));
+        }
+        self.parameter_schema.validate(&parameters).map_err(|_| {
+            McpError::invalid_params("serialized proxy notification does not satisfy its schema")
+        })?;
+        ensure_live(context)?;
+        Ok(parameters)
+    }
+
+    async fn forward(&self, context: &McpContext, parameters: Value) -> McpResult<Value> {
+        ensure_live(context)?;
+        let _permit = HttpProxyNotificationPermit::reserve(&self.upstream.pending_notifications)?;
+        let method = self.binding.descriptor.notification.as_ref().ok_or_else(|| {
+            McpError::internal_error("typed notification descriptor is unavailable")
+        })?;
+        // Clone the immutable modern transport, not a request or its authority.
+        // A short lock is never retained over network or cancellation awaits.
+        let client = {
+            let client = self.upstream.client.lock().map_err(|_| {
+                McpError::internal_error("HTTP extension upstream is unavailable")
+            })?;
+            #[allow(unreachable_patterns)]
+            match client.connection() {
+                ClientHttpConnection::Modern(client) => client.clone(),
+                _ => {
+                    return Err(McpError::invalid_request(
+                        "HTTP extension proxy requires a modern upstream",
+                    ));
+                }
+            }
+        };
+        poll_live(context, async {
+            let acknowledged = client
+                .notify_final_extension(
+                    context.cx(),
+                    &self.binding.descriptor.id,
+                    &method.name,
+                    parameters,
+                )
+                .await;
+            ensure_live(context)?;
+            acknowledged.map_err(|_| {
+                McpError::invalid_request("HTTP extension upstream notification was not acknowledged")
+            })?;
+            Ok(Value::Null)
+        })
+        .await
+    }
+}
+
+impl<Notification, Settings> ErasedExtensionHandler
+    for TypedHttpProxyNotification<Notification, Settings>
+where
+    Notification: Serialize + Send + 'static,
+    Settings: DeserializeOwned + Send + Sync + 'static,
+{
+    fn invoke(&self, _context: &McpContext, _parameters: Value) -> McpResult<Value> {
+        Err(unbound_handler())
+    }
+
+    fn invoke_authorized_notification_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        negotiated: &'a NegotiatedExtension,
+        _parameters: &'a Value,
+        authorized: AuthorizedNotificationPayload,
+    ) -> BoxFuture<'a, McpResult<Value>> {
+        Box::pin(async move {
+            let parameters = self.prepare(context, negotiated, authorized)?;
+            self.forward(context, parameters).await
+        })
+    }
 }
 
 struct HttpProxyNotification {
@@ -655,6 +887,25 @@ mod tests {
                 "additionalProperties": false
             })
         }
+    }
+
+    #[test]
+    fn client_notification_permits_are_shared_bounded_and_released_on_drop() {
+        let pending = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::clone(&pending);
+        let mut permits = Vec::new();
+        for _ in 0..MAX_PENDING_NOTIFICATIONS {
+            permits.push(HttpProxyNotificationPermit::reserve(&pending).unwrap());
+        }
+        assert_eq!(shared.load(Ordering::Acquire), MAX_PENDING_NOTIFICATIONS);
+        assert!(HttpProxyNotificationPermit::reserve(&shared).is_err());
+        drop(permits.pop().unwrap());
+        let replacement = HttpProxyNotificationPermit::reserve(&shared).unwrap();
+        assert!(HttpProxyNotificationPermit::reserve(&pending).is_err());
+        drop(permits);
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        drop(replacement);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
     }
 
     #[test]
