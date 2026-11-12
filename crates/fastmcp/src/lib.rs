@@ -3546,6 +3546,36 @@ pub mod modern {
             .await
         }
 
+        /// Connects a complete authored contract to a native Unix stdio child.
+        ///
+        /// Discovery and independent extension settings negotiation finish on
+        /// the caller's runtime before the opaque handle becomes available.
+        /// Install it with the typed stdio proxy request/notification routes.
+        /// The upstream builder retains its own identity, subprocess policy and
+        /// deadlines; each forwarded request has an independent cancellation
+        /// lifetime on the child's single bounded ingress driver.
+        #[cfg(all(feature = "extension-authoring", feature = "proxy", unix))]
+        pub async fn connect_extension_stdio_upstream_with_cx<ClientSettings>(
+            self,
+            cx: &Cx,
+            command: &str,
+            args: &[&str],
+            registration: extensions::authoring::ExtensionRegistration,
+            client_settings: &ClientSettings,
+        ) -> McpResult<extensions::authoring::ExtensionStdioUpstream>
+        where
+            ClientSettings: serde::Serialize + Sync + ?Sized,
+        {
+            Box::pin(registration.connect_stdio_upstream(
+                cx,
+                self.inner,
+                command,
+                args,
+                client_settings,
+            ))
+            .await
+        }
+
         /// Sets the working directory for the final-only stdio subprocess.
         #[must_use]
         pub fn working_dir(self, path: impl Into<std::path::PathBuf>) -> Self {

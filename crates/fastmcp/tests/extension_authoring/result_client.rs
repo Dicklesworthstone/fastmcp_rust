@@ -4,6 +4,10 @@
 #[path = "result_client/http_proxy.rs"]
 mod http_proxy;
 
+#[cfg(all(feature = "proxy", unix))]
+#[path = "result_client/stdio_proxy.rs"]
+mod stdio_proxy;
+
 #[cfg(unix)]
 #[path = "result_client/stdio.rs"]
 mod stdio;

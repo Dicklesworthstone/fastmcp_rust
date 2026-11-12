@@ -1954,6 +1954,35 @@ concurrent notification POSTs across its clones; completion, cancellation, or
 Drop releases the permit. Notifications allocate no request ID or response
 waiter and are never retried automatically.
 
+### Typed extension gateways to stdio subprocesses (Unix)
+
+With `extension-authoring` and `proxy` enabled, the same typed extension
+contracts can forward to a local subprocess. Consume the upstream declaration
+with `modern::ClientBuilder::connect_extension_stdio_upstream_with_cx`, supplying
+the caller's `cx`, executable, arguments, and typed client settings. Discovery
+and settings negotiation finish before it returns an `ExtensionStdioUpstream`,
+including when the builder defers ordinary initialization.
+
+Install the complete matching contract on the gateway with
+`typed_stdio_proxy_request::<Request, Response>`. For request-owned server
+notifications, declare the event and use
+`typed_stdio_proxy_request_with_notifications::<Request, Response, Notification>`.
+Standalone client notifications use `typed_stdio_proxy_notification` with an
+explicit typed authorization policy. Both legs independently negotiate;
+contract identities, schemas, and effective settings must match. Framework
+metadata is rebuilt for the upstream leg, and request-owned notification IDs
+are rewritten for the downstream request.
+
+Cloned upstream handles share one subprocess and one bounded ingress driver.
+Requests have independent IDs, cancellation, deadlines, and a 64-event
+intermediate-notification bound. Cancelling or dropping a forwarded call
+publishes its retirement even when no sibling request is driving the child.
+Standalone notifications allocate no request IDs; success means publication
+to the pipe. The adapter does not create a detached task or private runtime,
+and its receive turns retain the native client's bounded synchronous slices.
+After dropping installed routes and other handles, consume the last handle
+with `close_with_cx` to await observable subprocess cleanup.
+
 ## Client executor observations
 
 `OperatorExecutorSnapshot` captures the selected protocol profile, lifecycle,
