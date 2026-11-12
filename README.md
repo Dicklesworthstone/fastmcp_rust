@@ -1455,10 +1455,11 @@ extension work.
 DPoP. It is deliberately *not* wired into the bearer OAuth driver: its module
 documentation states that it "never promotes a DPoP token into the existing
 bearer-only OAuth driver" and "does not install automatic OAuth negotiation or
-HTTP retries". So the application owns the authenticated HTTPS I/O, the
-response-size limits, cancellation of in-flight I/O, and every retry decision.
-If you want DPoP, you drive it; nothing in this SDK will start doing so on your
-behalf.
+HTTP retries". With the low-level session API, the application owns authenticated
+HTTPS I/O, response-size limits, and cancellation of in-flight I/O. The explicit
+native adapters described below can own those operations. The application
+chooses when to acquire a DPoP grant and whether to retry a nonce challenge;
+ordinary bearer operations never switch to DPoP automatically.
 
 One session pins one HTTPS token endpoint, one exact HTTPS MCP resource, and
 one ES256 proof key. The two types a caller must name to open one — `DpopKey`,
@@ -1499,6 +1500,32 @@ the library's to enforce. `fastmcp_protocol::dpop` holds the ES256 proof and
 RFC 7638 thumbprint primitives behind the `jose` feature. A bounded native
 HTTPS resource POST is available under the module's `native` submodule for
 callers who would rather not own that I/O.
+
+#### Native DPoP authorization-code acquisition
+
+`http_auth::oauth::OAuthClient` also provides explicit native-public-client
+entry points: `authorize_dpop(cx, key, launch_browser)` uses a loopback callback,
+and `authorize_dpop_with_redirect_driver(cx, key, redirect_uri, driver)` uses
+the host's independently registered HTTPS callback. The caller supplies the
+proof key and browser or callback driver. Both paths retain state, S256 PKCE,
+issuer, scope, resource, and exact callback checks; the authorization request
+binds `dpop_jkt`, and the bounded HTTPS token POST carries a fresh proof for
+that same key.
+
+The result is `oauth::dpop::DpopAuthorizationOutcome`. `Authorized` owns the
+session and proof-bound access credential; `into_parts` transfers them to the
+explicit `dpop::native::DpopHttpClient`, whose resource TLS policy is selected
+separately. `NonceRequired` owns one in-memory continuation. After choosing to
+continue, consume it with `retry(cx)` for at most one token-endpoint nonce
+retry. It preserves the original code, key, cancellation, and deadline, also
+enforces a stricter supplied caller, and produces a fresh proof. An ambiguous
+transport failure does not authorize another retry.
+
+This access-only flow rejects bearer downgrades, wrong proof-key bindings,
+scope expansion, and refresh, ID-token, or token-exchange response profiles.
+Authorization-server and resource-server nonces stay separate. No credential
+is converted to the bearer driver, and no browser process, automatic refresh,
+resource-operation replay, or durable callback custody is created.
 
 ---
 

@@ -40,6 +40,10 @@ use serde::{Deserialize, Deserializer};
 use super::caller::with_caller;
 use super::{BoundBearerCredential, CanonicalHttpUrl};
 
+/// Explicit RFC 9449 authorization-code acquisition with a separate DPoP owner.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dpop;
+
 /// Anchored refresh-grant custody and native renewal after a Linux file reopen.
 #[cfg(target_os = "linux")]
 pub mod persistence;
