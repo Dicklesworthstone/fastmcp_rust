@@ -2875,6 +2875,24 @@ pub enum Role {
     Assistant,
 }
 
+impl From<fastmcp_core::SamplingRole> for Role {
+    fn from(role: fastmcp_core::SamplingRole) -> Self {
+        match role {
+            fastmcp_core::SamplingRole::User => Self::User,
+            fastmcp_core::SamplingRole::Assistant => Self::Assistant,
+        }
+    }
+}
+
+impl From<Role> for fastmcp_core::SamplingRole {
+    fn from(role: Role) -> Self {
+        match role {
+            Role::User => Self::User,
+            Role::Assistant => Self::Assistant,
+        }
+    }
+}
+
 /// Exact 2024-11-05 prompt messages carried in legacy results.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LegacyPromptMessage {
@@ -3051,7 +3069,7 @@ pub struct TasksCapability {
 
 /// Message content for sampling requests.
 ///
-/// Can contain text, images, or tool-related content.
+/// Exact-2024 sampling can contain text or an image.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SamplingContent {
@@ -3068,6 +3086,26 @@ pub enum SamplingContent {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
+}
+
+impl From<fastmcp_core::SamplingMessageContent> for SamplingContent {
+    fn from(content: fastmcp_core::SamplingMessageContent) -> Self {
+        match content {
+            fastmcp_core::SamplingMessageContent::Text { text } => Self::Text { text },
+            fastmcp_core::SamplingMessageContent::Image { data, mime_type } => {
+                Self::Image { data, mime_type }
+            }
+        }
+    }
+}
+
+impl From<SamplingContent> for fastmcp_core::SamplingMessageContent {
+    fn from(content: SamplingContent) -> Self {
+        match content {
+            SamplingContent::Text { text } => Self::Text { text },
+            SamplingContent::Image { data, mime_type } => Self::Image { data, mime_type },
+        }
+    }
 }
 
 /// A message in a sampling conversation.

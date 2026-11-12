@@ -151,7 +151,7 @@ impl ToolHandler for RowTool {
             None => fastmcp_core::block_on(request),
         }?;
         Ok(vec![Content::Text {
-            text: response.text,
+            text: response.into_text()?,
         }])
     }
 }
@@ -177,7 +177,7 @@ where
         if reply.is_some() {
             if let Poll::Ready(request) = requested.as_mut().poll(task) {
                 let request = request.unwrap();
-                assert_eq!(request.messages[0].text, "complete from peer");
+                assert_eq!(request.messages[0].text_content(), Some("complete from peer"));
                 assert_eq!(request.max_tokens, 17);
                 reply
                     .take()

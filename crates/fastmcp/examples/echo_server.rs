@@ -488,7 +488,7 @@ async fn client_root_uri(ctx: &McpContext) -> McpResult<String> {
 #[tool]
 async fn sample_text(ctx: &McpContext) -> McpResult<String> {
     let response = ctx.sample("echo", 16).await?;
-    Ok(response.text)
+    response.into_text()
 }
 
 fn complete_text_tool(text: impl Into<String>) -> FinalToolOutcome {

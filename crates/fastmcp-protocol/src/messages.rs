@@ -6098,7 +6098,7 @@ pub enum IncludeContext {
 pub struct CreateMessageResult {
     /// Generated content.
     pub content: SamplingContent,
-    /// Role of the generated message (always "assistant").
+    /// Role of the generated message, as declared by the sampling client.
     pub role: crate::types::Role,
     /// Model that was used.
     pub model: String,

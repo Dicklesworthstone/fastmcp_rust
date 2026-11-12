@@ -48,7 +48,7 @@ use fastmcp_core::{
     Outcome,
 };
 #[cfg(feature = "legacy-2024-11-05")]
-use fastmcp_core::{SamplingRequest, SamplingRequestMessage, SamplingRole};
+use fastmcp_core::{SamplingRequest, SamplingRequestMessage};
 use fastmcp_protocol::common_types::{AbsoluteUri, Implementation, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::{
@@ -86,7 +86,7 @@ use fastmcp_protocol::{
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::{
     CreateMessageParams, CreateMessageResult, InitializeParams, InitializeResult, ListRootsResult,
-    Root, SamplingContent,
+    Root,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -2085,24 +2085,11 @@ fn sampling_request_from_create_message_params(
     let messages = params
         .messages
         .into_iter()
-        .map(|message| {
-            let text = match message.content {
-                SamplingContent::Text { text } => text,
-                SamplingContent::Image { .. } => {
-                    return Err(McpError::invalid_params(
-                        "Proxy inbound sampling cannot forward an image sampling message",
-                    ));
-                }
-            };
-            Ok(SamplingRequestMessage {
-                role: match message.role {
-                    fastmcp_protocol::Role::User => SamplingRole::User,
-                    fastmcp_protocol::Role::Assistant => SamplingRole::Assistant,
-                },
-                text,
-            })
+        .map(|message| SamplingRequestMessage {
+            role: message.role.into(),
+            content: message.content.into(),
         })
-        .collect::<McpResult<Vec<_>>>()?;
+        .collect();
     let mut request = SamplingRequest::new(messages, max_tokens);
     if let Some(system_prompt) = params.system_prompt {
         request = request.with_system_prompt(system_prompt);
@@ -7507,9 +7494,13 @@ impl ProxyHttpClient {
                         .sample_with_request(sampling_request_from_create_message_params(params)?)
                         .await?;
                     let stop_reason = response.stop_reason.as_wire_value().map(str::to_owned);
-                    let mut result = CreateMessageResult::text(response.text, response.model);
-                    result.stop_reason = stop_reason;
-                    Ok(result)
+                    Ok(CreateMessageResult {
+                        role: response.role.into(),
+                        content: response.content.into(),
+                        model: response.model,
+                        stop_reason,
+                        meta: None,
+                    })
                 })
             });
         }
@@ -31433,12 +31424,15 @@ expect_request notifications/initialized '' absent
     #[test]
     fn proxy_legacy_http_sampling_preserves_options_and_stop_reason() {
         use fastmcp_core::{
-            SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences,
-            SamplingRequest, SamplingResponse, SamplingSender, SamplingStopReason,
+            SamplingIncludeContext, SamplingMessageContent, SamplingModelHint,
+            SamplingModelPreferences, SamplingRequest, SamplingResponse, SamplingRole,
+            SamplingSender, SamplingStopReason,
         };
 
         struct RecordingSampler {
             requests: Arc<Mutex<Vec<SamplingRequest>>>,
+            role: SamplingRole,
+            image_response: bool,
             stop_reason: SamplingStopReason,
         }
 
@@ -31456,7 +31450,12 @@ expect_request notifications/initialized '' absent
                 Box::pin(async move {
                     self.requests.lock().unwrap().push(request);
                     Ok(SamplingResponse {
-                        text: "sampled".to_owned(),
+                        role: self.role,
+                        content: if self.image_response {
+                            SamplingMessageContent::image("AQIDBA==", "image/webp")
+                        } else {
+                            SamplingMessageContent::text("sampled")
+                        },
                         model: "chosen".to_owned(),
                         stop_reason: self.stop_reason.clone(),
                     })
@@ -31464,12 +31463,21 @@ expect_request notifications/initialized '' absent
             }
         }
 
-        for (stop_reason, include_context, expected_context, with_options) in [
-            (None, None, None, false),
+        for (
+            stop_reason,
+            include_context,
+            expected_context,
+            with_options,
+            response_role,
+            image_response,
+        ) in [
+            (None, None, None, false, SamplingRole::Assistant, false),
             (
                 Some("provider_safety_limit"),
                 Some("allServers"),
                 Some(SamplingIncludeContext::AllServers),
+                true,
+                SamplingRole::Assistant,
                 true,
             ),
             (
@@ -31477,12 +31485,16 @@ expect_request notifications/initialized '' absent
                 Some("none"),
                 Some(SamplingIncludeContext::None),
                 true,
+                SamplingRole::User,
+                true,
             ),
             (
                 None,
                 Some("thisServer"),
                 Some(SamplingIncludeContext::ThisServer),
                 true,
+                SamplingRole::User,
+                false,
             ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -31495,7 +31507,23 @@ expect_request notifications/initialized '' absent
                 "wide": 9007199254740993_u64
             });
             let mut params = serde_json::json!({
-                "messages": [{"role": "user", "content": {"type": "text", "text": "sample"}}],
+                "messages": [
+                    {"role": "user", "content": {"type": "text", "text": "sample"}},
+                    {
+                        "role": "assistant",
+                        "content": {
+                            "type": "image", "data": "AAECA/8=", "mimeType": "image/png"
+                        }
+                    },
+                    {
+                        "role": "user",
+                        "content": {
+                            "type": "image", "data": "aW1hZ2U=",
+                            "mimeType": "image/svg+xml;charset=utf-8"
+                        }
+                    },
+                    {"role": "assistant", "content": {"type": "text", "text": "prior answer"}}
+                ],
                 "maxTokens": 12,
                 "systemPrompt": "system",
                 "temperature": 0.25,
@@ -31575,7 +31603,7 @@ expect_request notifications/initialized '' absent
                 // reaches the peer with its inbound context bound.
                 let sampling = serde_json::json!({
                     "jsonrpc": "2.0", "id": 80,
-                    "method": "sampling/createMessage", "params": params
+                    "method": "sampling/createMessage", "params": params.clone()
                 });
                 write_chunked_sse_event(
                     &mut sse, format!("event: message\ndata: {sampling}\n\n").as_bytes(),
@@ -31598,11 +31626,29 @@ expect_request notifications/initialized '' absent
 
                 let mut follow_up_socket = accept();
                 let request = read_http_request(&mut follow_up_socket);
-                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-                assert_eq!(request["method"], "tools/call");
+                let follow_up: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(follow_up["method"], "tools/call");
                 write_http_response(&mut follow_up_socket, 202, "application/json", b"");
+                // Reuse the identical multimodal input after the caller removes
+                // only its current sampling sender. The installed callback must
+                // refuse it without invoking the retained sampler again.
+                let sampling = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 81,
+                    "method": "sampling/createMessage", "params": params
+                });
+                write_chunked_sse_event(
+                    &mut sse, format!("event: message\ndata: {sampling}\n\n").as_bytes(),
+                );
+                sse.flush().unwrap();
+                let mut refused_socket = accept();
+                let request = read_http_request(&mut refused_socket);
+                let refused: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(refused["id"], 81);
+                write_http_response(&mut refused_socket, 202, "application/json", b"");
                 let response = serde_json::json!({
-                    "jsonrpc": "2.0", "id": request["id"],
+                    "jsonrpc": "2.0", "id": follow_up["id"],
                     "result": {"content": [{"type": "text", "text": "follow-up"}]}
                 });
                 write_chunked_sse_event(
@@ -31611,12 +31657,14 @@ expect_request notifications/initialized '' absent
                 sse.flush().unwrap();
                 finish.recv_timeout(Duration::from_secs(5))
                     .expect("keep the SSE generation alive until both responses are consumed");
-                reply
+                (reply, refused)
             });
 
             let requests = Arc::new(Mutex::new(Vec::new()));
             let sampler = Arc::new(RecordingSampler {
                 requests: Arc::clone(&requests),
+                role: response_role,
+                image_response,
                 stop_reason: SamplingStopReason::from_wire_value(stop_reason.map(str::to_owned)),
             });
             let proxy = ProxyClient::from_backend(legacy_http_proxy_client(
@@ -31627,11 +31675,15 @@ expect_request notifications/initialized '' absent
                     ..Default::default()
                 },
             ));
-            let context = McpContext::new(caller_runtime_cx(), 330).with_sampling(sampler);
-            for (name, expected) in [("sample", "active-complete"), ("follow-up", "follow-up")] {
+            let context = McpContext::new(caller_runtime_cx(), 330);
+            let sampling_context = context.clone().with_sampling(sampler);
+            for (name, expected, context) in [
+                ("sample", "active-complete", &sampling_context),
+                ("follow-up", "follow-up", &context),
+            ] {
                 let result = proxy
-                    .call_tool_typed(&context, name, serde_json::json!({}))
-                    .expect("legacy sampling must retain the current and following tool calls");
+                    .call_tool_typed(context, name, serde_json::json!({}))
+                    .expect("sampling and its capability refusal preserve both tool calls");
                 let CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) = result else {
                     panic!("legacy sampling must not change the selected protocol era");
                 };
@@ -31641,11 +31693,28 @@ expect_request notifications/initialized '' absent
                 );
             }
             finished.send(()).unwrap();
-            let reply = server.join().expect("sampling peer joins");
+            let (reply, refused) = server.join().expect("sampling peer joins");
             assert!(reply.get("error").is_none(), "{reply}");
-            assert_eq!(reply["result"]["content"]["text"], "sampled");
-            assert_eq!(reply["result"]["role"], "assistant");
+            assert_eq!(
+                reply["result"]["content"],
+                if image_response {
+                    serde_json::json!({
+                        "type": "image", "data": "AQIDBA==", "mimeType": "image/webp"
+                    })
+                } else {
+                    serde_json::json!({"type": "text", "text": "sampled"})
+                }
+            );
+            assert_eq!(
+                reply["result"]["role"],
+                match response_role {
+                    SamplingRole::User => "user",
+                    SamplingRole::Assistant => "assistant",
+                }
+            );
             assert_eq!(reply["result"]["model"], "chosen");
+            assert_eq!(refused["error"]["code"], -32600);
+            assert!(refused.get("result").is_none());
             match stop_reason {
                 Some(reason) => assert_eq!(reply["result"]["stopReason"], reason),
                 None => assert!(reply["result"].get("stopReason").is_none()),
@@ -31655,7 +31724,24 @@ expect_request notifications/initialized '' absent
             let recorded = requests.lock().unwrap();
             assert_eq!(recorded.len(), 1);
             let request = &recorded[0];
-            assert_eq!(request.messages[0].text, "sample");
+            assert_eq!(request.messages[0].text_content(), Some("sample"));
+            assert_eq!(
+                request.messages,
+                vec![
+                    SamplingRequestMessage::user("sample"),
+                    SamplingRequestMessage::image(
+                        SamplingRole::Assistant,
+                        "AAECA/8=",
+                        "image/png",
+                    ),
+                    SamplingRequestMessage::image(
+                        SamplingRole::User,
+                        "aW1hZ2U=",
+                        "image/svg+xml;charset=utf-8",
+                    ),
+                    SamplingRequestMessage::assistant("prior answer"),
+                ]
+            );
             assert_eq!(request.max_tokens, 12);
             assert_eq!(request.system_prompt.as_deref(), Some("system"));
             assert_eq!(request.temperature, Some(0.25));

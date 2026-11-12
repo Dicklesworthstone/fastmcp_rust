@@ -2134,7 +2134,7 @@ mod bd_6rfrg_sampling_bridge {
             // is not. Returning through `Echo` keeps this arm's result shape
             // identical to the control's.
             let response = block_on(ctx.sample(SAMPLING_PROMPT, 16))?;
-            Echo.call(ctx, serde_json::json!({ "value": response.text }))
+            Echo.call(ctx, serde_json::json!({ "value": response.into_text()? }))
         }
     }
 
@@ -2171,8 +2171,12 @@ mod bd_6rfrg_sampling_bridge {
             Box<dyn std::future::Future<Output = McpOutcome<FinalToolOutcome>> + Send + 'a>,
         > {
             Box::pin(async move {
-                let sampled = match ctx.sample(SAMPLING_PROMPT, 16).await {
-                    Ok(response) => response.text,
+                let sampled = match ctx
+                    .sample(SAMPLING_PROMPT, 16)
+                    .await
+                    .and_then(fastmcp_core::SamplingResponse::into_text)
+                {
+                    Ok(text) => text,
                     Err(error) => return McpOutcome::Err(error),
                 };
                 match Echo.call_final(ctx, serde_json::json!({ "value": sampled })) {

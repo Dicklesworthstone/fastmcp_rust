@@ -1003,6 +1003,7 @@ fn assert_modern_companion_facade_exports() {
     let _: Option<modern::ResourceReadResult> = None;
     let _: Option<std::sync::Arc<dyn modern::ResourceReader>> = None;
     let _: Option<modern::SamplingIncludeContext> = None;
+    let _: Option<modern::SamplingMessageContent> = None;
     let _: Option<modern::SamplingModelHint> = None;
     let _: Option<modern::SamplingModelPreferences> = None;
     let _: Option<modern::SamplingRequest> = None;
@@ -1097,6 +1098,7 @@ mod prelude_companion_facade_reachability {
         let _: Option<ResourceReadResult> = None;
         let _: Option<std::sync::Arc<dyn ResourceReader>> = None;
         let _: Option<SamplingIncludeContext> = None;
+        let _: Option<SamplingMessageContent> = None;
         let _: Option<SamplingModelHint> = None;
         let _: Option<SamplingModelPreferences> = None;
         let _: Option<SamplingRequest> = None;

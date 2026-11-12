@@ -33596,8 +33596,12 @@ impl ToolHandler for PublicHttpSampleTool {
         _arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
         Box::pin(async move {
-            match ctx.sample("echo", 16).await {
-                Ok(response) => Outcome::Ok(vec![Content::text(response.text)]),
+            match ctx
+                .sample("echo", 16)
+                .await
+                .and_then(fastmcp_core::SamplingResponse::into_text)
+            {
+                Ok(text) => Outcome::Ok(vec![Content::text(text)]),
                 Err(error) => Outcome::Err(error),
             }
         })
@@ -33635,7 +33639,7 @@ impl ToolHandler for PublicHttpSyncSampleTool {
 
     fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let response = fastmcp_core::block_on(ctx.sample("echo", 16))?;
-        Ok(vec![Content::text(response.text)])
+        Ok(vec![Content::text(response.into_text()?)])
     }
 }
 
@@ -33677,8 +33681,10 @@ impl ToolHandler for PublicHttpDriverBridgeSampleTool {
         _arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
         Box::pin(async move {
-            match fastmcp_core::block_on(ctx.sample("echo", 16)) {
-                Ok(response) => Outcome::Ok(vec![Content::text(response.text)]),
+            match fastmcp_core::block_on(ctx.sample("echo", 16))
+                .and_then(fastmcp_core::SamplingResponse::into_text)
+            {
+                Ok(text) => Outcome::Ok(vec![Content::text(text)]),
                 Err(error) => Outcome::Err(error),
             }
         })
@@ -41934,7 +41940,7 @@ fn e2e_public_http_custom_token_verifier_refuses_wrong_and_commits_subject() {
 #[cfg(feature = "websocket-experimental")]
 #[tool(name = "public-ws-legacy-sample")]
 async fn public_ws_legacy_sample(ctx: &McpContext) -> McpResult<String> {
-    Ok(ctx.sample("ws legacy sample", 16).await?.text)
+    ctx.sample("ws legacy sample", 16).await?.into_text()
 }
 
 /// The same reverse sampling from a synchronous tool that bridges with
@@ -41942,7 +41948,7 @@ async fn public_ws_legacy_sample(ctx: &McpContext) -> McpResult<String> {
 #[cfg(feature = "websocket-experimental")]
 #[tool(name = "public-ws-legacy-sample-sync")]
 fn public_ws_legacy_sample_sync(ctx: &McpContext) -> McpResult<String> {
-    Ok(fastmcp_core::block_on(ctx.sample("ws legacy sync sample", 16))?.text)
+    fastmcp_core::block_on(ctx.sample("ws legacy sync sample", 16))?.into_text()
 }
 
 /// Exact-2024 reverse roots over WebSocket from an async tool.

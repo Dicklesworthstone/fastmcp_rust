@@ -423,7 +423,7 @@ fn block_until_cancelled(ctx: &McpContext) -> McpResult<String> {
 )]
 fn sampling_round_trip(ctx: &McpContext) -> McpResult<String> {
     let response = fastmcp_core::block_on(ctx.sample("reply with a test value", 16))?;
-    Ok(response.text)
+    response.into_text()
 }
 
 struct LoggingBlockingToolState {

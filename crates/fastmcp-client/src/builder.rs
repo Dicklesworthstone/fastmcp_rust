@@ -38,9 +38,7 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 #[cfg(feature = "websocket-experimental")]
 use asupersync::io::{AsyncRead, AsyncWrite};
-use fastmcp_core::{
-    McpContext, McpError, McpResult, SamplingRequest, SamplingRequestMessage, SamplingRole,
-};
+use fastmcp_core::{McpContext, McpError, McpResult, SamplingRequest, SamplingRequestMessage};
 use fastmcp_protocol::extensions::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettingsCompatibilityResolver,
     McpAppsClientSettings,
@@ -48,7 +46,7 @@ use fastmcp_protocol::extensions::{
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, CreateMessageParams, CreateMessageResult, ListRootsResult,
-    Root, RootsCapability, SamplingContent,
+    Root, RootsCapability,
 };
 use fastmcp_transport::StdioTransport;
 #[cfg(feature = "websocket-experimental")]
@@ -586,9 +584,13 @@ impl ClientBuilder {
                             .sample_with_request(stdio_sampling_request_from_params(params)?)
                             .await?;
                         let stop_reason = response.stop_reason.as_wire_value().map(str::to_owned);
-                        let mut result = CreateMessageResult::text(response.text, response.model);
-                        result.stop_reason = stop_reason;
-                        Ok(result)
+                        Ok(CreateMessageResult {
+                            role: response.role.into(),
+                            content: response.content.into(),
+                            model: response.model,
+                            stop_reason,
+                            meta: None,
+                        })
                     })
                 }
             })
@@ -1907,24 +1909,11 @@ fn stdio_sampling_request_from_params(params: CreateMessageParams) -> McpResult<
     let messages = params
         .messages
         .into_iter()
-        .map(|message| {
-            let text = match message.content {
-                SamplingContent::Text { text } => text,
-                SamplingContent::Image { .. } => {
-                    return Err(McpError::invalid_params(
-                        "Stdio inbound sampling cannot forward an image sampling message",
-                    ));
-                }
-            };
-            Ok(SamplingRequestMessage {
-                role: match message.role {
-                    fastmcp_protocol::Role::User => SamplingRole::User,
-                    fastmcp_protocol::Role::Assistant => SamplingRole::Assistant,
-                },
-                text,
-            })
+        .map(|message| SamplingRequestMessage {
+            role: message.role.into(),
+            content: message.content.into(),
         })
-        .collect::<McpResult<Vec<_>>>()?;
+        .collect();
     let mut request = SamplingRequest::new(messages, max_tokens);
     if let Some(system_prompt) = params.system_prompt {
         request = request.with_system_prompt(system_prompt);
@@ -1974,8 +1963,9 @@ mod tests {
     #[test]
     fn inbound_legacy_stdio_sampling_preserves_options_and_stop_reason() {
         use fastmcp_core::{
-            SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences,
-            SamplingResponse, SamplingSender, SamplingStopReason,
+            SamplingIncludeContext, SamplingMessageContent, SamplingModelHint,
+            SamplingModelPreferences, SamplingResponse, SamplingRole, SamplingSender,
+            SamplingStopReason,
         };
 
         struct RecordingSampler {
@@ -1993,7 +1983,8 @@ mod tests {
                 Box::pin(async move {
                     self.requests.lock().unwrap().push(request);
                     Ok(SamplingResponse {
-                        text: "sampled".to_owned(),
+                        role: SamplingRole::Assistant,
+                        content: SamplingMessageContent::text("sampled"),
                         model: "chosen".to_owned(),
                         stop_reason: self.stop_reason.clone(),
                     })
@@ -2084,7 +2075,7 @@ mod tests {
                         let recorded = requests.lock().unwrap();
                         assert_eq!(recorded.len(), 1);
                         let request = &recorded[0];
-                        assert_eq!(request.messages[0].text, "sample");
+                        assert_eq!(request.messages[0].text_content(), Some("sample"));
                         assert_eq!(request.max_tokens, 12);
                         assert_eq!(request.system_prompt.as_deref(), Some("system"));
                         assert_eq!(request.temperature, Some(0.25));
@@ -2125,6 +2116,150 @@ mod tests {
                     .expect_err("removing only sampling authority must refuse before the handler");
                     assert_eq!(error.code, McpErrorCode::InvalidRequest);
                     assert_eq!(requests.lock().unwrap().len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inbound_legacy_stdio_sampling_preserves_images_and_result_roles() {
+        use fastmcp_core::{
+            SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
+        };
+        use fastmcp_protocol::{Role, SamplingContent, SamplingMessage};
+
+        struct RecordingSampler {
+            requests: Arc<Mutex<Vec<SamplingRequest>>>,
+            response: SamplingResponse,
+        }
+
+        impl SamplingSender for RecordingSampler {
+            fn create_message(
+                &self,
+                request: SamplingRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = McpResult<SamplingResponse>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    self.requests.lock().unwrap().push(request);
+                    Ok(self.response.clone())
+                })
+            }
+        }
+
+        let expected_messages = vec![
+            SamplingRequestMessage::user("describe"),
+            SamplingRequestMessage::image(
+                SamplingRole::Assistant,
+                "AAECA/8=",
+                "image/png",
+            ),
+            SamplingRequestMessage::image(
+                SamplingRole::User,
+                "aW1hZ2U=",
+                "image/svg+xml;charset=utf-8",
+            ),
+            SamplingRequestMessage::assistant("prior answer"),
+        ];
+        for role in [SamplingRole::User, SamplingRole::Assistant] {
+            for image_response in [false, true] {
+                for stop_reason in [None, Some("maxTokens"), Some("provider_safety_limit")] {
+                    let requests = Arc::new(Mutex::new(Vec::new()));
+                    let mut response = if image_response {
+                        SamplingResponse::image("AQIDBA==", "image/webp", "chosen")
+                    } else {
+                        SamplingResponse::new("sampled", "chosen")
+                    }
+                    .with_role(role);
+                    response.stop_reason =
+                        SamplingStopReason::from_wire_value(stop_reason.map(str::to_owned));
+                    let sampler = Arc::new(RecordingSampler {
+                        requests: Arc::clone(&requests),
+                        response,
+                    });
+                    let builder = ClientBuilder::new().forward_inbound_legacy_reverse();
+                    let cx = Cx::for_testing();
+                    *builder.inbound_legacy_reverse.lock().unwrap() =
+                        Some(McpContext::new(cx.clone(), 1).with_sampling(sampler));
+                    let callback = builder
+                        .reverse_request_handlers
+                        .sampling_create_message
+                        .as_ref()
+                        .expect("forwarding installs the actual sampling callback");
+                    let params = CreateMessageParams::new(
+                        vec![
+                            SamplingMessage::user("describe"),
+                            SamplingMessage {
+                                role: Role::Assistant,
+                                content: SamplingContent::Image {
+                                    data: "AAECA/8=".to_owned(),
+                                    mime_type: "image/png".to_owned(),
+                                },
+                            },
+                            SamplingMessage {
+                                role: Role::User,
+                                content: SamplingContent::Image {
+                                    data: "aW1hZ2U=".to_owned(),
+                                    mime_type: "image/svg+xml;charset=utf-8".to_owned(),
+                                },
+                            },
+                            SamplingMessage::assistant("prior answer"),
+                        ],
+                        fastmcp_protocol::JsonInteger::from(16_u64),
+                    );
+
+                    let reply = block_on(callback(
+                        &cx,
+                        crate::ReverseRequestCancellation::new(),
+                        params.clone(),
+                    ))
+                    .expect("mixed text and image messages cross the installed callback");
+                    let wire = serde_json::to_value(reply).unwrap();
+                    assert_eq!(
+                        wire["role"],
+                        match role {
+                            SamplingRole::User => "user",
+                            SamplingRole::Assistant => "assistant",
+                        }
+                    );
+                    assert_eq!(
+                        wire["content"],
+                        if image_response {
+                            serde_json::json!({
+                                "type": "image", "data": "AQIDBA==", "mimeType": "image/webp"
+                            })
+                        } else {
+                            serde_json::json!({"type": "text", "text": "sampled"})
+                        }
+                    );
+                    assert_eq!(wire["model"], "chosen");
+                    match stop_reason {
+                        Some(reason) => assert_eq!(wire["stopReason"], reason),
+                        None => assert!(wire.get("stopReason").is_none()),
+                    }
+                    assert!(wire.get("resultType").is_none());
+                    assert!(wire.get("_meta").is_none());
+                    {
+                        let recorded = requests.lock().unwrap();
+                        assert_eq!(recorded.len(), 1);
+                        assert_eq!(recorded[0].messages, expected_messages);
+                        assert_eq!(recorded[0].max_tokens, 16);
+                    }
+
+                    *builder.inbound_legacy_reverse.lock().unwrap() =
+                        Some(McpContext::new(cx.clone(), 1));
+                    let error = block_on(callback(
+                        &cx,
+                        crate::ReverseRequestCancellation::new(),
+                        params,
+                    ))
+                    .expect_err("identical multimodal input needs current sampling authority");
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    assert_eq!(
+                        requests.lock().unwrap().len(),
+                        1,
+                        "refusal must not invoke the sampling handler"
+                    );
                 }
             }
         }

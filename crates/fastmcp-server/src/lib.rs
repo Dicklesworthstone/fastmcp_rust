@@ -39633,7 +39633,7 @@ mod lib_unit_tests {
                 .ok_or_else(|| McpError::invalid_params("sample must be a boolean"))?;
             let text = if sample {
                 let response = block_on(ctx.sample("legacy runtime sample", 16))?;
-                format!("legacy-runtime-{counter}-{}", response.text)
+                format!("legacy-runtime-{counter}-{}", response.into_text()?)
             } else {
                 format!("legacy-runtime-{counter}-without-sampling")
             };
@@ -39693,8 +39693,12 @@ mod lib_unit_tests {
                     ));
                 };
                 let text = if sample {
-                    match ctx.sample("legacy runtime sample", 16).await {
-                        Ok(response) => format!("legacy-runtime-{counter}-{}", response.text),
+                    match ctx
+                        .sample("legacy runtime sample", 16)
+                        .await
+                        .and_then(fastmcp_core::SamplingResponse::into_text)
+                    {
+                        Ok(text) => format!("legacy-runtime-{counter}-{text}"),
                         Err(error) => return asupersync::Outcome::Err(error),
                     }
                 } else {

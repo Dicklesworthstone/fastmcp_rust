@@ -2251,9 +2251,9 @@ pub use context::{
     McpRequestCancellation, NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender,
     NotificationSender, ProgressReporter, PromptCaller, PromptGetResult, PromptMessageItem,
     PromptMessageRole, ResourceContentItem, ResourceReadResult, ResourceReader, RootsProvider,
-    SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences, SamplingRequest,
-    SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
-    ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
+    SamplingIncludeContext, SamplingMessageContent, SamplingModelHint, SamplingModelPreferences,
+    SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
+    SamplingStopReason, ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
 };
 pub use crypto::{
     CryptoInputTooLongError, EPHEMERAL_KEY_MATERIAL_BYTES, EphemeralKeyMaterial,

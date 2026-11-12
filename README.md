@@ -1587,13 +1587,14 @@ standard streams are handles.
 
 ## Legacy sampling options in proxies
 
-The exact-2024 stdio and HTTP reverse-request bridges carry text-sampling
-model preferences, context selection, and provider metadata to the downstream
-sampling handler. Returned stop reasons are preserved, including an omitted
-`stopReason` or a provider-defined value.
+The exact-2024 stdio and HTTP reverse-request bridges carry text and image
+messages, model preferences, context selection, and provider metadata to the
+downstream sampling handler. Image data and MIME types retain their original
+strings. Responses preserve their declared user/assistant role and stop reason,
+including an omitted `stopReason` or a provider-defined value.
 
 ```rust
-use fastmcp::{
+use fastmcp_rust::{
     SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences,
     SamplingRequest,
 };
@@ -1610,18 +1611,31 @@ let request = SamplingRequest::prompt("Summarize this result", 256)
     .with_include_context(SamplingIncludeContext::ThisServer);
 ```
 
-Pass the request to `ctx.sample_with_request(request).await`. Use
-`with_metadata` for a provider-specific JSON object. Leaving
+Pass the request to `ctx.sample_with_request(request).await`. For image inputs,
+construct a conversation with `SamplingRequest::new` and
+`SamplingRequestMessage::image(role, base64_data, mime_type)`. A conversation
+can mix text and image messages. A sampling handler can return
+`SamplingResponse::image(data, mime_type, model)` and select a role with
+`with_role`.
+
+Both messages and responses expose one typed `content` field:
+`SamplingMessageContent::Text { text }` or
+`SamplingMessageContent::Image { data, mime_type }`. Match that enum when
+handling either kind. `text_content()` borrows text when present;
+`SamplingResponse::into_text()` extracts text or returns an error for an image.
+
+Use `with_metadata` for a provider-specific JSON object. Leaving
 `include_context` unset differs from explicitly selecting
 `SamplingIncludeContext::None`; optional model preferences and metadata also
 retain their presence. The `with_model_hints` shorthand replaces only hints
 and retains any configured priorities.
 
-For callers constructing `SamplingRequest` directly, the former
-`model_hints` field is now `model_preferences`; initialize
-`include_context` and `metadata` as well, or use the constructors and
-builders. This is the text-sampling surface: image forwarding, wider token
-budgets, and exact wire metadata require the protocol-specific APIs.
+For direct struct construction, the former `SamplingRequest::model_hints`
+field is now `model_preferences`; initialize `include_context` and
+`metadata` as well, or use the constructors and builders. The former message
+and response `text` fields are now typed `content`, and responses include an
+explicit `role`. Wider token budgets, content annotations, and exact
+request/result `_meta` preservation still require the protocol-specific APIs.
 
 ## Typed extension handlers (opt-in, current source tree)
 

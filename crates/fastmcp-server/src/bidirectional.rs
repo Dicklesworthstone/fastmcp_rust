@@ -44,7 +44,7 @@ use base64::Engine as _;
 use fastmcp_core::{
     ClientRoot, ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
     ElicitationSender, McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult,
-    RootsProvider, SamplingRequest, SamplingResponse, SamplingRole, SamplingSender,
+    RootsProvider, SamplingRequest, SamplingResponse, SamplingSender,
     SamplingStopReason, draw_security_identifier,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
@@ -890,11 +890,8 @@ impl SamplingSender for TransportSamplingSender {
                     .messages
                     .into_iter()
                     .map(|m| fastmcp_protocol::SamplingMessage {
-                        role: match m.role {
-                            SamplingRole::User => fastmcp_protocol::Role::User,
-                            SamplingRole::Assistant => fastmcp_protocol::Role::Assistant,
-                        },
-                        content: fastmcp_protocol::SamplingContent::Text { text: m.text },
+                        role: m.role.into(),
+                        content: m.content.into(),
                     })
                     .collect(),
                 max_tokens: fastmcp_protocol::JsonInteger::from(u64::from(request.max_tokens)),
@@ -943,17 +940,9 @@ impl SamplingSender for TransportSamplingSender {
                 )
                 .await?;
 
-            if result.role != fastmcp_protocol::Role::Assistant {
-                return Err(McpError::internal_error(RESPONSE_PAYLOAD_ERROR));
-            }
-
             Ok(SamplingResponse {
-                text: match result.content {
-                    fastmcp_protocol::SamplingContent::Text { text } => text,
-                    fastmcp_protocol::SamplingContent::Image { data, mime_type } => {
-                        format!("[image: {} bytes, type: {}]", data.len(), mime_type)
-                    }
-                },
+                role: result.role.into(),
+                content: result.content.into(),
                 model: result.model,
                 stop_reason: SamplingStopReason::from_wire_value(result.stop_reason),
             })
@@ -2805,7 +2794,7 @@ impl DualEraServerToClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastmcp_core::block_on;
+    use fastmcp_core::{SamplingRole, block_on};
 
     fn receive_pending(mut receiver: ResponseReceiver) -> PendingResponse {
         let cx = Cx::for_testing();
@@ -6275,10 +6264,7 @@ mod tests {
         let sampling = TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
 
         let request = SamplingRequest {
-            messages: vec![fastmcp_core::SamplingRequestMessage {
-                role: SamplingRole::User,
-                text: "Hi".to_string(),
-            }],
+            messages: vec![fastmcp_core::SamplingRequestMessage::user("Hi")],
             max_tokens: 100,
             system_prompt: Some("Be helpful".to_string()),
             temperature: Some(0.7),
@@ -6290,7 +6276,8 @@ mod tests {
 
         let future = SamplingSender::create_message(&sampling, request);
         let result = fastmcp_core::block_on(future).unwrap();
-        assert_eq!(result.text, "Hello world");
+        assert_eq!(result.text_content(), Some("Hello world"));
+        assert_eq!(result.role, SamplingRole::Assistant);
         assert_eq!(result.model, "test-model");
         assert!(matches!(result.stop_reason, SamplingStopReason::EndTurn));
     }
@@ -6321,10 +6308,8 @@ mod tests {
         );
 
         let emitted = fastmcp_protocol::CreateMessageResult {
-            content: fastmcp_protocol::SamplingContent::Text {
-                text: callback_response.text,
-            },
-            role: fastmcp_protocol::Role::Assistant,
+            content: callback_response.content.into(),
+            role: callback_response.role.into(),
             model: callback_response.model,
             stop_reason: callback_response
                 .stop_reason
@@ -6340,37 +6325,55 @@ mod tests {
 
     #[test]
     fn transport_sampling_sender_create_message_image() {
-        let sender = make_sender_with_responder(|_| {
-            serde_json::json!({
-                "content": {"type": "image", "data": "aW1hZ2VkYXRh", "mimeType": "image/png"},
-                "role": "assistant",
-                "model": "vision-model",
-                "stopReason": "maxTokens"
-            })
-        });
-        let sampling = TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
+        use fastmcp_core::{SamplingMessageContent, SamplingRequestMessage};
 
-        let request = SamplingRequest {
-            messages: vec![fastmcp_core::SamplingRequestMessage {
-                role: SamplingRole::User,
-                text: "Describe image".to_string(),
-            }],
-            max_tokens: 50,
-            system_prompt: None,
-            temperature: None,
-            stop_sequences: vec![],
-            model_preferences: None,
-            include_context: None,
-            metadata: None,
-        };
-
-        let future = SamplingSender::create_message(&sampling, request);
-        let result = fastmcp_core::block_on(future).unwrap();
-        // Image content is formatted as "[image: N bytes, type: ...]"
-        assert!(result.text.contains("image"));
-        assert!(result.text.contains("image/png"));
-        assert_eq!(result.model, "vision-model");
-        assert!(matches!(result.stop_reason, SamplingStopReason::MaxTokens));
+        for role in [SamplingRole::User, SamplingRole::Assistant] {
+            let wire_role = match role {
+                SamplingRole::User => "user",
+                SamplingRole::Assistant => "assistant",
+            };
+            let sender = make_sender_with_responder(move |request| {
+                assert_eq!(request.method, "sampling/createMessage");
+                let params = request.params.as_ref().unwrap();
+                assert_eq!(params["messages"], serde_json::json!([
+                    {"role": "user", "content": {"type": "text", "text": "Describe these"}},
+                    {"role": "user", "content": {
+                        "type": "image", "data": "AAECA/8=", "mimeType": "image/png"
+                    }},
+                    {"role": "assistant", "content": {
+                        "type": "image", "data": "d2VicA==", "mimeType": "image/webp"
+                    }}
+                ]));
+                serde_json::json!({
+                    "content": {"type": "image", "data": "AAECA/8=", "mimeType": "image/png"},
+                    "role": wire_role,
+                    "model": "vision-model",
+                    "stopReason": "maxTokens"
+                })
+            });
+            let sampling =
+                TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
+            let request = SamplingRequest::new(
+                vec![
+                    SamplingRequestMessage::user("Describe these"),
+                    SamplingRequestMessage::image(SamplingRole::User, "AAECA/8=", "image/png"),
+                    SamplingRequestMessage::image(
+                        SamplingRole::Assistant, "d2VicA==", "image/webp",
+                    ),
+                ],
+                50,
+            );
+            let result = fastmcp_core::block_on(SamplingSender::create_message(&sampling, request))
+                .expect("mixed text/image messages and image results retain their typed content");
+            assert_eq!(
+                result.content,
+                SamplingMessageContent::image("AAECA/8=", "image/png")
+            );
+            assert_eq!(result.text_content(), None);
+            assert_eq!(result.role, role);
+            assert_eq!(result.model, "vision-model");
+            assert_eq!(result.stop_reason, SamplingStopReason::MaxTokens);
+        }
     }
 
     #[test]
@@ -6390,10 +6393,7 @@ mod tests {
         let sampling = TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
 
         let request = SamplingRequest {
-            messages: vec![fastmcp_core::SamplingRequestMessage {
-                role: SamplingRole::User,
-                text: "Hi".to_string(),
-            }],
+            messages: vec![fastmcp_core::SamplingRequestMessage::user("Hi")],
             max_tokens: 10,
             system_prompt: None,
             temperature: None,
@@ -6485,7 +6485,7 @@ mod tests {
                 let result =
                     fastmcp_core::block_on(SamplingSender::create_message(&sampling, request))
                         .expect("supported sampling options must reach the client");
-                assert_eq!(result.text, "sampled");
+                assert_eq!(result.text_content(), Some("sampled"));
                 assert_eq!(result.stop_reason, SamplingStopReason::Unspecified);
             }
         }
@@ -6511,7 +6511,7 @@ mod tests {
             .with_metadata(serde_json::Map::new());
         let result = fastmcp_core::block_on(SamplingSender::create_message(&sampling, request))
             .expect("explicit empty preferences and metadata remain present on the wire");
-        assert_eq!(result.text, "sampled");
+        assert_eq!(result.text_content(), Some("sampled"));
         assert_eq!(result.stop_reason, SamplingStopReason::Unspecified);
     }
 
@@ -6531,10 +6531,7 @@ mod tests {
         let sampling = TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
 
         let request = SamplingRequest {
-            messages: vec![fastmcp_core::SamplingRequestMessage {
-                role: SamplingRole::Assistant,
-                text: "Previous response".to_string(),
-            }],
+            messages: vec![fastmcp_core::SamplingRequestMessage::assistant("Previous response")],
             max_tokens: 10,
             system_prompt: None,
             temperature: None,
@@ -6546,26 +6543,71 @@ mod tests {
 
         let future = SamplingSender::create_message(&sampling, request);
         let result = fastmcp_core::block_on(future).unwrap();
-        assert_eq!(result.text, "continued");
+        assert_eq!(result.text_content(), Some("continued"));
     }
 
     #[test]
-    fn transport_sampling_sender_rejects_non_assistant_result_role() {
+    fn transport_sampling_sender_preserves_schema_valid_user_result_role() {
+        // The pinned 2024 schema defines CreateMessageResult as SamplingMessage,
+        // whose Role permits both user and assistant.
         let sender = make_sender_with_responder(|_| {
             serde_json::json!({
-                "content": {"type": "text", "text": "not authoritative"},
+                "content": {"type": "text", "text": "user content"},
                 "role": "user",
                 "model": "m",
                 "stopReason": "endTurn"
             })
         });
         let sampling = TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
-        let request = SamplingRequest::prompt("Hi", 10);
+        let result = fastmcp_core::block_on(SamplingSender::create_message(
+            &sampling,
+            SamplingRequest::prompt("Hi", 10),
+        ))
+        .expect("both roles declared by the pinned exact-2024 schema are preserved");
+        assert_eq!(result.role, SamplingRole::User);
+        assert_eq!(result.text_content(), Some("user content"));
+    }
 
-        let error = fastmcp_core::block_on(SamplingSender::create_message(&sampling, request))
-            .expect_err("sampling results must retain the documented assistant role");
+    #[test]
+    fn transport_sampling_sender_rejects_roles_outside_the_legacy_schema() {
+        for role in ["system", "tool"] {
+            let sender = make_sender_with_responder(move |_| {
+                serde_json::json!({
+                    "content": {"type": "text", "text": "invalid role"},
+                    "role": role,
+                    "model": "m"
+                })
+            });
+            let sampling =
+                TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
+            let error = fastmcp_core::block_on(SamplingSender::create_message(
+                &sampling,
+                SamplingRequest::prompt("Hi", 10),
+            ))
+            .expect_err("unknown roles remain invalid at the actual response decoder");
+            assert_eq!(error.message, RESPONSE_PAYLOAD_ERROR);
+        }
+    }
 
-        assert_eq!(error.message, RESPONSE_PAYLOAD_ERROR);
+    #[test]
+    fn transport_sampling_sender_rejects_invalid_image_content() {
+        for content in [
+            serde_json::json!({"type": "image", "data": 12, "mimeType": "image/png"}),
+            serde_json::json!({"type": "image", "data": "AAECA/8=", "mimeType": false}),
+            serde_json::json!({"type": "audio", "data": "AAECA/8=", "mimeType": "audio/wav"}),
+        ] {
+            let sender = make_sender_with_responder(move |_| {
+                serde_json::json!({"content": content, "role": "assistant", "model": "m"})
+            });
+            let sampling =
+                TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
+            let error = fastmcp_core::block_on(SamplingSender::create_message(
+                &sampling,
+                SamplingRequest::prompt("Hi", 10),
+            ))
+            .expect_err("image support does not admit malformed fields or modern-only content");
+            assert_eq!(error.message, RESPONSE_PAYLOAD_ERROR);
+        }
     }
 
     // ── TransportElicitationSender — elicit ──────────────────────────
@@ -6905,10 +6947,7 @@ mod tests {
         let sampling = TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
 
         let request = SamplingRequest {
-            messages: vec![fastmcp_core::SamplingRequestMessage {
-                role: SamplingRole::User,
-                text: "Hi".to_string(),
-            }],
+            messages: vec![fastmcp_core::SamplingRequestMessage::user("Hi")],
             max_tokens: 10,
             system_prompt: None,
             temperature: None,
@@ -6946,18 +6985,9 @@ mod tests {
 
         let request = SamplingRequest {
             messages: vec![
-                fastmcp_core::SamplingRequestMessage {
-                    role: SamplingRole::User,
-                    text: "Hello".to_string(),
-                },
-                fastmcp_core::SamplingRequestMessage {
-                    role: SamplingRole::Assistant,
-                    text: "Hi".to_string(),
-                },
-                fastmcp_core::SamplingRequestMessage {
-                    role: SamplingRole::User,
-                    text: "Follow up".to_string(),
-                },
+                fastmcp_core::SamplingRequestMessage::user("Hello"),
+                fastmcp_core::SamplingRequestMessage::assistant("Hi"),
+                fastmcp_core::SamplingRequestMessage::user("Follow up"),
             ],
             max_tokens: 100,
             system_prompt: None,
@@ -6970,7 +7000,7 @@ mod tests {
 
         let future = SamplingSender::create_message(&sampling, request);
         let result = fastmcp_core::block_on(future).unwrap();
-        assert_eq!(result.text, "done");
+        assert_eq!(result.text_content(), Some("done"));
     }
 
     // ── RequestSender — ID cleanup after success ────────────────
