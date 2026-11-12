@@ -6,8 +6,11 @@ use fastmcp_client::{
     ClientBuilder, HttpClient, ModernHttpExtensionEvent, ModernHttpExtensionExecution,
 };
 use fastmcp_core::{Cx, DEFAULT_JSON_RPC_MAX_BODY_BYTES};
-use fastmcp_protocol::extensions::ClientExtensionDiscovery;
+use fastmcp_protocol::extensions::{
+    ClientExtensionDiscovery, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
+};
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+use fastmcp_protocol::{AdmittedSchema, JsonRpcRequest};
 
 use super::{
     Arc, BTreeMap, BoxFuture, DeserializeOwned, ErasedExtensionHandler, ExtensionBuilder,
@@ -15,8 +18,8 @@ use super::{
     ExtensionSettingsCompatibilityResolver, HandlerBinding, JsonSchemaType,
     MAX_AUTHORING_SETTINGS_BYTES, MAX_SCHEMA_INSTANCE_BYTES, McpContext, McpError, McpResult,
     NegotiatedExtension, PendingMethod, PhantomData, ProtocolDescriptor, Serialize,
-    SettingsResolver, Value, encode_value, ensure_live, poll_live, retain_schema_identity,
-    unbound_handler,
+    SettingsResolver, Value, compile_schema, encode_bytes, encode_value, ensure_live, poll_live,
+    retain_schema_identity, unbound_handler,
 };
 
 // Progress and core notifications are admitted by the client but not relayed.
@@ -30,9 +33,10 @@ const MAX_INTERMEDIATE_EVENTS: usize = 64;
 /// They expose no client, credentials, registry, resolver, or execution control.
 /// Each forwarded request owns its response stream and cancellation lifetime.
 ///
-/// This request/result surface rejects contracts declaring notifications.
-/// Core progress and log notifications are consumed within a 64-event budget;
-/// they are not forwarded to the downstream caller.
+/// Request-owned server notifications require the explicit typed notification
+/// route. Standalone client notifications are not supported. All intermediate
+/// events share a 64-event budget; core progress and log notifications are
+/// consumed without being forwarded to the downstream caller.
 #[derive(Clone)]
 pub struct ExtensionHttpUpstream {
     client: Arc<Mutex<HttpClient>>,
@@ -90,14 +94,15 @@ impl ExtensionRegistration {
     ///
     /// This consumes the registration without invoking its handlers. Build a
     /// second registration with the same complete contract for the gateway,
-    /// using [`ExtensionBuilder::typed_http_proxy_request`] for routed methods.
+    /// using [`ExtensionBuilder::typed_http_proxy_request`] or
+    /// [`ExtensionBuilder::typed_http_proxy_request_with_notifications`].
     /// All methods and schemas, including their order and descriptor version,
-    /// must match. Neither client nor server notification declarations are
-    /// supported by this request/result route.
+    /// must match. Request-owned server notifications require the latter typed
+    /// route. Standalone client notification declarations remain unsupported.
     ///
     /// # Errors
     ///
-    /// Returns an error if the declaration includes notifications, the client
+    /// Returns an error if the declaration includes client notifications, the
     /// builder does not select a modern-only HTTP plan, client settings fail
     /// validation, or the upstream connection fails to negotiate the extension.
     pub async fn connect_http_upstream<ClientSettings>(
@@ -109,11 +114,9 @@ impl ExtensionRegistration {
     where
         ClientSettings: Serialize + Sync + ?Sized,
     {
-        if self.descriptor.notification.is_some()
-            || self.descriptor.request_notification.is_some()
-        {
+        if self.descriptor.notification.is_some() {
             return Err(McpError::invalid_params(
-                "HTTP extension proxy does not support notification declarations",
+                "HTTP extension proxy does not support client notification declarations",
             ));
         }
         if builder.selected_protocol_plan().policy() != ProtocolPolicy::ModernOnly
@@ -192,7 +195,7 @@ where
     /// Returns an error if the upstream does not own the request-only extension
     /// method or if method schema registration fails.
     pub fn typed_http_proxy_request<Request, Response>(
-        mut self,
+        self,
         method: impl Into<String>,
         parameter_schema_id: impl Into<String>,
         result_schema_id: impl Into<String>,
@@ -202,11 +205,103 @@ where
         Request: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
         Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
     {
-        let method = method.into();
+        if self.descriptor.request_notification.is_some()
+            || upstream.descriptor.request_notification.is_some()
+        {
+            return Err(McpError::invalid_params(
+                "Request-owned notifications require the typed notification proxy route",
+            ));
+        }
+        self.register_http_proxy_request::<Request, Response>(
+            method.into(),
+            parameter_schema_id.into(),
+            result_schema_id.into(),
+            upstream,
+            None,
+        )
+    }
+
+    /// Registers a typed request and its request-owned server notifications.
+    ///
+    /// First declare the notification with [`Self::typed_request_notification`].
+    /// Its compiled schema must match `Notification` exactly. Both the complete
+    /// authored contract and the independently resolved settings on each leg
+    /// remain subject to the ordinary typed proxy checks.
+    ///
+    /// Every upstream notification is decoded and re-encoded through this Rust
+    /// type. Upstream metadata is consumed locally; the downstream request's
+    /// existing sink supplies its own method and correlation. HTTP uses its
+    /// owned SSE body, while memory and stdio stamp the downstream request ID.
+    /// A missing sink is refused before upstream dispatch. At most 64 total
+    /// intermediate events are accepted, including core progress/log events.
+    /// Cancellation or output backpressure closes only the owning execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either notification declaration is missing or
+    /// differs, the notification type has another schema, or request method
+    /// registration fails. Standalone client notifications are not forwarded.
+    pub fn typed_http_proxy_request_with_notifications<Request, Response, Notification>(
+        self,
+        method: impl Into<String>,
+        parameter_schema_id: impl Into<String>,
+        result_schema_id: impl Into<String>,
+        upstream: ExtensionHttpUpstream,
+    ) -> McpResult<Self>
+    where
+        Request: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+        Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+        Notification: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+    {
+        let declaration = self.descriptor.request_notification.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "HTTP notification proxy requires a typed notification declaration",
+            )
+        })?;
+        if upstream.descriptor.request_notification.as_ref() != Some(declaration) {
+            return Err(McpError::invalid_params(
+                "HTTP notification proxy requires matching notification declarations",
+            ));
+        }
+        let schema = self.request_notification_schema.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "HTTP notification proxy requires an admitted notification schema",
+            )
+        })?;
+        if compile_schema::<Notification>()?.digest != schema.digest {
+            return Err(McpError::invalid_params(
+                "HTTP notification proxy type does not match its declared schema",
+            ));
+        }
+        let notification = HttpProxyNotification {
+            method: declaration.name.clone(),
+            schema: Arc::clone(&schema.admitted),
+            codec: reencode_notification::<Notification>,
+        };
+        self.register_http_proxy_request::<Request, Response>(
+            method.into(),
+            parameter_schema_id.into(),
+            result_schema_id.into(),
+            upstream,
+            Some(notification),
+        )
+    }
+
+    fn register_http_proxy_request<Request, Response>(
+        mut self,
+        method: String,
+        parameter_schema_id: String,
+        result_schema_id: String,
+        upstream: ExtensionHttpUpstream,
+        notification: Option<HttpProxyNotification>,
+    ) -> McpResult<Self>
+    where
+        Request: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+        Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+    {
         if upstream.descriptor.id != self.descriptor.id
             || !upstream.descriptor.methods.iter().any(|entry| entry.name == method)
             || self.descriptor.notification.is_some()
-            || self.descriptor.request_notification.is_some()
         {
             return Err(McpError::invalid_params(
                 "HTTP upstream does not own this request-only extension method",
@@ -215,8 +310,8 @@ where
         let (method, parameter_schema, result_schema, total) = self
             .prepare_method::<Request, Response>(
                 method,
-                parameter_schema_id.into(),
-                result_schema_id.into(),
+                parameter_schema_id,
+                result_schema_id,
             )?;
         let index = self.pending.len();
         let effective_schema = Arc::clone(&self.effective_schema.admitted);
@@ -244,6 +339,7 @@ where
                         effective_schema,
                     },
                     upstream,
+                    notification,
                     marker: PhantomData,
                 })
             }),
@@ -257,7 +353,87 @@ where
 struct TypedHttpProxyHandler<Request, Response, Settings> {
     binding: HandlerBinding,
     upstream: ExtensionHttpUpstream,
+    notification: Option<HttpProxyNotification>,
     marker: PhantomData<fn(Request, Settings) -> Response>,
+}
+
+struct HttpProxyNotification {
+    method: String,
+    schema: Arc<AdmittedSchema>,
+    codec: fn(Value) -> McpResult<Value>,
+}
+
+impl HttpProxyNotification {
+    fn relay(
+        &self,
+        context: &McpContext,
+        notification: JsonRpcRequest,
+        raw_params: Option<&str>,
+    ) -> McpResult<()> {
+        ensure_live(context)?;
+        if notification.id.is_some() || notification.method != self.method {
+            return Err(McpError::invalid_request(
+                "HTTP notification proxy received another owner or method",
+            ));
+        }
+        let source = raw_params.ok_or_else(|| {
+            McpError::invalid_request("HTTP notification proxy requires notification parameters")
+        })?;
+        fastmcp_protocol::admit_raw_jsonrpc_document(
+            source.as_bytes(),
+            MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
+        )
+        .map_err(|_| {
+            McpError::invalid_request("HTTP upstream notification exceeds its wire bounds")
+        })?;
+        let mut parameters: Value = serde_json::from_str(source).map_err(|_| {
+            McpError::invalid_request("HTTP upstream notification parameters are invalid")
+        })?;
+        if notification.params.as_ref() != Some(&parameters) {
+            return Err(McpError::invalid_request(
+                "HTTP upstream notification source does not match its payload",
+            ));
+        }
+        let object = parameters.as_object_mut().ok_or_else(|| {
+            McpError::invalid_request("HTTP upstream notification parameters must be an object")
+        })?;
+        object.remove("_meta");
+        self.schema.validate(&parameters).map_err(|_| {
+            McpError::invalid_request("HTTP upstream notification does not satisfy its typed schema")
+        })?;
+        let parameters = (self.codec)(parameters)?;
+        ensure_live(context)?;
+        if !parameters.is_object() || parameters.get("_meta").is_some() {
+            return Err(McpError::invalid_request(
+                "Typed notification serialization cannot supply framework metadata",
+            ));
+        }
+        self.schema.validate(&parameters).map_err(|_| {
+            McpError::invalid_request(
+                "Re-encoded HTTP notification does not satisfy its typed schema",
+            )
+        })?;
+        context.emit_request_extension_notification(parameters)
+    }
+}
+
+fn reencode_notification<Notification: DeserializeOwned + Serialize>(
+    parameters: Value,
+) -> McpResult<Value> {
+    let notification: Notification = serde_json::from_value(parameters).map_err(|_| {
+        McpError::invalid_request("HTTP upstream notification typed decoding failed")
+    })?;
+    let source = encode_bytes(&notification, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)?;
+    fastmcp_protocol::admit_raw_jsonrpc_document(
+        &source,
+        MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
+    )
+    .map_err(|_| {
+        McpError::invalid_request("Re-encoded HTTP notification exceeds its wire bounds")
+    })?;
+    serde_json::from_slice(&source).map_err(|_| {
+        McpError::invalid_request("Re-encoded HTTP notification is not valid JSON")
+    })
 }
 
 impl<Request, Response, Settings> TypedHttpProxyHandler<Request, Response, Settings>
@@ -280,6 +456,9 @@ where
             return Err(McpError::invalid_request(
                 "HTTP extension proxy requires identical effective settings on both legs",
             ));
+        }
+        if self.notification.is_some() {
+            context.ensure_request_extension_notifications_available()?;
         }
         let parameters = encode_value(&request, MAX_SCHEMA_INSTANCE_BYTES)?;
         let object = parameters.as_object().ok_or_else(|| {
@@ -327,7 +506,7 @@ where
         context: &McpContext,
         mut execution: ModernHttpExtensionExecution,
     ) -> McpResult<Value> {
-        for _ in 0..=MAX_INTERMEDIATE_EVENTS {
+        for event_index in 0..=MAX_INTERMEDIATE_EVENTS {
             ensure_live(context)?;
             let event = execution.next_event(context.cx()).await;
             ensure_live(context)?;
@@ -360,10 +539,19 @@ where
                 }
                 Some(ModernHttpExtensionEvent::Progress(_)
                     | ModernHttpExtensionEvent::Notification(_)) => {}
-                Some(ModernHttpExtensionEvent::ExtensionNotification { .. }) => {
-                    return Err(McpError::invalid_request(
-                        "HTTP extension proxy does not relay extension notifications",
-                    ));
+                Some(ModernHttpExtensionEvent::ExtensionNotification {
+                    notification,
+                    raw_params,
+                }) => {
+                    if event_index == MAX_INTERMEDIATE_EVENTS {
+                        break;
+                    }
+                    let relay = self.notification.as_ref().ok_or_else(|| {
+                        McpError::invalid_request(
+                            "HTTP request-only proxy does not relay extension notifications",
+                        )
+                    })?;
+                    relay.relay(context, notification, raw_params.as_deref())?;
                 }
                 None => {
                     return Err(McpError::invalid_request(
@@ -443,4 +631,91 @@ fn response_limits() -> fastmcp_client::sse::SseLimits {
         4096,
     )
     .expect("shared HTTP response bounds are nonzero")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastmcp_protocol::schema::SchemaGenerator;
+    use serde::Deserialize;
+    use serde_json::json;
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Notice {
+        value: u32,
+    }
+
+    impl JsonSchemaType for Notice {
+        fn schema_body(_generator: &mut SchemaGenerator) -> Value {
+            json!({
+                "type": "object",
+                "properties": {"value": {"type": "integer", "minimum": 0}},
+                "required": ["value"],
+                "additionalProperties": false
+            })
+        }
+    }
+
+    #[test]
+    fn notification_proxy_consumes_upstream_metadata_and_refuses_invalid_frames_before_emission() {
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&values);
+        let context = McpContext::new(Cx::for_testing(), 41)
+            .with_request_extension_notification_sender(Arc::new(move |parameters| {
+                received.lock().unwrap().push(parameters);
+                Ok(())
+            }));
+        let relay = HttpProxyNotification {
+            method: "com.example/notice".to_owned(),
+            schema: compile_schema::<Notice>().unwrap().admitted,
+            codec: reencode_notification::<Notice>,
+        };
+        let parameters = json!({
+            "value": 7,
+            "_meta": {"com.example/upstream-owner": "must-not-cross"}
+        });
+        let source = serde_json::to_string(&parameters).unwrap();
+        let notification = JsonRpcRequest::notification(
+            "com.example/notice",
+            Some(parameters.clone()),
+        );
+        relay.relay(&context, notification.clone(), Some(&source)).unwrap();
+        assert_eq!(*values.lock().unwrap(), vec![json!({"value": 7})]);
+
+        let wrong_method = JsonRpcRequest::notification(
+            "com.example/another-notice",
+            Some(parameters.clone()),
+        );
+        assert!(relay.relay(&context, wrong_method, Some(&source)).is_err());
+        let wrong_role = JsonRpcRequest::new(
+            "com.example/notice",
+            Some(parameters),
+            41_i64,
+        );
+        assert!(relay.relay(&context, wrong_role, Some(&source)).is_err());
+        let different_source = serde_json::to_string(&json!({"value": 8})).unwrap();
+        assert!(relay.relay(&context, notification, Some(&different_source)).is_err());
+        for parameters in [
+            json!({"value": "wrong-type"}),
+            json!({
+                "value": 7,
+                "_meta": {"com.example/padding": "x".repeat(
+                    MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES
+                )}
+            }),
+        ] {
+            let source = serde_json::to_string(&parameters).unwrap();
+            let notification = JsonRpcRequest::notification(
+                "com.example/notice",
+                Some(parameters),
+            );
+            assert!(relay.relay(&context, notification, Some(&source)).is_err());
+        }
+        assert_eq!(
+            *values.lock().unwrap(),
+            vec![json!({"value": 7})],
+            "every refusal leaves the downstream output unchanged"
+        );
+    }
 }

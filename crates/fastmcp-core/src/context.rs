@@ -2248,6 +2248,23 @@ impl McpContext {
         self
     }
 
+    /// Checks that this request owns an extension-notification output sink.
+    /// This does not publish a message or mark the response as uncacheable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request is no longer live or has no output sink.
+    #[doc(hidden)]
+    pub fn ensure_request_extension_notifications_available(&self) -> McpResult<()> {
+        self.ensure_live()?;
+        if self.request_extension_notification_sender.is_none() {
+            return Err(McpError::invalid_request(
+                "Request-owned extension notifications are unavailable",
+            ));
+        }
+        Ok(())
+    }
+
     /// Emits through the installed request-owned extension capability.
     /// This hidden component seam grants no choice of method, key or request ID.
     #[doc(hidden)]

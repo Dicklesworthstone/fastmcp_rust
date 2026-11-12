@@ -3519,9 +3519,11 @@ pub mod modern {
         ///
         /// The supplied registration contributes its complete typed contract
         /// and settings resolver; none of its handlers run. The returned opaque
-        /// handle installs with ExtensionBuilder::typed_http_proxy_request.
+        /// handle installs with `ExtensionBuilder::typed_http_proxy_request` or
+        /// its explicit `typed_http_proxy_request_with_notifications` variant.
         /// Identity, credentials, TLS and timeout configuration belong to this
-        /// upstream builder. Notification declarations are rejected.
+        /// upstream builder. Request-owned server notifications require the
+        /// notification-aware route. Standalone client notifications are rejected.
         #[cfg(all(feature = "extension-authoring", feature = "proxy"))]
         pub async fn connect_extension_http_upstream_with_cx<ClientSettings>(
             self,

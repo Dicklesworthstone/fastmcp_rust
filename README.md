@@ -1846,11 +1846,53 @@ connecting. The gateway uses that configured upstream identity. Each forwarded
 call must match the registered contract and independently negotiated effective
 settings, and its request and result pass the typed schema checks.
 
-This request/result surface rejects extension notification declarations.
-Core progress and log events are consumed within a 64-event budget and are
-not relayed. Downstream framework metadata is not application payload or an
-upstream activation proof. Cancelling a forwarded request drops its owned
-upstream execution without cancelling sibling requests.
+The request/result route rejects contracts that declare notifications. To relay
+request-owned server notifications as they arrive, declare the same event on both
+legs and choose the explicit notification-aware route. This variant uses
+`Message` for the event payload as well:
+
+```rust
+let with_notices = || {
+    make_builder()?.typed_request_notification::<Message>(
+        "com.example/echo/changed",
+        "echo-changed-v1",
+        "com.example/echo-request-id",
+    )
+};
+let declaration = EchoExtension.register(with_notices()?)?.build()?;
+let upstream = modern::ClientBuilder::new()
+    .connect_extension_http_upstream_with_cx(
+        cx,
+        endpoint,
+        declaration,
+        &Settings {},
+    )
+    .await?;
+let registration = with_notices()?
+    .typed_http_proxy_request_with_notifications::<Message, Message, Message>(
+        "com.example/echo",
+        "echo-params-v1",
+        "echo-result-v1",
+        upstream,
+    )?
+    .build()?;
+```
+
+The upstream server must advertise that same complete contract. Install the
+resulting registration on the gateway as above. Each event is bounded, checked
+against its schema, decoded and re-encoded through the declared Rust type, and
+checked again before downstream publication. Upstream `_meta` is consumed locally;
+typed serialization cannot inject replacement metadata. The gateway reconstructs
+correlation for the downstream request, using its owned SSE stream for HTTP or its
+own request ID for memory and stdio. A request without an output sink is refused
+before any upstream request is started.
+
+All intermediate events share a 64-event budget. Core progress and log events
+count toward the budget and are consumed without being relayed. Standalone
+client-to-server notification forwarding remains unsupported. Downstream framework
+metadata is not application payload or an upstream activation proof. Cancelling
+or dropping a forwarded request closes its owned upstream execution while sibling
+requests continue independently.
 
 ## Client executor observations
 
