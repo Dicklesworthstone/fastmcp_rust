@@ -319,6 +319,7 @@ fn exchange(cx: &Cx, configuration: &OAuthClientConfiguration) -> CodeExchange {
     CodeExchange::new(
         FlowBounds::new(cx, Duration::from_secs(60)).unwrap(), configuration, session,
         AuthorizationAttempt::new().unwrap(), REDIRECT, "issued-code".to_owned(),
+        RefreshPolicy::Refuse,
     ).unwrap()
 }
 
@@ -526,5 +527,498 @@ fn quiet_nonce_retry_obeys_the_supplied_callers_independent_deadline_and_cancell
         });
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
         assert!(supplied_runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+}
+
+
+#[test]
+fn renewable_dpop_acquisition_requires_explicit_valid_refresh_custody() {
+    run(|cx| async move {
+        for refresh in [
+            Some(json!("refresh +/=&? one")),
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("refresh\nprivate")),
+            Some(json!("refresh-\u{00e9}")),
+            Some(json!("r".repeat(4097))),
+            Some(json!(["refresh-one"])),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
+            let resource = url("https://mcp.example/mcp");
+            let client = OAuthClient::new(config(endpoint, resource.clone()));
+            let acceptor = test_acceptor();
+            let positive = refresh.as_ref() == Some(&json!("refresh +/=&? one"));
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = acceptor.accept(socket).await.unwrap();
+                let (head, form) = read_token_request(&mut socket).await.unwrap();
+                assert_eq!(form["grant_type"], "authorization_code");
+                assert_eq!(form["resource"], resource.as_str());
+                assert!(!head.to_ascii_lowercase().contains("authorization:"));
+                assert!(proof(&head).1.get("ath").is_none());
+                let mut response = json!({
+                    "access_token": TOKEN, "token_type": "DPoP", "expires_in": 60,
+                    "scope": "tools:read", "resource": resource.as_str(),
+                });
+                if let Some(refresh) = &refresh {
+                    response["refresh_token"] = refresh.clone();
+                }
+                respond(&mut socket, 200, &response, Some("initial-as-nonce")).await;
+            };
+            let application = async {
+                let outcome = client.authorize_renewable_dpop_with_redirect_driver(
+                    &cx, DpopKey::generate().unwrap(), url(REDIRECT),
+                    |authorization| async move { Ok(callback(&authorization, ISSUER)) },
+                ).await;
+                if positive {
+                    let DpopAuthorizationOutcome::Authorized(grant) = outcome.unwrap() else {
+                        panic!("valid refresh custody must accompany the DPoP grant");
+                    };
+                    assert!(grant.has_refresh_token());
+                    assert_eq!(grant.scopes(), ["tools:read"]);
+                    let (session, credential, refresh) = grant.into_renewable_parts();
+                    let refresh = refresh.expect("explicit renewable acquisition retains custody");
+                    assert_eq!(refresh.scopes(), ["tools:read"]);
+                    assert_eq!(refresh.credential().resource(), &resource);
+                    assert_eq!(format!("{refresh:?}"), "DpopRefreshToken(<redacted>)");
+                    drop(refresh);
+                    assert!(!credential.is_revoked(), "discarding unused refresh custody preserves access");
+                    assert!(session.resource_request_headers("POST", &resource, &credential).is_ok());
+                    drop(session);
+                    assert!(credential.is_revoked());
+                } else {
+                    assert_eq!(outcome.unwrap_err(), DpopAuthorizationError::OAuth(OAuthError::InvalidTokenResponse));
+                }
+            };
+            pair(server, application).await;
+            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+        }
+    });
+}
+
+#[test]
+fn rotating_dpop_refresh_preserves_key_nonce_and_scope_bindings_across_generations() {
+    run(|cx| async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = url(&format!("https://{address}/token"));
+        let resource = url(&format!("https://{address}/mcp"));
+        let client = OAuthClient::new(config(endpoint.clone(), resource.clone()));
+        let key = DpopKey::generate().unwrap();
+        let jwk = key.public_jwk().clone();
+        let acceptor = test_acceptor();
+        let posts = Cell::new(0);
+        let server = async {
+            let mut ids = Vec::new();
+            let mut first_refresh = None;
+            for index in 0..6 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = acceptor.accept(socket).await.unwrap();
+                posts.set(posts.get() + 1);
+                if index == 3 {
+                    let (head, payload) = read_resource_request(&mut socket).await;
+                    assert_eq!(header(&head, "authorization"), "DPoP access-two");
+                    let (protected, claims) = proof(&head);
+                    assert_eq!(protected["jwk"], jwk);
+                    assert_eq!(claims["htu"], resource.as_str());
+                    assert_eq!(claims["nonce"], "resource-before-refresh");
+                    assert!(claims["ath"].is_string());
+                    assert!(!ids.contains(&claims["jti"]));
+                    ids.push(claims["jti"].clone());
+                    respond(&mut socket, 200, &json!({
+                        "jsonrpc": "2.0", "id": payload["id"],
+                        "result": {"resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private"},
+                    }), Some("resource-after-refresh")).await;
+                    continue;
+                }
+                let (head, form) = read_token_request(&mut socket).await.unwrap();
+                assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
+                assert!(!head.to_ascii_lowercase().contains("authorization:"));
+                assert!(!head.to_ascii_lowercase().contains("cookie:"));
+                let (protected, claims) = proof(&head);
+                assert_eq!(protected["jwk"], jwk);
+                assert_eq!(claims["htu"], endpoint.as_str());
+                assert_eq!(claims["htm"], "POST");
+                assert!(claims.get("ath").is_none());
+                assert!(!ids.contains(&claims["jti"]), "each attempt must sign a fresh proof");
+                ids.push(claims["jti"].clone());
+                assert_eq!(form["client_id"], "native-client");
+                assert_eq!(form["resource"], resource.as_str());
+                match index {
+                    0 => {
+                        assert_eq!(form["grant_type"], "authorization_code");
+                        assert!(claims.get("nonce").is_none());
+                        respond(&mut socket, 200, &json!({
+                            "access_token": "access-one", "token_type": "DPoP", "expires_in": 60,
+                            "refresh_token": "refresh +/=&? one",
+                        }), Some("as-initial")).await;
+                    }
+                    1 | 2 => {
+                        assert_eq!(form["grant_type"], "refresh_token");
+                        assert_eq!(form["refresh_token"], "refresh +/=&? one");
+                        assert_eq!(form["scope"], "tools:read resources:read");
+                        assert_eq!(form.len(), 5, "no code, PKCE verifier or client secret on refresh");
+                        if index == 1 {
+                            assert_eq!(claims["nonce"], "as-initial");
+                            first_refresh = Some(form);
+                            respond(&mut socket, 400, &json!({"error": "use_dpop_nonce"}), Some("as-challenge")).await;
+                        } else {
+                            assert_eq!(first_refresh.as_ref(), Some(&form));
+                            assert_eq!(claims["nonce"], "as-challenge");
+                            respond(&mut socket, 200, &json!({
+                                "access_token": "access-two", "token_type": "DPoP", "expires_in": 60,
+                                "refresh_token": "refresh-two", "scope": "tools:read",
+                            }), Some("as-rotated")).await;
+                        }
+                    }
+                    4 => {
+                        assert_eq!(form["refresh_token"], "refresh-two");
+                        assert_eq!(form["scope"], "tools:read");
+                        assert_eq!(claims["nonce"], "as-rotated");
+                        respond(&mut socket, 200, &json!({
+                            "access_token": "access-three", "token_type": "DPoP", "expires_in": 60,
+                            "refresh_token": "refresh-three",
+                        }), None).await;
+                    }
+                    5 => {
+                        assert_eq!(form["refresh_token"], "refresh-three");
+                        assert_eq!(form["scope"], "tools:read", "omission must not restore original broader scopes");
+                        assert_eq!(claims["nonce"], "as-rotated");
+                        respond(&mut socket, 200, &json!({
+                            "access_token": "access-four", "token_type": "DPoP", "expires_in": 60,
+                            "refresh_token": "refresh-four", "scope": "tools:read resources:read",
+                        }), None).await;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        };
+        let application = async {
+            let DpopAuthorizationOutcome::Authorized(grant) = client.authorize_renewable_dpop_with_redirect_driver(
+                &cx, key, url(REDIRECT),
+                |authorization| async move { Ok(callback(&authorization, ISSUER)) },
+            ).await.unwrap() else { panic!("initial renewable grant"); };
+            let (mut session, first_access, refresh) = grant.into_renewable_parts();
+            session.observe_resource_nonce(&resource, &response_headers(Some("resource-before-refresh"))).unwrap();
+            let first_expiry = first_access.expires_at();
+            let DpopRefreshOutcome::NonceRequired(challenge) = refresh.unwrap().refresh(&cx, &mut session).await.unwrap() else {
+                panic!("an explicit nonce continuation must reach the application");
+            };
+            assert_eq!(posts.get(), 2, "no automatic refresh replay");
+            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            let replacement = challenge.retry(&cx).await.unwrap();
+            assert_eq!(replacement.scopes(), ["tools:read"]);
+            let (second_access, second_refresh) = replacement.into_parts();
+            assert!(!first_access.is_revoked());
+            assert_eq!(first_access.expires_at(), first_expiry);
+            let policy = DpopHttpPolicy::default().with_resource_root_der(test_root().as_der().to_vec()).unwrap();
+            let mut native = DpopHttpClient::new(session, policy).unwrap();
+            let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", Some(&json!({
+                "_meta": FinalRequestMeta::new(ClientCapabilities::default()),
+            }))).unwrap();
+            native.request_core(&cx, &second_access, request, RequestId::Number(91), ManagedCoreLimits::default()).await.unwrap();
+            session = native.into_session();
+            let DpopRefreshOutcome::Refreshed(replacement) = second_refresh.refresh(&cx, &mut session).await.unwrap() else {
+                panic!("second direct rotation");
+            };
+            assert_eq!(replacement.scopes(), ["tools:read"]);
+            let (third_access, third_refresh) = replacement.into_parts();
+            assert!(!first_access.is_revoked());
+            assert!(!second_access.is_revoked());
+            let error = third_refresh.refresh(&cx, &mut session).await.unwrap_err();
+            assert_eq!(error, DpopAuthorizationError::OAuth(OAuthError::ScopeExpansion));
+            for access in [&first_access, &second_access, &third_access] {
+                assert!(access.is_revoked(), "failed rotation retires every generation in its family");
+                assert!(session.resource_request_headers("POST", &resource, access).is_err());
+            }
+        };
+        pair(server, application).await;
+        assert_eq!(posts.get(), 6);
+        assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+    });
+}
+
+
+fn renewable_parts(
+    cx: &Cx,
+    configuration: &OAuthClientConfiguration,
+    key: DpopKey,
+) -> (DpopSession, DpopCredential, DpopRefreshToken) {
+    let pending = CodeExchange::new(
+        FlowBounds::new(cx, Duration::from_secs(60)).unwrap(), configuration,
+        DpopSession::new(key, configuration.token_endpoint.clone(), configuration.resource.clone()).unwrap(),
+        AuthorizationAttempt::new().unwrap(), REDIRECT, "issued-code".to_owned(),
+        RefreshPolicy::RequireRotation,
+    ).unwrap();
+    let DpopAuthorizationOutcome::Authorized(grant) = pending.admit_response(
+        200, &response_headers(Some("initial-as-nonce")),
+        br#"{"access_token":"access-one","token_type":"DPoP","expires_in":60,"refresh_token":"refresh-one"}"#,
+        Instant::now(), true,
+    ).unwrap() else { panic!("renewable grant fixture"); };
+    let (session, access, refresh) = grant.into_renewable_parts();
+    (session, access, refresh.unwrap())
+}
+
+#[test]
+fn invalid_dpop_rotation_quarantines_the_family_without_replaying_the_refresh() {
+    run(|cx| async move {
+        for mutation in [
+            "missing", "same", "empty", "null", "control", "oversized", "bearer",
+            "key", "resource", "scope", "id_token", "mixed", "redirect", "server_error",
+            "duplicate", "nonce_missing", "nonce_status", "nonce_duplicate",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
+            let configuration = config(endpoint, url("https://mcp.example/mcp"));
+            let (mut session, access, refresh) = renewable_parts(&cx, &configuration, DpopKey::generate().unwrap());
+            let acceptor = test_acceptor();
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = acceptor.accept(socket).await.unwrap();
+                let (head, form) = read_token_request(&mut socket).await.unwrap();
+                assert_eq!(form["refresh_token"], "refresh-one");
+                assert_eq!(proof(&head).1["nonce"], "initial-as-nonce");
+                let mut body = json!({
+                    "access_token": "access-two", "token_type": "DPoP", "expires_in": 60,
+                    "refresh_token": "refresh-two",
+                });
+                let status = match mutation {
+                    "missing" => { body.as_object_mut().unwrap().remove("refresh_token"); 200 }
+                    "same" => { body["refresh_token"] = json!("refresh-one"); 200 }
+                    "empty" => { body["refresh_token"] = json!(""); 200 }
+                    "null" => { body["refresh_token"] = Value::Null; 200 }
+                    "control" => { body["refresh_token"] = json!("refresh\nprivate"); 200 }
+                    "oversized" => { body["refresh_token"] = json!("r".repeat(4097)); 200 }
+                    "bearer" => { body["token_type"] = json!("Bearer"); 200 }
+                    "key" => { body["cnf"] = json!({"jkt": "another-key"}); 200 }
+                    "resource" => { body["resource"] = json!("https://mcp.example/mcp?foreign"); 200 }
+                    "scope" => { body["scope"] = json!("tools:admin"); 200 }
+                    "id_token" => { body["id_token"] = Value::Null; 200 }
+                    "mixed" => { body["error"] = json!("invalid_grant"); 200 }
+                    "redirect" => 302,
+                    "server_error" => 503,
+                    "nonce_missing" | "nonce_duplicate" => { body = json!({"error": "use_dpop_nonce"}); 400 }
+                    "nonce_status" => { body = json!({"error": "use_dpop_nonce"}); 401 }
+                    _ => 200,
+                };
+                if mutation == "duplicate" {
+                    let raw = r#"{"access_token":"access-two","token_type":"DPoP","refresh_token":"refresh-two","extension":{"nested":1,"nested":2}}"#;
+                    socket.write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}", raw.len(),
+                    ).as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                } else if mutation == "nonce_duplicate" {
+                    let raw = serde_json::to_string(&body).unwrap();
+                    socket.write_all(format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nDPoP-Nonce: one\r\ndpop-nonce: one\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}", raw.len(),
+                    ).as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                } else {
+                    respond(&mut socket, status, &body, (mutation != "nonce_missing").then_some("next-as-nonce")).await;
+                }
+            };
+            let application = async {
+                let result = refresh.refresh(&cx, &mut session).await;
+                assert!(result.is_err(), "mutation {mutation} must not produce any successor or continuation");
+                let error = result.unwrap_err();
+                assert!(!format!("{error:?} {error}").contains("refresh-one"));
+                assert!(access.is_revoked(), "{mutation} must retire the old access token");
+                assert_eq!(session.token_request_headers(&configuration.token_endpoint).unwrap_err(), DpopClientError::SessionRevoked);
+            };
+            pair(server, application).await;
+            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending(), "no retry after {mutation}");
+        }
+    });
+}
+
+#[test]
+fn refresh_preflight_refuses_same_key_foreign_session_without_retiring_either_owner() {
+    run(|cx| async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let configuration = config(
+            url(&format!("https://{}/token", listener.local_addr().unwrap())),
+            url("https://mcp.example/mcp"),
+        );
+        let key = DpopKey::generate().unwrap();
+        let (original_session, original_access, refresh) = renewable_parts(&cx, &configuration, key.clone());
+        let (mut foreign_session, foreign_access, foreign_refresh) = renewable_parts(&cx, &configuration, key);
+        assert_eq!(original_session.authorization_jkt(), foreign_session.authorization_jkt());
+        assert!(refresh.refresh(&cx, &mut foreign_session).await.is_err());
+        assert!(!original_access.is_revoked());
+        assert!(!foreign_access.is_revoked());
+        assert!(original_session.resource_request_headers("POST", &configuration.resource, &original_access).is_ok());
+        assert!(foreign_session.resource_request_headers("POST", &configuration.resource, &foreign_access).is_ok());
+        drop(foreign_refresh);
+        assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+    });
+}
+
+
+#[test]
+fn expired_dpop_access_can_rotate_but_local_revocation_cannot_dispatch() {
+    run(|cx| async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut configuration = config(
+            url(&format!("https://{}/token", listener.local_addr().unwrap())),
+            url("https://mcp.example/mcp"),
+        );
+        configuration.max_access_token_lifetime = Duration::from_secs(1);
+        let (mut session, access, refresh) = renewable_parts(&cx, &configuration, DpopKey::generate().unwrap());
+        asupersync::time::sleep(cx.now(), Duration::from_millis(1100)).await;
+        assert!(access.expires_at().unwrap() <= Instant::now());
+        assert!(!access.is_revoked());
+        assert_eq!(
+            session.resource_request_headers("POST", &configuration.resource, &access).unwrap_err(),
+            DpopClientError::CredentialUnavailable,
+        );
+        let acceptor = test_acceptor();
+        let server = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = acceptor.accept(socket).await.unwrap();
+            let (head, form) = read_token_request(&mut socket).await.unwrap();
+            assert_eq!(form["refresh_token"], "refresh-one");
+            assert!(proof(&head).1.get("ath").is_none());
+            respond(&mut socket, 200, &json!({
+                "access_token": "access-two", "token_type": "DPoP", "expires_in": 60,
+                "refresh_token": "refresh-two",
+            }), None).await;
+        };
+        let application = async {
+            let DpopRefreshOutcome::Refreshed(replacement) = refresh.refresh(&cx, &mut session).await.unwrap() else {
+                panic!("expiry must permit a direct refresh");
+            };
+            let (replacement_access, replacement_refresh) = replacement.into_parts();
+            assert!(replacement_access.expires_at().unwrap() > Instant::now());
+            assert!(!access.is_revoked());
+            assert!(session.resource_request_headers("POST", &configuration.resource, &replacement_access).is_ok());
+            replacement_access.revoke();
+            assert!(replacement_refresh.refresh(&cx, &mut session).await.is_err());
+        };
+        pair(server, application).await;
+        assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending(), "revoked access cannot authorize another refresh POST");
+    });
+}
+
+#[test]
+fn quiet_or_abandoned_dpop_refresh_retires_the_session_and_closes_its_socket() {
+    for stop in ["drop", "token_revoke", "session_revoke", "disconnect", "cancel"] {
+        run(|cx| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let configuration = config(
+                url(&format!("https://{}/token", listener.local_addr().unwrap())),
+                url("https://mcp.example/mcp"),
+            );
+            let (session, access, refresh) = renewable_parts(&cx, &configuration, DpopKey::generate().unwrap());
+            let native = DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap();
+            let owner = native.revocation_handle();
+            let mut session = native.into_session();
+            let acceptor = test_acceptor();
+            let received = Cell::new(false);
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = acceptor.accept(socket).await.unwrap();
+                let (_, form) = read_token_request(&mut socket).await.unwrap();
+                assert_eq!(form["refresh_token"], "refresh-one");
+                received.set(true);
+                match stop {
+                    "token_revoke" => access.revoke(),
+                    "session_revoke" => owner.revoke(),
+                    "cancel" => cx.set_cancel_requested(true),
+                    "disconnect" => {
+                        socket.shutdown().await.unwrap();
+                        return;
+                    }
+                    _ => {}
+                }
+                let mut byte = [0];
+                assert!(matches!(socket.read(&mut byte).await, Ok(0) | Err(_)), "quiet refresh socket must close on {stop}");
+            };
+            let application = async {
+                if stop == "drop" {
+                    let mut pending = Box::pin(refresh.refresh(&cx, &mut session));
+                    poll_fn(|task| {
+                        if received.get() {
+                            return Poll::Ready(());
+                        }
+                        assert!(pending.as_mut().poll(task).is_pending());
+                        Poll::Pending
+                    }).await;
+                    drop(pending);
+                } else {
+                    let error = refresh.refresh(&cx, &mut session).await.unwrap_err();
+                    assert!(received.get(), "the {stop} control must occur after credential dispatch");
+                    if stop == "cancel" {
+                        assert_eq!(error, DpopAuthorizationError::OAuth(OAuthError::Cancelled));
+                    }
+                }
+                assert!(access.is_revoked());
+                assert!(owner.is_revoked(), "{stop} must retire the entire original session");
+                assert_eq!(session.token_request_headers(&configuration.token_endpoint).unwrap_err(), DpopClientError::SessionRevoked);
+            };
+            pair(server, application).await;
+            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending(), "{stop} never retries");
+        });
+    }
+}
+
+#[test]
+fn dpop_refresh_nonce_challenge_is_consuming_and_cannot_start_a_retry_loop() {
+    for stop in ["drop", "second_challenge", "cancel", "restricted"] {
+        run(|cx| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let configuration = config(
+                url(&format!("https://{}/token", listener.local_addr().unwrap())),
+                url("https://mcp.example/mcp"),
+            );
+            let (mut session, access, refresh) = renewable_parts(&cx, &configuration, DpopKey::generate().unwrap());
+            let acceptor = test_acceptor();
+            let posts = Cell::new(0);
+            let server = async {
+                let mut first = None;
+                for index in 0..(if stop == "second_challenge" { 2 } else { 1 }) {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = acceptor.accept(socket).await.unwrap();
+                    let (head, form) = read_token_request(&mut socket).await.unwrap();
+                    posts.set(posts.get() + 1);
+                    let claims = proof(&head).1;
+                    if index == 0 {
+                        assert_eq!(claims["nonce"], "initial-as-nonce");
+                        first = Some((form, claims["jti"].clone()));
+                    } else {
+                        let (original_form, original_jti) = first.as_ref().unwrap();
+                        assert_eq!(original_form, &form);
+                        assert_ne!(original_jti, &claims["jti"]);
+                        assert_eq!(claims["nonce"], "challenge-one");
+                    }
+                    respond(&mut socket, 400, &json!({"error": "use_dpop_nonce"}), Some("challenge-one")).await;
+                }
+            };
+            let application = async {
+                let DpopRefreshOutcome::NonceRequired(challenge) = refresh.refresh(&cx, &mut session).await.unwrap() else {
+                    panic!("first valid challenge must return control");
+                };
+                assert_eq!(posts.get(), 1);
+                assert!(!access.is_revoked(), "nonce continuation temporarily retains the family");
+                match stop {
+                    "drop" => drop(challenge),
+                    "cancel" => {
+                        cx.set_cancel_requested(true);
+                        assert_eq!(challenge.retry(&cx).await.unwrap_err(), DpopAuthorizationError::OAuth(OAuthError::Cancelled));
+                    }
+                    "restricted" => {
+                        let _restriction = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+                        assert_eq!(challenge.retry(&cx).await.unwrap_err(), DpopAuthorizationError::OAuth(OAuthError::RuntimeCapabilityUnavailable));
+                    }
+                    _ => assert_eq!(challenge.retry(&cx).await.unwrap_err(), DpopAuthorizationError::NonceRetryLimit),
+                }
+                assert!(access.is_revoked(), "{stop} must retire the grant instead of releasing a retryable token");
+                assert_eq!(session.token_request_headers(&configuration.token_endpoint).unwrap_err(), DpopClientError::SessionRevoked);
+            };
+            pair(server, application).await;
+            assert_eq!(posts.get(), if stop == "second_challenge" { 2 } else { 1 });
+            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+        });
     }
 }

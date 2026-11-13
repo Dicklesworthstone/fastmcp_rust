@@ -4,7 +4,9 @@
 //! state, S256 PKCE, scope and resource checks. The authorization request also
 //! carries `dpop_jkt`, and the HTTPS token POST proves possession of that same
 //! key. Success owns a separate [`DpopSession`] and [`DpopCredential`]; there
-//! is no conversion to the bearer driver and no refresh-token custody.
+//! is no conversion to the bearer driver. The explicitly renewable entry
+//! points additionally retain a rotating refresh grant for caller-driven
+//! renewal through the same session, issuer and client policy.
 //!
 //! A token endpoint's HTTP 400 `use_dpop_nonce` response can return a linear
 //! continuation. Only an explicit [`DpopNonceChallenge::retry`] sends its one
@@ -31,6 +33,18 @@ use super::{
 };
 use crate::http_auth::CanonicalHttpUrl;
 use crate::http_auth::dpop::{DpopClientError, DpopCredential, DpopKey, DpopSession};
+
+/// Explicit native renewal with exclusive rotating refresh-token custody.
+pub mod refresh;
+pub use refresh::{
+    DpopRefreshNonceChallenge, DpopRefreshOutcome, DpopRefreshResult, DpopRefreshToken,
+};
+
+#[derive(Clone, Copy)]
+enum RefreshPolicy {
+    Refuse,
+    RequireRotation,
+}
 
 /// Sanitized failure without a callback, code, token, proof or response body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +103,7 @@ pub struct DpopAuthorization {
     session: DpopSession,
     credential: DpopCredential,
     scopes: Vec<String>,
+    refresh: Option<DpopRefreshToken>,
 }
 
 impl fmt::Debug for DpopAuthorization {
@@ -110,10 +125,32 @@ impl DpopAuthorization {
         &self.scopes
     }
 
+    /// Whether the explicitly renewable profile retained rotating grant custody.
+    #[must_use]
+    pub fn has_refresh_token(&self) -> bool {
+        self.refresh.is_some()
+    }
+
     /// Transfer the session and credential together to the native DPoP client.
+    /// Any retained refresh token is erased; the access credential stays usable
+    /// until its original expiry or revocation.
     #[must_use]
     pub fn into_parts(self) -> (DpopSession, DpopCredential) {
         (self.session, self.credential)
+    }
+
+    /// Retain explicit renewal custody alongside the session and access token.
+    ///
+    /// The renewable acquisition entry points always return `Some` here. Pass
+    /// the session into the native DPoP client, use the access token for calls,
+    /// then recover that same session with `DpopHttpClient::into_session` when
+    /// explicitly renewing. The refresh owner cannot be used with a different
+    /// session, even if the proof key and endpoints are identical.
+    #[must_use]
+    pub fn into_renewable_parts(
+        self,
+    ) -> (DpopSession, DpopCredential, Option<DpopRefreshToken>) {
+        (self.session, self.credential, self.refresh)
     }
 }
 
@@ -192,6 +229,46 @@ impl OAuthClient {
         L: FnOnce(CanonicalHttpUrl) -> F,
         F: Future<Output = Result<(), OAuthError>>,
     {
+        Box::pin(self.authorize_dpop_profile(cx, key, launch_browser, RefreshPolicy::Refuse)).await
+    }
+
+    /// Acquire a DPoP grant with mandatory rotating refresh-token custody.
+    ///
+    /// The caller explicitly selects this public-client profile. A successful
+    /// token response must contain a nonempty, bounded refresh token. Native
+    /// renewal is explicit, uses this same proof-key session and issuer/client
+    /// policy, and requires a distinct successor refresh token each time.
+    /// This does not install automatic refresh or replay an MCP operation.
+    pub async fn authorize_renewable_dpop<L, F>(
+        &self,
+        cx: &Cx,
+        key: DpopKey,
+        launch_browser: L,
+    ) -> Result<DpopAuthorizationOutcome, DpopAuthorizationError>
+    where
+        L: FnOnce(CanonicalHttpUrl) -> F,
+        F: Future<Output = Result<(), OAuthError>>,
+    {
+        Box::pin(self.authorize_dpop_profile(
+            cx,
+            key,
+            launch_browser,
+            RefreshPolicy::RequireRotation,
+        ))
+        .await
+    }
+
+    async fn authorize_dpop_profile<L, F>(
+        &self,
+        cx: &Cx,
+        key: DpopKey,
+        launch_browser: L,
+        refresh_policy: RefreshPolicy,
+    ) -> Result<DpopAuthorizationOutcome, DpopAuthorizationError>
+    where
+        L: FnOnce(CanonicalHttpUrl) -> F,
+        F: Future<Output = Result<(), OAuthError>>,
+    {
         CallerContextFuture::new(cx, async move {
             let bounds = FlowBounds::new(cx, self.configuration.authorization_timeout)?;
             let attempt = AuthorizationAttempt::new()?;
@@ -237,6 +314,7 @@ impl OAuthClient {
                 attempt,
                 &redirect_uri,
                 code,
+                refresh_policy,
             )?
             .send(true)
             .await
@@ -257,6 +335,55 @@ impl OAuthClient {
         key: DpopKey,
         redirect_uri: CanonicalHttpUrl,
         driver: D,
+    ) -> Result<DpopAuthorizationOutcome, DpopAuthorizationError>
+    where
+        D: FnOnce(CanonicalHttpUrl) -> F,
+        F: Future<Output = Result<String, OAuthError>>,
+    {
+        Box::pin(self.authorize_dpop_redirect_profile(
+            cx,
+            key,
+            redirect_uri,
+            driver,
+            RefreshPolicy::Refuse,
+        ))
+        .await
+    }
+
+    /// Acquire mandatory rotating DPoP grant custody through a registered
+    /// host-provided HTTPS callback route.
+    ///
+    /// The callback, issuer, state and PKCE contract is identical to
+    /// [`Self::authorize_dpop_with_redirect_driver`]. Only this explicitly
+    /// renewable profile admits a refresh token, and its absence is an error.
+    pub async fn authorize_renewable_dpop_with_redirect_driver<D, F>(
+        &self,
+        cx: &Cx,
+        key: DpopKey,
+        redirect_uri: CanonicalHttpUrl,
+        driver: D,
+    ) -> Result<DpopAuthorizationOutcome, DpopAuthorizationError>
+    where
+        D: FnOnce(CanonicalHttpUrl) -> F,
+        F: Future<Output = Result<String, OAuthError>>,
+    {
+        Box::pin(self.authorize_dpop_redirect_profile(
+            cx,
+            key,
+            redirect_uri,
+            driver,
+            RefreshPolicy::RequireRotation,
+        ))
+        .await
+    }
+
+    async fn authorize_dpop_redirect_profile<D, F>(
+        &self,
+        cx: &Cx,
+        key: DpopKey,
+        redirect_uri: CanonicalHttpUrl,
+        driver: D,
+        refresh_policy: RefreshPolicy,
     ) -> Result<DpopAuthorizationOutcome, DpopAuthorizationError>
     where
         D: FnOnce(CanonicalHttpUrl) -> F,
@@ -289,6 +416,7 @@ impl OAuthClient {
                 attempt,
                 redirect_uri.as_str(),
                 code,
+                refresh_policy,
             )?
             .send(true)
             .await
@@ -409,6 +537,7 @@ struct CodeExchange {
     configuration: OAuthClientConfiguration,
     session: DpopSession,
     form: SecretString,
+    refresh_policy: RefreshPolicy,
 }
 
 impl CodeExchange {
@@ -419,6 +548,7 @@ impl CodeExchange {
         attempt: AuthorizationAttempt,
         redirect_uri: &str,
         code: String,
+        refresh_policy: RefreshPolicy,
     ) -> Result<Self, OAuthError> {
         let code = SecretString::from_string(code);
         let verifier = SecretString::from_string(attempt.verifier());
@@ -435,6 +565,7 @@ impl CodeExchange {
             configuration: configuration.clone(),
             session,
             form,
+            refresh_policy,
         })
     }
 
@@ -531,7 +662,7 @@ impl CodeExchange {
             self.bounds.check()?;
             return Ok(DpopAuthorizationOutcome::NonceRequired(DpopNonceChallenge { exchange: self }));
         }
-        if ["refresh_token", "id_token", "issued_token_type", "error", "error_description", "error_uri"]
+        if ["id_token", "issued_token_type", "error", "error_description", "error_uri"]
             .iter()
             .any(|name| object.contains_key(*name))
             || object.get("resource").is_some_and(|value| {
@@ -540,6 +671,17 @@ impl CodeExchange {
         {
             return Err(OAuthError::InvalidTokenResponse.into());
         }
+        let refresh_token = match self.refresh_policy {
+            RefreshPolicy::Refuse => {
+                if object.contains_key("refresh_token") {
+                    return Err(OAuthError::InvalidTokenResponse.into());
+                }
+                None
+            }
+            RefreshPolicy::RequireRotation => {
+                Some(refresh::admit_refresh_secret(object.get("refresh_token"))?)
+            }
+        };
         let scopes = match object.get("scope") {
             None => self.configuration.scopes.clone(),
             Some(value) => value
@@ -562,10 +704,23 @@ impl CodeExchange {
             self.configuration.max_access_token_lifetime,
         )?;
         self.bounds.check()?;
+        let refresh = refresh_token.map(|token| {
+            DpopRefreshToken::new(
+                self.configuration.clone(),
+                credential.clone(),
+                scopes.clone(),
+                token,
+            )
+        });
+        self.bounds.check()?;
+        if credential.expires_at().is_none_or(|expiry| Instant::now() >= expiry) {
+            return Err(DpopClientError::InvalidLifetime.into());
+        }
         Ok(DpopAuthorizationOutcome::Authorized(DpopAuthorization {
             session: self.session,
             credential,
             scopes,
+            refresh,
         }))
     }
 }

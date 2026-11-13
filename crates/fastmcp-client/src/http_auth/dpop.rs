@@ -13,6 +13,9 @@
 //! This module does not install automatic OAuth negotiation or HTTP retries.
 
 use std::fmt;
+use std::future::{Future, poll_fn};
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
@@ -139,6 +142,7 @@ pub struct DpopCredential {
     bound: BoundBearerCredential,
     key_thumbprint: String,
     token_endpoint: CanonicalHttpUrl,
+    session_identity: Arc<()>,
 }
 
 impl fmt::Debug for DpopCredential {
@@ -170,6 +174,29 @@ impl DpopCredential {
     pub fn expires_at(&self) -> Option<Instant> {
         self.bound.expires_at()
     }
+
+    /// Wake a native refresh on either token-local or original-owner revocation.
+    /// Access expiry is deliberately separate: it does not prohibit renewal.
+    pub(crate) async fn cancelled(&self) {
+        let mut token_cancelled = std::pin::pin!(self.bound.revoked.cancelled());
+        let mut owner_cancelled = std::pin::pin!(async {
+            match &self.bound.owner_cancellation {
+                Some(owner) => owner.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        });
+        poll_fn(|task| {
+            if self.is_revoked()
+                || token_cancelled.as_mut().poll(task).is_ready()
+                || owner_cancelled.as_mut().poll(task).is_ready()
+            {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
 }
 
 /// One owner-controlled DPoP authorization context.
@@ -185,6 +212,9 @@ pub struct DpopSession {
     token_nonce: Option<DpopNonce>,
     resource_nonce: Option<DpopNonce>,
     cancellation: McpRequestCancellation,
+    // A key can intentionally be shared between sessions. Refresh custody
+    // must still retain its original owner and cannot migrate to another one.
+    identity: Arc<()>,
 }
 
 impl fmt::Debug for DpopSession {
@@ -221,6 +251,7 @@ impl DpopSession {
             token_nonce: None,
             resource_nonce: None,
             cancellation: McpRequestCancellation::new(),
+            identity: Arc::new(()),
         })
     }
 
@@ -240,6 +271,28 @@ impl DpopSession {
             return Err(DpopClientError::SessionRevoked);
         }
         Ok(())
+    }
+
+    /// Admit refresh custody without requiring an unexpired access token.
+    /// Unlike resource requests, renewal cannot substitute another session
+    /// even when that session deliberately holds the same proof key.
+    pub(crate) fn validate_refresh_credential(
+        &self,
+        credential: &DpopCredential,
+    ) -> Result<(), DpopClientError> {
+        self.require_active()?;
+        if credential.resource().as_str() != self.resource.as_str()
+            || credential.token_endpoint.as_str() != self.token_endpoint.as_str()
+        {
+            return Err(DpopClientError::EndpointMismatch);
+        }
+        if credential.key_thumbprint != self.key.thumbprint() {
+            return Err(DpopClientError::KeyMismatch);
+        }
+        if !Arc::ptr_eq(&credential.session_identity, &self.identity) || credential.is_revoked() {
+            return Err(DpopClientError::CredentialUnavailable);
+        }
+        self.require_active()
     }
 
     /// Produce a fresh POST proof for token issuance or refresh.
@@ -341,6 +394,7 @@ impl DpopSession {
             bound,
             key_thumbprint: self.key.thumbprint().to_owned(),
             token_endpoint: self.token_endpoint.clone(),
+            session_identity: Arc::clone(&self.identity),
         })
     }
 
@@ -756,6 +810,103 @@ mod tests {
             session.observe_resource_nonce(&source, &[]).unwrap_err(),
             DpopClientError::SessionRevoked
         );
+    }
+
+    #[test]
+    fn dpop_refresh_owner_admission_allows_expiry_but_not_token_or_session_revocation() {
+        let session = session();
+        let mut expired = credential(&session);
+        expired.bound.expires_at = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(session.validate_refresh_credential(&expired), Ok(()));
+        assert_eq!(
+            session
+                .resource_request_headers("POST", &session.resource, &expired)
+                .unwrap_err(),
+            DpopClientError::CredentialUnavailable
+        );
+
+        let live = credential(&session);
+        expired.revoke();
+        assert_eq!(
+            session.validate_refresh_credential(&expired),
+            Err(DpopClientError::CredentialUnavailable)
+        );
+        assert_eq!(session.validate_refresh_credential(&live), Ok(()));
+        session.revoke();
+        assert_eq!(
+            session.validate_refresh_credential(&live),
+            Err(DpopClientError::SessionRevoked)
+        );
+    }
+
+    #[test]
+    fn dpop_refresh_owner_admission_refuses_same_key_foreign_session_without_mutation() {
+        let original = session();
+        let credential = credential(&original);
+        let foreign = DpopSession::new(
+            original.key.clone(),
+            original.token_endpoint.clone(),
+            original.resource.clone(),
+        )
+        .unwrap();
+        // Explicit proof-key sharing remains supported for resource calls.
+        // Only transferring the refresh lineage to another owner is refused.
+        assert!(
+            foreign
+                .resource_request_headers("POST", &foreign.resource, &credential)
+                .is_ok()
+        );
+        assert_eq!(
+            foreign.validate_refresh_credential(&credential),
+            Err(DpopClientError::CredentialUnavailable)
+        );
+        assert_eq!(original.validate_refresh_credential(&credential), Ok(()));
+        assert!(!credential.is_revoked());
+        drop(foreign);
+        assert_eq!(original.validate_refresh_credential(&credential), Ok(()));
+    }
+
+    #[test]
+    fn dpop_refresh_revocation_wait_wakes_for_token_owner_and_owner_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Wake, Waker};
+
+        struct WakeCounter(AtomicUsize);
+
+        impl Wake for WakeCounter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for mode in 0..3 {
+            let mut owner = Some(session());
+            let token = credential(owner.as_ref().unwrap());
+            let sibling = credential(owner.as_ref().unwrap());
+            let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wake_counter));
+            let mut task = Context::from_waker(&waker);
+            let mut waiting = std::pin::pin!(token.cancelled());
+            assert!(waiting.as_mut().poll(&mut task).is_pending());
+            sibling.revoke();
+            assert!(waiting.as_mut().poll(&mut task).is_pending());
+            assert_eq!(wake_counter.0.load(Ordering::SeqCst), 0);
+            match mode {
+                0 => token.clone().revoke(),
+                1 => owner.as_ref().unwrap().revoke(),
+                _ => drop(owner.take()),
+            }
+            assert!(wake_counter.0.load(Ordering::SeqCst) > 0);
+            assert!(waiting.as_mut().poll(&mut task).is_ready());
+
+            // Revocation that precedes registration is observed immediately.
+            let mut already_cancelled = std::pin::pin!(token.cancelled());
+            assert!(already_cancelled.as_mut().poll(&mut task).is_ready());
+        }
     }
 
     #[test]

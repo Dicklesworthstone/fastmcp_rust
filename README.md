@@ -1527,6 +1527,43 @@ Authorization-server and resource-server nonces stay separate. No credential
 is converted to the bearer driver, and no browser process, automatic refresh,
 resource-operation replay, or durable callback custody is created.
 
+#### Explicit rotating DPoP refresh
+
+Public clients whose validated issuer registration and requested scopes permit
+refresh can select `authorize_renewable_dpop` or
+`authorize_renewable_dpop_with_redirect_driver`. These entry points retain the
+same callback and proof-key checks and require a valid refresh token in the
+initial response. The access-only entry points keep their existing response
+policy.
+
+`DpopAuthorization::into_renewable_parts` returns the session, access credential,
+and exclusive `DpopRefreshToken` custody. After resource calls, recover the
+original session with `DpopHttpClient::into_session` and consume the refresh
+owner with `refresh(cx, &mut session)`. The native HTTPS exchange uses the
+original issuer, client, token endpoint, resource, TLS trust and granted scope
+ceiling. It cannot transfer the refresh grant to another session, even one with
+the same proof key and endpoints.
+
+`DpopRefreshOutcome::Refreshed` contains a new access credential and a
+byte-distinct successor refresh token. A narrowed scope grant becomes the next
+refresh ceiling; an omitted scope preserves that ceiling. Existing access
+snapshots retain their original expiration. Access expiration permits renewal,
+while local credential or session revocation prevents it.
+
+`DpopRefreshOutcome::NonceRequired` hands one consuming continuation back to the
+application. Its explicit `retry(cx)` retains the original transaction and
+deadline and produces a fresh proof. A second challenge is terminal. The
+authorization-server nonce remains separate from the resource-server nonce.
+
+After renewal preflight succeeds, cancellation, a dropped future or continuation,
+a disconnect, or any rejected response revokes the complete session, including
+access snapshots from earlier rotations. The consumed refresh token is erased
+and never automatically replayed. Preflight refusal sends nothing and preserves
+existing access snapshots, although the consuming refresh owner is erased.
+Dropping unused refresh custody also erases only that secret. This API provides
+in-memory rotating custody; it does not provide persistent refresh storage,
+automatic login, nonrotating refresh, or automatic resource-call retries.
+
 ---
 
 ## Quick Start
