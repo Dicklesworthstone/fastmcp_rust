@@ -268,6 +268,10 @@ pub struct ServerBuilder {
     task_manager: Option<SharedTaskManager>,
     /// Behavior when registering duplicate component names.
     on_duplicate: DuplicateBehavior,
+    /// Union routing rejects ambiguous upstream identities unless explicitly
+    /// configured otherwise, independently of the local compatibility default.
+    #[cfg(feature = "proxy")]
+    proxy_on_duplicate: DuplicateBehavior,
     /// Whether to use strict input validation (reject extra properties).
     strict_input_validation: bool,
     /// Per-connection ceiling for concurrent server-to-client requests.
@@ -422,6 +426,8 @@ impl ServerBuilder {
             #[cfg(all(test, feature = "tasks"))]
             task_manager: None,
             on_duplicate: DuplicateBehavior::default(),
+            #[cfg(feature = "proxy")]
+            proxy_on_duplicate: DuplicateBehavior::Error,
             strict_input_validation: false,
             #[cfg(feature = "legacy-2024-11-05")]
             max_bidirectional_requests_per_connection:
@@ -459,9 +465,13 @@ impl ServerBuilder {
     ///
     /// - [`DuplicateBehavior::Error`]: Refuse the conflicting registration;
     ///   [`try_build`](Self::try_build) then fails naming it
-    /// - [`DuplicateBehavior::Warn`]: Log warning, keep original (default)
+    /// - [`DuplicateBehavior::Warn`]: Log warning, keep original (local default)
     /// - [`DuplicateBehavior::Replace`]: Replace with new component
     /// - [`DuplicateBehavior::Ignore`]: Silently keep original
+    ///
+    /// Proxy catalogs default to `Error` so an ambiguous upstream cannot
+    /// silently disappear from the union. Calling this method explicitly
+    /// applies the selected policy to both local and proxy registrations.
     ///
     /// # Example
     ///
@@ -475,6 +485,10 @@ impl ServerBuilder {
     #[must_use]
     pub fn on_duplicate(mut self, behavior: DuplicateBehavior) -> Self {
         self.on_duplicate = behavior;
+        #[cfg(feature = "proxy")]
+        {
+            self.proxy_on_duplicate = behavior;
+        }
         self
     }
 
@@ -1431,7 +1445,8 @@ impl ServerBuilder {
     /// retained local target.
     #[cfg(feature = "proxy")]
     fn proxy_prompt_wins_admission(&self, name: &str) -> bool {
-        self.router.get_prompt(name).is_none() || self.on_duplicate == DuplicateBehavior::Replace
+        self.router.get_prompt(name).is_none()
+            || self.proxy_on_duplicate == DuplicateBehavior::Replace
     }
 
     /// Returns whether this proxy registration will own the exact resource
@@ -1442,21 +1457,7 @@ impl ServerBuilder {
     #[cfg(feature = "proxy")]
     fn proxy_resource_template_wins_admission(&self, uri_template: &str) -> bool {
         self.router.get_resource_template(uri_template).is_none()
-            || self.on_duplicate == DuplicateBehavior::Replace
-    }
-
-    /// Skips one colliding catalog member under [`DuplicateBehavior::Error`].
-    /// Other admission failures still fail `proxy` / `as_proxy_typed` so a
-    /// schema or metadata defect is not logged away as a duplicate skip.
-    #[cfg(feature = "proxy")]
-    fn absorb_prefixed_proxy_duplicate(
-        error: fastmcp_core::McpError,
-    ) -> Result<(), fastmcp_core::McpError> {
-        if crate::router::is_duplicate_registration_error(&error) {
-            Ok(())
-        } else {
-            Err(error)
-        }
+            || self.proxy_on_duplicate == DuplicateBehavior::Replace
     }
 
     #[cfg(feature = "proxy")]
@@ -1535,7 +1536,9 @@ impl ServerBuilder {
     /// # Errors
     ///
     /// Returns an error when the catalog is malformed, contradicts the route,
-    /// or attempts to establish an era without upstream evidence.
+    /// attempts to establish an era without upstream evidence, or the
+    /// configured duplicate policy rejects any component. A rejected union
+    /// never returns a builder containing only its noncolliding members.
     #[cfg(feature = "proxy")]
     pub fn proxy(
         mut self,
@@ -1597,21 +1600,21 @@ impl ServerBuilder {
         for tool in catalog.tools {
             if let Err(error) = self.router.add_legacy_tool_with_behavior(
                 ProxyToolHandler::new(tool, client.clone()),
-                self.on_duplicate,
+                self.proxy_on_duplicate,
             ) {
                 log::error!(
                     target: "fastmcp_rust::builder",
                     "Failed to register proxied tool; code={:?}",
                     error.code
                 );
-                Self::absorb_prefixed_proxy_duplicate(error)?;
+                return Err(error);
             }
         }
 
         for handler in final_handlers {
             match self
                 .router
-                .add_final_tool_with_behavior(handler, self.on_duplicate)
+                .add_final_tool_with_behavior(handler, self.proxy_on_duplicate)
             {
                 Ok(()) => {}
                 Err(error) => {
@@ -1620,7 +1623,7 @@ impl ServerBuilder {
                         "Failed to register exact-final proxied tool; code={:?}",
                         error.code
                     );
-                    Self::absorb_prefixed_proxy_duplicate(error)?;
+                    return Err(error);
                 }
             }
         }
@@ -1628,14 +1631,14 @@ impl ServerBuilder {
         for resource in catalog.resources {
             if let Err(error) = self.router.add_legacy_resource_with_behavior(
                 ProxyResourceHandler::new(resource, client.clone()),
-                self.on_duplicate,
+                self.proxy_on_duplicate,
             ) {
                 log::error!(
                     target: "fastmcp_rust::builder",
                     "Failed to register proxied resource; code={:?}",
                     error.code
                 );
-                Self::absorb_prefixed_proxy_duplicate(error)?;
+                return Err(error);
             }
         }
 
@@ -1645,7 +1648,7 @@ impl ServerBuilder {
                 self.proxy_resource_template_wins_admission(&downstream_uri);
             match self.router.add_legacy_resource_with_behavior(
                 ProxyResourceHandler::from_template(template, client.clone()),
-                self.on_duplicate,
+                self.proxy_on_duplicate,
             ) {
                 Ok(()) if completion_target_admitted => {
                     if completion_supported && catalog_era == ProtocolEra::Legacy2024 {
@@ -1667,7 +1670,7 @@ impl ServerBuilder {
                         "Failed to register proxied resource template; code={:?}",
                         error.code
                     );
-                    Self::absorb_prefixed_proxy_duplicate(error)?;
+                    return Err(error);
                 }
             }
         }
@@ -1677,7 +1680,7 @@ impl ServerBuilder {
             let completion_target_admitted = self.proxy_prompt_wins_admission(&downstream_name);
             match self.router.add_legacy_prompt_with_behavior(
                 ProxyPromptHandler::new(prompt, client.clone()),
-                self.on_duplicate,
+                self.proxy_on_duplicate,
             ) {
                 Ok(()) if completion_target_admitted => {
                     if completion_supported && catalog_era == ProtocolEra::Legacy2024 {
@@ -1699,7 +1702,7 @@ impl ServerBuilder {
                         "Failed to register proxied prompt; code={:?}",
                         error.code
                     );
-                    Self::absorb_prefixed_proxy_duplicate(error)?;
+                    return Err(error);
                 }
             }
         }
@@ -1707,14 +1710,14 @@ impl ServerBuilder {
         for resource in catalog.final_resources {
             if let Err(error) = self.router.add_final_resource_with_behavior(
                 FinalProxyResourceHandler::new(resource, client.clone()),
-                self.on_duplicate,
+                self.proxy_on_duplicate,
             ) {
                 log::error!(
                     target: "fastmcp_rust::builder",
                     "Failed to register exact-final proxied resource; code={:?}",
                     error.code
                 );
-                Self::absorb_prefixed_proxy_duplicate(error)?;
+                return Err(error);
             }
         }
 
@@ -1724,7 +1727,7 @@ impl ServerBuilder {
                 self.proxy_resource_template_wins_admission(&downstream_uri);
             match self.router.add_final_resource_with_behavior(
                 FinalProxyResourceTemplateHandler::new(template, client.clone()),
-                self.on_duplicate,
+                self.proxy_on_duplicate,
             ) {
                 Ok(())
                     if completion_target_admitted
@@ -1748,7 +1751,7 @@ impl ServerBuilder {
                         "Failed to register exact-final proxied resource template; code={:?}",
                         error.code
                     );
-                    Self::absorb_prefixed_proxy_duplicate(error)?;
+                    return Err(error);
                 }
             }
         }
@@ -1758,7 +1761,7 @@ impl ServerBuilder {
             let completion_target_admitted = self.proxy_prompt_wins_admission(&downstream_name);
             match self.router.add_final_prompt_with_behavior(
                 FinalProxyPromptHandler::new(prompt, client.clone()),
-                self.on_duplicate,
+                self.proxy_on_duplicate,
             ) {
                 Ok(())
                     if completion_target_admitted
@@ -1782,7 +1785,7 @@ impl ServerBuilder {
                         "Failed to register exact-final proxied prompt; code={:?}",
                         error.code
                     );
-                    Self::absorb_prefixed_proxy_duplicate(error)?;
+                    return Err(error);
                 }
             }
         }
@@ -1834,9 +1837,9 @@ impl ServerBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the catalog fetch fails. Duplicate-policy
-    /// rejections of individual proxied components are logged and skipped so
-    /// the rest of the catalog still installs.
+    /// Returns an error if catalog discovery or any component admission fails.
+    /// Duplicate identities are rejected by default. An explicit `on_duplicate`
+    /// policy can retain or replace colliding components.
     #[cfg(feature = "proxy")]
     pub fn as_proxy(
         self,
@@ -1881,9 +1884,9 @@ impl ServerBuilder {
     /// # Errors
     ///
     /// Returns an error if the typed catalog is mixed-era or contradicts the
-    /// selected route. Duplicate-policy rejections of individual proxied
-    /// components are logged and skipped so the rest of the catalog still
-    /// installs.
+    /// selected route, or the configured duplicate policy rejects any
+    /// component. Choose `Warn`, `Ignore`, or `Replace` explicitly when that
+    /// composition policy is intended; `Error` rejects the whole operation.
     #[cfg(feature = "proxy")]
     pub fn as_proxy_typed(
         self,
@@ -1999,27 +2002,27 @@ impl ServerBuilder {
                 for tool in tools {
                     if let Err(error) = self.router.add_legacy_tool_with_behavior(
                         ProxyToolHandler::with_prefix(tool, prefix, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     ) {
                         log::error!(
                             target: "fastmcp_rust::builder",
                             "Failed to register prefixed proxied tool; code={:?}",
                             error.code
                         );
-                        Self::absorb_prefixed_proxy_duplicate(error)?;
+                        return Err(error);
                     }
                 }
                 for resource in resources {
                     if let Err(error) = self.router.add_legacy_resource_with_behavior(
                         ProxyResourceHandler::with_prefix(resource, prefix, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     ) {
                         log::error!(
                             target: "fastmcp_rust::builder",
                             "Failed to register prefixed proxied resource; code={:?}",
                             error.code
                         );
-                        Self::absorb_prefixed_proxy_duplicate(error)?;
+                        return Err(error);
                     }
                 }
                 for template in resource_templates {
@@ -2033,7 +2036,7 @@ impl ServerBuilder {
                             prefix,
                             proxy_client.clone(),
                         ),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     ) {
                         Ok(()) if completion_target_admitted && completion_supported => {
                             self.router.add_legacy_resource_template_completion_handler(
@@ -2053,7 +2056,7 @@ impl ServerBuilder {
                                 "Failed to register prefixed proxied resource template; code={:?}",
                                 error.code
                             );
-                            Self::absorb_prefixed_proxy_duplicate(error)?;
+                            return Err(error);
                         }
                     }
                 }
@@ -2064,7 +2067,7 @@ impl ServerBuilder {
                         self.proxy_prompt_wins_admission(&downstream_name);
                     match self.router.add_legacy_prompt_with_behavior(
                         ProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     ) {
                         Ok(()) if completion_target_admitted && completion_supported => {
                             self.router.add_legacy_prompt_completion_handler(
@@ -2084,7 +2087,7 @@ impl ServerBuilder {
                                 "Failed to register prefixed proxied prompt; code={:?}",
                                 error.code
                             );
-                            Self::absorb_prefixed_proxy_duplicate(error)?;
+                            return Err(error);
                         }
                     }
                 }
@@ -2123,27 +2126,27 @@ impl ServerBuilder {
                         ProxyToolHandler::with_prefix_final(tool, prefix, proxy_client.clone())?;
                     if let Err(error) = self
                         .router
-                        .add_final_tool_with_behavior(handler, self.on_duplicate)
+                        .add_final_tool_with_behavior(handler, self.proxy_on_duplicate)
                     {
                         log::error!(
                             target: "fastmcp_rust::builder",
                             "Failed to register prefixed exact-final proxied tool; code={:?}",
                             error.code
                         );
-                        Self::absorb_prefixed_proxy_duplicate(error)?;
+                        return Err(error);
                     }
                 }
                 for resource in resources.entries {
                     if let Err(error) = self.router.add_final_resource_with_behavior(
                         FinalProxyResourceHandler::new(resource, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     ) {
                         log::error!(
                             target: "fastmcp_rust::builder",
                             "Failed to register prefixed exact-final proxied resource; code={:?}",
                             error.code
                         );
-                        Self::absorb_prefixed_proxy_duplicate(error)?;
+                        return Err(error);
                     }
                 }
                 for template in resource_templates.entries {
@@ -2152,7 +2155,7 @@ impl ServerBuilder {
                         self.proxy_resource_template_wins_admission(&downstream_uri);
                     match self.router.add_final_resource_with_behavior(
                         FinalProxyResourceTemplateHandler::new(template, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     ) {
                         Ok(()) if completion_target_admitted && completion_supported => {
                             self.router.add_resource_template_completion_handler(
@@ -2172,7 +2175,7 @@ impl ServerBuilder {
                                 "Failed to register prefixed exact-final proxied resource template; code={:?}",
                                 error.code
                             );
-                            Self::absorb_prefixed_proxy_duplicate(error)?;
+                            return Err(error);
                         }
                     }
                 }
@@ -2183,7 +2186,7 @@ impl ServerBuilder {
                         self.proxy_prompt_wins_admission(&downstream_name);
                     match self.router.add_final_prompt_with_behavior(
                         FinalProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     ) {
                         Ok(()) if completion_target_admitted && completion_supported => {
                             self.router.add_prompt_completion_handler(
@@ -2203,7 +2206,7 @@ impl ServerBuilder {
                                 "Failed to register prefixed exact-final proxied prompt; code={:?}",
                                 error.code
                             );
-                            Self::absorb_prefixed_proxy_duplicate(error)?;
+                            return Err(error);
                         }
                     }
                 }
@@ -2370,13 +2373,13 @@ impl ServerBuilder {
                 for tool in tools {
                     self.router.add_legacy_tool_with_behavior(
                         ProxyToolHandler::new(tool, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     )?;
                 }
                 for resource in resources {
                     self.router.add_legacy_resource_with_behavior(
                         ProxyResourceHandler::new(resource, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     )?;
                 }
                 for template in resource_templates {
@@ -2385,7 +2388,7 @@ impl ServerBuilder {
                         self.proxy_resource_template_wins_admission(&downstream_uri);
                     self.router.add_legacy_resource_with_behavior(
                         ProxyResourceHandler::from_template(template, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     )?;
                     if completion_target_admitted && completion_supported {
                         self.router.add_legacy_resource_template_completion_handler(
@@ -2405,7 +2408,7 @@ impl ServerBuilder {
                         self.proxy_prompt_wins_admission(&downstream_name);
                     self.router.add_legacy_prompt_with_behavior(
                         ProxyPromptHandler::new(prompt, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     )?;
                     if completion_target_admitted && completion_supported {
                         self.router.add_legacy_prompt_completion_handler(
@@ -2445,12 +2448,12 @@ impl ServerBuilder {
                     // still installs `final_task_relay` for `tasks/*` controls.
                     let handler = ProxyToolHandler::from_final(tool, proxy_client.clone())?;
                     self.router
-                        .add_final_tool_with_behavior(handler, self.on_duplicate)?;
+                        .add_final_tool_with_behavior(handler, self.proxy_on_duplicate)?;
                 }
                 for resource in resources.entries {
                     self.router.add_final_resource_with_behavior(
                         FinalProxyResourceHandler::new(resource, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     )?;
                 }
                 for template in resource_templates.entries {
@@ -2459,7 +2462,7 @@ impl ServerBuilder {
                         self.proxy_resource_template_wins_admission(&downstream_uri);
                     self.router.add_final_resource_with_behavior(
                         FinalProxyResourceTemplateHandler::new(template, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     )?;
                     if completion_target_admitted && completion_supported {
                         self.router.add_resource_template_completion_handler(
@@ -2479,7 +2482,7 @@ impl ServerBuilder {
                         self.proxy_prompt_wins_admission(&downstream_name);
                     self.router.add_final_prompt_with_behavior(
                         FinalProxyPromptHandler::new(prompt, proxy_client.clone()),
-                        self.on_duplicate,
+                        self.proxy_on_duplicate,
                     )?;
                     if completion_target_admitted && completion_supported {
                         self.router.add_prompt_completion_handler(
@@ -9923,7 +9926,6 @@ mod tests {
             for behavior in [
                 DuplicateBehavior::Warn,
                 DuplicateBehavior::Ignore,
-                DuplicateBehavior::Error,
             ] {
                 let (client, catalog) = discovered_duplicate_policy_proxy();
                 let server = ServerBuilder::new("srv", "1.0")
@@ -9964,6 +9966,113 @@ mod tests {
                 replaced.prompts()[0].description.as_deref(),
                 Some("proxied prompt")
             );
+        }
+
+        #[test]
+        fn proxy_union_rejects_each_collision_by_default_and_under_error_policy() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                for prefixed in [false, true] {
+                    for explicit in [false, true] {
+                        for family in 0..4 {
+                            let full = match era {
+                                ProtocolEra::Legacy2024 => {
+                                    let catalog = duplicate_policy_proxy_catalog();
+                                    ProxyTypedCatalog {
+                                        tools: ProxyToolCatalog::Legacy(catalog.tools),
+                                        resources: ProxyResourceCatalog::Legacy(catalog.resources),
+                                        resource_templates: ProxyResourceTemplateCatalog::Legacy(
+                                            vec![marked_resource_template("upstream")],
+                                        ),
+                                        prompts: ProxyPromptCatalog::Legacy(catalog.prompts),
+                                    }
+                                }
+                                ProtocolEra::Modern2026 => {
+                                    cache_policy_proxy_catalog(std::array::from_fn(|_| Vec::new()))
+                                }
+                            };
+                            let mut first = full.clone();
+                            if family != 0 {
+                                match &mut first.tools {
+                                    ProxyToolCatalog::Legacy(entries) => entries.clear(),
+                                    ProxyToolCatalog::Final(catalog) => catalog.entries.clear(),
+                                }
+                            }
+                            if family != 1 {
+                                match &mut first.resources {
+                                    ProxyResourceCatalog::Legacy(entries) => entries.clear(),
+                                    ProxyResourceCatalog::Final(catalog) => catalog.entries.clear(),
+                                }
+                            }
+                            if family != 2 {
+                                match &mut first.resource_templates {
+                                    ProxyResourceTemplateCatalog::Legacy(entries) => {
+                                        entries.clear()
+                                    }
+                                    ProxyResourceTemplateCatalog::Final(catalog) => {
+                                        catalog.entries.clear();
+                                    }
+                                }
+                            }
+                            if family != 3 {
+                                match &mut first.prompts {
+                                    ProxyPromptCatalog::Legacy(entries) => entries.clear(),
+                                    ProxyPromptCatalog::Final(catalog) => catalog.entries.clear(),
+                                }
+                            }
+                            let install = |builder: ServerBuilder, catalog: ProxyTypedCatalog| {
+                                let client = bound_proxy_client(DuplicatePolicyProxyBackend, era);
+                                if prefixed {
+                                    builder.as_proxy_typed("upstream", client, catalog)
+                                } else {
+                                    builder.proxy_typed(client, catalog)
+                                }
+                            };
+                            let mut builder = ServerBuilder::new("strict-union", "1.0");
+                            if explicit {
+                                builder = builder.on_duplicate(DuplicateBehavior::Error);
+                            }
+                            let builder = install(builder, first)
+                                .expect("one noncolliding upstream family is admitted");
+                            let error = match install(builder, full) {
+                                Ok(_) => panic!(
+                                    "{era:?}, prefixed={prefixed}, explicit={explicit}, family={family}: ambiguous union admitted"
+                                ),
+                                Err(error) => error,
+                            };
+                            assert!(crate::router::is_duplicate_registration_error(&error));
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn untyped_proxy_union_rejects_collisions_with_local_components() {
+            for explicit in [false, true] {
+                for family in 0..4 {
+                    let (client, mut catalog) = discovered_duplicate_policy_proxy();
+                    catalog.resource_templates = vec![marked_resource_template("upstream")];
+                    let builder = ServerBuilder::new("strict-local-union", "1.0");
+                    let builder = match family {
+                        0 => builder.tool(TestTool),
+                        1 => builder.resource(TestResource),
+                        2 => builder.resource_template(marked_resource_template("local")),
+                        _ => builder.prompt(TestPrompt),
+                    };
+                    let builder = if explicit {
+                        builder.on_duplicate(DuplicateBehavior::Error)
+                    } else {
+                        builder
+                    };
+                    let error = match builder.proxy(client, catalog) {
+                        Ok(_) => {
+                            panic!("an upstream collision with local family {family} was ignored")
+                        }
+                        Err(error) => error,
+                    };
+                    assert!(crate::router::is_duplicate_registration_error(&error));
+                }
+            }
         }
 
         #[cfg(feature = "tasks")]
@@ -10162,30 +10271,6 @@ mod tests {
         assert_eq!(
             (refused[0].kind, refused[0].name.as_str()),
             (RegistrationKind::Prompt, "dup")
-        );
-    }
-
-    #[cfg(feature = "proxy")]
-    #[test]
-    fn prefixed_as_proxy_skips_only_duplicate_registration_errors() {
-        let duplicate =
-            fastmcp_core::McpError::invalid_request("Tool already exists; component_key=tool_key");
-        assert!(
-            ServerBuilder::absorb_prefixed_proxy_duplicate(duplicate).is_ok(),
-            "a colliding catalog member may skip under DuplicateBehavior::Error"
-        );
-        let panicked =
-            fastmcp_core::McpError::internal_error("tool metadata hook panicked during admission");
-        assert!(
-            ServerBuilder::absorb_prefixed_proxy_duplicate(panicked).is_err(),
-            "a non-duplicate admission failure must fail the proxy / as_proxy_typed install"
-        );
-        let apps = fastmcp_core::McpError::invalid_request(
-            "MCP Apps tool metadata requires ServerBuilder::mcp_apps_tool",
-        );
-        assert!(
-            ServerBuilder::absorb_prefixed_proxy_duplicate(apps).is_err(),
-            "InvalidRequest that is not a duplicate must not be skipped"
         );
     }
 
