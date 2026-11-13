@@ -532,6 +532,23 @@ async fn bounded<T>(
     .await?
 }
 
+// The native HTTP adapter returns an owned body. Transfer that allocation to
+// SecretString inside the request future, before a ready-response cancellation
+// check can discard it. Invalid UTF-8 is erased through the same allocation.
+fn protect_response_body(bytes: Vec<u8>) -> Result<SecretString, DpopAuthorizationError> {
+    match String::from_utf8(bytes) {
+        Ok(body) => Ok(SecretString::from_string(body)),
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.fill(0);
+            if let Ok(cleared) = String::from_utf8(bytes) {
+                drop(SecretString::from_string(cleared));
+            }
+            Err(OAuthError::InvalidTokenResponse.into())
+        }
+    }
+}
+
 struct CodeExchange {
     bounds: FlowBounds,
     configuration: OAuthClientConfiguration,
@@ -594,8 +611,8 @@ impl CodeExchange {
             }
             let client = builder.build();
             let started = Instant::now();
-            let response = bounded(&self.bounds, async {
-                client
+            let (status, headers, body) = bounded(&self.bounds, async {
+                let response = client
                     .request(
                         &self.bounds.caller,
                         Method::Post,
@@ -604,13 +621,20 @@ impl CodeExchange {
                         self.form.as_str().as_bytes().to_vec(),
                     )
                     .await
-                    .map_err(|_| OAuthError::TransportFailed.into())
+                    .map_err(|_| OAuthError::TransportFailed)?;
+                // Protect the owned allocation before the outer wait can
+                // discard a completed response on its post-poll checkpoint.
+                let body = protect_response_body(response.body)?;
+                if !response.trailers.is_empty() {
+                    return Err(OAuthError::InvalidTokenResponse.into());
+                }
+                Ok((response.status, response.headers, body))
             })
             .await?;
             self.admit_response(
-                response.status,
-                &response.headers,
-                &response.body,
+                status,
+                &headers,
+                body.as_bytes(),
                 started,
                 allow_nonce_retry,
             )
@@ -631,7 +655,7 @@ impl CodeExchange {
             return Err(OAuthError::TokenEndpointRejected.into());
         }
         validate_token_headers(headers)?;
-        let object = admit_security_document_object(SecurityDocumentKind::TokenResponse, body)
+        let mut object = admit_security_document_object(SecurityDocumentKind::TokenResponse, body)
             .map_err(|_| OAuthError::InvalidTokenResponse)?;
         if status == 400 {
             // RFC 9449 section 8: token-endpoint nonce challenges use HTTP 400.
@@ -679,7 +703,7 @@ impl CodeExchange {
                 None
             }
             RefreshPolicy::RequireRotation => {
-                Some(refresh::admit_refresh_secret(object.get("refresh_token"))?)
+                Some(refresh::admit_refresh_secret(object.remove("refresh_token"))?)
             }
         };
         let scopes = match object.get("scope") {
@@ -696,10 +720,10 @@ impl CodeExchange {
             return Err(OAuthError::ScopeExpansion.into());
         }
         self.session.observe_token_nonce(&self.configuration.token_endpoint, headers)?;
-        let credential = self.session.admit_token_response(
+        let credential = self.session.admit_token_response_fields(
             &self.configuration.token_endpoint,
             status,
-            body,
+            &object,
             started,
             self.configuration.max_access_token_lifetime,
         )?;

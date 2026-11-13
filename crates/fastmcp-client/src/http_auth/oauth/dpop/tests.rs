@@ -1300,3 +1300,209 @@ fn native_renewal_cannot_promote_token_roots_or_reset_resource_timeouts() {
         });
     }
 }
+
+
+async fn respond_chunked_token<IO: AsyncWrite + Unpin>(
+    io: &mut IO,
+    status: u16,
+    body: &[u8],
+    trailer: bool,
+    nonce: Option<&str>,
+) {
+    let nonce = nonce.map_or_else(String::new, |value| format!("DPoP-Nonce: {value}\r\n"));
+    let declaration = if trailer { "Trailer: X-Token-Postlude\r\n" } else { "" };
+    io.write_all(format!(
+        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\n{declaration}{nonce}Connection: close\r\n\r\n",
+    ).as_bytes()).await.unwrap();
+    io.write_all(format!("{:x}\r\n", body.len()).as_bytes()).await.unwrap();
+    io.write_all(body).await.unwrap();
+    io.write_all(b"\r\n0\r\n").await.unwrap();
+    if trailer {
+        io.write_all(b"X-Token-Postlude: private-tail\r\n").await.unwrap();
+    }
+    io.write_all(b"\r\n").await.unwrap();
+    io.shutdown().await.unwrap();
+}
+
+#[test]
+fn dpop_code_response_rejects_trailers_before_token_or_nonce_admission() {
+    run(|cx| async move {
+        for renewable in [false, true] {
+            for mutation in ["clean", "trailer", "nonce-clean", "nonce-trailer", "invalid-utf8"] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let configuration = config(
+                    url(&format!("https://{}/token", listener.local_addr().unwrap())),
+                    url("https://mcp.example/mcp"),
+                );
+                let client = OAuthClient::new(configuration);
+                let acceptor = test_acceptor();
+                let posts = Cell::new(0);
+                let server = async {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = acceptor.accept(socket).await.unwrap();
+                    let (head, form) = read_token_request(&mut socket).await.unwrap();
+                    posts.set(posts.get() + 1);
+                    assert_eq!(form["grant_type"], "authorization_code");
+                    assert_eq!(proof(&head).1["htm"], "POST");
+                    let challenged = mutation.starts_with("nonce-");
+                    let mut body = if challenged {
+                        json!({"error": "use_dpop_nonce"})
+                    } else {
+                        json!({
+                            "access_token": "wire-access",
+                            "token_type": "DPoP",
+                            "expires_in": 60,
+                        })
+                    };
+                    if renewable && !challenged {
+                        body["refresh_token"] = json!("wire-refresh");
+                    }
+                    let mut body = serde_json::to_vec(&body).unwrap();
+                    if mutation == "invalid-utf8" {
+                        body.push(0xff);
+                    }
+                    respond_chunked_token(
+                        &mut socket,
+                        if challenged { 400 } else { 200 },
+                        &body,
+                        mutation.ends_with("trailer"),
+                        challenged.then_some("wire-challenge"),
+                    ).await;
+                };
+                let application = async {
+                    let key = DpopKey::generate().unwrap();
+                    let outcome = if renewable {
+                        client.authorize_renewable_dpop_with_redirect_driver(
+                            &cx, key, url(REDIRECT),
+                            |authorization| async move { Ok(callback(&authorization, ISSUER)) },
+                        ).await
+                    } else {
+                        client.authorize_dpop_with_redirect_driver(
+                            &cx, key, url(REDIRECT),
+                            |authorization| async move { Ok(callback(&authorization, ISSUER)) },
+                        ).await
+                    };
+                    match outcome {
+                        Ok(DpopAuthorizationOutcome::Authorized(grant)) => {
+                            assert_eq!(mutation, "clean");
+                            assert_eq!(grant.has_refresh_token(), renewable);
+                            assert!(!grant.credential().is_revoked());
+                        }
+                        Ok(DpopAuthorizationOutcome::NonceRequired(challenge)) => {
+                            assert_eq!(mutation, "nonce-clean");
+                            assert_eq!(posts.get(), 1, "nonce admission must return to the caller");
+                            drop(challenge);
+                        }
+                        Err(error) => {
+                            assert!(matches!(mutation, "trailer" | "nonce-trailer" | "invalid-utf8"));
+                            assert_eq!(
+                                error,
+                                DpopAuthorizationError::OAuth(OAuthError::InvalidTokenResponse),
+                            );
+                            let diagnostic = format!("{error:?} {error}");
+                            for secret in ["wire-access", "wire-refresh", "private-tail"] {
+                                assert!(!diagnostic.contains(secret));
+                            }
+                        }
+                    }
+                };
+                pair(server, application).await;
+                assert_eq!(posts.get(), 1);
+                assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            }
+        }
+    });
+}
+
+#[test]
+fn dpop_refresh_response_trailers_quarantine_the_session_without_replay() {
+    run(|cx| async move {
+        for mutation in ["clean", "trailer", "nonce-clean", "nonce-trailer", "invalid-utf8"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let configuration = config(
+                url(&format!("https://{}/token", listener.local_addr().unwrap())),
+                url("https://mcp.example/mcp"),
+            );
+            let (mut session, access, refresh) =
+                renewable_parts(&cx, &configuration, DpopKey::generate().unwrap());
+            let original_expiry = access.expires_at();
+            let acceptor = test_acceptor();
+            let posts = Cell::new(0);
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = acceptor.accept(socket).await.unwrap();
+                let (head, form) = read_token_request(&mut socket).await.unwrap();
+                posts.set(posts.get() + 1);
+                assert_eq!(form["grant_type"], "refresh_token");
+                assert_eq!(form["refresh_token"], "refresh-one");
+                assert_eq!(proof(&head).1["nonce"], "initial-as-nonce");
+                let challenged = mutation.starts_with("nonce-");
+                let body = if challenged {
+                    json!({"error": "use_dpop_nonce"})
+                } else {
+                    json!({
+                        "access_token": "wire-access",
+                        "token_type": "DPoP",
+                        "expires_in": 60,
+                        "refresh_token": "wire-refresh",
+                    })
+                };
+                let mut body = serde_json::to_vec(&body).unwrap();
+                if mutation == "invalid-utf8" {
+                    body.push(0xff);
+                }
+                respond_chunked_token(
+                    &mut socket,
+                    if challenged { 400 } else { 200 },
+                    &body,
+                    mutation.ends_with("trailer"),
+                    challenged.then_some("wire-challenge"),
+                ).await;
+            };
+            let application = async {
+                let renewed = match refresh.refresh(&cx, &mut session).await {
+                    Ok(DpopRefreshOutcome::Refreshed(grant)) => {
+                        assert_eq!(mutation, "clean");
+                        assert!(!grant.credential().is_revoked());
+                        assert_eq!(grant.scopes(), ["tools:read", "resources:read"]);
+                        true
+                    }
+                    Ok(DpopRefreshOutcome::NonceRequired(challenge)) => {
+                        assert_eq!(mutation, "nonce-clean");
+                        assert_eq!(posts.get(), 1);
+                        assert!(!access.is_revoked(), "an admitted continuation still owns the session");
+                        drop(challenge);
+                        false
+                    }
+                    Err(error) => {
+                        assert!(matches!(mutation, "trailer" | "nonce-trailer" | "invalid-utf8"));
+                        assert_eq!(
+                            error,
+                            DpopAuthorizationError::OAuth(OAuthError::InvalidTokenResponse),
+                        );
+                        let diagnostic = format!("{error:?} {error}");
+                        for secret in ["refresh-one", "wire-access", "wire-refresh", "private-tail"] {
+                            assert!(!diagnostic.contains(secret));
+                        }
+                        false
+                    }
+                };
+                assert_eq!(access.expires_at(), original_expiry);
+                assert_eq!(access.is_revoked(), !renewed);
+                if renewed {
+                    assert!(session.resource_request_headers(
+                        "POST", &configuration.resource, &access,
+                    ).is_ok(), "successful rotation must preserve the original access snapshot");
+                } else {
+                    assert_eq!(
+                        session.token_request_headers(&configuration.token_endpoint).unwrap_err(),
+                        DpopClientError::SessionRevoked,
+                    );
+                }
+            };
+            pair(server, application).await;
+            assert_eq!(posts.get(), 1);
+            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+        }
+    });
+}

@@ -19,7 +19,7 @@ use fastmcp_protocol::{SecurityDocumentKind, admit_security_document_object};
 
 use super::{
     DpopAuthorizationError, DpopClientError, DpopCredential, DpopSession, FlowBounds,
-    OAuthClientConfiguration, OAuthError, bounded,
+    OAuthClientConfiguration, OAuthError, bounded, protect_response_body,
 };
 use super::super::{
     MAX_TOKEN_RESPONSE_BYTES, TOKEN_TIMEOUT, encode_form, validate_scopes, validate_token_headers,
@@ -66,7 +66,8 @@ impl DpopRefreshToken {
 
     /// Consume this grant for one native HTTPS refresh attempt.
     ///
-    /// The exact original session must be recovered from its native client.
+    /// Supply the exact original session, or borrow it through
+    /// [`crate::http_auth::dpop::native::DpopHttpClient::refresh_authorization`].
     /// Access-token expiry permits renewal; local token or session revocation
     /// does not. A caller, runtime or session-binding preflight failure sends
     /// nothing and leaves the supplied session and existing access snapshots
@@ -249,8 +250,8 @@ impl<'session> RefreshExchange<'session> {
             let client = builder.build();
             self.check()?;
             let started = Instant::now();
-            let response = self.wait_for_response(async {
-                client
+            let (status, headers, body) = self.wait_for_response(async {
+                let response = client
                     .request(
                         &self.bounds.caller,
                         Method::Post,
@@ -259,13 +260,20 @@ impl<'session> RefreshExchange<'session> {
                         self.form.as_str().as_bytes().to_vec(),
                     )
                     .await
-                    .map_err(|_| OAuthError::TransportFailed.into())
+                    .map_err(|_| OAuthError::TransportFailed)?;
+                // The revocation and deadline waits can reject this ready
+                // response. They must drop zeroizing custody on that path too.
+                let body = protect_response_body(response.body)?;
+                if !response.trailers.is_empty() {
+                    return Err(OAuthError::InvalidTokenResponse.into());
+                }
+                Ok((response.status, response.headers, body))
             })
             .await?;
             self.admit_response(
-                response.status,
-                &response.headers,
-                &response.body,
+                status,
+                &headers,
+                body.as_bytes(),
                 started,
                 allow_nonce_retry,
             )
@@ -309,7 +317,7 @@ impl<'session> RefreshExchange<'session> {
             return Err(OAuthError::TokenEndpointRejected.into());
         }
         validate_token_headers(headers)?;
-        let object = admit_security_document_object(SecurityDocumentKind::TokenResponse, body)
+        let mut object = admit_security_document_object(SecurityDocumentKind::TokenResponse, body)
             .map_err(|_| OAuthError::InvalidTokenResponse)?;
         if status == 400 {
             if object.get("error").and_then(serde_json::Value::as_str) != Some("use_dpop_nonce") {
@@ -343,8 +351,8 @@ impl<'session> RefreshExchange<'session> {
         {
             return Err(OAuthError::InvalidTokenResponse.into());
         }
-        let token = admit_refresh_secret(object.get("refresh_token"))?;
-        if token.as_str() == self.previous.token.as_str() {
+        let token = admit_refresh_secret(object.remove("refresh_token"))?;
+        if token == self.previous.token {
             return Err(OAuthError::InvalidTokenResponse.into());
         }
         let scopes = match object.get("scope") {
@@ -360,10 +368,10 @@ impl<'session> RefreshExchange<'session> {
         if scopes.iter().any(|scope| !self.previous.scopes.contains(scope)) {
             return Err(OAuthError::ScopeExpansion.into());
         }
-        let credential = self.session.admit_token_response(
+        let credential = self.session.admit_token_response_fields(
             &self.previous.configuration.token_endpoint,
             status,
-            body,
+            &object,
             started,
             self.previous.configuration.max_access_token_lifetime,
         )?;
@@ -383,13 +391,18 @@ impl<'session> RefreshExchange<'session> {
 }
 
 pub(super) fn admit_refresh_secret(
-    value: Option<&serde_json::Value>,
+    value: Option<serde_json::Value>,
 ) -> Result<SecretString, OAuthError> {
-    let value = value
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| super::super::valid_opaque(value, 4096))
-        .ok_or(OAuthError::InvalidTokenResponse)?;
-    Ok(SecretString::from_string(value.to_owned()))
+    let Some(serde_json::Value::String(value)) = value else {
+        return Err(OAuthError::InvalidTokenResponse);
+    };
+    // Own the decoded allocation even when its syntax is rejected. A borrowed
+    // Value plus to_owned would leave a separate unprotected refresh string.
+    let token = SecretString::from_string(value);
+    if !super::super::valid_opaque(token.as_str(), 4096) {
+        return Err(OAuthError::InvalidTokenResponse);
+    }
+    Ok(token)
 }
 
 async fn while_credential_live<T>(

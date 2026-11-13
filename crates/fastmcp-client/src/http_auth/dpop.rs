@@ -343,6 +343,33 @@ impl DpopSession {
         }
         let response = admit_security_document_object(SecurityDocumentKind::TokenResponse, bytes)
             .map_err(|_| DpopClientError::InvalidTokenResponse)?;
+        self.admit_token_response_fields(
+            source,
+            status,
+            &response,
+            received_at,
+            maximum_lifetime,
+        )
+    }
+
+    // Native OAuth has already admitted raw duplicate/depth/number boundaries
+    // and moved its refresh secret into zeroizing custody. Borrow the remaining
+    // fields instead of decoding a second plaintext copy of that secret.
+    pub(crate) fn admit_token_response_fields(
+        &self,
+        source: &CanonicalHttpUrl,
+        status: u16,
+        response: &serde_json::Map<String, serde_json::Value>,
+        received_at: Instant,
+        maximum_lifetime: Duration,
+    ) -> Result<DpopCredential, DpopClientError> {
+        self.require_active()?;
+        if source.as_str() != self.token_endpoint.as_str() {
+            return Err(DpopClientError::EndpointMismatch);
+        }
+        if status != 200 {
+            return Err(DpopClientError::InvalidTokenResponse);
+        }
         if response.contains_key("error") {
             return Err(DpopClientError::InvalidTokenResponse);
         }
