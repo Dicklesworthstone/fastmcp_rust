@@ -826,6 +826,71 @@ pub enum ProxyFinalTaskListenerEvent {
 #[cfg(feature = "tasks")]
 const MAX_RELAYED_FINAL_TASKS: usize = 128;
 
+/// Retained and in-flight Task handle limits for one upstream proxy route.
+///
+/// Every issued handle, including aliases for the same upstream Task, consumes
+/// one route slot and one stable authenticated owner's slot. A pending
+/// creation consumes the same slots before the upstream tool is called.
+/// Every call that negotiates Tasks requires this reservation, even when its
+/// eventual result is immediate. A non-Task result or failed call releases the
+/// reservation; an admitted Task transfers it to its retained handle.
+/// Completed Tasks and expired snapshots awaiting authoritative recovery remain
+/// charged until their mapping is reclaimed. These limits do not alter Task
+/// lifetimes or grant permission to access another owner's Task.
+///
+/// The default preserves the route's 128-handle limit and permits one owner to
+/// use all 128 slots. Configure a smaller owner limit to reserve capacity for
+/// other callers. Both limits must be positive, and the owner limit cannot
+/// exceed the route limit or the implementation's 128-handle ceiling.
+#[cfg(feature = "tasks")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyTaskLimits {
+    maximum_tasks: usize,
+    maximum_tasks_per_owner: usize,
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyTaskLimits {
+    /// Admits the maximum number of route handles and handles per stable owner.
+    pub fn new(maximum_tasks: usize, maximum_tasks_per_owner: usize) -> McpResult<Self> {
+        if maximum_tasks == 0
+            || maximum_tasks > MAX_RELAYED_FINAL_TASKS
+            || maximum_tasks_per_owner == 0
+            || maximum_tasks_per_owner > maximum_tasks
+        {
+            return Err(McpError::invalid_params(
+                "Proxy Task limits require 1 <= owner capacity <= route capacity <= 128",
+            ));
+        }
+        Ok(Self {
+            maximum_tasks,
+            maximum_tasks_per_owner,
+        })
+    }
+
+    /// Maximum retained and pending handles across this route's owners.
+    #[must_use]
+    pub const fn maximum_tasks(self) -> usize {
+        self.maximum_tasks
+    }
+
+    /// Maximum retained and pending handles for one stable authenticated owner.
+    #[must_use]
+    pub const fn maximum_tasks_per_owner(self) -> usize {
+        self.maximum_tasks_per_owner
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl Default for ProxyTaskLimits {
+    fn default() -> Self {
+        Self {
+            maximum_tasks: MAX_RELAYED_FINAL_TASKS,
+            maximum_tasks_per_owner: MAX_RELAYED_FINAL_TASKS,
+        }
+    }
+}
+
 /// Bounded recovery for a finite Task whose last observed deadline has passed.
 /// This never extends the lifetime of a cached Task snapshot. An initially
 /// promised longer finite lifetime is preserved, but subsequent reads and
@@ -5168,7 +5233,10 @@ pub(crate) struct ProxyFinalTaskRelay {
 #[derive(Default)]
 struct ProxyFinalTaskRegistry {
     tasks: HashMap<FinalTaskId, ProxyRelayedFinalTask>,
-    pending_creations: HashSet<FinalTaskId>,
+    pending_creations: HashMap<FinalTaskId, fastmcp_core::Sha256Digest>,
+    limits: ProxyTaskLimits,
+    /// Every client clone and relay shares one immutable admitted policy.
+    limits_frozen: bool,
     /// Local observation order only; upstream wall-clock timestamps are not
     /// revisions and can repeat or move backwards.
     next_snapshot_revision: u64,
@@ -5183,6 +5251,8 @@ impl std::fmt::Debug for ProxyFinalTaskRegistry {
             .debug_struct("ProxyFinalTaskRegistry")
             .field("tasks", &self.tasks.len())
             .field("pending_creations", &self.pending_creations.len())
+            .field("limits", &self.limits)
+            .field("limits_frozen", &self.limits_frozen)
             .field("access_authorizers", &self.access_authorizers.len())
             .finish_non_exhaustive()
     }
@@ -5995,10 +6065,26 @@ impl ProxyFinalTaskRelay {
                 "Proxy Task creation requires a current original-operation access policy",
             ));
         }
+        registry.limits_frozen = true;
         Self::reclaim_expired_tasks(&mut registry, Instant::now());
-        if registry.tasks.len() + registry.pending_creations.len() >= MAX_RELAYED_FINAL_TASKS {
+        if registry.tasks.len() + registry.pending_creations.len() >= registry.limits.maximum_tasks {
             return Err(McpError::invalid_params(
                 "Proxy final Tasks registry capacity exhausted",
+            ));
+        }
+        let owner_tasks = registry
+            .tasks
+            .values()
+            .filter(|retained| retained.owner == owner)
+            .count();
+        let owner_pending = registry
+            .pending_creations
+            .values()
+            .filter(|pending_owner| **pending_owner == owner)
+            .count();
+        if owner_tasks + owner_pending >= registry.limits.maximum_tasks_per_owner {
+            return Err(McpError::invalid_params(
+                "Proxy final Tasks owner capacity exhausted",
             ));
         }
         let pending_slots = registry.pending_creations.len() + 1;
@@ -6020,8 +6106,9 @@ impl ProxyFinalTaskRelay {
             let handle = FinalTaskId::parse(encoded)
                 .map_err(|_| McpError::internal_error("Proxy final Task handle encoding failed"))?;
             if !registry.tasks.contains_key(&handle)
-                && registry.pending_creations.insert(handle.clone())
+                && !registry.pending_creations.contains_key(&handle)
             {
+                registry.pending_creations.insert(handle.clone(), owner);
                 return Ok(ProxyFinalTaskReservation {
                     relay: Arc::clone(self),
                     handle,
@@ -6074,13 +6161,19 @@ impl ProxyFinalTaskRelay {
             .tasks
             .lock()
             .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?;
-        if !registry.pending_creations.contains(&reservation.handle) {
+        if registry.pending_creations.get(&reservation.handle) != Some(&reservation.owner) {
             return Err(McpError::internal_error(
                 "Proxy final Task creation reservation was not retained",
             ));
         }
         if registry.tasks.contains_key(&reservation.handle)
-            || registry.tasks.len() >= MAX_RELAYED_FINAL_TASKS
+            || registry.tasks.len() >= registry.limits.maximum_tasks
+            || registry
+                .tasks
+                .values()
+                .filter(|retained| retained.owner == reservation.owner)
+                .count()
+                >= registry.limits.maximum_tasks_per_owner
         {
             return Err(McpError::internal_error(
                 "Proxy final Tasks registry exceeded its admitted capacity",
@@ -10564,6 +10657,40 @@ impl ProxyClient {
         }
     }
 
+    /// Configures Task handle admission for this upstream route and every clone.
+    ///
+    /// Call this before installing the client into a proxy server. Once a Tasks
+    /// relay is admitted or a creation is reserved, its limits are immutable,
+    /// even after every handle expires. Reconfiguring a clone cannot split the
+    /// shared route's accounting or evict previously admitted work.
+    #[cfg(feature = "tasks")]
+    pub fn with_task_limits(self, limits: ProxyTaskLimits) -> McpResult<Self> {
+        {
+            let mut registry = self.final_task_registry.lock().map_err(|_| {
+                McpError::internal_error("Proxy final Tasks registry lock poisoned")
+            })?;
+            if registry.limits_frozen
+                || !registry.tasks.is_empty()
+                || !registry.pending_creations.is_empty()
+            {
+                return Err(McpError::invalid_request(
+                    "Proxy Task limits are immutable after relay admission",
+                ));
+            }
+            registry.limits = limits;
+        }
+        Ok(self)
+    }
+
+    /// Returns this route's shared Task handle admission limits.
+    #[cfg(feature = "tasks")]
+    pub fn task_limits(&self) -> McpResult<ProxyTaskLimits> {
+        self.final_task_registry
+            .lock()
+            .map(|registry| registry.limits)
+            .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))
+    }
+
     #[cfg(test)]
     pub(crate) fn subscription_rewrites_for_test(&self) -> HashMap<String, String> {
         self.subscription_rewrites
@@ -10718,6 +10845,10 @@ impl ProxyClient {
         if !self.with_backend(|backend| backend.supports_final_tasks_relay())? {
             return Ok(None);
         }
+        self.final_task_registry
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?
+            .limits_frozen = true;
         Ok(Some(Arc::new(ProxyFinalTaskRelay::new(
             self.clone(),
             binding,
@@ -14045,6 +14176,8 @@ fn resource_from_template(template: &ResourceTemplate) -> Resource {
 mod tests {
     #[cfg(feature = "tasks")]
     mod task_authorization;
+    #[cfg(feature = "tasks")]
+    mod task_quota;
 
     use fastmcp_core::runtime::poll_on_cx;
     #[cfg(feature = "tasks")]

@@ -162,7 +162,7 @@ pub use proxy::{
 #[cfg(feature = "proxy")]
 use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyCatalogRelay};
 #[cfg(all(feature = "proxy", feature = "tasks"))]
-pub use proxy::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
+pub use proxy::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskLimits};
 pub use router::{
     InboundRequestContext, InboundRequestTransport, ModernConnection, MountResult,
     NotificationSender, Router, TagFilters,

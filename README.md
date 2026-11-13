@@ -397,6 +397,16 @@ scenarios, including every input-required one, so a measurement taken without
   events, including queued aliases. An unauthorized selection opens no upstream
   listener. These policies govern the current gateway process; they do not
   authorize an upstream worker's execution lifetime or provide restart recovery.
+- **Proxied Task capacity can be divided among callers.** Before installing a
+  `ProxyClient` in the gateway, call
+  `proxy.with_task_limits(ProxyTaskLimits::new(128, 8)?)?` to allow at most 128
+  handles on that upstream route and eight per stable authenticated owner.
+  Both limits include pending creation reservations, so a rejected call sends
+  no upstream `tools/call`. Client clones and rebuilt relays share the same
+  accounting and limits; configuration becomes immutable when a Tasks relay
+  is admitted. Completed handles, aliases, and expired snapshots retained for
+  authoritative recovery continue to consume capacity until their mappings
+  are reclaimed. The default remains 128 handles per route and per owner.
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
   remain available for development, but production security/profile
   conformance is unverified and no production-support claim is made for them.

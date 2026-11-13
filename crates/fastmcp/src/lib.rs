@@ -514,7 +514,7 @@ pub mod server {
         ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
-    pub use fastmcp_server::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
+    pub use fastmcp_server::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskLimits};
 }
 
 /// Serialization traits and derives for facade-only typed consumers.
@@ -1031,7 +1031,7 @@ pub use fastmcp_server::{
 
 /// Final Tasks proxy-listener APIs require both extensions.
 #[cfg(all(feature = "proxy", feature = "tasks"))]
-pub use fastmcp_server::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
+pub use fastmcp_server::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskLimits};
 
 /// Proxy-backend legacy progress callback.
 ///
@@ -3354,6 +3354,8 @@ pub mod modern {
         FinalProgressCallback, ProxyUpstreamAdapter, ProxyUpstreamBinding,
         ProxyUpstreamBindingRegistry,
     };
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    pub use fastmcp_server::ProxyTaskLimits;
 
     /// A non-resettable marker for the modern facade's sole protocol policy.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12436,7 +12438,7 @@ pub mod prelude {
         McpAppsViewLifecycle, project_final_core_tools_call_result,
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
-    pub use crate::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
+    pub use crate::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskLimits};
     pub use crate::{
         ResourceSubscriptionMatcher, ResourceSubscriptionRelations, SubscriptionListenRequest,
     };
@@ -15457,7 +15459,7 @@ mod tests {
     fn facade_reexports_final_proxy_listener_and_modern_progress_binding_surface() {
         use super::{
             FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyFinalTaskListener,
-            ProxyFinalTaskListenerEvent, ProxyUpstreamAdapter, ProxyUpstreamBinding,
+            ProxyFinalTaskListenerEvent, ProxyTaskLimits, ProxyUpstreamAdapter, ProxyUpstreamBinding,
             ProxyUpstreamBindingRegistry, modern, prelude,
         };
 
@@ -15466,6 +15468,12 @@ mod tests {
         let _: Option<Box<dyn ProxyBackend>> = None;
         let _: Option<Box<dyn ProxyFinalTaskListener>> = None;
         let _: Option<ProxyFinalTaskListenerEvent> = None;
+        let limits = ProxyTaskLimits::new(16, 4).unwrap();
+        let _: super::server::ProxyTaskLimits = limits;
+        let _: modern::ProxyTaskLimits = limits;
+        let _: prelude::ProxyTaskLimits = limits;
+        assert_eq!(limits.maximum_tasks(), 16);
+        assert_eq!(limits.maximum_tasks_per_owner(), 4);
         let _: Option<ProxyUpstreamAdapter> = None;
         let _: Option<ProxyUpstreamBinding> = None;
         let _: Option<ProxyUpstreamBindingRegistry> = None;
