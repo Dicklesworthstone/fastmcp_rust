@@ -541,7 +541,15 @@ async fn within<T>(
     bounds: WaitBounds,
     future: impl Future<Output = Result<T, DpopHttpError>>,
 ) -> Result<T, DpopHttpError> {
-    within_owner(cx, cancellation, &session.cancellation, credential, bounds, future).await
+    within_owner(
+        cx,
+        cancellation,
+        &session.cancellation,
+        credential,
+        bounds,
+        future,
+    )
+    .await
 }
 
 // Same cancellation domains, effect ceiling, timer and error ordering as

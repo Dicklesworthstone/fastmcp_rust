@@ -343,13 +343,7 @@ impl DpopSession {
         }
         let response = admit_security_document_object(SecurityDocumentKind::TokenResponse, bytes)
             .map_err(|_| DpopClientError::InvalidTokenResponse)?;
-        self.admit_token_response_fields(
-            source,
-            status,
-            &response,
-            received_at,
-            maximum_lifetime,
-        )
+        self.admit_token_response_fields(source, status, &response, received_at, maximum_lifetime)
     }
 
     // Native OAuth has already admitted raw duplicate/depth/number boundaries

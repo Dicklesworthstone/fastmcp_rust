@@ -143,13 +143,12 @@ impl DpopAuthorization {
     ///
     /// The renewable acquisition entry points always return `Some` here. Pass
     /// the session into the native DPoP client, use the access token for calls,
-    /// then recover that same session with `DpopHttpClient::into_session` when
-    /// explicitly renewing. The refresh owner cannot be used with a different
-    /// session, even if the proof key and endpoints are identical.
+    /// then renew in place with `DpopHttpClient::refresh_authorization`.
+    /// Low-level callers can recover the session with `DpopHttpClient::into_session`.
+    /// The refresh owner cannot be used with a different session, even if the
+    /// proof key and endpoints are identical.
     #[must_use]
-    pub fn into_renewable_parts(
-        self,
-    ) -> (DpopSession, DpopCredential, Option<DpopRefreshToken>) {
+    pub fn into_renewable_parts(self) -> (DpopSession, DpopCredential, Option<DpopRefreshToken>) {
         (self.session, self.credential, self.refresh)
     }
 }
@@ -195,7 +194,10 @@ impl DpopNonceChallenge {
             // a different clock nor another retry can renew the lifetime.
             let retry_bounds = FlowBounds::new(
                 cx,
-                self.exchange.bounds.expires_at.saturating_duration_since(Instant::now()),
+                self.exchange
+                    .bounds
+                    .expires_at
+                    .saturating_duration_since(Instant::now()),
             )?;
             // The supplied caller may carry a different, currently idle timer
             // driver. Enforce its shorter remainder on the original active
@@ -281,12 +283,8 @@ impl OAuthClient {
                 return Err(OAuthError::CallbackBindFailed.into());
             }
             let redirect_uri = format!("http://{address}{CALLBACK_PATH}");
-            let authorization_url = authorization_url(
-                &attempt,
-                &self.configuration,
-                &redirect_uri,
-                &session,
-            )?;
+            let authorization_url =
+                authorization_url(&attempt, &self.configuration, &redirect_uri, &session)?;
             bounded(&bounds, async {
                 launch_browser(authorization_url)
                     .await
@@ -456,9 +454,8 @@ impl FlowBounds {
         with_caller(cx, || {
             let caller = Cx::current().ok_or(OAuthError::RuntimeCapabilityUnavailable)?;
             let deadline = operation_deadline(&caller, timeout)?;
-            let remaining = Duration::from_nanos(
-                deadline.as_nanos().saturating_sub(caller.now().as_nanos()),
-            );
+            let remaining =
+                Duration::from_nanos(deadline.as_nanos().saturating_sub(caller.now().as_nanos()));
             let bounds = Self {
                 caller,
                 deadline,
@@ -473,7 +470,9 @@ impl FlowBounds {
 
     fn for_token_exchange(mut self) -> Result<Self, OAuthError> {
         self.check()?;
-        self.deadline = self.deadline.min(operation_deadline(&self.caller, TOKEN_TIMEOUT)?);
+        self.deadline = self
+            .deadline
+            .min(operation_deadline(&self.caller, TOKEN_TIMEOUT)?);
         self.expires_at = self.expires_at.min(
             Instant::now()
                 .checked_add(TOKEN_TIMEOUT)
@@ -485,7 +484,9 @@ impl FlowBounds {
     fn tighten(&mut self, other: &Self) -> Result<(), OAuthError> {
         self.expires_at = self.expires_at.min(other.expires_at);
         let remaining = self.expires_at.saturating_duration_since(Instant::now());
-        self.deadline = self.deadline.min(operation_deadline(&self.caller, remaining)?);
+        self.deadline = self
+            .deadline
+            .min(operation_deadline(&self.caller, remaining)?);
         self.check()
     }
 
@@ -519,16 +520,20 @@ async fn bounded<T>(
     future: impl Future<Output = Result<T, DpopAuthorizationError>>,
 ) -> Result<T, DpopAuthorizationError> {
     let mut future = std::pin::pin!(future);
-    within(&bounds.caller, bounds.deadline, poll_fn(|task| {
-        if let Err(error) = bounds.check() {
-            return Poll::Ready(Err(error));
-        }
-        let result = future.as_mut().poll(task);
-        if let Err(error) = bounds.check() {
-            return Poll::Ready(Err(error));
-        }
-        result.map(Ok)
-    }))
+    within(
+        &bounds.caller,
+        bounds.deadline,
+        poll_fn(|task| {
+            if let Err(error) = bounds.check() {
+                return Poll::Ready(Err(error));
+            }
+            let result = future.as_mut().poll(task);
+            if let Err(error) = bounds.check() {
+                return Poll::Ready(Err(error));
+            }
+            result.map(Ok)
+        }),
+    )
     .await?
 }
 
@@ -586,12 +591,18 @@ impl CodeExchange {
         })
     }
 
-    async fn send(self, allow_nonce_retry: bool) -> Result<DpopAuthorizationOutcome, DpopAuthorizationError> {
+    async fn send(
+        self,
+        allow_nonce_retry: bool,
+    ) -> Result<DpopAuthorizationOutcome, DpopAuthorizationError> {
         let caller = self.bounds.caller.clone();
         CallerContextFuture::new(&caller, async move {
             self.bounds.check()?;
             let mut headers = vec![
-                ("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
+                (
+                    "Content-Type".to_owned(),
+                    "application/x-www-form-urlencoded".to_owned(),
+                ),
                 ("Accept".to_owned(), "application/json".to_owned()),
                 ("Accept-Encoding".to_owned(), "identity".to_owned()),
                 ("Connection".to_owned(), "close".to_owned()),
@@ -607,7 +618,8 @@ impl CodeExchange {
                 .max_body_size(MAX_TOKEN_RESPONSE_BYTES)
                 .max_total_connections(1);
             for der in &self.configuration.extra_root_certificates {
-                builder = builder.add_root_certificate(asupersync::tls::Certificate::from_der(der.clone()));
+                builder = builder
+                    .add_root_certificate(asupersync::tls::Certificate::from_der(der.clone()));
             }
             let client = builder.build();
             let started = Instant::now();
@@ -663,35 +675,59 @@ impl CodeExchange {
             if object.get("error").and_then(serde_json::Value::as_str) != Some("use_dpop_nonce") {
                 return Err(OAuthError::TokenEndpointRejected.into());
             }
-            if ["access_token", "token_type", "expires_in", "scope", "resource", "refresh_token", "id_token", "issued_token_type", "cnf"]
-                .iter()
-                .any(|name| object.contains_key(*name))
+            if [
+                "access_token",
+                "token_type",
+                "expires_in",
+                "scope",
+                "resource",
+                "refresh_token",
+                "id_token",
+                "issued_token_type",
+                "cnf",
+            ]
+            .iter()
+            .any(|name| object.contains_key(*name))
                 || ["error_description", "error_uri"].iter().any(|name| {
                     object.get(*name).is_some_and(|value| {
-                        !value.as_str().is_some_and(|value| super::valid_opaque(value, 4096))
+                        !value
+                            .as_str()
+                            .is_some_and(|value| super::valid_opaque(value, 4096))
                     })
                 })
             {
                 return Err(OAuthError::InvalidTokenResponse.into());
             }
-            if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("DPoP-Nonce")) {
+            if !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("DPoP-Nonce"))
+            {
                 return Err(OAuthError::InvalidTokenResponse.into());
             }
             // Admission validates even an unchanged nonce. The observer's
             // boolean reports a change, not whether a valid field was present.
-            self.session.observe_token_nonce(&self.configuration.token_endpoint, headers)?;
+            self.session
+                .observe_token_nonce(&self.configuration.token_endpoint, headers)?;
             if !allow_nonce_retry {
                 return Err(DpopAuthorizationError::NonceRetryLimit);
             }
             self.bounds.check()?;
-            return Ok(DpopAuthorizationOutcome::NonceRequired(DpopNonceChallenge { exchange: self }));
+            return Ok(DpopAuthorizationOutcome::NonceRequired(
+                DpopNonceChallenge { exchange: self },
+            ));
         }
-        if ["id_token", "issued_token_type", "error", "error_description", "error_uri"]
-            .iter()
-            .any(|name| object.contains_key(*name))
-            || object.get("resource").is_some_and(|value| {
-                value.as_str() != Some(self.configuration.resource.as_str())
-            })
+        if [
+            "id_token",
+            "issued_token_type",
+            "error",
+            "error_description",
+            "error_uri",
+        ]
+        .iter()
+        .any(|name| object.contains_key(*name))
+            || object
+                .get("resource")
+                .is_some_and(|value| value.as_str() != Some(self.configuration.resource.as_str()))
         {
             return Err(OAuthError::InvalidTokenResponse.into());
         }
@@ -702,9 +738,9 @@ impl CodeExchange {
                 }
                 None
             }
-            RefreshPolicy::RequireRotation => {
-                Some(refresh::admit_refresh_secret(object.remove("refresh_token"))?)
-            }
+            RefreshPolicy::RequireRotation => Some(refresh::admit_refresh_secret(
+                object.remove("refresh_token"),
+            )?),
         };
         let scopes = match object.get("scope") {
             None => self.configuration.scopes.clone(),
@@ -716,10 +752,14 @@ impl CodeExchange {
                 .collect(),
         };
         validate_scopes(&scopes)?;
-        if scopes.iter().any(|scope| !self.configuration.scopes.contains(scope)) {
+        if scopes
+            .iter()
+            .any(|scope| !self.configuration.scopes.contains(scope))
+        {
             return Err(OAuthError::ScopeExpansion.into());
         }
-        self.session.observe_token_nonce(&self.configuration.token_endpoint, headers)?;
+        self.session
+            .observe_token_nonce(&self.configuration.token_endpoint, headers)?;
         let credential = self.session.admit_token_response_fields(
             &self.configuration.token_endpoint,
             status,
@@ -737,7 +777,10 @@ impl CodeExchange {
             )
         });
         self.bounds.check()?;
-        if credential.expires_at().is_none_or(|expiry| Instant::now() >= expiry) {
+        if credential
+            .expires_at()
+            .is_none_or(|expiry| Instant::now() >= expiry)
+        {
             return Err(DpopClientError::InvalidLifetime.into());
         }
         Ok(DpopAuthorizationOutcome::Authorized(DpopAuthorization {

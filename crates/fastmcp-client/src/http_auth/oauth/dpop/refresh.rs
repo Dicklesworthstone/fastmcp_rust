@@ -17,12 +17,12 @@ use asupersync::security::SecretString;
 use fastmcp_core::runtime::CallerContextFuture;
 use fastmcp_protocol::{SecurityDocumentKind, admit_security_document_object};
 
+use super::super::{
+    MAX_TOKEN_RESPONSE_BYTES, TOKEN_TIMEOUT, encode_form, validate_scopes, validate_token_headers,
+};
 use super::{
     DpopAuthorizationError, DpopClientError, DpopCredential, DpopSession, FlowBounds,
     OAuthClientConfiguration, OAuthError, bounded, protect_response_body,
-};
-use super::super::{
-    MAX_TOKEN_RESPONSE_BYTES, TOKEN_TIMEOUT, encode_form, validate_scopes, validate_token_headers,
 };
 
 /// Exclusive, zeroizing custody of one rotating DPoP refresh token.
@@ -51,7 +51,12 @@ impl DpopRefreshToken {
         scopes: Vec<String>,
         token: SecretString,
     ) -> Self {
-        Self { configuration, credential, scopes, token }
+        Self {
+            configuration,
+            credential,
+            scopes,
+            token,
+        }
     }
 
     /// The access snapshot issued alongside this refresh generation.
@@ -66,8 +71,8 @@ impl DpopRefreshToken {
 
     /// Consume this grant for one native HTTPS refresh attempt.
     ///
-    /// Supply the exact original session, or borrow it through
-    /// [`crate::http_auth::dpop::native::DpopHttpClient::refresh_authorization`].
+    /// Pass the exact original session, or renew through its native client's
+    /// `DpopHttpClient::refresh_authorization` method without recovering it.
     /// Access-token expiry permits renewal; local token or session revocation
     /// does not. A caller, runtime or session-binding preflight failure sends
     /// nothing and leaves the supplied session and existing access snapshots
@@ -183,7 +188,10 @@ impl DpopRefreshNonceChallenge<'_> {
             }
             let retry_bounds = FlowBounds::new(
                 cx,
-                self.exchange.bounds.expires_at.saturating_duration_since(Instant::now()),
+                self.exchange
+                    .bounds
+                    .expires_at
+                    .saturating_duration_since(Instant::now()),
             )?;
             self.exchange.bounds.tighten(&retry_bounds)?;
             // Retain both callers through raw I/O and final response admission.
@@ -229,7 +237,10 @@ impl<'session> RefreshExchange<'session> {
         Box::pin(CallerContextFuture::new(&caller, async move {
             self.check()?;
             let mut headers = vec![
-                ("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
+                (
+                    "Content-Type".to_owned(),
+                    "application/x-www-form-urlencoded".to_owned(),
+                ),
                 ("Accept".to_owned(), "application/json".to_owned()),
                 ("Accept-Encoding".to_owned(), "identity".to_owned()),
                 ("Connection".to_owned(), "close".to_owned()),
@@ -245,31 +256,33 @@ impl<'session> RefreshExchange<'session> {
                 .max_body_size(MAX_TOKEN_RESPONSE_BYTES)
                 .max_total_connections(1);
             for der in &self.previous.configuration.extra_root_certificates {
-                builder = builder.add_root_certificate(asupersync::tls::Certificate::from_der(der.clone()));
+                builder = builder
+                    .add_root_certificate(asupersync::tls::Certificate::from_der(der.clone()));
             }
             let client = builder.build();
             self.check()?;
             let started = Instant::now();
-            let (status, headers, body) = self.wait_for_response(async {
-                let response = client
-                    .request(
-                        &self.bounds.caller,
-                        Method::Post,
-                        self.previous.configuration.token_endpoint.as_str(),
-                        headers,
-                        self.form.as_str().as_bytes().to_vec(),
-                    )
-                    .await
-                    .map_err(|_| OAuthError::TransportFailed)?;
-                // The revocation and deadline waits can reject this ready
-                // response. They must drop zeroizing custody on that path too.
-                let body = protect_response_body(response.body)?;
-                if !response.trailers.is_empty() {
-                    return Err(OAuthError::InvalidTokenResponse.into());
-                }
-                Ok((response.status, response.headers, body))
-            })
-            .await?;
+            let (status, headers, body) = self
+                .wait_for_response(async {
+                    let response = client
+                        .request(
+                            &self.bounds.caller,
+                            Method::Post,
+                            self.previous.configuration.token_endpoint.as_str(),
+                            headers,
+                            self.form.as_str().as_bytes().to_vec(),
+                        )
+                        .await
+                        .map_err(|_| OAuthError::TransportFailed)?;
+                    // The revocation and deadline waits can reject this ready
+                    // response. They must drop zeroizing custody on that path too.
+                    let body = protect_response_body(response.body)?;
+                    if !response.trailers.is_empty() {
+                        return Err(OAuthError::InvalidTokenResponse.into());
+                    }
+                    Ok((response.status, response.headers, body))
+                })
+                .await?;
             self.admit_response(
                 status,
                 &headers,
@@ -300,7 +313,8 @@ impl<'session> RefreshExchange<'session> {
         if let Some(bounds) = &self.retry_bounds {
             bounds.check()?;
         }
-        self.session.validate_refresh_credential(&self.previous.credential)?;
+        self.session
+            .validate_refresh_credential(&self.previous.credential)?;
         Ok(())
     }
 
@@ -323,28 +337,51 @@ impl<'session> RefreshExchange<'session> {
             if object.get("error").and_then(serde_json::Value::as_str) != Some("use_dpop_nonce") {
                 return Err(OAuthError::TokenEndpointRejected.into());
             }
-            if ["access_token", "token_type", "expires_in", "scope", "resource", "refresh_token", "id_token", "issued_token_type", "cnf"]
-                .iter()
-                .any(|name| object.contains_key(*name))
+            if [
+                "access_token",
+                "token_type",
+                "expires_in",
+                "scope",
+                "resource",
+                "refresh_token",
+                "id_token",
+                "issued_token_type",
+                "cnf",
+            ]
+            .iter()
+            .any(|name| object.contains_key(*name))
                 || ["error_description", "error_uri"].iter().any(|name| {
                     object.get(*name).is_some_and(|value| {
-                        !value.as_str().is_some_and(|value| super::super::valid_opaque(value, 4096))
+                        !value
+                            .as_str()
+                            .is_some_and(|value| super::super::valid_opaque(value, 4096))
                     })
                 })
-                || !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("DPoP-Nonce"))
+                || !headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("DPoP-Nonce"))
             {
                 return Err(OAuthError::InvalidTokenResponse.into());
             }
-            self.session.observe_token_nonce(&self.previous.configuration.token_endpoint, headers)?;
+            self.session
+                .observe_token_nonce(&self.previous.configuration.token_endpoint, headers)?;
             if !allow_nonce_retry {
                 return Err(DpopAuthorizationError::NonceRetryLimit);
             }
             self.check()?;
-            return Ok(DpopRefreshOutcome::NonceRequired(DpopRefreshNonceChallenge { exchange: self }));
+            return Ok(DpopRefreshOutcome::NonceRequired(
+                DpopRefreshNonceChallenge { exchange: self },
+            ));
         }
-        if ["id_token", "issued_token_type", "error", "error_description", "error_uri"]
-            .iter()
-            .any(|name| object.contains_key(*name))
+        if [
+            "id_token",
+            "issued_token_type",
+            "error",
+            "error_description",
+            "error_uri",
+        ]
+        .iter()
+        .any(|name| object.contains_key(*name))
             || object.get("resource").is_some_and(|value| {
                 value.as_str() != Some(self.previous.configuration.resource.as_str())
             })
@@ -365,7 +402,10 @@ impl<'session> RefreshExchange<'session> {
                 .collect(),
         };
         validate_scopes(&scopes)?;
-        if scopes.iter().any(|scope| !self.previous.scopes.contains(scope)) {
+        if scopes
+            .iter()
+            .any(|scope| !self.previous.scopes.contains(scope))
+        {
             return Err(OAuthError::ScopeExpansion.into());
         }
         let credential = self.session.admit_token_response_fields(
@@ -375,18 +415,28 @@ impl<'session> RefreshExchange<'session> {
             started,
             self.previous.configuration.max_access_token_lifetime,
         )?;
-        self.session.observe_token_nonce(&self.previous.configuration.token_endpoint, headers)?;
+        self.session
+            .observe_token_nonce(&self.previous.configuration.token_endpoint, headers)?;
         let refresh = DpopRefreshToken::new(
-            self.previous.configuration.clone(), credential.clone(), scopes, token,
+            self.previous.configuration.clone(),
+            credential.clone(),
+            scopes,
+            token,
         );
         self.check()?;
-        if credential.expires_at().is_none_or(|expiry| Instant::now() >= expiry) {
+        if credential
+            .expires_at()
+            .is_none_or(|expiry| Instant::now() >= expiry)
+        {
             return Err(DpopClientError::InvalidLifetime.into());
         }
         // Commit the successor pair only after final caller/session admission.
         // Every earlier return leaves the Drop guard armed for all generations.
         self.armed = false;
-        Ok(DpopRefreshOutcome::Refreshed(DpopRefreshResult { credential, refresh }))
+        Ok(DpopRefreshOutcome::Refreshed(DpopRefreshResult {
+            credential,
+            refresh,
+        }))
     }
 }
 
