@@ -25,6 +25,7 @@ use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 
 use super::{DpopClientError, DpopCredential, DpopSession, require_credential};
 use crate::http_auth::caller::with_caller;
+use crate::http_auth::oauth::dpop::{DpopAuthorizationError, DpopRefreshOutcome, DpopRefreshToken};
 use crate::http_executor::ModernHttpRequest;
 
 /// Method-owned core MCP calls over the same bounded DPoP transport.
@@ -192,7 +193,8 @@ impl DpopHttpRevocation {
 }
 
 /// Explicit DPoP POST executor bound to one session and one resource-trust
-/// policy. Token issuance and refresh remain caller-owned through DpopSession.
+/// policy. Token acquisition and refresh are explicitly caller-controlled.
+/// [`Self::refresh_authorization`] renews in place with a one-use refresh token.
 /// Dropping this client revokes credentials admitted by its session.
 ///
 /// No response stream or unguarded HTTP client escapes. Cancellation, local
@@ -253,6 +255,29 @@ impl DpopHttpClient {
     /// intact. Rebuilding a client does not replay any prior resource request.
     pub fn into_session(self) -> DpopSession {
         self.session
+    }
+
+    /// Explicitly renew this client's authorization without replacing its resource
+    /// transport, TLS roots, timeout or body limit.
+    ///
+    /// The token retains the original OAuth registration and token-endpoint
+    /// trust; this client's resource policy remains independent. The session
+    /// keeps its proof key, separate token/resource nonces and existing
+    /// revocation handles. Renewal never replays a resource request.
+    ///
+    /// A nonce challenge retains this mutable client borrow until its one
+    /// explicit retry completes or the continuation is dropped. Successful
+    /// rotation returns a new credential and refresh token; previous access
+    /// snapshots retain their original expiry. Caller, runtime or session
+    /// preflight failures consume the refresh token without changing the client.
+    /// Once renewal is admitted, failure or abandonment revokes the entire
+    /// session, including earlier access generations.
+    pub async fn refresh_authorization<'client>(
+        &'client mut self,
+        cx: &Cx,
+        token: DpopRefreshToken,
+    ) -> Result<DpopRefreshOutcome<'client>, DpopAuthorizationError> {
+        token.refresh(cx, &mut self.session).await
     }
 
     /// Performs exactly one HTTPS POST with a fresh access-token-bound proof.

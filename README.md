@@ -1537,12 +1537,19 @@ initial response. The access-only entry points keep their existing response
 policy.
 
 `DpopAuthorization::into_renewable_parts` returns the session, access credential,
-and exclusive `DpopRefreshToken` custody. After resource calls, recover the
-original session with `DpopHttpClient::into_session` and consume the refresh
-owner with `refresh(cx, &mut session)`. The native HTTPS exchange uses the
-original issuer, client, token endpoint, resource, TLS trust and granted scope
-ceiling. It cannot transfer the refresh grant to another session, even one with
-the same proof key and endpoints.
+and exclusive `DpopRefreshToken` custody. An existing native resource client can
+renew in place with `DpopHttpClient::refresh_authorization(cx, refresh_token)`.
+It retains the same HTTP transport, resource TLS roots, body-size limit, request
+timeout, nonce state and existing revocation handles. The token endpoint still
+uses its separately admitted issuer TLS policy. The consuming nonce continuation
+keeps the client mutably borrowed until explicitly retried or dropped, so no
+resource request can race the pending renewal.
+
+For low-level session ownership, recover the original session with
+`DpopHttpClient::into_session` and call `refresh_token.refresh(cx, &mut session)`.
+Both paths use the original issuer, client, token endpoint, resource, TLS trust
+and granted scope ceiling. Renewal cannot transfer to another session, even one
+with the same proof key and endpoints.
 
 `DpopRefreshOutcome::Refreshed` contains a new access credential and a
 byte-distinct successor refresh token. A narrowed scope grant becomes the next
