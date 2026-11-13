@@ -265,16 +265,37 @@ impl<P: TaskResumeProtector + 'static> PersistedManagedTaskRestart<P> {
     }
 }
 
-struct RestartCommit<P> {
-    current: TaskResumeBinding,
-    storage: TaskResumePersistence<P>,
-    pending: Option<TaskResumeRestartItem>,
-    change: Option<TaskResumeChange>,
-    state: RestartCheckpointState,
+/// Internal transport-specific outcome admission into the shared local
+/// acknowledgement state machine. This never dispatches network work or grants
+/// mutation authority from saved controls; each item rechecks its current owner.
+pub(crate) trait RestartCheckpointItem {
+    fn storage_change(
+        &self,
+        cx: &Cx,
+        current: &TaskResumeBinding,
+    ) -> Result<TaskResumeChange, TaskResumeError>;
 }
 
-impl<P: TaskResumeProtector + 'static> RestartCommit<P> {
-    fn new(store: AsyncTaskResumeStore<P>, current: TaskResumeBinding) -> Self {
+impl RestartCheckpointItem for TaskResumeRestartItem {
+    fn storage_change(
+        &self,
+        cx: &Cx,
+        current: &TaskResumeBinding,
+    ) -> Result<TaskResumeChange, TaskResumeError> {
+        TaskResumeRestartItem::storage_change(self, cx, current)
+    }
+}
+
+pub(crate) struct RestartCommit<P, I = TaskResumeRestartItem> {
+    pub(crate) current: TaskResumeBinding,
+    pub(crate) storage: TaskResumePersistence<P>,
+    pub(crate) pending: Option<I>,
+    pub(crate) change: Option<TaskResumeChange>,
+    pub(crate) state: RestartCheckpointState,
+}
+
+impl<P: TaskResumeProtector + 'static, I: RestartCheckpointItem> RestartCommit<P, I> {
+    pub(crate) fn new(store: AsyncTaskResumeStore<P>, current: TaskResumeBinding) -> Self {
         Self {
             storage: TaskResumePersistence::new(store, current.clone()),
             current,
@@ -284,10 +305,10 @@ impl<P: TaskResumeProtector + 'static> RestartCommit<P> {
         }
     }
 
-    async fn acknowledge(
+    pub(crate) async fn acknowledge(
         &mut self,
         cx: &Cx,
-    ) -> Result<TaskResumeRestartItem, PersistedTaskRestartError> {
+    ) -> Result<I, PersistedTaskRestartError> {
         let pending = self.pending.as_ref().ok_or(PersistedTaskRestartError::NoPending)?;
         let outcome = match self.state {
             RestartCheckpointState::NotAttempted => {
@@ -322,7 +343,7 @@ impl<P: TaskResumeProtector + 'static> RestartCommit<P> {
         self.pending.take().ok_or(PersistedTaskRestartError::NoPending)
     }
 
-    fn take_without_persisting(&mut self) -> Result<TaskResumeRestartItem, PersistedTaskRestartError> {
+    pub(crate) fn take_without_persisting(&mut self) -> Result<I, PersistedTaskRestartError> {
         if self.state != RestartCheckpointState::NotAttempted {
             return Err(PersistedTaskRestartError::AcknowledgementRequired);
         }

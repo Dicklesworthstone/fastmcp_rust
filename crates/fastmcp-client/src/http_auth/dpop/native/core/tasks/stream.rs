@@ -263,14 +263,17 @@ impl DpopHttpClient {
         )).await?;
         check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
         let discovery_bytes = response.body().len();
+        if let Some(budget) = &budget {
+            // A protected restart may classify an unavailable response and
+            // continue to another Task. Received discovery bytes remain spent
+            // even when this response does not admit a Task operation.
+            budget.charge((discovery_bytes, 0))?;
+        }
         let admitted = prepared.admit(response);
         check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
         let (wire, decoder) = TaskStreamDecoder::from_admitted(
             admitted?, limits.core, discovery_bytes, progress,
         )?;
-        if let Some(budget) = &budget {
-            budget.charge((discovery_bytes, 0))?;
-        }
         let decoder = Budgeted::new(decoder, budget);
         Box::pin(self.execute_prepared_core_stream(
             cx, cancellation, credential,

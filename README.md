@@ -1571,6 +1571,29 @@ Dropping unused refresh custody also erases only that secret. This API provides
 in-memory rotating custody; it does not provide persistent refresh storage,
 automatic login, nonrotating refresh, or automatic resource-call retries.
 
+#### Protected DPoP Task restart
+
+With the `tasks` feature, `DpopHttpClient::prepare_task_restart` consumes a
+complete `TaskResumeRestartPlan` of protected, owner-bound Task controls. The
+host supplies its current verified owner/profile binding and explicitly selects
+the DPoP client and credential. Saved records cannot select a login, endpoint,
+proof key, or TLS trust policy.
+
+The returned `DpopTaskRestart` reconciles records sequentially through fresh
+authenticated discovery and `tasks/get`. The batch retains one deadline and one
+response-byte budget across records. Local expiry and remote unavailable results
+are explicit outcomes; operational errors and an abandoned read close that
+restart owner while retaining the pending record, any completed response, and
+unvisited records for inspection. The workflow does not replay Task creation,
+submit inputs, cancel remote work, or automatically open watches.
+
+Handle a terminal application result before applying the item's conditional
+`storage_change`. An active replacement preserves the original local retention
+window, and writes compare the exact staged version. A changed checkpoint must
+be reconciled explicitly. Loading a plan stages the complete bounded selection
+before network work, so later checkpoint writes cannot invalidate an enumeration
+cursor halfway through recovery.
+
 ---
 
 ## Quick Start

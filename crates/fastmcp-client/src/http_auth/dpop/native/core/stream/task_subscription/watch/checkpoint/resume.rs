@@ -6,6 +6,9 @@
 //! record cannot select a login, transport root, endpoint or DPoP signing key.
 //! Neither the stored status nor a Task ID is proof of remote authorization.
 
+/// Staged protected-record restart with retained per-record disposition.
+pub mod restart;
+
 #[cfg(all(test, feature = "native-tls-roots"))]
 mod tls;
 
@@ -24,6 +27,7 @@ use crate::http_auth::dpop::native::{
 };
 use crate::http_auth::dpop::native::core::DpopCoreError;
 use crate::http_auth::dpop::native::core::stream::{DpopStreamError, DpopStreamLimits};
+use crate::http_auth::dpop::native::core::stream::budget::SharedStreamBudget;
 use crate::http_auth::dpop::native::core::tasks::ManagedTaskEvent;
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::client::resume_read_deadline;
 use crate::http_auth::rpc::ManagedCoreError;
@@ -181,23 +185,51 @@ impl DpopHttpClient {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(DpopHttpError::Cancelled.into());
         }
-        let retention = resume_read_deadline(cx, current, record, self.resource().as_str())?;
         let mut state = WatchState::new(id_prefix, DpopTaskWatchPolicy::new(1)?, limits)?;
-        let (operation, limits) = state.snapshot_request(record.task_id())?;
         let owner = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
+        self.reconcile_task_resume_with_state(
+            cx, cancellation, credential, metadata, current, record,
+            owner, &mut state, None, &mut notify,
+        ).await
+    }
+
+    // A staged restart supplies its original lifetime and aggregate ledger.
+    // Saved controls never select a new client or replenish a response budget.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_task_resume_with_state<N>(
+        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
+        credential: &DpopCredential, metadata: FinalRequestMeta,
+        current: &TaskResumeBinding, record: &TaskResumeRecord,
+        owner: WaitBounds, state: &mut WatchState,
+        budget: Option<SharedStreamBudget>, notify: &mut N,
+    ) -> Result<DpopTaskResumeSnapshot, DpopTaskResumeError>
+    where N: FnMut(&ServerNotification) -> bool,
+    {
+        let retention = resume_read_deadline(cx, current, record, self.resource().as_str())?;
+        if let Some(budget) = &budget {
+            state.usage = budget.usage().map_err(DpopTaskWatchError::from)?;
+        }
+        let (operation, limits) = state.snapshot_request(record.task_id())?;
         let bounds = retained_bounds(owner, retention);
         check_live(cx, cancellation, &self.session, credential, owner)?;
         if cx.now() >= retention { return Err(TaskResumeError::Unavailable.into()); }
         record.admit(cx, current)?;
-        let response = self.request_task_stream_with_bounds(
-            cx, cancellation, credential, metadata, operation, limits, bounds, &mut notify,
+        let response = self.request_task_stream_with_budget(
+            cx, cancellation, credential, metadata, operation, limits, bounds, notify,
+            budget.clone(),
         ).await;
         // Stop/revoke/owner timeout outranks unavailable and any peer error.
         // Checking ORIGINAL owner bounds lets retention expiry stay unavailable.
         check_live(cx, cancellation, &self.session, credential, owner)?;
         if cx.now() >= retention { return Err(TaskResumeError::Unavailable.into()); }
         record.admit(cx, current)?;
-        let ManagedTaskEvent::Snapshot(snapshot) = response.map_err(classify)?.result else {
+        let completed = response.map_err(classify)?;
+        if let Some(budget) = &budget {
+            state.usage = budget.usage().map_err(DpopTaskWatchError::from)?;
+        } else {
+            state.charge(completed.usage)?;
+        }
+        let ManagedTaskEvent::Snapshot(snapshot) = completed.result else {
             return Err(TaskResumeError::InvalidRecord.into());
         };
         let result = reconciled(cx, current, record, snapshot);

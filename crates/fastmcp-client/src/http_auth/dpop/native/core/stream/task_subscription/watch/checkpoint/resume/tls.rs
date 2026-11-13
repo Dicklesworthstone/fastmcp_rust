@@ -28,7 +28,7 @@ fn runtime() -> Runtime {
     RuntimeBuilder::current_thread().blocking_threads(0, 0)
         .with_reactor(create_reactor().unwrap()).build().unwrap()
 }
-fn run(future: impl Future<Output = ()>) {
+pub(super) fn run(future: impl Future<Output = ()>) {
     let rt = runtime();
     rt.block_on(async {
         let cx = Cx::current().unwrap();
@@ -37,7 +37,7 @@ fn run(future: impl Future<Output = ()>) {
     });
     assert!(rt.shutdown_timeout(Duration::from_secs(1)));
 }
-async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output) {
+pub(super) async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output) {
     let mut left = std::pin::pin!(left);
     let mut right = std::pin::pin!(right);
     let (mut a, mut b) = (None, None);
@@ -48,20 +48,23 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
         else { Poll::Pending }
     }).await
 }
-fn meta() -> FinalRequestMeta {
+pub(super) fn meta() -> FinalRequestMeta {
     let mut value = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
     value["progressToken"] = json!("work");
     serde_json::from_value(value).unwrap()
 }
-fn limits() -> DpopStreamLimits {
+pub(super) fn limits() -> DpopStreamLimits {
     DpopStreamLimits::new(
         crate::http_auth::rpc::ManagedCoreLimits::new(8192, 8192, 32768, 4, Duration::from_secs(30)).unwrap(),
         Duration::from_secs(30),
     ).unwrap()
 }
 fn envelope(prefix: &str, discovery: bool, result: Value) -> Vec<u8> {
+    turn_envelope(prefix, 0, discovery, result)
+}
+pub(super) fn turn_envelope(prefix: &str, turn: usize, discovery: bool, result: Value) -> Vec<u8> {
     let suffix = if discovery { "discover" } else { "get" };
-    serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":format!("{prefix}.0.{suffix}"), "result":result})).unwrap()
+    serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":format!("{prefix}.{turn}.{suffix}"), "result":result})).unwrap()
 }
 fn progress() -> Vec<u8> {
     serde_json::to_vec(&json!({"jsonrpc":"2.0", "method":"notifications/progress",
@@ -76,13 +79,13 @@ fn event(bytes: &[u8]) -> Vec<u8> {
     wire.extend_from_slice(b"\r\n");
     wire
 }
-async fn json_reply(socket: &mut TlsStream<TcpStream>, status: u16, bytes: &[u8]) {
+pub(super) async fn json_reply(socket: &mut TlsStream<TcpStream>, status: u16, bytes: &[u8]) {
     let mut wire = format!("HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nDPoP-Nonce: next\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
     wire.extend_from_slice(bytes);
     socket.write_all(&wire).await.unwrap();
     let _ = socket.shutdown().await;
 }
-async fn closed(socket: &mut TlsStream<TcpStream>) {
+pub(super) async fn closed(socket: &mut TlsStream<TcpStream>) {
     let cx = Cx::current().unwrap();
     let mut byte = [0];
     let result = asupersync::time::timeout_at(cx.now().saturating_add_nanos(8_000_000_000), socket.read(&mut byte))
@@ -90,13 +93,13 @@ async fn closed(socket: &mut TlsStream<TcpStream>) {
     assert!(matches!(result, Ok(0) | Err(_)));
 }
 
-struct Peer {
+pub(super) struct Peer {
     listener: TcpListener,
     acceptor: TlsAcceptor,
     proofs: BTreeSet<String>,
 }
 impl Peer {
-    async fn new() -> (Self, DpopHttpClient, DpopCredential) {
+    pub(super) async fn new() -> (Self, DpopHttpClient, DpopCredential) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = fastmcp_core::CanonicalHttpUrl::parse(&format!("https://{}/mcp?tenant=one", listener.local_addr().unwrap())).unwrap();
         let issuer = fastmcp_core::CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
@@ -112,6 +115,9 @@ impl Peer {
         (Self { listener, acceptor, proofs: BTreeSet::new() }, client, credential)
     }
     async fn request(&mut self, prefix: &str, discovery: bool) -> TlsStream<TcpStream> {
+        self.request_turn(prefix, 0, discovery, "task-secret").await
+    }
+    pub(super) async fn request_turn(&mut self, prefix: &str, turn: usize, discovery: bool, task_id: &str) -> TlsStream<TcpStream> {
         let (socket, _) = self.listener.accept().await.unwrap();
         let mut socket = self.acceptor.accept(socket).await.unwrap();
         let mut bytes = Vec::new();
@@ -144,24 +150,27 @@ impl Peer {
         assert_eq!(header("authorization"), "DPoP protected-test-token");
         assert_eq!(header("mcp-method"), method);
         assert_eq!(body["method"], method, "recovery must not create, update or cancel");
-        assert_eq!(body["id"], format!("{prefix}.0.{suffix}"));
+        assert_eq!(body["id"], format!("{prefix}.{turn}.{suffix}"));
         assert_eq!(header("accept"), if discovery { "application/json" } else { "application/json, text/event-stream" });
         assert!(!header("dpop").is_empty());
         assert!(self.proofs.insert(header("dpop")), "each request needs a fresh proof");
         if discovery { assert!(body["params"].get("taskId").is_none()); }
-        else { assert_eq!(body["params"]["taskId"], "task-secret"); }
+        else { assert_eq!(body["params"]["taskId"], task_id); }
         assert!(body["params"].get("inputResponses").is_none());
         socket
     }
     async fn get(&mut self, prefix: &str) -> TlsStream<TcpStream> {
-        let mut discovery = self.request(prefix, true).await;
+        self.get_turn(prefix, 0, "task-secret").await
+    }
+    pub(super) async fn get_turn(&mut self, prefix: &str, turn: usize, task_id: &str) -> TlsStream<TcpStream> {
+        let mut discovery = self.request_turn(prefix, turn, true, task_id).await;
         let offer = json!({"resultType":"complete", "supportedVersions":[FINAL_PROTOCOL_VERSION],
             "capabilities":{"tools":{},"extensions":{TASKS_EXTENSION:{}}}, "ttlMs":0,"cacheScope":"private",
             "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"protected-peer","version":"1"}}});
-        json_reply(&mut discovery, 200, &envelope(prefix, true, offer)).await;
-        self.request(prefix, false).await
+        json_reply(&mut discovery, 200, &turn_envelope(prefix, turn, true, offer)).await;
+        self.request_turn(prefix, turn, false, task_id).await
     }
-    fn no_extra(&self, expected: usize) {
+    pub(super) fn no_extra(&self, expected: usize) {
         assert_eq!(self.proofs.len(), expected);
         assert!(self.listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
     }

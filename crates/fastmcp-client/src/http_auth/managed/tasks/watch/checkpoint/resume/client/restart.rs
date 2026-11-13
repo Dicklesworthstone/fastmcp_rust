@@ -176,6 +176,18 @@ impl TaskResumeRestartPlan {
         self.records.values()
     }
 
+    // Both managed OAuth and DPoP restart consumers must retain the complete
+    // staged selection under the same independently supplied owner/resource.
+    // Saved controls cannot choose a transport, login or fresh timeout.
+    pub(crate) fn into_bound_parts(
+        self,
+        current: &TaskResumeBinding,
+        resource: &str,
+    ) -> Result<(VecDeque<TaskResumeRecord>, Duration), TaskResumeError> {
+        admit_client(self.binding, current, resource)?;
+        Ok((self.records.into_values().collect(), self.policy.timeout))
+    }
+
     fn empty(current: &TaskResumeBinding, policy: TaskResumeRestartPolicy) -> Self {
         Self {
             binding: *current.associated_data(),
@@ -395,14 +407,15 @@ impl ManagedTasksClient {
         id_prefix: String,
     ) -> Result<ManagedTaskRestart, TaskResumeRestartError> {
         self.session.check(cx, cancellation)?;
-        admit_client(plan.binding, &current, self.session.resource().as_str())?;
+        let (records, timeout) =
+            plan.into_bound_parts(&current, self.session.resource().as_str())?;
         let ids = WatchIds::new(id_prefix)?;
-        let deadline = deadline_after(cx, plan.policy.timeout)?;
-        let finished = plan.records.is_empty();
+        let deadline = deadline_after(cx, timeout)?;
+        let finished = records.is_empty();
         Ok(ManagedTaskRestart {
             client: self.clone(),
             current,
-            records: plan.records.into_values().collect(),
+            records,
             ids,
             cancellation: cancellation.clone(),
             deadline,
