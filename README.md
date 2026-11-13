@@ -417,10 +417,16 @@ scenarios, including every input-required one, so a measurement taken without
   `_meta.io.modelcontextprotocol/serverInfo` metadata and retains the open
   discovery capability shape (including `completions` and `extensions`)
   subject to output bounds and credential/control-text sanitization; a
-  selected legacy session renders only the exact legacy capability shape. A
+  selected legacy session renders only the exact legacy capability shape.
+  Modern `inspect --format json` uses `fastmcp.cli.inspect/v2` over both stdio
+  and HTTP, retaining catalog titles, icons, annotations, resource sizes,
+  prompt argument metadata, and `_meta` (including MCP Apps UI bindings),
+  together with rich discovery identity and open capability fields. Retained
+  fields preserve optional-field presence and numeric spellings within the
+  existing redaction and size limits; truncation and schema completeness are
+  reported explicitly. Exact legacy inspection keeps the v1 schema. A
   `--no-default-features` build supports `modern-only` only. This does not
-  qualify either protocol era as aggregate conformance or production
-  readiness.
+  qualify either protocol era as aggregate conformance or production readiness.
 - **Subprocess cleanup is explicit and platform-bounded:**
   `Client::close(&mut self)` returns cleanup failures. The opt-in owned-group mode used by
   `fastmcp test` is Unix-only and fails before spawn elsewhere. Its

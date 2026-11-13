@@ -4883,3 +4883,262 @@ mod plain_http {
         backend.kill_and_reap().expect("framework HTTP cleanup");
     }
 }
+
+/// A selected-era peer with fields that cannot survive the legacy display
+/// projection. Both transports exercise the shipped CLI with the same data.
+#[cfg(unix)]
+mod modern_inspect_catalogs {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::io::Write as _;
+
+    const SECRET: &str = "CATALOG_AUTOMATION_SECRET_CANARY";
+    const STDIO_PEER: &str = r#"
+while IFS= read -r request; do
+    case "$request" in
+        *'"id":'*)
+            request_id=${request##*'"id":'}
+            request_id=${request_id%\}}
+            case "$request_id" in '' | *[!0-9]*) continue ;; esac
+            ;;
+        *) continue ;;
+    esac
+    case "$request" in
+        *'"method":"server/discover"'*) result=$INSPECT_DISCOVERY ;;
+        *'"method":"tools/list"'*) result=$INSPECT_TOOLS ;;
+        *'"method":"resources/list"'*) result=$INSPECT_RESOURCES ;;
+        *'"method":"resources/templates/list"'*) result=$INSPECT_TEMPLATES ;;
+        *'"method":"prompts/list"'*) result=$INSPECT_PROMPTS ;;
+        *) exit 91 ;;
+    esac
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$request_id" "$result"
+done
+"#;
+
+    fn replies(secret: bool) -> BTreeMap<&'static str, Value> {
+        let note = if secret {
+            format!("token={SECRET}")
+        } else {
+            "public café".to_owned()
+        };
+        BTreeMap::from([
+            (
+                "server/discover",
+                json!({
+                    "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}, "resources": {}, "prompts": {},
+                        "com.example/catalog": {"label": "公開"}},
+                    "_meta": {"io.modelcontextprotocol/serverInfo": {
+                        "name": "catalog-peer", "version": "1", "title": "Serveur café",
+                        "description": "Discovery identity", "websiteUrl": "https://example.test/about",
+                        "icons": [{"src": "https://example.test/server.svg", "theme": "dark"}],
+                        "com.example/identity": {"region": "日本"},
+                    }},
+                    "ttlMs": 0, "cacheScope": "private",
+                }),
+            ),
+            (
+                "tools/list",
+                json!({
+                    "resultType": "complete", "ttlMs": 0, "cacheScope": "private",
+                    "tools": [{
+                        "name": "echo", "title": "Écho", "description": "Line\n\u{1b}[31m\u{202e}λ",
+                        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}},
+                        "outputSchema": {"type": "object"},
+                        "annotations": {"title": "Afficher", "readOnlyHint": true},
+                        "icons": [{"src": "https://example.test/light.svg", "sizes": [], "theme": "light",
+                            "com.example/icon": {"value": "白"}},
+                            {"src": "https://example.test/dark.svg", "sizes": ["16x16", "32x32"], "theme": "dark"}],
+                        "_meta": {"ui": {"resourceUri": "ui://catalog/panel", "visibility": ["model", "app"]},
+                            "com.example/note": note},
+                    }],
+                }),
+            ),
+            (
+                "resources/list",
+                json!({
+                    "resultType": "complete", "ttlMs": 0, "cacheScope": "private",
+                    "resources": [{"uri": "ui://catalog/panel", "name": "panel", "title": "Panneau",
+                        "mimeType": "text/html", "size": 9007199254740993_u64, "icons": [],
+                        "annotations": {"audience": ["user"], "priority": 0.5,
+                            "lastModified": "2026-11-13", "com.example/hint": "retain"},
+                        "_meta": {"com.example/resource": {"label": "资源"}},
+                    }],
+                }),
+            ),
+            (
+                "resources/templates/list",
+                json!({
+                    "resultType": "complete", "ttlMs": 0, "cacheScope": "private",
+                    "resourceTemplates": [{"uriTemplate": "custom://catalog/{name}", "name": "files",
+                        "title": "Fichiers", "icons": [], "annotations": {"audience": []},
+                        "_meta": {"com.example/template": true},
+                    }],
+                }),
+            ),
+            (
+                "prompts/list",
+                json!({
+                    "resultType": "complete", "ttlMs": 0, "cacheScope": "private",
+                    "prompts": [{"name": "greeting", "title": "Salutation", "icons": [],
+                        "arguments": [{"name": "name", "title": "Prénom", "required": false}, {"name": "optional"}],
+                        "_meta": {"com.example/prompt": "bonjour"},
+                    }],
+                }),
+            ),
+        ])
+    }
+
+    fn stdio(replies: &BTreeMap<&str, Value>, format: &str) -> Output {
+        let mut command = Command::new(get_binary_path());
+        command.args([
+            "inspect",
+            "--protocol-policy",
+            "modern-only",
+            "--format",
+            format,
+            "/bin/sh",
+            "-c",
+            STDIO_PEER,
+        ]);
+        for (method, variable) in [
+            ("server/discover", "INSPECT_DISCOVERY"),
+            ("tools/list", "INSPECT_TOOLS"),
+            ("resources/list", "INSPECT_RESOURCES"),
+            ("resources/templates/list", "INSPECT_TEMPLATES"),
+            ("prompts/list", "INSPECT_PROMPTS"),
+        ] {
+            command.env(variable, serde_json::to_string(&replies[method]).unwrap());
+        }
+        run_with_deadline(command, Duration::from_secs(15)).expect("bounded inspect child")
+    }
+
+    fn http(replies: &BTreeMap<&str, Value>) -> Output {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        std::thread::scope(|scope| {
+            let peer = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                for expected in ["server/discover", "tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "missing {expected} request");
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("fixture accept failed: {error}"),
+                        }
+                    };
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0; 4096];
+                    let end = loop {
+                        let count = stream.read(&mut chunk).unwrap();
+                        assert!(count > 0 && bytes.len() + count <= 64 * 1024);
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                    assert!(headers.starts_with("POST /mcp HTTP/1.1\r\n"));
+                    let length = headers.lines().filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .unwrap().1.trim().parse::<usize>().unwrap();
+                    assert!(end + length <= 64 * 1024);
+                    while bytes.len() < end + length {
+                        let count = stream.read(&mut chunk).unwrap();
+                        assert!(count > 0 && bytes.len() + count <= 64 * 1024);
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    let request: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                    assert_eq!(request["method"], expected);
+                    let response = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": request["id"], "result": replies[expected]})).unwrap();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                    stream.write_all(&response).unwrap();
+                }
+                assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            });
+            let mut command = Command::new(get_binary_path());
+            command.args([
+                "inspect",
+                "--http-url",
+                &endpoint,
+                "--protocol-policy",
+                "modern-only",
+                "--format",
+                "json",
+            ]);
+            let output =
+                run_with_deadline(command, Duration::from_secs(15)).expect("bounded HTTP inspect");
+            peer.join().expect("five bounded selected-era requests");
+            output
+        })
+    }
+
+    fn assert_catalog(output: &Output, replies: &BTreeMap<&str, Value>, secret: bool) {
+        assert!(output.status.success(), "{}", stderr_str(output));
+        let mut report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "fastmcp.cli.inspect/v2");
+        assert_eq!(
+            report["protocol"],
+            json!({"policy": "modern-only", "version": "2026-07-28", "era": "modern-2026"})
+        );
+        assert_eq!(
+            report["server"],
+            replies["server/discover"]["_meta"]["io.modelcontextprotocol/serverInfo"]
+        );
+        assert_eq!(
+            report["capabilities"],
+            replies["server/discover"]["capabilities"]
+        );
+        assert_eq!(report["redacted"], secret);
+        assert_eq!(report["sanitized"], false);
+        assert_eq!(report["truncated"], false);
+        let tool = report["tools"][0].as_object_mut().unwrap();
+        assert_eq!(tool.remove("inputSchemaStatus").unwrap()["complete"], true);
+        assert_eq!(tool.remove("outputSchemaStatus").unwrap()["complete"], true);
+        for (field, method, member) in [
+            ("tools", "tools/list", "tools"),
+            ("resources", "resources/list", "resources"),
+            (
+                "resource_templates",
+                "resources/templates/list",
+                "resourceTemplates",
+            ),
+            ("prompts", "prompts/list", "prompts"),
+        ] {
+            let mut expected = replies[method][member].clone();
+            if secret && field == "tools" {
+                expected[0]["_meta"]["com.example/note"] = "token=<redacted>".into();
+            }
+            assert_eq!(report[field], expected, "complete selected-era {field}");
+        }
+        assert!(!stdout_str(output).contains(SECRET));
+        assert!(!stderr_str(output).contains(SECRET));
+    }
+
+    #[test]
+    fn cli_inspect_modern_stdio_preserves_full_catalog_metadata() {
+        for secret in [false, true] {
+            let replies = replies(secret);
+            assert_catalog(&stdio(&replies, "json"), &replies, secret);
+        }
+        let human = stdio(&replies(false), "text");
+        assert!(human.status.success(), "{}", stderr_str(&human));
+        assert!(!stdout_str(&human).contains('\u{1b}'));
+        assert!(!stdout_str(&human).contains('\u{202e}'));
+    }
+
+    #[test]
+    fn cli_inspect_modern_http_preserves_full_catalog_metadata() {
+        for secret in [false, true] {
+            let replies = replies(secret);
+            assert_catalog(&http(&replies), &replies, secret);
+        }
+    }
+}

@@ -371,6 +371,13 @@ impl<'de> Deserialize<'de> for ServerDiscoverCapabilities {
 }
 
 impl ServerDiscoverCapabilities {
+    /// Returns admitted capability members without reparsing open JSON values.
+    /// Reading a peer-defined member does not grant it protocol authority.
+    #[must_use]
+    pub fn entries(&self) -> &BTreeMap<String, Value> {
+        &self.members
+    }
+
     /// Derives discovery capabilities from installed behavior and extensions.
     pub fn from_registry(
         registry: &ServerBehaviorRegistry,

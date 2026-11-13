@@ -440,7 +440,7 @@ fn cli_core_01_b_positive() {
         report["protocol"],
         json!({"era": "modern-2026", "policy": "modern-only", "version": "2026-07-28"})
     );
-    assert_eq!(report["schema"], json!("fastmcp.cli.inspect/v1"));
+    assert_eq!(report["schema"], json!("fastmcp.cli.inspect/v2"));
     assert_eq!(
         report["server"]["name"],
         json!(format!(

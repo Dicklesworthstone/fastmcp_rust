@@ -7941,12 +7941,13 @@ async fn cmd_inspect(
     // open final model, so rendering it through the legacy capability struct
     // would silently discard advertised final members.
     let inspection = async {
-        let server_info = client.server_info().cloned();
+        let server_info =
+            InspectIdentity::from_discovery(client.server_info(), client.server_discovery());
         let capabilities = stdio_inspect_capabilities(&client)?;
 
         // Acquire one typed page per category. MCP's list requests have no item
         // limit, so the transport may still receive one bounded protocol message,
-        // but inspect projects and bounds that page locally and never follows a
+        // but inspect retains and bounds that page locally and never follows a
         // peer cursor into the client's larger auto-pagination budget.
         let mut acquisition_truncated = false;
         let tools = if capabilities.advertises("tools") {
@@ -7956,7 +7957,7 @@ async fn cmd_inspect(
             acquisition_truncated |= truncated;
             items
         } else {
-            Vec::new()
+            InspectTools::default()
         };
 
         let resources = if capabilities.advertises("resources") {
@@ -7966,7 +7967,7 @@ async fn cmd_inspect(
             acquisition_truncated |= truncated;
             items
         } else {
-            Vec::new()
+            InspectResources::default()
         };
 
         let resource_templates = if capabilities.advertises("resources") {
@@ -7976,7 +7977,7 @@ async fn cmd_inspect(
             acquisition_truncated |= truncated;
             items
         } else {
-            Vec::new()
+            InspectResourceTemplates::default()
         };
 
         let prompts = if capabilities.advertises("prompts") {
@@ -7986,7 +7987,7 @@ async fn cmd_inspect(
             acquisition_truncated |= truncated;
             items
         } else {
-            Vec::new()
+            InspectPrompts::default()
         };
 
         Ok((
@@ -8134,6 +8135,124 @@ enum InspectCapabilities {
     Final(serde_json::Map<String, serde_json::Value>),
 }
 
+/// Retain the selected era's catalog until the output mode is known. The
+/// terminal projection intentionally shows fewer fields; machine output must
+/// not pass through it and lose modern metadata, icons, or presence information.
+enum InspectCatalog<Legacy, Final> {
+    Legacy(Vec<Legacy>),
+    Final(Vec<Final>),
+}
+
+impl<Legacy, Final> Default for InspectCatalog<Legacy, Final> {
+    fn default() -> Self {
+        Self::Legacy(Vec::new())
+    }
+}
+
+impl<Legacy, Final> InspectCatalog<Legacy, Final> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Legacy(items) => items.len(),
+            Self::Final(items) => items.len(),
+        }
+    }
+
+    fn display_items(&self, project: fn(Final) -> Legacy) -> Vec<Legacy>
+    where
+        Legacy: Clone,
+        Final: Clone,
+    {
+        match self {
+            Self::Legacy(items) => items.clone(),
+            Self::Final(items) => items.iter().cloned().map(project).collect(),
+        }
+    }
+
+    fn json_values(
+        &self,
+        budget: &mut InspectJsonBudget,
+        legacy: fn(&Legacy, &mut InspectJsonBudget) -> serde_json::Value,
+        modern: fn(&Final, &mut InspectJsonBudget) -> McpResult<serde_json::Value>,
+    ) -> McpResult<Vec<serde_json::Value>> {
+        budget.mutation.truncated |= self.len() > CLI_OUTPUT_MAX_ITEMS;
+        match self {
+            Self::Legacy(items) => Ok(items
+                .iter()
+                .take(CLI_OUTPUT_MAX_ITEMS)
+                .map(|item| legacy(item, budget))
+                .collect()),
+            Self::Final(items) => items
+                .iter()
+                .take(CLI_OUTPUT_MAX_ITEMS)
+                .map(|item| modern(item, budget))
+                .collect(),
+        }
+    }
+}
+
+type InspectTools = InspectCatalog<fastmcp_protocol::Tool, fastmcp_protocol::FinalTool>;
+type InspectResources = InspectCatalog<fastmcp_protocol::Resource, fastmcp_protocol::FinalResource>;
+type InspectResourceTemplates =
+    InspectCatalog<fastmcp_protocol::ResourceTemplate, fastmcp_protocol::FinalResourceTemplate>;
+type InspectPrompts = InspectCatalog<fastmcp_protocol::Prompt, fastmcp_protocol::FinalPrompt>;
+
+enum InspectIdentity {
+    Legacy(fastmcp_protocol::ServerInfo),
+    Final(fastmcp_protocol::common_types::Implementation),
+}
+
+impl InspectIdentity {
+    fn from_discovery(
+        legacy: Option<&fastmcp_protocol::ServerInfo>,
+        discovery: Option<&fastmcp_protocol::ServerDiscoverResult>,
+    ) -> Option<Self> {
+        match discovery {
+            Some(discovery) => discovery
+                .implementation()
+                .cloned()
+                .map(Self::Final)
+                .or_else(|| discovery.server_info().cloned().map(Self::Legacy)),
+            None => legacy.cloned().map(Self::Legacy),
+        }
+    }
+
+    fn display_info(&self) -> fastmcp_protocol::ServerInfo {
+        match self {
+            Self::Legacy(info) => info.clone(),
+            Self::Final(info) => fastmcp_protocol::ServerInfo {
+                name: info.name.clone(),
+                version: info.version.clone(),
+            },
+        }
+    }
+
+    fn json_value(&self, budget: &mut InspectJsonBudget) -> McpResult<serde_json::Value> {
+        match self {
+            Self::Legacy(info) => Ok(serde_json::json!({
+                "name": bounded_json_string(&info.name, budget),
+                "version": bounded_json_string(&info.version, budget),
+            })),
+            Self::Final(info) => {
+                let mut fields = final_catalog_fields(
+                    &info.name,
+                    info.title.as_deref(),
+                    info.description.as_deref(),
+                    (!info.icons.is_empty()).then_some(info.icons.as_slice()),
+                    None,
+                );
+                fields.insert("version".to_owned(), info.version.clone().into());
+                insert_catalog_string(
+                    &mut fields,
+                    "websiteUrl",
+                    info.website_url.as_ref().map(|uri| uri.as_str()),
+                );
+                fields.extend(info.additional.clone());
+                Ok(bounded_inspect_json_value(&fields.into(), 0, budget))
+            }
+        }
+    }
+}
+
 impl InspectCapabilities {
     fn advertises(&self, member: &str) -> bool {
         match self {
@@ -8149,21 +8268,8 @@ impl InspectCapabilities {
         }
     }
 
-    fn final_from_discovery(
-        capabilities: &fastmcp_protocol::ServerDiscoverCapabilities,
-        source: &str,
-    ) -> McpResult<Self> {
-        let capabilities = serde_json::to_value(capabilities).map_err(|error| {
-            fastmcp_core::McpError::internal_error(format!(
-                "inspect could not serialize final {source} capabilities: {error}"
-            ))
-        })?;
-        let serde_json::Value::Object(capabilities) = capabilities else {
-            return Err(fastmcp_core::McpError::internal_error(format!(
-                "inspect received non-object final {source} capabilities"
-            )));
-        };
-        Ok(Self::Final(capabilities))
+    fn final_from_discovery(capabilities: &fastmcp_protocol::ServerDiscoverCapabilities) -> Self {
+        Self::Final(capabilities.entries().clone().into_iter().collect())
     }
 
     fn text_summary(&self) -> String {
@@ -8220,7 +8326,7 @@ fn stdio_inspect_capabilities(client: &Client) -> McpResult<InspectCapabilities>
                     "modern stdio inspect completed without a server/discover result",
                 )
             })?;
-            InspectCapabilities::final_from_discovery(discovery.capabilities(), "server/discover")
+            Ok(InspectCapabilities::final_from_discovery(discovery.capabilities()))
         }
         #[cfg(feature = "legacy-2024-11-05")]
         Some(ProtocolEra::Legacy2024) => Ok(InspectCapabilities::Legacy(
@@ -8317,7 +8423,8 @@ async fn cmd_inspect_http(
         )
     })?;
     let protocol_status = InspectProtocolStatus::new(protocol_policy, negotiated_version)?;
-    let server_info = client.server_info().cloned();
+    let server_info =
+        InspectIdentity::from_discovery(client.server_info(), client.server_discovery().as_ref());
     let capabilities = http_inspect_capabilities(&client)?;
     let (acquisition_truncated, tools, resources, resource_templates, prompts) =
         http_inspect_catalogs(cx, &mut client, &capabilities).await?;
@@ -8346,7 +8453,7 @@ fn http_inspect_capabilities(
                     "modern HTTP inspect completed without a server/discover result",
                 )
             })?;
-            InspectCapabilities::final_from_discovery(discovery.capabilities(), "server/discover")
+            Ok(InspectCapabilities::final_from_discovery(discovery.capabilities()))
         }
         #[cfg(feature = "legacy-2024-11-05")]
         ProtocolEra::Legacy2024 => client
@@ -8373,10 +8480,10 @@ async fn http_inspect_catalogs(
     capabilities: &InspectCapabilities,
 ) -> McpResult<(
     bool,
-    Vec<fastmcp_protocol::Tool>,
-    Vec<fastmcp_protocol::Resource>,
-    Vec<fastmcp_protocol::ResourceTemplate>,
-    Vec<fastmcp_protocol::Prompt>,
+    InspectTools,
+    InspectResources,
+    InspectResourceTemplates,
+    InspectPrompts,
 )> {
     let mut acquisition_truncated = false;
     let tools = if capabilities.advertises("tools") {
@@ -8385,7 +8492,7 @@ async fn http_inspect_catalogs(
         acquisition_truncated |= truncated;
         items
     } else {
-        Vec::new()
+        InspectTools::default()
     };
     let resources = if capabilities.advertises("resources") {
         let (items, truncated) = inspect_resources_result(
@@ -8394,7 +8501,7 @@ async fn http_inspect_catalogs(
         acquisition_truncated |= truncated;
         items
     } else {
-        Vec::new()
+        InspectResources::default()
     };
     let resource_templates = if capabilities.advertises("resources") {
         let (items, truncated) = inspect_resource_templates_result(
@@ -8403,7 +8510,7 @@ async fn http_inspect_catalogs(
         acquisition_truncated |= truncated;
         items
     } else {
-        Vec::new()
+        InspectResourceTemplates::default()
     };
     let prompts = if capabilities.advertises("prompts") {
         let (items, truncated) =
@@ -8411,7 +8518,7 @@ async fn http_inspect_catalogs(
         acquisition_truncated |= truncated;
         items
     } else {
-        Vec::new()
+        InspectPrompts::default()
     };
     Ok((
         acquisition_truncated,
@@ -8437,13 +8544,12 @@ async fn http_inspect_core_request(
         })
 }
 
-fn inspect_tools_result(
-    result: fastmcp_client::CoreResult,
-) -> McpResult<(Vec<fastmcp_protocol::Tool>, bool)> {
+fn inspect_tools_result(result: fastmcp_client::CoreResult) -> McpResult<(InspectTools, bool)> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::ToolsList(result)) => {
             bound_inspect_items(result.tools, result.next_cursor.is_some(), "tools/list")
+                .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated))
         }
         fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ToolsList {
             result,
@@ -8452,11 +8558,8 @@ fn inspect_tools_result(
             let fastmcp_protocol::FinalListToolsResult {
                 tools, next_cursor, ..
             } = result.payload;
-            bound_inspect_items(
-                tools.into_iter().map(inspect_tool_from_final).collect(),
-                next_cursor.is_some(),
-                "tools/list",
-            )
+            bound_inspect_items(tools, next_cursor.is_some(), "tools/list")
+                .map(|(items, truncated)| (InspectCatalog::Final(items), truncated))
         }
         _ => Err(unexpected_inspect_result("tools/list")),
     }
@@ -8464,7 +8567,7 @@ fn inspect_tools_result(
 
 fn inspect_resources_result(
     result: fastmcp_client::CoreResult,
-) -> McpResult<(Vec<fastmcp_protocol::Resource>, bool)> {
+) -> McpResult<(InspectResources, bool)> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::ResourcesList(
@@ -8473,7 +8576,8 @@ fn inspect_resources_result(
             result.resources,
             result.next_cursor.is_some(),
             "resources/list",
-        ),
+        )
+        .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated)),
         fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ResourcesList {
             result,
             ..
@@ -8483,14 +8587,8 @@ fn inspect_resources_result(
                 next_cursor,
                 ..
             } = result.payload;
-            bound_inspect_items(
-                resources
-                    .into_iter()
-                    .map(inspect_resource_from_final)
-                    .collect(),
-                next_cursor.is_some(),
-                "resources/list",
-            )
+            bound_inspect_items(resources, next_cursor.is_some(), "resources/list")
+                .map(|(items, truncated)| (InspectCatalog::Final(items), truncated))
         }
         _ => Err(unexpected_inspect_result("resources/list")),
     }
@@ -8498,7 +8596,7 @@ fn inspect_resources_result(
 
 fn inspect_resource_templates_result(
     result: fastmcp_client::CoreResult,
-) -> McpResult<(Vec<fastmcp_protocol::ResourceTemplate>, bool)> {
+) -> McpResult<(InspectResourceTemplates, bool)> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(
@@ -8507,7 +8605,8 @@ fn inspect_resource_templates_result(
             result.resource_templates,
             result.next_cursor.is_some(),
             "resources/templates/list",
-        ),
+        )
+        .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated)),
         fastmcp_client::CoreResult::Final(
             fastmcp_client::FinalCoreResult::ResourceTemplatesList { result, .. },
         ) => {
@@ -8517,26 +8616,23 @@ fn inspect_resource_templates_result(
                 ..
             } = result.payload;
             bound_inspect_items(
-                resource_templates
-                    .into_iter()
-                    .map(inspect_resource_template_from_final)
-                    .collect(),
+                resource_templates,
                 next_cursor.is_some(),
                 "resources/templates/list",
             )
+            .map(|(items, truncated)| (InspectCatalog::Final(items), truncated))
         }
         _ => Err(unexpected_inspect_result("resources/templates/list")),
     }
 }
 
-fn inspect_prompts_result(
-    result: fastmcp_client::CoreResult,
-) -> McpResult<(Vec<fastmcp_protocol::Prompt>, bool)> {
+fn inspect_prompts_result(result: fastmcp_client::CoreResult) -> McpResult<(InspectPrompts, bool)> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::PromptsList(
             result,
-        )) => bound_inspect_items(result.prompts, result.next_cursor.is_some(), "prompts/list"),
+        )) => bound_inspect_items(result.prompts, result.next_cursor.is_some(), "prompts/list")
+            .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated)),
         fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::PromptsList {
             result,
             ..
@@ -8546,11 +8642,8 @@ fn inspect_prompts_result(
                 next_cursor,
                 ..
             } = result.payload;
-            bound_inspect_items(
-                prompts.into_iter().map(inspect_prompt_from_final).collect(),
-                next_cursor.is_some(),
-                "prompts/list",
-            )
+            bound_inspect_items(prompts, next_cursor.is_some(), "prompts/list")
+                .map(|(items, truncated)| (InspectCatalog::Final(items), truncated))
         }
         _ => Err(unexpected_inspect_result("prompts/list")),
     }
@@ -8564,8 +8657,8 @@ fn unexpected_inspect_result(method: &str) -> fastmcp_core::McpError {
 
 /// Bounds one already-decoded, single peer page before it reaches an inspect
 /// renderer. The byte count is the exact compact JSON array spelling,
-/// including brackets and commas, so final-era projection cannot bypass the
-/// same output budget applied to legacy pages.
+/// including brackets and commas. Modern metadata is bounded before any
+/// terminal projection can discard it.
 fn bound_inspect_items<T: Serialize>(
     items: Vec<T>,
     peer_has_more: bool,
@@ -8683,12 +8776,12 @@ fn inspect_prompt_from_final(prompt: fastmcp_protocol::FinalPrompt) -> fastmcp_p
 
 #[allow(clippy::too_many_arguments)]
 fn write_inspect_report(
-    server_info: Option<&fastmcp_protocol::ServerInfo>,
+    server_info: Option<&InspectIdentity>,
     capabilities: &InspectCapabilities,
-    tools: &[fastmcp_protocol::Tool],
-    resources: &[fastmcp_protocol::Resource],
-    resource_templates: &[fastmcp_protocol::ResourceTemplate],
-    prompts: &[fastmcp_protocol::Prompt],
+    tools: &InspectTools,
+    resources: &InspectResources,
+    resource_templates: &InspectResourceTemplates,
+    prompts: &InspectPrompts,
     acquisition_truncated: bool,
     protocol_status: InspectProtocolStatus,
     format: InspectFormat,
@@ -8697,16 +8790,16 @@ fn write_inspect_report(
     // Format output
     let output_text = match format {
         InspectFormat::Text => format_inspect_text_for_capabilities_with_truncation(
-            server_info,
+            server_info.map(InspectIdentity::display_info).as_ref(),
             capabilities,
-            tools,
-            resources,
-            resource_templates,
-            prompts,
+            &tools.display_items(inspect_tool_from_final),
+            &resources.display_items(inspect_resource_from_final),
+            &resource_templates.display_items(inspect_resource_template_from_final),
+            &prompts.display_items(inspect_prompt_from_final),
             acquisition_truncated,
             protocol_status,
         ),
-        InspectFormat::Json => format_inspect_json_for_capabilities_with_truncation(
+        InspectFormat::Json => format_inspect_catalog_json(
             server_info,
             capabilities,
             tools,
@@ -9247,6 +9340,221 @@ fn bounded_prompt_value(
     serde_json::Value::Object(output)
 }
 
+fn insert_catalog_string(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value {
+        fields.insert(key.to_owned(), value.into());
+    }
+}
+
+/// Construct from the admitted leaves directly. `to_value` and `json!` on a
+/// whole typed catalog would reparse arbitrary-precision number tokens in
+/// schemas, metadata, and open icon/annotation members.
+fn final_catalog_fields(
+    name: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    icons: Option<&[fastmcp_protocol::common_types::RawIcon]>,
+    metadata: Option<&fastmcp_protocol::common_types::OpenMetadata>,
+) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::Value;
+
+    let mut fields = serde_json::Map::new();
+    fields.insert("name".to_owned(), name.into());
+    insert_catalog_string(&mut fields, "title", title);
+    insert_catalog_string(&mut fields, "description", description);
+    if let Some(icons) = icons {
+        fields.insert(
+            "icons".to_owned(),
+            Value::Array(
+                icons
+                    .iter()
+                    .map(|icon| {
+                        let mut fields: serde_json::Map<String, Value> =
+                            icon.additional.clone().into_iter().collect();
+                        fields.insert("src".to_owned(), icon.src.as_str().into());
+                        insert_catalog_string(&mut fields, "mimeType", icon.mime_type.as_deref());
+                        if let Some(sizes) = &icon.sizes {
+                            fields.insert(
+                                "sizes".to_owned(),
+                                Value::Array(sizes.iter().cloned().map(Value::String).collect()),
+                            );
+                        }
+                        if let Some(theme) = &icon.theme {
+                            fields.insert(
+                                "theme".to_owned(),
+                                match theme {
+                                    fastmcp_protocol::common_types::IconTheme::Light => {
+                                        "light".into()
+                                    }
+                                    fastmcp_protocol::common_types::IconTheme::Dark => {
+                                        "dark".into()
+                                    }
+                                },
+                            );
+                        }
+                        Value::Object(fields)
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(metadata) = metadata {
+        fields.insert(
+            "_meta".to_owned(),
+            Value::Object(metadata.entries().clone().into_iter().collect()),
+        );
+    }
+    fields
+}
+
+fn final_catalog_annotations(
+    annotations: &fastmcp_protocol::common_types::Annotations,
+) -> McpResult<serde_json::Value> {
+    use serde_json::Value;
+
+    let mut fields: serde_json::Map<String, Value> =
+        annotations.additional.clone().into_iter().collect();
+    if let Some(audience) = &annotations.audience {
+        fields.insert(
+            "audience".to_owned(),
+            Value::Array(
+                audience
+                    .iter()
+                    .map(|role| match role {
+                        fastmcp_protocol::common_types::AnnotationAudience::User => "user".into(),
+                        fastmcp_protocol::common_types::AnnotationAudience::Assistant => {
+                            "assistant".into()
+                        }
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(priority) = annotations.priority {
+        let number = serde_json::Number::from_f64(priority).ok_or_else(|| {
+            fastmcp_core::McpError::internal_error("could not encode catalog annotation priority")
+        })?;
+        fields.insert("priority".to_owned(), Value::Number(number));
+    }
+    insert_catalog_string(
+        &mut fields,
+        "lastModified",
+        annotations.last_modified.as_deref(),
+    );
+    Ok(fields.into())
+}
+
+fn bounded_final_tool_value(
+    tool: &fastmcp_protocol::FinalTool,
+    budget: &mut InspectJsonBudget,
+) -> McpResult<serde_json::Value> {
+    let mut fields = final_catalog_fields(
+        &tool.name,
+        tool.title.as_deref(),
+        tool.description.as_deref(),
+        tool.icons.as_deref(),
+        tool.meta.as_ref(),
+    );
+    if let Some(annotations) = &tool.annotations {
+        // This closed model contains only strings and booleans.
+        fields.insert(
+            "annotations".to_owned(),
+            serde_json::to_value(annotations).map_err(|_| {
+                fastmcp_core::McpError::internal_error("could not encode tool annotations")
+            })?,
+        );
+    }
+    let mut value = bounded_inspect_json_value(&fields.into(), 0, budget);
+    if let serde_json::Value::Object(fields) = &mut value {
+        insert_inspect_schema(fields, "inputSchema", &tool.input_schema, budget);
+        if let Some(schema) = &tool.output_schema {
+            insert_inspect_schema(fields, "outputSchema", schema, budget);
+        }
+    }
+    Ok(value)
+}
+
+fn bounded_final_resource_value(
+    resource: &fastmcp_protocol::FinalResource,
+    budget: &mut InspectJsonBudget,
+) -> McpResult<serde_json::Value> {
+    let mut fields = final_catalog_fields(
+        &resource.name,
+        resource.title.as_deref(),
+        resource.description.as_deref(),
+        resource.icons.as_deref(),
+        resource.meta.as_ref(),
+    );
+    fields.insert("uri".to_owned(), resource.uri.as_str().into());
+    insert_catalog_string(&mut fields, "mimeType", resource.mime_type.as_deref());
+    if let Some(size) = &resource.size {
+        fields.insert(
+            "size".to_owned(),
+            serde_json::Value::Number(size.to_number()),
+        );
+    }
+    if let Some(annotations) = &resource.annotations {
+        fields.insert(
+            "annotations".to_owned(),
+            final_catalog_annotations(annotations)?,
+        );
+    }
+    Ok(bounded_inspect_json_value(&fields.into(), 0, budget))
+}
+
+fn bounded_final_resource_template_value(
+    template: &fastmcp_protocol::FinalResourceTemplate,
+    budget: &mut InspectJsonBudget,
+) -> McpResult<serde_json::Value> {
+    let mut fields = final_catalog_fields(
+        &template.name,
+        template.title.as_deref(),
+        template.description.as_deref(),
+        template.icons.as_deref(),
+        template.meta.as_ref(),
+    );
+    fields.insert(
+        "uriTemplate".to_owned(),
+        template.uri_template.clone().into(),
+    );
+    insert_catalog_string(&mut fields, "mimeType", template.mime_type.as_deref());
+    if let Some(annotations) = &template.annotations {
+        fields.insert(
+            "annotations".to_owned(),
+            final_catalog_annotations(annotations)?,
+        );
+    }
+    Ok(bounded_inspect_json_value(&fields.into(), 0, budget))
+}
+
+fn bounded_final_prompt_value(
+    prompt: &fastmcp_protocol::FinalPrompt,
+    budget: &mut InspectJsonBudget,
+) -> McpResult<serde_json::Value> {
+    let mut fields = final_catalog_fields(
+        &prompt.name,
+        prompt.title.as_deref(),
+        prompt.description.as_deref(),
+        prompt.icons.as_deref(),
+        prompt.meta.as_ref(),
+    );
+    if let Some(arguments) = &prompt.arguments {
+        // Unlike the display projection, preserve absent/empty arguments and
+        // absent/false required flags, plus each argument's title.
+        fields.insert(
+            "arguments".to_owned(),
+            serde_json::to_value(arguments).map_err(|_| {
+                fastmcp_core::McpError::internal_error("could not encode prompt arguments")
+            })?,
+        );
+    }
+    Ok(bounded_inspect_json_value(&fields.into(), 0, budget))
+}
+
 #[cfg(test)]
 fn format_inspect_json(
     server_info: Option<&fastmcp_protocol::ServerInfo>,
@@ -9269,6 +9577,7 @@ fn format_inspect_json(
     )
 }
 
+#[cfg(test)]
 fn format_inspect_json_for_capabilities_with_truncation(
     server_info: Option<&fastmcp_protocol::ServerInfo>,
     capabilities: &InspectCapabilities,
@@ -9279,35 +9588,51 @@ fn format_inspect_json_for_capabilities_with_truncation(
     acquisition_truncated: bool,
     protocol_status: InspectProtocolStatus,
 ) -> McpResult<String> {
+    format_inspect_catalog_json(
+        server_info.cloned().map(InspectIdentity::Legacy).as_ref(),
+        capabilities,
+        &InspectCatalog::Legacy(tools.to_vec()),
+        &InspectCatalog::Legacy(resources.to_vec()),
+        &InspectCatalog::Legacy(resource_templates.to_vec()),
+        &InspectCatalog::Legacy(prompts.to_vec()),
+        acquisition_truncated,
+        protocol_status,
+    )
+}
+
+fn format_inspect_catalog_json(
+    server_info: Option<&InspectIdentity>,
+    capabilities: &InspectCapabilities,
+    tools: &InspectTools,
+    resources: &InspectResources,
+    resource_templates: &InspectResourceTemplates,
+    prompts: &InspectPrompts,
+    acquisition_truncated: bool,
+    protocol_status: InspectProtocolStatus,
+) -> McpResult<String> {
     let mut budget = InspectJsonBudget::default();
     // `null` when a modern peer advertised no identity, which the 2026-07-28
     // schema permits. Emitting an invented name would be worse than absent.
-    let server = server_info.map(|server_info| {
-        serde_json::json!({
-            "name": bounded_json_string(&server_info.name, &mut budget),
-            "version": bounded_json_string(&server_info.version, &mut budget),
-        })
-    });
-    let tool_values = tools
-        .iter()
-        .take(CLI_OUTPUT_MAX_ITEMS)
-        .map(|tool| bounded_tool_value(tool, &mut budget))
-        .collect::<Vec<_>>();
-    let resource_values = resources
-        .iter()
-        .take(CLI_OUTPUT_MAX_ITEMS)
-        .map(|resource| bounded_resource_value(resource, &mut budget))
-        .collect::<Vec<_>>();
-    let template_values = resource_templates
-        .iter()
-        .take(CLI_OUTPUT_MAX_ITEMS)
-        .map(|template| bounded_resource_template_value(template, &mut budget))
-        .collect::<Vec<_>>();
-    let prompt_values = prompts
-        .iter()
-        .take(CLI_OUTPUT_MAX_ITEMS)
-        .map(|prompt| bounded_prompt_value(prompt, &mut budget))
-        .collect::<Vec<_>>();
+    let server = server_info
+        .map(|info| info.json_value(&mut budget))
+        .transpose()?;
+    let tool_values =
+        tools.json_values(&mut budget, bounded_tool_value, bounded_final_tool_value)?;
+    let resource_values = resources.json_values(
+        &mut budget,
+        bounded_resource_value,
+        bounded_final_resource_value,
+    )?;
+    let template_values = resource_templates.json_values(
+        &mut budget,
+        bounded_resource_template_value,
+        bounded_final_resource_template_value,
+    )?;
+    let prompt_values = prompts.json_values(
+        &mut budget,
+        bounded_prompt_value,
+        bounded_final_prompt_value,
+    )?;
     let capability_value = capabilities.json_value(&mut budget);
     let truncated = acquisition_truncated
         || tools.len() > tool_values.len()
@@ -9316,23 +9641,44 @@ fn format_inspect_json_for_capabilities_with_truncation(
         || prompts.len() > prompt_values.len()
         || budget.mutation.truncated;
     budget.mutation.truncated = truncated;
-    let output = serde_json::json!({
-        "schema": "fastmcp.cli.inspect/v1",
-        "server": server,
-        "protocol": {
+    // Serialize the final document directly. `json!` would run the retained
+    // Value numbers through a second serializer and normalize their lexemes.
+    #[derive(Serialize)]
+    struct Document {
+        schema: &'static str,
+        server: Option<serde_json::Value>,
+        protocol: serde_json::Value,
+        capabilities: serde_json::Value,
+        tools: Vec<serde_json::Value>,
+        resources: Vec<serde_json::Value>,
+        resource_templates: Vec<serde_json::Value>,
+        prompts: Vec<serde_json::Value>,
+        redacted: bool,
+        sanitized: bool,
+        truncated: bool,
+    }
+    let output = Document {
+        // Modern v2 retains the final protocol models, including plural icons
+        // and metadata. The exact-2024 diagnostic shape remains v1.
+        schema: match protocol_status.version.as_str() {
+            "2026-07-28" => "fastmcp.cli.inspect/v2",
+            _ => "fastmcp.cli.inspect/v1",
+        },
+        server,
+        protocol: serde_json::json!({
             "policy": protocol_status.policy.server_launch_value(),
             "version": protocol_status.version.as_str(),
             "era": protocol_status.era_name(),
-        },
-        "capabilities": capability_value,
-        "tools": tool_values,
-        "resources": resource_values,
-        "resource_templates": template_values,
-        "prompts": prompt_values,
-        "redacted": budget.mutation.redacted,
-        "sanitized": budget.mutation.sanitized,
-        "truncated": budget.mutation.truncated,
-    });
+        }),
+        capabilities: capability_value,
+        tools: tool_values,
+        resources: resource_values,
+        resource_templates: template_values,
+        prompts: prompt_values,
+        redacted: budget.mutation.redacted,
+        sanitized: budget.mutation.sanitized,
+        truncated: budget.mutation.truncated,
+    };
 
     serialize_machine_json(&output, "inspect JSON")
 }
@@ -18479,6 +18825,347 @@ IFS= read -r end
             assert!(inspect_icon_from_final(Some(Vec::new())).is_none());
         }
 
+        fn modern_inspect_fixture() -> serde_json::Value {
+            serde_json::json!({
+                "server": {
+                    "name": "catalog-server", "version": "1", "title": "Serveur café",
+                    "description": "Unicode λ", "websiteUrl": "https://example.test/about",
+                    "icons": [{"src": "https://example.test/server.svg", "theme": "dark"}],
+                    "com.example/identity": {"region": "日本"},
+                },
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {},
+                    "com.example/future": {"label": "café"}},
+                "tools": [{
+                    "name": "echo", "title": "Écho", "description": "Line\n\u{202e}λ",
+                    "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+                    "outputSchema": {"type": "object"},
+                    "annotations": {"title": "Afficher", "readOnlyHint": true},
+                    "icons": [
+                        {"src": "https://example.test/light.svg", "sizes": [], "theme": "light",
+                            "com.example/icon": {"label": "白"}},
+                        {"src": "https://example.test/dark.svg", "sizes": ["16x16", "32x32"],
+                            "theme": "dark"},
+                    ],
+                    "_meta": {"ui": {"resourceUri": "ui://catalog/panel", "visibility": ["model", "app"]},
+                        "com.example/value": {"label": "é"}},
+                }],
+                "resources": [{
+                    "uri": "ui://catalog/panel", "name": "panel", "title": "Panneau",
+                    "size": 9007199254740993_u64, "mimeType": "text/html", "icons": [],
+                    "annotations": {"audience": ["user"], "priority": 0.5,
+                        "lastModified": "2026-11-13", "com.example/note": {"value": "公開"}},
+                    "_meta": {"com.example/resource": "ressource"},
+                }],
+                "resource_templates": [{
+                    "uriTemplate": "custom://catalog/{name}", "name": "files", "title": "Fichiers",
+                    "annotations": {"audience": [], "com.example/template": "名"},
+                    "_meta": {"com.example/template": {"enabled": true}},
+                }],
+                "prompts": [{
+                    "name": "greeting", "title": "Salutation", "icons": [],
+                    "arguments": [{"name": "name", "title": "Prénom", "required": false},
+                        {"name": "optional", "description": "préserver l’absence"}],
+                    "_meta": {"com.example/prompt": "bonjour"},
+                }],
+            })
+        }
+
+        fn render_modern_inspect_fixture(fixture: &serde_json::Value) -> String {
+            let server =
+                InspectIdentity::Final(serde_json::from_value(fixture["server"].clone()).unwrap());
+            let capabilities: fastmcp_protocol::ServerDiscoverCapabilities =
+                serde_json::from_value(fixture["capabilities"].clone()).unwrap();
+            format_inspect_catalog_json(
+                Some(&server),
+                &InspectCapabilities::final_from_discovery(&capabilities),
+                &InspectCatalog::Final(serde_json::from_value(fixture["tools"].clone()).unwrap()),
+                &InspectCatalog::Final(
+                    serde_json::from_value(fixture["resources"].clone()).unwrap(),
+                ),
+                &InspectCatalog::Final(
+                    serde_json::from_value(fixture["resource_templates"].clone()).unwrap(),
+                ),
+                &InspectCatalog::Final(serde_json::from_value(fixture["prompts"].clone()).unwrap()),
+                false,
+                make_test_protocol_status(),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn modern_inspect_preserves_all_catalog_fields_and_identity() {
+            let fixture = modern_inspect_fixture();
+            let output = render_modern_inspect_fixture(&fixture);
+            let mut value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["schema"], "fastmcp.cli.inspect/v2");
+            assert_eq!(value["protocol"]["version"], "2026-07-28");
+            assert_eq!(value["redacted"], false);
+            assert_eq!(value["sanitized"], false);
+            assert_eq!(value["truncated"], false);
+            let tool = value["tools"][0].as_object_mut().unwrap();
+            assert_eq!(tool.remove("inputSchemaStatus").unwrap()["complete"], true);
+            assert_eq!(tool.remove("outputSchemaStatus").unwrap()["complete"], true);
+            for field in [
+                "server",
+                "capabilities",
+                "tools",
+                "resources",
+                "resource_templates",
+                "prompts",
+            ] {
+                assert_eq!(value[field], fixture[field], "all retained {field} fields");
+            }
+            assert!(
+                !output.contains("\\xC3"),
+                "machine output must not use terminal byte escapes"
+            );
+        }
+
+        #[test]
+        fn modern_inspect_redacts_metadata_without_dropping_public_app_bindings() {
+            const SECRET: &str = "MODERN_INSPECT_CREDENTIAL_CANARY";
+            let mut fixture = modern_inspect_fixture();
+            fixture["tools"][0]["_meta"]["com.example/value"] =
+                serde_json::json!({"label": format!("token={SECRET}")});
+            let output = render_modern_inspect_fixture(&fixture);
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["redacted"], true);
+            assert_eq!(value["sanitized"], false);
+            assert_eq!(value["truncated"], false);
+            assert_eq!(
+                value["tools"][0]["_meta"]["com.example/value"]["label"],
+                "token=<redacted>"
+            );
+            assert_eq!(
+                value["tools"][0]["_meta"]["ui"],
+                fixture["tools"][0]["_meta"]["ui"]
+            );
+            assert_eq!(value["tools"][0]["inputSchemaStatus"]["complete"], true);
+            assert!(!output.contains(SECRET));
+        }
+
+        #[test]
+        fn modern_inspect_bounds_complete_fields_and_schemas_without_display_substitution() {
+            for extra_byte in [false, true] {
+                let mut fixture = modern_inspect_fixture();
+                let text = "é".repeat(JSON_PREVIEW_MAX_STRING_CHARS / 2)
+                    + if extra_byte { "x" } else { "" };
+                fixture["tools"][0]["inputSchema"]["properties"]["text"]["pattern"] =
+                    text.clone().into();
+                fixture["prompts"][0]["_meta"]["com.example/prompt"] = text.clone().into();
+                let output = render_modern_inspect_fixture(&fixture);
+                let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(value["truncated"], extra_byte);
+                assert_eq!(
+                    value["tools"][0]["inputSchemaStatus"]["complete"],
+                    !extra_byte
+                );
+                if extra_byte {
+                    assert!(value["tools"][0]["inputSchema"].is_null());
+                    assert!(value["prompts"][0]["_meta"]["com.example/prompt"].is_null());
+                    assert!(!output.contains(TERMINAL_TRUNCATED));
+                } else {
+                    assert_eq!(
+                        value["tools"][0]["inputSchema"],
+                        fixture["tools"][0]["inputSchema"]
+                    );
+                    assert_eq!(value["prompts"][0]["_meta"]["com.example/prompt"], text);
+                }
+            }
+        }
+
+        #[test]
+        fn modern_inspect_retains_number_lexemes_in_open_fields_and_resource_size() {
+            use fastmcp_protocol::common_types::{Implementation, JsonInteger, OpenMetadata};
+            use serde_json::{Number, Value};
+            use std::collections::BTreeMap;
+
+            let lexeme = || Value::Number(Number::from_string_unchecked("1e2".to_owned()));
+            let fixture = modern_inspect_fixture();
+            let mut tool: fastmcp_protocol::FinalTool =
+                serde_json::from_value(fixture["tools"][0].clone()).unwrap();
+            tool.input_schema["schemaLexeme"] = lexeme();
+            tool.meta = Some(
+                OpenMetadata::try_from_entries([("com.example/metaLexeme".to_owned(), lexeme())])
+                    .unwrap(),
+            );
+            tool.icons.as_mut().unwrap()[0]
+                .additional
+                .insert("iconLexeme".to_owned(), lexeme());
+            let mut resource: fastmcp_protocol::FinalResource =
+                serde_json::from_value(fixture["resources"][0].clone()).unwrap();
+            resource.size = Some("1e2".parse::<JsonInteger>().unwrap());
+            resource
+                .annotations
+                .as_mut()
+                .unwrap()
+                .additional
+                .insert("annotationLexeme".to_owned(), lexeme());
+            let mut identity: Implementation =
+                serde_json::from_value(fixture["server"].clone()).unwrap();
+            identity
+                .additional
+                .insert("identityLexeme".to_owned(), lexeme());
+            let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+                &fastmcp_protocol::ServerBehaviorRegistry::default(),
+                BTreeMap::from([(
+                    "com.example/catalog".to_owned(),
+                    Value::Object(
+                        [("capabilityLexeme".to_owned(), lexeme())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                )]),
+            )
+            .unwrap();
+            let output = format_inspect_catalog_json(
+                Some(&InspectIdentity::Final(identity)),
+                &InspectCapabilities::final_from_discovery(&capabilities),
+                &InspectCatalog::Final(vec![tool]),
+                &InspectCatalog::Final(vec![resource]),
+                &InspectResourceTemplates::default(),
+                &InspectPrompts::default(),
+                false,
+                make_test_protocol_status(),
+            )
+            .unwrap();
+            for key in [
+                "schemaLexeme",
+                "com.example/metaLexeme",
+                "iconLexeme",
+                "annotationLexeme",
+                "identityLexeme",
+                "capabilityLexeme",
+                "size",
+            ] {
+                assert!(
+                    output.contains(&format!("\"{key}\": 1e2")),
+                    "retained {key} lexeme was reparsed: {output}"
+                );
+            }
+            let value: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["redacted"], false);
+            assert_eq!(value["truncated"], false);
+        }
+
+        #[test]
+        fn modern_inspect_acquisition_counts_metadata_before_terminal_projection() {
+            use fastmcp_protocol::common_types::OpenMetadata;
+
+            let mut tool: fastmcp_protocol::FinalTool =
+                serde_json::from_value(modern_inspect_fixture()["tools"][0].clone()).unwrap();
+            let chunk = fastmcp_protocol::common_types::MAX_METADATA_VALUE_BYTES - 2;
+            let make_metadata = |last: usize| {
+                OpenMetadata::try_from_entries((0..4).map(|index| {
+                    (
+                        format!("com.example/part{index}"),
+                        serde_json::Value::String("x".repeat(if index == 3 {
+                            last
+                        } else {
+                            chunk
+                        })),
+                    )
+                }))
+                .unwrap()
+            };
+            tool.meta = Some(make_metadata(chunk));
+            let excess = serde_json::to_vec(&tool).unwrap().len() + 2 - INSPECT_CATEGORY_MAX_BYTES;
+            assert!(excess > 0 && excess < chunk);
+            let params = serde_json::json!({
+                "_meta": fastmcp_protocol::FinalRequestMeta::new(fastmcp_protocol::ClientCapabilities::default()),
+            });
+            let request = fastmcp_protocol::CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                "tools/list",
+                Some(&params),
+            )
+            .unwrap();
+            for extra_byte in [false, true] {
+                tool.meta = Some(make_metadata(chunk - excess + usize::from(extra_byte)));
+                assert_eq!(
+                    serde_json::to_vec(&tool).unwrap().len() + 2,
+                    INSPECT_CATEGORY_MAX_BYTES + usize::from(extra_byte)
+                );
+                let wire = format!(
+                    "{{\"resultType\":\"complete\",\"tools\":[{}],\"ttlMs\":0,\"cacheScope\":\"private\"}}",
+                    serde_json::to_string(&tool).unwrap(),
+                );
+                let (items, truncated) =
+                    inspect_tools_result(request.decode_result(&wire).unwrap()).unwrap();
+                assert_eq!(items.len(), usize::from(!extra_byte));
+                assert_eq!(truncated, extra_byte);
+                assert!(
+                    serde_json::to_vec(&inspect_tool_from_final(tool.clone()))
+                        .unwrap()
+                        .len()
+                        < INSPECT_CATEGORY_MAX_BYTES,
+                    "the discarded metadata alone crosses the bound"
+                );
+            }
+        }
+
+        #[test]
+        fn modern_inspect_identity_preserves_basic_identity_and_absence() {
+            for present in [false, true] {
+                let mut source = serde_json::json!({
+                    "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                    "capabilities": {}, "ttlMs": 0, "cacheScope": "private",
+                });
+                if present {
+                    source["_meta"] = serde_json::json!({
+                        "io.modelcontextprotocol/serverInfo": {"name": "simple", "version": "2"},
+                    });
+                }
+                let discovery: fastmcp_protocol::ServerDiscoverResult =
+                    serde_json::from_value(source).unwrap();
+                assert!(
+                    discovery.implementation().is_none(),
+                    "fixture uses only the basic identity"
+                );
+                let stale = fastmcp_protocol::ServerInfo {
+                    name: "stale".to_owned(),
+                    version: "1".to_owned(),
+                };
+                let identity = InspectIdentity::from_discovery(Some(&stale), Some(&discovery));
+                if present {
+                    assert_eq!(
+                        identity
+                            .unwrap()
+                            .json_value(&mut InspectJsonBudget::default())
+                            .unwrap(),
+                        serde_json::json!({"name": "simple", "version": "2"})
+                    );
+                } else {
+                    assert!(
+                        identity.is_none(),
+                        "absent modern identity must not use a cached projection"
+                    );
+                }
+            }
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn inspect_legacy_catalog_keeps_v1_schema_and_shape() {
+            let tool = make_test_tool("legacy", Some("unchanged"));
+            let output = format_inspect_json(
+                Some(&make_test_server_info()),
+                &make_test_capabilities(true, false, false),
+                &[tool],
+                &[],
+                &[],
+                &[],
+                InspectProtocolStatus::new(CliProtocolPolicy::LegacyOnly, "2024-11-05").unwrap(),
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["schema"], "fastmcp.cli.inspect/v1");
+            assert_eq!(value["protocol"]["era"], "legacy-2024");
+            assert_eq!(value["tools"][0]["name"], "legacy");
+            assert!(value["tools"][0].get("icons").is_none());
+            assert!(value["tools"][0].get("_meta").is_none());
+        }
+
         #[test]
         fn inspect_page_byte_boundary_accepts_exact_fit_and_rejects_one_extra_byte() {
             let exact = "x".repeat(INSPECT_CATEGORY_MAX_BYTES - 4);
@@ -18638,7 +19325,7 @@ IFS= read -r end
             assert!(json.contains("\"resources\": true"));
             assert!(json.contains("\"prompts\": false"));
             let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert_eq!(value["schema"], "fastmcp.cli.inspect/v1");
+            assert_eq!(value["schema"], "fastmcp.cli.inspect/v2");
             assert_eq!(value["redacted"], false);
             assert_eq!(value["sanitized"], false);
             assert_eq!(value["truncated"], false);
