@@ -4,6 +4,9 @@
 //! thread, background pump or network connector. Callers may start several
 //! executions, then drive any handle; the one reader routes other owners'
 //! responses and progress without consuming their results.
+//! High-level catalog and resource reads reuse complete results under peer
+//! freshness hints, bounded connection-local storage and admitted invalidation.
+//! Owned execution handles and raw requests always retain direct wire behavior.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::{Future, poll_fn};
@@ -30,12 +33,16 @@ use fastmcp_transport::{
 };
 use serde_json::Value;
 
+use crate::cache::{FinalCachePageLookup, final_cache_hints};
 use crate::execution::{
     CancellationRequested, FinalCacheTtlDiagnostic, RequestExecution, RequestExecutor,
     decode_core_result_with_cache_ttl_from_source,
 };
 use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime, ClientSession};
-use crate::{RequestTimeoutPolicy, ReverseRequestHandlers, transport_error_to_mcp};
+use crate::{
+    CachePartitionKey, FinalCacheKey, FinalCacheMiss, FinalCachePageState, FinalCacheStats,
+    RequestTimeoutPolicy, ReverseRequestHandlers, final_cache_result_set, transport_error_to_mcp,
+};
 
 #[cfg(feature = "apps")]
 mod apps;
@@ -53,6 +60,7 @@ mod tasks;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(20);
 const SEND_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DIAGNOSTICS: usize = 1_024;
+const MAX_CACHE_INGRESS_FRAMES: usize = 64;
 // This exclusion also applies when the typed Tasks implementation is absent.
 const TASKS_EXTENSION_NAME: &str = "io.modelcontextprotocol/tasks";
 
@@ -1087,8 +1095,9 @@ impl MemoryClient {
             || serde_json::json!({}),
             |cursor| serde_json::json!({"cursor": cursor}),
         );
-        self.request_core(cx, cancellation, "tools/list", parameters)
+        self.cached_core_request(cx, cancellation, "tools/list", parameters, true)
             .await
+            .map(|(result, _)| result)
     }
 
     /// Calls a tool, following input-required results through installed handlers.
@@ -1152,6 +1161,36 @@ impl MemoryClient {
         self.cache_diagnostics.drain(..).collect()
     }
 
+    /// Whether complete catalog/resource results are cached on this connection.
+    ///
+    /// Raw `request_core` and execution handles always send their request.
+    /// Tool calls, prompt retrieval, input-required results and continuations
+    /// are never cached. A peer's public hint never shares an entry with a
+    /// different Memory client or connection.
+    #[must_use]
+    pub const fn final_result_cache_enabled(&self) -> bool {
+        self.subscriptions.final_result_cache.is_enabled()
+    }
+
+    /// Enables or disables high-level complete-result caching.
+    ///
+    /// Disabling retains entries without pausing their original expiry or
+    /// notification invalidation. Use `clear_final_result_cache` to erase them.
+    pub fn set_final_result_cache_enabled(&mut self, enabled: bool) {
+        self.subscriptions.final_result_cache.set_enabled(enabled);
+    }
+
+    /// Returns bounded cache counters without result or parameter labels.
+    #[must_use]
+    pub const fn final_result_cache_stats(&self) -> FinalCacheStats {
+        self.subscriptions.final_result_cache.stats()
+    }
+
+    /// Discards every complete result retained by this live connection.
+    pub fn clear_final_result_cache(&mut self) {
+        self.subscriptions.final_result_cache.clear();
+    }
+
     /// Closes both channel directions and retires every request immediately.
     /// Channel closure is the cancellation boundary; queued controls are not
     /// misreported as wire sends, and a full peer queue cannot delay teardown.
@@ -1160,6 +1199,7 @@ impl MemoryClient {
             return Ok(());
         }
         self.closed = true;
+        self.clear_final_result_cache();
         let result = self.executor.shutdown(cx);
         let receive = self.receiver.close(cx).map_err(transport_error_to_mcp);
         let send = self.sender.close(cx).map_err(transport_error_to_mcp);
@@ -1171,6 +1211,164 @@ impl MemoryClient {
             return Err(McpError::internal_error("Memory client is closed"));
         }
         self.executor.terminal_error().map_or(Ok(()), Err)
+    }
+
+    /// The caller supplies only one of the high-level methods' fixed typed
+    /// parameter shapes. Raw/extension requests never enter this adapter.
+    async fn cached_core_request(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: Value,
+        read_cache: bool,
+    ) -> McpResult<(CoreResult, Option<FinalCachePageState>)> {
+        self.ensure_open()?;
+        checkpoint(cx, cancellation)?;
+        let core_parameters = self.parameters_with_tasks(parameters.clone(), false)?;
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&core_parameters))
+            .map_err(|_| McpError::invalid_params("Invalid Memory cacheable request parameters"))?;
+        let Some(result_set) = final_cache_result_set(&request) else {
+            return self
+                .request_core(cx, cancellation, method, parameters)
+                .await
+                .map(|result| (result, None));
+        };
+        let mut semantic_parameters = parameters.clone();
+        let object = semantic_parameters
+            .as_object_mut()
+            .ok_or_else(|| McpError::invalid_params("Memory cache parameters must be an object"))?;
+        let cursor = object
+            .remove("cursor")
+            .and_then(|cursor| cursor.as_str().map(str::to_owned));
+        // High-level callers cannot inject arbitrary metadata. The framework
+        // adds only immutable capabilities/extensions and observation identity;
+        // those capabilities/settings are separate key dimensions below.
+        object.remove("_meta");
+        let key = FinalCacheKey::new(
+            "memory",
+            MODERN_PROTOCOL_VERSION,
+            serde_json::to_string(self.session.client_capabilities())
+                .map_err(|_| McpError::internal_error("Invalid Memory cache capabilities"))?,
+            serde_json::to_string(&self.session.client_extension_wire_settings())
+                .map_err(|_| McpError::internal_error("Invalid Memory cache extension settings"))?,
+            method,
+            serde_json::to_string(&semantic_parameters)
+                .map_err(|_| McpError::internal_error("Invalid Memory cache parameters"))?,
+            cursor,
+            crate::FINAL_CACHE_POLICY_REVISION,
+            crate::FINAL_CACHE_EXTENSION_REVISION,
+            crate::FINAL_CACHE_REPRESENTATION_POLICY_REVISION,
+            crate::FINAL_CACHE_LIMITS_POLICY_REVISION,
+            // This owner is never moved to another connection or exported.
+            CachePartitionKey::new("memory-client-connection"),
+            result_set.clone(),
+        );
+        let origin = self
+            .subscriptions
+            .final_result_cache
+            .capture_cursor_origin(&key);
+        let mut miss = Some(FinalCacheMiss::Disabled);
+        if read_cache {
+            // Probe without counting a hit: queued invalidations may retire
+            // this candidate before its one real lookup. A cold request does
+            // not need an ingress drain before ordinary send admission.
+            let candidate = self
+                .subscriptions
+                .final_result_cache
+                .has_fresh_entry_at(&key, Instant::now());
+            if !candidate || self.drain_ready_cache_frames(cx, cancellation).await? {
+                match self
+                    .subscriptions
+                    .final_result_cache
+                    .lookup_page_at(&key, Instant::now())
+                {
+                    FinalCachePageLookup::Fresh(page) => {
+                        checkpoint(cx, cancellation)?;
+                        return Ok((
+                            page.result,
+                            Some(FinalCachePageState {
+                                generation: page.generation,
+                                scope: page.scope,
+                                miss: None,
+                            }),
+                        ));
+                    }
+                    FinalCachePageLookup::Miss(reason) => miss = Some(reason),
+                }
+            }
+        }
+        let generation = self
+            .subscriptions
+            .final_result_cache
+            .begin_fetch(&result_set);
+        let result = match self
+            .request_core(cx, cancellation, method, parameters)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if error.code == McpErrorCode::InvalidParams
+                    && let Some(origin) = origin
+                {
+                    self.subscriptions
+                        .final_result_cache
+                        .invalidate_rejected_cursor(origin);
+                }
+                return Err(error);
+            }
+        };
+        let receipt = Instant::now();
+        checkpoint(cx, cancellation)?;
+        let scope = final_cache_hints(&result).map(|(_, scope)| scope);
+        self.subscriptions.final_result_cache.insert_if_current_at(
+            key,
+            generation,
+            result.clone(),
+            receipt,
+        );
+        Ok((
+            result,
+            scope.map(|scope| FinalCachePageState {
+                generation,
+                scope,
+                miss,
+            }),
+        ))
+    }
+
+    /// Returns true only after observing an empty live receive queue. A busy
+    /// peer is bounded and forces an ordinary request instead of a cache hit.
+    async fn drain_ready_cache_frames(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<bool> {
+        for _ in 0..MAX_CACHE_INGRESS_FRAMES {
+            checkpoint(cx, cancellation)?;
+            self.executor.poll_timeouts_at(cx, Instant::now())?;
+            self.ensure_open()?;
+            if self.executor.has_external_controls(cx)? {
+                // The ordinary send path flushes controls under its existing
+                // cancellation/deadline contract before publishing new work.
+                return Ok(false);
+            }
+            let received = {
+                let mut receiving = pin!(self.receiver.recv_with_source_async(cx));
+                poll_fn(|task| Poll::Ready(receiving.as_mut().poll(task))).await
+            };
+            match received {
+                Poll::Pending => return Ok(true),
+                Poll::Ready(Ok(frame)) => {
+                    admit_frame(&self.executor, &mut self.subscriptions, cx, frame)?;
+                }
+                Poll::Ready(Err(TransportError::Cancelled)) => {
+                    return Err(McpError::request_cancelled());
+                }
+                Poll::Ready(Err(error)) => return Err(fail_transport(&self.executor, error)),
+            }
+        }
+        Ok(false)
     }
 
     fn ensure_owner(&self, execution: &MemoryRequestExecution) -> McpResult<()> {

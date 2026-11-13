@@ -197,6 +197,10 @@ impl SubscriptionState {
 pub(super) struct MemorySubscriptionRegistry {
     owners: HashMap<CorrelationKey, Weak<Mutex<SubscriptionState>>>,
     catalog_generations: [u64; 3],
+    // The same ingress owner admits notifications during ordinary reads,
+    // subscription waits and send-capacity waits. Keeping the connection's
+    // cache here makes every accepted invalidation fence outstanding fills.
+    pub(super) final_result_cache: crate::FinalResultCache,
 }
 
 impl MemorySubscriptionRegistry {
@@ -211,8 +215,8 @@ impl MemorySubscriptionRegistry {
     }
 
     /// Called only on the ordinary ingress path after subscription routing has
-    /// declined the frame. A valid unsolicited catalog event invalidates an
-    /// ongoing traversal while remaining available in the executor's queue.
+    /// declined the frame. A valid unsolicited catalog/resource event
+    /// invalidates cached results while remaining in the executor's queue.
     pub(super) fn observe_unowned_catalog_frame(&mut self, frame: &ReceivedTransportFrame) {
         let JsonRpcMessage::Request(request) = frame.message() else {
             return;
@@ -223,6 +227,7 @@ impl MemorySubscriptionRegistry {
                 "notifications/tools/list_changed"
                     | "notifications/resources/list_changed"
                     | "notifications/prompts/list_changed"
+                    | "notifications/resources/updated"
             )
             || request
                 .params
@@ -233,12 +238,9 @@ impl MemorySubscriptionRegistry {
         {
             return;
         }
-        if let Ok(
-            ServerNotification::ToolsListChanged(_)
-            | ServerNotification::ResourcesListChanged(_)
-            | ServerNotification::PromptsListChanged(_),
-        ) = ServerNotification::decode(request)
-        {
+        if let Ok(notification) = ServerNotification::decode(request) {
+            self.final_result_cache
+                .invalidate_notification(&notification);
             self.record_catalog_change(&request.method);
         }
     }
@@ -350,6 +352,13 @@ impl MemorySubscriptionRegistry {
         if let Err(error) = result {
             executor.fail_subscription(cx, &mut state.inner, error)?;
         } else {
+            // Only a notification accepted by this exact live listener can
+            // invalidate entries. Unknown owners and rejected filters above
+            // have no cache authority, just as they have no event authority.
+            if let Ok(notification) = ServerNotification::decode(request) {
+                self.final_result_cache
+                    .invalidate_notification(&notification);
+            }
             self.record_catalog_change(method);
         }
         Ok(true)

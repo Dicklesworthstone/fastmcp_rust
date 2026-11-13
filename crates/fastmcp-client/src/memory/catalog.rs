@@ -1,4 +1,4 @@
-//! Bounded catalog acquisition through the existing Memory request owner.
+//! Bounded catalog acquisition and complete-result replay on a Memory connection.
 
 use std::pin::pin;
 
@@ -11,20 +11,24 @@ use serde_json::Value;
 
 use super::{MemoryClient, checkpoint, wait_turn};
 use crate::cache::final_cache_hints;
-use crate::{CollectedCatalog, PaginationBudget, catalog_page, list_catalog_wire_parameters};
+use crate::{
+    CollectedCatalog, FinalCachePageState, FinalCacheResultSet, PaginationBudget, catalog_page,
+    list_catalog_wire_parameters,
+};
 
 impl MemoryClient {
     /// Lists one tools page with exact cursor and tag-filter parameters.
     ///
     /// The complete modern result retains its metadata, cache hints and open
-    /// members. This method performs one request and never follows its cursor.
+    /// members. A fresh connection-local cache entry may satisfy this page;
+    /// otherwise one request is sent. This method never follows its cursor.
     pub async fn list_tools_with_params(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         params: ListToolsParams,
     ) -> McpResult<CoreResult> {
-        self.request_core(
+        self.cached_core_request(
             cx,
             cancellation,
             "tools/list",
@@ -33,8 +37,10 @@ impl MemoryClient {
                 params.include_tags.as_ref(),
                 params.exclude_tags.as_ref(),
             ),
+            true,
         )
         .await
+        .map(|(result, _)| result)
     }
 
     /// Lists one resource page, retaining all modern result fields.
@@ -44,7 +50,7 @@ impl MemoryClient {
         cancellation: &McpRequestCancellation,
         params: ListResourcesParams,
     ) -> McpResult<CoreResult> {
-        self.request_core(
+        self.cached_core_request(
             cx,
             cancellation,
             "resources/list",
@@ -53,8 +59,10 @@ impl MemoryClient {
                 params.include_tags.as_ref(),
                 params.exclude_tags.as_ref(),
             ),
+            true,
         )
         .await
+        .map(|(result, _)| result)
     }
 
     /// Lists one resource-template page with the caller's exact filters.
@@ -64,7 +72,7 @@ impl MemoryClient {
         cancellation: &McpRequestCancellation,
         params: ListResourceTemplatesParams,
     ) -> McpResult<CoreResult> {
-        self.request_core(
+        self.cached_core_request(
             cx,
             cancellation,
             "resources/templates/list",
@@ -73,8 +81,10 @@ impl MemoryClient {
                 params.include_tags.as_ref(),
                 params.exclude_tags.as_ref(),
             ),
+            true,
         )
         .await
+        .map(|(result, _)| result)
     }
 
     /// Lists one prompt page without discarding metadata or open result members.
@@ -84,7 +94,7 @@ impl MemoryClient {
         cancellation: &McpRequestCancellation,
         params: ListPromptsParams,
     ) -> McpResult<CoreResult> {
-        self.request_core(
+        self.cached_core_request(
             cx,
             cancellation,
             "prompts/list",
@@ -93,8 +103,10 @@ impl MemoryClient {
                 params.include_tags.as_ref(),
                 params.exclude_tags.as_ref(),
             ),
+            true,
         )
         .await
+        .map(|(result, _)| result)
     }
 
     /// Collects every tools page within one caller-owned operation.
@@ -112,10 +124,15 @@ impl MemoryClient {
     ///
     /// An observed matching catalog change, changed cache scope, or rejected
     /// continuation cursor permits one cursorless rebuild. Events remain in
-    /// their existing queues. Each page retains its own cache hints, metadata
-    /// and exact open members; no merged result, synthetic TTL, result cache or
-    /// background listener is created. This local consistency policy does not
-    /// promise a server snapshot. Failure returns no partial collection.
+    /// their existing queues. A fresh terminal first page may satisfy the
+    /// collection from this connection's complete-result cache. A cached
+    /// prefix with a continuation cursor causes the same bounded cursorless
+    /// rebuild; all remaining pages are freshly requested, so a fresh prefix
+    /// cannot be combined with stale later pages. Each page retains its own
+    /// cache hints, metadata and exact open members. No merged result,
+    /// synthetic TTL or background listener is created. This local consistency
+    /// policy does not promise a server snapshot. Failure returns no partial
+    /// collection.
     pub async fn list_all_tools(
         &mut self,
         cx: &Cx,
@@ -217,6 +234,13 @@ impl MemoryClient {
                 "Complete Memory catalog collection requires an absent initial cursor",
             ));
         }
+        let result_set = match method {
+            "tools/list" => FinalCacheResultSet::Tools,
+            "resources/list" => FinalCacheResultSet::Resources,
+            "resources/templates/list" => FinalCacheResultSet::ResourceTemplates,
+            "prompts/list" => FinalCacheResultSet::Prompts,
+            _ => return Err(McpError::invalid_params("Unknown Memory catalog method")),
+        };
         let mut rebuilds = 0;
         'rebuild: loop {
             let mut pages = Vec::new();
@@ -232,15 +256,9 @@ impl MemoryClient {
                     page_parameters["cursor"] = Value::String(cursor.clone());
                 }
                 let page = self
-                    .catalog_request_with_budget(
-                        cx,
-                        cancellation,
-                        method,
-                        page_parameters,
-                        &budget,
-                    )
+                    .catalog_request_with_budget(cx, cancellation, method, page_parameters, &budget)
                     .await;
-                let result = match page {
+                let (result, cache_state) = match page {
                     Err(error)
                         if !self.closed
                             && cursor.is_some()
@@ -249,6 +267,9 @@ impl MemoryClient {
                     {
                         checkpoint(cx, cancellation)?;
                         budget.check_deadline()?;
+                        self.subscriptions
+                            .final_result_cache
+                            .invalidate_result_set(&result_set);
                         rebuilds += 1;
                         continue 'rebuild;
                     }
@@ -264,7 +285,21 @@ impl MemoryClient {
                 if let Some(page_scope) = page_scope {
                     scope.get_or_insert(page_scope);
                 }
-                if changed_scope || self.subscriptions.catalog_generation(method) != generation {
+                let cache_changed = cache_state.is_some_and(|state| {
+                    state.generation
+                        != self
+                            .subscriptions
+                            .final_result_cache
+                            .begin_fetch(&result_set)
+                        || (state.miss.is_none() && next_cursor.is_some())
+                });
+                if changed_scope
+                    || cache_changed
+                    || self.subscriptions.catalog_generation(method) != generation
+                {
+                    self.subscriptions
+                        .final_result_cache
+                        .invalidate_result_set(&result_set);
                     if rebuilds != 0 {
                         return Err(McpError::invalid_request(
                             "Memory catalog changed during its bounded rebuild",
@@ -295,11 +330,14 @@ impl MemoryClient {
         method: &str,
         parameters: Value,
         budget: &PaginationBudget,
-    ) -> McpResult<CoreResult> {
+    ) -> McpResult<(CoreResult, Option<FinalCachePageState>)> {
         // This future owns its page execution. Dropping it at the traversal
         // boundary either releases an unpublished reservation or retires that
         // exact committed request through the existing executor tombstone path.
-        let mut request = pin!(self.request_core(cx, cancellation, method, parameters));
+        let mut request =
+            pin!(
+                self.cached_core_request(cx, cancellation, method, parameters, budget.pages == 1,)
+            );
         loop {
             checkpoint(cx, cancellation)?;
             budget.check_deadline()?;
@@ -489,6 +527,499 @@ mod tests {
             "prompts/list" => call!(ListPromptsParams, list_all_prompts),
             _ => unreachable!(),
         }
+    }
+
+    fn fresh_page(method: &str, name: &str, cursor: Option<&str>) -> Value {
+        let mut result = page(method, Some(name), cursor, "public");
+        result["ttlMs"] = json!(60_000);
+        result
+    }
+
+    fn page_name(result: &CoreResult) -> String {
+        let value: Value = serde_json::from_str(&result.encode().unwrap()).unwrap();
+        value["_meta"]["com.example/page"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn memory_cache_all_catalogs_replay_complete_results_on_the_exact_connection() {
+        run(|cx| async move {
+            for method in METHODS {
+                let (mut client, mut peer) = connected(&cx).await;
+                let token = McpRequestCancellation::new();
+                peer.send_async(&cx, &response(2, fresh_page(method, "original", None)))
+                    .await
+                    .unwrap();
+                let original = one_page(&mut client, &cx, &token, method, None)
+                    .await
+                    .unwrap();
+                receive(&cx, &mut peer, method, Some(2)).await;
+                let replay = one_page(&mut client, &cx, &token, method, None)
+                    .await
+                    .unwrap();
+                let original_source = original.encode().unwrap();
+                let replay_source = replay.encode().unwrap();
+                assert!(replay_source.contains("7.30e-2"));
+                assert!(replay_source.contains("18446744073709551617"));
+                let mut original: Value = serde_json::from_str(&original_source).unwrap();
+                let mut replay: Value = serde_json::from_str(&replay_source).unwrap();
+                let ttl = replay.as_object_mut().unwrap().remove("ttlMs").unwrap();
+                let original_ttl = original.as_object_mut().unwrap().remove("ttlMs").unwrap();
+                assert!(ttl.as_u64().unwrap() <= original_ttl.as_u64().unwrap());
+                assert_eq!(original, replay, "only the typed top-level TTL may age");
+                let collected = collect(&mut client, &cx, &token, method, None)
+                    .await
+                    .unwrap();
+                assert_eq!(collected.pages().len(), 1);
+                assert_eq!(client.next_id, 3, "both replays must avoid publication");
+                assert_eq!(client.final_result_cache_stats().hits, 2);
+                assert_eq!(client.final_result_cache_stats().fills, 1);
+
+                let (mut other, mut other_peer) = connected(&cx).await;
+                other_peer
+                    .send_async(&cx, &response(2, fresh_page(method, "other", None)))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    page_name(
+                        &one_page(&mut other, &cx, &token, method, None)
+                            .await
+                            .unwrap()
+                    ),
+                    "other"
+                );
+                receive(&cx, &mut other_peer, method, Some(2)).await;
+                assert_eq!(
+                    other.final_result_cache_stats().hits,
+                    0,
+                    "public is still connection-private"
+                );
+                other.close(&cx).unwrap();
+                client.close(&cx).unwrap();
+                assert!(
+                    one_page(&mut client, &cx, &token, method, None)
+                        .await
+                        .is_err()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn memory_cache_preserves_cursor_presence_filters_and_explicit_controls() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx).await;
+            let token = McpRequestCancellation::new();
+            for (id, cursor, name) in [
+                (2, None, "absent"),
+                (3, Some(""), "empty"),
+                (4, Some("opaque"), "opaque"),
+            ] {
+                peer.send_async(&cx, &response(id, fresh_page("tools/list", name, None)))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    page_name(
+                        &one_page(
+                            &mut client,
+                            &cx,
+                            &token,
+                            "tools/list",
+                            cursor.map(str::to_owned)
+                        )
+                        .await
+                        .unwrap()
+                    ),
+                    name
+                );
+                assert_parameters(
+                    receive(&cx, &mut peer, "tools/list", Some(id)).await,
+                    cursor,
+                );
+            }
+            for (cursor, name) in [
+                (None, "absent"),
+                (Some(""), "empty"),
+                (Some("opaque"), "opaque"),
+            ] {
+                assert_eq!(
+                    page_name(
+                        &one_page(
+                            &mut client,
+                            &cx,
+                            &token,
+                            "tools/list",
+                            cursor.map(str::to_owned)
+                        )
+                        .await
+                        .unwrap()
+                    ),
+                    name
+                );
+            }
+            peer.send_async(
+                &cx,
+                &response(5, fresh_page("tools/list", "unfiltered", None)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                "unfiltered"
+            );
+            receive(&cx, &mut peer, "tools/list", Some(5)).await;
+            assert_eq!(client.final_result_cache_stats().fills, 4);
+            assert_eq!(client.final_result_cache_stats().hits, 3);
+
+            client.set_final_result_cache_enabled(false);
+            assert!(!client.final_result_cache_enabled());
+            peer.send_async(
+                &cx,
+                &response(6, fresh_page("tools/list", "disabled", None)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                "disabled"
+            );
+            receive(&cx, &mut peer, "tools/list", Some(6)).await;
+            assert_eq!(client.final_result_cache_stats().fills, 4);
+            client.set_final_result_cache_enabled(true);
+            assert_eq!(
+                page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                "unfiltered"
+            );
+            client.clear_final_result_cache();
+            peer.send_async(
+                &cx,
+                &response(7, fresh_page("tools/list", "after-clear", None)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                "after-clear"
+            );
+            receive(&cx, &mut peer, "tools/list", Some(7)).await;
+
+            let stopped = McpRequestCancellation::new();
+            stopped.cancel();
+            assert_eq!(
+                client
+                    .list_tools(&cx, &stopped, None)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(client.next_id, 8);
+            client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn memory_cache_ready_invalidation_precedes_hits_and_preserves_listener_events() {
+        run(|cx| async move {
+            for owned in [false, true] {
+                let (mut client, mut peer) = connected(&cx).await;
+                let token = McpRequestCancellation::new();
+                let mut listener = if owned {
+                    let mut listener = client
+                        .subscribe(
+                            &cx,
+                            &token,
+                            SubscriptionFilter {
+                                tools_list_changed: Some(true),
+                                ..SubscriptionFilter::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    receive(&cx, &mut peer, "subscriptions/listen", Some(2)).await;
+                    peer.send_async(
+                        &cx,
+                        &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/subscriptions/acknowledged",
+                            Some(json!({
+                                "notifications":{"toolsListChanged":true},
+                                "_meta":{"io.modelcontextprotocol/subscriptionId":2},
+                            })),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(
+                        client
+                            .next_subscription_event(&cx, &token, &mut listener)
+                            .await
+                            .unwrap(),
+                        Some(MemorySubscriptionEvent::Acknowledged { .. })
+                    ));
+                    Some(listener)
+                } else {
+                    None
+                };
+                let first_id = client.next_id;
+                peer.send_async(
+                    &cx,
+                    &response(first_id, fresh_page("tools/list", "before", None)),
+                )
+                .await
+                .unwrap();
+                client.list_tools(&cx, &token, None).await.unwrap();
+                receive(&cx, &mut peer, "tools/list", Some(first_id)).await;
+                peer.send_async(
+                    &cx,
+                    &catalog_notification("notifications/tools/list_changed", owned.then_some(2)),
+                )
+                .await
+                .unwrap();
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        receive(&peer_cx, &mut peer, "tools/list", Some(first_id + 1)).await;
+                        peer.send_async(
+                            &peer_cx,
+                            &response(first_id + 1, fresh_page("tools/list", "after", None)),
+                        )
+                        .await
+                        .unwrap();
+                        peer
+                    })
+                    .unwrap();
+                assert_eq!(
+                    page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                    "after"
+                );
+                assert_eq!(
+                    client.final_result_cache_stats().hits,
+                    0,
+                    "invalidated candidates are not reported as hits"
+                );
+                assert_eq!(client.final_result_cache_stats().invalidations, 1);
+                if let Some(listener) = &mut listener {
+                    assert!(matches!(
+                        client
+                            .next_subscription_event(&cx, &token, listener)
+                            .await
+                            .unwrap(),
+                        Some(MemorySubscriptionEvent::Notification(_))
+                    ));
+                    assert!(client.take_server_notifications().is_empty());
+                } else {
+                    assert_eq!(client.take_server_notifications().len(), 1);
+                }
+                let _peer = serving.join(&cx).await.unwrap();
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn memory_cache_invalidation_during_fetch_prevents_repopulation() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx).await;
+            let mut serving = cx
+                .spawn(move |peer_cx| async move {
+                    receive(&peer_cx, &mut peer, "tools/list", Some(2)).await;
+                    peer.send_async(
+                        &peer_cx,
+                        &catalog_notification("notifications/tools/list_changed", None),
+                    )
+                    .await
+                    .unwrap();
+                    peer.send_async(
+                        &peer_cx,
+                        &response(2, fresh_page("tools/list", "racing", None)),
+                    )
+                    .await
+                    .unwrap();
+                    receive(&peer_cx, &mut peer, "tools/list", Some(3)).await;
+                    peer.send_async(
+                        &peer_cx,
+                        &response(3, fresh_page("tools/list", "current", None)),
+                    )
+                    .await
+                    .unwrap();
+                    peer
+                })
+                .unwrap();
+            let token = McpRequestCancellation::new();
+            assert_eq!(
+                page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                "racing"
+            );
+            assert_eq!(client.final_result_cache_stats().fills, 0);
+            assert_eq!(
+                page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                "current"
+            );
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            let _peer = serving.join(&cx).await.unwrap();
+            client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn memory_cache_drains_sibling_responses_without_stealing_their_ownership() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx).await;
+            let token = McpRequestCancellation::new();
+            peer.send_async(&cx, &response(2, fresh_page("tools/list", "cached", None)))
+                .await
+                .unwrap();
+            client.list_tools(&cx, &token, None).await.unwrap();
+            receive(&cx, &mut peer, "tools/list", Some(2)).await;
+            let mut sibling = client
+                .execute_core(&cx, &token, "prompts/get", json!({"name":"other"}))
+                .await
+                .unwrap();
+            receive(&cx, &mut peer, "prompts/get", Some(3)).await;
+            peer.send_async(
+                &cx,
+                &response(3, json!({"resultType":"complete","messages":[]})),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                "cached"
+            );
+            assert_eq!(client.next_id, 4);
+            assert!(matches!(
+                client.next_event(&cx, &token, &mut sibling).await.unwrap(),
+                Some(MemoryRequestEvent::Result(_))
+            ));
+            assert!(
+                client
+                    .next_event(&cx, &token, &mut sibling)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            peer.send_async(
+                &cx,
+                &catalog_notification("notifications/tools/list_changed", Some(999)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                "cached"
+            );
+            assert_eq!(
+                client.final_result_cache_stats().invalidations,
+                0,
+                "a foreign listener cannot invalidate this cache"
+            );
+            assert_eq!(client.final_result_cache_stats().hits, 2);
+            client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn memory_cache_full_catalog_rebuilds_cached_prefix_instead_of_mixing_pages() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx).await;
+            let token = McpRequestCancellation::new();
+            peer.send_async(
+                &cx,
+                &response(2, fresh_page("tools/list", "old-head", Some("old"))),
+            )
+            .await
+            .unwrap();
+            one_page(&mut client, &cx, &token, "tools/list", None)
+                .await
+                .unwrap();
+            receive(&cx, &mut peer, "tools/list", Some(2)).await;
+            peer.send_async(
+                &cx,
+                &response(3, fresh_page("tools/list", "old-tail", None)),
+            )
+            .await
+            .unwrap();
+            one_page(&mut client, &cx, &token, "tools/list", Some("old".into()))
+                .await
+                .unwrap();
+            receive(&cx, &mut peer, "tools/list", Some(3)).await;
+            let mut serving = cx
+                .spawn(move |peer_cx| async move {
+                    assert_parameters(
+                        receive(&peer_cx, &mut peer, "tools/list", Some(4)).await,
+                        None,
+                    );
+                    peer.send_async(
+                        &peer_cx,
+                        &response(4, fresh_page("tools/list", "new-head", Some("new"))),
+                    )
+                    .await
+                    .unwrap();
+                    assert_parameters(
+                        receive(&peer_cx, &mut peer, "tools/list", Some(5)).await,
+                        Some("new"),
+                    );
+                    peer.send_async(
+                        &peer_cx,
+                        &response(5, fresh_page("tools/list", "new-tail", None)),
+                    )
+                    .await
+                    .unwrap();
+                    peer
+                })
+                .unwrap();
+            let result = collect(&mut client, &cx, &token, "tools/list", None)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.pages().iter().map(page_name).collect::<Vec<_>>(),
+                ["new-head", "new-tail"]
+            );
+            assert_eq!(client.final_result_cache_stats().invalidations, 1);
+            assert_eq!(client.next_id, 6);
+            let _peer = serving.join(&cx).await.unwrap();
+            client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn memory_cache_zero_missing_negative_and_expired_ttl_never_replay() {
+        run(|cx| async move {
+            for ttl in [None, Some(-1), Some(0), Some(1)] {
+                let (mut client, mut peer) = connected(&cx).await;
+                let token = McpRequestCancellation::new();
+                let mut first = fresh_page("tools/list", "expired", None);
+                if let Some(ttl) = ttl {
+                    first["ttlMs"] = json!(ttl);
+                } else {
+                    first.as_object_mut().unwrap().remove("ttlMs");
+                }
+                peer.send_async(&cx, &response(2, first)).await.unwrap();
+                client.list_tools(&cx, &token, None).await.unwrap();
+                receive(&cx, &mut peer, "tools/list", Some(2)).await;
+                if ttl == Some(1) {
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(20)).await;
+                }
+                peer.send_async(&cx, &response(3, fresh_page("tools/list", "fresh", None)))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    page_name(&client.list_tools(&cx, &token, None).await.unwrap()),
+                    "fresh"
+                );
+                receive(&cx, &mut peer, "tools/list", Some(3)).await;
+                assert_eq!(client.final_result_cache_stats().hits, 0);
+                if matches!(ttl, None | Some(-1)) {
+                    assert_eq!(client.take_cache_ttl_diagnostics().len(), 1);
+                }
+                if ttl == Some(1) {
+                    assert_eq!(client.final_result_cache_stats().stale, 1);
+                }
+                client.close(&cx).unwrap();
+            }
+        });
     }
 
     async fn ordinary_survives(cx: &Cx, client: &mut MemoryClient, peer: &mut MemoryTransport) {

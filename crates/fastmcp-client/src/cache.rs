@@ -440,6 +440,31 @@ impl FinalResultCache {
         }
     }
 
+    /// Probes whether a lookup could succeed without cloning a result or
+    /// counting a hit. Ingress drivers use this only to decide whether to
+    /// drain queued invalidations; the subsequent ordinary lookup remains
+    /// the authority for freshness and generation at the time of replay.
+    pub(crate) fn has_fresh_entry_at(&self, key: &FinalCacheKey, now: Instant) -> bool {
+        self.enabled
+            && self.entries.get(key).is_some_and(|entry| {
+                Self::entry_miss_at(entry, self.begin_fetch(key.result_set()), now).is_none()
+            })
+    }
+
+    fn entry_miss_at(
+        entry: &FinalCacheEntry,
+        generation: FinalCacheGeneration,
+        now: Instant,
+    ) -> Option<FinalCacheMiss> {
+        if entry.result_set_revision != generation.revision {
+            Some(FinalCacheMiss::Invalidated)
+        } else if now >= entry.expires_at {
+            Some(FinalCacheMiss::Stale)
+        } else {
+            None
+        }
+    }
+
     /// Looks up one page while retaining its generation and scope for a
     /// caller that is assembling a full cursor-following list.
     pub(crate) fn lookup_page_at(
@@ -457,16 +482,9 @@ impl FinalResultCache {
             self.stats.misses = self.stats.misses.saturating_add(1);
             return FinalCachePageLookup::Miss(FinalCacheMiss::Absent);
         };
-        let entry_revision = entry.result_set_revision;
         let expires_at = entry.expires_at;
 
-        let miss = if entry_revision != generation.revision {
-            Some(FinalCacheMiss::Invalidated)
-        } else if now >= expires_at {
-            Some(FinalCacheMiss::Stale)
-        } else {
-            None
-        };
+        let miss = Self::entry_miss_at(entry, generation, now);
 
         if let Some(miss) = miss {
             if let Some(removed) = self.entries.remove(key) {

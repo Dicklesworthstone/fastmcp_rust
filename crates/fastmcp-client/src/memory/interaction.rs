@@ -46,6 +46,8 @@ impl MemoryClient {
     /// The original caller context, cancellation token, absolute deadline, and
     /// resource URI remain bound across all rounds. Without installed modern
     /// handlers, an input-required result is returned directly to the caller.
+    /// Complete first-round results honor the connection's cache policy;
+    /// input-required results and every continuation remain uncached.
     pub async fn read_resource(
         &mut self,
         cx: &Cx,
@@ -94,8 +96,9 @@ impl MemoryClient {
         let handlers = self.reverse_request_handlers.clone();
         if !handlers.has_modern_handlers() {
             return self
-                .request_core(cx, cancellation, method, original_parameters)
-                .await;
+                .cached_core_request(cx, cancellation, method, original_parameters, true)
+                .await
+                .map(|(result, _)| result);
         }
         let deadline = mrtr_operation_deadline(cx, self.timeout_policy)?;
         let mut driver = MrtrDriver::new(
@@ -110,11 +113,18 @@ impl MemoryClient {
         let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         wait_for_mrtr_operation(cx, Some(cancellation), deadline, async {
             let mut parameters = original_parameters.clone();
+            let mut first_round = true;
             loop {
                 driver.before_request()?;
-                let result = self
-                    .request_core(cx, cancellation, method, parameters)
-                    .await?;
+                let result = if first_round {
+                    first_round = false;
+                    self.cached_core_request(cx, cancellation, method, parameters, true)
+                        .await?
+                        .0
+                } else {
+                    self.request_core(cx, cancellation, method, parameters)
+                        .await?
+                };
                 check_mrtr_operation(cx, Some(cancellation), deadline)?;
                 let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
                     return Ok(result);
@@ -130,11 +140,8 @@ impl MemoryClient {
                         check_mrtr_operation(cx, Some(cancellation), deadline)
                     })
                     .await?;
-                parameters = mrtr_retry_parameters(
-                    original_parameters.clone(),
-                    input_required,
-                    responses,
-                )?;
+                parameters =
+                    mrtr_retry_parameters(original_parameters.clone(), input_required, responses)?;
             }
         })
         .await
@@ -365,6 +372,177 @@ mod tests {
             assert_eq!(result["com.example/receipt"]["value"], "résumé 東京");
             assert!(source.contains("7.30e-2"));
         }
+    }
+
+    #[test]
+    fn memory_cache_resource_reads_invalidate_on_queued_resource_and_catalog_changes() {
+        run(|cx| async move {
+            for notification_method in [
+                "notifications/resources/updated",
+                "notifications/resources/list_changed",
+            ] {
+                let (mut client, mut peer) = connected(&cx, builder(), json!({})).await;
+                let token = McpRequestCancellation::new();
+                let mut complete = Verb::Resource.completed();
+                complete["ttlMs"] = json!(60_000);
+                for (id, uri) in [(2, "file:///one"), (3, "file:///two")] {
+                    peer.send_async(&cx, &response(id, complete.clone()))
+                        .await
+                        .unwrap();
+                    Verb::Resource
+                        .assert_completed(client.read_resource(&cx, &token, uri).await.unwrap());
+                    assert_eq!(
+                        receive(&cx, &mut peer, "resources/read", id)
+                            .await
+                            .params
+                            .unwrap()["uri"],
+                        uri
+                    );
+                    Verb::Resource
+                        .assert_completed(client.read_resource(&cx, &token, uri).await.unwrap());
+                }
+                assert_eq!(client.next_id, 4);
+                assert_eq!(client.final_result_cache_stats().hits, 2);
+                peer.send_async(
+                    &cx,
+                    &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        notification_method,
+                        Some(if notification_method.ends_with("/updated") {
+                            json!({"uri":"file:///one"})
+                        } else {
+                            json!({})
+                        }),
+                    )),
+                )
+                .await
+                .unwrap();
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        for (id, uri) in [(4, "file:///one"), (5, "file:///two")] {
+                            assert_eq!(
+                                receive(&peer_cx, &mut peer, "resources/read", id)
+                                    .await
+                                    .params
+                                    .unwrap()["uri"],
+                                uri
+                            );
+                            peer.send_async(&peer_cx, &response(id, complete.clone()))
+                                .await
+                                .unwrap();
+                        }
+                        peer
+                    })
+                    .unwrap();
+                // The bounded cache uses a shared resource-read generation;
+                // no old URI survives either accepted resource invalidation.
+                for uri in ["file:///one", "file:///two"] {
+                    Verb::Resource
+                        .assert_completed(client.read_resource(&cx, &token, uri).await.unwrap());
+                }
+                assert_eq!(client.final_result_cache_stats().hits, 2);
+                assert_eq!(client.take_server_notifications().len(), 1);
+                let _peer = serving.join(&cx).await.unwrap();
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn memory_cache_prompt_get_and_input_required_cache_lookalikes_remain_uncached() {
+        run(|cx| async move {
+            for verb in [Verb::Resource, Verb::Prompt] {
+                let (mut client, mut peer) = connected(&cx, builder(), json!({})).await;
+                let token = McpRequestCancellation::new();
+                for id in 2..=3 {
+                    let result = match verb {
+                        Verb::Resource => json!({
+                            "resultType":"input_required", "requestState":"manual",
+                            "ttlMs":60_000, "cacheScope":"public", "nextCursor":"inert",
+                        }),
+                        Verb::Prompt => json!({
+                            "resultType":"complete", "messages":[],
+                            "ttlMs":60_000, "cacheScope":"public", "nextCursor":"inert",
+                        }),
+                        Verb::Tool => unreachable!(),
+                    };
+                    peer.send_async(&cx, &response(id, result)).await.unwrap();
+                    let result = verb.call(&cx, &mut client, &token).await.unwrap();
+                    assert!(matches!(
+                        result,
+                        CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. })
+                            | CoreResult::Final(FinalCoreResult::PromptsGet { .. })
+                    ));
+                    receive(&cx, &mut peer, verb.method(), id).await;
+                }
+                assert_eq!(client.final_result_cache_stats().fills, 0);
+                assert_eq!(client.final_result_cache_stats().hits, 0);
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn memory_cache_mrtr_continuation_results_and_raw_requests_do_not_fill() {
+        run(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (mut client, mut peer) = connected(
+                &cx,
+                builder().reverse_request_handlers(roots_handler(&calls)),
+                json!({}),
+            )
+            .await;
+            let mut serving = cx
+                .spawn(move |peer_cx| async move {
+                    let mut complete = Verb::Resource.completed();
+                    complete["ttlMs"] = json!(60_000);
+                    for first_id in [2, 4] {
+                        let original =
+                            receive(&peer_cx, &mut peer, "resources/read", first_id).await;
+                        assert!(original.params.unwrap().get("requestState").is_none());
+                        peer.send_async(&peer_cx, &response(first_id, input("once-per-operation")))
+                            .await
+                            .unwrap();
+                        let continuation =
+                            receive(&peer_cx, &mut peer, "resources/read", first_id + 1).await;
+                        assert_eq!(
+                            continuation.params.unwrap()["requestState"],
+                            "once-per-operation"
+                        );
+                        peer.send_async(&peer_cx, &response(first_id + 1, complete.clone()))
+                            .await
+                            .unwrap();
+                    }
+                    for id in 6..=7 {
+                        receive(&peer_cx, &mut peer, "resources/read", id).await;
+                        peer.send_async(&peer_cx, &response(id, complete.clone()))
+                            .await
+                            .unwrap();
+                    }
+                    peer
+                })
+                .unwrap();
+            let token = McpRequestCancellation::new();
+            for _ in 0..2 {
+                Verb::Resource
+                    .assert_completed(Verb::Resource.call(&cx, &mut client, &token).await.unwrap());
+            }
+            assert_eq!(
+                calls.load(Ordering::Acquire),
+                2,
+                "a prior continuation cannot suppress a later interaction"
+            );
+            for _ in 0..2 {
+                client
+                    .request_core(&cx, &token, "resources/read", Verb::Resource.original())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(client.final_result_cache_stats().fills, 0);
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            assert_eq!(client.next_id, 8);
+            let _peer = serving.join(&cx).await.unwrap();
+            client.close(&cx).unwrap();
+        });
     }
 
     #[test]
