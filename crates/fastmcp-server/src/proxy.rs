@@ -904,6 +904,7 @@ impl Default for ProxyTaskLimits {
 pub struct ProxyTaskRetentionPolicy {
     maximum_upstream_ttl: Duration,
     mapping_lifetime: Duration,
+    renewal_margin: Duration,
 }
 
 #[cfg(feature = "tasks")]
@@ -921,7 +922,20 @@ impl ProxyTaskRetentionPolicy {
         Ok(Self {
             maximum_upstream_ttl,
             mapping_lifetime,
+            renewal_margin: maximum_upstream_ttl.min(Duration::from_secs(30)),
         })
+    }
+
+    /// Revalidate near-expiry Tasks before an active update, cancel or listen
+    /// request. This does not start a background poll or extend any deadline.
+    pub fn with_renewal_margin(mut self, renewal_margin: Duration) -> McpResult<Self> {
+        if renewal_margin.is_zero() || renewal_margin > self.maximum_upstream_ttl {
+            return Err(McpError::invalid_params(
+                "Proxy Task renewal margin must be positive and no greater than the upstream maximum",
+            ));
+        }
+        self.renewal_margin = renewal_margin;
+        Ok(self)
     }
 
     #[must_use]
@@ -932,6 +946,13 @@ impl ProxyTaskRetentionPolicy {
     #[must_use]
     pub const fn mapping_lifetime(self) -> Duration {
         self.mapping_lifetime
+    }
+
+    /// The active-request revalidation margin, initially the smaller of thirty
+    /// seconds and the configured maximum upstream TTL.
+    #[must_use]
+    pub const fn renewal_margin(self) -> Duration {
+        self.renewal_margin
     }
 }
 
@@ -7047,6 +7068,84 @@ impl ProxyFinalTaskRelay {
         Ok(Some(task.clone()))
     }
 
+    fn task_needs_renewal(&self, retained: &ProxyRelayedFinalTask) -> McpResult<bool> {
+        let margin = {
+            let registry = self.tasks.lock().map_err(|_| {
+                McpError::internal_error("Proxy final Tasks registry lock poisoned")
+            })?;
+            ProxyClient::require_task_retention_policy(&registry)?.renewal_margin
+        };
+        let now = Instant::now();
+        Ok(retained
+            .expires_at
+            .is_none_or(|expiry| expiry.saturating_duration_since(now) <= margin))
+    }
+
+    /// A listener or mutation grant never authorizes an implicit read. Keep
+    /// the requested action and Get checks on both sides of every read, before
+    /// its snapshot can change retention, quarantine state or downstream data.
+    async fn get_authoritative_task(
+        &self,
+        ctx: &McpContext,
+        retained: &ProxyRelayedFinalTask,
+        action: crate::TaskAccessAction,
+    ) -> McpResult<FinalGetTaskResult> {
+        ctx.ensure_live()?;
+        if action != crate::TaskAccessAction::Get {
+            self.authorize_mapping(ctx, action, retained)?;
+        }
+        self.check_observed_recovery_ceiling(ctx, crate::TaskAccessAction::Get, retained)?;
+        ctx.ensure_live()?;
+        let response = self
+            .client
+            .get_final_task(ctx, retained.task.base().task_id.clone())
+            .await;
+        ctx.ensure_live()?;
+        if action != crate::TaskAccessAction::Get {
+            self.authorize_mapping(ctx, action, retained)?;
+        }
+        self.check_observed_recovery_ceiling(ctx, crate::TaskAccessAction::Get, retained)?;
+        response
+    }
+
+    /// Revalidation is bounded to the active caller's request. A failed read
+    /// leaves the original locator, fixed ceiling and quota charge untouched.
+    async fn renew_task_if_needed(
+        self: &Arc<Self>,
+        ctx: &McpContext,
+        owner: fastmcp_core::Sha256Digest,
+        handle: &FinalTaskId,
+        action: crate::TaskAccessAction,
+    ) -> McpResult<ProxyRelayedFinalTask> {
+        ctx.ensure_live()?;
+        let retained = self.known_locator(owner, handle)?;
+        self.authorize_mapping(ctx, action, &retained)?;
+        if self.task_needs_renewal(&retained)? {
+            let response = self.get_authoritative_task(ctx, &retained, action).await?;
+            self.reconcile_task(
+                ctx,
+                owner,
+                handle,
+                response.task,
+                Some(retained.snapshot_revision),
+                action,
+            )
+            .await?;
+        }
+        drop(retained);
+        ctx.ensure_live()?;
+        let retained = self.known_mapping(owner, handle)?;
+        self.authorize_handle(
+            ctx,
+            action,
+            owner,
+            handle,
+            ProxyFinalTaskLookup::CurrentSnapshot,
+        )?;
+        ctx.ensure_live()?;
+        Ok(retained)
+    }
+
     async fn reconcile_task(
         self: &Arc<Self>,
         ctx: &McpContext,
@@ -7066,6 +7165,16 @@ impl ProxyFinalTaskRelay {
             self.authorize_handle(
                 ctx, action, owner, handle, ProxyFinalTaskLookup::RecoveryLocator,
             )?;
+            // A fenced snapshot came from tasks/get, including a fresh read
+            // required to reconcile an unsolicited Listen event. Recheck that
+            // separate grant before applying the response under another action.
+            if expected_revision.is_some() && action != crate::TaskAccessAction::Get {
+                self.authorize_handle(
+                    ctx, crate::TaskAccessAction::Get, owner, handle,
+                    ProxyFinalTaskLookup::RecoveryLocator,
+                )?;
+            }
+            ctx.ensure_live()?;
             match self.record_task(owner, handle, &task, expected_revision) {
                 Ok(Some(admitted)) => return Ok(admitted),
                 Ok(None) => {}
@@ -7087,14 +7196,8 @@ impl ProxyFinalTaskRelay {
                 break;
             }
             let current = self.known_locator(owner, handle)?;
-            self.authorize_mapping(ctx, action, &current)?;
             expected_revision = Some(current.snapshot_revision);
-            let response = self
-                .client
-                .get_final_task(ctx, current.task.base().task_id.clone())
-                .await;
-            self.check_observed_recovery_ceiling(ctx, action, &current)?;
-            task = response?.task;
+            task = self.get_authoritative_task(ctx, &current, action).await?.task;
         }
         Err(McpError::invalid_request(
             "Proxy upstream Task reconciliation raced newer observations",
@@ -7255,13 +7358,9 @@ impl ProxyFinalTaskRelay {
             &parameters.task_id,
             ProxyFinalTaskLookup::RecoveryLocator,
         )?;
-        route.authorize_mapping(ctx, crate::TaskAccessAction::Get, &retained)?;
-        let response = route
-            .client
-            .get_final_task(ctx, retained.task.base().task_id.clone())
-            .await;
-        route.check_observed_recovery_ceiling(ctx, crate::TaskAccessAction::Get, &retained)?;
-        let mut result = response?;
+        let mut result = route
+            .get_authoritative_task(ctx, &retained, crate::TaskAccessAction::Get)
+            .await?;
         result.task = route
             .reconcile_task(
                 ctx,
@@ -7284,12 +7383,22 @@ impl ProxyFinalTaskRelay {
         self.ensure_modern_route()?;
         let parameters = serde_json::from_value::<UpdateTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/update parameters"))?;
+        let owner = proxy_task_owner(ctx)?;
         let (route, retained) = self.resolve_task(
-            proxy_task_owner(ctx)?,
+            owner,
             &parameters.task_id,
-            ProxyFinalTaskLookup::CurrentSnapshot,
+            ProxyFinalTaskLookup::RecoveryLocator,
         )?;
         route.authorize_mapping(ctx, crate::TaskAccessAction::Update, &retained)?;
+        drop(retained);
+        let retained = route
+            .renew_task_if_needed(
+                ctx,
+                owner,
+                &parameters.task_id,
+                crate::TaskAccessAction::Update,
+            )
+            .await?;
         let result = route
             .client
             .update_final_task(ctx, &retained.task, parameters.input_responses)
@@ -7311,12 +7420,22 @@ impl ProxyFinalTaskRelay {
         self.ensure_modern_route()?;
         let parameters = serde_json::from_value::<FinalCancelTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel parameters"))?;
+        let owner = proxy_task_owner(ctx)?;
         let (route, retained) = self.resolve_task(
-            proxy_task_owner(ctx)?,
+            owner,
             &parameters.task_id,
-            ProxyFinalTaskLookup::CurrentSnapshot,
+            ProxyFinalTaskLookup::RecoveryLocator,
         )?;
         route.authorize_mapping(ctx, crate::TaskAccessAction::Cancel, &retained)?;
+        drop(retained);
+        let retained = route
+            .renew_task_if_needed(
+                ctx,
+                owner,
+                &parameters.task_id,
+                crate::TaskAccessAction::Cancel,
+            )
+            .await?;
         let result = route
             .client
             .cancel_final_task(ctx, retained.task.base().task_id.clone())
@@ -7336,21 +7455,25 @@ impl ProxyFinalTaskRelay {
         notifications: SubscriptionFilter,
     ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
         self.ensure_modern_route()?;
+        ctx.ensure_live()?;
         let task_ids = task_subscription_ids(&notifications)
             .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
             .ok_or_else(|| McpError::invalid_params("Tasks listener requires taskIds"))?;
         let owner = proxy_task_owner(ctx)?;
         let mut groups: Vec<(Arc<Self>, Vec<FinalTaskId>)> = Vec::new();
-        // Resolve the entire selection before opening any upstream stream.
+        // Resolve and authorize the entire selection before any upstream
+        // renewal read or stream open, including expired recovery locators.
         for handle in task_ids {
             let (route, retained) =
-                self.resolve_task(owner, &handle, ProxyFinalTaskLookup::CurrentSnapshot)?;
+                self.resolve_task(owner, &handle, ProxyFinalTaskLookup::RecoveryLocator)?;
             route.authorize_mapping(ctx, crate::TaskAccessAction::Listen, &retained)?;
             match groups
                 .iter_mut()
                 .find(|(known, _)| Arc::ptr_eq(known, &route))
             {
-                Some((_, handles)) => handles.push(handle),
+                Some((_, handles)) => {
+                    if !handles.contains(&handle) { handles.push(handle); }
+                }
                 None => groups.push((route, vec![handle])),
             }
         }
@@ -7361,6 +7484,53 @@ impl ProxyFinalTaskRelay {
                 Vec::new(), notifications, ctx.clone(), Vec::new(),
             )));
         }
+        // A Get denial on a later route must not allow an earlier route to be
+        // contacted. Preflight every currently required read independently of
+        // Listen; each actual read rechecks both grants around its await.
+        for (route, handles) in &groups {
+            for handle in handles {
+                ctx.ensure_live()?;
+                let retained = route.known_locator(owner, handle)?;
+                if route.task_needs_renewal(&retained)? {
+                    route.authorize_mapping(ctx, crate::TaskAccessAction::Get, &retained)?;
+                }
+            }
+        }
+        for (route, handles) in &groups {
+            let mut validated = Vec::new();
+            for handle in handles {
+                let identity = {
+                    let retained = route.known_locator(owner, handle)?;
+                    (
+                        retained.task.base().task_id.clone(),
+                        retained.task.base().created_at.as_str().to_owned(),
+                    )
+                };
+                if validated.contains(&identity) {
+                    continue;
+                }
+                route
+                    .renew_task_if_needed(ctx, owner, handle, crate::TaskAccessAction::Listen)
+                    .await?;
+                validated.push(identity);
+            }
+        }
+        // All renewed aliases must still be live and authorized before the
+        // first stream opens. Route opening below performs no further renewal:
+        // an unchanged fresh snapshot may legitimately remain inside the margin.
+        ctx.ensure_live()?;
+        for (route, handles) in &groups {
+            for handle in handles {
+                route.authorize_handle(
+                    ctx,
+                    crate::TaskAccessAction::Listen,
+                    owner,
+                    handle,
+                    ProxyFinalTaskLookup::CurrentSnapshot,
+                )?;
+            }
+        }
+        ctx.ensure_live()?;
         if groups.len() == 1 {
             let (route, _) = groups.pop().expect("one admitted route");
             return route.open_route_listener_async(ctx, notifications).await;
@@ -7436,6 +7606,7 @@ impl ProxyFinalTaskRelay {
                 mappings.push((task_id, upstream_id));
             }
         }
+        ctx.ensure_live()?;
         let upstream_filter = relayed_task_filter(notifications.clone(), upstream_ids)?;
         self.client
             .open_final_task_listener_async(ctx, upstream_filter.clone())
@@ -14995,6 +15166,8 @@ mod tests {
     mod task_authorization;
     #[cfg(feature = "tasks")]
     mod task_quota;
+    #[cfg(feature = "tasks")]
+    mod task_renewal;
     #[cfg(feature = "tasks")]
     mod task_retention;
 
@@ -23768,6 +23941,7 @@ IFS= read -r end
     struct TaskReconciliationBackend {
         backend: FinalTaskRelayBackend,
         replies: Arc<Mutex<VecDeque<TaskReconciliationReply>>>,
+        observed_updates: Option<Arc<Mutex<Vec<fastmcp_protocol::Task>>>>,
     }
 
     #[cfg(feature = "tasks")]
@@ -23815,6 +23989,13 @@ IFS= read -r end
         fn supports_final_tasks_relay(&mut self) -> fastmcp_core::McpResult<bool> {
             Ok(true)
         }
+        fn call_tool_final_outcome(
+            &mut self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> fastmcp_core::McpResult<FinalToolCallOutcome> {
+            self.backend.call_tool_final_outcome(name, arguments)
+        }
         fn get_final_task(
             &mut self,
             task_id: fastmcp_protocol::FinalTaskId,
@@ -23841,6 +24022,9 @@ IFS= read -r end
             task: &fastmcp_protocol::Task,
             input_responses: fastmcp_protocol::TaskInputResponses,
         ) -> fastmcp_core::McpResult<fastmcp_protocol::UpdateTaskResult> {
+            if let Some(observed) = &self.observed_updates {
+                observed.lock().unwrap().push(task.clone());
+            }
             self.backend.update_final_task(task, input_responses)
         }
         fn cancel_final_task(
@@ -23909,6 +24093,7 @@ IFS= read -r end
                     final_progress: None,
                 },
                 replies: Arc::clone(&replies),
+                observed_updates: None,
             },
             final_task_relay_binding(ProtocolEra::Modern2026),
             "2026-07-28",
@@ -24124,7 +24309,7 @@ IFS= read -r end
     #[test]
     fn proxy_final_task_recovery_requires_fresh_get_before_cached_mutating_or_listening_use() {
         let initial = final_task_relay_result_with_ttl("get-before-use", Some(60_000)).task;
-        let renewed = relay_task_with_ttl(&initial, Some(120_000));
+        let renewed = relay_task_with_ttl(&initial, Some(180_000));
         let fixture = task_reconciliation_fixture(initial, Vec::new());
         age_relay_task_mappings(
             &fixture.relay,
@@ -24156,6 +24341,30 @@ IFS= read -r end
                 .relay
                 .admit_carried_task(&fixture.context, &carrier)
                 .unwrap_err(),
+            block_on(fixture.relay.dispatch_get(&foreign, parameters.clone())).unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+            assert!(error.data.is_none());
+        }
+        assert!(fixture.calls.lock().unwrap().is_empty());
+        // An owned expired locator may now seek one fresh observation before
+        // each requested control. An outage grants neither use of its cached
+        // snapshot nor permission to release its retained quota.
+        for _ in 0..3 {
+            fixture
+                .replies
+                .lock()
+                .unwrap()
+                .push_back(TaskReconciliationReply {
+                    result: Err(fastmcp_core::McpError::internal_error(
+                        "renewal read unavailable",
+                    )),
+                    before_reply: None,
+                });
+        }
+        for error in [
             block_on(
                 fixture
                     .relay
@@ -24168,22 +24377,23 @@ IFS= read -r end
                     .dispatch_cancel(&fixture.context, parameters.clone()),
             )
             .unwrap_err(),
-            block_on(fixture.relay.dispatch_get(&foreign, parameters.clone())).unwrap_err(),
-        ];
-        for error in errors {
-            assert_eq!(error.code, McpErrorCode::InvalidParams);
-            assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
-            assert!(error.data.is_none());
+        ] {
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, "renewal read unavailable");
         }
         let error = match block_on(fixture.relay.open_listener_async(
             &fixture.context,
             relay_test_filter(vec![fixture.handle.clone()]),
         )) {
-            Ok(_) => panic!("expired cached snapshots cannot admit a listener"),
+            Ok(_) => panic!("an unavailable renewal cannot admit a listener"),
             Err(error) => error,
         };
-        assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
-        assert!(fixture.calls.lock().unwrap().is_empty());
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(error.message, "renewal read unavailable");
+        assert_eq!(
+            fixture.calls.lock().unwrap().as_slice(),
+            ["tasks/get", "tasks/get", "tasks/get"]
+        );
         assert_eq!(
             fixture
                 .proxy
@@ -24223,6 +24433,9 @@ IFS= read -r end
         assert_eq!(
             fixture.calls.lock().unwrap().as_slice(),
             [
+                "tasks/get",
+                "tasks/get",
+                "tasks/get",
                 "tasks/get",
                 "tasks/update",
                 "tasks/cancel",
@@ -24460,33 +24673,41 @@ IFS= read -r end
     fn proxy_final_task_recovery_ceiling_elapsed_during_get_cannot_recreate_mapping() {
         for reply_failed in [false, true] {
             let initial = final_task_relay_result_with_ttl("ceiling-during-get", Some(60_000)).task;
-        let renewed = relay_task_with_ttl(&initial, Some(120_000));
-        let fixture = task_reconciliation_fixture(initial, Vec::new());
-        let route = Arc::downgrade(&fixture.relay);
-        let handle = fixture.handle.clone();
-        fixture
-            .replies
-            .lock()
-            .unwrap()
-            .push_back(TaskReconciliationReply {
-                result: if reply_failed {
-                    Err(fastmcp_core::McpError::internal_error("private upstream transport failure"))
-                } else {
-                    Ok(renewed)
-                },
-                before_reply: Some(Box::new(move || {
-                    route
-                        .upgrade()
-                        .unwrap()
-                        .tasks
-                        .lock()
-                        .unwrap()
-                        .tasks
-                        .get_mut(&handle)
-                        .unwrap()
-                        .recovery_until = Some(Instant::now() - Duration::from_millis(1));
-                })),
-            });
+            let renewed = relay_task_with_ttl(&initial, Some(120_000));
+            let fixture = task_reconciliation_fixture(initial, Vec::new());
+            let ceiling = Instant::now() + Duration::from_millis(250);
+            fixture
+                .relay
+                .tasks
+                .lock()
+                .unwrap()
+                .tasks
+                .get_mut(&fixture.handle)
+                .unwrap()
+                .recovery_until = Some(ceiling);
+            fixture
+                .replies
+                .lock()
+                .unwrap()
+                .push_back(TaskReconciliationReply {
+                    result: if reply_failed {
+                        Err(fastmcp_core::McpError::internal_error(
+                            "private upstream transport failure",
+                        ))
+                    } else {
+                        Ok(renewed)
+                    },
+                    before_reply: Some(Box::new(move || {
+                        // Cross the same immutable ceiling captured before
+                        // I/O. Changing only the stored copy after capture
+                        // would not model time passing during this read.
+                        thread::sleep(ceiling.saturating_duration_since(Instant::now()));
+                        assert!(
+                            Instant::now() >= ceiling,
+                            "the bounded reply wait crosses the captured ceiling"
+                        );
+                    })),
+                });
             let error = task_reconciliation_get(&fixture).unwrap_err();
             assert_eq!(error.code, McpErrorCode::InvalidRequest);
             assert_eq!(

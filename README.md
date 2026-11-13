@@ -427,6 +427,17 @@ scenarios, including every input-required one, so a measurement taken without
   cancellation request does not establish that upstream work has stopped.
   Gateway restart invalidates mappings; this profile provides neither shared
   durable mappings nor atomic administration across the two systems.
+- **Task control requests validate approaching retention deadlines.** The
+  retention policy's renewal margin defaults to the smaller of thirty seconds
+  and the configured upstream maximum TTL. Set it with
+  `policy.with_renewal_margin(duration)?`; the margin must be positive and no
+  greater than that maximum. Before an update, cancellation, or new listener,
+  a snapshot inside this margin or past its cached deadline requires a fresh
+  `tasks/get`. The caller needs current permission for both the requested
+  action and that read, including after the read completes. Renewal runs
+  within the caller's request and budget, and preserves the original mapping
+  ceiling. An unavailable upstream prevents the requested control operation
+  while retaining the mapping and its quota charge until the hard ceiling.
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
   remain available for development, but production security/profile
   conformance is unverified and no production-support claim is made for them.
