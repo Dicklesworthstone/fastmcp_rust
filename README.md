@@ -407,6 +407,26 @@ scenarios, including every input-required one, so a measurement taken without
   is admitted. Completed handles, aliases, and expired snapshots retained for
   authoritative recovery continue to consume capacity until their mappings
   are reclaimed. The default remains 128 handles per route and per owner.
+- **Proxied Tasks require a finite retention contract.** Before installing the
+  client, configure `ProxyClient::with_task_retention_policy` with
+  `ProxyTaskRetentionPolicy::new(maximum_upstream_ttl, mapping_lifetime)`.
+  Both durations must be positive, the upstream maximum must fit the mapping
+  lifetime, and the mapping lifetime cannot exceed 365 days. For example,
+  `Duration::from_secs(86_400)` and `Duration::from_secs(2_592_000)` declare a
+  one-day upstream maximum within a thirty-day local mapping ceiling. The
+  ordinary builder methods `as_proxy_with_task_retention` and
+  `as_proxy_raw_with_task_retention` accept the same policy directly; they are
+  also available through the modern and auto facades. The
+  upstream maximum is a trusted deployment contract, not a value accepted from
+  peer discovery. A missing contract prevents Task creation from reaching the
+  upstream, and clones share an immutable policy after relay admission.
+  Arbitrary remote upstreams cannot use null-TTL Tasks under this profile.
+  Contract violations and permanent ambiguity produce an explicit
+  `UpstreamStateUnknown` outcome with a bounded, redacted, process-local orphan
+  audit available through `task_orphan_audit`. An authorized best-effort
+  cancellation request does not establish that upstream work has stopped.
+  Gateway restart invalidates mappings; this profile provides neither shared
+  durable mappings nor atomic administration across the two systems.
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
   remain available for development, but production security/profile
   conformance is unverified and no production-support claim is made for them.

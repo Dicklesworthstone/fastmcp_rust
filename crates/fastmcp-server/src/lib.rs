@@ -104,8 +104,8 @@ mod tests;
 
 pub use async_stdio::{BoundStdioServer, StdioOperatorHandle};
 pub use auth::{
-    AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, StaticTokenVerifier, TokenAuthProvider,
-    TokenVerifier,
+    AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, StaticTokenVerifier,
+    TokenAuthProvider, TokenVerifier,
 };
 pub use builder::{
     RefusedRegistration, RegistrationKind, ServerBuildError, ServerBuilder, ServerLaunchPolicyError,
@@ -117,10 +117,10 @@ pub use extensions::{
 #[cfg(feature = "console")]
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_core::stats::{
-    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorOutputCapacity,
-    OperatorOutputCounters, OperatorProfile, OperatorReadiness, OperatorReason, OperatorSnapshot,
-    OperatorSnapshotError, OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot,
-    ServerStats, StatsSnapshot,
+    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle,
+    OperatorOutputCapacity, OperatorOutputCounters, OperatorProfile, OperatorReadiness,
+    OperatorReason, OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource,
+    OperatorStdioOutput, OperatorStdioSnapshot, ServerStats, StatsSnapshot,
 };
 use fastmcp_protocol::{
     MAX_CLIENT_REGISTRATION_BYTES, SecurityDocumentKind, admit_security_document,
@@ -162,7 +162,10 @@ pub use proxy::{
 #[cfg(feature = "proxy")]
 use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyCatalogRelay};
 #[cfg(all(feature = "proxy", feature = "tasks"))]
-pub use proxy::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskLimits};
+pub use proxy::{
+    ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskCleanupOutcome, ProxyTaskLimits,
+    ProxyTaskOrphanAudit, ProxyTaskOrphanReason, ProxyTaskRetentionPolicy,
+};
 pub use router::{
     InboundRequestContext, InboundRequestTransport, ModernConnection, MountResult,
     NotificationSender, Router, TagFilters,

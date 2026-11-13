@@ -5397,6 +5397,18 @@ impl Router {
                     // gate, retain the route-bound snapshot for controls, and
                     // emit its owner-bound downstream handle without local creation.
                     require_final_tasks_capability(&request_metadata)?;
+                    // A peer may have committed work outside the configured
+                    // retention contract. Its private carrier keeps that work
+                    // charged even though no ordinary handle can be issued.
+                    // Bind cleanup to the real router registration and current
+                    // caller before attempting a bounded best-effort cancel.
+                    if let Some(cleanup) = relay.prepare_orphan_cleanup(
+                        request_ctx,
+                        &work_descriptor,
+                        original.clone(),
+                    )? {
+                        return Err(cleanup.run(request_ctx).await);
+                    }
                     if let Some(result) = relay.admit_carried_task_for_operation(
                         request_ctx,
                         &work_descriptor,

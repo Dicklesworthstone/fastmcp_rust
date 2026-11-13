@@ -1848,7 +1848,28 @@ impl ServerBuilder {
         self.register_prefixed_typed_proxy_catalog(prefix, proxy_client, catalog)
     }
 
-    /// Registers one already-negotiated typed upstream catalog under a caller
+    /// Creates a prefixed proxy with an explicitly trusted finite Task lifetime
+    /// contract for this upstream. Configure the contract before discovery can
+    /// install a Tasks relay; it remains shared and immutable across clones.
+    ///
+    /// The maximum must come from the upstream deployment's configuration.
+    /// This gateway cannot provide transactional administration of a remote
+    /// null-TTL Task. For additional route limits or HTTP transport, configure
+    /// a [`ProxyClient`] and use [`Self::as_proxy_typed`].
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    pub fn as_proxy_with_task_retention(
+        self,
+        prefix: &str,
+        client: fastmcp_client::Client,
+        retention: crate::ProxyTaskRetentionPolicy,
+    ) -> Result<Self, fastmcp_core::McpError> {
+        let proxy_client =
+            ProxyClient::from_client(client)?.with_task_retention_policy(retention)?;
+        let catalog = proxy_client.catalog_typed()?;
+        self.register_prefixed_typed_proxy_catalog(prefix, proxy_client, catalog)
+    }
+
+/// Registers one already-negotiated typed upstream catalog under a caller
     /// prefix. Tools and prompts take `{prefix}/{name}`; exact-final resource
     /// URIs stay unprefixed so they remain absolute.
     ///
@@ -2254,7 +2275,21 @@ impl ServerBuilder {
         self.into_proxy_raw_with_proxy_client(ProxyClient::from_client(client)?)
     }
 
-    /// Registers one already-negotiated, typed upstream catalog without any
+    /// Creates an unprefixed proxy with an explicitly trusted finite Task
+    /// lifetime contract. See [`Self::as_proxy_with_task_retention`] for the
+    /// upstream configuration and remote-administration requirements.
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    pub fn as_proxy_raw_with_task_retention(
+        self,
+        client: fastmcp_client::Client,
+        retention: crate::ProxyTaskRetentionPolicy,
+    ) -> Result<Self, fastmcp_core::McpError> {
+        self.into_proxy_raw_with_proxy_client(
+            ProxyClient::from_client(client)?.with_task_retention_policy(retention)?,
+        )
+    }
+
+/// Registers one already-negotiated, typed upstream catalog without any
     /// legacy projection. Final components are visible only to final routes;
     /// legacy components remain visible only to exact MCP 2024-11-05 routes.
     ///
@@ -6628,6 +6663,16 @@ mod tests {
         }
 
         #[cfg(feature = "tasks")]
+        fn ordinary_proxy_task_created_at() -> &'static str {
+            static CREATED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            CREATED
+                .get_or_init(|| {
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                })
+                .as_str()
+        }
+
+        #[cfg(feature = "tasks")]
         fn ordinary_proxy_tasks_client_with_catalog(
             calls: Arc<Mutex<Vec<String>>>,
             updates: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -6640,9 +6685,9 @@ mod tests {
                 "resultType": "task",
                 "taskId": "ordinary-proxy-task-71",
                 "status": "input_required",
-                "createdAt": "2026-07-28T12:00:00Z",
-                "lastUpdatedAt": "2026-07-28T12:00:00Z",
-                "ttlMs": null,
+                "createdAt": ordinary_proxy_task_created_at(),
+                "lastUpdatedAt": ordinary_proxy_task_created_at(),
+                "ttlMs": 86_400_000,
                 "inputRequests": {},
             }))
             .expect("the ordinary proxy Task fixture is exact");
@@ -6658,6 +6703,19 @@ mod tests {
                 },
                 ProtocolEra::Modern2026,
             );
+            let client = if relay_tasks {
+                client
+                    .with_task_retention_policy(
+                        crate::ProxyTaskRetentionPolicy::new(
+                            Duration::from_hours(30 * 24),
+                            Duration::from_hours(30 * 24),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+            } else {
+                client
+            };
             if relay_tasks {
                 client.final_tasks_relay().unwrap().unwrap()
                     .install_access_authorizers(vec![Arc::new(OrdinaryProxyTaskAccessPolicy)])
@@ -7291,13 +7349,18 @@ mod tests {
             task_id: &str,
             revision: u8,
         ) -> fastmcp_protocol::TaskStatusNotification {
+            let updated = chrono::DateTime::parse_from_rfc3339(ordinary_proxy_task_created_at())
+                .unwrap()
+                .checked_add_signed(chrono::TimeDelta::seconds(i64::from(revision)))
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             let task = serde_json::from_value(serde_json::json!({
                 "taskId": task_id,
                 "status": "input_required",
-                "createdAt": "2026-07-28T12:00:00Z",
-                "lastUpdatedAt": format!("2026-07-28T12:00:{revision:02}Z"),
+                "createdAt": ordinary_proxy_task_created_at(),
+                "lastUpdatedAt": updated,
                 "statusMessage": format!("update-{revision}"),
-                "ttlMs": null,
+                "ttlMs": 86_400_000,
                 "inputRequests": {},
             }))
             .expect("a complete upstream Task snapshot");

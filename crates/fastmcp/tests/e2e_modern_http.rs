@@ -37,6 +37,8 @@ use std::time::{Duration, Instant};
     feature = "native-tls-roots"
 ))]
 use fastmcp_rust::FinalTaskWatchEvent;
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+use fastmcp_rust::ProxyTaskRetentionPolicy;
 use fastmcp_rust::http_headers::{
     HeaderExposureError, NonSensitiveHeaderExposure, ToolSchemaRevision,
 };
@@ -128,6 +130,15 @@ const PUBLIC_HTTP_CUSTOM_AUTH_TOKEN: &str = "gamma";
 const MCP_CONFIG_HTTP_SERVER_NAME: &str = "configured-modern-http";
 const MCP_CONFIG_NONEXISTENT_COMMAND: &str =
     "fastmcp-http-config-command-must-not-exist-bd-mcp-http-03-integration-vx7y-1";
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn proxy_task_fixture_retention() -> ProxyTaskRetentionPolicy {
+    // The owned HTTP fixtures retain Tasks for one minute; echo_server uses
+    // ten minutes. This deployment contract leaves both within a one-hour
+    // mapping ceiling without trusting peer discovery to choose the bound.
+    ProxyTaskRetentionPolicy::new(Duration::from_secs(10 * 60), Duration::from_secs(60 * 60))
+        .expect("the owned Tasks upstreams have a finite retention contract")
+}
 
 struct McpConfigHttpRequestCounter {
     requests: Arc<AtomicUsize>,
@@ -5719,7 +5730,9 @@ fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixtu
                     ClientCapabilities::default(),
                 )
                 .await
-                .map_err(|error| format!("live HTTP task proxy upstream connect failed: {error}"))?;
+                .map_err(|error| format!("live HTTP task proxy upstream connect failed: {error}"))?
+                .with_task_retention_policy(proxy_task_fixture_retention())
+                .map_err(|error| format!("HTTP task proxy retention policy failed: {error}"))?;
             let catalog = proxy
                 .catalog_typed_with_cx(&cx)
                 .await
@@ -6709,7 +6722,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                 builder = builder.on_duplicate(behavior).tool(LocalPrefixedEcho);
             }
             let server = builder
-                .as_proxy("ext", stdio)
+                .as_proxy_with_task_retention("ext", stdio, proxy_task_fixture_retention())
                 .map_err(|error| format!("as_proxy stdio install failed: {error}"))?
                 .build();
             if server.final_task_runtime().is_some() {
@@ -44698,7 +44711,9 @@ mod live_websocket_bind {
                     ClientCapabilities::default(),
                 )
                 .await
-                .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime");
+                .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime")
+                .with_task_retention_policy(proxy_task_fixture_retention())
+                .expect("the WebSocket Tasks relay has a trusted retention contract");
             let catalog = proxy
                 .catalog_typed_with_cx(&cx)
                 .await
@@ -44930,7 +44945,9 @@ mod live_websocket_bind {
                     ClientCapabilities::default(),
                 )
                 .await
-                .expect("live modern HTTP catalog proxy upstream must connect from the WebSocket runtime");
+                .expect("live modern HTTP catalog proxy upstream must connect from the WebSocket runtime")
+                .with_task_retention_policy(proxy_task_fixture_retention())
+                .expect("the catalog gateway's Tasks relay has a trusted retention contract");
             let catalog = proxy
                 .catalog_typed_with_cx(&cx)
                 .await
@@ -45104,7 +45121,9 @@ mod live_websocket_bind {
                     ClientCapabilities::default(),
                 )
                 .await
-                .expect("live modern HTTP dual-listen proxy upstream must connect from the WebSocket runtime");
+                .expect("live modern HTTP dual-listen proxy upstream must connect from the WebSocket runtime")
+                .with_task_retention_policy(proxy_task_fixture_retention())
+                .expect("the dual-listen Tasks relay has a trusted retention contract");
             let catalog = proxy
                 .catalog_typed_with_cx(&cx)
                 .await
@@ -45367,7 +45386,9 @@ mod live_websocket_bind {
                     ClientCapabilities::default(),
                 )
                 .await
-                .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime");
+                .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime")
+                .with_task_retention_policy(proxy_task_fixture_retention())
+                .expect("the WebSocket Task creation relay has a trusted retention contract");
             let catalog = proxy
                 .catalog_typed_with_cx(&cx)
                 .await
@@ -50027,7 +50048,7 @@ mod live_websocket_bind {
                 "e2e-ws-as-proxy-stdio-elicit-upstream",
             );
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-stdio-elicit", "1.0.0")
-                .as_proxy("ext", stdio)
+                .as_proxy_with_task_retention("ext", stdio, proxy_task_fixture_retention())
                 .expect("as_proxy stdio elicitation install must succeed")
                 .build();
             let bound = server
@@ -50174,7 +50195,7 @@ mod live_websocket_bind {
                 "e2e-ws-as-proxy-stdio-sample-upstream",
             );
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-stdio-sample", "1.0.0")
-                .as_proxy("ext", stdio)
+                .as_proxy_with_task_retention("ext", stdio, proxy_task_fixture_retention())
                 .expect("as_proxy stdio sampling install must succeed")
                 .build();
             let bound = server
@@ -51228,7 +51249,9 @@ mod live_websocket_bind {
                     ClientCapabilities::default(),
                 )
                 .await
-                .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime");
+                .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime")
+                .with_task_retention_policy(proxy_task_fixture_retention())
+                .expect("the WebSocket Task progress relay has a trusted retention contract");
             let catalog = proxy
                 .catalog_typed_with_cx(&cx)
                 .await

@@ -22,6 +22,7 @@ fn configured_client(
         "2026-07-28",
     )
     .unwrap();
+    let client = with_relay_test_retention(client);
     (client, calls, creation)
 }
 
@@ -382,7 +383,7 @@ fn proxy_task_quota_counts_aliases_and_recovery_locators_until_retention_ends() 
 }
 
 #[test]
-fn proxy_task_quota_failed_task_admission_releases_the_reserved_owner_slot() {
+fn proxy_task_quota_expired_remote_creation_retains_its_committed_owner_slot() {
     let route = route(1, 1);
     let alice = owner("quota-alice", 7450);
     let reservation = route.relay.reserve_task_creation(&alice).unwrap();
@@ -398,12 +399,10 @@ fn proxy_task_quota_failed_task_admission_releases_the_reserved_owner_slot() {
         "inputRequests": {},
     }))
     .unwrap();
-    assert!(
-        route
-            .relay
-            .encode_task_carrier(reservation, creation)
-            .is_err()
-    );
+    let carrier = route
+        .relay
+        .encode_task_carrier(reservation, creation)
+        .expect("a committed Task outside the contract retains a private cleanup carrier");
     assert_eq!(
         route
             .client
@@ -411,7 +410,24 @@ fn proxy_task_quota_failed_task_admission_releases_the_reserved_owner_slot() {
             .unwrap(),
         serde_json::json!({"pendingCreations": 0, "tasks": {}}),
     );
-    assert!(route.relay.reserve_task_creation(&alice).is_ok());
+    assert_eq!(route.relay.tasks.lock().unwrap().orphans.len(), 1);
+    assert!(route.relay.reserve_task_creation(&alice).is_err());
+    assert!(
+        route
+            .relay
+            .reserve_task_creation(&owner("quota-bob", 7451))
+            .is_err()
+    );
+    let audit = route.client.task_orphan_audit().unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(
+        audit[0].reason(),
+        super::super::ProxyTaskOrphanReason::InvalidDeadline
+    );
+    assert!(!audit[0].quota_released());
+    assert!(route.calls.lock().unwrap().is_empty());
+    drop(carrier);
+    assert!(route.relay.reserve_task_creation(&alice).is_err());
 }
 
 #[test]

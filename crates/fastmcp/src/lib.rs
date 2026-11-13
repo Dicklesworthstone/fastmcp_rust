@@ -460,45 +460,44 @@ pub mod server {
     #[cfg(feature = "legacy-2024-11-05")]
     pub use fastmcp_server::legacy_2024;
     pub use fastmcp_server::{
-        AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
-        BoundHttpServer, BoundStdioServer, BoxFuture, CompletionHandler, ConsoleConfig,
-        DuplicateBehavior,
-        ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
-        ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
-        FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
+        AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, BannerStyle,
+        BidirectionalSenders, BoundHttpServer, BoundStdioServer, BoxFuture, CompletionHandler,
+        ConsoleConfig, DuplicateBehavior, ExtensionHandler, ExtensionHandlerInvocationError,
+        ExtensionHandlerKey, ExtensionHandlerLookupError, ExtensionHandlerRegistrationError,
+        ExtensionHandlerRegistry, FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
         FinalResourceReadCacheHintProvenance, FinalRoots, FinalRootsContextExt, FinalSampling,
-        FinalSamplingContextExt, FinalSubscriptionPublisher, FinalToolOutcome, FinalToolSchemaAuthority,
-        HttpConnectionAdmissionError, HttpConnectionAdmissionPermit, HttpConnectionAdmissionProbe,
-        HttpNonquiescentShutdown, HttpOperatorHandle, HttpServerConfig, HttpServerShutdown,
-        HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, LifespanHooks,
-        LoggingConfig, Middleware, MiddlewareDecision, ModernConnection, MountResult,
-        NotificationSender, OperatorConnectionCapacity, OperatorConnectionCounters,
-        OperatorLifecycle, OperatorOutputCapacity, OperatorOutputCounters, OperatorProfile,
-        OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorSnapshotError,
-        OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot, PendingRequests,
-        ProgressNotificationSender,
-        PromptHandler, RequestSender, ResourceHandler, Router, ServerExtensionConfigurationError,
+        FinalSamplingContextExt, FinalSubscriptionPublisher, FinalToolOutcome,
+        FinalToolSchemaAuthority, HttpConnectionAdmissionError, HttpConnectionAdmissionPermit,
+        HttpConnectionAdmissionProbe, HttpNonquiescentShutdown, HttpOperatorHandle,
+        HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement, InboundRequestContext,
+        InboundRequestTransport, LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision,
+        ModernConnection, MountResult, NotificationSender, OperatorConnectionCapacity,
+        OperatorConnectionCounters, OperatorLifecycle, OperatorOutputCapacity,
+        OperatorOutputCounters, OperatorProfile, OperatorReadiness, OperatorReason,
+        OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource, OperatorStdioOutput,
+        OperatorStdioSnapshot, PendingRequests, ProgressNotificationSender, PromptHandler,
+        RequestSender, ResourceHandler, Router, ServerExtensionConfigurationError,
         ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
         ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse,
         ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier, StatsSnapshot,
-        StdioOperatorHandle,
-        TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolExecutionMode,
-        ToolHandler, TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
-        TransportSamplingSender, UriParams, caching, create_context_with_progress,
-        create_context_with_progress_and_senders, oauth, oidc, providers, rate_limiting, transform,
+        StdioOperatorHandle, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind,
+        ToolExecutionMode, ToolHandler, TrafficVerbosity, TransportElicitationSender,
+        TransportRootsProvider, TransportSamplingSender, UriParams, caching,
+        create_context_with_progress, create_context_with_progress_and_senders, oauth, oidc,
+        providers, rate_limiting, transform,
     };
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
-        TaskExecutionAuthorizer,
-        FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
-        FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
-        FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskRetentionAdministrator,
-        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy,
-        TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskExecutionBudget,
+        FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+        FinalTaskOperation, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
+        FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+        InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
+        TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
+        TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
+        TaskRetentionTarget,
     };
     /// WebSocket server listener and lifecycle APIs.
     #[cfg(feature = "websocket-experimental")]
@@ -514,7 +513,10 @@ pub mod server {
         ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
-    pub use fastmcp_server::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskLimits};
+    pub use fastmcp_server::{
+        ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskCleanupOutcome,
+        ProxyTaskLimits, ProxyTaskOrphanAudit, ProxyTaskOrphanReason, ProxyTaskRetentionPolicy,
+    };
 }
 
 /// Serialization traits and derives for facade-only typed consumers.
@@ -1029,9 +1031,12 @@ pub use fastmcp_server::{
     ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
 
-/// Final Tasks proxy-listener APIs require both extensions.
+/// Final Tasks proxy control, retention, and listener APIs require both features.
 #[cfg(all(feature = "proxy", feature = "tasks"))]
-pub use fastmcp_server::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskLimits};
+pub use fastmcp_server::{
+    ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskCleanupOutcome, ProxyTaskLimits,
+    ProxyTaskOrphanAudit, ProxyTaskOrphanReason, ProxyTaskRetentionPolicy,
+};
 
 /// Proxy-backend legacy progress callback.
 ///
@@ -2343,10 +2348,35 @@ pub mod auto {
                 .map(|inner| Self { inner })
         }
 
+        /// Registers a prefixed proxy with a trusted finite Task retention contract.
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        pub fn as_proxy_with_task_retention(
+            self,
+            prefix: &str,
+            client: fastmcp_client::Client,
+            retention: crate::ProxyTaskRetentionPolicy,
+        ) -> McpResult<Self> {
+            self.inner
+                .as_proxy_with_task_retention(prefix, client, retention)
+                .map(|inner| Self { inner })
+        }
+
         /// Registers an unprefixed proxy from an Auto-selected upstream client.
         #[cfg(feature = "proxy")]
         pub fn as_proxy_raw(self, client: fastmcp_client::Client) -> McpResult<Self> {
             self.inner.as_proxy_raw(client).map(|inner| Self { inner })
+        }
+
+        /// Registers an unprefixed proxy with a trusted finite Task retention contract.
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        pub fn as_proxy_raw_with_task_retention(
+            self,
+            client: fastmcp_client::Client,
+            retention: crate::ProxyTaskRetentionPolicy,
+        ) -> McpResult<Self> {
+            self.inner
+                .as_proxy_raw_with_task_retention(client, retention)
+                .map(|inner| Self { inner })
         }
 
         /// Registers one typed proxy catalog while retaining Auto's selected-era routing.
@@ -3355,7 +3385,10 @@ pub mod modern {
         ProxyUpstreamBindingRegistry,
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
-    pub use fastmcp_server::ProxyTaskLimits;
+    pub use fastmcp_server::{
+        ProxyTaskCleanupOutcome, ProxyTaskLimits, ProxyTaskOrphanAudit, ProxyTaskOrphanReason,
+        ProxyTaskRetentionPolicy,
+    };
 
     /// A non-resettable marker for the modern facade's sole protocol policy.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8132,11 +8165,36 @@ pub mod modern {
                 .map(|inner| Self { inner })
         }
 
+        /// Registers a prefixed final proxy with a trusted finite Task retention contract.
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        pub fn as_proxy_with_task_retention(
+            self,
+            prefix: &str,
+            client: Client,
+            retention: crate::ProxyTaskRetentionPolicy,
+        ) -> McpResult<Self> {
+            self.inner
+                .as_proxy_with_task_retention(prefix, client.inner, retention)
+                .map(|inner| Self { inner })
+        }
+
         /// Registers an unprefixed proxy from this facade's sealed final client.
         #[cfg(feature = "proxy")]
         pub fn as_proxy_raw(self, client: Client) -> McpResult<Self> {
             self.inner
                 .as_proxy_raw(client.inner)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers an unprefixed final proxy with a trusted finite Task retention contract.
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        pub fn as_proxy_raw_with_task_retention(
+            self,
+            client: Client,
+            retention: crate::ProxyTaskRetentionPolicy,
+        ) -> McpResult<Self> {
+            self.inner
+                .as_proxy_raw_with_task_retention(client.inner, retention)
                 .map(|inner| Self { inner })
         }
 
@@ -12132,8 +12190,6 @@ pub mod testing;
 /// use fastmcp_rust::prelude::*;
 /// ```
 pub mod prelude {
-    #[cfg(feature = "tasks")]
-    pub use crate::{FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskStreamWatch};
     pub use crate::{
         // Context and errors
         AccessToken,
@@ -12404,8 +12460,7 @@ pub mod prelude {
         RequestSender, ResourceContentItem, ResourceHandler, ResourceReadResult, ResourceReader,
         ReverseRequest, ReverseRequestCancellation, SamplingIncludeContext, SamplingMessageContent,
         SamplingModelHint, SamplingModelPreferences, SamplingRequest, SamplingRequestMessage,
-        SamplingResponse,
-        SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
+        SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
         StdioRequestExecution, StdioRequestExecutor, ToolCallResult, ToolCaller, ToolContentItem,
         ToolHandler, Transport, TransportElicitationSender, TransportRootsProvider,
         TransportSamplingSender, UriParams, decode_strict_jsonrpc_message,
@@ -12423,6 +12478,8 @@ pub mod prelude {
         ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding,
         ProxyUpstreamBindingRegistry,
     };
+    #[cfg(feature = "tasks")]
+    pub use crate::{FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskStreamWatch};
     #[cfg(feature = "apps")]
     pub use crate::{
         MAX_MCP_APPS_CSP_DOMAIN_BYTES, MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE,
@@ -12438,7 +12495,10 @@ pub mod prelude {
         McpAppsViewLifecycle, project_final_core_tools_call_result,
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
-    pub use crate::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskLimits};
+    pub use crate::{
+        ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskCleanupOutcome,
+        ProxyTaskLimits, ProxyTaskOrphanAudit, ProxyTaskOrphanReason, ProxyTaskRetentionPolicy,
+    };
     pub use crate::{
         ResourceSubscriptionMatcher, ResourceSubscriptionRelations, SubscriptionListenRequest,
     };

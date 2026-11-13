@@ -61,6 +61,7 @@ fn raw_route() -> BrokerRouteFixture {
         final_task_relay_binding(ProtocolEra::Modern2026),
         "2026-07-28",
     ).unwrap();
+    let client = with_relay_test_retention(client);
     let relay = client.final_tasks_relay().unwrap().unwrap();
     BrokerRouteFixture { client, relay, calls, creation }
 }
