@@ -1594,6 +1594,18 @@ be reconciled explicitly. Loading a plan stages the complete bounded selection
 before network work, so later checkpoint writes cannot invalidate an enumeration
 cursor halfway through recovery.
 
+On Linux, a completed `AsyncTaskResumeStore::try_load_restart` operation can
+call `prepare_persisted_dpop_restart` to bind that staged selection and its
+protected store to the DPoP client. The returned `PersistedDpopTaskRestart`
+retains each application outcome until the host explicitly `acknowledge`s it
+or takes it without persisting. An interrupted acknowledgement keeps the
+original storage job; the next acknowledgement observes that job instead of
+submitting a second write. A failed write retains the result, exact checkpoint
+change, and store for recovery through `into_parts`. Local acknowledgement has
+its own caller budget and does not renew the batch's remote authorization or
+retention window. Handle or durably save terminal results before acknowledging;
+a crash before acknowledgement can deliver the result again.
+
 ---
 
 ## Quick Start

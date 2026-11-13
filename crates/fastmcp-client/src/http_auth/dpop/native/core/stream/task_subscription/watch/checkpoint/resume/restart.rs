@@ -4,6 +4,15 @@
 //! the whole batch. Saved controls are lookup hints; they cannot select a
 //! transport, renew authority, replay execution or acknowledge result handling.
 
+/// Protected-store acknowledgements with retained completion-mailbox custody.
+#[cfg(target_os = "linux")]
+pub mod persisted;
+#[cfg(target_os = "linux")]
+pub use persisted::{
+    DpopTaskRestartPreparationFailure, PersistedDpopTaskRestart, PersistedDpopTaskRestartError,
+    PersistedDpopTaskRestartParts, PersistedTaskRestartError, RestartCheckpointState,
+};
+
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, feature = "native-tls-roots"))]
@@ -451,6 +460,9 @@ impl DpopTaskRestart<'_> {
             .map(|record| (record, self.pending_outcome.take()))
     }
 
+    /// Read under the original caller's task/region identity. A supplied caller
+    /// can narrow its budget or effect ceiling; it cannot replace the original
+    /// cancellation domain, credential lifetime or absolute batch deadline.
     pub async fn next_reconciled(
         &mut self,
         cx: &Cx,
