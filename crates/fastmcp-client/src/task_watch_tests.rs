@@ -91,6 +91,158 @@ fn assert_completed(task: &FinalTask) {
     assert_eq!(serde_json::to_string(result).unwrap(), EXACT_RESULT);
 }
 
+fn drive_policy() -> FinalTaskDrivePolicy {
+    FinalTaskDrivePolicy::new(
+        FinalTaskWaitPolicy::new(Duration::from_secs(3), 8, Duration::from_millis(40)).unwrap(),
+        4,
+        8,
+        64 * 1024,
+        64 * 1024,
+    )
+    .unwrap()
+}
+
+fn with_poll(snapshot: &str, millis: u64) -> String {
+    format!(r#"{{"pollIntervalMs":{millis},{}"#, &snapshot[1..])
+}
+
+fn input_task(updated_second: u8, later: bool) -> String {
+    let mut inputs = json!({"roots":{"method":"roots/list"}});
+    if later {
+        inputs["later"] = json!({"method":"roots/list"});
+    }
+    format!(
+        r#"{{"inputRequests":{inputs},{}"#,
+        &task("input_required", None, updated_second)[1..]
+    )
+}
+
+// A scripted unit proof for the shared opening handoff. The transport tests
+// below separately exercise real stdio and WebSocket ownership and ingress.
+mod opening_handoff {
+    use super::*;
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct CancellingOpen {
+        opens: usize,
+        reads: usize,
+        updates: usize,
+        events: usize,
+        input_contexts: Cell<usize>,
+        retired: Vec<RequestId>,
+    }
+
+    impl TaskInputTransport for CancellingOpen {
+        type Error = McpError;
+
+        async fn read(
+            &mut self,
+            _: &Cx,
+            _: &McpRequestCancellation,
+            _: FinalTaskId,
+        ) -> McpResult<FinalTask> {
+            self.reads += 1;
+            Err(McpError::internal_error(
+                "unexpected read after cancelled open",
+            ))
+        }
+
+        fn input_context(&self) -> McpResult<(crate::ReverseRequestHandlers, serde_json::Value)> {
+            self.input_contexts.set(self.input_contexts.get() + 1);
+            Err(McpError::internal_error(
+                "unexpected input after cancelled open",
+            ))
+        }
+
+        async fn update(
+            &mut self,
+            _: &Cx,
+            _: &McpRequestCancellation,
+            _: &FinalTask,
+            _: FinalTaskInputResponses,
+        ) -> McpResult<FinalUpdateTaskResult> {
+            self.updates += 1;
+            Err(McpError::internal_error(
+                "unexpected update after cancelled open",
+            ))
+        }
+    }
+
+    impl TaskDriveWatchTransport for CancellingOpen {
+        type Listener = RequestId;
+        type Options = ();
+
+        async fn open_drive_watch(
+            &mut self,
+            _: &Cx,
+            cancellation: &McpRequestCancellation,
+            _: SubscriptionFilter,
+            (): (),
+            listener: &mut Option<Self::Listener>,
+        ) -> McpResult<()> {
+            self.opens += 1;
+            *listener = Some(RequestId::Number(41));
+            // Commit the listener, then elect cancellation in the same poll.
+            // WaitBudget must suppress success without losing this ownership.
+            cancellation.cancel();
+            Ok(())
+        }
+
+        async fn next_drive_event(
+            &mut self,
+            _: &Cx,
+            _: &McpRequestCancellation,
+            _: &mut Self::Listener,
+        ) -> McpResult<StdioTaskSubscriptionEvent> {
+            self.events += 1;
+            Err(McpError::internal_error(
+                "unexpected event after cancelled open",
+            ))
+        }
+
+        fn abandon_drive_watch(&mut self, listener: Self::Listener) {
+            self.retired.push(listener);
+        }
+    }
+
+    #[test]
+    fn task_watch_driver_retires_owner_when_open_finishes_cancelled() {
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let initial: FinalTask = serde_json::from_str(&input_task(1, false)).unwrap();
+                let before = serde_json::to_vec(&initial).unwrap();
+                let mut driver = FinalTaskHandle::new(initial).into_driver(drive_policy());
+                let mut transport = CancellingOpen::default();
+                let cancellation = McpRequestCancellation::new();
+                for _ in 0..2 {
+                    assert_eq!(
+                        drive_task_watching(&mut driver, &cx, &mut transport, &cancellation, (),)
+                            .await
+                            .unwrap(),
+                        FinalTaskWaitOutcome::ObservationCancelled
+                    );
+                }
+                assert_eq!(transport.opens, 1, "a cancelled retry makes no new contact");
+                assert_eq!(transport.retired, vec![RequestId::Number(41)]);
+                assert_eq!(
+                    (transport.reads, transport.updates, transport.events),
+                    (0, 0, 0)
+                );
+                assert_eq!(
+                    transport.input_contexts.get(),
+                    0,
+                    "no Host callback can be selected"
+                );
+                assert_eq!(serde_json::to_vec(driver.task()).unwrap(), before);
+                assert!(!driver.input_resolution_interrupted());
+            });
+    }
+}
+
 #[cfg(unix)]
 mod stdio {
     use super::*;
@@ -108,8 +260,17 @@ case "$attach" in *'"id":2'*) ;; *) exit 84 ;; esac
 "#;
 
     async fn connect(cx: &Cx, script: &str) -> (Client, FinalTaskHandle) {
+        connect_with_handlers(cx, script, crate::ReverseRequestHandlers::new()).await
+    }
+
+    async fn connect_with_handlers(
+        cx: &Cx,
+        script: &str,
+        handlers: crate::ReverseRequestHandlers,
+    ) -> (Client, FinalTaskHandle) {
         let mut client = ClientBuilder::new()
             .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+            .reverse_request_handlers(handlers)
             .request_timeout_policy(
                 RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
             )
@@ -125,6 +286,331 @@ case "$attach" in *'"id":2'*) ;; *) exit 84 ;; esac
             .await
             .unwrap();
         (client, handle)
+    }
+
+    fn finish_script(next_id: i64) -> String {
+        format!(
+            r#"
+IFS= read -r sibling || exit 97
+case "$sibling" in *'"method":"tasks/get"'*) ;; *) exit 98 ;; esac
+case "$sibling" in *'"id":{next_id}'*) ;; *) exit 99 ;; esac
+printf '%s\n' '{}'
+exec sleep 10
+"#,
+            response(next_id, &task("cancelled", None, 9))
+        )
+    }
+
+    async fn finish(cx: &Cx, client: &mut Client) {
+        let result = client
+            .get_task_final_with_cx(
+                cx,
+                &McpRequestCancellation::new(),
+                FinalTaskId::parse("stream-task").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result.task, FinalTask::Cancelled(_)));
+        client.close_with_cx(cx).await.unwrap();
+    }
+
+    #[test]
+    fn public_stdio_task_watch_driver_resolves_inputs_and_delivers_early_completion() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&calls);
+                let handlers =
+                    crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {
+                            Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] })
+                        })
+                    });
+                let script = format!(
+                    r#"{START}
+printf '%s\n' '{}'
+IFS= read -r listen || exit 85
+case "$listen" in *'"method":"subscriptions/listen"'*) ;; *) exit 86 ;; esac
+printf '%s\n' '{}'
+IFS= read -r first || exit 87
+case "$first" in *'"method":"tasks/get"'*) ;; *) exit 88 ;; esac
+printf '%s\n' '{}' '{}'
+IFS= read -r update || exit 89
+case "$update" in *'"inputResponses":{{"roots":{{"roots":[]}}}}'*) ;; *) exit 90 ;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"resultType":"complete"}}}}' '{}' '{}'
+IFS= read -r reconcile || exit 91
+case "$reconcile" in *'"method":"tasks/get"'*) ;; *) exit 92 ;; esac
+printf '%s\n' '{}'
+IFS= read -r update || exit 93
+case "$update" in *'"inputResponses":{{"later":{{"roots":[]}}}}'*) ;; *) exit 94 ;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","id":7,"result":{{"resultType":"complete"}}}}'
+IFS= read -r reconcile || exit 95
+case "$reconcile" in *'"method":"tasks/get"'*) ;; *) exit 96 ;; esac
+printf '%s\n' '{}' '{}'
+IFS= read -r cancel || exit 97
+case "$cancel" in *'"requestId":3'*) ;; *) exit 98 ;; esac
+{}
+"#,
+                    response(2, &task("working", None, 1)),
+                    ack(3, json!(["stream-task"])),
+                    response(4, &with_poll(&task("working", None, 1), 600_001)),
+                    notification(3, &input_task(2, false)),
+                    notification(3, &input_task(2, false)),
+                    notification(3, &input_task(3, true)),
+                    response(6, &input_task(3, true)),
+                    response(8, &with_poll(&task("working", None, 4), 600_001)),
+                    notification(3, &task("completed", None, 5)),
+                    finish_script(9)
+                );
+                let (mut client, handle) = connect_with_handlers(&cx, &script, handlers).await;
+                let mut driver = handle.into_driver(drive_policy());
+                let live = McpRequestCancellation::new();
+                assert_eq!(
+                    driver
+                        .drive_watching_with_stdio(&cx, &mut client, &live)
+                        .await
+                        .unwrap(),
+                    FinalTaskWaitOutcome::Completed
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    2,
+                    "an answered key is never replayed"
+                );
+                assert!(!driver.input_resolution_interrupted());
+                assert_completed(driver.task());
+                assert_eq!(
+                    driver
+                        .drive_watching_with_stdio(&cx, &mut client, &live)
+                        .await
+                        .unwrap(),
+                    FinalTaskWaitOutcome::Completed,
+                    "a terminal Task opens no second listener"
+                );
+                finish(&cx, &mut client).await;
+            });
+    }
+
+    #[test]
+    fn public_stdio_task_watch_driver_preserves_partial_ingress_across_due_poll() {
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let terminal = notification(3, &task("completed", None, 2));
+                let (prefix, suffix) = terminal.split_at(65);
+                let script = format!(
+                    r#"{START}
+printf '%s\n' '{}'
+IFS= read -r listen || exit 85
+printf '%s\n' '{}'
+IFS= read -r reconcile || exit 86
+case "$reconcile" in *'"method":"tasks/get"'*) ;; *) exit 87 ;; esac
+case "$reconcile" in *'"id":4'*) ;; *) exit 88 ;; esac
+printf '%s\n' '{}'
+printf '%s' '{prefix}'
+IFS= read -r poll || exit 89
+case "$poll" in *'"method":"tasks/get"'*) ;; *) exit 90 ;; esac
+case "$poll" in *'"id":5'*) ;; *) exit 91 ;; esac
+printf '%s\n' '{suffix}' '{}'
+IFS= read -r cancel || exit 92
+case "$cancel" in *'"requestId":3'*) ;; *) exit 93 ;; esac
+{}
+"#,
+                    response(2, &task("working", None, 1)),
+                    ack(3, json!(["stream-task"])),
+                    response(4, &with_poll(&task("working", None, 1), 40)),
+                    response(5, &with_poll(&task("working", None, 1), 600_001)),
+                    finish_script(6)
+                );
+                let (mut client, handle) = connect(&cx, &script).await;
+                let mut driver = handle.into_driver(drive_policy());
+                assert_eq!(driver.drive_watching_with_stdio(
+                &cx, &mut client, &McpRequestCancellation::new(),
+            ).await.unwrap(), FinalTaskWaitOutcome::Completed);
+                assert_completed(driver.task());
+                finish(&cx, &mut client).await;
+            });
+    }
+
+    #[test]
+    fn public_stdio_task_watch_driver_cancellation_preserves_uncertain_input_custody() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owned = Arc::new(Mutex::new(None));
+                let observing = McpRequestCancellation::new();
+                let cancelled = observing.clone();
+                let observed = Arc::clone(&calls);
+                let callback_owner = Arc::clone(&owned);
+                let handlers = crate::ReverseRequestHandlers::new().with_modern_roots_list(
+                    move |_, local, _| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        *callback_owner.lock().unwrap() = Some(local);
+                        cancelled.cancel();
+                        Box::pin(std::future::pending())
+                    },
+                );
+                let script = format!(
+                    r#"{START}
+printf '%s\n' '{}'
+IFS= read -r listen || exit 85
+printf '%s\n' '{}'
+IFS= read -r reconcile || exit 86
+case "$reconcile" in *'"method":"tasks/get"'*) ;; *) exit 87 ;; esac
+printf '%s\n' '{}'
+IFS= read -r cancel || exit 88
+case "$cancel" in *'"method":"notifications/cancelled"'*) ;; *) exit 89 ;; esac
+case "$cancel" in *'"requestId":3'*) ;; *) exit 90 ;; esac
+{}
+"#,
+                    response(2, &input_task(1, false)),
+                    ack(3, json!(["stream-task"])),
+                    response(4, &input_task(2, false)),
+                    finish_script(5)
+                );
+                let (mut client, handle) = connect_with_handlers(&cx, &script, handlers).await;
+                let mut driver = handle.into_driver(drive_policy());
+                assert_eq!(
+                    driver
+                        .drive_watching_with_stdio(&cx, &mut client, &observing)
+                        .await
+                        .unwrap(),
+                    FinalTaskWaitOutcome::ObservationCancelled
+                );
+                assert!(driver.input_resolution_interrupted());
+                assert!(
+                    owned
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .is_cancel_requested()
+                );
+                let live = McpRequestCancellation::new();
+                assert!(
+                    driver
+                        .drive_watching_with_stdio(&cx, &mut client, &live)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    driver
+                        .drive_with_stdio(&cx, &mut client, &live)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                finish(&cx, &mut client).await;
+            });
+    }
+
+    #[test]
+    fn public_stdio_task_watch_driver_falls_back_after_empty_or_completed_listener() {
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            for empty in [false, true] {
+                let end = if empty {
+                    "IFS= read -r cancel || exit 86\ncase \"$cancel\" in *'\"requestId\":3'*) ;; *) exit 87 ;; esac\n".to_owned()
+                } else {
+                    format!("printf '%s\\n' '{}'\n", completion(3))
+                };
+                let script = format!(r#"{START}
+printf '%s\n' '{}'
+IFS= read -r listen || exit 85
+printf '%s\n' '{}'
+{end}
+IFS= read -r poll || exit 88
+case "$poll" in *'"method":"tasks/get"'*) ;; *) exit 89 ;; esac
+printf '%s\n' '{}'
+{}
+"#, response(2, &task("working", None, 1)),
+                    ack(3, if empty { json!([]) } else { json!(["stream-task"]) }),
+                    response(4, &task("completed", None, 2)), finish_script(5));
+                let (mut client, handle) = connect(&cx, &script).await;
+                let mut driver = handle.into_driver(drive_policy());
+                assert_eq!(driver.drive_watching_with_stdio(
+                    &cx, &mut client, &McpRequestCancellation::new(),
+                ).await.unwrap(), FinalTaskWaitOutcome::Completed);
+                assert_completed(driver.task());
+                finish(&cx, &mut client).await;
+            }
+        });
+    }
+
+    #[test]
+    fn public_stdio_task_watch_driver_cancel_and_drop_preserve_catalog_and_foreign_listener() {
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            for mode in ["cancel", "drop", "foreign"] {
+                let script = format!(r#"{START}
+printf '%s\n' '{}'
+IFS= read -r catalog || exit 85
+printf '%s\n' '{{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":3}},"notifications":{{"toolsListChanged":true}}}}}}'
+IFS= read -r listen || exit 86
+case "$listen" in *'"id":4'*) ;; *) exit 87 ;; esac
+printf '%s\n' '{}'
+IFS= read -r cancel || exit 88
+case "$cancel" in *'"requestId":4'*) ;; *) exit 89 ;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":3}}}}}}' '{}'
+{}
+"#, response(2, &with_poll(&task("working", None, 1), 600_001)),
+                    ack(4, json!(["stream-task"])), completion(3), finish_script(5));
+                let (mut client, handle) = connect(&cx, &script).await;
+                let live = McpRequestCancellation::new();
+                client.open_subscriptions_listener_with_cx(&cx, &live,
+                    SubscriptionFilter { tools_list_changed: Some(true), ..SubscriptionFilter::default() },
+                ).await.unwrap();
+                let mut driver = handle.into_driver(drive_policy());
+                let before = serde_json::to_vec(driver.task()).unwrap();
+                let observing = McpRequestCancellation::new();
+                if mode == "foreign" {
+                    client.open_final_task_subscription_listener_with_cx(&cx, &live,
+                        serde_json::from_value(json!({"taskIds":["stream-task"]})).unwrap(),
+                    ).await.unwrap();
+                    let before_id = client.peek_next_request_id();
+                    let error = driver.drive_watching_with_stdio(&cx, &mut client, &observing).await.unwrap_err();
+                    assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+                    assert_eq!(client.peek_next_request_id(), before_id);
+                    assert!(matches!(client.next_final_task_subscription_event_with_cx(&cx, &live).await.unwrap(),
+                        StdioTaskSubscriptionEvent::Acknowledged(_)), "the original Task listener survives rejection");
+                    client.cancel_live_final_task_subscription(&cx).unwrap();
+                } else {
+                    let mut driving = Box::pin(driver.drive_watching_with_stdio(&cx, &mut client, &observing));
+                    assert!(std::future::poll_fn(|task_cx| Poll::Ready(driving.as_mut().poll(task_cx))).await.is_pending());
+                    if mode == "cancel" {
+                        observing.cancel();
+                        assert_eq!(driving.await.unwrap(), FinalTaskWaitOutcome::ObservationCancelled);
+                    } else {
+                        drop(driving);
+                    }
+                }
+                assert_eq!(serde_json::to_vec(driver.task()).unwrap(), before);
+                assert!(!driver.input_resolution_interrupted());
+                assert!(matches!(client.next_subscription_event_with_cx(&cx, &live).await.unwrap(), StdioSubscriptionEvent::Acknowledged(_)));
+                assert!(matches!(client.next_subscription_event_with_cx(&cx, &live).await.unwrap(), StdioSubscriptionEvent::Notification(_)));
+                assert!(matches!(client.next_subscription_event_with_cx(&cx, &live).await.unwrap(), StdioSubscriptionEvent::Terminal));
+                finish(&cx, &mut client).await;
+            }
+        });
     }
 
     #[test]
@@ -360,7 +846,7 @@ mod websocket {
     use fastmcp_protocol::JsonRpcMessage;
     use fastmcp_transport::websocket::AsyncWsServerTransport;
 
-    async fn frame(peer: &mut VirtualTcpStream, source: &str) {
+    fn frame_bytes(source: &str) -> Vec<u8> {
         let payload = source.as_bytes();
         let mut bytes = vec![0x81];
         if payload.len() <= 125 {
@@ -370,12 +856,28 @@ mod websocket {
             bytes.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
         }
         bytes.extend_from_slice(payload);
-        peer.write_all(&bytes).await.unwrap();
+        bytes
+    }
+
+    async fn frame(peer: &mut VirtualTcpStream, source: &str) {
+        peer.write_all(&frame_bytes(source)).await.unwrap();
     }
 
     async fn connect(
         cx: &Cx,
         initial: &str,
+    ) -> (
+        WebSocketClient<VirtualTcpStream>,
+        FinalTaskHandle,
+        VirtualTcpStream,
+    ) {
+        connect_with_handlers(cx, initial, crate::ReverseRequestHandlers::new()).await
+    }
+
+    async fn connect_with_handlers(
+        cx: &Cx,
+        initial: &str,
+        handlers: crate::ReverseRequestHandlers,
     ) -> (
         WebSocketClient<VirtualTcpStream>,
         FinalTaskHandle,
@@ -389,6 +891,7 @@ mod websocket {
         frame(&mut peer, &response(2, initial)).await;
         let mut client = ClientBuilder::new()
             .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+            .reverse_request_handlers(handlers)
             .request_timeout_policy(
                 RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
             )
@@ -408,6 +911,304 @@ mod websocket {
             .await
             .unwrap();
         (client, handle, peer)
+    }
+
+    async fn receive(
+        cx: &Cx,
+        peer: &mut AsyncWsServerTransport<VirtualTcpStream>,
+        method: &str,
+        id: Option<i64>,
+    ) -> fastmcp_protocol::JsonRpcRequest {
+        let JsonRpcMessage::Request(request) = peer.recv(cx).await.unwrap() else {
+            panic!("expected WebSocket client request");
+        };
+        assert_eq!(request.method, method);
+        assert_eq!(request.id, id.map(RequestId::Number));
+        request
+    }
+
+    async fn send(cx: &Cx, peer: &mut AsyncWsServerTransport<VirtualTcpStream>, source: &str) {
+        peer.send(cx, &serde_json::from_str(source).unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn public_websocket_task_watch_driver_resolves_inputs_and_delivers_early_completion() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let handlers = crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] }) })
+            });
+            let (mut client, handle, peer) = connect_with_handlers(
+                &cx, &task("working", None, 1), handlers,
+            ).await;
+            let mut server = cx.spawn(move |peer_cx| async move {
+                let mut peer = AsyncWsServerTransport::from_upgraded(peer);
+                receive(&peer_cx, &mut peer, "server/discover", Some(1)).await;
+                receive(&peer_cx, &mut peer, "tasks/get", Some(2)).await;
+                let listen = receive(&peer_cx, &mut peer, "subscriptions/listen", Some(3)).await;
+                assert_eq!(listen.params.unwrap()["notifications"]["taskIds"], json!(["stream-task"]));
+                send(&peer_cx, &mut peer, &ack(3, json!(["stream-task"]))).await;
+                receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                send(&peer_cx, &mut peer, &response(4, &with_poll(&task("working", None, 1), 600_001))).await;
+                send(&peer_cx, &mut peer, &notification(3, &input_task(2, false))).await;
+                let update = receive(&peer_cx, &mut peer, "tasks/update", Some(5)).await;
+                assert_eq!(update.params.unwrap()["inputResponses"], json!({"roots":{"roots":[]}}));
+                send(&peer_cx, &mut peer, r#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete"}}"#).await;
+                send(&peer_cx, &mut peer, &notification(3, &input_task(2, false))).await;
+                send(&peer_cx, &mut peer, &notification(3, &input_task(3, true))).await;
+                receive(&peer_cx, &mut peer, "tasks/get", Some(6)).await;
+                send(&peer_cx, &mut peer, &response(6, &input_task(3, true))).await;
+                let update = receive(&peer_cx, &mut peer, "tasks/update", Some(7)).await;
+                assert_eq!(update.params.unwrap()["inputResponses"], json!({"later":{"roots":[]}}));
+                send(&peer_cx, &mut peer, r#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete"}}"#).await;
+                receive(&peer_cx, &mut peer, "tasks/get", Some(8)).await;
+                send(&peer_cx, &mut peer, &response(8, &with_poll(&task("working", None, 4), 600_001))).await;
+                send(&peer_cx, &mut peer, &notification(3, &task("completed", None, 5))).await;
+                let cancelled = receive(&peer_cx, &mut peer, "notifications/cancelled", None).await;
+                assert_eq!(cancelled.params.unwrap()["requestId"], 3);
+                receive(&peer_cx, &mut peer, "tools/list", Some(9)).await;
+                send(&peer_cx, &mut peer, r#"{"jsonrpc":"2.0","id":9,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#).await;
+                assert!(matches!(peer.recv(&peer_cx).await, Err(TransportError::Closed)));
+            }).unwrap();
+            let mut driver = handle.into_driver(drive_policy());
+            let live = McpRequestCancellation::new();
+            assert_eq!(driver.drive_watching_with_websocket(&cx, &mut client, &live).await.unwrap(),
+                FinalTaskWaitOutcome::Completed);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(!driver.input_resolution_interrupted());
+            let FinalTask::Completed { result, .. } = driver.task() else { panic!("notified completion expected"); };
+            // The typed peer's emitted map ordering is canonical; every numeric
+            // lexeme and opaque result member still survives the driver.
+            assert_eq!(serde_json::to_string(result).unwrap(),
+                serde_json::to_string(&serde_json::from_str::<serde_json::Value>(EXACT_RESULT).unwrap()).unwrap());
+            assert_eq!(driver.drive_watching_with_websocket(&cx, &mut client, &live).await.unwrap(),
+                FinalTaskWaitOutcome::Completed);
+            client.list_tools(&cx, None).await.unwrap();
+            client.close(&cx).await.unwrap();
+            server.join(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn public_websocket_task_watch_driver_preserves_partial_frame_across_due_poll() {
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let (mut client, handle, mut peer) = connect(&cx, &task("working", None, 1)).await;
+                frame(&mut peer, &ack(3, json!(["stream-task"]))).await;
+                let terminal = frame_bytes(&notification(3, &task("completed", None, 2)));
+                let live = McpRequestCancellation::new();
+                let mut driver = handle.into_driver(drive_policy());
+                let mut driving =
+                    Box::pin(driver.drive_watching_with_websocket(&cx, &mut client, &live));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(driving.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(80)).await;
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(driving.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                // Settle the attach/listen reconciliation before introducing the
+                // partial frame. Dropping the pending event wait for the later
+                // due poll (id 5) must retain the frame begun after read id 4.
+                frame(
+                    &mut peer,
+                    &response(4, &with_poll(&task("working", None, 1), 40)),
+                )
+                .await;
+                peer.write_all(&terminal[..65]).await.unwrap();
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(driving.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(80)).await;
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(driving.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                peer.write_all(&terminal[65..]).await.unwrap();
+                frame(
+                    &mut peer,
+                    &response(5, &with_poll(&task("working", None, 1), 600_001)),
+                )
+                .await;
+                assert_eq!(driving.await.unwrap(), FinalTaskWaitOutcome::Completed);
+                assert_completed(driver.task());
+                finish(
+                    &cx,
+                    &mut client,
+                    peer,
+                    &[
+                        ("server/discover", Some(1), None),
+                        ("tasks/get", Some(2), None),
+                        ("subscriptions/listen", Some(3), None),
+                        ("tasks/get", Some(4), None),
+                        ("tasks/get", Some(5), None),
+                        ("notifications/cancelled", None, Some(3)),
+                        ("tools/list", Some(6), None),
+                    ],
+                )
+                .await;
+            });
+    }
+
+    #[test]
+    fn public_websocket_task_watch_driver_cancellation_preserves_uncertain_input_custody() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let owned = Arc::new(Mutex::new(None));
+            let observing = McpRequestCancellation::new();
+            let cancelled = observing.clone();
+            let observed = Arc::clone(&calls);
+            let callback_owner = Arc::clone(&owned);
+            let handlers = crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                *callback_owner.lock().unwrap() = Some(local);
+                cancelled.cancel();
+                Box::pin(std::future::pending())
+            });
+            let (mut client, handle, mut peer) = connect_with_handlers(
+                &cx, &input_task(1, false), handlers,
+            ).await;
+            frame(&mut peer, &ack(3, json!(["stream-task"]))).await;
+            let mut server = cx.spawn(move |peer_cx| async move {
+                let mut peer = AsyncWsServerTransport::from_upgraded(peer);
+                receive(&peer_cx, &mut peer, "server/discover", Some(1)).await;
+                receive(&peer_cx, &mut peer, "tasks/get", Some(2)).await;
+                receive(&peer_cx, &mut peer, "subscriptions/listen", Some(3)).await;
+                receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                send(&peer_cx, &mut peer, &response(4, &input_task(2, false))).await;
+                let cancel = receive(&peer_cx, &mut peer, "notifications/cancelled", None).await;
+                assert_eq!(cancel.params.unwrap()["requestId"], 3);
+                receive(&peer_cx, &mut peer, "tools/list", Some(5)).await;
+                send(&peer_cx, &mut peer, r#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#).await;
+                assert!(matches!(peer.recv(&peer_cx).await, Err(TransportError::Closed)));
+            }).unwrap();
+            let mut driver = handle.into_driver(drive_policy());
+            assert_eq!(driver.drive_watching_with_websocket(&cx, &mut client, &observing).await.unwrap(),
+                FinalTaskWaitOutcome::ObservationCancelled);
+            assert!(driver.input_resolution_interrupted());
+            assert!(owned.lock().unwrap().as_ref().unwrap().is_cancel_requested());
+            let live = McpRequestCancellation::new();
+            assert!(driver.drive_watching_with_websocket(&cx, &mut client, &live).await.is_err());
+            assert!(driver.drive_with_websocket(&cx, &mut client, &live).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            client.list_tools(&cx, None).await.unwrap();
+            client.close(&cx).await.unwrap();
+            server.join(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn public_websocket_task_watch_driver_falls_back_after_empty_or_completed_listener() {
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            for empty in [false, true] {
+                let (mut client, handle, mut peer) = connect(&cx, &task("working", None, 1)).await;
+                frame(&mut peer, &ack(3, if empty { json!([]) } else { json!(["stream-task"]) })).await;
+                if !empty { frame(&mut peer, &completion(3)).await; }
+                let mut server = cx.spawn(move |peer_cx| async move {
+                    let mut peer = AsyncWsServerTransport::from_upgraded(peer);
+                    receive(&peer_cx, &mut peer, "server/discover", Some(1)).await;
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(2)).await;
+                    receive(&peer_cx, &mut peer, "subscriptions/listen", Some(3)).await;
+                    if empty {
+                        let cancel = receive(&peer_cx, &mut peer, "notifications/cancelled", None).await;
+                        assert_eq!(cancel.params.unwrap()["requestId"], 3);
+                    }
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                    send(&peer_cx, &mut peer, &response(4, &task("completed", None, 2))).await;
+                    receive(&peer_cx, &mut peer, "tools/list", Some(5)).await;
+                    send(&peer_cx, &mut peer, r#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#).await;
+                    assert!(matches!(peer.recv(&peer_cx).await, Err(TransportError::Closed)));
+                }).unwrap();
+                let mut driver = handle.into_driver(drive_policy());
+                assert_eq!(driver.drive_watching_with_websocket(
+                    &cx, &mut client, &McpRequestCancellation::new(),
+                ).await.unwrap(), FinalTaskWaitOutcome::Completed);
+                client.list_tools(&cx, None).await.unwrap();
+                client.close(&cx).await.unwrap();
+                server.join(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn public_websocket_task_watch_driver_cancel_and_drop_preserve_catalog_and_foreign_listener() {
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            for mode in ["cancel", "drop", "foreign"] {
+                let (mut client, handle, mut peer) = connect(&cx,
+                    &with_poll(&task("working", None, 1), 600_001),
+                ).await;
+                client.open_subscriptions_listener(&cx,
+                    SubscriptionFilter { tools_list_changed: Some(true), ..SubscriptionFilter::default() },
+                ).await.unwrap();
+                frame(&mut peer, r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3},"notifications":{"toolsListChanged":true}}}"#).await;
+                frame(&mut peer, &ack(4, json!(["stream-task"]))).await;
+                let live = McpRequestCancellation::new();
+                let observing = McpRequestCancellation::new();
+                let mut driver = handle.into_driver(drive_policy());
+                let before = serde_json::to_vec(driver.task()).unwrap();
+                if mode == "foreign" {
+                    client.open_final_task_subscription_listener(&cx,
+                        serde_json::from_value(json!({"taskIds":["stream-task"]})).unwrap(),
+                    ).await.unwrap();
+                    let before_id = client.next_id;
+                    let error = driver.drive_watching_with_websocket(&cx, &mut client, &observing).await.unwrap_err();
+                    assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+                    assert_eq!(client.next_id, before_id);
+                    assert!(matches!(client.next_final_task_subscription_event(&cx, &live).await.unwrap(),
+                        StdioTaskSubscriptionEvent::Acknowledged(_)));
+                    client.cancel_live_task_subscription().await.unwrap();
+                } else {
+                    let mut driving = Box::pin(driver.drive_watching_with_websocket(&cx, &mut client, &observing));
+                    assert!(std::future::poll_fn(|task_cx| Poll::Ready(driving.as_mut().poll(task_cx))).await.is_pending());
+                    if mode == "cancel" {
+                        observing.cancel();
+                        assert_eq!(driving.await.unwrap(), FinalTaskWaitOutcome::ObservationCancelled);
+                    } else {
+                        drop(driving);
+                    }
+                }
+                assert_eq!(serde_json::to_vec(driver.task()).unwrap(), before);
+                assert!(!driver.input_resolution_interrupted());
+                frame(&mut peer, r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#).await;
+                frame(&mut peer, &completion(3)).await;
+                assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(), StdioSubscriptionEvent::Acknowledged(_)));
+                assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(), StdioSubscriptionEvent::Notification(_)));
+                assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(), StdioSubscriptionEvent::Terminal));
+                finish(&cx, &mut client, peer, &[
+                    ("server/discover", Some(1), None), ("tasks/get", Some(2), None),
+                    ("subscriptions/listen", Some(3), None), ("subscriptions/listen", Some(4), None),
+                    ("notifications/cancelled", None, Some(4)), ("tools/list", Some(5), None),
+                ]).await;
+            }
+        });
     }
 
     async fn finish(

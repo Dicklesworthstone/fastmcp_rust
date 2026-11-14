@@ -346,6 +346,53 @@ impl FinalTaskDriver {
         drive_task_watching(self, cx, client, cancellation, ()).await
     }
 
+    /// Drives with the existing Unix stdio Task subscription and input handlers.
+    ///
+    /// Notifications and authoritative reads share the sole connection reader.
+    /// A polling deadline preserves partial ingress before the read is issued;
+    /// no competing receive loop or background task is created. The original
+    /// invocation bounds, input ledger and fallback rules are the same as
+    /// [`Self::drive_watching`]. An already-active Task listener is left intact
+    /// and causes this operation to fail before opening another one.
+    ///
+    /// During ordinary observation, cancellation or drop retires only this
+    /// operation's listener and any currently owned input operation. Catalog
+    /// listeners and other requests remain live; deferred cancellation is
+    /// flushed by the next client turn. Transport failures retain their normal
+    /// connection-failure semantics.
+    #[cfg(unix)]
+    pub async fn drive_watching_with_stdio(
+        &mut self,
+        cx: &Cx,
+        client: &mut Client,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<FinalTaskWaitOutcome> {
+        Box::pin(drive_task_watching(self, cx, client, cancellation, ())).await
+    }
+
+    /// Drives with the negotiated WebSocket Task subscription and input handlers.
+    ///
+    /// Partial frames remain on the existing connection when a due poll takes
+    /// over from a stream wait. Notifications can deliver input and completion
+    /// before that poll, under the same reconciliation, input-custody and
+    /// bounded fallback policy as [`Self::drive_watching`]. This does not open
+    /// another Task listener when one is already live, reconnect, or cancel the
+    /// remote Task. Clean observation cancellation and drop retire the exact
+    /// listen owner. An uncertain interrupted write still follows the existing
+    /// connection-failure rules because its frame cannot safely be replayed.
+    #[cfg(feature = "websocket-experimental")]
+    pub async fn drive_watching_with_websocket<IO>(
+        &mut self,
+        cx: &Cx,
+        client: &mut WebSocketClient<IO>,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<FinalTaskWaitOutcome>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Box::pin(drive_task_watching(self, cx, client, cancellation, ())).await
+    }
+
     /// Drives through the negotiated WebSocket dispatcher and callbacks.
     #[cfg(feature = "websocket-experimental")]
     pub async fn drive_with_websocket<IO>(
@@ -1987,8 +2034,9 @@ async fn resolve_driver_inputs<T: TaskInputTransport>(
 
 /// Only transports whose event future retains partial ingress on its listener
 /// may implement this trait. A poll timer may drop that future while retaining
-/// the listener, then issue an authoritative read on the same client. In
-/// particular, the stdio singleton reader is not admitted by this contract.
+/// the listener, then issue an authoritative read on the same client. The Unix
+/// stdio slice reader and WebSocket receive half retain their partial frames
+/// across that handoff; both continue using their sole connection dispatcher.
 trait TaskDriveWatchTransport: TaskInputTransport {
     type Listener;
     type Options;
@@ -1999,7 +2047,8 @@ trait TaskDriveWatchTransport: TaskInputTransport {
         cancellation: &McpRequestCancellation,
         filter: SubscriptionFilter,
         options: Self::Options,
-    ) -> Result<Self::Listener, Self::Error>;
+        listener: &mut Option<Self::Listener>,
+    ) -> Result<(), Self::Error>;
 
     async fn next_drive_event(
         &mut self,
@@ -2021,8 +2070,10 @@ impl TaskDriveWatchTransport for MemoryClient {
         cancellation: &McpRequestCancellation,
         filter: SubscriptionFilter,
         (): (),
-    ) -> McpResult<Self::Listener> {
-        self.subscribe(cx, cancellation, filter).await
+        listener: &mut Option<Self::Listener>,
+    ) -> McpResult<()> {
+        *listener = Some(self.subscribe(cx, cancellation, filter).await?);
+        Ok(())
     }
 
     async fn next_drive_event(
@@ -2039,6 +2090,79 @@ impl TaskDriveWatchTransport for MemoryClient {
     }
 }
 
+#[cfg(unix)]
+impl TaskDriveWatchTransport for Client {
+    type Listener = RequestId;
+    type Options = ();
+
+    async fn open_drive_watch(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        filter: SubscriptionFilter,
+        (): (),
+        listener: &mut Option<Self::Listener>,
+    ) -> McpResult<()> {
+        if TaskWatchTransport::live_watch_id(self).is_some() {
+            return Err(McpError::invalid_request(
+                "A final Tasks stdio subscription is already active on this client",
+            ));
+        }
+        TaskWatchTransport::open_watch(self, cx, cancellation, filter, listener).await
+    }
+
+    async fn next_drive_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        listener: &mut Self::Listener,
+    ) -> McpResult<StdioTaskSubscriptionEvent> {
+        TaskWatchTransport::next_watch_event(self, cx, cancellation, listener).await
+    }
+
+    fn abandon_drive_watch(&mut self, listener: Self::Listener) {
+        TaskWatchTransport::abandon_watch(self, listener);
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<IO> TaskDriveWatchTransport for WebSocketClient<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Listener = RequestId;
+    type Options = ();
+
+    async fn open_drive_watch(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        filter: SubscriptionFilter,
+        (): (),
+        listener: &mut Option<Self::Listener>,
+    ) -> McpResult<()> {
+        if TaskWatchTransport::live_watch_id(self).is_some() {
+            return Err(McpError::invalid_request(
+                "A final Tasks WebSocket subscription is already active on this client",
+            ));
+        }
+        TaskWatchTransport::open_watch(self, cx, cancellation, filter, listener).await
+    }
+
+    async fn next_drive_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        listener: &mut Self::Listener,
+    ) -> McpResult<StdioTaskSubscriptionEvent> {
+        TaskWatchTransport::next_watch_event(self, cx, cancellation, listener).await
+    }
+
+    fn abandon_drive_watch(&mut self, listener: Self::Listener) {
+        TaskWatchTransport::abandon_watch(self, listener);
+    }
+}
+
 impl TaskDriveWatchTransport for HttpTaskInputTransport<'_> {
     type Listener = crate::ModernHttpSubscriptionListener;
     type Options = crate::sse::SseLimits;
@@ -2049,13 +2173,15 @@ impl TaskDriveWatchTransport for HttpTaskInputTransport<'_> {
         cancellation: &McpRequestCancellation,
         filter: SubscriptionFilter,
         limits: Self::Options,
-    ) -> Result<Self::Listener, HttpClientError> {
+        listener: &mut Option<Self::Listener>,
+    ) -> Result<(), HttpClientError> {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled().into());
         }
-        self.client_mut()
+        *listener = Some(self.client_mut()
             .open_final_task_watch_listener(cx, filter, limits)
-            .await
+            .await?);
+        Ok(())
     }
 
     async fn next_drive_event(
@@ -2199,17 +2325,25 @@ async fn drive_task_watching<T: TaskDriveWatchTransport>(
     // This fact survives future drop and a later switch to poll-only driving.
     driver.reconcile_before_input = true;
     let mut watch = TaskDriveWatch { client, listener: None };
-    watch.listener = Some(match budget
+    match budget
         .guard(
             cx,
             cancellation,
-            watch.client.open_drive_watch(cx, cancellation, filter, options),
+            watch.client.open_drive_watch(
+                cx, cancellation, filter, options, &mut watch.listener,
+            ),
         )
         .await
     {
         Ok(result) => result?,
         Err(outcome) => return Ok(outcome),
-    });
+    }
+    // Publish the exact owner inside the guarded open future. A cancellation
+    // selected immediately after a completed open must still let this guard
+    // retire the newly installed singleton listener, rather than orphaning it.
+    if watch.listener.is_none() {
+        return Err(McpError::internal_error("Final Task drive lost its listen owner").into());
+    }
 
     let mut polls = 0;
     let mut updates = 0;
