@@ -1634,13 +1634,28 @@ impl LegacyIngress {
     }
 
     fn authenticate(
-        &self,
-        server: &Server,
+        lifetime: &ConnectionLifetime,
         cx: &Cx,
         budget: Budget,
         request: &mut JsonRpcRequest,
     ) -> McpResult<AuthAdmissionReceipt> {
         Server::enforce_request_budget(cx, budget)?;
+        #[cfg(feature = "websocket")]
+        if lifetime.binding.transport == InboundRequestTransport::WebSocket
+            && !matches!(
+                &lifetime.binding.auth_custody,
+                Some(AuthDispatchCustody::WebSocket(_))
+            )
+        {
+            // A WebSocket frame cannot replace absent handshake custody with
+            // fresh per-frame credential authentication. The common commit
+            // consumes its rejection marker before checking exact generation
+            // and freshness, including when those checks refuse the frame.
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Authentication failed",
+            ));
+        }
         let (request_ctx, _request_lease_guard) =
             McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref()))
                 .with_budget_ceiling(budget)
@@ -1648,17 +1663,41 @@ impl LegacyIngress {
                 .ok_or_else(|| {
                     McpError::internal_error("request scope could not be established")
                 })?;
-        let (fingerprint, authenticated) = server.authenticate_request_without_commit(
-            &request_ctx,
-            AuthRequest {
-                method: &request.method,
-                params: request.params.as_ref(),
-                transport_authorization: None,
-                request_id: request_id_to_u64(request.id.as_ref()),
-            },
-        )?;
+        let (fingerprint, authenticated) = match &lifetime.binding.auth_custody {
+            Some(custody) => {
+                let inbound =
+                    InboundRequestContext::with_modern_connection_and_transport_authorization(
+                        cx.clone(),
+                        request_id_to_u64(request.id.as_ref()),
+                        lifetime.binding.transport,
+                        &lifetime.connection,
+                        lifetime.binding.authorization.clone(),
+                    );
+                #[cfg(feature = "websocket")]
+                if let AuthDispatchCustody::WebSocket(custody) = custody {
+                    // Consume the mixed-source fence in this same admission.
+                    // No rejected credential survives in a queued request,
+                    // and a rejected frame cannot poison later ID reuse.
+                    sanitize_websocket_decoded_request(custody, request);
+                }
+                let fingerprint = custody.commit(
+                    &request_ctx,
+                    &inbound,
+                    request,
+                    lifetime.binding.auth_generation,
+                )?;
+                (fingerprint, request_ctx.auth())
+            }
+            None => lifetime.server.authenticate_request_without_commit(
+                &request_ctx,
+                lifetime.binding.authorization.auth_request(
+                    &request.method,
+                    request.params.as_ref(),
+                    request_id_to_u64(request.id.as_ref()),
+                ),
+            )?,
+        };
         Server::enforce_request_context(&request_ctx)?;
-        bind_connection_principal(&self.principal, fingerprint)?;
         auth::strip_recognized_access_credentials(&mut request.params);
         Ok(AuthAdmissionReceipt {
             method: request.method.clone(),
@@ -1702,13 +1741,25 @@ impl LegacyIngress {
             return Ok(());
         }
         if request.id.is_none() && request.method == "notifications/cancelled" {
-            if let Ok(cancellation) = lifetime.server.authenticate_cancelled_control_notification(
+            // Control messages use the same generation-bound transport
+            // custody as ordinary requests, but can only verify an owner
+            // established by a prior admitted request.
+            let authentication = Self::authenticate(
+                lifetime,
                 cx,
-                &self.principal,
-                ProtocolEra::Legacy2024,
+                lifetime.server.create_request_budget(cx),
                 &mut request,
-                None,
-            ) {
+            );
+            if let Ok(authentication) = authentication
+                && let Ok(cancellation) =
+                    lifetime.server.authenticate_cancelled_control_notification(
+                        cx,
+                        &self.principal,
+                        ProtocolEra::Legacy2024,
+                        &mut request,
+                        Some(&authentication),
+                    )
+            {
                 if lifetime
                     .admission
                     .cancel_reserved(Server::cancellation_wire_request_id(&cancellation))
@@ -1764,7 +1815,12 @@ impl LegacyIngress {
                 active: None,
             })),
         });
-        let authentication = match self.authenticate(&lifetime.server, cx, budget, &mut request) {
+        let authentication = match Self::authenticate(lifetime, cx, budget, &mut request)
+            .and_then(|receipt| {
+                bind_connection_principal(&self.principal, receipt.fingerprint)?;
+                Ok(receipt)
+            })
+        {
             Ok(receipt) => receipt,
             Err(error) => {
                 if let Some(id) = request.id {
@@ -2180,7 +2236,23 @@ impl NativeProtocol {
             }
         }
         match self {
-            Self::Modern => prepare_request(lifetime, cx, frame).map(ConnectionAdmission::Continue),
+            Self::Modern => {
+                // Auto WebSocket admission has always made an attempted
+                // switch back to initialization terminal for this peer.
+                // A fixed ModernOnly listener retains its ordinary stateless
+                // per-request diagnostic and stays usable after that refusal.
+                #[cfg(feature = "websocket")]
+                if lifetime.binding.transport == InboundRequestTransport::WebSocket
+                    && lifetime.server.protocol_policy == ProtocolPolicy::Auto
+                    && let JsonRpcMessage::Request(request) = frame.message()
+                    && request.method == "initialize"
+                    && !Self::has_modern_marker(request)
+                {
+                    Self::refuse_opening(lifetime, request, false);
+                    return Ok(ConnectionAdmission::Close);
+                }
+                prepare_request(lifetime, cx, frame).map(ConnectionAdmission::Continue)
+            }
             Self::Legacy(legacy) => {
                 if let JsonRpcMessage::Request(request) = frame.message()
                     && Self::has_modern_marker(request)
@@ -2829,10 +2901,12 @@ impl Server {
     }
 
     /// The listener owns startup, the shared Task service, and shutdown.
-    /// Each upgraded modern connection owns only its native I/O, requests,
-    /// and output; closing it cannot terminate a sibling's subscriptions.
+    /// Each upgraded connection owns its native I/O, immutable era selection,
+    /// requests, and output. Closing it cannot terminate a sibling's
+    /// subscriptions. Both exact-2024 and modern admission consume the same
+    /// generation-bound authentication custody from the accepted upgrade.
     #[cfg(feature = "websocket")]
-    pub(super) async fn serve_modern_websocket<IO>(
+    pub(super) async fn serve_native_websocket<IO>(
         self: Arc<Self>,
         cx: &Cx,
         transport: fastmcp_transport::websocket::AsyncWsServerTransport<IO>,
@@ -2899,18 +2973,7 @@ impl Server {
         };
         lifetime.output.start();
         #[cfg(feature = "legacy-2024-11-05")]
-        let mut protocol = NativeProtocol::new(
-            if matches!(
-                lifetime.binding.transport,
-                InboundRequestTransport::Stdio | InboundRequestTransport::Memory
-            ) {
-                server.protocol_policy
-            } else {
-                // WebSocket retains its existing ModernOnly native binding;
-                // its dual-era bridge owns separate upgrade authentication.
-                ProtocolPolicy::ModernOnly
-            },
-        );
+        let mut protocol = NativeProtocol::new(server.protocol_policy);
         let mut reading = Some(receive(reader, cx.clone()));
         // A terminal opening refusal must retain the receive half until its
         // response drains: dropping native stdio's reader closes the shared
@@ -3054,11 +3117,20 @@ impl Server {
                                 #[cfg(feature = "legacy-2024-11-05")]
                                 Ok(ConnectionAdmission::Close) => {
                                     dormant_reader = Some(reader);
-                                    error.get_or_insert(server_run_error(
-                                        "receive",
-                                        "protocol_era",
-                                        "Native connection rejected protocol-era traffic",
-                                    ));
+                                    // A WebSocket policy refusal closes only
+                                    // this peer after its diagnostic drains.
+                                    // It is not a failure of the shared
+                                    // listener; failed writes still surface
+                                    // through the ordinary egress path.
+                                    if lifetime.binding.transport
+                                        != InboundRequestTransport::WebSocket
+                                    {
+                                        error.get_or_insert(server_run_error(
+                                            "receive",
+                                            "protocol_era",
+                                            "Native connection rejected protocol-era traffic",
+                                        ));
+                                    }
                                     lifetime.admission.stop();
                                     protocol.finish_input();
                                     lifetime.output.discard_cancelled();
@@ -3299,6 +3371,193 @@ mod tests {
     use fastmcp_protocol::{Content, Tool};
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Waker};
+
+    #[cfg(all(feature = "websocket", feature = "legacy-2024-11-05"))]
+    mod legacy_websocket_custody {
+        use super::*;
+
+        fn custody_lifetime(authenticated: AuthContext) -> ConnectionLifetime {
+            let fingerprint = auth::principal_fingerprint(Some(&authenticated)).unwrap();
+            ConnectionLifetime {
+                server: Arc::new(
+                    Server::new("native-legacy-custody", "1")
+                        .protocol_policy(ProtocolPolicy::Auto)
+                        .unwrap()
+                        .without_stats()
+                        .without_banner()
+                        .build(),
+                ),
+                connection: ModernConnection::new(),
+                admission: Arc::new(DispatchQueueState::default()),
+                output: Arc::new(OutputQueue::default()),
+                binding: ConnectionBinding {
+                    transport: InboundRequestTransport::WebSocket,
+                    authorization: TransportAuthorization::from_singleton_header(Some(
+                        "Bearer accepted-at-upgrade",
+                    )),
+                    auth_custody: Some(AuthDispatchCustody::WebSocket(Arc::new(
+                        WebSocketAuthCustody {
+                            connection_generation: 44,
+                            fingerprint,
+                            authenticated: Some(authenticated),
+                            rejected_inband_request_ids: Mutex::new(HashSet::new()),
+                        },
+                    ))),
+                    auth_generation: Some(44),
+                },
+            }
+        }
+
+        fn receipt(
+            lifetime: &ConnectionLifetime,
+            cx: &Cx,
+            request: &mut JsonRpcRequest,
+        ) -> McpResult<AuthAdmissionReceipt> {
+            LegacyIngress::authenticate(
+                lifetime,
+                cx,
+                lifetime.server.create_request_budget(cx),
+                request,
+            )
+        }
+
+        fn assert_no_retained_refusal(lifetime: &ConnectionLifetime) {
+            let Some(AuthDispatchCustody::WebSocket(custody)) = &lifetime.binding.auth_custody
+            else {
+                panic!("test connection retains its upgrade custody");
+            };
+            assert!(
+                custody
+                    .rejected_inband_request_ids
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn native_legacy_websocket_requires_live_exact_generation_custody() {
+            let cx = Cx::for_testing();
+            let authenticated = AuthContext::with_subject("upgrade-owner");
+            let fingerprint = auth::principal_fingerprint(Some(&authenticated)).unwrap();
+            let mut lifetime = custody_lifetime(authenticated.clone());
+            let mut request = JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 7_i64);
+            let accepted = receipt(&lifetime, &cx, &mut request).unwrap();
+            assert_eq!(accepted.fingerprint, fingerprint);
+            assert_eq!(
+                accepted.authenticated.unwrap().subject.as_deref(),
+                Some("upgrade-owner")
+            );
+
+            for generation in [Some(45), None] {
+                lifetime.binding.auth_generation = generation;
+                assert_eq!(
+                    receipt(&lifetime, &cx, &mut request).err().unwrap().code,
+                    McpErrorCode::ResourceForbidden,
+                );
+                request.params = Some(serde_json::json!({"_meta": {"token": "refused"}}));
+                assert_eq!(
+                    receipt(&lifetime, &cx, &mut request).err().unwrap().code,
+                    McpErrorCode::ResourceForbidden,
+                );
+                assert_no_retained_refusal(&lifetime);
+                request.params = Some(serde_json::json!({}));
+            }
+            lifetime.binding.auth_generation = Some(44);
+            assert!(
+                receipt(&lifetime, &cx, &mut request).is_ok(),
+                "refused generation cannot leave a marker that poisons the same ID"
+            );
+            lifetime.binding.auth_custody = None;
+            assert_eq!(
+                receipt(&lifetime, &cx, &mut request).err().unwrap().code,
+                McpErrorCode::ResourceForbidden,
+                "a retained header cannot replace absent handshake custody",
+            );
+
+            let expired =
+                custody_lifetime(authenticated.with_verification_valid_until(Instant::now()));
+            assert_eq!(
+                receipt(&expired, &cx, &mut request).err().unwrap().code,
+                McpErrorCode::ResourceForbidden,
+            );
+            for id in 100_i64..108 {
+                let mut mixed = JsonRpcRequest::new(
+                    "tools/list",
+                    Some(serde_json::json!({"_meta": {"token": "refused-after-expiry"}})),
+                    id,
+                );
+                assert_eq!(
+                    receipt(&expired, &cx, &mut mixed).err().unwrap().code,
+                    McpErrorCode::ResourceForbidden,
+                );
+                assert_no_retained_refusal(&expired);
+            }
+        }
+
+        #[test]
+        fn native_legacy_websocket_cancellation_cannot_establish_principal() {
+            let cx = Cx::for_testing();
+            let lifetime = custody_lifetime(AuthContext::with_subject("upgrade-owner"));
+            let mut mixed = JsonRpcRequest::new(
+                "tools/list",
+                Some(serde_json::json!({"_meta": {"token": "forbidden-in-band"}})),
+                7_i64,
+            );
+            assert_eq!(
+                receipt(&lifetime, &cx, &mut mixed).err().unwrap().code,
+                McpErrorCode::ResourceForbidden,
+            );
+            assert!(
+                mixed.params.as_ref().unwrap()["_meta"]
+                    .get("token")
+                    .is_none()
+            );
+            assert_no_retained_refusal(&lifetime);
+            let mut admitted =
+                JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 7_i64);
+            let authentication = receipt(&lifetime, &cx, &mut admitted)
+                .expect("a refused in-band credential cannot poison later reuse of its ID");
+            let principal = SessionPrincipalBinding::default();
+            let mut cancel = JsonRpcRequest::notification(
+                "notifications/cancelled",
+                Some(serde_json::json!({"requestId": 7})),
+            );
+            let control_auth = receipt(&lifetime, &cx, &mut cancel).unwrap();
+            assert!(
+                lifetime
+                    .server
+                    .authenticate_cancelled_control_notification(
+                        &cx,
+                        &principal,
+                        ProtocolEra::Legacy2024,
+                        &mut cancel,
+                        Some(&control_auth),
+                    )
+                    .is_err()
+            );
+            assert!(!principal.verify_existing(authentication.fingerprint));
+
+            bind_connection_principal(&principal, authentication.fingerprint).unwrap();
+            let cancellation = lifetime
+                .server
+                .authenticate_cancelled_control_notification(
+                    &cx,
+                    &principal,
+                    ProtocolEra::Legacy2024,
+                    &mut cancel,
+                    Some(&control_auth),
+                )
+                .expect(
+                    "the same control is admitted only after an ordinary request binds ownership",
+                );
+            assert_eq!(
+                Server::cancellation_wire_request_id(&cancellation),
+                &RequestId::Number(7)
+            );
+            assert!(principal.verify_existing(authentication.fingerprint));
+        }
+    }
 
     mod output_cancellation {
         use super::*;

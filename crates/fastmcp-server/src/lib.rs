@@ -3384,9 +3384,8 @@ type SubscriptionDeliverySender = Arc<
 >;
 
 #[derive(Clone)]
-enum PumpIoMode {
-    Split,
-    #[cfg(feature = "websocket")]
+enum PumpIoMode {    Split,
+    #[cfg(all(test, feature = "websocket"))]
     GuardedSplit(SubscriptionDeliverySender),
     #[cfg(not(feature = "legacy-2024-11-05"))]
     GuardedUnsplit(SubscriptionDeliverySender),
@@ -3401,7 +3400,7 @@ impl PumpIoMode {
     fn subscription_sender(&self) -> Option<SubscriptionDeliverySender> {
         match self {
             Self::Split => None,
-            #[cfg(feature = "websocket")]
+            #[cfg(all(test, feature = "websocket"))]
             Self::GuardedSplit(sender) => Some(Arc::clone(sender)),
             #[cfg(not(feature = "legacy-2024-11-05"))]
             Self::GuardedUnsplit(sender) => Some(Arc::clone(sender)),
@@ -9757,16 +9756,14 @@ impl Drop for BoundHttpServer {
     }
 }
 
-// The WebSocket adapter owns one read/write object, while the established
-// dual-era server dispatcher owns independent synchronous receive and send
-// halves. Keep their bridge bounded in both directions; this preserves the
-// dispatcher's mature cancellation and reverse-request semantics without
-// giving a slow socket an unbounded in-memory queue.
-#[cfg(feature = "websocket")]
+// Retain the former blocking WebSocket bridge for test-only comparison. The
+// public listener uses native independently owned read/write halves in every
+// protocol policy and never enters this bridge.
+#[cfg(all(test, feature = "websocket"))]
 const WEBSOCKET_BRIDGE_QUEUE_CAPACITY: usize = 64;
 #[cfg(feature = "websocket")]
 const WEBSOCKET_HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
-#[cfg(feature = "websocket")]
+#[cfg(all(test, feature = "websocket"))]
 const WEBSOCKET_DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(feature = "websocket")]
 const WEBSOCKET_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -9780,10 +9777,11 @@ static NEXT_WEBSOCKET_AUTH_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// A bound, caller-owned WebSocket listener.
 ///
 /// Each accepted connection completes HTTP Upgrade before dispatch. A
-/// ModernOnly listener drives independently owned native read/write halves
-/// and request child regions without a blocking worker. Auto and LegacyOnly
-/// retain the split dual-era dispatcher used by synchronous stdio. Protocol
-/// binding, cancellation, and authentication remain connection scoped.
+/// listener drives independently owned native read/write halves and request
+/// child regions without a blocking connection worker. Auto selects one exact
+/// protocol era per connection; LegacyOnly retains serialized exact-2024
+/// lifecycle dispatch while reverse responses and cancellation remain live.
+/// Protocol binding and Upgrade authentication remain connection scoped.
 #[cfg(feature = "websocket")]
 pub struct BoundWebSocketServer {
     listener: AsyncTcpListener,
@@ -10120,12 +10118,12 @@ impl AsyncWrite for PrefixedWebSocketStream {
     }
 }
 
-#[cfg(feature = "websocket")]
+#[cfg(all(test, feature = "websocket"))]
 struct WebSocketBridgeRecv {
     receiver: asupersync_mpsc::Receiver<JsonRpcMessage>,
 }
 
-#[cfg(feature = "websocket")]
+#[cfg(all(test, feature = "websocket"))]
 impl TransportRecvHalf for WebSocketBridgeRecv {
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
         loop {
@@ -10155,12 +10153,12 @@ impl TransportRecvHalf for WebSocketBridgeRecv {
     }
 }
 
-#[cfg(feature = "websocket")]
+#[cfg(all(test, feature = "websocket"))]
 struct WebSocketBridgeSend {
     sender: asupersync_mpsc::Sender<GuardedTransportOutput>,
 }
 
-#[cfg(feature = "websocket")]
+#[cfg(all(test, feature = "websocket"))]
 impl WebSocketBridgeSend {
     fn send_with_delivery(
         &mut self,
@@ -10194,7 +10192,7 @@ impl WebSocketBridgeSend {
     }
 }
 
-#[cfg(feature = "websocket")]
+#[cfg(all(test, feature = "websocket"))]
 impl TransportSendHalf for WebSocketBridgeSend {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         self.send_with_delivery(cx, message, None)
@@ -10299,26 +10297,15 @@ async fn serve_websocket_connection(
         prefix: trailing,
         stream,
     });
-    if server.protocol_policy == ProtocolPolicy::ModernOnly {
-        return server
-            .serve_modern_websocket(
-                cx,
-                transport,
-                transport_authorization,
-                auth_custody,
-                connection_generation,
-            )
-            .await;
-    }
-    run_websocket_dispatch_bridge(
-        cx,
-        server,
-        transport,
-        transport_authorization,
-        auth_custody,
-        connection_generation,
-    )
-    .await
+    server
+        .serve_native_websocket(
+            cx,
+            transport,
+            transport_authorization,
+            auth_custody,
+            connection_generation,
+        )
+        .await
 }
 
 #[cfg(feature = "websocket")]
@@ -10471,7 +10458,8 @@ fn raw_websocket_upgrade_authorization_is_admissible(head: &[u8]) -> Result<(), 
     Ok(())
 }
 
-#[cfg(feature = "websocket")]
+#[cfg(all(test, feature = "websocket"))]
+#[allow(dead_code, reason = "retained comparison path; public WebSocket serving is native")]
 async fn run_websocket_dispatch_bridge(
     cx: &Cx,
     server: Arc<Server>,
@@ -10621,7 +10609,7 @@ impl Server {
         })
     }
 
-    /// Binds and serves a turnkey WebSocket MCP bridge until `cx` is cancelled.
+    /// Binds and serves native WebSocket MCP connections until `cx` is cancelled.
     pub async fn serve_websocket(
         self,
         cx: &Cx,
@@ -10990,6 +10978,24 @@ enum AuthDispatchCustody {
     WebSocket(Arc<WebSocketAuthCustody>),
 }
 
+/// A decoded frame's sanitation marker must be retired even when its request
+/// context fails admission before authentication custody can be consumed.
+#[cfg(feature = "websocket")]
+struct WebSocketFrameRejectionCleanup<'a>(Option<&'a AuthDispatchCustody>, u64);
+
+#[cfg(feature = "websocket")]
+impl Drop for WebSocketFrameRejectionCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(AuthDispatchCustody::WebSocket(custody)) = self.0 {
+            custody
+                .rejected_inband_request_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.1);
+        }
+    }
+}
+
 impl AuthDispatchCustody {
     fn commit(
         &self,
@@ -11004,13 +11010,18 @@ impl AuthDispatchCustody {
             Self::Http(receipt) => receipt.commit(ctx, inbound, request),
             #[cfg(feature = "websocket")]
             Self::WebSocket(custody) => {
+                // This marker belongs to the decoded frame, including a frame
+                // refused for expired or stale connection custody. Consume it
+                // before any early return so rejection cannot retain IDs or
+                // contaminate a later request that reuses the same ID.
+                let rejected_inband_credentials = custody
+                    .rejected_inband_request_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&request_id_to_u64(request.id.as_ref()));
                 Server::enforce_authentication_freshness(custody.authenticated.as_ref())?;
                 if _websocket_connection_generation != Some(custody.connection_generation)
-                    || custody
-                        .rejected_inband_request_ids
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&request_id_to_u64(request.id.as_ref()))
+                    || rejected_inband_credentials
                     || !inbound
                         .auth_request(&request.method, request.params.as_ref())
                         .credential_sources_are_admissible()
@@ -20503,7 +20514,7 @@ impl Server {
         combine_split_transport_results(run_result, recv_close, send_close)
     }
 
-    #[cfg(feature = "websocket")]
+    #[cfg(all(test, feature = "websocket"))]
     fn run_split_transport_returning_shared_with_dispatch_cx<R>(
         self: Arc<Self>,
         pump_cx: &Cx,
@@ -20879,7 +20890,7 @@ impl Server {
         }
     }
 
-    #[cfg(feature = "websocket")]
+    #[cfg(all(test, feature = "websocket"))]
     fn run_loop_returning_shared_with_dispatch_cx<R, S>(
         self: Arc<Self>,
         pump_cx: &Cx,
@@ -24849,6 +24860,9 @@ impl Server {
         auth_receipt: Option<&AuthDispatchCustody>,
         websocket_connection_generation: Option<u64>,
     ) -> McpResult<AuthDispatchCustody> {
+        #[cfg(feature = "websocket")]
+        let _frame_rejection =
+            WebSocketFrameRejectionCleanup(auth_receipt, request_id_to_u64(request.id.as_ref()));
         let context = inbound.request_context();
         let budget = self.create_request_budget(context.cx());
         let (context, _lease) = context
@@ -24898,6 +24912,9 @@ impl Server {
         auth_receipt: Option<&AuthDispatchCustody>,
         websocket_connection_generation: Option<u64>,
     ) -> McpResult<CancellationWireMessage> {
+        #[cfg(feature = "websocket")]
+        let _frame_rejection =
+            WebSocketFrameRejectionCleanup(auth_receipt, request_id_to_u64(request.id.as_ref()));
         let context = inbound.request_context();
         let budget = self.create_request_budget(context.cx());
         let (context, _lease) = context
@@ -27900,7 +27917,7 @@ mod lib_unit_tests {
     #[cfg(all(feature = "websocket", feature = "legacy-2024-11-05"))]
     #[test]
     fn live_websocket_auto_accepts_fresh_eras_and_fences_cross_era_traffic() {
-        run_live_http_test(|cx| async move {
+        run_live_native_websocket_test(|cx| async move {
             use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 
             fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -28171,6 +28188,783 @@ mod lib_unit_tests {
             }
             Ok(())
         });
+    }
+
+    #[cfg(feature = "websocket")]
+    mod native_websocket_policy {
+        use super::*;
+        use fastmcp_transport::websocket::AsyncWsClientTransport;
+
+        type Peer = AsyncWsClientTransport<PrefixedWebSocketStream>;
+
+        async fn connect(cx: &Cx, address: SocketAddr) -> Result<Peer, String> {
+            let opening = concat!(
+                "GET /mcp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n",
+                "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+                "Authorization: Bearer alpha\r\n\r\n"
+            );
+            let (stream, received) = websocket_upgrade(cx, address, opening.as_bytes()).await?;
+            if !received.starts_with(b"HTTP/1.1 101") {
+                return Err("native WebSocket did not admit the authenticated Upgrade".to_owned());
+            }
+            let header_end = received
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .ok_or_else(|| {
+                    "native WebSocket Upgrade omitted its header terminator".to_owned()
+                })?
+                + 4;
+            Ok(AsyncWsClientTransport::from_upgraded(
+                PrefixedWebSocketStream {
+                    prefix: received[header_end..].to_vec(),
+                    stream,
+                },
+            ))
+        }
+
+        async fn send(peer: &mut Peer, cx: &Cx, message: JsonRpcMessage) -> Result<(), String> {
+            let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+            asupersync::time::timeout_at(deadline, peer.send(cx, &message))
+                .await
+                .map_err(|_| "native WebSocket send timed out".to_owned())?
+                .map_err(|error| format!("native WebSocket send failed: {error}"))
+        }
+
+        async fn receive(peer: &mut Peer, cx: &Cx) -> Result<JsonRpcMessage, String> {
+            let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+            asupersync::time::timeout_at(deadline, peer.recv(cx))
+                .await
+                .map_err(|_| "native WebSocket receive timed out".to_owned())?
+                .map_err(|error| format!("native WebSocket receive failed: {error}"))
+        }
+
+        async fn response(peer: &mut Peer, cx: &Cx, id: i64) -> Result<JsonRpcResponse, String> {
+            for _ in 0..64 {
+                match receive(peer, cx).await? {
+                    JsonRpcMessage::Response(response)
+                        if response.id == Some(RequestId::from(id)) =>
+                    {
+                        return Ok(response);
+                    }
+                    JsonRpcMessage::Request(notification) if notification.id.is_none() => {}
+                    message => {
+                        return Err(format!("unexpected native WebSocket message: {message:?}"));
+                    }
+                }
+            }
+            Err("native WebSocket response exceeded its notification bound".to_owned())
+        }
+
+        fn tool_request(id: i64, legacy: bool, arguments: serde_json::Value) -> JsonRpcRequest {
+            let mut params =
+                serde_json::json!({"name": "native_websocket_probe", "arguments": arguments});
+            if !legacy {
+                params["_meta"] = serde_json::json!({
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                });
+            }
+            JsonRpcRequest::new("tools/call", Some(params), id)
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        async fn initialize(
+            peer: &mut Peer,
+            cx: &Cx,
+            capabilities: serde_json::Value,
+        ) -> Result<(), String> {
+            let JsonRpcMessage::Request(mut request) =
+                exact_legacy_initialize_request(1, serde_json::json!("1.0.0"))
+            else {
+                unreachable!()
+            };
+            request.params.as_mut().unwrap()["capabilities"] = capabilities;
+            send(peer, cx, JsonRpcMessage::Request(request)).await?;
+            let initialized = response(peer, cx, 1).await?;
+            if initialized.error.is_some()
+                || initialized
+                    .result
+                    .as_ref()
+                    .and_then(|value| value.get("protocolVersion"))
+                    != Some(&serde_json::json!(LEGACY_PROTOCOL_VERSION))
+                || initialized
+                    .result
+                    .as_ref()
+                    .and_then(|value| value.get("instructions"))
+                    != Some(&serde_json::json!("native WebSocket instructions"))
+            {
+                return Err(format!(
+                    "native WebSocket lost exact-2024 configuration: {initialized:?}"
+                ));
+            }
+            send(
+                peer,
+                cx,
+                JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/initialized",
+                    None,
+                )),
+            )
+            .await
+        }
+
+        struct Probe {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for Probe {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "native_websocket_probe".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({
+                        "type": "object", "properties": {"mode": {"type": "string"}},
+                        "additionalProperties": false,
+                    }),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn execution_mode(&self) -> ToolExecutionMode {
+                ToolExecutionMode::Async
+            }
+
+            fn call(
+                &self,
+                ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                if ctx.auth().and_then(|auth| auth.subject).as_deref() != Some("one-shot-alpha")
+                    || ctx.cx().capabilities().remote
+                    || Cx::current().is_none_or(|caller| caller.capabilities().remote)
+                {
+                    return Err(McpError::internal_error(
+                        "native WebSocket lost caller authority",
+                    ));
+                }
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                Ok(vec![Content::text("native authenticated dispatch")])
+            }
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        struct ReverseProbe {
+            calls: Arc<AtomicUsize>,
+            active: Arc<AtomicUsize>,
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        impl ToolHandler for ReverseProbe {
+            fn definition(&self) -> Tool {
+                Probe {
+                    calls: Arc::clone(&self.calls),
+                }
+                .definition()
+            }
+
+            fn execution_mode(&self) -> ToolExecutionMode {
+                ToolExecutionMode::Async
+            }
+
+            fn call(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                Err(McpError::internal_error(
+                    "native reverse probe requires async dispatch",
+                ))
+            }
+
+            fn call_async<'a>(
+                &'a self,
+                ctx: &'a McpContext,
+                arguments: serde_json::Value,
+            ) -> BoxFuture<'a, fastmcp_core::McpOutcome<Vec<Content>>> {
+                Box::pin(async move {
+                    if let Err(error) = (Probe {
+                        calls: Arc::clone(&self.calls),
+                    })
+                    .call(ctx, serde_json::json!({}))
+                    {
+                        return asupersync::Outcome::Err(error);
+                    }
+                    struct Active(Arc<AtomicUsize>);
+                    impl Drop for Active {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+                    self.active.fetch_add(1, Ordering::AcqRel);
+                    let _active = Active(Arc::clone(&self.active));
+                    let result = match arguments.get("mode").and_then(serde_json::Value::as_str) {
+                        Some("sample") => ctx
+                            .sample("native WebSocket sample", 16)
+                            .await
+                            .and_then(fastmcp_core::SamplingResponse::into_text),
+                        Some("roots") => ctx.list_roots().await.map(|roots| {
+                            roots
+                                .first()
+                                .map_or_else(|| "no roots".to_owned(), |root| root.uri.clone())
+                        }),
+                        _ => Ok("native authenticated dispatch".to_owned()),
+                    };
+                    match result {
+                        Ok(text) => asupersync::Outcome::Ok(vec![Content::text(text)]),
+                        Err(error) => asupersync::Outcome::Err(error),
+                    }
+                })
+            }
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        async fn reverse_request(
+            peer: &mut Peer,
+            cx: &Cx,
+            method: &str,
+        ) -> Result<RequestId, String> {
+            for _ in 0..64 {
+                match receive(peer, cx).await? {
+                    JsonRpcMessage::Request(request) if request.method == method => {
+                        if request
+                            .params
+                            .as_ref()
+                            .is_some_and(|params| params.get("_meta").is_some())
+                        {
+                            return Err(
+                                "legacy WebSocket reverse request carried final-era metadata"
+                                    .to_owned(),
+                            );
+                        }
+                        return request
+                            .id
+                            .ok_or_else(|| "reverse request omitted its ID".to_owned());
+                    }
+                    JsonRpcMessage::Request(notification) if notification.id.is_none() => {}
+                    message => {
+                        return Err(format!(
+                            "unexpected message before reverse request: {message:?}"
+                        ));
+                    }
+                }
+            }
+            Err("native WebSocket reverse request exceeded its notification bound".to_owned())
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        fn require_text(response: &JsonRpcResponse, expected: &str) -> Result<(), String> {
+            if response.error.is_some()
+                || response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("content"))
+                    .and_then(|content| content.get(0))
+                    .and_then(|content| content.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected)
+            {
+                return Err(format!(
+                    "native WebSocket tool result was not {expected:?}: {response:?}"
+                ));
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn native_websocket_policies_preserve_upgrade_auth_and_options_without_blocking_pool() {
+            let policies = [
+                (ProtocolPolicy::ModernOnly, false),
+                #[cfg(feature = "legacy-2024-11-05")]
+                (ProtocolPolicy::Auto, false),
+                #[cfg(feature = "legacy-2024-11-05")]
+                (ProtocolPolicy::Auto, true),
+                #[cfg(feature = "legacy-2024-11-05")]
+                (ProtocolPolicy::LegacyOnly, true),
+            ];
+            for (policy, legacy) in policies {
+                run_live_native_websocket_test(move |cx| async move {
+                    use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+                    let provider_calls = Arc::new(AtomicUsize::new(0));
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let middleware_calls = Arc::new(AtomicUsize::new(0));
+                    let saw_credential = Arc::new(AtomicBool::new(false));
+                    let listener = Server::new("native-websocket-policy", "1.0.0")
+                        .protocol_policy(policy)
+                        .unwrap()
+                        .instructions("native WebSocket instructions")
+                        .strict_input_validation(true)
+                        .request_timeout(5)
+                        .auth_provider(OneShotNativeAuthProvider {
+                            calls: Arc::clone(&provider_calls),
+                        })
+                        .middleware(ModernHttpAuthMiddleware {
+                            calls: Arc::clone(&middleware_calls),
+                            saw_credential: Arc::clone(&saw_credential),
+                        })
+                        .tool(Probe {
+                            calls: Arc::clone(&calls),
+                        })
+                        .build()
+                        .bind_websocket(&cx, "127.0.0.1:0")
+                        .await
+                        .map_err(|error| format!("native WebSocket bind failed: {error}"))?;
+                    let address = listener.local_addr().map_err(|error| error.to_string())?;
+                    let scope = cx.scope();
+                    let restricted = {
+                        let _caller = Cx::set_current(Some(cx.clone()));
+                        let _restriction =
+                            Cx::push_restriction(CapSet::<true, true, true, true, false>::MASK);
+                        Cx::current().unwrap()
+                    };
+                    let mut serving = restricted
+                        .spawn_in(&scope, move |listener_cx| async move {
+                            listener.serve(&listener_cx).await
+                        })
+                        .map_err(|error| format!("native WebSocket spawn failed: {error}"))?;
+                    let mut peer = connect(&cx, address).await?;
+                    if legacy {
+                        #[cfg(feature = "legacy-2024-11-05")]
+                        initialize(&mut peer, &cx, serde_json::json!({})).await?;
+                    } else {
+                        send(&mut peer, &cx, modern_discovery_request(1)).await?;
+                        if response(&mut peer, &cx, 1).await?.error.is_some() {
+                            return Err("native Auto/ModernOnly discovery failed".to_owned());
+                        }
+                    }
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(tool_request(2, legacy, serde_json::json!({}))),
+                    )
+                    .await?;
+                    let completed = response(&mut peer, &cx, 2).await?;
+                    if completed.error.is_some() || calls.load(Ordering::Acquire) != 1 {
+                        return Err(format!("native authenticated call failed: {completed:?}"));
+                    }
+                    let before_mixed = middleware_calls.load(Ordering::Acquire);
+                    let mut mixed = tool_request(3, legacy, serde_json::json!({}));
+                    mixed.params.as_mut().unwrap()["authorization"] =
+                        serde_json::json!("Bearer beta");
+                    send(&mut peer, &cx, JsonRpcMessage::Request(mixed)).await?;
+                    let rejected = response(&mut peer, &cx, 3).await?;
+                    if rejected.error.is_none()
+                        || calls.load(Ordering::Acquire) != 1
+                        || middleware_calls.load(Ordering::Acquire) != before_mixed
+                        || saw_credential.load(Ordering::Acquire)
+                    {
+                        return Err(
+                            "native WebSocket mixed credentials reached application code"
+                                .to_owned(),
+                        );
+                    }
+                    // Reusing the refused ID must not retain its sanitation marker.
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(tool_request(3, legacy, serde_json::json!({}))),
+                    )
+                    .await?;
+                    let recovered = response(&mut peer, &cx, 3).await?;
+                    if recovered.error.is_some() || calls.load(Ordering::Acquire) != 2 {
+                        return Err(format!(
+                            "native WebSocket failed to recover after refusal: {recovered:?}"
+                        ));
+                    }
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(tool_request(
+                            4,
+                            legacy,
+                            serde_json::json!({"extra": true}),
+                        )),
+                    )
+                    .await?;
+                    let invalid = response(&mut peer, &cx, 4).await?;
+                    if calls.load(Ordering::Acquire) != 2
+                        || (invalid.error.is_none()
+                            && invalid
+                                .result
+                                .as_ref()
+                                .and_then(|value| value.get("isError"))
+                                != Some(&serde_json::json!(true)))
+                        || provider_calls.load(Ordering::Acquire) != 1
+                    {
+                        return Err(format!(
+                            "native WebSocket lost strict validation or Upgrade custody: {invalid:?}"
+                        ));
+                    }
+                    peer.close(&cx).await.map_err(|error| error.to_string())?;
+                    drop(peer);
+                    serving.abort();
+                    let shutdown = serving
+                        .join(&Cx::for_testing())
+                        .await
+                        .map_err(|error| format!("native WebSocket join failed: {error:?}"))?
+                        .map_err(|error| error.to_string())?;
+                    if !matches!(shutdown, WebSocketServerShutdown::Quiescent) {
+                        return Err("native WebSocket policy retained connection work".to_owned());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn native_legacy_websocket_reverse_rpc_and_owner_cancellation_without_blocking_pool() {
+            for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                run_live_native_websocket_test(move |cx| async move {
+                    use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+                    let provider_calls = Arc::new(AtomicUsize::new(0));
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let active = Arc::new(AtomicUsize::new(0));
+                    let listener = Server::new("native-websocket-reverse", "1.0.0")
+                        .protocol_policy(policy)
+                        .unwrap()
+                        .instructions("native WebSocket instructions")
+                        .strict_input_validation(true)
+                        .max_bidirectional_requests_per_connection(1)
+                        .unwrap()
+                        .auth_provider(OneShotNativeAuthProvider {
+                            calls: Arc::clone(&provider_calls),
+                        })
+                        .tool(ReverseProbe {
+                            calls: Arc::clone(&calls),
+                            active: Arc::clone(&active),
+                        })
+                        .build()
+                        .bind_websocket(&cx, "127.0.0.1:0")
+                        .await
+                        .map_err(|error| {
+                            format!("native reverse WebSocket bind failed: {error}")
+                        })?;
+                    let address = listener.local_addr().map_err(|error| error.to_string())?;
+                    let scope = cx.scope();
+                    let restricted = {
+                        let _caller = Cx::set_current(Some(cx.clone()));
+                        let _restriction =
+                            Cx::push_restriction(CapSet::<true, true, true, true, false>::MASK);
+                        Cx::current().unwrap()
+                    };
+                    let mut serving = restricted
+                        .spawn_in(&scope, move |listener_cx| async move {
+                            listener.serve(&listener_cx).await
+                        })
+                        .map_err(|error| {
+                            format!("native reverse WebSocket spawn failed: {error}")
+                        })?;
+                    let mut peer = connect(&cx, address).await?;
+                    initialize(
+                        &mut peer,
+                        &cx,
+                        serde_json::json!({"sampling": {}, "roots": {}}),
+                    )
+                    .await?;
+
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(tool_request(
+                            2,
+                            true,
+                            serde_json::json!({"mode": "sample"}),
+                        )),
+                    )
+                    .await?;
+                    let sample_id =
+                        reverse_request(&mut peer, &cx, "sampling/createMessage").await?;
+                    send(&mut peer, &cx, JsonRpcMessage::Response(JsonRpcResponse::success(
+                        sample_id,
+                        serde_json::json!({
+                            "role": "assistant", "content": {"type": "text", "text": "native sampled result"},
+                            "model": "native-peer", "stopReason": "endTurn",
+                        }),
+                    ))).await?;
+                    require_text(&response(&mut peer, &cx, 2).await?, "native sampled result")?;
+
+                    // The single reverse-request slot must be released before
+                    // the next operation can ask the peer for roots.
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(tool_request(
+                            3,
+                            true,
+                            serde_json::json!({"mode": "roots"}),
+                        )),
+                    )
+                    .await?;
+                    let roots_id = reverse_request(&mut peer, &cx, "roots/list").await?;
+                    send(&mut peer, &cx, JsonRpcMessage::Response(JsonRpcResponse::success(
+                        roots_id, serde_json::json!({"roots": [{"uri": "file:///native-root", "name": "native"}]}),
+                    ))).await?;
+                    require_text(&response(&mut peer, &cx, 3).await?, "file:///native-root")?;
+
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(tool_request(
+                            4,
+                            true,
+                            serde_json::json!({"mode": "roots"}),
+                        )),
+                    )
+                    .await?;
+                    let abandoned_id = reverse_request(&mut peer, &cx, "roots/list").await?;
+                    let mut mixed_cancel = JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(serde_json::json!({"requestId": 4, "authorization": "Bearer beta"})),
+                    );
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(mixed_cancel.clone()),
+                    )
+                    .await?;
+                    // Unknown verbs are refused at admission while the legacy
+                    // FIFO is held, proving the mixed cancellation was read.
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(JsonRpcRequest::new(
+                            "native/unknown",
+                            Some(serde_json::json!({})),
+                            5_i64,
+                        )),
+                    )
+                    .await?;
+                    let unknown = response(&mut peer, &cx, 5).await?;
+                    if unknown.error.as_ref().map(|error| error.code.as_i32()) != Some(Some(-32601))
+                        || active.load(Ordering::Acquire) != 1
+                    {
+                        return Err(
+                            "mixed-credential cancellation affected an owned legacy request"
+                                .to_owned(),
+                        );
+                    }
+                    mixed_cancel
+                        .params
+                        .as_mut()
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("authorization");
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(mixed_cancel.clone()),
+                    )
+                    .await?;
+                    let JsonRpcMessage::Request(cancelled) = receive(&mut peer, &cx).await? else {
+                        return Err(
+                            "legacy cancellation did not retire the reverse request".to_owned()
+                        );
+                    };
+                    if cancelled.method != "notifications/cancelled"
+                        || cancelled.id.is_some()
+                        || cancelled
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("requestId"))
+                            != Some(
+                                &serde_json::to_value(&abandoned_id)
+                                    .map_err(|error| error.to_string())?,
+                            )
+                        || cancelled
+                            .params
+                            .as_ref()
+                            .is_some_and(|params| params.get("_meta").is_some())
+                    {
+                        return Err(format!(
+                            "legacy WebSocket emitted incorrect reverse cancellation: {cancelled:?}"
+                        ));
+                    }
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Response(JsonRpcResponse::success(
+                            abandoned_id,
+                            serde_json::json!({"roots": [{"uri": "file:///late"}]}),
+                        )),
+                    )
+                    .await?;
+                    send(&mut peer, &cx, JsonRpcMessage::Request(mixed_cancel)).await?;
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(tool_request(6, true, serde_json::json!({}))),
+                    )
+                    .await?;
+                    // An unwanted terminal result for cancelled request 4 is
+                    // also rejected by the exact response-ID helper.
+                    require_text(
+                        &response(&mut peer, &cx, 6).await?,
+                        "native authenticated dispatch",
+                    )?;
+                    if calls.load(Ordering::Acquire) != 4
+                        || active.load(Ordering::Acquire) != 0
+                        || provider_calls.load(Ordering::Acquire) != 1
+                    {
+                        return Err("legacy WebSocket failed to quiesce its cancelled request or reuse Upgrade auth".to_owned());
+                    }
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(tool_request(
+                            7,
+                            true,
+                            serde_json::json!({"mode": "roots"}),
+                        )),
+                    )
+                    .await?;
+                    reverse_request(&mut peer, &cx, "roots/list").await?;
+                    peer.close(&cx).await.map_err(|error| error.to_string())?;
+                    drop(peer);
+                    let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                    while active.load(Ordering::Acquire) != 0 {
+                        if cx.now() >= deadline {
+                            return Err(
+                                "legacy peer close retained its waiting reverse request".to_owned()
+                            );
+                        }
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                    if calls.load(Ordering::Acquire) != 5 {
+                        return Err(
+                            "legacy disconnect did not exercise a waiting handler".to_owned()
+                        );
+                    }
+                    serving.abort();
+                    let shutdown = serving
+                        .join(&Cx::for_testing())
+                        .await
+                        .map_err(|error| {
+                            format!("native reverse WebSocket join failed: {error:?}")
+                        })?
+                        .map_err(|error| error.to_string())?;
+                    if !matches!(shutdown, WebSocketServerShutdown::Quiescent) {
+                        return Err(
+                            "native legacy WebSocket retained reverse or handler work".to_owned()
+                        );
+                    }
+                    Ok(())
+                });
+            }
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn native_websocket_refuses_unsupported_and_cross_era_peers_without_poisoning_listener() {
+            for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                run_live_native_websocket_test(move |cx| async move {
+                    let listener = Server::new("native-websocket-era-fence", "1.0.0")
+                        .protocol_policy(policy)
+                        .unwrap()
+                        .instructions("native WebSocket instructions")
+                        .auth_provider(ModernHttpAuthProvider)
+                        .build()
+                        .bind_websocket(&cx, "127.0.0.1:0")
+                        .await
+                        .map_err(|error| {
+                            format!("native era-fence WebSocket bind failed: {error}")
+                        })?;
+                    let address = listener.local_addr().map_err(|error| error.to_string())?;
+                    let scope = cx.scope();
+                    let mut serving = cx
+                        .spawn_in(&scope, move |listener_cx| async move {
+                            listener.serve(&listener_cx).await
+                        })
+                        .map_err(|error| {
+                            format!("native era-fence WebSocket spawn failed: {error}")
+                        })?;
+                    for unsupported in ["2025-03-26", "2025-06-18"] {
+                        let mut peer = connect(&cx, address).await?;
+                        let JsonRpcMessage::Request(mut opening) =
+                            exact_legacy_initialize_request(1, serde_json::json!("1.0.0"))
+                        else {
+                            unreachable!()
+                        };
+                        opening.params.as_mut().unwrap()["protocolVersion"] =
+                            serde_json::json!(unsupported);
+                        send(&mut peer, &cx, JsonRpcMessage::Request(opening)).await?;
+                        if response(&mut peer, &cx, 1).await?.error.is_none() {
+                            return Err(format!(
+                                "native WebSocket admitted unsupported era {unsupported}"
+                            ));
+                        }
+                        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                        if !matches!(
+                            asupersync::time::timeout_at(deadline, peer.recv(&cx)).await,
+                            Ok(Err(TransportError::Closed))
+                        ) {
+                            return Err(
+                                "unsupported WebSocket opening did not close its own connection"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+
+                    let mut peer = connect(&cx, address).await?;
+                    initialize(&mut peer, &cx, serde_json::json!({})).await?;
+                    send(
+                        &mut peer,
+                        &cx,
+                        JsonRpcMessage::Request(JsonRpcRequest::new(
+                            "tools/list",
+                            Some(serde_json::json!({})),
+                            2_i64,
+                        )),
+                    )
+                    .await?;
+                    if response(&mut peer, &cx, 2).await?.error.is_some() {
+                        return Err(
+                            "unsupported opening poisoned a later exact-2024 peer".to_owned()
+                        );
+                    }
+                    send(&mut peer, &cx, modern_discovery_request(3)).await?;
+                    if response(&mut peer, &cx, 3).await?.error.is_none() {
+                        return Err("legacy WebSocket changed its bound era".to_owned());
+                    }
+                    let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                    if !matches!(
+                        asupersync::time::timeout_at(deadline, peer.recv(&cx)).await,
+                        Ok(Err(TransportError::Closed))
+                    ) {
+                        return Err(
+                            "cross-era WebSocket traffic did not close its own connection"
+                                .to_owned(),
+                        );
+                    }
+                    drop(peer);
+                    // An observed peer protocol refusal is not a listener
+                    // failure and must not affect a fresh connection.
+                    let mut fresh = connect(&cx, address).await?;
+                    initialize(&mut fresh, &cx, serde_json::json!({})).await?;
+                    fresh.close(&cx).await.map_err(|error| error.to_string())?;
+                    drop(fresh);
+                    serving.abort();
+                    let shutdown = serving
+                        .join(&Cx::for_testing())
+                        .await
+                        .map_err(|error| {
+                            format!("native era-fence WebSocket join failed: {error:?}")
+                        })?
+                        .map_err(|error| error.to_string())?;
+                    if !matches!(shutdown, WebSocketServerShutdown::Quiescent) {
+                        return Err("native WebSocket retained refused protocol work".to_owned());
+                    }
+                    Ok(())
+                });
+            }
+        }
     }
 
     #[cfg(feature = "websocket")]
@@ -29061,11 +29855,37 @@ mod lib_unit_tests {
         F: FnOnce(Cx) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
+        run_live_http_test_with_blocking_capacity(operation, MAX_DISPATCH_QUEUE_DEPTH);
+    }
+
+    #[cfg(feature = "websocket")]
+    fn run_live_native_websocket_test<F, Fut>(operation: F)
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        // An accidental connection-wide blocking bridge runs inline without
+        // this pool and starves the socket driver. The existing watchdog makes
+        // that regression a bounded failure instead of hiding it on a worker.
+        run_live_http_test_with_blocking_capacity(operation, 0);
+    }
+
+    fn run_live_http_test_with_blocking_capacity<F, Fut>(operation: F, blocking_capacity: usize)
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
         let runtime = RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().expect("live HTTP test reactor must initialize"))
-            .blocking_threads(4, MAX_DISPATCH_QUEUE_DEPTH)
+            .blocking_threads(4.min(blocking_capacity), blocking_capacity)
             .build()
             .expect("live HTTP test runtime must initialize");
+        if blocking_capacity == 0 {
+            assert!(
+                runtime.blocking_handle().is_none(),
+                "native test has no blocking pool"
+            );
+        }
         let host = RunnableClock::start();
         let (result, expired) = runtime.block_on(async move {
             let cx = Cx::current().expect("the live HTTP test runtime must install an ambient Cx");
@@ -51809,6 +52629,136 @@ mod lib_unit_tests {
         assert_eq!(error.code, McpErrorCode::ResourceForbidden);
         assert_eq!(request.method, "tools/list");
         assert!(request.params.is_some());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_auth_custody_retires_markers_when_context_refuses_before_commit() {
+        let server = Server::new("native-custody-context", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .request_timeout(0)
+            .build();
+        let custody = Arc::new(WebSocketAuthCustody {
+            connection_generation: 44,
+            fingerprint: auth::principal_fingerprint(None).unwrap(),
+            authenticated: None,
+            rejected_inband_request_ids: Mutex::new(HashSet::new()),
+        });
+        let dispatch = AuthDispatchCustody::WebSocket(Arc::clone(&custody));
+        let connection = ModernConnection::new();
+        let expired =
+            Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(asupersync::Time::ZERO));
+        for control in [false, true] {
+            for id in 100_i64..108 {
+                let mut request = if control {
+                    JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(
+                            serde_json::json!({"requestId": id, "authorization": "Bearer refused"}),
+                        ),
+                    )
+                } else {
+                    JsonRpcRequest::new(
+                        "tools/list",
+                        Some(serde_json::json!({
+                            "authorization": "Bearer refused",
+                            "_meta": {MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION},
+                        })),
+                        id,
+                    )
+                };
+                sanitize_websocket_decoded_request(&custody, &mut request);
+                assert_eq!(custody.rejected_inband_request_ids.lock().unwrap().len(), 1);
+                let inbound =
+                    InboundRequestContext::with_modern_connection_and_transport_authorization(
+                        expired.clone(),
+                        request_id_to_u64(request.id.as_ref()),
+                        InboundRequestTransport::WebSocket,
+                        &connection,
+                        TransportAuthorization::default(),
+                    );
+                let error = if control {
+                    server
+                        .authenticate_modern_cancelled_control(
+                            &inbound,
+                            &mut request,
+                            Some(&dispatch),
+                            Some(44),
+                        )
+                        .err()
+                } else {
+                    server
+                        .admit_modern_pump_authentication(
+                            &inbound,
+                            &request,
+                            Some(&dispatch),
+                            Some(44),
+                        )
+                        .err()
+                }
+                .expect("an expired request context must be refused before custody commit");
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert!(
+                    custody
+                        .rejected_inband_request_ids
+                        .lock()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        // The connection's accepted custody remains usable once a live
+        // request arrives; neither request nor notification ID reuse inherits
+        // an earlier frame's sanitation refusal.
+        let live = Cx::for_testing();
+        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
+            live.clone(),
+            request_id_to_u64(Some(&RequestId::Number(107))),
+            InboundRequestTransport::WebSocket,
+            &connection,
+            TransportAuthorization::default(),
+        );
+        let request = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION},
+            })),
+            107_i64,
+        );
+        assert!(
+            server
+                .admit_modern_pump_authentication(&inbound, &request, Some(&dispatch), Some(44),)
+                .is_ok()
+        );
+        let mut control = JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": 107})),
+        );
+        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
+            live,
+            request_id_to_u64(None),
+            InboundRequestTransport::WebSocket,
+            &connection,
+            TransportAuthorization::default(),
+        );
+        assert!(
+            server
+                .authenticate_modern_cancelled_control(
+                    &inbound,
+                    &mut control,
+                    Some(&dispatch),
+                    Some(44),
+                )
+                .is_ok()
+        );
+        assert!(
+            custody
+                .rejected_inband_request_ids
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
