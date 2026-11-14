@@ -9,18 +9,26 @@ async fn composes_actual_async_websocket_client(cx: &Cx) -> McpResult<()> {
     let transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9000/mcp")
         .await
         .map_err(|error| McpError::internal_error(error.to_string()))?;
-    let client = fastmcp_rust::ClientBuilder::new()
+    let mut client = fastmcp_rust::ClientBuilder::new()
         .connect_websocket_with_cx(cx, transport)
         .await?;
     let _ = client.session();
+    let _ = client.final_result_cache_enabled();
+    let _: fastmcp_rust::FinalCacheStats = client.final_result_cache_stats();
+    client.set_final_result_cache_enabled(false);
+    client.clear_final_result_cache();
 
     let modern_transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9001/mcp")
         .await
         .map_err(|error| McpError::internal_error(error.to_string()))?;
-    let modern_client = fastmcp_rust::modern::ClientBuilder::new()
+    let mut modern_client = fastmcp_rust::modern::ClientBuilder::new()
         .connect_websocket_with_cx(cx, modern_transport)
         .await?;
     let _ = modern_client.session();
+    let _ = modern_client.final_result_cache_enabled();
+    let _: fastmcp_rust::FinalCacheStats = modern_client.final_result_cache_stats();
+    modern_client.set_final_result_cache_enabled(false);
+    modern_client.clear_final_result_cache();
 
     let modern_listener = fastmcp_rust::modern::server_builder("modern-ws", "1.0")
         .build()
@@ -39,7 +47,7 @@ async fn composes_actual_async_websocket_client(cx: &Cx) -> McpResult<()> {
         let _ = legacy_client.protocol_policy();
         let _ = legacy_client.protocol_version();
 
-        let auto_client = fastmcp_rust::auto::ClientBuilder::new()
+        let mut auto_client = fastmcp_rust::auto::ClientBuilder::new()
             .connect_websocket_auto_with_cx(cx, move |_| async move {
                 AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9003/mcp")
                     .await
@@ -47,6 +55,10 @@ async fn composes_actual_async_websocket_client(cx: &Cx) -> McpResult<()> {
             })
             .await?;
         let _ = auto_client.session();
+        let _ = auto_client.final_result_cache_enabled();
+        let _: fastmcp_rust::FinalCacheStats = auto_client.final_result_cache_stats();
+        auto_client.set_final_result_cache_enabled(false);
+        auto_client.clear_final_result_cache();
 
         let legacy_listener = fastmcp_rust::legacy_2024::server_builder("legacy-ws", "1.0")
             .build()

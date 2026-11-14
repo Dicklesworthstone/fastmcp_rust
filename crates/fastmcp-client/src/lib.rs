@@ -6394,6 +6394,10 @@ where
     subscription_timeout_policy: SubscriptionTimeoutPolicy,
     final_server_notifications: VecDeque<ServerNotification>,
     final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
+    /// Complete final results remain private to this exact connection.
+    final_result_cache: FinalResultCache,
+    /// Provenance consumed by the immediate automatic catalog traversal.
+    last_final_cache_page: Option<FinalCachePageState>,
     /// Catalog receipts remain observable if subscription cleanup drains queues.
     tools_list_generation: u64,
     resources_list_generation: u64,
@@ -6667,6 +6671,8 @@ where
                 subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
                 final_server_notifications: VecDeque::new(),
                 final_progress_notifications: VecDeque::new(),
+                final_result_cache: FinalResultCache::default(),
+                last_final_cache_page: None,
                 tools_list_generation: 0,
                 resources_list_generation: 0,
                 prompts_list_generation: 0,
@@ -6841,6 +6847,31 @@ where
         self.session
             .selected_era()
             .expect("negotiated WebSocket clients always select an era")
+    }
+
+    /// Whether complete modern catalog and initial resource results are cached.
+    /// The bounded cache belongs to this connection, including public results.
+    #[must_use]
+    pub const fn final_result_cache_enabled(&self) -> bool {
+        self.final_result_cache.is_enabled()
+    }
+
+    /// Enables or disables cache lookup and fills for this connection.
+    /// Retained entries still age and receive notification invalidation.
+    pub fn set_final_result_cache_enabled(&mut self, enabled: bool) {
+        self.final_result_cache.set_enabled(enabled);
+    }
+
+    /// Returns this connection's bounded complete-result cache counters.
+    #[must_use]
+    pub const fn final_result_cache_stats(&self) -> FinalCacheStats {
+        self.final_result_cache.stats()
+    }
+
+    /// Erases all retained complete results and fences outstanding fills.
+    pub fn clear_final_result_cache(&mut self) {
+        self.final_result_cache.clear();
+        self.last_final_cache_page = None;
     }
 
     /// Drains non-progress final server notifications received during modern requests.
@@ -7416,7 +7447,7 @@ where
     /// late final response. They remain owned by that cancelled subscription,
     /// never by a new listener or the connection notification queue.
     fn discard_retired_websocket_subscription_notification(
-        &self,
+        &mut self,
         request: &JsonRpcRequest,
     ) -> McpResult<bool> {
         if request.id.is_some()
@@ -7461,7 +7492,7 @@ where
                 })?;
             return Ok(true);
         }
-        ServerNotification::decode(request).map_err(|_| {
+        let notification = ServerNotification::decode(request).map_err(|_| {
             McpError::invalid_request(
                 "WebSocket retired subscription received an invalid notification",
             )
@@ -7474,6 +7505,9 @@ where
             )
             .map_err(|_| McpError::invalid_request("WebSocket server cancellation is invalid"))?;
         }
+        // A valid event that raced cancellation can still make retained data
+        // stale. It never transfers notification ownership to a new listener.
+        self.final_result_cache.invalidate_notification(&notification);
         Ok(true)
     }
 
@@ -7519,6 +7553,17 @@ where
         *generation = generation.wrapping_add(1);
     }
 
+    fn invalidate_websocket_catalog_cache(&mut self, method: &str) {
+        let result_set = match method {
+            "tools/list" => FinalCacheResultSet::Tools,
+            "resources/list" => FinalCacheResultSet::Resources,
+            "resources/templates/list" => FinalCacheResultSet::ResourceTemplates,
+            "prompts/list" => FinalCacheResultSet::Prompts,
+            _ => return,
+        };
+        self.final_result_cache.invalidate_result_set(&result_set);
+    }
+
     fn retain_live_websocket_subscription_notification(
         &mut self,
         notification: &ServerNotification,
@@ -7531,6 +7576,7 @@ where
             )
         {
             if subscription.terminal_response.is_some() || subscription.terminal_error.is_some() {
+                self.final_result_cache.invalidate_notification(notification);
                 return Ok(true);
             }
             match notification {
@@ -7575,6 +7621,7 @@ where
                 _ => return Ok(false),
             }
             subscription.lifetime.observe_activity(received_at);
+            self.final_result_cache.invalidate_notification(notification);
             match notification {
                 ServerNotification::ToolsListChanged(_) => {
                     self.record_websocket_catalog_change("notifications/tools/list_changed");
@@ -7661,6 +7708,7 @@ where
                     FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
                 ));
             }
+            self.final_result_cache.invalidate_notification(&notification);
             self.final_server_notifications.push_back(notification);
             self.record_websocket_catalog_change(&request.method);
             return Ok(true);
@@ -8006,10 +8054,8 @@ where
     where
         IO: Send + 'static,
     {
-        match self.selected_protocol_era() {
-            ProtocolEra::Modern2026 => self.request_final_core(cx, method, parameters).await,
-            ProtocolEra::Legacy2024 => self.request_selected_core(cx, method, parameters).await,
-        }
+        self.request_core_verb_with_options(cx, None, None, method, parameters)
+            .await
     }
 
     /// Lists one page of tools through the negotiated WebSocket era.
@@ -8078,10 +8124,11 @@ where
     /// traversal budget after each send commits. A failed traversal returns no
     /// partial collection.
     ///
-    /// WebSocket pages are fetched from the peer without a result cache. A
-    /// rejected continuation cursor, observed matching list-change notification,
-    /// or change in modern cache scope discards the traversal and permits one
-    /// cursorless rebuild. Notifications remain available to their caller.
+    /// A fresh terminal first page may be replayed from this connection's cache.
+    /// A cached nonterminal prefix, rejected continuation cursor, observed
+    /// matching list-change notification, or change in modern cache scope
+    /// discards the traversal and permits one cursorless rebuild. Subsequent
+    /// pages are fetched from the peer; notifications retain their owners.
     /// Each page retains its own TTL, scope, metadata and exact unknown result
     /// members. This local consistency policy does not promise a server snapshot.
     pub async fn list_all_tools(
@@ -8323,12 +8370,13 @@ where
                 // retires its exact ID on expiry. Do not drop that owner from
                 // an outer timeout around the complete traversal.
                 let page = self
-                    .request_core_verb_with_options(
+                    .request_core_verb_with_cache_options(
                         cx,
                         cancellation,
                         Some(budget.deadline),
                         method,
                         page_parameters,
+                        budget.pages == 1,
                     )
                     .await;
                 let result = match page {
@@ -8342,6 +8390,7 @@ where
                             return Err(McpError::request_cancelled());
                         }
                         budget.check_deadline()?;
+                        self.invalidate_websocket_catalog_cache(method);
                         rebuilds += 1;
                         continue 'rebuild;
                     }
@@ -8363,7 +8412,21 @@ where
                     scope.get_or_insert(page_scope);
                 }
                 let changed_catalog = self.websocket_catalog_generation(method) != generation;
-                if changed_scope || changed_catalog {
+                let cache_page = self.last_final_cache_page.take();
+                let cached_prefix = next_cursor.is_some()
+                    && cache_page.is_some_and(|page| page.miss.is_none());
+                let invalidated_fill = cache_page.is_some_and(|page| {
+                    let result_set = match method {
+                        "tools/list" => FinalCacheResultSet::Tools,
+                        "resources/list" => FinalCacheResultSet::Resources,
+                        "resources/templates/list" => FinalCacheResultSet::ResourceTemplates,
+                        "prompts/list" => FinalCacheResultSet::Prompts,
+                        _ => unreachable!("catalog method was admitted"),
+                    };
+                    page.generation != self.final_result_cache.begin_fetch(&result_set)
+                });
+                if changed_scope || changed_catalog || cached_prefix || invalidated_fill {
+                    self.invalidate_websocket_catalog_cache(method);
                     if rebuilds != 0 {
                         return Err(McpError::invalid_request(
                             "WebSocket catalog changed during its bounded rebuild",
@@ -8909,6 +8972,133 @@ where
             .await
     }
 
+    fn check_websocket_cache_lifetime(
+        &self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        deadline: Option<Instant>,
+    ) -> McpResult<()> {
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            || cx.checkpoint().is_err()
+            || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+        {
+            return Err(McpError::request_cancelled());
+        }
+        if let Some(deadline) = deadline {
+            check_mrtr_operation(cx, cancellation, deadline)?;
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        self.reverse_callback_pool.terminal_error().map_or(Ok(()), Err)
+    }
+
+    fn websocket_final_cache_key(
+        &self,
+        method: &str,
+        parameters: &serde_json::Value,
+        result_set: FinalCacheResultSet,
+    ) -> McpResult<FinalCacheKey> {
+        let mut projection = parameters.clone();
+        let object = projection.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("WebSocket cache parameters must be an object")
+        })?;
+        let cursor = object.remove("cursor")
+            .and_then(|cursor| cursor.as_str().map(str::to_owned));
+        // list_catalog_page also admits caller-owned open metadata. Preserve
+        // it in the projection instead of assuming it is observational only.
+        let capabilities = parameters.get("_meta")
+            .and_then(|meta| meta.get(FINAL_CLIENT_CAPABILITIES_META_KEY));
+        Ok(FinalCacheKey::new(
+            "websocket",
+            MODERN_PROTOCOL_VERSION,
+            serde_json::to_string(&capabilities).map_err(|_| {
+                McpError::internal_error("WebSocket cache capabilities could not serialize")
+            })?,
+            serde_json::to_string(&self.session.client_extension_wire_settings()).map_err(|_| {
+                McpError::internal_error("WebSocket cache extensions could not serialize")
+            })?,
+            method,
+            serde_json::to_string(&projection).map_err(|_| {
+                McpError::internal_error("WebSocket cache parameters could not serialize")
+            })?,
+            cursor,
+            FINAL_CACHE_POLICY_REVISION,
+            FINAL_CACHE_EXTENSION_REVISION,
+            FINAL_CACHE_REPRESENTATION_POLICY_REVISION,
+            FINAL_CACHE_LIMITS_POLICY_REVISION,
+            CachePartitionKey::new("websocket-client-connection"),
+            result_set,
+        ))
+    }
+
+    /// Replays only after a receive turn has no complete frame ready. Native
+    /// framing stays in its owned half when one poll is pending, including an
+    /// incomplete frame.
+    /// A busy peer forces a real request after the bounded drain.
+    async fn drain_ready_websocket_cache_frames(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        deadline: Option<Instant>,
+    ) -> McpResult<bool>
+    where
+        IO: Send + 'static,
+    {
+        self.check_websocket_cache_lifetime(cx, cancellation, deadline)?;
+        self.settle_abandoned_websocket_request().await?;
+        for _ in 0..MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+            self.check_websocket_cache_lifetime(cx, cancellation, deadline)?;
+            self.expire_live_websocket_subscriptions().await?;
+            if let Err(error) = self.drain_completed_reverse_callbacks() {
+                return Err(self.terminal_callback_error(cx, error).await);
+            }
+            let connection_cx = self.connection_cx.clone();
+            let received = {
+                let receiver = self.receiver.as_mut().ok_or_else(|| {
+                    McpError::internal_error("WebSocket client receive half is closed")
+                })?;
+                let mut receive = std::pin::pin!(receiver.recv_with_source(&connection_cx));
+                std::future::poll_fn(|task| std::task::Poll::Ready(receive.as_mut().poll(task)))
+                    .await
+            };
+            let frame = match received {
+                std::task::Poll::Pending => return Ok(true),
+                std::task::Poll::Ready(Ok(frame)) => frame,
+                std::task::Poll::Ready(Err(error)) => {
+                    return Err(self.terminal_transport_error(cx, error).await);
+                }
+            };
+            let received_at = cx.now();
+            self.expire_live_websocket_subscriptions_at(received_at).await?;
+            match frame.message() {
+                JsonRpcMessage::Request(_) => {
+                    if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame, received_at).await {
+                        return Err(self.terminal_callback_error(cx, error).await);
+                    }
+                }
+                JsonRpcMessage::Response(response) => {
+                    if self.discard_retired_websocket_response(response) {
+                        continue;
+                    }
+                    let response = response.clone();
+                    let raw = raw_result_from_admitted_response(&response, frame, "WebSocket")?;
+                    match self.park_websocket_listen_terminal(response, raw) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(self.close_after_protocol_error(
+                                cx,
+                                "WebSocket cache drain received an unowned response",
+                            ).await);
+                        }
+                        Err(error) => return Err(self.terminal_callback_error(cx, error).await),
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     async fn request_core_verb_with_options(
         &mut self,
         cx: &Cx,
@@ -8920,6 +9110,30 @@ where
     where
         IO: Send + 'static,
     {
+        self.request_core_verb_with_cache_options(
+            cx,
+            cancellation,
+            deadline,
+            method,
+            parameters,
+            true,
+        )
+        .await
+    }
+
+    async fn request_core_verb_with_cache_options(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        deadline: Option<Instant>,
+        method: &str,
+        parameters: serde_json::Value,
+        read_cache: bool,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.last_final_cache_page = None;
         if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
             || cx.checkpoint().is_err()
         {
@@ -8942,6 +9156,42 @@ where
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
+        // Continuations remain real one-use peer operations. Their complete
+        // response must never become a replayable initial resource read.
+        let key = if parameters.get("requestState").is_none()
+            && parameters.get("inputResponses").is_none()
+            && parameters.get("task").is_none()
+        {
+            final_cache_result_set(&request)
+                .map(|result_set| self.websocket_final_cache_key(method, &parameters, result_set))
+                .transpose()?
+        } else {
+            None
+        };
+        let origin = key
+            .as_ref()
+            .and_then(|key| self.final_result_cache.capture_cursor_origin(key));
+        let mut miss = Some(FinalCacheMiss::Disabled);
+        if read_cache && let Some(key) = key.as_ref() {
+            let candidate = self.final_result_cache.has_fresh_entry_at(key, Instant::now());
+            if !candidate || self.drain_ready_websocket_cache_frames(cx, cancellation, deadline).await? {
+                match self.final_result_cache.lookup_page_at(key, Instant::now()) {
+                    FinalCachePageLookup::Fresh(page) => {
+                        self.check_websocket_cache_lifetime(cx, cancellation, deadline)?;
+                        self.last_final_cache_page = Some(FinalCachePageState {
+                            generation: page.generation,
+                            scope: page.scope,
+                            miss: None,
+                        });
+                        return Ok(page.result);
+                    }
+                    FinalCachePageLookup::Miss(reason) => miss = Some(reason),
+                }
+            }
+        }
+        let generation = key
+            .as_ref()
+            .map(|key| self.final_result_cache.begin_fetch(key.result_set()));
         let request_id = self.allocate_request_id().await?;
         let received = self
             .request_admitted_with_raw_result_with_deadline(
@@ -8951,8 +9201,13 @@ where
                 deadline,
             )
             .await?;
+        let receipt = Instant::now();
         if let Some(error) = received.response.error {
-            return Err(json_rpc_error_to_mcp(error));
+            let error = json_rpc_error_to_mcp(error);
+            if error.code == McpErrorCode::InvalidParams && let Some(origin) = origin {
+                self.final_result_cache.invalidate_rejected_cursor(origin);
+            }
+            return Err(error);
         }
         let result = received.response.result.as_ref().ok_or_else(|| {
             McpError::invalid_request("WebSocket successful response has no result")
@@ -8960,7 +9215,18 @@ where
         let source = received.raw_result.as_deref().ok_or_else(|| {
             McpError::invalid_request("WebSocket response has no admitted result source")
         })?;
-        decode_core_result_from_source(&request, result, Some(source))
+        let result = decode_core_result_from_source(&request, result, Some(source))?;
+        if let (Some(key), Some(generation)) = (key, generation) {
+            self.check_websocket_cache_lifetime(cx, cancellation, deadline)?;
+            let scope = final_cache_hints(&result).map(|(_, scope)| scope);
+            self.final_result_cache.insert_if_current_at(key, generation, result.clone(), receipt);
+            self.last_final_cache_page = scope.map(|scope| FinalCachePageState {
+                generation,
+                scope,
+                miss,
+            });
+        }
+        Ok(result)
     }
 
     /// Lists one page of tools under a caller-owned cancellation domain.
@@ -11091,8 +11357,8 @@ where
         IO: Send + 'static,
     {
         self.require_modern(method)?;
-        let params = self.with_modern_request_metadata(params)?;
-        self.request_final_core_prepared(cx, method, params).await
+        self.request_core_verb_with_options(cx, None, None, method, params)
+            .await
     }
 
     async fn request_selected_core(
@@ -11735,6 +12001,7 @@ where
     }
 
     async fn settle_close(&mut self, _cx: &Cx) -> McpResult<()> {
+        self.clear_final_result_cache();
         if let Some(owner) = self.transient_request.take() {
             owner
                 .state
@@ -34390,6 +34657,505 @@ exec sleep 2
                 serde_json::json!({"name":"catalog-client","version":"7"})
             );
         }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn websocket_cache_test_response(
+        id: i64,
+        method: &str,
+        name: &str,
+        cursor: Option<&str>,
+        scope: &str,
+    ) -> String {
+        let result = websocket_catalog_test_result(method, Some(name), cursor, scope, false)
+            .replacen("\"ttlMs\":0", "\"ttlMs\":60000", 1);
+        format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}")
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_all_catalogs_replay_exact_results_and_partition_query_identity() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for method in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+                for scope in ["private", "public"] {
+                    let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+                    let parameters = serde_json::json!({"includeTags":["visible"]});
+                    write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                        2, method, "first", Some(""), scope,
+                    )).await;
+                    let first = client.list_catalog_page(&cx, method, parameters.clone()).await.unwrap();
+                    let replay = client.list_catalog_page(&cx, method, parameters.clone()).await.unwrap();
+                    assert_eq!(client.next_id, 3, "a cache hit allocates no request");
+                    assert_eq!(client.final_result_cache_stats().hits, 1);
+                    let encoded = replay.encode().unwrap();
+                    assert!(encoded.contains("\"vendorExact\":922337203685477580812345678901234567890"));
+                    assert!(encoded.contains("\"vendorDecimal\":1.2300e+42"));
+                    let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                    assert_eq!(value["_meta"]["com.example/page"], "first");
+                    assert_eq!(value["nextCursor"], "");
+                    assert_eq!(value["cacheScope"], scope);
+                    assert!(value["ttlMs"].as_u64().unwrap() <= 60_000);
+                    assert_eq!(catalog_page(method, &first).unwrap().0, 1);
+
+                    for (offset, changed) in [
+                        serde_json::json!({"includeTags":["visible"],"cursor":""}),
+                        serde_json::json!({"includeTags":["different"]}),
+                        serde_json::json!({"includeTags":["visible"],"_meta":{"com.example/view":"different"}}),
+                    ].into_iter().enumerate() {
+                        let id = offset as i64 + 3;
+                        write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                            id, method, "different", None, scope,
+                        )).await;
+                        assert!(client.list_catalog_page(&cx, method, changed).await.unwrap()
+                            .encode().unwrap().contains("different"));
+                        assert_eq!(client.next_id, id as u64 + 1);
+                    }
+                    assert_eq!(client.final_result_cache_stats().fills, 4);
+                    client.close(&cx).await.unwrap();
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_cache_controls_cancellation_and_connection_isolation() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+            assert!(client.final_result_cache_enabled());
+            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                2, "tools/list", "first", None, "public",
+            )).await;
+            client.list_tools(&cx, None).await.unwrap();
+            let cancellation = McpRequestCancellation::new();
+            cancellation.cancel();
+            assert_eq!(client.list_tools_with_cancellation(&cx, &cancellation, None).await
+                .unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(client.next_id, 3);
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+
+            client.set_final_result_cache_enabled(false);
+            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                3, "tools/list", "uncached", None, "public",
+            )).await;
+            assert!(client.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("uncached"));
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            client.set_final_result_cache_enabled(true);
+            assert!(client.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("first"));
+            client.clear_final_result_cache();
+            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                4, "tools/list", "after-clear", None, "public",
+            )).await;
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.next_id, 5);
+
+            let (mut other, mut other_peer) = websocket_catalog_test_fixture(&cx, false).await;
+            write_server_text_frame(&mut other_peer, &websocket_cache_test_response(
+                2, "tools/list", "other-connection", None, "public",
+            )).await;
+            assert!(other.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("other-connection"));
+            assert_eq!(other.final_result_cache_stats().hits, 0);
+            assert_eq!(other.final_result_cache_stats().fills, 1);
+            client.close(&cx).await.unwrap();
+            assert!(client.list_tools(&cx, None).await.is_err());
+            other.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_ready_notification_prevents_a_stale_hit_and_keeps_its_owner() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                2, "tools/list", "stale", None, "private",
+            )).await;
+            client.list_tools(&cx, None).await.unwrap();
+            write_server_text_frame(&mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}"#,
+            ).await;
+            let fresh = {
+                let mut waiting = Box::pin(client.list_tools(&cx, None));
+                assert!(std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
+                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                    3, "tools/list", "fresh", None, "private",
+                )).await;
+                waiting.await.unwrap()
+            };
+            assert!(fresh.encode().unwrap().contains("fresh"));
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            assert_eq!(client.final_result_cache_stats().invalidations, 1);
+            assert!(matches!(client.take_final_server_notifications().as_slice(),
+                [ServerNotification::ToolsListChanged(_)]));
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_inflight_change_and_zero_ttl_never_fill_a_replayable_entry() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for invalidated in [false, true] {
+                let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+                if invalidated {
+                    write_server_text_frame(&mut peer_io,
+                        r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}"#,
+                    ).await;
+                }
+                let first = websocket_cache_test_response(2, "tools/list", "first", None, "private");
+                let first = if invalidated { first } else {
+                    first.replacen("\"ttlMs\":60000", "\"ttlMs\":0", 1)
+                };
+                write_server_text_frame(&mut peer_io, &first).await;
+                client.list_tools(&cx, None).await.unwrap();
+                assert_eq!(client.final_result_cache_stats().fills, 0);
+                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                    3, "tools/list", "fresh", None, "private",
+                )).await;
+                assert!(client.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("fresh"));
+                assert_eq!(client.next_id, 4);
+                assert_eq!(client.final_result_cache_stats().hits, 0);
+                assert_eq!(client.final_result_cache_stats().fills, 1);
+                client.close(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_resource_update_invalidates_retained_resource_reads() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+            for (id, uri) in [(2, "file:///a"), (3, "file:///b")] {
+                write_server_text_frame(&mut peer_io, &serde_json::json!({
+                    "jsonrpc":"2.0", "id":id, "result":{
+                        "resultType":"complete", "contents":[{"uri":uri,"text":"original"}],
+                        "ttlMs":60000, "cacheScope":"private"
+                    }
+                }).to_string()).await;
+                client.read_resource(&cx, uri).await.unwrap();
+            }
+            write_server_text_frame(&mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///a"}}"#,
+            ).await;
+            {
+                let mut waiting = Box::pin(client.read_resource(&cx, "file:///b"));
+                assert!(std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
+                write_server_text_frame(&mut peer_io,
+                    r#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","contents":[{"uri":"file:///b","text":"refetched"}],"ttlMs":60000,"cacheScope":"private"}}"#,
+                ).await;
+                assert!(waiting.await.unwrap().encode().unwrap().contains("refetched"));
+            }
+            assert_eq!(client.next_id, 5, "the resource generation conservatively invalidates both reads");
+            write_server_text_frame(&mut peer_io,
+                r#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","contents":[{"uri":"file:///a","text":"updated"}],"ttlMs":60000,"cacheScope":"private"}}"#,
+            ).await;
+            assert!(client.read_resource(&cx, "file:///a").await.unwrap().encode().unwrap().contains("updated"));
+            client.read_resource(&cx, "file:///b").await.unwrap();
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            assert_eq!(client.final_result_cache_stats().fills, 4);
+            assert!(matches!(client.take_final_server_notifications().as_slice(),
+                [ServerNotification::ResourceUpdated(_)]));
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_ready_subscription_frames_retain_their_listener_owner() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for changed in [false, true] {
+                let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                    2, "tools/list", "first", None, "private",
+                )).await;
+                client.list_tools(&cx, None).await.unwrap();
+                client.open_subscriptions_listener(&cx, websocket_catalog_test_filter()).await.unwrap();
+                write_server_text_frame(&mut peer_io, &websocket_subscription_test_ack(
+                    3, serde_json::json!({"toolsListChanged":true}),
+                )).await;
+                if changed {
+                    write_server_text_frame(&mut peer_io,
+                        r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#,
+                    ).await;
+                }
+                write_server_text_frame(&mut peer_io, &websocket_subscription_test_terminal(3)).await;
+                let result = if changed {
+                    let mut waiting = Box::pin(client.list_tools(&cx, None));
+                    assert!(std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
+                    write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                        4, "tools/list", "fresh", None, "private",
+                    )).await;
+                    waiting.await.unwrap()
+                } else {
+                    client.list_tools(&cx, None).await.unwrap()
+                };
+                assert!(result.encode().unwrap().contains(if changed { "fresh" } else { "first" }));
+                assert_eq!(client.final_result_cache_stats().hits, u64::from(!changed));
+                assert!(client.take_final_server_notifications().is_empty());
+                let live = McpRequestCancellation::new();
+                assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(),
+                    StdioSubscriptionEvent::Acknowledged(_)));
+                if changed {
+                    assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(),
+                        StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(_))));
+                }
+                assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(),
+                    StdioSubscriptionEvent::Terminal));
+                client.close(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_cancellation_during_ready_read_preserves_sibling_ingress() {
+        struct CancelOnReadyReadIo {
+            inner: asupersync::net::tcp::VirtualTcpStream,
+            cancel_next: Arc<Mutex<Option<McpRequestCancellation>>>,
+        }
+
+        impl AsyncRead for CancelOnReadyReadIo {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                let before = buf.filled().len();
+                let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+                if matches!(result, Poll::Ready(Ok(())))
+                    && buf.filled()[before..].ends_with(b"}}")
+                    && let Some(cancellation) = this.cancel_next.lock().unwrap().take()
+                {
+                    cancellation.cancel();
+                }
+                result
+            }
+        }
+
+        impl AsyncWrite for CancelOnReadyReadIo {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+            }
+        }
+
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for terminal in [false, true] {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                let cancel_next = Arc::new(Mutex::new(None));
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                    .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(
+                        CancelOnReadyReadIo { inner: client_io, cancel_next: Arc::clone(&cancel_next) },
+                    )).await.unwrap();
+                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                    2, "tools/list", "first", None, "private",
+                )).await;
+                client.list_tools(&cx, None).await.unwrap();
+                client.open_subscriptions_listener(&cx, websocket_catalog_test_filter()).await.unwrap();
+                write_server_text_frame(&mut peer_io, &websocket_subscription_test_ack(
+                    3, serde_json::json!({"toolsListChanged":true}),
+                )).await;
+                let live = McpRequestCancellation::new();
+                assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(),
+                    StdioSubscriptionEvent::Acknowledged(_)));
+                let cancellation = McpRequestCancellation::new();
+                *cancel_next.lock().unwrap() = Some(cancellation.clone());
+                let incoming = if terminal {
+                    websocket_subscription_test_terminal(3)
+                } else {
+                    r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#.to_owned()
+                };
+                write_server_text_frame(&mut peer_io, &incoming).await;
+                assert_eq!(client.list_tools_with_cancellation(&cx, &cancellation, None).await
+                    .unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert!(cancellation.is_cancel_requested(), "the actual native read elected cancellation");
+                assert_eq!(client.next_id, 4, "cancelled lookup does not allocate an RPC");
+                assert_eq!(client.final_result_cache_stats().hits, 0);
+                let event = client.next_subscription_event(&cx, &live).await.unwrap();
+                if terminal {
+                    assert!(matches!(event, StdioSubscriptionEvent::Terminal));
+                } else {
+                    assert!(matches!(event,
+                        StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(_))));
+                }
+                assert!(!live.is_cancel_requested());
+                assert!(client.take_final_server_notifications().is_empty());
+                client.close(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_retired_subscription_change_invalidates_without_reassigning_events() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                2, "tools/list", "first", None, "private",
+            )).await;
+            client.list_tools(&cx, None).await.unwrap();
+            client.open_subscriptions_listener(&cx, websocket_catalog_test_filter()).await.unwrap();
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            assert_eq!(client.next_subscription_event(&cx, &cancelled).await.unwrap_err().code,
+                McpErrorCode::RequestCancelled);
+            write_server_text_frame(&mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#,
+            ).await;
+            write_server_text_frame(&mut peer_io, &websocket_subscription_test_terminal(3)).await;
+            {
+                let mut waiting = Box::pin(client.list_tools(&cx, None));
+                assert!(std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
+                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                    4, "tools/list", "fresh", None, "private",
+                )).await;
+                assert!(waiting.await.unwrap().encode().unwrap().contains("fresh"));
+            }
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            assert_eq!(client.final_result_cache_stats().invalidations, 1);
+            assert!(client.take_final_server_notifications().is_empty());
+            assert!(client.live_catalog_subscription.is_none());
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_raw_requests_bypass_lookup_and_do_not_replace_typed_entries() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                2, "tools/list", "typed", None, "private",
+            )).await;
+            client.list_tools(&cx, None).await.unwrap();
+            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                3, "tools/list", "raw", None, "private",
+            )).await;
+            let parameters = client.with_modern_request_metadata(serde_json::json!({})).unwrap();
+            let raw = client.request_with_raw_result(&cx, "tools/list", Some(parameters)).await.unwrap();
+            assert!(raw.raw_result.unwrap().contains("raw"));
+            assert_eq!(client.next_id, 4);
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert!(client.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("typed"));
+            assert_eq!(client.next_id, 4);
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_mrtr_continuation_does_not_fill_an_initial_resource_read() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                serde_json::from_value(serde_json::json!({"roots":{}})).unwrap(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            ).await.unwrap();
+            write_server_text_frame(&mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"one-use"}}"#,
+            ).await;
+            write_server_text_frame(&mut peer_io,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","contents":[{"uri":"file:///a","text":"continuation"}],"ttlMs":60000,"cacheScope":"private"}}"#,
+            ).await;
+            let mut callbacks = 0;
+            let result = client.read_resource_with_mrtr_retry(
+                &cx, Instant::now() + Duration::from_secs(1), "file:///a", |_| {
+                    callbacks += 1;
+                    Ok(BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots":[]}))]))
+                },
+            ).await.unwrap();
+            assert!(matches!(result, FinalCoreResult::ResourcesRead { .. }));
+            assert_eq!(callbacks, 1);
+            assert_eq!(client.next_id, 4);
+            assert_eq!(client.final_result_cache_stats().fills, 0);
+            write_server_text_frame(&mut peer_io,
+                r#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","contents":[{"uri":"file:///a","text":"initial"}],"ttlMs":60000,"cacheScope":"private"}}"#,
+            ).await;
+            assert!(client.read_resource(&cx, "file:///a").await.unwrap().encode().unwrap().contains("initial"));
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert!(client.read_resource(&cx, "file:///a").await.unwrap().encode().unwrap().contains("initial"));
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            assert_eq!(client.next_id, 5);
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_cached_nonterminal_catalog_prefix_rebuilds_under_shared_bounds() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for max_pages in [2, 3] {
+                let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                    2, "tools/list", "old", Some("old-cursor"), "private",
+                )).await;
+                client.list_tools(&cx, None).await.unwrap();
+                let mut limits = PaginationLimits::DEFAULT;
+                limits.pages = max_pages;
+                let result = {
+                    let mut traversal = Box::pin(client.collect_websocket_catalog_with_budget(
+                        &cx, None, "tools/list", serde_json::json!({}), PaginationBudget::with_limits(limits),
+                    ));
+                    assert!(std::future::poll_fn(|task| Poll::Ready(traversal.as_mut().poll(task))).await.is_pending());
+                    write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                        3, "tools/list", "fresh-first", Some("fresh-cursor"), "private",
+                    )).await;
+                    if max_pages == 3 {
+                        write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
+                            4, "tools/list", "fresh-last", None, "private",
+                        )).await;
+                    }
+                    traversal.await
+                };
+                if max_pages == 3 {
+                    let collection = result.unwrap();
+                    assert_eq!(collection.pages().len(), 2);
+                    assert_eq!(collection.item_count(), 2);
+                    assert!(collection.pages()[0].encode().unwrap().contains("fresh-first"));
+                    assert!(collection.pages()[1].encode().unwrap().contains("fresh-last"));
+                    assert_eq!(client.next_id, 5);
+                } else {
+                    assert_eq!(result.unwrap_err().message, PAGINATION_PAGE_LIMIT_ERROR);
+                    assert_eq!(client.next_id, 4, "the discarded cached page consumes the same budget");
+                }
+                assert_eq!(client.final_result_cache_stats().hits, 1);
+                client.close(&cx).await.unwrap();
+            }
+        });
     }
 
     #[cfg(feature = "websocket-experimental")]

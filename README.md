@@ -1020,6 +1020,22 @@ caller-owned cancellation domain for those ordinary verbs.
 Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse_with_cx` when the GET
 event stream and POST message endpoints are already known.
 
+With `websocket-experimental`, high-level modern WebSocket catalog calls and
+initial resource reads reuse complete results while their peer TTL remains
+fresh. Entries belong to one connection, retain exact result metadata and
+unknown members, and report only their remaining TTL. Queued catalog/resource
+notifications are processed before a candidate hit; invalidation also fences
+responses already in flight. A full catalog traversal rebuilds a cached
+nonterminal prefix under its existing cumulative limits.
+
+The direct, `auto`, and `modern` WebSocket clients expose
+`final_result_cache_enabled`, `set_final_result_cache_enabled`,
+`final_result_cache_stats`, and `clear_final_result_cache`. Disabling the cache
+does not pause TTL expiry or invalidation; clearing or closing the connection
+erases retained entries. Raw requests, tool calls, prompt retrieval, Tasks,
+input-required results, and MRTR continuations are not cached. Exact-2024
+WebSocket calls keep their existing uncached behavior.
+
 On Unix, `Client::call_tool_with_cx`, `read_resource_with_cx`, and
 `get_prompt_with_cx` follow installed async reverse handlers when a modern
 peer requests input. After initialization, all rounds and handler waits share

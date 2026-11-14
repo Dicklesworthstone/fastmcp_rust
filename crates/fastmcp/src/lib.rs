@@ -1340,6 +1340,29 @@ pub mod auto {
             self.inner.selected_protocol_era()
         }
 
+        /// Reports whether complete-result caching is enabled on this connection.
+        /// Only the modern era uses the cache; exact-2024 calls remain uncached.
+        #[must_use]
+        pub const fn final_result_cache_enabled(&self) -> bool {
+            self.inner.final_result_cache_enabled()
+        }
+
+        /// Enables or disables caching without extending retained entries' TTLs.
+        pub fn set_final_result_cache_enabled(&mut self, enabled: bool) {
+            self.inner.set_final_result_cache_enabled(enabled);
+        }
+
+        /// Returns bounded cache counters without parameter or identity labels.
+        #[must_use]
+        pub const fn final_result_cache_stats(&self) -> crate::FinalCacheStats {
+            self.inner.final_result_cache_stats()
+        }
+
+        /// Erases this connection's cached results and fences outstanding fills.
+        pub fn clear_final_result_cache(&mut self) {
+            self.inner.clear_final_result_cache();
+        }
+
         /// Structurally closes the selected connection through the caller Cx.
         pub async fn close(&mut self, cx: &Cx) -> McpResult<()> {
             self.inner.close(cx).await
@@ -3823,6 +3846,28 @@ pub mod modern {
             &self,
         ) -> fastmcp_protocol::protocol_policy::ProtocolEra {
             self.inner.selected_protocol_era()
+        }
+
+        /// Reports whether complete catalog/resource results are cached locally.
+        #[must_use]
+        pub const fn final_result_cache_enabled(&self) -> bool {
+            self.inner.final_result_cache_enabled()
+        }
+
+        /// Enables or disables caching without extending retained entries' TTLs.
+        pub fn set_final_result_cache_enabled(&mut self, enabled: bool) {
+            self.inner.set_final_result_cache_enabled(enabled);
+        }
+
+        /// Returns bounded cache counters without parameter or identity labels.
+        #[must_use]
+        pub const fn final_result_cache_stats(&self) -> crate::FinalCacheStats {
+            self.inner.final_result_cache_stats()
+        }
+
+        /// Erases this connection's cached results and fences outstanding fills.
+        pub fn clear_final_result_cache(&mut self) {
+            self.inner.clear_final_result_cache();
         }
 
         /// Structurally closes the connection through the caller Cx.
