@@ -55,6 +55,7 @@ use crate::{
     AuthProvider, DuplicateBehavior, ExtensionHandlerRegistry, FinalSubscriptionRegistry,
     HttpServerConfig, LifespanHooks, LoggingConfig, PromptHandler, ResourceHandler, Router, Server,
     ServerExtensionConfigurationError, ServerExtensionRuntime, ToolHandler,
+    DEFAULT_MAX_FINAL_SUBSCRIPTION_STREAMS_PER_PRINCIPAL, MAX_FINAL_SUBSCRIPTION_STREAMS,
 };
 #[cfg(feature = "proxy")]
 use crate::{ProxyCatalog, ProxyClient};
@@ -247,6 +248,10 @@ pub struct ServerBuilder {
     icons: Vec<fastmcp_protocol::common_types::RawIcon>,
     /// Request timeout in seconds (0 = no timeout).
     request_timeout_secs: u64,
+    /// Aggregate live/settling modern subscription reservations.
+    max_subscription_streams: usize,
+    /// Stable verified principal's share of the aggregate subscription bound.
+    max_subscription_streams_per_principal: usize,
     /// Whether to enable statistics collection.
     stats_enabled: bool,
     /// Whether to mask internal error details in responses.
@@ -415,6 +420,9 @@ impl ServerBuilder {
             website_url: None,
             icons: Vec::new(),
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            max_subscription_streams: MAX_FINAL_SUBSCRIPTION_STREAMS,
+            max_subscription_streams_per_principal:
+                DEFAULT_MAX_FINAL_SUBSCRIPTION_STREAMS_PER_PRINCIPAL,
             stats_enabled: true,
             mask_error_details: false, // Disabled by default for development
             logging,
@@ -522,6 +530,34 @@ impl ServerBuilder {
     pub fn request_timeout(mut self, secs: u64) -> Self {
         self.request_timeout_secs = secs;
         self
+    }
+
+    /// Sets aggregate and per-principal modern subscription capacities.
+    ///
+    /// The defaults are 64 streams overall and 32 for one verified principal.
+    /// Every wire transport and in-process listen shares these bounds. Token
+    /// rotation, scope changes, request IDs and HTTP connections do not create
+    /// a new principal partition. All anonymous listeners share one partition.
+    /// These admission keys do not authorize event delivery.
+    ///
+    /// Opening acknowledgements, active request handles, and callbacks or
+    /// terminal drains still in progress retain their slots. Saturation refuses
+    /// the new listen before acknowledgement and never evicts another stream.
+    /// Existing in-process handles must be dropped to release their reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidParams` unless both limits are positive,
+    /// `max_streams_per_principal <= max_streams`, and `max_streams <= 64`.
+    pub fn subscription_capacity(
+        mut self,
+        max_streams: usize,
+        max_streams_per_principal: usize,
+    ) -> fastmcp_core::McpResult<Self> {
+        FinalSubscriptionRegistry::validate_capacity(max_streams, max_streams_per_principal)?;
+        self.max_subscription_streams = max_streams;
+        self.max_subscription_streams_per_principal = max_streams_per_principal;
+        Ok(self)
     }
 
     /// Sets the maximum number of in-flight server-to-client requests for one
@@ -3273,7 +3309,10 @@ impl ServerBuilder {
         let console = fastmcp_console::console::FastMcpConsole::with_enabled(
             self.console_config.should_use_rich(),
         );
-        let final_subscriptions = Arc::new(FinalSubscriptionRegistry::default());
+        let final_subscriptions = Arc::new(FinalSubscriptionRegistry::with_capacity(
+            self.max_subscription_streams,
+            self.max_subscription_streams_per_principal,
+        ));
         #[cfg(feature = "proxy")]
         let catalog_relay = self.catalog_relay.clone();
         #[cfg(feature = "tasks")]

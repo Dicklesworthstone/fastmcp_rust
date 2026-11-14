@@ -5338,6 +5338,42 @@ pub enum ServerHttpEndpointResponse {
 /// notification callback. The callback remains owned by the originating
 /// request transport; this registry never creates a background runtime.
 const MAX_FINAL_SUBSCRIPTION_STREAMS: usize = 64;
+const DEFAULT_MAX_FINAL_SUBSCRIPTION_STREAMS_PER_PRINCIPAL: usize = 32;
+
+/// Admission-only accounting. Neither this key nor a reserved slot grants
+/// event visibility. Anonymous listeners share one fixed partition; verified
+/// principals use their stable provider owner independently of token, scope,
+/// request-ID, connection, or accepted-filter changes.
+#[derive(Default)]
+struct FinalSubscriptionAdmissionState {
+    total: usize,
+    principals: BTreeMap<Option<[u8; 32]>, usize>,
+}
+
+/// One charge shared by the opening call, request lease, and every callback
+/// snapshot. Removing an entry cannot release capacity while a callback or its
+/// request-owned terminal drain still retains subscription state.
+struct FinalSubscriptionReservation {
+    admission: Arc<Mutex<FinalSubscriptionAdmissionState>>,
+    principal: Option<[u8; 32]>,
+}
+
+impl Drop for FinalSubscriptionReservation {
+    fn drop(&mut self) {
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.total -= 1;
+        if let Some(count) = admission.principals.get_mut(&self.principal) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                admission.principals.remove(&self.principal);
+            }
+        }
+    }
+}
 
 /// Per-subscription bounds for events retained by the registry, including its
 /// sole active callback. Concurrent publishers enqueue without waiting for
@@ -5461,15 +5497,26 @@ impl fastmcp_core::CatalogChangePublisher for FinalCatalogPublisher {
 /// and cancel that opening reservation without waiting on an external sender.
 /// Events are cloned and tagged per entry so a notification can never escape
 /// its accepted filter or correlation ID.
-#[derive(Default)]
 struct FinalSubscriptionRegistry {
     inner: Mutex<FinalSubscriptionRegistryState>,
+    admission: Arc<Mutex<FinalSubscriptionAdmissionState>>,
+    max_streams: usize,
+    max_streams_per_principal: usize,
     terminating: AtomicBool,
     /// The server and its live listen handles own Task observation. The
     /// runtime keeps only a weak reference; this observer also reaches this
     /// registry weakly so neither edge can retain a retired subscription.
     #[cfg(feature = "tasks")]
     task_notification_emitter: OnceLock<tasks::OwnedTaskNotificationEmitter>,
+}
+
+impl Default for FinalSubscriptionRegistry {
+    fn default() -> Self {
+        Self::with_capacity(
+            MAX_FINAL_SUBSCRIPTION_STREAMS,
+            DEFAULT_MAX_FINAL_SUBSCRIPTION_STREAMS_PER_PRINCIPAL,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -5485,6 +5532,7 @@ struct FinalSubscriptionRegistryState {
 #[derive(Clone)]
 struct FinalSubscriptionEntry {
     registry_key: usize,
+    _reservation: Arc<FinalSubscriptionReservation>,
     subscription_id: RequestId,
     modern_http_owner: Option<u64>,
     accepted_filter: SubscriptionFilter,
@@ -5544,6 +5592,9 @@ impl FinalSubscriptionTaskAdmission {
 struct FinalSubscriptionTransportAdmission {
     registry: std::sync::Weak<FinalSubscriptionRegistry>,
     registry_key: usize,
+    // A request can finish before its queued events or elected terminal frame
+    // leave the transport. Cloned transport guards retain the same one charge.
+    _reservation: Arc<FinalSubscriptionReservation>,
     election: Arc<FinalSubscriptionElection>,
     request_cancellation: McpRequestCancellation,
     subscription_id: RequestId,
@@ -5882,7 +5933,9 @@ impl FinalSubscriptionElection {
 /// Caller-owned in-process `subscriptions/listen` stream.
 ///
 /// Keep this handle alive for as long as events should be delivered. Drop
-/// unregisters the listener from the server.
+/// unregisters the listener from the server. A cancelled handle retains its
+/// capacity reservation until it is dropped, and an in-flight callback retains
+/// that reservation until its delivery finishes.
 pub struct SubscriptionListenHandle {
     _lease: FinalSubscriptionLease,
 }
@@ -5901,6 +5954,7 @@ struct FinalSubscriptionLease {
     registry: Arc<FinalSubscriptionRegistry>,
     key: usize,
     election: Arc<FinalSubscriptionElection>,
+    _reservation: Arc<FinalSubscriptionReservation>,
 }
 
 impl FinalSubscriptionLease {
@@ -6097,6 +6151,58 @@ fn complete_final_subscription_server_termination(
 }
 
 impl FinalSubscriptionRegistry {
+    fn validate_capacity(max_streams: usize, max_streams_per_principal: usize) -> McpResult<()> {
+        if max_streams == 0
+            || max_streams > MAX_FINAL_SUBSCRIPTION_STREAMS
+            || max_streams_per_principal == 0
+            || max_streams_per_principal > max_streams
+        {
+            return Err(McpError::invalid_params(
+                "Subscription capacities must be positive, with the principal limit no greater than the total and the total no greater than 64",
+            ));
+        }
+        Ok(())
+    }
+
+    fn with_capacity(max_streams: usize, max_streams_per_principal: usize) -> Self {
+        Self {
+            inner: Mutex::new(FinalSubscriptionRegistryState::default()),
+            admission: Arc::new(Mutex::new(FinalSubscriptionAdmissionState::default())),
+            max_streams,
+            max_streams_per_principal,
+            terminating: AtomicBool::new(false),
+            #[cfg(feature = "tasks")]
+            task_notification_emitter: OnceLock::new(),
+        }
+    }
+
+    fn reserve(&self, principal: Option<[u8; 32]>) -> McpResult<Arc<FinalSubscriptionReservation>> {
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admission.total >= self.max_streams {
+            return Err(McpError::new(
+                McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE),
+                "final subscription stream capacity exhausted",
+            ));
+        }
+        let count = admission.principals.get(&principal).copied().unwrap_or(0);
+        if count >= self.max_streams_per_principal {
+            return Err(McpError::new(
+                McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE),
+                "final subscription principal capacity exhausted",
+            ));
+        }
+        admission.total += 1;
+        admission.principals.insert(principal, count + 1);
+        drop(admission);
+        Ok(Arc::new(FinalSubscriptionReservation {
+            admission: Arc::clone(&self.admission),
+            principal,
+        }))
+    }
+
     #[cfg(all(test, feature = "proxy", feature = "tasks"))]
     fn snapshot_for_test(&self) -> serde_json::Value {
         let state = self
@@ -6191,8 +6297,6 @@ impl FinalSubscriptionRegistry {
         task_principal: Option<Sha256Digest>,
         resource_admission: Option<FinalSubscriptionResourceAdmission>,
     ) -> McpResult<FinalSubscriptionLease> {
-        #[cfg(not(feature = "tasks"))]
-        let _ = task_principal;
         requested
             .validate_resource_subscriptions()
             .map_err(|error| McpError::invalid_params(error.to_string()))?;
@@ -6221,6 +6325,24 @@ impl FinalSubscriptionRegistry {
             }
         }
 
+        // Catalog-only and resource-only listens need the same admission
+        // partition as Tasks. A task-specific fingerprint is not present for
+        // those wire paths. Authenticated facts come from the already-admitted
+        // request context; peer metadata and filters never select a partition.
+        let principal = if let Some(admission) = &resource_admission {
+            let auth = admission.context.auth();
+            match auth.as_ref() {
+                Some(auth) => {
+                    let fingerprint = auth::principal_fingerprint(Some(auth))?;
+                    (auth.session_owner().is_some() || auth.subject.is_some())
+                        .then(|| fingerprint.into_bytes())
+                }
+                None => None,
+            }
+        } else {
+            task_principal.map(Sha256Digest::into_bytes)
+        };
+
         #[cfg(feature = "tasks")]
         let accepted_filter = accepted_subscription_filter(&requested, accept_tasks)?;
         #[cfg(not(feature = "tasks"))]
@@ -6241,12 +6363,6 @@ impl FinalSubscriptionRegistry {
         if self.terminating.load(Ordering::Acquire) {
             return Err(McpError::request_cancelled());
         }
-        if state.entries.len() >= MAX_FINAL_SUBSCRIPTION_STREAMS {
-            return Err(McpError::new(
-                McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE),
-                "final subscription stream capacity exhausted",
-            ));
-        }
         if let Some(owner) = modern_http_owner
             && state.modern_http_owners.contains_key(&owner)
         {
@@ -6254,6 +6370,9 @@ impl FinalSubscriptionRegistry {
                 "a modern HTTP subscriptions/listen response body is already active",
             ));
         }
+        // Reserve before the acknowledgement or any registry mutation. Both
+        // counters also include removed entries whose owners are still draining.
+        let reservation = self.reserve(principal)?;
         let mut key = state.next_key;
         while state.entries.contains_key(&key) {
             key = key.checked_add(1).unwrap_or(0);
@@ -6268,6 +6387,7 @@ impl FinalSubscriptionRegistry {
                 Some(Arc::new(FinalSubscriptionTransportAdmission {
                     registry: Arc::downgrade(self),
                     registry_key: key,
+                    _reservation: Arc::clone(&reservation),
                     election: Arc::clone(&election),
                     request_cancellation: request_cancellation.clone(),
                     subscription_id: subscription_id.clone(),
@@ -6279,6 +6399,7 @@ impl FinalSubscriptionRegistry {
             key,
             FinalSubscriptionEntry {
                 registry_key: key,
+                _reservation: Arc::clone(&reservation),
                 subscription_id: subscription_id.clone(),
                 modern_http_owner,
                 accepted_filter,
@@ -6386,6 +6507,7 @@ impl FinalSubscriptionRegistry {
                         registry: Arc::clone(self),
                         key,
                         election,
+                        _reservation: reservation,
                     });
                 }
                 FinalSubscriptionPhase::Opening
@@ -6457,6 +6579,7 @@ impl FinalSubscriptionRegistry {
                         registry: Arc::clone(self),
                         key,
                         election,
+                        _reservation: reservation,
                     });
                 }
                 FinalSubscriptionPhase::OpeningDelivery
@@ -6487,6 +6610,7 @@ impl FinalSubscriptionRegistry {
             registry: Arc::clone(self),
             key,
             election,
+            _reservation: reservation,
         })
     }
 
@@ -55835,6 +55959,7 @@ mod lib_unit_tests {
         let admission = Arc::new(FinalSubscriptionTransportAdmission {
             registry: std::sync::Weak::new(),
             registry_key: 0,
+            _reservation: FinalSubscriptionRegistry::default().reserve(None).unwrap(),
             election,
             request_cancellation: cancellation,
             subscription_id: 937_i64.into(),
@@ -65439,6 +65564,353 @@ mod lib_unit_tests {
             2,
             "peer-cancelled Tasks publication must leave delivery state unchanged",
         );
+    }
+
+    mod subscription_capacity_tests {
+        use super::*;
+
+        fn context(auth: Option<AuthContext>) -> McpContext {
+            let context = McpContext::with_state(Cx::for_testing(), 1, SessionState::new());
+            match auth {
+                Some(auth) => context.with_auth(auth),
+                None => context,
+            }
+        }
+
+        fn filter() -> SubscriptionFilter {
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            }
+        }
+
+        fn capture(count: &Arc<AtomicUsize>) -> NotificationSender {
+            let count = Arc::clone(count);
+            Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+
+        fn assert_capacity(error: McpError) {
+            assert_eq!(error.code, McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE));
+        }
+
+        fn wire_listen(
+            registry: &Arc<FinalSubscriptionRegistry>,
+            context: McpContext,
+            owner: u64,
+            sender: NotificationSender,
+        ) -> McpResult<FinalSubscriptionLease> {
+            registry.open_with_resource_bindings(
+                // Reusing one wire ID on independent HTTP bodies is valid and
+                // cannot create additional principal quota.
+                RequestId::Number(1),
+                filter(),
+                false,
+                Some(owner),
+                McpRequestCancellation::new(),
+                None,
+                sender,
+                None,
+                Some(FinalSubscriptionResourceAdmission {
+                    context,
+                    bindings: Vec::new(),
+                    #[cfg(feature = "tasks")]
+                    task_access: None,
+                }),
+            )
+        }
+
+        #[test]
+        fn catalog_principal_saturation_preserves_another_principals_streams() {
+            let server = Server::new("subscription-capacity", "1")
+                .subscription_capacity(4, 2)
+                .unwrap()
+                .build();
+            let alice = context(Some(AuthContext::with_subject("alice")));
+            let bob = context(Some(AuthContext::with_subject("bob")));
+            let seen = Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for id in 1..=2 {
+                handles.push(server.open_subscription_listen_in_context(
+                    &alice, RequestId::Number(id), filter(), capture(&seen),
+                ).unwrap());
+            }
+            let error = server.open_subscription_listen_in_context(
+                &alice, RequestId::Number(3), filter(), capture(&seen),
+            ).err().expect("a principal cannot occupy the remaining deployment capacity");
+            assert_capacity(error);
+            assert_eq!(seen.load(Ordering::SeqCst), 2, "refusal must precede acknowledgement");
+
+            handles.push(server.open_subscription_listen_in_context(
+                &bob, RequestId::Number(3), filter(), capture(&seen),
+            ).expect("changing only the verified principal leaves capacity for a sibling"));
+            assert_eq!(server.publish_subscription_notification(
+                ServerNotification::ToolsListChanged(None),
+            ).unwrap(), 3);
+            assert_eq!(seen.load(Ordering::SeqCst), 6);
+            drop(handles);
+            let admission = server.final_subscriptions.admission.lock().unwrap();
+            assert_eq!(admission.total, 0);
+            assert!(admission.principals.is_empty());
+        }
+
+        #[test]
+        fn provider_owner_survives_token_scope_and_subject_display_changes() {
+            let server = Server::new("subscription-owner", "1")
+                .subscription_capacity(3, 1)
+                .unwrap()
+                .build();
+            let owner = auth::principal_fingerprint(Some(&AuthContext::with_subject("provider-owner"))).unwrap();
+            let first_auth = AuthContext::with_subject("display-before").with_session_owner(owner);
+            let mut rotated_auth = AuthContext::with_subject("display-after").with_session_owner(owner);
+            rotated_auth.scopes = vec!["new-scope".to_owned()];
+            rotated_auth.claims = Some(serde_json::json!({"jti": "rotated-instance", "iat": 42}));
+            let seen = Arc::new(AtomicUsize::new(0));
+            let first = server.open_subscription_listen_in_context(
+                &context(Some(first_auth)), RequestId::Number(1), filter(), capture(&seen),
+            ).unwrap();
+            assert_capacity(server.open_subscription_listen_in_context(
+                &context(Some(rotated_auth.clone())), RequestId::String("rotated-id".to_owned()),
+                SubscriptionFilter::default(), capture(&seen),
+            ).err().expect("rotating facts and filters must not mint another owner"));
+            assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+            let other_owner = auth::principal_fingerprint(Some(&AuthContext::with_subject("other-provider-owner"))).unwrap();
+            let second = server.open_subscription_listen_in_context(
+                &context(Some(rotated_auth.with_session_owner(other_owner))),
+                RequestId::Number(2), filter(), capture(&seen),
+            ).expect("another verified provider owner is an independent admission partition");
+            drop((first, second));
+            assert_eq!(server.final_subscriptions.admission.lock().unwrap().total, 0);
+        }
+
+        #[test]
+        fn anonymous_context_and_embedding_listens_share_one_fixed_partition() {
+            let server = Server::new("subscription-anonymous", "1")
+                .subscription_capacity(2, 1)
+                .unwrap()
+                .build();
+            let seen = Arc::new(AtomicUsize::new(0));
+            let first = server.open_subscription_listen(
+                RequestId::Number(1), SubscriptionFilter::default(), capture(&seen),
+            ).unwrap();
+            for anonymous in [None, Some(AuthContext::anonymous())] {
+                assert_capacity(server.open_subscription_listen_in_context(
+                    &context(anonymous), RequestId::Number(2), filter(), capture(&seen),
+                ).err().expect("anonymous forms cannot split the shared quota"));
+            }
+            assert_eq!(seen.load(Ordering::SeqCst), 1);
+            let authenticated = server.open_subscription_listen_in_context(
+                &context(Some(AuthContext::with_subject("reader"))),
+                RequestId::Number(2), filter(), capture(&seen),
+            ).unwrap();
+            drop(first);
+            let replacement = server.open_subscription_listen(
+                RequestId::Number(3), filter(), capture(&seen),
+            ).expect("dropping the sole anonymous owner releases its slot");
+            drop((authenticated, replacement));
+            assert!(server.final_subscriptions.admission.lock().unwrap().principals.is_empty());
+        }
+
+        #[test]
+        fn global_capacity_cannot_be_evaded_by_new_principals_and_releases_once() {
+            let server = Server::new("subscription-total", "1")
+                .subscription_capacity(2, 1)
+                .unwrap()
+                .build();
+            let seen = Arc::new(AtomicUsize::new(0));
+            let alice = server.open_subscription_listen_in_context(
+                &context(Some(AuthContext::with_subject("alice"))),
+                RequestId::Number(1), filter(), capture(&seen),
+            ).unwrap();
+            let bob = server.open_subscription_listen_in_context(
+                &context(Some(AuthContext::with_subject("bob"))),
+                RequestId::Number(2), filter(), capture(&seen),
+            ).unwrap();
+            let carol = context(Some(AuthContext::with_subject("carol")));
+            assert_capacity(server.open_subscription_listen_in_context(
+                &carol, RequestId::Number(3), filter(), capture(&seen),
+            ).err().expect("new identities remain subject to the aggregate ceiling"));
+            assert_eq!(seen.load(Ordering::SeqCst), 2);
+            drop(alice);
+            let third = server.open_subscription_listen_in_context(
+                &carol, RequestId::Number(3), filter(), capture(&seen),
+            ).unwrap();
+            assert_eq!(server.publish_subscription_notification(
+                ServerNotification::ToolsListChanged(None),
+            ).unwrap(), 2);
+            drop((bob, third));
+            let admission = server.final_subscriptions.admission.lock().unwrap();
+            assert_eq!(admission.total, 0);
+            assert!(admission.principals.is_empty());
+        }
+
+        #[test]
+        fn acknowledgement_reservation_precedes_reentrant_admission_and_panic_releases_it() {
+            let server = Arc::new(Server::new("subscription-opening", "1")
+                .subscription_capacity(2, 1).unwrap().build());
+            let alice = context(Some(AuthContext::with_subject("alice")));
+            let nested_error = Arc::new(Mutex::new(None));
+            let sender_server = Arc::clone(&server);
+            let sender_context = alice.clone();
+            let sender_error = Arc::clone(&nested_error);
+            let first = server.open_subscription_listen_in_context(
+                &alice, RequestId::Number(1), filter(), Arc::new(move |_| {
+                    *sender_error.lock().unwrap() = sender_server.open_subscription_listen_in_context(
+                        &sender_context, RequestId::Number(2), filter(), Arc::new(|_| {}),
+                    ).err();
+                }),
+            ).unwrap();
+            assert_capacity(nested_error.lock().unwrap().take().expect("opening must already own a slot"));
+            drop(first);
+            let refused = server.open_subscription_listen_in_context(
+                &alice, RequestId::Number(3), filter(), Arc::new(|_| panic!("held ack failure")),
+            );
+            assert!(refused.is_err());
+            assert_eq!(server.final_subscriptions.admission.lock().unwrap().total, 0);
+            let recovered = server.open_subscription_listen_in_context(
+                &alice, RequestId::Number(4), filter(), Arc::new(|_| {}),
+            ).expect("a failed acknowledgement must release its complete admission");
+            drop(recovered);
+            assert!(server.final_subscriptions.admission.lock().unwrap().principals.is_empty());
+        }
+
+        #[test]
+        fn cancelled_opening_keeps_its_slot_until_the_acknowledgement_returns() {
+            let registry = Arc::new(FinalSubscriptionRegistry::with_capacity(2, 1));
+            let alice = context(Some(AuthContext::with_subject("alice")));
+            let bob = context(Some(AuthContext::with_subject("bob")));
+            let (entered_tx, entered_rx) = sync_channel(1);
+            let (release_tx, release_rx) = sync_channel(1);
+            let release_rx = Mutex::new(release_rx);
+            let opener_registry = Arc::clone(&registry);
+            let opener_context = alice.clone();
+            let opener = thread::spawn(move || wire_listen(
+                &opener_registry, opener_context, 10, Arc::new(move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }),
+            ));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let cancelled = registry.cancel_modern_http_owner(10);
+            let same_owner = wire_listen(&registry, alice.clone(), 11, Arc::new(|_| {}));
+            let sibling = wire_listen(&registry, bob, 12, Arc::new(|_| {}));
+            // Always release the callback before asserting the observations.
+            release_tx.send(()).unwrap();
+            let opened = opener.join().unwrap();
+            assert!(cancelled);
+            assert!(opened.is_err());
+            assert_capacity(same_owner.err().expect("removed opening is still retained by its callback"));
+            let sibling = sibling.expect("a different owner can use the other slot while acknowledgement drains");
+            let replacement = wire_listen(&registry, alice, 13, Arc::new(|_| {}))
+                .expect("the callback return releases the cancelled opening slot");
+            drop((sibling, replacement));
+            assert_eq!(registry.admission.lock().unwrap().total, 0);
+            assert!(registry.admission.lock().unwrap().principals.is_empty());
+        }
+
+        #[test]
+        fn removed_stream_and_dropped_handle_remain_charged_while_callback_drains() {
+            let registry = Arc::new(FinalSubscriptionRegistry::with_capacity(2, 1));
+            let alice = context(Some(AuthContext::with_subject("alice")));
+            let bob = context(Some(AuthContext::with_subject("bob")));
+            let (entered_tx, entered_rx) = sync_channel(1);
+            let (release_tx, release_rx) = sync_channel(1);
+            let release_rx = Mutex::new(release_rx);
+            let first = wire_listen(&registry, alice.clone(), 20, Arc::new(move |notification| {
+                if notification.method == "notifications/tools/list_changed" {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            })).unwrap();
+            let publishing_registry = Arc::clone(&registry);
+            let publishing = thread::spawn(move || publishing_registry.publish(
+                ServerNotification::ToolsListChanged(None),
+            ));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let cancelled = registry.cancel_modern_http_owner(20);
+            drop(first);
+            let same_owner = wire_listen(&registry, alice.clone(), 21, Arc::new(|_| {}));
+            let sibling = wire_listen(&registry, bob, 22, Arc::new(|_| {}));
+            release_tx.send(()).unwrap();
+            let published = publishing.join().unwrap().unwrap();
+            assert!(cancelled);
+            assert_eq!(published, 0, "peer cancellation wins the held event callback");
+            assert_capacity(same_owner.err().expect("callback snapshots must retain their admission"));
+            let sibling = sibling.expect("another owner does not wait for the held callback");
+            let replacement = wire_listen(&registry, alice, 23, Arc::new(|_| {}))
+                .expect("settling the last callback releases its one reservation");
+            drop((sibling, replacement));
+            assert_eq!(registry.admission.lock().unwrap().total, 0);
+            assert!(registry.admission.lock().unwrap().principals.is_empty());
+        }
+
+        #[test]
+        fn transport_admission_retains_capacity_until_its_last_body_guard_drops() {
+            for fail_delivery in [false, true] {
+                let registry = Arc::new(FinalSubscriptionRegistry::with_capacity(2, 1));
+                let alice = context(Some(AuthContext::with_subject("alice")));
+                let bob = context(Some(AuthContext::with_subject("bob")));
+                let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+                let lease = registry
+                    .open_with_resource_bindings(
+                        RequestId::Number(1),
+                        filter(),
+                        false,
+                        Some(30),
+                        McpRequestCancellation::new(),
+                        Some(Arc::clone(&delivery)),
+                        Arc::new(|_| {}),
+                        None,
+                        Some(FinalSubscriptionResourceAdmission {
+                            context: alice.clone(),
+                            bindings: Vec::new(),
+                            #[cfg(feature = "tasks")]
+                            task_access: None,
+                        }),
+                    )
+                    .unwrap();
+                let entry = registry.inner.lock().unwrap().entries[&lease.key].clone();
+                registry.remove_entry(lease.key);
+                let (terminated, receipt) =
+                    FinalSubscriptionRegistry::terminate_removed_entry(entry);
+                assert!(terminated);
+                drop((lease, receipt));
+                assert!(delivery.cancellation_pending());
+
+                assert_capacity(
+                    wire_listen(&registry, alice.clone(), 31, Arc::new(|_| {}))
+                        .err()
+                        .expect("the queued terminal body still owns the retired request slot"),
+                );
+                let sibling = wire_listen(&registry, bob, 32, Arc::new(|_| {}))
+                    .expect("a terminal drain cannot consume another owner's remaining slot");
+
+                // A writer clones this guard before rechecking provider
+                // authority. It must retain the charge even if cancellation
+                // concurrently drops the response and its delivery receipt.
+                let guard = delivery.subscription_admission.lock().unwrap().clone().unwrap();
+                if fail_delivery {
+                    delivery.mark_failed();
+                } else {
+                    delivery.mark_drained();
+                }
+                assert!(delivery.is_settled());
+                drop(delivery);
+                assert_capacity(
+                    wire_listen(&registry, alice.clone(), 33, Arc::new(|_| {}))
+                        .err()
+                        .expect("a retained transport guard still owns one reservation"),
+                );
+                drop(guard);
+                let replacement = wire_listen(&registry, alice, 34, Arc::new(|_| {}))
+                    .expect("success and failure release capacity after the last owner drains");
+                drop((sibling, replacement));
+                assert_eq!(registry.admission.lock().unwrap().total, 0);
+                assert!(registry.admission.lock().unwrap().principals.is_empty());
+            }
+        }
     }
 
     #[test]

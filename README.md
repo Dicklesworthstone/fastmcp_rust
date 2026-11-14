@@ -790,6 +790,29 @@ directly when that dependency boundary is required.
 This feature selection does not change the transport qualification boundaries
 described above.
 
+### Modern subscription admission (current source tree)
+
+Modern subscription listeners share a server-wide capacity of 64 streams and
+a default limit of 32 streams per verified principal. Configure smaller bounds
+through the root, `auto`, or `modern` server builder:
+
+```rust
+let server = fastmcp_rust::modern::ServerBuilder::new("bounded-listeners", "1.0")
+    .subscription_capacity(32, 8)?
+    .build();
+```
+
+Both values must be positive; the per-principal limit cannot exceed the total,
+and the total cannot exceed 64. Token rotation, scope changes, request IDs, and
+new HTTP connections do not reset a verified principal's count. Anonymous
+listeners share one admission partition. These partitions govern capacity;
+existing authorization checks still govern event access.
+
+Opening acknowledgements, active listeners, and retained callbacks or terminal
+drains consume capacity until their owners release it. Saturation rejects the
+new listen before acknowledgement without evicting an existing listener.
+In-process callers must drop finished listen handles to release their slots.
+
 ### From Source
 
 ```bash

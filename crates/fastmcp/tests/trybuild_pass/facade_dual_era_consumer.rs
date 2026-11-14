@@ -1364,8 +1364,20 @@ fn assert_lossless_dual_era_product_paths() {
         meta: None,
     };
     let _: modern::Server = modern::server_builder("final-only", "1.0.0")
+        .subscription_capacity(8, 2)
+        .expect("modern facade forwards subscription capacities")
         .resource_template(final_template)
         .build();
+    let _: auto::Server = auto::ServerBuilder::new("dual-era", "1.0.0")
+        .subscription_capacity(8, 2)
+        .expect("Auto facade forwards modern subscription capacities")
+        .build();
+    assert!(modern::server_builder("invalid-capacity", "1.0.0")
+        .subscription_capacity(8, 9)
+        .is_err());
+    assert!(auto::ServerBuilder::new("invalid-capacity", "1.0.0")
+        .subscription_capacity(8, 9)
+        .is_err());
     let final_resource = modern::FinalResource {
         uri: modern::AbsoluteUri::parse("resource://cities/london")
             .expect("absolute resource URI parses through the facade"),

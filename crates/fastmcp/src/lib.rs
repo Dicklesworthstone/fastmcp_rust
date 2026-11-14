@@ -2252,6 +2252,19 @@ pub mod auto {
                 .map(|inner| Self { inner })
         }
 
+        /// Bounds modern subscriptions across the server and per verified principal.
+        /// Defaults are 64 overall and 32 per principal, including opening and
+        /// draining owners. Anonymous listeners share one principal partition.
+        pub fn subscription_capacity(
+            self,
+            max_streams: usize,
+            max_streams_per_principal: usize,
+        ) -> McpResult<Self> {
+            self.inner
+                .subscription_capacity(max_streams, max_streams_per_principal)
+                .map(|inner| Self { inner })
+        }
+
         #[must_use]
         pub fn list_page_size(self, page_size: usize) -> Self {
             Self {
@@ -8063,6 +8076,19 @@ pub mod modern {
             Self {
                 inner: self.inner.request_timeout(seconds),
             }
+        }
+
+        /// Bounds modern subscriptions across the server and per verified principal.
+        /// Defaults are 64 overall and 32 per principal, including opening and
+        /// draining owners. Anonymous listeners share one principal partition.
+        pub fn subscription_capacity(
+            self,
+            max_streams: usize,
+            max_streams_per_principal: usize,
+        ) -> McpResult<Self> {
+            self.inner
+                .subscription_capacity(max_streams, max_streams_per_principal)
+                .map(|inner| Self { inner })
         }
 
         /// Sets the final catalog page size.
