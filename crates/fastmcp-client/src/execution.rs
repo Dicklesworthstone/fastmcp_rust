@@ -10,6 +10,8 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+#[cfg(feature = "tasks")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
@@ -73,6 +75,17 @@ pub const DEFAULT_MAX_RESPONSE_CORRELATIONS: usize = 4_096;
 pub const DEFAULT_TOMBSTONE_RETENTION: Duration = Duration::from_mins(10);
 
 const MAX_RETAINED_PEER_ACTIVITY: usize = 1_024;
+
+// Task data can contain a complete result; it is not a small lifetime-control
+// message. Bound both one listener and all listeners sharing this executor.
+#[cfg(feature = "tasks")]
+const MAX_TASK_SUBSCRIPTION_QUEUED_EVENTS: usize = 256;
+#[cfg(feature = "tasks")]
+const MAX_TASK_SUBSCRIPTION_EVENT_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(feature = "tasks")]
+const MAX_TASK_SUBSCRIPTION_QUEUED_BYTES: usize = 9 * 1024 * 1024;
+#[cfg(feature = "tasks")]
+const MAX_TASK_SUBSCRIPTION_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 // Observation identities are process-local counters, never transport addresses,
 // peer identifiers, or request generations. Exhaustion disables observation of
@@ -1071,7 +1084,110 @@ enum TaskExecutionOperation {
 struct TaskSubscription {
     requested_filter: SubscriptionFilter,
     accepted_filter: Option<SubscriptionFilter>,
-    notifications: VecDeque<TaskStatusNotification>,
+    notifications: VecDeque<RetainedTaskNotification>,
+    retained_bytes: usize,
+}
+
+#[cfg(feature = "tasks")]
+#[derive(Debug)]
+struct RetainedTaskNotification {
+    notification: TaskStatusNotification,
+    _reservation: TaskNotificationReservation,
+}
+
+/// Capacity follows each event until ownership is transferred to its caller or
+/// the listener is retired. Dropping a terminal, abandoned, or failed listener
+/// releases its events without relying on every map-removal path to account.
+#[cfg(feature = "tasks")]
+#[derive(Debug)]
+struct TaskNotificationReservation {
+    total: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+#[cfg(feature = "tasks")]
+impl TaskNotificationReservation {
+    fn reserve(total: &Arc<AtomicUsize>, bytes: usize) -> Option<Self> {
+        total
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+                retained
+                    .checked_add(bytes)
+                    .filter(|next| *next <= MAX_TASK_SUBSCRIPTION_TOTAL_BYTES)
+            })
+            .ok()?;
+        Some(Self {
+            total: Arc::clone(total),
+            bytes,
+        })
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl Drop for TaskNotificationReservation {
+    fn drop(&mut self) {
+        let previous = self.total.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(previous >= self.bytes);
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl TaskSubscription {
+    fn admits_notification(&self, bytes: usize) -> bool {
+        self.notifications.len() < MAX_TASK_SUBSCRIPTION_QUEUED_EVENTS
+            && self
+                .retained_bytes
+                .checked_add(bytes)
+                .is_some_and(|next| next <= MAX_TASK_SUBSCRIPTION_QUEUED_BYTES)
+    }
+
+    fn take_notifications(&mut self) -> Vec<TaskStatusNotification> {
+        self.retained_bytes = 0;
+        self.notifications
+            .drain(..)
+            .map(|retained| retained.notification)
+            .collect()
+    }
+}
+
+/// Check the admitted wire size before constructing another typed Task result.
+/// Typed-only adapters use a bounded counting sink instead of an encoded copy.
+#[cfg(feature = "tasks")]
+fn task_subscription_notification_bytes(
+    notification: &JsonRpcRequest,
+    source: Option<&[u8]>,
+) -> McpResult<usize> {
+    if let Some(source) = source {
+        return (source.len() <= MAX_TASK_SUBSCRIPTION_EVENT_BYTES)
+            .then_some(source.len())
+            .ok_or_else(|| {
+                McpError::invalid_request("Tasks subscription event byte bound exceeded")
+            });
+    }
+
+    struct Counter(usize);
+
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let next = self
+                .0
+                .checked_add(bytes.len())
+                .filter(|next| *next <= MAX_TASK_SUBSCRIPTION_EVENT_BYTES)
+                .ok_or_else(|| {
+                    std::io::Error::other("Tasks subscription event byte bound exceeded")
+                })?;
+            self.0 = next;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, notification)
+        .map_err(|_| McpError::invalid_request("Tasks subscription event byte bound exceeded"))?;
+    Ok(counter.0)
 }
 
 #[derive(Debug)]
@@ -1264,6 +1380,8 @@ struct ExecutorState<T> {
     deferred_rejections: VecDeque<JsonRpcMessage>,
     #[cfg(feature = "tasks")]
     task_subscriptions: HashMap<(RequestId, u64), TaskSubscription>,
+    #[cfg(feature = "tasks")]
+    task_subscription_bytes: Arc<AtomicUsize>,
     next_generation: u64,
     result_peer_era: ResultPeerEra,
     terminal_error: Option<McpError>,
@@ -1406,6 +1524,16 @@ impl<T> ExecutorState<T> {
     fn prune_tombstones(&mut self, now: Instant) {
         self.tombstones
             .retain(|_, tombstone| tombstone.expires_at > now);
+    }
+
+    fn is_retired_subscription_id(&self, subscription_id: &RequestId) -> bool {
+        subscription_id
+            .correlation_key()
+            .ok()
+            .and_then(|key| self.tombstones.get(&key))
+            .is_some_and(|tombstone| {
+                tombstone.subscription && tombstone.expires_at > Instant::now()
+            })
     }
 
     fn retain_terminal(
@@ -1671,6 +1799,8 @@ where
                 deferred_rejections: VecDeque::new(),
                 #[cfg(feature = "tasks")]
                 task_subscriptions: HashMap::new(),
+                #[cfg(feature = "tasks")]
+                task_subscription_bytes: Arc::new(AtomicUsize::new(0)),
                 next_generation: 0,
                 result_peer_era,
                 terminal_error: None,
@@ -1968,16 +2098,9 @@ where
     /// set of subscription identities. An ordinary request grants no event
     /// suppression authority, and expired records are never treated as live.
     pub(crate) fn is_retired_subscription_id(&self, subscription_id: &RequestId) -> bool {
-        let Ok(key) = subscription_id.correlation_key() else {
-            return false;
-        };
         self.state
             .borrow()
-            .tombstones
-            .get(&key)
-            .is_some_and(|tombstone| {
-                tombstone.subscription && tombstone.expires_at > Instant::now()
-            })
+            .is_retired_subscription_id(subscription_id)
     }
 
     /// Returns whether a progress notification names one live request owner.
@@ -2490,6 +2613,7 @@ where
                 requested_filter,
                 accepted_filter: None,
                 notifications: VecDeque::new(),
+                retained_bytes: 0,
             },
         );
         Ok(execution)
@@ -2800,7 +2924,7 @@ where
                     let handled = self
                         .route_task_subscription_acknowledgement_locked(state, &request)?
                         || self
-                            .route_task_subscription_notification_locked(state, &request, source)?
+                            .route_task_subscription_notification_locked(cx, state, &request, source)?
                         || self.route_stream_notification_locked(
                             state,
                             &request,
@@ -3081,7 +3205,7 @@ where
             .task_subscriptions
             .get_mut(&(execution.request_id.clone(), execution.generation))
             .ok_or_else(|| McpError::invalid_request("Tasks subscription is no longer active"))?;
-        Ok(subscription.notifications.drain(..).collect())
+        Ok(subscription.take_notifications())
     }
 
     /// Returns the exact filter acknowledged for one live Tasks subscription.
@@ -3186,12 +3310,16 @@ where
         })?;
         Ok((
             accepted_filter,
-            subscription.notifications.into_iter().collect(),
+            subscription
+                .notifications
+                .into_iter()
+                .map(|retained| retained.notification)
+                .collect(),
         ))
     }
 
-    /// Returns whether a notification could belong to one active Tasks
-    /// subscription.  The caller must still route the frame through
+    /// Returns whether a notification could belong to an active or retired
+    /// Tasks subscription. The caller must still route the frame through
     /// [`Self::drive_frame`], which validates the exact subscription ID,
     /// acknowledgement order, and task filter.
     #[cfg(feature = "tasks")]
@@ -3200,10 +3328,11 @@ where
             return false;
         }
         let state = self.state.borrow();
-        if notification.method == TASK_STATUS_NOTIFICATION {
-            return !state.task_subscriptions.is_empty();
+        let task_event = notification.method == TASK_STATUS_NOTIFICATION;
+        if task_event && !state.task_subscriptions.is_empty() {
+            return true;
         }
-        if notification.method != "notifications/subscriptions/acknowledged" {
+        if !task_event && notification.method != "notifications/subscriptions/acknowledged" {
             return false;
         }
         let Some(subscription_id) = notification
@@ -3215,6 +3344,9 @@ where
         else {
             return false;
         };
+        if task_event {
+            return state.is_retired_subscription_id(&subscription_id);
+        }
         // Catalog and Tasks listeners share ingress. Claim only the exact
         // Tasks owner; a catalog acknowledgement must reach its own harvester.
         let Ok(key) = subscription_id.correlation_key() else {
@@ -3427,26 +3559,34 @@ where
         let cx = &turn;
         execution.ensure_owner(&self.state)?;
         let mut state = self.state.borrow_mut();
-        let key = execution.request_id.correlation_key().map_err(|_| {
+        self.fail_subscription_locked(
+            cx,
+            &mut state,
+            &(execution.request_id.clone(), execution.generation),
+            error,
+        )
+    }
+
+    fn fail_subscription_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+        owner: &(RequestId, u64),
+        error: McpError,
+    ) -> McpResult<()> {
+        let key = owner.0.correlation_key().map_err(|_| {
             McpError::invalid_params("Subscription execution has an invalid request ID")
         })?;
         if state.pending.get(&key).is_none_or(|pending| {
-            pending.record.execution_generation != execution.generation
-                || pending.method != SUBSCRIPTIONS_LISTEN
+            pending.record.execution_generation != owner.1 || pending.method != SUBSCRIPTIONS_LISTEN
         }) {
             return Ok(());
         }
-        self.cancel_pending_locked(
-            cx,
-            &mut state,
-            &execution.request_id,
-            ExecutionTerminalReason::PeerProtocol,
-        )?;
-        let owner = (execution.request_id.clone(), execution.generation);
-        if let Some(outcome) = state.completed.get_mut(&owner) {
+        self.cancel_pending_locked(cx, state, &owner.0, ExecutionTerminalReason::PeerProtocol)?;
+        if let Some(outcome) = state.completed.get_mut(owner) {
             *outcome = ExecutionOutcome::Failure(error);
         }
-        if let Some(record) = state.terminal_records.get_mut(&owner) {
+        if let Some(record) = state.terminal_records.get_mut(owner) {
             record.terminal_state = ExecutionTerminalState::Failed;
         }
         Ok(())
@@ -4162,39 +4302,31 @@ where
     #[cfg(feature = "tasks")]
     fn route_task_subscription_notification_locked(
         &self,
+        cx: &ExecutionTurn<'_>,
         state: &mut ExecutorState<T>,
         notification: &JsonRpcRequest,
         source: Option<&[u8]>,
     ) -> McpResult<bool> {
-        if notification.id.is_some()
-            || notification.method != TASK_STATUS_NOTIFICATION
-            || state.task_subscriptions.is_empty()
-        {
+        if notification.id.is_some() || notification.method != TASK_STATUS_NOTIFICATION {
             return Ok(false);
         }
         let Some(params) = notification.params.as_ref() else {
             return Ok(false);
         };
-        // Native ingress carries the same admitted source as the typed frame.
-        // Reconstructing it from params would lose the completed result bytes.
-        let task_notification: TaskStatusNotification = match source {
-            Some(source) => serde_json::from_slice(source),
-            None => serde_json::from_value(serde_json::json!({
-                "jsonrpc": fastmcp_protocol::JSONRPC_VERSION,
-                "method": TASK_STATUS_NOTIFICATION,
-                "params": params,
-            })),
-        }
-        .map_err(|_| McpError::invalid_request("Tasks subscription event is invalid"))?;
-        let Some(subscription_id) = task_notification
-            .params
-            .meta
-            .as_ref()
+        // Select the owner from the already-admitted frame before allocating
+        // another representation of a potentially large completed Task result.
+        let Some(subscription_id) = params
+            .get("_meta")
             .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
             .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
         else {
             return Ok(false);
         };
+        // Retired data must not escape into the generic peer-activity queue,
+        // including when no other Task listener remains on the connection.
+        if state.is_retired_subscription_id(&subscription_id) {
+            return Ok(true);
+        }
         let Some((owned_subscription_id, generation)) = state
             .pending
             .values()
@@ -4220,6 +4352,51 @@ where
         let accepted_task_ids = task_subscription_ids(accepted_filter).map_err(|_| {
             McpError::internal_error("Tasks subscription retained an invalid acknowledgement")
         })?;
+        let bytes = match task_subscription_notification_bytes(notification, source) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.fail_subscription_locked(cx, state, &key, error)?;
+                return Ok(true);
+            }
+        };
+        let reservation = subscription
+            .admits_notification(bytes)
+            .then(|| TaskNotificationReservation::reserve(&state.task_subscription_bytes, bytes))
+            .flatten();
+        let Some(reservation) = reservation else {
+            self.fail_subscription_locked(
+                cx,
+                state,
+                &key,
+                McpError::internal_error("Tasks subscription event queue is full"),
+            )?;
+            return Ok(true);
+        };
+        // Native ingress carries the same admitted source as the typed frame.
+        // Reconstructing it from params would lose the completed result bytes.
+        let task_notification: TaskStatusNotification = match source {
+            Some(source) => serde_json::from_slice(source),
+            None => serde_json::from_value(serde_json::json!({
+                "jsonrpc": fastmcp_protocol::JSONRPC_VERSION,
+                "method": TASK_STATUS_NOTIFICATION,
+                "params": params,
+            })),
+        }
+        .map_err(|_| McpError::invalid_request("Tasks subscription event is invalid"))?;
+        let source_owner = task_notification
+            .params
+            .meta
+            .as_ref()
+            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok());
+        if !source_owner
+            .as_ref()
+            .is_some_and(|source_owner| source_owner.correlates_with(&key.0))
+        {
+            return Err(McpError::invalid_request(
+                "Tasks subscription event source owner does not match its admitted frame",
+            ));
+        }
         if !accepted_task_ids.as_ref().is_some_and(|task_ids| {
             task_ids
                 .iter()
@@ -4229,19 +4406,16 @@ where
                 "Tasks subscription event taskId is outside the acknowledged filter",
             ));
         }
-        if subscription.notifications.len() >= MAX_RETAINED_PEER_ACTIVITY {
-            return Err(McpError::internal_error(
-                "Tasks subscription event queue is full",
-            ));
-        }
-        state
-            .task_subscriptions
-            .get_mut(&key)
-            .ok_or_else(|| {
-                McpError::internal_error("Tasks subscription disappeared during event routing")
-            })?
+        let subscription = state.task_subscriptions.get_mut(&key).ok_or_else(|| {
+            McpError::internal_error("Tasks subscription disappeared during event routing")
+        })?;
+        subscription.retained_bytes += bytes;
+        subscription
             .notifications
-            .push_back(task_notification);
+            .push_back(RetainedTaskNotification {
+                notification: task_notification,
+                _reservation: reservation,
+            });
         if let Some(pending) = state.pending.get_mut(
             &subscription_id
                 .correlation_key()
@@ -7170,6 +7344,21 @@ mod tests {
                 "ttlMs": null,
             })),
         ))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn completed_task_notification_source(id: i64, task_id: &TaskId, text_bytes: usize) -> String {
+        let task_id = serde_json::to_string(task_id).unwrap();
+        let text = "x".repeat(text_bytes);
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{id}}},"taskId":{task_id},"status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{{"content":[{{"type":"text","text":"{text}"}}],"x-exact":1.2300e+4,"x-large":123456789012345678901234567890}}}}}}"#
+        )
+    }
+
+    #[cfg(feature = "tasks")]
+    fn task_notification_frame(source: &str) -> ReceivedTransportFrame {
+        ReceivedTransportFrame::admit(source.as_bytes().to_vec().into_boxed_slice())
+            .expect("the Task notification is an admitted source-preserving frame")
     }
 
     #[test]
@@ -11024,6 +11213,322 @@ mod tests {
         assert_eq!(executor.take_cancellation_events().len(), 0);
     }
 
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_large_subscription_result_releases_bytes_on_consumption_terminal_and_drop() {
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-large").unwrap();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([]),
+            ResultPeerEra::Modern,
+        );
+        let mut subscription = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(73, &task_id))
+            .unwrap();
+        executor
+            .drive_frame(
+                &cx,
+                source_frame(tasks_subscription_acknowledgement(73, &task_id)),
+            )
+            .unwrap();
+        let source = completed_task_notification_source(73, &task_id, 1024 * 1024);
+        let bytes = Arc::clone(&executor.state.borrow().task_subscription_bytes);
+        executor
+            .drive_frame(&cx, task_notification_frame(&source))
+            .unwrap();
+        assert_eq!(bytes.load(Ordering::Acquire), source.len());
+        let notifications = executor
+            .take_tasks_subscription_notifications(&subscription)
+            .unwrap();
+        assert_eq!(notifications.len(), 1);
+        let Task::Completed { result, .. } = &notifications[0].params.task else {
+            panic!("a completed result larger than 256 KiB must reach the caller");
+        };
+        let result = serde_json::to_string(result).unwrap();
+        assert!(result.contains(&"x".repeat(1024 * 1024)));
+        assert!(
+            result.ends_with(r#"],"x-exact":1.2300e+4,"x-large":123456789012345678901234567890}"#)
+        );
+        assert_eq!(
+            bytes.load(Ordering::Acquire),
+            0,
+            "returned data is now caller-owned"
+        );
+
+        executor
+            .drive_frame(&cx, task_notification_frame(&source))
+            .unwrap();
+        executor
+            .drive_frame(
+                &cx,
+                source_frame(response(
+                    73,
+                    serde_json::json!({
+                        "resultType": "complete",
+                        "_meta": {"io.modelcontextprotocol/subscriptionId": 73},
+                    }),
+                )),
+            )
+            .unwrap();
+        assert_eq!(bytes.load(Ordering::Acquire), source.len());
+        let (_, final_notifications) = executor
+            .wait_tasks_subscription(&cx, &mut subscription)
+            .unwrap();
+        assert_eq!(final_notifications.len(), 1);
+        assert_eq!(bytes.load(Ordering::Acquire), 0);
+
+        let dropped = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(74, &task_id))
+            .unwrap();
+        executor
+            .drive_frame(
+                &cx,
+                source_frame(tasks_subscription_acknowledgement(74, &task_id)),
+            )
+            .unwrap();
+        let source = completed_task_notification_source(74, &task_id, 1024 * 1024);
+        executor
+            .drive_frame(&cx, task_notification_frame(&source))
+            .unwrap();
+        assert_eq!(bytes.load(Ordering::Acquire), source.len());
+        drop(dropped);
+        assert_eq!(
+            bytes.load(Ordering::Acquire),
+            0,
+            "dropping a listener releases retained data immediately"
+        );
+        assert!(executor.state.borrow().task_subscriptions.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_subscription_byte_overflow_retires_only_owner_and_suppresses_late_events() {
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-large").unwrap();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([]),
+            ResultPeerEra::Modern,
+        );
+        let mut slow = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(73, &task_id))
+            .unwrap();
+        let mut sibling = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(74, &task_id))
+            .unwrap();
+        let mut ordinary = executor.execute(&cx, request(75)).unwrap();
+        for id in [73, 74] {
+            executor
+                .drive_frame(
+                    &cx,
+                    source_frame(tasks_subscription_acknowledgement(id, &task_id)),
+                )
+                .unwrap();
+        }
+        let source = completed_task_notification_source(73, &task_id, 2 * 1024 * 1024);
+        let bytes = Arc::clone(&executor.state.borrow().task_subscription_bytes);
+        for _ in 0..4 {
+            executor
+                .drive_frame(&cx, task_notification_frame(&source))
+                .unwrap();
+        }
+        assert_eq!(bytes.load(Ordering::Acquire), 4 * source.len());
+        executor
+            .drive_frame(&cx, task_notification_frame(&source))
+            .expect("one full subscription must not fail the connection driver");
+        assert_eq!(bytes.load(Ordering::Acquire), 0);
+        assert_eq!(executor.pending_records().len(), 2);
+        assert_eq!(
+            executor
+                .try_take_tasks_subscription_terminal(&mut slow)
+                .unwrap_err()
+                .message,
+            "Tasks subscription event queue is full"
+        );
+        let late: JsonRpcRequest = serde_json::from_str(&source).unwrap();
+        assert!(executor.owns_task_subscription_notification(&late));
+        executor
+            .drive_frame(&cx, task_notification_frame(&source))
+            .unwrap();
+        assert!(
+            executor.take_notifications().is_empty(),
+            "retired data must not enter the generic queue"
+        );
+
+        executor
+            .drive_frame(&cx, source_frame(tasks_status_notification(74, &task_id)))
+            .unwrap();
+        assert_eq!(
+            executor
+                .take_tasks_subscription_notifications(&sibling)
+                .unwrap()
+                .len(),
+            1
+        );
+        executor.cancel(&cx, &mut sibling).unwrap();
+        assert!(executor.state.borrow().task_subscriptions.is_empty());
+        assert!(
+            executor.owns_task_subscription_notification(&late),
+            "retired owners remain recognized with no active Task listeners"
+        );
+        executor
+            .drive_frame(&cx, task_notification_frame(&source))
+            .unwrap();
+        assert!(executor.take_notifications().is_empty());
+        assert_eq!(bytes.load(Ordering::Acquire), 0);
+        let owner_cancellations = executor.state.borrow().transport.sent.iter().filter(|message| {
+            matches!(message, JsonRpcMessage::Request(request)
+                if request.method == "notifications/cancelled"
+                    && request.params.as_ref().and_then(|params| params.get("requestId")) == Some(&serde_json::json!(73)))
+        }).count();
+        assert_eq!(
+            owner_cancellations, 1,
+            "overflow and late events elect one cancellation"
+        );
+        executor
+            .drive_frame(
+                &cx,
+                source_frame(response(75, serde_json::json!({"resultType": "complete"}))),
+            )
+            .unwrap();
+        assert_eq!(
+            executor.wait(&cx, &mut ordinary).unwrap().id,
+            Some(RequestId::Number(75))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_subscription_aggregate_byte_limit_is_shared_and_reclaimable() {
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-shared").unwrap();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([]),
+            ResultPeerEra::Modern,
+        );
+        let bytes = Arc::clone(&executor.state.borrow().task_subscription_bytes);
+        let mut subscriptions = Vec::new();
+        let mut event_bytes = 0;
+        for id in 100..108 {
+            let subscription = executor
+                .execute_tasks_subscription(&cx, tasks_subscription_request(id, &task_id))
+                .unwrap();
+            executor
+                .drive_frame(
+                    &cx,
+                    source_frame(tasks_subscription_acknowledgement(id, &task_id)),
+                )
+                .unwrap();
+            let source = completed_task_notification_source(id, &task_id, 2 * 1024 * 1024);
+            event_bytes = source.len();
+            for _ in 0..4 {
+                executor
+                    .drive_frame(&cx, task_notification_frame(&source))
+                    .unwrap();
+                assert!(bytes.load(Ordering::Acquire) <= MAX_TASK_SUBSCRIPTION_TOTAL_BYTES);
+            }
+            subscriptions.push(subscription);
+        }
+        assert_eq!(executor.pending_records().len(), 7);
+        assert_eq!(
+            bytes.load(Ordering::Acquire),
+            7 * 4 * event_bytes,
+            "aggregate exhaustion releases the offending stream without discarding its siblings"
+        );
+        assert_eq!(
+            executor
+                .try_take_tasks_subscription_terminal(&mut subscriptions[7])
+                .unwrap_err()
+                .message,
+            "Tasks subscription event queue is full"
+        );
+        for subscription in subscriptions.iter().take(7) {
+            assert_eq!(
+                executor
+                    .take_tasks_subscription_notifications(subscription)
+                    .unwrap()
+                    .len(),
+                4
+            );
+        }
+        assert_eq!(bytes.load(Ordering::Acquire), 0);
+        let source = completed_task_notification_source(100, &task_id, 2 * 1024 * 1024);
+        executor
+            .drive_frame(&cx, task_notification_frame(&source))
+            .unwrap();
+        assert_eq!(bytes.load(Ordering::Acquire), source.len());
+        executor.shutdown(&cx).unwrap();
+        assert_eq!(
+            bytes.load(Ordering::Acquire),
+            0,
+            "connection teardown releases all retained Task data"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_subscription_data_frame_bound_is_stricter_than_transport_admission() {
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-bounded").unwrap();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([]),
+            ResultPeerEra::Modern,
+        );
+        let mut subscription = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(73, &task_id))
+            .unwrap();
+        let mut sibling = executor.execute(&cx, request(74)).unwrap();
+        executor
+            .drive_frame(
+                &cx,
+                source_frame(tasks_subscription_acknowledgement(73, &task_id)),
+            )
+            .unwrap();
+        let mut source = completed_task_notification_source(73, &task_id, 1);
+        source.extend(std::iter::repeat_n(
+            ' ',
+            MAX_TASK_SUBSCRIPTION_EVENT_BYTES - source.len(),
+        ));
+        executor
+            .drive_frame(&cx, task_notification_frame(&source))
+            .unwrap();
+        let bytes = Arc::clone(&executor.state.borrow().task_subscription_bytes);
+        assert_eq!(
+            bytes.load(Ordering::Acquire),
+            MAX_TASK_SUBSCRIPTION_EVENT_BYTES
+        );
+        assert_eq!(
+            executor
+                .take_tasks_subscription_notifications(&subscription)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(bytes.load(Ordering::Acquire), 0);
+        source.push(' ');
+        executor
+            .drive_frame(&cx, task_notification_frame(&source))
+            .expect("a transport-admitted but oversized data frame retires only its listener");
+        assert_eq!(
+            executor
+                .try_take_tasks_subscription_terminal(&mut subscription)
+                .unwrap_err()
+                .message,
+            "Tasks subscription event byte bound exceeded"
+        );
+        assert_eq!(bytes.load(Ordering::Acquire), 0);
+        assert_eq!(executor.pending_records().len(), 1);
+        executor
+            .drive_frame(
+                &cx,
+                source_frame(response(74, serde_json::json!({"resultType": "complete"}))),
+            )
+            .unwrap();
+        assert_eq!(
+            executor.wait(&cx, &mut sibling).unwrap().id,
+            Some(RequestId::Number(74))
+        );
+    }
+
     #[cfg(feature = "tasks")]
     enum TaskNotificationSourceMutation {
         MalformedResult,
@@ -11121,6 +11626,8 @@ mod tests {
             assert_eq!(executor.state.borrow().transport.sent.len(), 1);
             assert!(executor.terminal_records().is_empty());
             assert!(executor.take_cancellation_events().is_empty());
+            assert_eq!(executor.state.borrow().task_subscription_bytes.load(Ordering::Acquire), 0,
+                "invalid or foreign events cannot retain a byte reservation");
         }
 
         executor
