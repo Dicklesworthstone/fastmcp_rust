@@ -1251,6 +1251,44 @@ mod typed_tasks {
         )
     }
 
+    struct LargeResultSupervisor(usize);
+
+    impl ApplicationTaskSupervisor for LargeResultSupervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                assert!(cx.blocking_pool_handle().is_none());
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.require_input(
+                            serde_json::from_value(json!({
+                                "roots": {"method": "roots/list"},
+                            }))
+                            .unwrap(),
+                            None,
+                        )?;
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        assert_eq!(
+                            serde_json::to_value(accepted.input_responses()).unwrap(),
+                            json!({"roots": {"roots": []}})
+                        );
+                        let wire = format!(
+                            r#"{{"content":[{{"type":"text","text":"{}"}}],"precise":1.2300e+2,"huge":18446744073709551617}}"#,
+                            "L".repeat(self.0),
+                        );
+                        let result: FinalTaskCallToolResult = serde_json::from_str(&wire).unwrap();
+                        accepted.complete_task(result, None)?;
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
     async fn wait_for_task(
         cx: &Cx,
         client: &mut modern::MemoryClient,
@@ -1287,6 +1325,152 @@ mod typed_tasks {
             result.payload.content.as_slice(),
             [ContentBlock::Text { text, .. }] if text == "independent core request"
         ));
+    }
+
+    #[test]
+    fn memory_tasks_large_completions_reach_live_listeners_without_reviving_cancelled_ones() {
+        run(|cx| async move {
+            for cancel_first in [false, true] {
+                let effects = Arc::new(Effects::default());
+                let tasks = task_runtime();
+                let server = modern::ServerBuilder::new("memory-large-task-server", "1")
+                    .tool(TaskTool(effects))
+                    .tool(MemoryEcho)
+                    .final_tasks(tasks.clone())
+                    .unwrap()
+                    .task_supervisor(Arc::new(LargeResultSupervisor(1024 * 1024)))
+                    .build();
+                let (transport, server_transport) = create_memory_transport_pair_with_capacity(1);
+                let mut serving = cx
+                    .spawn(move |serve_cx| async move {
+                        server.serve_memory(&serve_cx, server_transport).await
+                    })
+                    .unwrap();
+                let mut client = modern::MemoryClient::builder(info())
+                    .capabilities(capabilities())
+                    .with_tasks()
+                    .connect(&cx, transport)
+                    .await
+                    .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let FinalToolCallOutcome::Task(created) = client
+                    .call_tool_final_outcome(
+                        &cx,
+                        &cancellation,
+                        TASK_TOOL,
+                        json!({"mode": "input"}),
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    panic!("the negotiated server must create a Task");
+                };
+                let id = created.task.base().task_id.clone();
+                let waiting = wait_for_task(&cx, &mut client, &id, |task| {
+                    matches!(task, FinalTask::InputRequired { .. })
+                })
+                .await;
+                let filter: SubscriptionFilter = serde_json::from_value(json!({
+                    "taskIds": [id.as_str()],
+                }))
+                .unwrap();
+                let mut first = client
+                    .subscribe(&cx, &cancellation, filter.clone())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    client
+                        .next_subscription_event(&cx, &cancellation, &mut first)
+                        .await
+                        .unwrap(),
+                    Some(MemorySubscriptionEvent::Acknowledged { .. })
+                ));
+                let mut sibling = client.subscribe(&cx, &cancellation, filter).await.unwrap();
+                assert!(matches!(
+                    client
+                        .next_subscription_event(&cx, &cancellation, &mut sibling)
+                        .await
+                        .unwrap(),
+                    Some(MemorySubscriptionEvent::Acknowledged { .. })
+                ));
+                if cancel_first {
+                    client.cancel_subscription(&cx, &mut first).unwrap();
+                    assert_eq!(
+                        client
+                            .next_subscription_event(&cx, &cancellation, &mut first)
+                            .await
+                            .unwrap_err()
+                            .code,
+                        McpErrorCode::RequestCancelled
+                    );
+                }
+                client
+                    .update_task_final(
+                        &cx,
+                        &cancellation,
+                        &waiting,
+                        serde_json::from_value(json!({"roots": {"roots": []}})).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                let mut completed = None;
+                for (index, observation) in [&mut first, &mut sibling].into_iter().enumerate() {
+                    if cancel_first && index == 0 {
+                        continue;
+                    }
+                    loop {
+                        let Some(MemorySubscriptionEvent::Task(notification)) = client
+                            .next_subscription_event(&cx, &cancellation, observation)
+                            .await
+                            .unwrap()
+                        else {
+                            panic!("an accepted live listener must receive the completed Task");
+                        };
+                        let FinalTask::Completed { result, .. } = &notification.params.task else {
+                            continue;
+                        };
+                        assert!(matches!(result.result.content.as_slice(),
+                            [ContentBlock::Text { text, .. }] if text.len() == 1024 * 1024));
+                        let wire = serde_json::to_string(&notification).unwrap();
+                        assert!(wire.len() > 256 * 1024);
+                        assert!(wire.contains("1.2300e+2"));
+                        assert!(wire.contains("18446744073709551617"));
+                        let value = serde_json::to_value(&notification).unwrap();
+                        assert_eq!(
+                            value["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                            serde_json::to_value(observation.request_id()).unwrap()
+                        );
+                        assert_eq!(notification.params.task.base().task_id, id);
+                        completed = Some(notification.params.task.clone());
+                        break;
+                    }
+                }
+                let polled = client.get_task_final(&cx, &cancellation, id).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(&polled.task).unwrap(),
+                    serde_json::to_value(completed.unwrap()).unwrap()
+                );
+                if cancel_first {
+                    assert!(
+                        client
+                            .next_subscription_event(&cx, &cancellation, &mut first)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "a late large result cannot revive a cancelled owner"
+                    );
+                } else {
+                    client.cancel_subscription(&cx, &mut first).unwrap();
+                }
+                client.cancel_subscription(&cx, &mut sibling).unwrap();
+                assert_echo(&cx, &mut client).await;
+                client.close(&cx).unwrap();
+                serving.join(&cx).await.unwrap().unwrap();
+                assert!(!tasks.is_task_service_ready());
+                assert!(cx.checkpoint().is_ok());
+            }
+        });
     }
 
     #[test]

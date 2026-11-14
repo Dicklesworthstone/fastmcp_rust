@@ -886,6 +886,7 @@ impl MemoryClient {
         }
         loop {
             let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
+            self.subscriptions.discard_failed_events();
             // Reconcile this waiter's lifetime before yielding buffered events.
             // Cancellation cannot replace an already elected terminal outcome.
             if checkpoint(cx, cancellation).is_err() {
@@ -973,6 +974,7 @@ impl MemoryClient {
         }
         loop {
             let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
+            self.subscriptions.discard_failed_events();
             // Reconcile this waiter's lifetime before yielding buffered events.
             // Cancellation cannot replace an already elected terminal outcome.
             if checkpoint(cx, cancellation).is_err() {
@@ -1201,6 +1203,7 @@ impl MemoryClient {
         self.closed = true;
         self.clear_final_result_cache();
         let result = self.executor.shutdown(cx);
+        self.subscriptions.discard_failed_events();
         let receive = self.receiver.close(cx).map_err(transport_error_to_mcp);
         let send = self.sender.close(cx).map_err(transport_error_to_mcp);
         result.and(receive).and(send)
@@ -1346,7 +1349,9 @@ impl MemoryClient {
     ) -> McpResult<bool> {
         for _ in 0..MAX_CACHE_INGRESS_FRAMES {
             checkpoint(cx, cancellation)?;
-            self.executor.poll_timeouts_at(cx, Instant::now())?;
+            let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
+            self.subscriptions.discard_failed_events();
+            maintenance?;
             self.ensure_open()?;
             if self.executor.has_external_controls(cx)? {
                 // The ordinary send path flushes controls under its existing
@@ -1365,7 +1370,9 @@ impl MemoryClient {
                 Poll::Ready(Err(TransportError::Cancelled)) => {
                     return Err(McpError::request_cancelled());
                 }
-                Poll::Ready(Err(error)) => return Err(fail_transport(&self.executor, error)),
+                Poll::Ready(Err(error)) => {
+                    return Err(fail_transport(&self.executor, &mut self.subscriptions, error));
+                }
             }
         }
         Ok(false)
@@ -1461,6 +1468,7 @@ impl MemoryClient {
                 // A successfully reserved slot's control is fixed/validated.
                 // The only remaining memory commit failure is disconnection.
                 self.executor.fail_connection(error.clone());
+                self.subscriptions.discard_failed_events();
                 return Err(error);
             }
         }
@@ -1488,6 +1496,7 @@ impl MemoryClient {
                         .commit_external_control(|message| permit.send(message))
                     {
                         self.executor.fail_connection(error.clone());
+                        self.subscriptions.discard_failed_events();
                         return Err(error);
                     }
                 }
@@ -1497,7 +1506,7 @@ impl MemoryClient {
                     return Err(McpError::request_cancelled());
                 }
                 Some(Ok(Err(error)) | Err(Err(error))) => {
-                    return Err(fail_transport(&self.executor, error));
+                    return Err(fail_transport(&self.executor, &mut self.subscriptions, error));
                 }
                 Some(Err(Ok(frame))) => {
                     admit_frame(&self.executor, &mut self.subscriptions, cx, frame)?;
@@ -1511,7 +1520,9 @@ impl MemoryClient {
                     admit_frame(&self.executor, &mut self.subscriptions, cx, frame)?;
                 }
                 Some(Err(TransportError::Cancelled)) => return Err(McpError::request_cancelled()),
-                Some(Err(error)) => return Err(fail_transport(&self.executor, error)),
+                Some(Err(error)) => {
+                    return Err(fail_transport(&self.executor, &mut self.subscriptions, error));
+                }
                 None => {}
             }
         }
@@ -1524,6 +1535,7 @@ impl Drop for MemoryClient {
         if !self.closed {
             self.executor.fail_connection(McpError::request_cancelled());
         }
+        self.subscriptions.discard_failed_events();
         // Dropping the two actual halves releases both channel directions.
         // Request handles retain only the bounded executor state, never I/O.
     }
@@ -1546,9 +1558,14 @@ fn transport_error_from_codec(error: fastmcp_transport::CodecError) -> McpError 
     transport_error_to_mcp(TransportError::Codec(error))
 }
 
-fn fail_transport(executor: &MemoryExecutor, error: TransportError) -> McpError {
+fn fail_transport(
+    executor: &MemoryExecutor,
+    subscriptions: &mut subscriptions::MemorySubscriptionRegistry,
+    error: TransportError,
+) -> McpError {
     let error = transport_error_to_mcp(error);
     executor.fail_connection(error.clone());
+    subscriptions.discard_failed_events();
     error
 }
 
@@ -1558,13 +1575,18 @@ fn admit_frame(
     cx: &Cx,
     frame: ReceivedTransportFrame,
 ) -> McpResult<()> {
-    executor.poll_timeouts_at(cx, Instant::now())?;
+    let maintenance = executor.poll_timeouts_at(cx, Instant::now());
+    // A timer/cancellation turn can retire an idle sibling. Release its data
+    // before the newly arrived frame competes for the shared queue budget.
+    subscriptions.discard_failed_events();
+    maintenance?;
     if subscriptions.route(executor, cx, &frame)? {
         return Ok(());
     }
     subscriptions.observe_unowned_catalog_frame(&frame);
     if let Err(error) = executor.drive_frame(cx, frame) {
         executor.fail_connection(error.clone());
+        subscriptions.discard_failed_events();
         return Err(error);
     }
     Ok(())
@@ -1583,7 +1605,9 @@ async fn reserve_capacity<'a>(
 ) -> McpResult<MemorySendPermit<'a>> {
     let mut sending = pin!(sender.reserve_send_async(cx));
     loop {
-        executor.poll_timeouts_at(cx, Instant::now())?;
+        let maintenance = executor.poll_timeouts_at(cx, Instant::now());
+        subscriptions.discard_failed_events();
+        maintenance?;
         if let Some(error) = executor.terminal_error() {
             return Err(error);
         }
@@ -1600,7 +1624,7 @@ async fn reserve_capacity<'a>(
                 return Err(McpError::request_cancelled());
             }
             Some(Ok(Err(error)) | Err(Err(error))) => {
-                return Err(fail_transport(executor, error));
+                return Err(fail_transport(executor, subscriptions, error));
             }
             Some(Err(Ok(frame))) => admit_frame(executor, subscriptions, cx, frame)?,
             None => {}

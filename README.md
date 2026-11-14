@@ -813,6 +813,17 @@ drains consume capacity until their owners release it. Saturation rejects the
 new listen before acknowledgement without evicting an existing listener.
 In-process callers must drop finished listen handles to release their slots.
 
+Subscription data events, including completed Task results, have an 8 MiB
+encoded-frame limit. The server retains at most 9 MiB / 64 events per listener,
+64 MiB per principal, and 256 MiB across its subscription registry. Reservations
+cover recipient copies and remain held until active delivery callbacks return.
+Memory client listeners and stdio Task listeners retain at most 9 MiB / 256
+events each and share a 64 MiB budget per connection. Consuming or discarding
+events releases their charges. An overflowing listener is retired independently,
+and late Task events cannot revive its retired owner. These limits account for
+encoded event ownership; they do not bound application-owned results or all
+temporary decoded allocations.
+
 ### From Source
 
 ```bash

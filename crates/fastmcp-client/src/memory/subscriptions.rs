@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fastmcp_protocol::{
     CompleteResult, CorrelationKey, FinalSubscriptionsListenResult, ServerNotification,
@@ -19,8 +20,67 @@ use crate::{
 
 const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
 const MAX_SUBSCRIPTIONS: usize = 64;
-const MAX_QUEUED_EVENTS: usize = 64;
-const MAX_QUEUED_EVENT_BYTES: usize = 256 * 1024;
+const MAX_QUEUED_EVENTS: usize = 256;
+const MAX_EVENT_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QUEUED_EVENT_BYTES: usize = 9 * 1024 * 1024;
+const MAX_CONNECTION_QUEUED_EVENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Encoded-source accounting for all listener queues on one connection. The
+/// transport owns its admitted source separately; this reservation precedes
+/// the additional typed event allocation retained by a subscription handle.
+#[derive(Debug, Default)]
+struct SubscriptionQueueBudget {
+    bytes: AtomicUsize,
+}
+
+impl SubscriptionQueueBudget {
+    fn reserve(self: &Arc<Self>, bytes: usize) -> McpResult<SubscriptionEventReservation> {
+        let mut retained = self.bytes.load(Ordering::Acquire);
+        loop {
+            let next = retained
+                .checked_add(bytes)
+                .filter(|next| *next <= MAX_CONNECTION_QUEUED_EVENT_BYTES)
+                .ok_or_else(|| {
+                    McpError::invalid_request(
+                        "Memory connection subscription event byte bound exceeded",
+                    )
+                })?;
+            match self.bytes.compare_exchange_weak(
+                retained,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(SubscriptionEventReservation {
+                        budget: Arc::clone(self),
+                        bytes,
+                    });
+                }
+                Err(current) => retained = current,
+            }
+        }
+    }
+}
+
+/// A non-cloneable charge follows one retained event through queue ownership.
+/// Dropping an execution, a rejected decode, or a discarded queue releases the
+/// same charge; transferring the event to its caller ends framework ownership.
+#[derive(Debug)]
+struct SubscriptionEventReservation {
+    budget: Arc<SubscriptionQueueBudget>,
+    bytes: usize,
+}
+
+impl Drop for SubscriptionEventReservation {
+    fn drop(&mut self) {
+        let retained = self.budget.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(
+            retained >= self.bytes,
+            "subscription byte charge released twice"
+        );
+    }
+}
 
 /// One independently owned, bounded Memory subscription.
 ///
@@ -87,8 +147,10 @@ struct SubscriptionState {
     requested: SubscriptionFilter,
     accepted: Option<SubscriptionFilter>,
     resource_relations: ResourceSubscriptionRelations,
-    events: VecDeque<(usize, MemorySubscriptionEvent)>,
+    // Tuple drop order releases the retained payload before its byte charge.
+    events: VecDeque<(MemorySubscriptionEvent, SubscriptionEventReservation)>,
     event_bytes: usize,
+    queue_budget: Arc<SubscriptionQueueBudget>,
     terminal_result: Option<CompleteResult<FinalSubscriptionsListenResult>>,
     finished: bool,
 }
@@ -104,7 +166,12 @@ enum SubscriptionPoll {
 }
 
 impl SubscriptionState {
-    fn queue(&mut self, event: MemorySubscriptionEvent, source_bytes: usize) -> McpResult<()> {
+    fn reserve_event(&self, source_bytes: usize) -> McpResult<SubscriptionEventReservation> {
+        if source_bytes > MAX_EVENT_SOURCE_BYTES {
+            return Err(McpError::invalid_request(
+                "Memory subscription event source byte bound exceeded",
+            ));
+        }
         let bytes = self.event_bytes.checked_add(source_bytes).ok_or_else(|| {
             McpError::invalid_request("Memory subscription event byte bound exceeded")
         })?;
@@ -113,9 +180,32 @@ impl SubscriptionState {
                 "Memory subscription event queue is full",
             ));
         }
-        self.event_bytes = bytes;
-        self.events.push_back((source_bytes, event));
-        Ok(())
+        self.queue_budget.reserve(source_bytes)
+    }
+
+    fn queue(&mut self, event: MemorySubscriptionEvent, reservation: SubscriptionEventReservation) {
+        self.event_bytes += reservation.bytes;
+        self.events.push_back((event, reservation));
+    }
+
+    fn clear_events(&mut self) {
+        self.events.clear();
+        self.event_bytes = 0;
+    }
+
+    fn discard_failed_events(&mut self) {
+        // The executor bounds terminal receipt retention independently of this
+        // handle. Once both the pending owner and its receipt are gone, queued
+        // data is no longer observable through take_event and must be released.
+        let receipt_unavailable =
+            !self.inner.is_pending_subscription() && self.inner.terminal_reason().is_none();
+        if receipt_unavailable
+            || (self.inner.terminal_error().is_some()
+                && self.inner.terminal_reason()
+                    != Some(ExecutionTerminalReason::PeerSubscriptionTeardown))
+        {
+            self.clear_events();
+        }
     }
 
     fn take_event(&mut self, executor: &MemoryExecutor) -> McpResult<SubscriptionPoll> {
@@ -127,8 +217,7 @@ impl SubscriptionState {
         if !self.inner.is_pending_subscription()
             && self.inner.terminal_reason().is_none()
         {
-            self.events.clear();
-            self.event_bytes = 0;
+            self.clear_events();
             self.finished = true;
             return Err(executor.try_take_response(&mut self.inner).err().unwrap_or_else(|| {
                 McpError::invalid_request("Memory subscription terminal receipt is unavailable")
@@ -137,14 +226,14 @@ impl SubscriptionState {
         if let Some(error) = self.inner.terminal_error()
             && !peer_cancelled
         {
-            self.events.clear();
-            self.event_bytes = 0;
+            self.clear_events();
             self.finished = true;
             let _ = executor.try_take_response(&mut self.inner);
             return Err(error);
         }
-        if let Some((bytes, event)) = self.events.pop_front() {
-            self.event_bytes -= bytes;
+        if let Some((event, reservation)) = self.events.pop_front() {
+            self.event_bytes -= reservation.bytes;
+            drop(reservation);
             return Ok(SubscriptionPoll::Event(event));
         }
         if peer_cancelled {
@@ -196,6 +285,7 @@ impl SubscriptionState {
 #[derive(Debug, Default)]
 pub(super) struct MemorySubscriptionRegistry {
     owners: HashMap<CorrelationKey, Weak<Mutex<SubscriptionState>>>,
+    queue_budget: Arc<SubscriptionQueueBudget>,
     catalog_generations: [u64; 3],
     // The same ingress owner admits notifications during ordinary reads,
     // subscription waits and send-capacity waits. Keeping the connection's
@@ -204,6 +294,15 @@ pub(super) struct MemorySubscriptionRegistry {
 }
 
 impl MemorySubscriptionRegistry {
+    /// Releases data belonging to cancelled or failed executions. Queues with
+    /// an already elected successful or peer-teardown terminal outcome remain
+    /// readable through their handles, including after connection close.
+    pub(super) fn discard_failed_events(&mut self) {
+        for owner in self.owners.values().filter_map(Weak::upgrade) {
+            lock(&owner).discard_failed_events();
+        }
+    }
+
     /// Observes catalog changes without consuming any listener's event queue.
     pub(super) fn catalog_generation(&self, method: &str) -> u64 {
         match method {
@@ -260,7 +359,8 @@ impl MemorySubscriptionRegistry {
     fn ensure_capacity(&mut self) -> McpResult<()> {
         self.owners.retain(|_, owner| {
             owner.upgrade().is_some_and(|owner| {
-                let state = lock(&owner);
+                let mut state = lock(&owner);
+                state.discard_failed_events();
                 !state.finished && state.inner.is_pending_subscription()
             })
         });
@@ -329,13 +429,15 @@ impl MemorySubscriptionRegistry {
                 if let Some(owner) = owner {
                     let mut state = lock(&owner);
                     if !state.finished && state.inner.is_pending_subscription() {
-                        executor.fail_subscription(
+                        let failed = executor.fail_subscription(
                             cx,
                             &mut state.inner,
                             McpError::invalid_request(
                                 "Memory peer subscription cancellation omitted its subscription ID",
                             ),
-                        )?;
+                        );
+                        state.discard_failed_events();
+                        failed?;
                     }
                     return Ok(true);
                 }
@@ -350,7 +452,9 @@ impl MemorySubscriptionRegistry {
         }
         let result = admit_notification(&mut state, executor, cx, frame);
         if let Err(error) = result {
-            executor.fail_subscription(cx, &mut state.inner, error)?;
+            let failed = executor.fail_subscription(cx, &mut state.inner, error);
+            state.discard_failed_events();
+            failed?;
         } else {
             // Only a notification accepted by this exact live listener can
             // invalidate entries. Unknown owners and rejected filters above
@@ -374,6 +478,14 @@ fn admit_notification(
     let JsonRpcMessage::Request(request) = frame.message() else {
         unreachable!("subscription router only admits notifications");
     };
+    // Teardown has a reserved executor terminal slot and never competes for
+    // data-queue bytes. All retained events reserve before decoding or cloning
+    // their potentially large Task result into the listener's typed queue.
+    let reservation = if request.method == "notifications/cancelled" {
+        None
+    } else {
+        Some(state.reserve_event(frame.source().len())?)
+    };
     if request.method == "notifications/tasks" {
         #[cfg(feature = "tasks")]
         {
@@ -395,8 +507,8 @@ fn admit_notification(
             }
             state.queue(
                 MemorySubscriptionEvent::Task(Box::new(notification)),
-                frame.source().len(),
-            )?;
+                reservation.expect("Task events reserve queue capacity before decoding"),
+            );
             executor.record_subscription_activity(&state.inner)?;
             return Ok(());
         }
@@ -429,8 +541,8 @@ fn admit_notification(
                     accepted: accepted.clone(),
                     unsupported,
                 },
-                frame.source().len(),
-            )?;
+                reservation.expect("acknowledgements reserve queue capacity before decoding"),
+            );
             state.accepted = Some(accepted);
             executor.record_subscription_activity(&state.inner)?;
         }
@@ -458,8 +570,8 @@ fn admit_notification(
             )?;
             state.queue(
                 MemorySubscriptionEvent::Notification(Box::new(notification)),
-                frame.source().len(),
-            )?;
+                reservation.expect("data events reserve queue capacity before decoding"),
+            );
             executor.record_subscription_activity(&state.inner)?;
         }
     }
@@ -551,9 +663,13 @@ impl MemoryClient {
     /// Opens one bounded listener with independent idle and absolute deadlines.
     ///
     /// Subscription lifetime is separate from ordinary request timeouts. Up to
-    /// 64 listeners share the existing reader, each retaining at most 64 events
-    /// and 256 KiB of event source. A listener exceeding either queue bound is
-    /// cancelled individually; other listeners and requests continue normally.
+    /// 64 listeners share the existing reader, each retaining at most 256 events
+    /// and 9 MiB of encoded event source. Individual events are bounded at
+    /// 8 MiB, and all listener queues on this connection share a 64 MiB budget.
+    /// These data limits are independent of the smaller cancellation-control
+    /// queue. An overflowing listener is cancelled individually; other listeners
+    /// and requests continue normally. Reservations are released when an event
+    /// is handed to its caller or its queue is discarded or dropped.
     pub async fn subscribe(
         &mut self,
         cx: &Cx,
@@ -602,7 +718,9 @@ impl MemoryClient {
                 ));
             }
         }
-        self.executor.poll_timeouts_at(cx, Instant::now())?;
+        let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
+        self.subscriptions.discard_failed_events();
+        maintenance?;
         self.subscriptions.ensure_capacity()?;
         let parameters = self.parameters_with_tasks(
             serde_json::json!({ "notifications": requested }),
@@ -649,6 +767,7 @@ impl MemoryClient {
                     resource_relations,
                     events: VecDeque::new(),
                     event_bytes: 0,
+                    queue_budget: Arc::clone(&self.subscriptions.queue_budget),
                     terminal_result: None,
                     finished: false,
                 }));
@@ -679,6 +798,7 @@ impl MemoryClient {
         self.ensure_subscription_owner(execution)?;
         loop {
             let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
+            self.subscriptions.discard_failed_events();
             let event = {
                 let mut state = lock(&execution.state);
                 // A finished subscription has consumed its outcome and has
@@ -726,7 +846,9 @@ impl MemoryClient {
         self.ensure_subscription_owner(execution)?;
         let mut state = lock(&execution.state);
         if !state.finished {
-            self.executor.cancel(cx, &mut state.inner)?;
+            let cancelled = self.executor.cancel(cx, &mut state.inner);
+            state.discard_failed_events();
+            cancelled?;
         }
         Ok(())
     }
@@ -804,6 +926,104 @@ mod tests {
         let client = MemoryClient::builder(info()).connect(cx, transport).await.unwrap();
         receive(cx, &mut peer, "server/discover").await;
         (client, peer)
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn connected_tasks(cx: &Cx) -> (MemoryClient, MemoryTransport) {
+        let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
+        peer.send_async(
+            cx,
+            &response(
+                1,
+                json!({
+                    "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"extensions": {"io.modelcontextprotocol/tasks": {}}},
+                    "ttlMs": 0, "cacheScope": "private",
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        let client = MemoryClient::builder(info())
+            .with_tasks()
+            .connect(cx, transport)
+            .await
+            .unwrap();
+        receive(cx, &mut peer, "server/discover").await;
+        (client, peer)
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn open_task(
+        cx: &Cx,
+        client: &mut MemoryClient,
+        peer: &mut MemoryTransport,
+        token: &McpRequestCancellation,
+    ) -> MemorySubscriptionExecution {
+        let filter = json!({"taskIds": ["task-a"]});
+        let mut owner = client
+            .subscribe(
+                cx,
+                token,
+                serde_json::from_value::<SubscriptionFilter>(filter.clone()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let request = receive(cx, peer, "subscriptions/listen").await;
+        let Some(RequestId::Number(id)) = request.id else {
+            panic!("the Memory client must allocate a numeric listen ID");
+        };
+        peer.send_async(cx, &acknowledgement(id, filter))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client
+                .next_subscription_event(cx, token, &mut owner)
+                .await
+                .unwrap(),
+            Some(MemorySubscriptionEvent::Acknowledged { .. })
+        ));
+        owner
+    }
+
+    #[cfg(feature = "tasks")]
+    fn completed_task_event(id: i64, payload_bytes: usize) -> JsonRpcMessage {
+        notification(
+            "notifications/tasks",
+            id,
+            json!({
+                "taskId": "task-a", "status": "completed",
+                "createdAt": "2026-07-28T12:00:00.000Z",
+                "lastUpdatedAt": "2026-07-28T12:00:01.000Z", "ttlMs": 60_000,
+                "result": {"content": [{"type": "text", "text": "x".repeat(payload_bytes)}]},
+            }),
+        )
+    }
+
+    #[test]
+    fn memory_subscription_shared_byte_reservations_release_exactly_once() {
+        let budget = Arc::new(SubscriptionQueueBudget::default());
+        let first = budget
+            .reserve(MAX_CONNECTION_QUEUED_EVENT_BYTES - 1)
+            .unwrap();
+        assert!(budget.reserve(2).is_err());
+        assert_eq!(
+            budget.bytes.load(Ordering::Acquire),
+            MAX_CONNECTION_QUEUED_EVENT_BYTES - 1
+        );
+        let last = budget.reserve(1).unwrap();
+        assert!(budget.reserve(1).is_err());
+        drop(first);
+        let replacement = budget
+            .reserve(MAX_CONNECTION_QUEUED_EVENT_BYTES - 1)
+            .unwrap();
+        assert_eq!(
+            budget.bytes.load(Ordering::Acquire),
+            MAX_CONNECTION_QUEUED_EVENT_BYTES
+        );
+        drop(last);
+        drop(replacement);
+        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
     }
 
     async fn open(
@@ -971,16 +1191,76 @@ mod tests {
                 client.next_subscription_event(&cx, &token, &mut owner).await.unwrap();
                 let count = if oversized_event { 1 } else { MAX_QUEUED_EVENTS + 1 };
                 for _ in 0..count {
-                    let params = if oversized_event { json!({"padding": "x".repeat(MAX_QUEUED_EVENT_BYTES)}) } else { json!({}) };
+                    let params = if oversized_event { json!({"padding": "x".repeat(MAX_EVENT_SOURCE_BYTES)}) } else { json!({}) };
                     peer.send_async(&cx, &notification("notifications/tools/list_changed", 2, params)).await.unwrap();
                     client.drive_once(&cx, &token).await.unwrap();
                 }
                 assert_eq!(client.next_subscription_event(&cx, &token, &mut owner).await.unwrap_err().code,
                     McpErrorCode::InvalidRequest);
+                assert_eq!(client.subscriptions.queue_budget.bytes.load(Ordering::Acquire), 0);
                 client.drive_once(&cx, &token).await.unwrap();
                 receive(&cx, &mut peer, "notifications/cancelled").await;
                 ordinary_survives(&cx, &mut client, &mut peer).await;
             }
+        });
+    }
+
+    #[test]
+    fn memory_subscription_full_data_queue_preserves_peer_teardown() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx).await;
+            let token = McpRequestCancellation::new();
+            let mut owner = open(&cx, &mut client, &mut peer, &token).await;
+            peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged": true})))
+                .await
+                .unwrap();
+            client
+                .next_subscription_event(&cx, &token, &mut owner)
+                .await
+                .unwrap();
+            for _ in 0..MAX_QUEUED_EVENTS {
+                peer.send_async(
+                    &cx,
+                    &notification("notifications/tools/list_changed", 2, json!({})),
+                )
+                .await
+                .unwrap();
+                client.drive_once(&cx, &token).await.unwrap();
+            }
+            assert_eq!(lock(&owner.state).events.len(), MAX_QUEUED_EVENTS);
+            peer.send_async(
+                &cx,
+                &notification("notifications/cancelled", 2, json!({"requestId": 2})),
+            )
+            .await
+            .unwrap();
+            client.drive_once(&cx, &token).await.unwrap();
+            for _ in 0..MAX_QUEUED_EVENTS {
+                assert!(matches!(
+                    client
+                        .next_subscription_event(&cx, &token, &mut owner)
+                        .await
+                        .unwrap(),
+                    Some(MemorySubscriptionEvent::Notification(_))
+                ));
+            }
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &token, &mut owner)
+                    .await
+                    .unwrap(),
+                Some(MemorySubscriptionEvent::Terminal)
+            ));
+            assert!(owner.terminal_result().is_none());
+            assert_eq!(
+                client
+                    .subscriptions
+                    .queue_budget
+                    .bytes
+                    .load(Ordering::Acquire),
+                0
+            );
+            ordinary_survives(&cx, &mut client, &mut peer).await;
         });
     }
 
@@ -1165,6 +1445,132 @@ mod tests {
     }
 
     #[test]
+    fn memory_subscription_close_preserves_elected_terminal_queues_after_registry_pruning() {
+        run(|cx| async move {
+            for peer_teardown in [false, true] {
+                for prune in [false, true] {
+                    let (mut client, mut peer) = connected(&cx).await;
+                    let token = McpRequestCancellation::new();
+                    let mut owner = open(&cx, &mut client, &mut peer, &token).await;
+                    peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged": true})))
+                        .await
+                        .unwrap();
+                    client
+                        .next_subscription_event(&cx, &token, &mut owner)
+                        .await
+                        .unwrap();
+                    peer.send_async(
+                        &cx,
+                        &notification("notifications/tools/list_changed", 2, json!({})),
+                    )
+                    .await
+                    .unwrap();
+                    client.drive_once(&cx, &token).await.unwrap();
+                    let terminal = if peer_teardown {
+                        notification("notifications/cancelled", 2, json!({"requestId": 2}))
+                    } else {
+                        response(
+                            2,
+                            json!({
+                                "resultType": "complete",
+                                "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                            }),
+                        )
+                    };
+                    peer.send_async(&cx, &terminal).await.unwrap();
+                    client.drive_once(&cx, &token).await.unwrap();
+                    let sibling = if prune {
+                        Some(open(&cx, &mut client, &mut peer, &token).await)
+                    } else {
+                        None
+                    };
+                    let key = owner.request_id().correlation_key().unwrap();
+                    assert_eq!(client.subscriptions.owners.contains_key(&key), !prune);
+                    let budget = Arc::clone(&client.subscriptions.queue_budget);
+                    let retained = budget.bytes.load(Ordering::Acquire);
+                    assert!(retained > 0);
+                    client.close(&cx).unwrap();
+                    assert_eq!(
+                        budget.bytes.load(Ordering::Acquire),
+                        retained,
+                        "close cannot erase already elected terminal history based on registry pruning"
+                    );
+                    assert!(matches!(
+                        client
+                            .next_subscription_event(&cx, &token, &mut owner)
+                            .await
+                            .unwrap(),
+                        Some(MemorySubscriptionEvent::Notification(_))
+                    ));
+                    assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+                    assert!(matches!(
+                        client
+                            .next_subscription_event(&cx, &token, &mut owner)
+                            .await
+                            .unwrap(),
+                        Some(MemorySubscriptionEvent::Terminal)
+                    ));
+                    assert_eq!(owner.terminal_result().is_some(), !peer_teardown);
+                    assert!(
+                        client
+                            .next_subscription_event(&cx, &token, &mut owner)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    drop(sibling);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn memory_subscription_reclaims_queue_when_terminal_receipt_is_unavailable() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx).await;
+            let token = McpRequestCancellation::new();
+            let mut owner = open(&cx, &mut client, &mut peer, &token).await;
+            peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged": true})))
+                .await
+                .unwrap();
+            client.drive_once(&cx, &token).await.unwrap();
+            peer.send_async(&cx, &response(2, json!({
+                "resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+            }))).await.unwrap();
+            client.drive_once(&cx, &token).await.unwrap();
+            let budget = Arc::clone(&client.subscriptions.queue_budget);
+            assert!(budget.bytes.load(Ordering::Acquire) > 0);
+            {
+                let mut state = lock(&owner.state);
+                // Consume the lower-level receipt to exercise the same absent
+                // pending/terminal state left by bounded terminal retention,
+                // without sleeping through the executor's retention period.
+                assert!(
+                    client
+                        .executor
+                        .try_take_response(&mut state.inner)
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(!state.inner.is_pending_subscription());
+                assert!(state.inner.terminal_reason().is_none());
+            }
+            client.subscriptions.ensure_capacity().unwrap();
+            assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+            assert!(lock(&owner.state).events.is_empty());
+            assert_eq!(
+                client
+                    .next_subscription_event(&cx, &token, &mut owner)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidRequest
+            );
+            ordinary_survives(&cx, &mut client, &mut peer).await;
+        });
+    }
+
+    #[test]
     fn memory_subscription_waiter_cancellation_survives_control_saturation() {
         run(|cx| async move {
             for buffered in [false, true] {
@@ -1243,6 +1649,283 @@ mod tests {
             assert_eq!(client.next_id, 2);
             assert!(client.executor.pending_records().is_empty());
             ordinary_survives(&cx, &mut client, &mut peer).await;
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn memory_subscription_large_task_events_and_source_limit_are_independent_of_controls() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected_tasks(&cx).await;
+            let token = McpRequestCancellation::new();
+            let mut owner = open_task(&cx, &mut client, &mut peer, &token).await;
+            let message = completed_task_event(2, 6 * 1024 * 1024);
+            let bytes = serde_json::to_vec(&message).unwrap().len();
+            assert!(bytes > 256 * 1024 && bytes < MAX_EVENT_SOURCE_BYTES);
+            peer.send_async(&cx, &message).await.unwrap();
+            client.drive_once(&cx, &token).await.unwrap();
+            assert_eq!(
+                client
+                    .subscriptions
+                    .queue_budget
+                    .bytes
+                    .load(Ordering::Acquire),
+                bytes
+            );
+            let Some(MemorySubscriptionEvent::Task(notification)) = client
+                .next_subscription_event(&cx, &token, &mut owner)
+                .await
+                .unwrap()
+            else {
+                panic!("a legal large completed Task must be delivered");
+            };
+            let fastmcp_protocol::FinalTask::Completed { result, .. } = &notification.params.task
+            else {
+                panic!("the admitted event must retain its completed result");
+            };
+            assert!(matches!(result.result.content.as_slice(),
+                [fastmcp_protocol::ContentBlock::Text { text, .. }] if text.len() == 6 * 1024 * 1024));
+            assert_eq!(
+                client
+                    .subscriptions
+                    .queue_budget
+                    .bytes
+                    .load(Ordering::Acquire),
+                0
+            );
+            drop(notification);
+
+            let oversized = completed_task_event(2, MAX_EVENT_SOURCE_BYTES);
+            peer.send_async(&cx, &oversized).await.unwrap();
+            client.drive_once(&cx, &token).await.unwrap();
+            let error = client
+                .next_subscription_event(&cx, &token, &mut owner)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "Memory subscription event source byte bound exceeded"
+            );
+            assert_eq!(
+                client
+                    .subscriptions
+                    .queue_budget
+                    .bytes
+                    .load(Ordering::Acquire),
+                0
+            );
+            client.drive_once(&cx, &token).await.unwrap();
+            receive(&cx, &mut peer, "notifications/cancelled").await;
+            ordinary_survives(&cx, &mut client, &mut peer).await;
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn memory_subscription_large_task_queue_overflow_retires_only_its_owner() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected_tasks(&cx).await;
+            let token = McpRequestCancellation::new();
+            let mut owner = open_task(&cx, &mut client, &mut peer, &token).await;
+            let mut sibling = open_task(&cx, &mut client, &mut peer, &token).await;
+            let event = completed_task_event(2, 4 * 1024 * 1024);
+            let bytes = serde_json::to_vec(&event).unwrap().len();
+            assert!(2 * bytes <= MAX_QUEUED_EVENT_BYTES && 3 * bytes > MAX_QUEUED_EVENT_BYTES);
+            for _ in 0..2 {
+                peer.send_async(&cx, &event).await.unwrap();
+                client.drive_once(&cx, &token).await.unwrap();
+            }
+            assert_eq!(
+                client
+                    .subscriptions
+                    .queue_budget
+                    .bytes
+                    .load(Ordering::Acquire),
+                2 * bytes
+            );
+            peer.send_async(&cx, &event).await.unwrap();
+            client.drive_once(&cx, &token).await.unwrap();
+            assert_eq!(
+                client
+                    .subscriptions
+                    .queue_budget
+                    .bytes
+                    .load(Ordering::Acquire),
+                0,
+                "overflow must discard this owner's buffered data before its next read"
+            );
+            let error = client
+                .next_subscription_event(&cx, &token, &mut owner)
+                .await
+                .unwrap_err();
+            assert_eq!(error.message, "Memory subscription event queue is full");
+            client.drive_once(&cx, &token).await.unwrap();
+            receive(&cx, &mut peer, "notifications/cancelled").await;
+            peer.send_async(&cx, &completed_task_event(3, 1024 * 1024))
+                .await
+                .unwrap();
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &token, &mut sibling)
+                    .await
+                    .unwrap(),
+                Some(MemorySubscriptionEvent::Task(_))
+            ));
+            assert_eq!(
+                client
+                    .subscriptions
+                    .queue_budget
+                    .bytes
+                    .load(Ordering::Acquire),
+                0
+            );
+            ordinary_survives(&cx, &mut client, &mut peer).await;
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn memory_subscription_aggregate_pressure_preserves_an_admitted_sibling() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected_tasks(&cx).await;
+            let token = McpRequestCancellation::new();
+            let mut owner = open_task(&cx, &mut client, &mut peer, &token).await;
+            let mut sibling = open_task(&cx, &mut client, &mut peer, &token).await;
+            let event = completed_task_event(2, 1024 * 1024);
+            let bytes = serde_json::to_vec(&event).unwrap().len();
+            let budget = Arc::clone(&client.subscriptions.queue_budget);
+            // Hold a real shared-budget lease to exercise its exact boundary
+            // without allocating 64 MiB of unrelated payloads in this test.
+            // Both listener events still take the ordinary transport path.
+            let retained = budget
+                .reserve(MAX_CONNECTION_QUEUED_EVENT_BYTES - bytes)
+                .unwrap();
+            peer.send_async(&cx, &event).await.unwrap();
+            client.drive_once(&cx, &token).await.unwrap();
+            assert_eq!(
+                budget.bytes.load(Ordering::Acquire),
+                MAX_CONNECTION_QUEUED_EVENT_BYTES
+            );
+            peer.send_async(&cx, &completed_task_event(3, 1024 * 1024))
+                .await
+                .unwrap();
+            client.drive_once(&cx, &token).await.unwrap();
+            let error = client
+                .next_subscription_event(&cx, &token, &mut sibling)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.message,
+                "Memory connection subscription event byte bound exceeded"
+            );
+            assert_eq!(
+                budget.bytes.load(Ordering::Acquire),
+                MAX_CONNECTION_QUEUED_EVENT_BYTES
+            );
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &token, &mut owner)
+                    .await
+                    .unwrap(),
+                Some(MemorySubscriptionEvent::Task(_))
+            ));
+            assert_eq!(
+                budget.bytes.load(Ordering::Acquire),
+                MAX_CONNECTION_QUEUED_EVENT_BYTES - bytes
+            );
+            drop(retained);
+            assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+            client.drive_once(&cx, &token).await.unwrap();
+            receive(&cx, &mut peer, "notifications/cancelled").await;
+            ordinary_survives(&cx, &mut client, &mut peer).await;
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn memory_subscription_large_task_queue_releases_on_cancel_drop_and_close() {
+        run(|cx| async move {
+            for cause in [
+                "cancel",
+                "drop-owner",
+                "close",
+                "drop-client",
+                "disconnect",
+                "invalid-event",
+            ] {
+                let (mut client, mut peer) = connected_tasks(&cx).await;
+                let token = McpRequestCancellation::new();
+                let mut owner = open_task(&cx, &mut client, &mut peer, &token).await;
+                let budget = Arc::clone(&client.subscriptions.queue_budget);
+                peer.send_async(&cx, &completed_task_event(2, 1024 * 1024))
+                    .await
+                    .unwrap();
+                client.drive_once(&cx, &token).await.unwrap();
+                assert!(budget.bytes.load(Ordering::Acquire) > 1024 * 1024);
+                match cause {
+                    "cancel" => {
+                        client.cancel_subscription(&cx, &mut owner).unwrap();
+                        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+                        assert_eq!(
+                            client
+                                .next_subscription_event(&cx, &token, &mut owner)
+                                .await
+                                .unwrap_err()
+                                .code,
+                            McpErrorCode::RequestCancelled
+                        );
+                    }
+                    "drop-owner" => drop(owner),
+                    "close" => {
+                        client.close(&cx).unwrap();
+                        assert!(
+                            owner.accepted_filter().is_some(),
+                            "the caller still retains its handle"
+                        );
+                    }
+                    "drop-client" => {
+                        drop(client);
+                        assert!(
+                            owner.accepted_filter().is_some(),
+                            "the caller still retains its handle"
+                        );
+                        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+                        continue;
+                    }
+                    "disconnect" => {
+                        peer.close(&cx).unwrap();
+                        assert!(client.drive_once(&cx, &token).await.is_err());
+                        assert_eq!(
+                            budget.bytes.load(Ordering::Acquire),
+                            0,
+                            "connection loss must release data before polling the failed owner"
+                        );
+                    }
+                    "invalid-event" => {
+                        peer.send_async(&cx, &acknowledgement(2, json!({"taskIds": ["task-a"]})))
+                            .await
+                            .unwrap();
+                        client.drive_once(&cx, &token).await.unwrap();
+                        assert_eq!(
+                            budget.bytes.load(Ordering::Acquire),
+                            0,
+                            "rejected decode/admission must return both its temporary charge and retained data"
+                        );
+                        assert_eq!(
+                            client
+                                .next_subscription_event(&cx, &token, &mut owner)
+                                .await
+                                .unwrap_err()
+                                .code,
+                            McpErrorCode::InvalidRequest
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+                client.close(&cx).unwrap();
+            }
         });
     }
 
