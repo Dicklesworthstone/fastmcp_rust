@@ -21428,6 +21428,18 @@ impl Client {
         cx: &Cx,
         receive_deadline: Option<Instant>,
     ) -> McpResult<()> {
+        self.drive_multiplexed_stdio_turn_until(cx, receive_deadline)
+            .map(|_| ())
+    }
+
+    /// Reports whether the sole reader consumed a frame in this service turn.
+    /// A receive deadline may leave partial or read-ahead input, so callers
+    /// must separately check readiness before treating a turn as idle.
+    fn drive_multiplexed_stdio_turn_until(
+        &mut self,
+        cx: &Cx,
+        receive_deadline: Option<Instant>,
+    ) -> McpResult<bool> {
         if let Err(error) = self.drain_completed_reverse_callbacks() {
             return Err(self.terminate_connection(error));
         }
@@ -21470,7 +21482,7 @@ impl Client {
                 if let Err(error) = self.drain_completed_reverse_callbacks() {
                     return Err(self.terminate_connection(error));
                 }
-                return Ok(());
+                return Ok(false);
             }
             Err(error) => return Err(self.terminate_connection(transport_error_to_mcp(error))),
         };
@@ -21481,7 +21493,7 @@ impl Client {
         if let Err(error) = self.drain_completed_reverse_callbacks() {
             return Err(self.terminate_connection(error));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Flushes request-owner terminal transitions without taking another
@@ -28404,6 +28416,165 @@ pub(crate) fn transport_error_to_mcp(e: TransportError) -> McpError {
 }
 
 impl Client {
+    #[cfg(unix)]
+    fn check_stdio_cache_lifetime(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+    ) -> McpResult<()> {
+        check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        check_mrtr_operation(&self.cx, Some(cancellation), deadline)?;
+        if self.transport_is_closed() {
+            return Err(McpError::internal_error("Stdio client is closed"));
+        }
+        self.reverse_callback_pool
+            .state
+            .terminal_error()
+            .map_or(Ok(()), Err)
+    }
+
+    /// Replays only after an idle observation by the connection's sole reader.
+    /// Every consumed frame keeps its ordinary response/subscription owner.
+    /// A busy peer or an exhausted drain bound forces a fresh request.
+    #[cfg(unix)]
+    async fn drain_ready_stdio_cache_frames(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        operation_deadline: Instant,
+    ) -> McpResult<bool> {
+        let deadline = (Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW)
+            .min(operation_deadline);
+        let connection_cx = self.cx.clone();
+        for _ in 0..MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+            self.check_stdio_cache_lifetime(cx, cancellation, operation_deadline)?;
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let consumed =
+                self.drive_multiplexed_stdio_turn_until(&connection_cx, Some(deadline))?;
+            self.check_stdio_cache_lifetime(cx, cancellation, operation_deadline)?;
+            if !consumed {
+                let ready = self
+                    .transport
+                    .lock()
+                    .map_err(|_| McpError::internal_error("Stdio receive state is unavailable"))?
+                    .has_ready_input()
+                    .map_err(transport_error_to_mcp)?;
+                return Ok(!ready);
+            }
+            asupersync::runtime::yield_now().await;
+        }
+        Ok(false)
+    }
+
+    /// The selected high-level verbs share the synchronous connection cache.
+    /// Raw requests, progress-owned calls and MRTR continuations never use it.
+    #[cfg(unix)]
+    async fn cached_final_core_request_with_cx_until(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        semantic_parameters: serde_json::Value,
+        cursor: Option<&str>,
+        result_set: FinalCacheResultSet,
+        deadline: Instant,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized_with_cancellation_until(
+            cx,
+            Some(cancellation),
+            Some(deadline),
+        )
+        .await?;
+        self.check_stdio_cache_lifetime(cx, cancellation, deadline)?;
+        self.last_final_cache_page = None;
+        let mut parameters = semantic_parameters.clone();
+        if let Some(cursor) = cursor {
+            parameters["cursor"] = serde_json::json!(cursor);
+        }
+        if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
+            return self
+                .request_core_with_cx_until(cx, cancellation, method, parameters, Some(deadline))
+                .await;
+        }
+        // Apply the same selected-era admission as a wire request before a hit
+        // can suppress it. This helper only receives typed high-level inputs.
+        let prepared = self.prepare_request_parameters(parameters.clone())?;
+        let request = self
+            .prepared_core_request(method, &prepared)?
+            .ok_or_else(|| McpError::invalid_params("Unsupported selected-era core request"))?;
+        if final_cache_result_set(&request).as_ref() != Some(&result_set) {
+            return Err(McpError::invalid_params("Method is not a cacheable final core request"));
+        }
+        let key = self.final_cache_key(method, semantic_parameters, cursor, result_set)?;
+        let cursor_origin = self.final_result_cache.capture_cursor_origin(&key);
+        let candidate = self.final_result_cache.has_fresh_entry_at(&key, Instant::now());
+        let lookup = if !candidate
+            || self.drain_ready_stdio_cache_frames(cx, cancellation, deadline).await?
+        {
+            self.check_stdio_cache_lifetime(cx, cancellation, deadline)?;
+            Some(self.final_result_cache.lookup_page_at(&key, Instant::now()))
+        } else {
+            None
+        };
+        let miss = match lookup {
+            Some(FinalCachePageLookup::Fresh(page)) => {
+                self.check_stdio_cache_lifetime(cx, cancellation, deadline)?;
+                self.last_final_cache_page = Some(FinalCachePageState {
+                    generation: page.generation,
+                    scope: page.scope,
+                    miss: None,
+                });
+                return Ok(page.result);
+            }
+            Some(FinalCachePageLookup::Miss(miss)) => Some(miss),
+            None => None,
+        };
+        let generation = self.final_result_cache.begin_fetch(key.result_set());
+        let fetch_started = Instant::now();
+        let result = match self
+            .request_core_with_cx_until(cx, cancellation, method, parameters, Some(deadline))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if error.code == McpErrorCode::InvalidParams
+                    && let Some(origin) = cursor_origin
+                {
+                    self.final_result_cache.invalidate_rejected_cursor(origin);
+                }
+                return Err(error);
+            }
+        };
+        self.check_stdio_cache_lifetime(cx, cancellation, deadline)?;
+        let scope = final_cache_hints(&result).map(|(_, scope)| scope);
+        // The yielding decoder records dequeue time. Bound freshness by fetch
+        // start so wire latency or a parked caller cannot extend the peer TTL.
+        let receipt = self
+            .last_core_result_receipt
+            .take()
+            .map_or(fetch_started, |receipt| receipt.min(fetch_started));
+        let page_result_set = key.result_set().clone();
+        let _ = self.final_result_cache.insert_if_current_at(
+            key, generation, result.clone(), receipt,
+        );
+        let current_generation = self.final_result_cache.begin_fetch(&page_result_set);
+        if let Some(scope) = scope {
+            self.last_final_cache_page = Some(FinalCachePageState {
+                generation: current_generation,
+                scope,
+                miss: if generation != current_generation {
+                    Some(FinalCacheMiss::Invalidated)
+                } else {
+                    miss
+                },
+            });
+        }
+        Ok(result)
+    }
+
     /// Sends one ordinary core stdio request while yielding the caller's Unix runtime.
     ///
     /// Supports catalog lists, tools/call, resources/read, prompts/get and
@@ -28856,6 +29027,11 @@ impl Client {
 
     /// Reads a resource with the same cooperative MRTR and cancellation
     /// semantics as [`Self::call_tool_with_cx`].
+    ///
+    /// Complete initial modern reads share the connection's typed result cache.
+    /// Pending invalidations are drained before a replay, and caller
+    /// cancellation still wins on a hit. Input-required results and MRTR
+    /// continuation results never populate the ordinary resource cache.
     #[cfg(unix)]
     pub async fn read_resource_with_cx(
         &mut self,
@@ -28925,11 +29101,31 @@ impl Client {
         };
         let mut operation = std::pin::pin!(async {
             let mut parameters = original_parameters.clone();
+            let mut first_round = true;
             loop {
                 driver.before_request()?;
-                let result = self
-                    .request_core_with_cx(cx, cancellation, method, parameters)
-                    .await?;
+                let initial_resource_read = first_round && method == "resources/read";
+                first_round = false;
+                let result = if initial_resource_read {
+                    let uri = parameters
+                        .get("uri")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| McpError::invalid_params("Resource URI is missing"))?
+                        .to_owned();
+                    self.cached_final_core_request_with_cx_until(
+                        cx,
+                        cancellation,
+                        method,
+                        serde_json::json!({"uri": &uri}),
+                        None,
+                        FinalCacheResultSet::Resource(uri),
+                        deadline,
+                    )
+                    .await?
+                } else {
+                    self.request_core_with_cx(cx, cancellation, method, parameters)
+                        .await?
+                };
                 driver.before_request()?;
                 let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
                     return Ok(result);
@@ -69591,6 +69787,317 @@ exec sleep 2
             CoreResult::Final(FinalCoreResult::ToolsList { .. })
         ));
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    fn stdio_cache_resource_exchange(id: usize, uri: &str, result: &str) -> String {
+        format!(
+            "IFS= read -r request || exit 20\n\
+             case \"$request\" in *'\"method\":\"resources/read\"'*) ;; *) exit 21 ;; esac\n\
+             case \"$request\" in *'\"id\":{id},'*|*'\"id\":{id}}}'*) ;; *) exit 22 ;; esac\n\
+             case \"$request\" in *'\"uri\":\"{uri}\"'*) ;; *) exit 23 ;; esac\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}'\n"
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_stdio_async_resources_share_cache_and_preserve_exact_results() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let first_result = r#"{"resultType":"complete","contents":[{"uri":"file:///one","text":"one"}],"ttlMs":60000,"cacheScope":"private","_meta":{"vendor":{"order":[2,1]}},"vendorExact":922337203685477580812345678901234567890,"vendorDecimal":1.2300e+42}"#;
+            let second_result = r#"{"resultType":"complete","contents":[{"uri":"file:///two","text":"two"}],"ttlMs":60000,"cacheScope":"private"}"#;
+            let raw_result = r#"{"resultType":"complete","contents":[{"uri":"file:///one","text":"raw"}],"ttlMs":60000,"cacheScope":"private"}"#;
+            let mut script = stdio_catalog_test_discovery_script();
+            for (id, uri, result) in [
+                (2, "file:///one", first_result),
+                (3, "file:///two", second_result),
+                (4, "file:///one", raw_result),
+            ] {
+                script.push_str(&stdio_cache_resource_exchange(id, uri, result));
+            }
+            script.push_str("while IFS= read -r unexpected; do exit 24; done\n");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .client_info("typed-catalog-client", "7.2")
+                .max_retries(0)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", &script])
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let first = client.read_resource_typed("file:///one").unwrap();
+            let original = first.encode().unwrap();
+            assert!(original.contains("922337203685477580812345678901234567890"));
+            assert!(original.contains("1.2300e+42"));
+            std::thread::sleep(Duration::from_millis(2));
+            let replay = client
+                .read_resource_with_cx(&cx, &cancellation, "file:///one")
+                .await
+                .unwrap();
+            crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+                &original,
+                &replay.encode().unwrap(),
+                "async reads reuse the exact synchronous resource entry",
+            );
+            let replay_value: serde_json::Value =
+                serde_json::from_str(&replay.encode().unwrap()).unwrap();
+            assert!(replay_value["ttlMs"].as_u64().unwrap() < 60_000);
+            assert_eq!(client.peek_next_request_id(), 3);
+
+            let second = client
+                .read_resource_with_cx(&cx, &cancellation, "file:///two")
+                .await
+                .unwrap();
+            let synchronous_replay = client.read_resource_typed("file:///two").unwrap();
+            crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+                &second.encode().unwrap(),
+                &synchronous_replay.encode().unwrap(),
+                "synchronous reads reuse the async resource entry",
+            );
+            assert_eq!(client.peek_next_request_id(), 4);
+            let raw = client
+                .request_core_with_cx(
+                    &cx,
+                    &cancellation,
+                    "resources/read",
+                    serde_json::json!({"uri":"file:///one"}),
+                )
+                .await
+                .unwrap();
+            assert!(raw.encode().unwrap().contains("\"text\":\"raw\""));
+            let retained = client
+                .read_resource_with_cx(&cx, &cancellation, "file:///one")
+                .await
+                .unwrap();
+            crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+                &original,
+                &retained.encode().unwrap(),
+                "raw requests neither reuse nor replace high-level cached data",
+            );
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            assert_eq!(
+                client
+                    .read_resource_with_cx(&cx, &cancelled, "file:///one")
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled,
+            );
+            assert_eq!(client.peek_next_request_id(), 5);
+            assert_eq!(client.final_result_cache_stats().fills, 2);
+            assert_eq!(client.final_result_cache_stats().hits, 3);
+            client.close().unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_stdio_async_resources_drain_and_fence_fragmented_invalidations() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for fragmented in [false, true] {
+                let old = r#"{"resultType":"complete","contents":[{"uri":"file:///changing","text":"old"}],"ttlMs":60000,"cacheScope":"private"}"#;
+                let intermediate = r#"{"resultType":"complete","contents":[{"uri":"file:///changing","text":"intermediate"}],"ttlMs":60000,"cacheScope":"private"}"#;
+                let stable = r#"{"resultType":"complete","contents":[{"uri":"file:///changing","text":"stable"}],"ttlMs":60000,"cacheScope":"private"}"#;
+                let notification = r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///changing"}}"#;
+                let mut script = stdio_catalog_test_discovery_script();
+                script.push_str(&stdio_cache_resource_exchange(2, "file:///changing", old));
+                if fragmented {
+                    script.push_str("printf '%s' '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",'\n");
+                } else {
+                    script.push_str(&format!("printf '%s\\n' '{notification}'\n"));
+                }
+                script.push_str(
+                    "IFS= read -r request || exit 25\n\
+                     case \"$request\" in *'\"method\":\"resources/read\"'*) ;; *) exit 26 ;; esac\n\
+                     case \"$request\" in *'\"id\":3,'*|*'\"id\":3}'*) ;; *) exit 27 ;; esac\n",
+                );
+                if fragmented {
+                    script.push_str("printf '%s\\n' '\"params\":{\"uri\":\"file:///changing\"}}'\n");
+                } else {
+                    // This second invalidation arrives after request 3 starts.
+                    script.push_str(&format!("printf '%s\\n' '{notification}'\n"));
+                }
+                script.push_str(&format!(
+                    "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{intermediate}}}'\n"
+                ));
+                script.push_str(&stdio_cache_resource_exchange(4, "file:///changing", stable));
+                script.push_str("while IFS= read -r unexpected; do exit 28; done\n");
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .client_info("typed-catalog-client", "7.2")
+                    .max_retries(0)
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", &script])
+                    .await
+                    .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let first = client
+                    .read_resource_with_cx(&cx, &cancellation, "file:///changing")
+                    .await
+                    .unwrap();
+                assert!(first.encode().unwrap().contains("\"text\":\"old\""));
+                let fixture_deadline = Instant::now() + Duration::from_secs(5);
+                while !client.transport.lock().unwrap().has_ready_input().unwrap() {
+                    assert!(Instant::now() < fixture_deadline);
+                    asupersync::runtime::yield_now().await;
+                }
+                if fragmented {
+                    while !client.transport.lock().unwrap().has_buffered_input() {
+                        assert!(Instant::now() < fixture_deadline);
+                        client
+                            .drive_multiplexed_stdio_until(
+                                &cx,
+                                Some(Instant::now() + Duration::from_millis(2)),
+                            )
+                            .unwrap();
+                        asupersync::runtime::yield_now().await;
+                    }
+                }
+                let second = client
+                    .read_resource_with_cx(&cx, &cancellation, "file:///changing")
+                    .await
+                    .unwrap();
+                assert!(second.encode().unwrap().contains("\"text\":\"intermediate\""));
+                assert_eq!(client.final_result_cache_stats().fills, 1);
+                let third = client
+                    .read_resource_with_cx(&cx, &cancellation, "file:///changing")
+                    .await
+                    .unwrap();
+                assert!(third.encode().unwrap().contains("\"text\":\"stable\""));
+                let replay = client
+                    .read_resource_with_cx(&cx, &cancellation, "file:///changing")
+                    .await
+                    .unwrap();
+                crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+                    &third.encode().unwrap(),
+                    &replay.encode().unwrap(),
+                    "only the result after the last invalidation is reusable",
+                );
+                assert_eq!(client.peek_next_request_id(), 5);
+                assert_eq!(client.final_result_cache_stats().fills, 2);
+                assert_eq!(client.final_result_cache_stats().hits, 1);
+                assert_eq!(client.take_final_server_notifications().len(), if fragmented { 1 } else { 2 });
+                client.close().unwrap();
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_stdio_async_resources_never_cache_mrtr_continuations() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                let observed = Arc::clone(&observed);
+                Box::pin(async move {
+                    observed.fetch_add(1, Ordering::AcqRel);
+                    serde_json::from_value(serde_json::json!({"roots":[]}))
+                        .map_err(|_| McpError::internal_error("Invalid roots fixture"))
+                })
+            });
+            let mut script = stdio_catalog_test_discovery_script();
+            script.push_str(
+                r#"for id in 2 4; do
+    IFS= read -r request || exit 30
+    case "$request" in *'"method":"resources/read"'*) ;; *) exit 31 ;; esac
+    case "$request" in *'"uri":"file:///consent"'*) ;; *) exit 32 ;; esac
+    case "$request" in *inputResponses*|*requestState*) exit 33 ;; *) ;; esac
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"private-round"}}\n' "$id"
+    IFS= read -r continuation || exit 34
+    case "$continuation" in *'"requestState":"private-round"'*) ;; *) exit 35 ;; esac
+    case "$continuation" in *'"inputResponses":{"roots":{"roots":[]}}'*) ;; *) exit 36 ;; esac
+    next=$((id + 1))
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","contents":[{"uri":"file:///consent","text":"consented"}],"ttlMs":60000,"cacheScope":"private"}}\n' "$next"
+done
+while IFS= read -r unexpected; do exit 37; done
+"#,
+            );
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .client_info("typed-catalog-client", "7.2")
+                .reverse_request_handlers(handlers)
+                .max_retries(0)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", &script])
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            for _ in 0..2 {
+                let result = client
+                    .read_resource_with_cx(&cx, &cancellation, "file:///consent")
+                    .await
+                    .unwrap();
+                assert!(result.encode().unwrap().contains("\"text\":\"consented\""));
+            }
+            assert_eq!(calls.load(Ordering::Acquire), 2);
+            assert_eq!(client.peek_next_request_id(), 6);
+            assert_eq!(client.final_result_cache_stats().fills, 0);
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            client.close().unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_stdio_async_resource_ttl_does_not_restart_after_a_parked_future() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let expired = r#"{"resultType":"complete","contents":[{"uri":"file:///delayed","text":"expired"}],"ttlMs":20,"cacheScope":"private"}"#;
+            let fresh = r#"{"resultType":"complete","contents":[{"uri":"file:///delayed","text":"fresh"}],"ttlMs":60000,"cacheScope":"private"}"#;
+            let mut script = stdio_catalog_test_discovery_script();
+            script.push_str(&stdio_cache_resource_exchange(2, "file:///delayed", expired));
+            script.push_str(&stdio_cache_resource_exchange(3, "file:///delayed", fresh));
+            script.push_str("while IFS= read -r unexpected; do exit 38; done\n");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .client_info("typed-catalog-client", "7.2")
+                .max_retries(0)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", &script])
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let executor = client.multiplexed_stdio_executor().unwrap();
+            assert!(executor.executor.terminal_records().is_empty());
+            let mut pending = Box::pin(client.read_resource_with_cx(
+                &cx,
+                &cancellation,
+                "file:///delayed",
+            ));
+            let fixture_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let poll = std::future::poll_fn(|task_cx| {
+                    std::task::Poll::Ready(pending.as_mut().poll(task_cx))
+                })
+                .await;
+                assert!(
+                    poll.is_pending(),
+                    "ingress yields before the owner observes its result",
+                );
+                if executor
+                    .executor
+                    .terminal_records()
+                    .iter()
+                    .any(|record| record.final_delivered)
+                {
+                    break;
+                }
+                assert!(Instant::now() < fixture_deadline);
+                asupersync::runtime::yield_now().await;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            let first = pending.await.unwrap();
+            assert!(first.encode().unwrap().contains("\"text\":\"expired\""));
+            let second = client
+                .read_resource_with_cx(&cx, &cancellation, "file:///delayed")
+                .await
+                .unwrap();
+            assert!(second.encode().unwrap().contains("\"text\":\"fresh\""));
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            assert_eq!(client.peek_next_request_id(), 4);
+            client.close().unwrap();
+        });
     }
 
     #[cfg(unix)]

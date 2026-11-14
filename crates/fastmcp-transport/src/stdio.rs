@@ -991,6 +991,21 @@ impl<R> StdioRecvHalf<R> {
 }
 
 impl<R: Read> StdioRecvHalf<R> {
+    /// Whether ingress retains unread bytes or an incomplete NDJSON frame.
+    ///
+    /// A polling slice may expire with a partial frame, or before consuming
+    /// read-ahead bytes from an earlier receive. Neither state is an idle
+    /// stream. The sole reader must admit or retire this input before a caller
+    /// can rely on having drained peer notifications.
+    ///
+    /// This reports framing state without exposing unadmitted bytes. It does
+    /// not probe the underlying descriptor for newly arrived input.
+    #[must_use]
+    pub fn has_buffered_input(&self) -> bool {
+        (self.transport.line_in_progress && !self.transport.line_buffer.is_empty())
+            || !self.transport.reader.buffer().is_empty()
+    }
+
     /// Returns the exact frame decoded by the immediately preceding receive.
     ///
     /// The slice remains valid only until the next receive. It allows a
@@ -1051,6 +1066,33 @@ impl<R: Read + Send> ClientTransportRecvHalf for StdioRecvHalf<R> {
 
 #[cfg(unix)]
 impl<R: Read + AsFd> StdioRecvHalf<R> {
+    /// Whether retained bytes or immediately readable input need a receive turn.
+    ///
+    /// The readiness probe never consumes bytes or waits for input. It includes
+    /// read-ahead and partial-frame state, which may survive a polling deadline.
+    /// Readable EOF, terminal/error readiness, and an interrupted probe all
+    /// require the normal receive path; none proves an idle peer.
+    ///
+    /// This is an instantaneous observation, not a promise that the peer cannot
+    /// publish another frame after the probe.
+    pub fn has_ready_input(&self) -> Result<bool, TransportError> {
+        if self.is_closed() || self.has_buffered_input() {
+            return Ok(true);
+        }
+        let mut descriptors = [PollFd::new(self.transport.reader.get_ref(), PollFlags::IN)];
+        let timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        match poll(&mut descriptors, Some(&timeout)) {
+            Ok(ready) => Ok(ready != 0),
+            // Conservatively require a receive turn rather than retrying in
+            // an unbounded signal-driven loop or claiming the pipe was idle.
+            Err(rustix::io::Errno::INTR) => Ok(true),
+            Err(error) => Err(TransportError::Io(error.into())),
+        }
+    }
+
     /// Receives through the bounded Unix readiness path and wakes when either
     /// split half becomes terminal.
     ///
@@ -2507,10 +2549,14 @@ mod tests {
     fn recv_slice_retains_partial_frame_and_exact_source() {
         let (mut peer, reader) = UnixStream::pair().unwrap();
         let (mut receiver, _sender) = StdioTransport::new(reader, Vec::new()).into_split();
+        assert!(!receiver.has_buffered_input());
+        assert!(!receiver.has_ready_input().unwrap());
         let cx = Cx::for_testing();
         let hard = Instant::now() + Duration::from_secs(2);
         let prefix = br#"{"jsonrpc":"2.0","id":1,"result":{"n":1."#;
         peer.write_all(prefix).unwrap();
+        assert!(!receiver.has_buffered_input());
+        assert!(receiver.has_ready_input().unwrap());
         for _ in 0..3 {
             assert!(
                 receiver
@@ -2524,6 +2570,7 @@ mod tests {
             );
             assert!(!receiver.is_closed());
             assert_eq!(receiver.transport.line_buffer, prefix);
+            assert!(receiver.has_buffered_input());
             assert!(receiver.last_received_frame().is_none());
         }
         // An exponent and CRLF straddle turns. Empty lines and a second frame
@@ -2547,6 +2594,19 @@ mod tests {
             Some(br#"{"jsonrpc":"2.0","id":1,"result":{"n":1.25e+2}}"#.as_slice())
         );
         assert!(receiver.partial_frame_deadline.is_none());
+        // The completed frame itself is not pending input, but read-ahead
+        // bytes for the next frame remain owned by this same reader. Explicitly
+        // fill the same buffer: a stream read may return only the first frame.
+        assert!(!receiver.transport.reader.fill_buf().unwrap().is_empty());
+        assert!(receiver.has_buffered_input());
+        assert!(
+            receiver
+                .recv_slice_or_closed(&cx, Instant::now(), Some(hard))
+                .unwrap()
+                .is_none()
+        );
+        assert!(receiver.has_buffered_input());
+        assert!(receiver.has_ready_input().unwrap());
         let second = receiver.recv_until_or_closed(&cx, Some(hard)).unwrap();
         assert!(
             matches!(second, JsonRpcMessage::Request(request) if request.id == Some(2_i64.into()))
@@ -2556,6 +2616,13 @@ mod tests {
                 .recv_slice_or_closed(&cx, Instant::now() + Duration::from_millis(2), None)
                 .unwrap()
                 .is_none()
+        );
+        assert!(!receiver.has_buffered_input());
+        assert!(!receiver.has_ready_input().unwrap());
+        drop(peer);
+        assert!(
+            receiver.has_ready_input().unwrap(),
+            "EOF readiness must be observed by the reader, never treated as idle"
         );
     }
 

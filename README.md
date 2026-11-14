@@ -1129,6 +1129,15 @@ handlers installed, the complete `input_required` result is returned.
 `complete_with_cx` and `ping_with_cx` provide the corresponding ordinary
 completion and liveness operations.
 
+Initial complete resource reads use the same connection-local result cache as
+the synchronous typed resource API. Replays preserve result metadata and exact
+unknown fields while aging the peer's TTL. Before a replay, the sole stdio
+reader processes ready invalidations; partial frames, buffered input, or a
+busy peer force a fresh request. Cancellation also applies to cache hits.
+Input-required results and continuation rounds never populate this cache.
+The yielding path starts cache freshness at the beginning of the fetch, so
+wire and scheduling delay can shorten reuse but cannot extend the peer's TTL.
+
 Use `open_subscriptions_listener_with_cx` and
 `next_subscription_event_with_cx` to interleave a live catalog listener
 with ordinary client requests. Dropping an event wait preserves the stream
