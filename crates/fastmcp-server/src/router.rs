@@ -849,7 +849,15 @@ fn final_mrtr_binding(
             verified_grants_digest,
         )
     };
-    Ok(Some(binding))
+    // Admission capacity follows verified ownership, independently of the
+    // stricter retry binding above. A changing display subject, scope set,
+    // token, or connection cannot manufacture another capacity partition.
+    // Unverified and anonymous callers all share the conservative None bucket.
+    let retention_owner = auth
+        .as_ref()
+        .and_then(|auth| auth.session_owner())
+        .map(|owner| *owner.as_bytes());
+    Ok(Some(binding.with_retention_owner(retention_owner)))
 }
 
 fn handler_mrtr_input_requests(
@@ -2330,6 +2338,32 @@ impl Router {
     /// continuation when the owning HTTP listener begins shutdown.
     pub(crate) fn close_stateless_mrtr_exchanges(&self) -> usize {
         self.mrtr_exchanges.close_stateless()
+    }
+
+    /// Bounds process-local interactive continuations before the router is used.
+    ///
+    /// Verified owners share a capacity partition across connections and token
+    /// rotations. Anonymous and unverified callers share one partition. Byte
+    /// limits charge retained payload and control data, not allocator overhead.
+    /// Admission never evicts another conversation. A rejected partial retry
+    /// leaves the original continuation available.
+    ///
+    /// Returns an error for invalid limits, after the first issued continuation,
+    /// or once the continuation registry has been shared with another router.
+    pub fn set_mrtr_retention_capacity(
+        &mut self,
+        max_states_per_owner: usize,
+        max_payload_bytes: usize,
+        max_payload_bytes_per_owner: usize,
+    ) -> McpResult<()> {
+        let registry = Arc::get_mut(&mut self.mrtr_exchanges).ok_or_else(|| {
+            McpError::invalid_request("MRTR retention capacity is already shared")
+        })?;
+        registry.set_retention_capacity(
+            max_states_per_owner,
+            max_payload_bytes,
+            max_payload_bytes_per_owner,
+        )
     }
 
     #[cfg(feature = "tasks")]
@@ -24646,6 +24680,166 @@ mod router_tests {
         assert_eq!(completed["resultType"], "complete");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(router.mrtr_exchanges.active_len(), 0);
+    }
+
+    #[test]
+    fn mrtr_retention_capacity_is_shared_by_verified_owner_across_connections() {
+        let mut router = Router::new();
+        router
+            .set_mrtr_retention_capacity(1, 64 * 1024, 32 * 1024)
+            .unwrap();
+        router
+            .add_tool(OneShotMrtrTool {
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .unwrap();
+        let cx = Cx::for_testing();
+        let owner_a = sha256_bounded(b"mrtr-owner-a", 128).unwrap();
+        let owner_b = sha256_bounded(b"mrtr-owner-b", 128).unwrap();
+        let auth_a =
+            fastmcp_core::AuthContext::with_subject("display-a").with_session_owner(owner_a);
+        let mut rotated_a =
+            fastmcp_core::AuthContext::with_subject("changed-display").with_session_owner(owner_a);
+        rotated_a.scopes = vec!["new-scope".to_owned()];
+        let auth_b =
+            fastmcp_core::AuthContext::with_subject("display-a").with_session_owner(owner_b);
+        let connection_a = ModernConnection::new();
+        let rotated_connection = ModernConnection::new();
+        let connection_b = ModernConnection::new();
+        let dispatch = |connection: &ModernConnection, auth, request: JsonRpcRequest| {
+            let inbound = InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                1,
+                InboundRequestTransport::Memory,
+                connection,
+            );
+            let context = inbound.request_context().with_auth(auth);
+            let cancellation = inbound.mrtr_continuation_cancellation().unwrap();
+            let raw = serde_json::to_string(request.params.as_ref().unwrap()).unwrap();
+            block_on(
+                router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                    &context,
+                    &request,
+                    Some(&raw),
+                    &cancellation,
+                ),
+            )
+        };
+        let initial =
+            |id| final_tools_call_request("one-shot-mrtr-tool", serde_json::json!({}), id);
+        let first = dispatch(&connection_a, auth_a.clone(), initial(1_i64)).unwrap();
+        assert_eq!(first["resultType"], "input_required");
+        assert!(dispatch(&rotated_connection, rotated_a, initial(2_i64)).is_err());
+        assert_eq!(router.mrtr_exchanges.active_len(), 1);
+        let other = dispatch(&connection_b, auth_b, initial(3_i64)).unwrap();
+        assert_eq!(other["resultType"], "input_required");
+        assert_eq!(router.mrtr_exchanges.active_len(), 2);
+
+        let mut retry = initial(4_i64);
+        let params = retry.params.as_mut().unwrap().as_object_mut().unwrap();
+        params.insert("requestState".to_owned(), first["requestState"].clone());
+        params.insert(
+            "inputResponses".to_owned(),
+            serde_json::json!({
+                "roots": router_roots_response_wire(),
+            }),
+        );
+        let completed = dispatch(&connection_a, auth_a.clone(), retry).unwrap();
+        assert_eq!(completed["resultType"], "complete");
+        assert_eq!(router.mrtr_exchanges.active_len(), 1);
+        assert_eq!(
+            dispatch(&connection_a, auth_a, initial(5_i64)).unwrap()["resultType"],
+            "input_required"
+        );
+        connection_b.disconnect();
+        assert_eq!(router.mrtr_exchanges.active_len(), 1);
+    }
+
+    #[test]
+    fn mrtr_retention_capacity_does_not_partition_unverified_auth_facts() {
+        let mut router = Router::new();
+        router
+            .set_mrtr_retention_capacity(1, 64 * 1024, 32 * 1024)
+            .unwrap();
+        router
+            .add_tool(OneShotMrtrTool {
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .unwrap();
+        let cx = Cx::for_testing();
+        let connections: Vec<_> = (0..4).map(|_| ModernConnection::new()).collect();
+        for (index, auth) in [
+            None,
+            Some(fastmcp_core::AuthContext::with_subject("unverified-a")),
+            Some(fastmcp_core::AuthContext::with_subject("unverified-b")),
+            Some(
+                fastmcp_core::AuthContext::with_subject("verified")
+                    .with_session_owner(sha256_bounded(b"mrtr-verified-owner", 128).unwrap()),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let inbound = InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                index as u64,
+                InboundRequestTransport::Memory,
+                &connections[index],
+            );
+            let mut context = inbound.request_context();
+            if let Some(auth) = auth {
+                context = context.with_auth(auth);
+            }
+            let request =
+                final_tools_call_request("one-shot-mrtr-tool", serde_json::json!({}), index as i64);
+            let cancellation = inbound.mrtr_continuation_cancellation().unwrap();
+            let raw = serde_json::to_string(request.params.as_ref().unwrap()).unwrap();
+            let result = block_on(
+                router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                    &context,
+                    &request,
+                    Some(&raw),
+                    &cancellation,
+                ),
+            );
+            if index == 0 || index == 3 {
+                assert_eq!(result.unwrap()["resultType"], "input_required");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "changing unverified auth cannot mint capacity"
+                );
+            }
+        }
+        assert_eq!(router.mrtr_exchanges.active_len(), 2);
+    }
+
+    #[test]
+    fn mrtr_retention_capacity_cannot_change_after_issue_or_sharing() {
+        let mut router = Router::new();
+        router
+            .set_mrtr_retention_capacity(1, 64 * 1024, 32 * 1024)
+            .unwrap();
+        let shared = Arc::clone(&router.mrtr_exchanges);
+        assert!(
+            router
+                .set_mrtr_retention_capacity(2, 64 * 1024, 32 * 1024)
+                .is_err()
+        );
+        drop(shared);
+        let owner = fastmcp_core::McpRequestCancellation::new();
+        router
+            .mrtr_exchanges
+            .issue(owner.clone(), MrtrInputRequests::default())
+            .unwrap();
+        owner.cancel();
+        assert_eq!(router.mrtr_exchanges.active_len(), 0);
+        assert!(
+            router
+                .set_mrtr_retention_capacity(2, 64 * 1024, 32 * 1024)
+                .is_err(),
+            "reclamation does not unfreeze an already active policy"
+        );
     }
 
     #[test]

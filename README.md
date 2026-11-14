@@ -1062,6 +1062,20 @@ or interrupting a callback cancels its local token and prevents a continuation;
 callback panics become redacted errors. These checks run between callback polls
 and cannot preempt synchronous work or undo external effects inside user code.
 
+Modern server continuations also have retained-payload limits. The default
+router admits at most 4,096 live continuations overall and 1,024 for one
+verified owner, with 64 MiB of retained payload overall and 32 MiB per owner.
+`ServerBuilder::mrtr_retention_capacity(states_per_owner, bytes, bytes_per_owner)`
+configures these bounds before startup, including through the `auto` and
+`modern` facades. Verified ownership spans connections and credential rotation;
+anonymous and unverified callers share one bounded partition. The accounting
+includes input schemas, descriptors, accumulated answers, and private handler
+state. A full partition refuses additional retained work without evicting
+another conversation; a rejected growing partial answer leaves its original
+continuation usable. Completion, cancellation, expiry, and listener shutdown
+reclaim the corresponding retained state. These are process-local payload
+limits, rather than allocator measurements or durable continuation storage.
+
 With the `tasks` feature on Unix, `Client::call_tool_final_outcome_with_cx`
 creates tasks without blocking the runtime while waiting for the peer. It
 returns the typed complete, task, or input-required outcome. A returned task ID
@@ -1279,8 +1293,11 @@ With `tasks` enabled, a retained `FinalTaskHandle` can become a
 `FinalTaskDriver` through `into_driver(FinalTaskDrivePolicy)`. Its
 `drive_watching` method combines native HTTP Task notifications with bounded
 polling and installed input callbacks. `drive_watching_with_memory` provides
-the same workflow through the Memory dispatcher. Configure the client's roots,
-sampling, and elicitation callbacks before connecting.
+the same workflow through the Memory dispatcher. Unix stdio uses
+`drive_watching_with_stdio`; WebSocket uses `drive_watching_with_websocket`
+with `websocket-experimental` enabled. Configure the client's roots, sampling,
+and elicitation callbacks before connecting. The `modern` facade's stdio,
+HTTP, and WebSocket clients expose this as `drive_final_task_watching`.
 
 The driver can answer newly requested input and observe completion directly
 from the subscription. Authoritative reads cover the attach/listen gap,
@@ -1298,6 +1315,13 @@ filter or a normal subscription terminal falls back to bounded polling once;
 an interrupted or malformed stream returns its error. The driver never
 reconnects, replays an uncertain update, or cancels the remote Task merely
 because local observation ends.
+
+Stdio and WebSocket share each connection's existing reader between Task
+notifications and authoritative reads, preserving a partially received frame
+when a poll becomes due. An existing Task listener is left intact and prevents
+the driver from opening a second one. Clean cancellation or dropping the driver
+retires its exact listener while preserving independently owned catalog
+listeners; a broken transport still follows its normal connection-failure rules.
 
 ### Authenticated HTTP clients (current source tree)
 

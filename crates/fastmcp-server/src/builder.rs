@@ -560,6 +560,38 @@ impl ServerBuilder {
         Ok(self)
     }
 
+    /// Sets retained-memory and per-owner capacity for modern interactive requests.
+    ///
+    /// Defaults retain at most 4,096 continuations overall, 1,024 per verified
+    /// owner, 64 MiB of payload overall, and 32 MiB per owner. The byte charge
+    /// includes input descriptors and schemas, accumulated answers, binding
+    /// data, and opaque handler state; it is not a heap-allocation measurement.
+    /// Anonymous and unverified callers share one owner partition. Token,
+    /// scope, request-ID, and connection changes cannot increase its capacity.
+    ///
+    /// Saturation rejects a new continuation or growing partial retry without
+    /// evicting another exchange or consuming the original retry state. A
+    /// completed, expired, or cancelled continuation releases its reservation.
+    /// These limits are fixed before the server begins handling requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero or excessive limits, an owner byte limit
+    /// greater than the aggregate limit, or a router already used or shared.
+    pub fn mrtr_retention_capacity(
+        mut self,
+        max_states_per_owner: usize,
+        max_payload_bytes: usize,
+        max_payload_bytes_per_owner: usize,
+    ) -> fastmcp_core::McpResult<Self> {
+        self.router.set_mrtr_retention_capacity(
+            max_states_per_owner,
+            max_payload_bytes,
+            max_payload_bytes_per_owner,
+        )?;
+        Ok(self)
+    }
+
     /// Sets the maximum number of in-flight server-to-client requests for one
     /// exact MCP 2024-11-05 transport connection. Modern transports do not
     /// enforce this ceiling, so the setter exists only with that lane.
@@ -5075,6 +5107,22 @@ mod tests {
     fn builder_request_timeout_zero_omits_server_ceiling() {
         let builder = ServerBuilder::new("srv", "1.0").request_timeout(0);
         assert_eq!(builder.request_timeout_secs(), 0);
+    }
+
+    #[test]
+    fn builder_mrtr_retention_capacity_rejects_invalid_limits_before_build() {
+        assert!(
+            ServerBuilder::new("srv", "1.0")
+                .mrtr_retention_capacity(2, 4096, 2048)
+                .is_ok()
+        );
+        for (owners, total, per_owner) in [(0, 4096, 2048), (2, 0, 0), (2, 2048, 4096)] {
+            assert!(
+                ServerBuilder::new("srv", "1.0")
+                    .mrtr_retention_capacity(owners, total, per_owner)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

@@ -2288,6 +2288,24 @@ pub mod auto {
                 .map(|inner| Self { inner })
         }
 
+        /// Bounds retained interactive continuations across the server and per
+        /// verified owner. Anonymous and unverified callers share one partition.
+        /// Byte limits charge payload and control data, not allocator overhead.
+        pub fn mrtr_retention_capacity(
+            self,
+            max_states_per_owner: usize,
+            max_payload_bytes: usize,
+            max_payload_bytes_per_owner: usize,
+        ) -> McpResult<Self> {
+            self.inner
+                .mrtr_retention_capacity(
+                    max_states_per_owner,
+                    max_payload_bytes,
+                    max_payload_bytes_per_owner,
+                )
+                .map(|inner| Self { inner })
+        }
+
         #[must_use]
         pub fn list_page_size(self, page_size: usize) -> Self {
             Self {
@@ -4718,6 +4736,23 @@ pub mod modern {
                 .await
         }
 
+        /// Drives a Task from notifications, bounded authoritative reads, and
+        /// installed input handlers. Keep the driver to retain its input ledger.
+        #[cfg(feature = "tasks")]
+        pub async fn drive_final_task_watching(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            driver: &mut FinalTaskDriver,
+        ) -> McpResult<FinalTaskWaitOutcome>
+        where
+            IO: Send + 'static,
+        {
+            driver
+                .drive_watching_with_websocket(cx, &mut self.inner, cancellation)
+                .await
+        }
+
         /// Watches one Task through this session's existing subscription owner.
         /// Local cancellation or dropping the watch retires its listen request
         /// without cancelling remote work or an independent catalog listener.
@@ -5147,6 +5182,21 @@ pub mod modern {
         ) -> McpResult<FinalTaskWaitOutcome> {
             driver
                 .drive_with_stdio(cx, &mut self.inner, cancellation)
+                .await
+        }
+
+        /// Drives a Task from the sole stdio reader's notifications, bounded
+        /// authoritative reads, and installed input handlers. Reuse the driver
+        /// to preserve answered input keys and interrupted-input custody.
+        #[cfg(all(feature = "tasks", unix))]
+        pub async fn drive_final_task_watching(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            driver: &mut FinalTaskDriver,
+        ) -> McpResult<FinalTaskWaitOutcome> {
+            driver
+                .drive_watching_with_stdio(cx, &mut self.inner, cancellation)
                 .await
         }
 
@@ -6929,6 +6979,19 @@ pub mod modern {
             driver.drive(cx, &mut self.inner, cancellation).await
         }
 
+        /// Drives a Task from its HTTP subscription and bounded reconciliation
+        /// reads, invoking installed input handlers at most once per input key.
+        #[cfg(feature = "tasks")]
+        pub async fn drive_final_task_watching(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            driver: &mut FinalTaskDriver,
+            limits: SseLimits,
+        ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+            Box::pin(driver.drive_watching(cx, &mut self.inner, cancellation, limits)).await
+        }
+
         /// Supplies input for an `input_required` task handle.
         ///
         /// The empty `tasks/update` acknowledgement does not replace the
@@ -8221,6 +8284,24 @@ pub mod modern {
         ) -> McpResult<Self> {
             self.inner
                 .subscription_capacity(max_streams, max_streams_per_principal)
+                .map(|inner| Self { inner })
+        }
+
+        /// Bounds retained interactive continuations across the server and per
+        /// verified owner. Anonymous and unverified callers share one partition.
+        /// Byte limits charge payload and control data, not allocator overhead.
+        pub fn mrtr_retention_capacity(
+            self,
+            max_states_per_owner: usize,
+            max_payload_bytes: usize,
+            max_payload_bytes_per_owner: usize,
+        ) -> McpResult<Self> {
+            self.inner
+                .mrtr_retention_capacity(
+                    max_states_per_owner,
+                    max_payload_bytes,
+                    max_payload_bytes_per_owner,
+                )
                 .map(|inner| Self { inner })
         }
 

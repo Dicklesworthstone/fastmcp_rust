@@ -47,6 +47,24 @@ use fastmcp_rust::http_auth::{CanonicalHttpUrl, PartitionAuthorization};
 use fastmcp_rust::partition::{CredentialStoreKey, DurableOwnerKey, PartitionDescriptor};
 use fastmcp_rust::ProcessGenerationGuard;
 
+#[test]
+fn facade_builders_expose_mrtr_retention_capacity() {
+    let _modern = fastmcp_rust::modern::ServerBuilder::new("bounded-interactions", "1.0")
+        .mrtr_retention_capacity(2, 4096, 2048)
+        .expect("modern callers can bound retained interactions")
+        .build();
+    assert!(
+        fastmcp_rust::modern::ServerBuilder::new("bounded-interactions", "1.0")
+            .mrtr_retention_capacity(2, 2048, 4096)
+            .is_err()
+    );
+    #[cfg(feature = "legacy-2024-11-05")]
+    let _auto = fastmcp_rust::auto::ServerBuilder::new("bounded-interactions", "1.0")
+        .mrtr_retention_capacity(2, 4096, 2048)
+        .expect("automatic-era callers share the same modern continuation policy")
+        .build();
+}
+
 /// `DpopKey::generate` returns `Result<DpopKey, DpopError>`, so a consumer that
 /// wraps key generation must be able to name BOTH types. Declared as a real
 /// signature because that is the thing under test: the `?` here only compiles

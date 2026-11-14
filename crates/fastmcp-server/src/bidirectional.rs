@@ -122,6 +122,11 @@ const MRTR_REQUEST_STATE_UNAVAILABLE_ERROR: &str = "Unable to create MRTR reques
 const MRTR_INPUT_MAP_ERROR: &str = "Invalid MRTR input request or response map";
 const MRTR_RESPONSE_KIND_ERROR: &str = "MRTR input response does not match its request";
 const MRTR_ROUND_LIMIT_ERROR: &str = "MRTR exchange limit reached";
+const MRTR_RETENTION_LIMIT_ERROR: &str = "MRTR retained payload limit reached";
+// Fixed control fields and collection framing have a bounded charge in addition
+// to every retained variable-sized value. This is encoded-payload accounting,
+// not a claim about allocator overhead or application-owned response buffers.
+const MRTR_RETAINED_RECORD_OVERHEAD_BYTES: usize = 256;
 
 /// The immutable request facts a router binds to one opaque MRTR state.
 ///
@@ -135,6 +140,7 @@ pub(crate) struct MrtrExchangeBinding {
     arguments_digest: [u8; 32],
     session_partition: [u8; 32],
     principal_digest: Option<[u8; 32]>,
+    retention_owner: Option<[u8; 32]>,
     verified_grants_digest: [u8; 32],
     is_stateless: bool,
 }
@@ -156,6 +162,7 @@ impl MrtrExchangeBinding {
             arguments_digest,
             session_partition,
             principal_digest,
+            retention_owner: principal_digest,
             verified_grants_digest,
             is_stateless: false,
         }
@@ -177,6 +184,7 @@ impl MrtrExchangeBinding {
             arguments_digest,
             session_partition,
             principal_digest,
+            retention_owner: principal_digest,
             verified_grants_digest,
             is_stateless: true,
         }
@@ -185,6 +193,14 @@ impl MrtrExchangeBinding {
     #[must_use]
     pub(crate) fn is_stateless(&self) -> bool {
         self.is_stateless
+    }
+
+    /// Separates stable quota ownership from the stricter continuation lookup
+    /// binding. Unverified or anonymous contexts share one bounded partition.
+    #[must_use]
+    pub(crate) fn with_retention_owner(mut self, owner: Option<[u8; 32]>) -> Self {
+        self.retention_owner = owner;
+        self
     }
 }
 const LEGACY_INPUT_RETRY_ERROR: &str = "MCP 2024-11-05 does not support input retries";
@@ -1642,16 +1658,6 @@ impl MrtrInputRequests {
         Ok(())
     }
 
-    fn unresolved_after(&self, responses: &MrtrInputResponses) -> Self {
-        Self {
-            entries: self
-                .entries
-                .iter()
-                .filter(|(key, _)| responses.get(key).is_none())
-                .map(|(key, request)| (key.clone(), request.clone()))
-                .collect(),
-        }
-    }
 }
 
 impl Serialize for MrtrInputRequests {
@@ -1735,12 +1741,12 @@ impl MrtrInputResponses {
     /// accepted its key already. The registry has separately bounded total
     /// exchange growth, so this must not apply the single-round constructor
     /// ceiling to accumulated partial retries.
-    fn append_accepted_if_absent(&mut self, key: &str, response: &MrtrInputResponse) -> bool {
-        if self.index.contains_key(key) {
+    fn append_accepted_if_absent(&mut self, key: String, response: MrtrInputResponse) -> bool {
+        if self.index.contains_key(&key) {
             return false;
         }
-        self.index.insert(key.to_owned(), self.entries.len());
-        self.entries.push((key.to_owned(), response.clone()));
+        self.index.insert(key.clone(), self.entries.len());
+        self.entries.push((key, response));
         true
     }
 }
@@ -1950,12 +1956,184 @@ struct MrtrExchange {
     responses: MrtrInputResponses,
     binding: Option<MrtrExchangeBinding>,
     handler_request_state: Option<MrtrRequestState>,
+    retained_payload_bytes: usize,
+}
+
+impl MrtrExchange {
+    fn quota_owner(&self) -> Option<[u8; 32]> {
+        self.binding
+            .as_ref()
+            .and_then(|binding| binding.retention_owner)
+    }
+}
+
+#[derive(Debug, Default)]
+struct MrtrOwnerRetention {
+    states: usize,
+    payload_bytes: usize,
 }
 
 #[derive(Debug, Default)]
 struct MrtrExchangeState {
     exchanges: HashMap<String, MrtrExchange>,
     stateless_closed: bool,
+    has_issued: bool,
+    retained_payload_bytes: usize,
+    owners: HashMap<Option<[u8; 32]>, MrtrOwnerRetention>,
+}
+
+impl MrtrExchangeState {
+    fn insert(&mut self, token: String, exchange: MrtrExchange) {
+        debug_assert!(!self.exchanges.contains_key(&token));
+        let owner = self.owners.entry(exchange.quota_owner()).or_default();
+        owner.states += 1;
+        owner.payload_bytes += exchange.retained_payload_bytes;
+        self.retained_payload_bytes += exchange.retained_payload_bytes;
+        self.has_issued = true;
+        self.exchanges.insert(token, exchange);
+    }
+
+    fn release_charge(&mut self, exchange: &MrtrExchange) {
+        self.retained_payload_bytes -= exchange.retained_payload_bytes;
+        let quota_owner = exchange.quota_owner();
+        if let Some(owner) = self.owners.get_mut(&quota_owner) {
+            owner.states -= 1;
+            owner.payload_bytes -= exchange.retained_payload_bytes;
+            if owner.states == 0 {
+                self.owners.remove(&quota_owner);
+            }
+        }
+    }
+
+    fn remove(&mut self, token: &str) -> Option<MrtrExchange> {
+        let exchange = self.exchanges.remove(token)?;
+        self.release_charge(&exchange);
+        Some(exchange)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&MrtrExchange) -> bool) {
+        // Split the fields so pruning cannot forget to release either charge.
+        let Self {
+            exchanges,
+            owners,
+            retained_payload_bytes,
+            ..
+        } = self;
+        exchanges.retain(|_, exchange| {
+            if keep(exchange) {
+                return true;
+            }
+            *retained_payload_bytes -= exchange.retained_payload_bytes;
+            let quota_owner = exchange.quota_owner();
+            if let Some(owner) = owners.get_mut(&quota_owner) {
+                owner.states -= 1;
+                owner.payload_bytes -= exchange.retained_payload_bytes;
+                if owner.states == 0 {
+                    owners.remove(&quota_owner);
+                }
+            }
+            false
+        });
+    }
+}
+
+/// Counts compact JSON without allocating a second encoded payload. Writes
+/// stop at the admission ceiling, including on a single oversized string.
+struct MrtrPayloadByteCounter {
+    bytes: usize,
+    limit: usize,
+}
+
+impl std::io::Write for MrtrPayloadByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .filter(|next| *next <= self.limit)
+            .ok_or_else(|| std::io::Error::other(MRTR_RETENTION_LIMIT_ERROR))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl MrtrPayloadByteCounter {
+    fn charge(&mut self, value: &(impl Serialize + ?Sized)) -> McpResult<()> {
+        serde_json::to_writer(self, value)
+            .map_err(|_| McpError::invalid_params(MRTR_RETENTION_LIMIT_ERROR))
+    }
+}
+
+/// Borrows the prospective state so a rejected partial retry never clones
+/// accumulated responses or changes the live token. Unknown/already accepted
+/// response keys are inert, as they are at ordinary MRTR admission.
+struct MrtrRetainedPayload<'a> {
+    binding: Option<&'a MrtrExchangeBinding>,
+    requests: &'a MrtrInputRequests,
+    responses: &'a MrtrInputResponses,
+    appended: Option<&'a MrtrInputResponses>,
+    handler_request_state: Option<&'a str>,
+}
+
+impl MrtrRetainedPayload<'_> {
+    fn unresolved(&self, key: &str) -> bool {
+        self.responses.get(key).is_none()
+            && self
+                .appended
+                .is_none_or(|responses| responses.get(key).is_none())
+    }
+
+    fn appended_responses(&self) -> impl Iterator<Item = (&str, &MrtrInputResponse)> {
+        self.appended
+            .into_iter()
+            .flat_map(MrtrInputResponses::iter)
+            .filter(|(key, _)| {
+                self.requests.get(key).is_some() && self.responses.get(key).is_none()
+            })
+    }
+
+    fn bytes(&self, token: &str, limit: usize) -> McpResult<usize> {
+        if limit < MRTR_RETAINED_RECORD_OVERHEAD_BYTES {
+            return Err(McpError::invalid_params(MRTR_RETENTION_LIMIT_ERROR));
+        }
+        let mut counter = MrtrPayloadByteCounter {
+            bytes: MRTR_RETAINED_RECORD_OVERHEAD_BYTES,
+            limit,
+        };
+        counter.charge(token)?;
+        if let Some(binding) = self.binding {
+            counter.charge(&(
+                binding.method,
+                &binding.target,
+                binding.arguments_digest,
+                binding.session_partition,
+                binding.principal_digest,
+                binding.retention_owner,
+                binding.verified_grants_digest,
+                binding.is_stateless,
+            ))?;
+        }
+        counter.charge(&self.handler_request_state)?;
+        for (key, request) in self.requests.iter().filter(|(key, _)| self.unresolved(key)) {
+            counter.charge(key)?;
+            counter.charge(request)?;
+            // The response-kind ledger owns a separate copy of every key.
+            counter.charge(&(key, request.kind().method()))?;
+        }
+        for (index, (key, response)) in self
+            .responses
+            .iter()
+            .chain(self.appended_responses())
+            .enumerate()
+        {
+            counter.charge(&(key, response))?;
+            // Ordered responses also retain a separate key-to-index lookup.
+            counter.charge(&(key, index))?;
+        }
+        Ok(counter.bytes)
+    }
 }
 
 /// Process-local, one-use final MRTR request-state storage.
@@ -1964,6 +2142,16 @@ struct MrtrExchangeState {
 /// emitted, including each final elicitation's mode and admitted form schema.
 /// The opaque state is random, expires, cannot be replayed after a successful
 /// retry, and is invalidated when its owning request is cancelled.
+///
+/// Both retained record count and compact-JSON payload bytes are bounded per
+/// registry and per immutable principal. Records without a principal share
+/// one embedding partition; changing request IDs, targets, or sessions never
+/// creates a new quota owner. Payload accounting includes descriptors and
+/// schemas, accumulated responses, duplicate ledger/index keys, private handler
+/// state, the token and binding, plus fixed control overhead. It excludes
+/// caller-owned results and does not measure decoded heap or allocator overhead.
+/// Saturation rejects without evicting another exchange; partial retries reserve
+/// the replacement delta before consuming their old token.
 pub struct MrtrExchangeRegistry {
     state: Mutex<MrtrExchangeState>,
     max_states: usize,
@@ -1971,9 +2159,21 @@ pub struct MrtrExchangeRegistry {
     max_inputs_per_round: usize,
     max_total_input_requests: usize,
     request_state_ttl: Duration,
+    max_states_per_owner: usize,
+    max_payload_bytes: usize,
+    max_payload_bytes_per_owner: usize,
 }
 
 impl MrtrExchangeRegistry {
+    /// Default retained continuation count for one immutable principal.
+    pub const DEFAULT_MAX_STATES_PER_OWNER: usize = 1_024;
+    /// Default retained compact-JSON payload capacity for one registry.
+    pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 64 * 1_024 * 1_024;
+    /// Hard retained compact-JSON payload capacity for one registry.
+    pub const HARD_MAX_PAYLOAD_BYTES: usize = 512 * 1_024 * 1_024;
+    /// Default retained compact-JSON payload capacity for one principal.
+    pub const DEFAULT_MAX_PAYLOAD_BYTES_PER_OWNER: usize = 32 * 1_024 * 1_024;
+
     /// Creates a registry with the final protocol's default bounded policy.
     #[must_use]
     pub fn new() -> Self {
@@ -1984,6 +2184,9 @@ impl MrtrExchangeRegistry {
             max_inputs_per_round: DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND,
             max_total_input_requests: DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL,
             request_state_ttl: DEFAULT_MRTR_REQUEST_STATE_TTL,
+            max_states_per_owner: Self::DEFAULT_MAX_STATES_PER_OWNER,
+            max_payload_bytes: Self::DEFAULT_MAX_PAYLOAD_BYTES,
+            max_payload_bytes_per_owner: Self::DEFAULT_MAX_PAYLOAD_BYTES_PER_OWNER,
         }
     }
 
@@ -2018,7 +2221,107 @@ impl MrtrExchangeRegistry {
             max_inputs_per_round,
             max_total_input_requests,
             request_state_ttl,
+            max_states_per_owner: max_states.min(Self::DEFAULT_MAX_STATES_PER_OWNER),
+            max_payload_bytes: Self::DEFAULT_MAX_PAYLOAD_BYTES,
+            max_payload_bytes_per_owner: Self::DEFAULT_MAX_PAYLOAD_BYTES_PER_OWNER,
         })
+    }
+
+    /// Configures immutable retained-state capacities before the first issue.
+    ///
+    /// All capacities must be positive. The owner count cannot exceed this
+    /// registry's global record count, and owner bytes cannot exceed global
+    /// bytes. Global bytes cannot exceed 512 MiB. Defaults are 1,024 states
+    /// per owner (narrowed for a smaller global count), 64 MiB globally, and
+    /// 32 MiB per owner. A lower owner limit leaves capacity for other owners.
+    ///
+    /// Accepted response values must fit the single-record payload ceiling
+    /// before they are copied or handed to the application, even on a
+    /// completing retry. Only retained successors reserve occupied aggregate
+    /// capacity: a completing retry releases its record and cannot be blocked
+    /// from doing so merely because other continuations fill the registry.
+    /// Completion, cancellation, expiry and listener shutdown release retained
+    /// capacity; no failure or partial retry resets the original lifetime or
+    /// cumulative round/input budgets. Completed values owned by an application
+    /// are outside registry accounting. This policy grants no authorization.
+    pub fn with_retention_capacity(
+        mut self,
+        max_states_per_owner: usize,
+        max_payload_bytes: usize,
+        max_payload_bytes_per_owner: usize,
+    ) -> McpResult<Self> {
+        self.set_retention_capacity(
+            max_states_per_owner,
+            max_payload_bytes,
+            max_payload_bytes_per_owner,
+        )?;
+        Ok(self)
+    }
+
+    pub(crate) fn set_retention_capacity(
+        &mut self,
+        max_states_per_owner: usize,
+        max_payload_bytes: usize,
+        max_payload_bytes_per_owner: usize,
+    ) -> McpResult<()> {
+        if max_states_per_owner == 0
+            || max_states_per_owner > self.max_states
+            || max_payload_bytes == 0
+            || max_payload_bytes > Self::HARD_MAX_PAYLOAD_BYTES
+            || max_payload_bytes_per_owner == 0
+            || max_payload_bytes_per_owner > max_payload_bytes
+        {
+            return Err(McpError::invalid_params(INVALID_MRTR_LIMIT_ERROR));
+        }
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.has_issued {
+            return Err(McpError::invalid_params(
+                "MRTR retention capacity requires an unused exchange registry",
+            ));
+        }
+        self.max_states_per_owner = max_states_per_owner;
+        self.max_payload_bytes = max_payload_bytes;
+        self.max_payload_bytes_per_owner = max_payload_bytes_per_owner;
+        Ok(())
+    }
+
+    fn payload_limit(&self) -> usize {
+        self.max_payload_bytes.min(self.max_payload_bytes_per_owner)
+    }
+
+    fn admit_retention(
+        &self,
+        state: &MrtrExchangeState,
+        owner: Option<[u8; 32]>,
+        payload_bytes: usize,
+        replaced: Option<&MrtrExchange>,
+    ) -> McpResult<()> {
+        debug_assert!(replaced.is_none_or(|exchange| exchange.quota_owner() == owner));
+        let replaced_count = usize::from(replaced.is_some());
+        let replaced_bytes = replaced.map_or(0, |exchange| exchange.retained_payload_bytes);
+        let owner_states = state.owners.get(&owner).map_or(0, |usage| usage.states);
+        let owner_bytes = state
+            .owners
+            .get(&owner)
+            .map_or(0, |usage| usage.payload_bytes);
+        if state.exchanges.len() - replaced_count >= self.max_states
+            || owner_states - replaced_count >= self.max_states_per_owner
+        {
+            return Err(McpError::internal_error(MRTR_ROUND_LIMIT_ERROR));
+        }
+        if (state.retained_payload_bytes - replaced_bytes)
+            .checked_add(payload_bytes)
+            .is_none_or(|bytes| bytes > self.max_payload_bytes)
+            || (owner_bytes - replaced_bytes)
+                .checked_add(payload_bytes)
+                .is_none_or(|bytes| bytes > self.max_payload_bytes_per_owner)
+        {
+            return Err(McpError::invalid_params(MRTR_RETENTION_LIMIT_ERROR));
+        }
+        Ok(())
     }
 
     /// Issues an `input_required` result bound to the owning request.
@@ -2158,10 +2461,22 @@ impl MrtrExchangeRegistry {
         binding: &MrtrExchangeBinding,
         input_responses: &FinalInputResponses,
     ) -> McpResult<MrtrRetry> {
+        // Preserve the raw map's structural count before selecting its known
+        // keys. Unknown responses are inert and must not consume retained
+        // quota or be cloned by this order-preserving protocol adapter.
+        let expected =
+            self.expected_input_ledger(request_state, Some(binding), input_responses.len())?;
+        let mut counter = MrtrPayloadByteCounter {
+            bytes: 0,
+            limit: self.payload_limit(),
+        };
         let entries = input_responses
             .entries()
             .iter()
+            .filter(|(key, _)| expected.get(key).is_some())
             .map(|(key, response)| {
+                counter.charge(key)?;
+                counter.charge(response)?;
                 serde_json::to_value(response)
                     .map(|value| (key.clone(), value))
                     .map_err(|_| {
@@ -2171,10 +2486,10 @@ impl MrtrExchangeRegistry {
                     })
             })
             .collect::<McpResult<Vec<_>>>()?;
-        self.accept_wire_entries_with_binding(
+        self.accept_expected_wire_entries(
             request_state,
             Some(binding),
-            entries.len(),
+            &expected,
             entries.iter().map(|(key, value)| (key, value)),
         )
     }
@@ -2230,6 +2545,16 @@ impl MrtrExchangeRegistry {
     where
         I: IntoIterator<Item = (&'a String, &'a serde_json::Value)>,
     {
+        let expected = self.expected_input_ledger(request_state, binding, input_responses_len)?;
+        self.accept_expected_wire_entries(request_state, binding, &expected, input_responses)
+    }
+
+    fn expected_input_ledger(
+        &self,
+        request_state: &str,
+        binding: Option<&MrtrExchangeBinding>,
+        input_responses_len: usize,
+    ) -> McpResult<ExpectedInputLedger> {
         if binding.is_some_and(|binding| binding.is_stateless && binding.principal_digest.is_none())
         {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
@@ -2247,28 +2572,55 @@ impl MrtrExchangeRegistry {
             let exchange = state
                 .exchanges
                 .get(request_state)
-                .cloned()
                 .ok_or_else(|| McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))?;
             if exchange.binding.as_ref() != binding {
                 return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
             }
             if now >= exchange.expires_at || exchange.owner_cancellation.is_cancel_requested() {
-                state.exchanges.remove(request_state);
-                return if exchange.owner_cancellation.is_cancel_requested() {
+                let cancelled = exchange.owner_cancellation.is_cancel_requested();
+                state.remove(request_state);
+                return if cancelled {
                     Err(McpError::request_cancelled())
                 } else {
                     Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
                 };
             }
+            let expected = exchange.expected.clone();
+            let owner_cancellation = exchange.owner_cancellation.clone();
             Self::purge_stale(&mut state, now);
-            exchange.expected
+            if owner_cancellation.is_cancel_requested() {
+                state.remove(request_state);
+                return Err(McpError::request_cancelled());
+            }
+            expected
         };
+        Ok(expected)
+    }
 
+    fn accept_expected_wire_entries<'a, I>(
+        &self,
+        request_state: &str,
+        binding: Option<&MrtrExchangeBinding>,
+        expected: &ExpectedInputLedger,
+        input_responses: I,
+    ) -> McpResult<MrtrRetry>
+    where
+        I: IntoIterator<Item = (&'a String, &'a serde_json::Value)>,
+    {
         let mut typed_responses = MrtrInputResponses::default();
+        let mut counter = MrtrPayloadByteCounter {
+            bytes: 0,
+            limit: self.payload_limit(),
+        };
         for (key, value) in input_responses {
             let Some(kind) = expected.get(key) else {
                 continue;
             };
+            // Bound the incoming recognized values before typed decoding
+            // clones them. The complete prospective retained state is admitted
+            // again atomically with the token replacement in accept_at.
+            counter.charge(key)?;
+            counter.charge(value)?;
             typed_responses.insert(
                 key.clone(),
                 MrtrInputResponse::from_wire(kind, value.clone())?,
@@ -2300,6 +2652,15 @@ impl MrtrExchangeRegistry {
         state.exchanges.len()
     }
 
+    /// Returns charged payload bytes for live process-local continuations.
+    /// Expired and cancelled records are reclaimed before this observation.
+    #[must_use]
+    pub fn retained_payload_bytes(&self) -> usize {
+        let mut state = self.lock_state();
+        Self::purge_stale(&mut state, Instant::now());
+        state.retained_payload_bytes
+    }
+
     /// Permanently closes stateless issuance for this registry and removes
     /// every already-issued stateless exchange.
     ///
@@ -2310,7 +2671,7 @@ impl MrtrExchangeRegistry {
         let mut state = self.lock_state();
         state.stateless_closed = true;
         let active_before = state.exchanges.len();
-        state.exchanges.retain(|_, exchange| {
+        state.retain(|exchange| {
             !exchange
                 .binding
                 .as_ref()
@@ -2393,14 +2754,26 @@ impl MrtrExchangeRegistry {
         {
             return Err(McpError::request_cancelled());
         }
-        if state.exchanges.len() >= self.max_states {
-            return Err(McpError::internal_error(MRTR_ROUND_LIMIT_ERROR));
-        }
+        let quota_owner = binding.as_ref().and_then(|binding| binding.retention_owner);
+        self.admit_retention(&state, quota_owner, 0, None)?;
 
         let request_state = Self::allocate_request_state(&state)?;
+        let responses = MrtrInputResponses::default();
+        let retained_payload_bytes = MrtrRetainedPayload {
+            binding: binding.as_ref(),
+            requests: &input_requests,
+            responses: &responses,
+            appended: None,
+            handler_request_state: handler_request_state.as_deref(),
+        }
+        .bytes(&request_state.0, self.payload_limit())?;
+        self.admit_retention(&state, quota_owner, retained_payload_bytes, None)?;
+        if owner_cancellation.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
         let expected = ExpectedInputLedger::from_requests(&input_requests);
         let input_requests = (!input_requests.is_empty()).then_some(input_requests);
-        state.exchanges.insert(
+        state.insert(
             request_state.0.clone(),
             MrtrExchange {
                 owner_cancellation,
@@ -2409,9 +2782,10 @@ impl MrtrExchangeRegistry {
                 total_input_requests,
                 expected,
                 requests: input_requests.clone().unwrap_or_default(),
-                responses: MrtrInputResponses::default(),
+                responses,
                 binding,
                 handler_request_state: handler_request_state.map(MrtrRequestState),
+                retained_payload_bytes,
             },
         );
         Ok(MrtrInputRequired {
@@ -2440,15 +2814,16 @@ impl MrtrExchangeRegistry {
         }
 
         let mut state = self.lock_state();
-        let Some(exchange) = state.exchanges.get(request_state).cloned() else {
+        let Some(exchange) = state.exchanges.get(request_state) else {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         };
         if exchange.binding.as_ref() != binding {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         }
         if now >= exchange.expires_at || exchange.owner_cancellation.is_cancel_requested() {
-            state.exchanges.remove(request_state);
-            return if exchange.owner_cancellation.is_cancel_requested() {
+            let cancelled = exchange.owner_cancellation.is_cancel_requested();
+            state.remove(request_state);
+            return if cancelled {
                 Err(McpError::request_cancelled())
             } else {
                 Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
@@ -2457,8 +2832,17 @@ impl MrtrExchangeRegistry {
         if state_only_retry && (!exchange.expected.is_empty() || !exchange.requests.is_empty()) {
             return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
         }
+        let owner_cancellation = exchange.owner_cancellation.clone();
+        Self::purge_stale(&mut state, now);
+        if owner_cancellation.is_cancel_requested() {
+            state.remove(request_state);
+            return Err(McpError::request_cancelled());
+        }
+        let exchange = state
+            .exchanges
+            .get(request_state)
+            .ok_or_else(|| McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))?;
 
-        let mut accepted_responses = exchange.responses.clone();
         let mut made_progress = false;
         for (key, response) in input_responses.iter() {
             if let Some(expected_kind) = exchange.expected.get(key) {
@@ -2470,14 +2854,14 @@ impl MrtrExchangeRegistry {
                     .get(key)
                     .ok_or_else(|| McpError::internal_error(MRTR_REQUEST_STATE_ERROR))?;
                 request.validate_response(response)?;
-                if accepted_responses.append_accepted_if_absent(key, response) {
+                if exchange.responses.get(key).is_none() {
                     made_progress = true;
                 }
             }
         }
 
         if exchange.owner_cancellation.is_cancel_requested() {
-            state.exchanges.remove(request_state);
+            state.remove(request_state);
             return Err(McpError::request_cancelled());
         }
 
@@ -2489,11 +2873,82 @@ impl MrtrExchangeRegistry {
             return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
         }
 
-        let missing_requests = exchange.requests.unresolved_after(&accepted_responses);
-        if missing_requests.is_empty() {
-            state.exchanges.remove(request_state);
+        let payload = MrtrRetainedPayload {
+            binding: exchange.binding.as_ref(),
+            requests: &exchange.requests,
+            responses: &exchange.responses,
+            appended: Some(&input_responses),
+            handler_request_state: exchange
+                .handler_request_state
+                .as_ref()
+                .map(|value| value.0.as_str()),
+        };
+        let missing_count = exchange
+            .requests
+            .iter()
+            .filter(|(key, _)| payload.unresolved(key))
+            .count();
+        let (next_round, next_total, next_state) = if missing_count == 0 {
+            (exchange.round, exchange.total_input_requests, None)
+        } else {
+            let next_round = exchange
+                .round
+                .checked_add(1)
+                .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
+            let next_total = exchange
+                .total_input_requests
+                .checked_add(missing_count)
+                .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
+            if next_round > self.max_rounds
+                || missing_count > self.max_inputs_per_round
+                || next_total > self.max_total_input_requests
+            {
+                state.remove(request_state);
+                return Err(McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR));
+            }
+            // A failure to generate a successor must leave the old state live.
+            (
+                next_round,
+                next_total,
+                Some(Self::allocate_request_state(&state)?),
+            )
+        };
+        let retained_payload_bytes = payload.bytes(
+            next_state
+                .as_ref()
+                .map_or(request_state, |token| token.0.as_str()),
+            self.payload_limit(),
+        )?;
+        // Completion transfers bounded values to the application and retains
+        // no successor. Reserving occupied bytes here would let saturated
+        // siblings prevent each other from completing and freeing capacity.
+        if next_state.is_some() {
+            self.admit_retention(
+                &state,
+                exchange.quota_owner(),
+                retained_payload_bytes,
+                Some(exchange),
+            )?;
+        }
+        if owner_cancellation.is_cancel_requested() {
+            state.remove(request_state);
+            return Err(McpError::request_cancelled());
+        }
+
+        // All shape, lifetime, quota and successor checks have passed under
+        // the same lock. Move accepted payloads now, without cloning either
+        // the previous exchange or the caller's response values.
+        let mut exchange = state
+            .remove(request_state)
+            .ok_or_else(|| McpError::internal_error(MRTR_REQUEST_STATE_ERROR))?;
+        for (key, response) in input_responses.entries {
+            if exchange.expected.get(&key).is_some() {
+                exchange.responses.append_accepted_if_absent(key, response);
+            }
+        }
+        let Some(next_state) = next_state else {
             return Ok(MrtrRetry::Complete(MrtrCompletedInputs {
-                responses: accepted_responses,
+                responses: exchange.responses,
                 handler_request_state: exchange.handler_request_state,
                 continuation: MrtrContinuationBudget {
                     owner_cancellation: exchange.owner_cancellation,
@@ -2503,41 +2958,18 @@ impl MrtrExchangeRegistry {
                     binding: exchange.binding,
                 },
             }));
-        }
-
-        let next_round = exchange
-            .round
-            .checked_add(1)
-            .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
-        let next_total = exchange
-            .total_input_requests
-            .checked_add(missing_requests.len())
-            .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
-        if next_round > self.max_rounds
-            || missing_requests.len() > self.max_inputs_per_round
-            || next_total > self.max_total_input_requests
-        {
-            state.exchanges.remove(request_state);
-            return Err(McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR));
-        }
-
-        // Generate the successor before consuming the current state. An RNG
-        // failure therefore leaves the original exchange intact and does not
-        // create a state/ledger gap.
-        let next_state = Self::allocate_request_state(&state)?;
-        let successor = MrtrExchange {
-            owner_cancellation: exchange.owner_cancellation,
-            expires_at: exchange.expires_at,
-            round: next_round,
-            total_input_requests: next_total,
-            expected: ExpectedInputLedger::from_requests(&missing_requests),
-            requests: missing_requests.clone(),
-            responses: accepted_responses,
-            binding: exchange.binding,
-            handler_request_state: exchange.handler_request_state,
         };
-        state.exchanges.remove(request_state);
-        state.exchanges.insert(next_state.0.clone(), successor);
+        let responses = &exchange.responses;
+        exchange
+            .requests
+            .entries
+            .retain(|key, _| responses.get(key).is_none());
+        exchange.expected = ExpectedInputLedger::from_requests(&exchange.requests);
+        exchange.round = next_round;
+        exchange.total_input_requests = next_total;
+        exchange.retained_payload_bytes = retained_payload_bytes;
+        let missing_requests = exchange.requests.clone();
+        state.insert(next_state.0.clone(), exchange);
 
         Ok(MrtrRetry::InputRequired(MrtrInputRequired {
             input_requests: Some(missing_requests),
@@ -2553,7 +2985,7 @@ impl MrtrExchangeRegistry {
     }
 
     fn purge_stale(state: &mut MrtrExchangeState, now: Instant) {
-        state.exchanges.retain(|_, exchange| {
+        state.retain(|exchange| {
             now < exchange.expires_at && !exchange.owner_cancellation.is_cancel_requested()
         });
     }
@@ -2580,6 +3012,9 @@ impl std::fmt::Debug for MrtrExchangeRegistry {
             .debug_struct("MrtrExchangeRegistry")
             .field("active_len", &self.active_len())
             .field("max_states", &self.max_states)
+            .field("max_states_per_owner", &self.max_states_per_owner)
+            .field("max_payload_bytes", &self.max_payload_bytes)
+            .field("max_payload_bytes_per_owner", &self.max_payload_bytes_per_owner)
             .field("max_rounds", &self.max_rounds)
             .field("max_inputs_per_round", &self.max_inputs_per_round)
             .field("max_total_input_requests", &self.max_total_input_requests)
@@ -2815,6 +3250,861 @@ mod tests {
             roots: Vec::new(),
         })
         .expect("roots response must serialize")
+    }
+
+    fn mrtr_retention_binding(owner: u8) -> MrtrExchangeBinding {
+        MrtrExchangeBinding::stateless(
+            "tools/call",
+            "retained-tool".to_owned(),
+            [3; 32],
+            [4; 32],
+            Some([owner; 32]),
+            [5; 32],
+        )
+    }
+
+    fn mrtr_retention_requests(keys: &[&str]) -> MrtrInputRequests {
+        MrtrInputRequests::new(
+            keys.iter()
+                .map(|key| ((*key).to_owned(), MrtrInputRequest::roots())),
+        )
+        .unwrap()
+    }
+
+    fn mrtr_retention_response(name_bytes: usize) -> MrtrInputResponse {
+        MrtrInputResponse::from_wire(
+            MrtrInputKind::Roots,
+            serde_json::json!({
+                "roots": [{"uri": "file:///retained", "name": "x".repeat(name_bytes)}],
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mrtr_retention_limits_are_bounded_and_immutable_after_first_issue() {
+        for (states, global, owner) in [
+            (0, 4_096, 2_048),
+            (DEFAULT_MAX_MRTR_REQUEST_STATES + 1, 4_096, 2_048),
+            (1, 0, 1),
+            (1, MrtrExchangeRegistry::HARD_MAX_PAYLOAD_BYTES + 1, 1),
+            (1, 4_096, 0),
+            (1, 4_096, 4_097),
+        ] {
+            assert_eq!(
+                MrtrExchangeRegistry::new()
+                    .with_retention_capacity(states, global, owner)
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidParams
+            );
+        }
+        let mut registry = MrtrExchangeRegistry::new()
+            .with_retention_capacity(1, 4_096, 4_096)
+            .unwrap();
+        let issued = registry
+            .issue(
+                McpRequestCancellation::new(),
+                mrtr_retention_requests(&["roots"]),
+            )
+            .unwrap();
+        assert!(registry.set_retention_capacity(2, 8_192, 4_096).is_err());
+        assert!(matches!(
+            registry.accept(
+                &mrtr_state_from_wire(&issued),
+                MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())]).unwrap()
+            ),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        assert_eq!(registry.retained_payload_bytes(), 0);
+        assert!(
+            registry.set_retention_capacity(2, 8_192, 4_096).is_err(),
+            "completing every exchange does not reopen immutable configuration"
+        );
+        assert_eq!(registry.max_states_per_owner, 1);
+    }
+
+    #[test]
+    fn mrtr_retention_owner_count_isolation_and_global_admission() {
+        let registry = MrtrExchangeRegistry::with_limits(3, 8, 4, 16, Duration::from_secs(60))
+            .unwrap()
+            .with_retention_capacity(1, 64 * 1_024, 32 * 1_024)
+            .unwrap();
+        let binding = mrtr_retention_binding(1);
+        let first = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                binding.clone(),
+                mrtr_retention_requests(&["roots"]),
+                None,
+            )
+            .unwrap();
+        let first_bytes = registry.retained_payload_bytes();
+        let mut another_session = binding.clone();
+        another_session.session_partition = [9; 32];
+        another_session.target = "another-tool".to_owned();
+        another_session.verified_grants_digest = [8; 32];
+        assert!(
+            registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    another_session,
+                    mrtr_retention_requests(&["roots"]),
+                    None
+                )
+                .is_err(),
+            "new connection, target and grants cannot evade an owner's count"
+        );
+        assert_eq!(registry.retained_payload_bytes(), first_bytes);
+        let mut issued = vec![(binding, mrtr_state_from_wire(&first))];
+        for owner in [2, 3] {
+            let binding = mrtr_retention_binding(owner);
+            let next = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    mrtr_retention_requests(&["roots"]),
+                    None,
+                )
+                .unwrap();
+            issued.push((binding, mrtr_state_from_wire(&next)));
+        }
+        assert_eq!(registry.active_len(), 3);
+        let before = registry.retained_payload_bytes();
+        assert!(
+            registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    mrtr_retention_binding(4),
+                    mrtr_retention_requests(&["roots"]),
+                    None
+                )
+                .is_err()
+        );
+        assert_eq!(registry.retained_payload_bytes(), before);
+        for (binding, token) in issued {
+            assert!(
+                matches!(
+                    registry.accept_wire_bound(
+                        &token,
+                        &binding,
+                        &BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": []}))])
+                    ),
+                    Ok(MrtrRetry::Complete(_))
+                ),
+                "every admitted owner remains usable"
+            );
+        }
+        assert_eq!(registry.retained_payload_bytes(), 0);
+        assert!(registry.lock_state().owners.is_empty());
+    }
+
+    #[test]
+    fn mrtr_retention_unverified_identities_share_one_partition() {
+        let registry = MrtrExchangeRegistry::new()
+            .with_retention_capacity(1, 64 * 1_024, 32 * 1_024)
+            .unwrap();
+        let first = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(1).with_retention_owner(None),
+                mrtr_retention_requests(&["roots"]),
+                None,
+            )
+            .unwrap();
+        for principal in [2, 3] {
+            let binding = mrtr_retention_binding(principal).with_retention_owner(None);
+            assert!(
+                registry
+                    .issue_bound(
+                        McpRequestCancellation::new(),
+                        binding,
+                        mrtr_retention_requests(&["roots"]),
+                        None
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            registry
+                .issue(
+                    McpRequestCancellation::new(),
+                    mrtr_retention_requests(&["roots"])
+                )
+                .is_err(),
+            "unbound embeddings share the same anonymous bucket"
+        );
+        registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(2),
+                mrtr_retention_requests(&["roots"]),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.accept_wire_bound(
+                &mrtr_state_from_wire(&first),
+                &mrtr_retention_binding(1).with_retention_owner(None),
+                &BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": []}))])
+            ),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        registry
+            .issue(
+                McpRequestCancellation::new(),
+                mrtr_retention_requests(&["roots"]),
+            )
+            .expect("completion releases the shared anonymous quota");
+    }
+
+    #[test]
+    fn mrtr_retention_payload_charges_schema_keys_binding_and_private_state() {
+        let parts = |changed: &str| {
+            let mut params = serde_json::to_value(final_form_elicitation_params()).unwrap();
+            params["requestedSchema"]["properties"]["displayName"]["description"] =
+                serde_json::json!(if changed == "schema" { "ab" } else { "a" });
+            if changed == "descriptor" {
+                params["message"] = serde_json::json!("Choose a display name!");
+            }
+            let request =
+                MrtrInputRequest::final_elicitation(serde_json::from_value(params).unwrap())
+                    .unwrap();
+            let key = if changed == "key" { "formx" } else { "form" };
+            let mut binding = mrtr_retention_binding(1);
+            if changed == "binding" {
+                binding.target.push('x');
+            }
+            let handler_state = if changed == "handler" {
+                "private-x"
+            } else {
+                "private-"
+            };
+            (
+                binding,
+                MrtrInputRequests::new([(key.to_owned(), request)]).unwrap(),
+                Some(handler_state.to_owned()),
+            )
+        };
+        let baseline = MrtrExchangeRegistry::new();
+        let (binding, requests, handler_state) = parts("");
+        baseline
+            .issue_bound(
+                McpRequestCancellation::new(),
+                binding,
+                requests,
+                handler_state,
+            )
+            .unwrap();
+        let exact = baseline.retained_payload_bytes();
+        for changed in ["schema", "descriptor", "key", "binding", "handler"] {
+            let registry = MrtrExchangeRegistry::new()
+                .with_retention_capacity(1, exact, exact)
+                .unwrap();
+            let (binding, requests, handler_state) = parts(changed);
+            let error = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    binding,
+                    requests,
+                    handler_state,
+                )
+                .unwrap_err();
+            assert_eq!(error.message, MRTR_RETENTION_LIMIT_ERROR, "{changed}");
+            assert_eq!(registry.active_len(), 0);
+            assert_eq!(registry.retained_payload_bytes(), 0);
+            assert!(registry.lock_state().owners.is_empty());
+            let (binding, requests, handler_state) = parts("");
+            registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    binding,
+                    requests,
+                    handler_state,
+                )
+                .expect("the exact boundary still admits after oversized issuance was refused");
+            assert_eq!(registry.retained_payload_bytes(), exact);
+        }
+    }
+
+    #[test]
+    fn mrtr_retention_partial_growth_is_atomic_and_preserves_accumulated_inputs() {
+        let binding = mrtr_retention_binding(1);
+        let issue = |registry: &MrtrExchangeRegistry| {
+            registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    mrtr_retention_requests(&["first", "second", "third"]),
+                    Some("private-upstream-state".to_owned()),
+                )
+                .unwrap()
+        };
+        let accept = |registry: &MrtrExchangeRegistry, token: &str, key: &str, size: usize| {
+            registry.accept_wire_bound(
+                token,
+                &binding,
+                &BTreeMap::from([(
+                    key.to_owned(),
+                    serde_json::to_value(mrtr_retention_response(size)).unwrap(),
+                )]),
+            )
+        };
+        let measurement = MrtrExchangeRegistry::new();
+        let initial = issue(&measurement);
+        let MrtrRetry::InputRequired(first) =
+            accept(&measurement, &mrtr_state_from_wire(&initial), "first", 256).unwrap()
+        else {
+            panic!("partial");
+        };
+        let first_size = measurement.retained_payload_bytes();
+        let MrtrRetry::InputRequired(_) =
+            accept(&measurement, &mrtr_state_from_wire(&first), "second", 256).unwrap()
+        else {
+            panic!("partial");
+        };
+        let exact = measurement.retained_payload_bytes();
+        assert!(
+            exact > first_size,
+            "the second accepted payload remains charged"
+        );
+
+        let registry = MrtrExchangeRegistry::with_limits(2, 8, 4, 16, Duration::from_secs(60))
+            .unwrap()
+            .with_retention_capacity(1, exact * 2, exact)
+            .unwrap();
+        let initial = issue(&registry);
+        let MrtrRetry::InputRequired(first) =
+            accept(&registry, &mrtr_state_from_wire(&initial), "first", 256).unwrap()
+        else {
+            panic!("partial");
+        };
+        let token = mrtr_state_from_wire(&first);
+        let before = registry.lock_state().exchanges.get(&token).unwrap().clone();
+        let other = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(2),
+                mrtr_retention_requests(&["roots"]),
+                None,
+            )
+            .unwrap();
+        let before_total = registry.retained_payload_bytes();
+        let error = accept(&registry, &token, "second", 257).unwrap_err();
+        assert_eq!(error.message, MRTR_RETENTION_LIMIT_ERROR);
+        assert_eq!(registry.retained_payload_bytes(), before_total);
+        {
+            let locked = registry.lock_state();
+            let retained = locked
+                .exchanges
+                .get(&token)
+                .expect("old token remains live");
+            assert_eq!(format!("{retained:?}"), format!("{before:?}"));
+            assert_eq!(
+                retained.handler_request_state.as_ref().unwrap().0,
+                "private-upstream-state"
+            );
+            assert_eq!(retained.retained_payload_bytes, first_size);
+        }
+        let MrtrRetry::InputRequired(second) = accept(&registry, &token, "second", 256)
+            .expect("corrected one-byte-smaller retry fits the exact owner ceiling")
+        else {
+            panic!("third input remains");
+        };
+        assert_eq!(
+            registry.active_len(),
+            2,
+            "replacement works at both count ceilings"
+        );
+        assert!(
+            accept(&registry, &token, "second", 256).is_err(),
+            "old token is now consumed"
+        );
+        let next_token = mrtr_state_from_wire(&second);
+        {
+            let locked = registry.lock_state();
+            let retained = locked.exchanges.get(&next_token).unwrap();
+            assert_eq!(retained.retained_payload_bytes, exact);
+            assert_eq!(retained.expires_at, before.expires_at);
+            assert_eq!(retained.round, before.round + 1);
+            assert_eq!(
+                retained.total_input_requests,
+                before.total_input_requests + 1
+            );
+        }
+        let MrtrRetry::Complete(complete) = registry
+            .accept_wire_bound(
+                &next_token,
+                &binding,
+                &BTreeMap::from([("third".to_owned(), serde_json::json!({"roots": []}))]),
+            )
+            .unwrap()
+        else {
+            panic!("all responses complete");
+        };
+        for key in ["first", "second"] {
+            assert_eq!(
+                complete.roots(key).unwrap().unwrap().roots[0]
+                    .name
+                    .as_ref()
+                    .unwrap()
+                    .len(),
+                256
+            );
+        }
+        assert_eq!(complete.responses().len(), 3);
+        assert_eq!(
+            complete.handler_request_state(),
+            Some("private-upstream-state")
+        );
+        assert!(matches!(
+            registry.accept_wire_bound(
+                &mrtr_state_from_wire(&other),
+                &mrtr_retention_binding(2),
+                &BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": []})),])
+            ),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        assert_eq!(registry.retained_payload_bytes(), 0);
+        assert!(registry.lock_state().owners.is_empty());
+    }
+
+    #[test]
+    fn mrtr_retention_global_and_owner_bytes_reject_without_evicting_peers() {
+        let probe = MrtrExchangeRegistry::new();
+        probe
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(1),
+                mrtr_retention_requests(&["roots"]),
+                None,
+            )
+            .unwrap();
+        let exact = probe.retained_payload_bytes();
+        let registry = MrtrExchangeRegistry::with_limits(4, 8, 4, 16, Duration::from_secs(60))
+            .unwrap()
+            .with_retention_capacity(4, exact * 2, exact)
+            .unwrap();
+        let mut tokens = Vec::new();
+        for owner in [1, 2] {
+            let required = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    mrtr_retention_binding(owner),
+                    mrtr_retention_requests(&["roots"]),
+                    None,
+                )
+                .unwrap();
+            tokens.push(mrtr_state_from_wire(&required));
+        }
+        assert_eq!(registry.retained_payload_bytes(), exact * 2);
+        for owner in [1, 3] {
+            let error = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    mrtr_retention_binding(owner),
+                    mrtr_retention_requests(&["roots"]),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error.message, MRTR_RETENTION_LIMIT_ERROR);
+            assert_eq!(registry.retained_payload_bytes(), exact * 2);
+        }
+        assert!(matches!(
+            registry.accept_wire_bound(
+                &tokens[1],
+                &mrtr_retention_binding(2),
+                &BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": []}))])
+            ),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        assert_eq!(registry.retained_payload_bytes(), exact);
+        registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(3),
+                mrtr_retention_requests(&["roots"]),
+                None,
+            )
+            .expect("completion releases global bytes");
+        assert!(
+            matches!(
+                registry.accept_wire_bound(
+                    &tokens[0],
+                    &mrtr_retention_binding(1),
+                    &BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": []}))])
+                ),
+                Ok(MrtrRetry::Complete(_))
+            ),
+            "owner saturation never evicts its earlier token"
+        );
+    }
+
+    #[test]
+    fn mrtr_retention_partial_retry_reserves_global_growth_before_consumption() {
+        let probe = MrtrExchangeRegistry::new();
+        let first = probe
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(1),
+                mrtr_retention_requests(&["first", "second"]),
+                None,
+            )
+            .unwrap();
+        let accepted = BTreeMap::from([(
+            "first".to_owned(),
+            serde_json::to_value(mrtr_retention_response(256)).unwrap(),
+        )]);
+        assert!(matches!(
+            probe.accept_wire_bound(
+                &mrtr_state_from_wire(&first),
+                &mrtr_retention_binding(1),
+                &accepted
+            ),
+            Ok(MrtrRetry::InputRequired(_))
+        ));
+        let expanded = probe.retained_payload_bytes();
+        probe
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(2),
+                mrtr_retention_requests(&["roots"]),
+                None,
+            )
+            .unwrap();
+        let global_limit = probe.retained_payload_bytes() - 1;
+        assert!(
+            expanded < global_limit,
+            "the new record fits the owner ceiling alone"
+        );
+
+        let registry = MrtrExchangeRegistry::new()
+            .with_retention_capacity(2, global_limit, global_limit)
+            .unwrap();
+        let first = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(1),
+                mrtr_retention_requests(&["first", "second"]),
+                None,
+            )
+            .unwrap();
+        let token = mrtr_state_from_wire(&first);
+        let second = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(2),
+                mrtr_retention_requests(&["roots"]),
+                None,
+            )
+            .unwrap();
+        let before = registry.retained_payload_bytes();
+        assert_eq!(
+            registry
+                .accept_wire_bound(&token, &mrtr_retention_binding(1), &accepted)
+                .unwrap_err()
+                .message,
+            MRTR_RETENTION_LIMIT_ERROR
+        );
+        assert_eq!(registry.retained_payload_bytes(), before);
+        assert!(
+            registry
+                .lock_state()
+                .exchanges
+                .get(&token)
+                .unwrap()
+                .responses
+                .is_empty()
+        );
+        assert!(matches!(
+            registry.accept_wire_bound(
+                &mrtr_state_from_wire(&second),
+                &mrtr_retention_binding(2),
+                &BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": []})),])
+            ),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        let MrtrRetry::InputRequired(next) = registry
+            .accept_wire_bound(&token, &mrtr_retention_binding(1), &accepted)
+            .expect("peer completion frees the exact growth")
+        else {
+            panic!("second input remains outstanding");
+        };
+        assert_eq!(registry.retained_payload_bytes(), expanded);
+        assert!(matches!(
+            registry.accept_wire_bound(
+                &mrtr_state_from_wire(&next),
+                &mrtr_retention_binding(1),
+                &BTreeMap::from([("second".to_owned(), serde_json::json!({"roots": []})),])
+            ),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        assert_eq!(registry.retained_payload_bytes(), 0);
+    }
+
+    #[test]
+    fn mrtr_retention_ordered_unknown_inputs_remain_inert() {
+        for ordered in [false, true] {
+            let registry = MrtrExchangeRegistry::with_limits(4, 8, 2, 4, Duration::from_secs(60))
+                .unwrap()
+                .with_retention_capacity(2, 4_096, 2_048)
+                .unwrap();
+            let binding = mrtr_retention_binding(1);
+            let required = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    mrtr_retention_requests(&["roots"]),
+                    None,
+                )
+                .unwrap();
+            let token = mrtr_state_from_wire(&required);
+            let before = registry.retained_payload_bytes();
+            let accept = |values: &BTreeMap<String, serde_json::Value>| {
+                if ordered {
+                    let responses: FinalInputResponses =
+                        serde_json::from_value(serde_json::to_value(values).unwrap()).unwrap();
+                    registry.accept_final_input_responses_bound(&token, &binding, &responses)
+                } else {
+                    registry.accept_wire_bound(&token, &binding, values)
+                }
+            };
+            let unknown = BTreeMap::from([(
+                "unknown-".repeat(1_024),
+                serde_json::to_value(mrtr_retention_response(8_192)).unwrap(),
+            )]);
+            let mut too_many = unknown.clone();
+            too_many.insert(
+                "another-unknown".to_owned(),
+                serde_json::json!({"roots": []}),
+            );
+            too_many.insert("roots".to_owned(), serde_json::json!({"roots": []}));
+            assert_eq!(
+                accept(&too_many).unwrap_err().message,
+                MRTR_INPUT_MAP_ERROR,
+                "all raw members still count against structural admission"
+            );
+            assert_eq!(
+                accept(&unknown).unwrap_err().message,
+                MRTR_INPUT_MAP_ERROR,
+                "unknown-only input makes no progress and is not retained quota"
+            );
+            assert_eq!(registry.retained_payload_bytes(), before);
+            assert!(
+                registry
+                    .lock_state()
+                    .exchanges
+                    .get(&token)
+                    .unwrap()
+                    .responses
+                    .is_empty()
+            );
+
+            let mut valid = unknown;
+            valid.insert("roots".to_owned(), serde_json::json!({"roots": []}));
+            let MrtrRetry::Complete(completed) = accept(&valid)
+                .expect("oversized inert keys and values do not charge retained bytes")
+            else {
+                panic!("recognized root response completes");
+            };
+            assert_eq!(
+                completed
+                    .responses()
+                    .iter()
+                    .map(|(key, _)| key)
+                    .collect::<Vec<_>>(),
+                vec!["roots"]
+            );
+            assert_eq!(registry.retained_payload_bytes(), 0);
+            assert!(registry.lock_state().owners.is_empty());
+        }
+    }
+
+    #[test]
+    fn mrtr_retention_completion_at_full_capacity_releases_without_new_reservation() {
+        let probe = MrtrExchangeRegistry::new();
+        probe
+            .issue_bound(
+                McpRequestCancellation::new(),
+                mrtr_retention_binding(1),
+                mrtr_retention_requests(&["roots"]),
+                None,
+            )
+            .unwrap();
+        let record_bytes = probe.retained_payload_bytes();
+        let global_limit = record_bytes * 2;
+        let registry = MrtrExchangeRegistry::with_limits(2, 8, 2, 4, Duration::from_secs(60))
+            .unwrap()
+            .with_retention_capacity(1, global_limit, global_limit)
+            .unwrap();
+        let mut tokens = Vec::new();
+        for owner in [1, 2] {
+            let required = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    mrtr_retention_binding(owner),
+                    mrtr_retention_requests(&["roots"]),
+                    None,
+                )
+                .unwrap();
+            tokens.push(mrtr_state_from_wire(&required));
+        }
+        assert_eq!(registry.retained_payload_bytes(), global_limit);
+        let oversized = BTreeMap::from([(
+            "roots".to_owned(),
+            serde_json::to_value(mrtr_retention_response(global_limit * 2)).unwrap(),
+        )]);
+        assert_eq!(
+            registry
+                .accept_wire_bound(&tokens[0], &mrtr_retention_binding(1), &oversized)
+                .unwrap_err()
+                .message,
+            MRTR_RETENTION_LIMIT_ERROR
+        );
+        assert_eq!(registry.retained_payload_bytes(), global_limit);
+        assert!(
+            registry.lock_state().exchanges.contains_key(&tokens[0]),
+            "completion still requires bounded input and preserves its token on refusal"
+        );
+
+        let bounded = BTreeMap::from([(
+            "roots".to_owned(),
+            serde_json::to_value(mrtr_retention_response(256)).unwrap(),
+        )]);
+        for (index, owner) in [1, 2].into_iter().enumerate() {
+            let MrtrRetry::Complete(completed) = registry
+                .accept_wire_bound(&tokens[index], &mrtr_retention_binding(owner), &bounded)
+                .expect("bounded completion transfers the larger value and frees its record")
+            else {
+                panic!("one response completes");
+            };
+            assert_eq!(
+                completed.roots("roots").unwrap().unwrap().roots[0]
+                    .name
+                    .as_ref()
+                    .unwrap()
+                    .len(),
+                256
+            );
+            assert_eq!(
+                registry.retained_payload_bytes(),
+                record_bytes * (1 - index)
+            );
+        }
+        assert!(registry.lock_state().owners.is_empty());
+    }
+
+    #[test]
+    fn mrtr_retention_terminal_paths_release_all_accounting_once() {
+        for path in [
+            "typed-cancel",
+            "wire-cancel",
+            "typed-expiry",
+            "wire-expiry",
+            "purge",
+            "round-exhaustion",
+            "complete",
+            "shutdown",
+        ] {
+            let registry = MrtrExchangeRegistry::with_limits(1, 1, 2, 2, Duration::from_secs(60))
+                .unwrap()
+                .with_retention_capacity(1, 8_192, 8_192)
+                .unwrap();
+            let binding = mrtr_retention_binding(1);
+            let cancellation = McpRequestCancellation::new();
+            let issued = registry
+                .issue_bound(
+                    cancellation.clone(),
+                    binding.clone(),
+                    mrtr_retention_requests(&["first", "second"]),
+                    None,
+                )
+                .unwrap();
+            let token = mrtr_state_from_wire(&issued);
+            assert!(registry.retained_payload_bytes() > 0);
+            let responses = || {
+                MrtrInputResponses::new([
+                    ("first".to_owned(), mrtr_roots_response()),
+                    ("second".to_owned(), mrtr_roots_response()),
+                ])
+                .unwrap()
+            };
+            if path.contains("cancel") || path == "purge" {
+                assert!(cancellation.cancel());
+            }
+            if path.contains("expiry") {
+                registry
+                    .lock_state()
+                    .exchanges
+                    .get_mut(&token)
+                    .unwrap()
+                    .expires_at = Instant::now() - Duration::from_secs(1);
+            }
+            match path {
+                "typed-cancel" | "typed-expiry" => {
+                    assert!(
+                        registry
+                            .accept_at(&token, Some(&binding), responses(), false, Instant::now())
+                            .is_err()
+                    );
+                }
+                "wire-cancel" | "wire-expiry" => {
+                    assert!(
+                        registry
+                            .accept_wire_bound(
+                                &token,
+                                &binding,
+                                &BTreeMap::from([(
+                                    "first".to_owned(),
+                                    serde_json::json!({"roots": []})
+                                )])
+                            )
+                            .is_err()
+                    );
+                }
+                "purge" => assert_eq!(registry.active_len(), 0),
+                "round-exhaustion" => {
+                    assert_eq!(
+                        registry
+                            .accept_wire_bound(
+                                &token,
+                                &binding,
+                                &BTreeMap::from([(
+                                    "first".to_owned(),
+                                    serde_json::json!({"roots": []})
+                                )])
+                            )
+                            .unwrap_err()
+                            .message,
+                        MRTR_ROUND_LIMIT_ERROR
+                    );
+                }
+                "complete" => assert!(matches!(
+                    registry.accept_at(&token, Some(&binding), responses(), false, Instant::now()),
+                    Ok(MrtrRetry::Complete(_))
+                )),
+                "shutdown" => assert_eq!(registry.close_stateless(), 1),
+                _ => unreachable!(),
+            }
+            {
+                let state = registry.lock_state();
+                assert!(state.exchanges.is_empty(), "{path}");
+                assert!(state.owners.is_empty(), "{path}");
+                assert_eq!(state.retained_payload_bytes, 0, "{path}");
+            }
+            assert_eq!(registry.retained_payload_bytes(), 0);
+            assert_eq!(registry.close_stateless(), 0);
+            let mut stateful_binding = binding;
+            stateful_binding.is_stateless = false;
+            registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    stateful_binding,
+                    mrtr_retention_requests(&["roots"]),
+                    None,
+                )
+                .expect("cleanup releases count and bytes without reopening stateless issuance");
+        }
     }
 
     fn final_form_elicitation_params() -> fastmcp_protocol::FinalEmbeddedElicitationParams {
