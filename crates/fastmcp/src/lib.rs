@@ -3234,13 +3234,15 @@ pub mod modern {
         /// request-owned server notifications on modern stdio and memory transports.
         #[cfg(feature = "extension-authoring")]
         pub mod authoring {
+            #[cfg(feature = "proxy")]
+            pub use fastmcp_server::extensions::authoring::ExtensionHttpUpstream;
+            #[cfg(all(feature = "proxy", unix))]
+            pub use fastmcp_server::extensions::authoring::ExtensionStdioUpstream;
             pub use fastmcp_server::extensions::authoring::{
                 ExtensionBuilder, ExtensionContext, ExtensionDescriptor, ExtensionHandler,
                 ExtensionNotification, ExtensionNotificationContext, ExtensionNotificationHandler,
                 ExtensionRegistration, ExtensionRequestNotification,
             };
-            #[cfg(feature = "proxy")]
-            pub use fastmcp_server::extensions::authoring::ExtensionHttpUpstream;
         }
 
         pub use fastmcp_protocol::extensions::{

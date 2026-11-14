@@ -456,17 +456,34 @@ async fn notification_http_exchange(
         "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nAccept-Encoding: identity\r\nConnection: close\r\n{authorization}Content-Length: {}\r\n\r\n",
         body.len()
     );
-    let mut socket = asupersync::net::TcpStream::connect(address).await?;
-    socket.write_all(headers.as_bytes()).await?;
-    socket.write_all(&body).await?;
-    socket.flush().await?;
+    let socket = asupersync::net::TcpStream::connect(address).await?;
+    struct ResetOnIncompleteDrop {
+        socket: asupersync::net::TcpStream,
+        completed: bool,
+    }
+    impl Drop for ResetOnIncompleteDrop {
+        fn drop(&mut self) {
+            if !self.completed {
+                let _ = self.socket.set_zero_linger();
+            }
+        }
+    }
+    let mut guard = ResetOnIncompleteDrop {
+        socket,
+        completed: false,
+    };
+    guard.socket.write_all(headers.as_bytes()).await?;
+    guard.socket.write_all(&body).await?;
+    guard.socket.flush().await?;
     let mut response = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {
-        let count = socket.read(&mut buffer).await?;
+        let count = guard.socket.read(&mut buffer).await?;
         if count == 0 {
+            guard.completed = true;
             return Ok(response);
         }
+        guard.completed = true;
         assert!(response.len() + count <= 64 * 1024, "bounded wire response");
         response.extend_from_slice(&buffer[..count]);
     }

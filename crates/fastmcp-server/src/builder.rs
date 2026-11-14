@@ -6797,8 +6797,8 @@ mod tests {
                 client
                     .with_task_retention_policy(
                         crate::ProxyTaskRetentionPolicy::new(
-                            Duration::from_hours(30 * 24),
-                            Duration::from_hours(30 * 24),
+                            std::time::Duration::from_hours(30 * 24),
+                            std::time::Duration::from_hours(30 * 24),
                         )
                         .unwrap(),
                     )

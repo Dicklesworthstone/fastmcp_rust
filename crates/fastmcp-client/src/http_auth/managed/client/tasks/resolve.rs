@@ -2114,7 +2114,7 @@ mod native_tests {
                 ).unwrap();
                 let mut driver = handle.into_driver(policy);
                 assert_eq!(driver.drive_watching(
-                    &cx, &mut client, &McpRequestCancellation::new(), crate::sse::SseLimits::default(),
+                    &cx, &mut client, &McpRequestCancellation::new(), crate::sse::SseLimits::new(4_096, 65_536, 64).unwrap(),
                 ).await.unwrap(), FinalTaskWaitOutcome::Completed);
                 assert_eq!(calls.load(Ordering::SeqCst), 3);
                 assert!(!driver.input_resolution_interrupted());
@@ -2141,7 +2141,7 @@ mod native_tests {
                     ).unwrap();
                     let mut driver = handle.into_driver(policy);
                     let result = driver.drive_watching(
-                        &cx, &mut client, &McpRequestCancellation::new(), crate::sse::SseLimits::default(),
+                        &cx, &mut client, &McpRequestCancellation::new(), crate::sse::SseLimits::new(4_096, 65_536, 64).unwrap(),
                     ).await;
                     if mode == "empty" {
                         assert_eq!(result.unwrap(), FinalTaskWaitOutcome::Completed);

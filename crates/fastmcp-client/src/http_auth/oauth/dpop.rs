@@ -85,6 +85,7 @@ impl From<DpopClientError> for DpopAuthorizationError {
 }
 
 /// The result of one authorization-code token POST. Neither variant is clonable.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum DpopAuthorizationOutcome {
     /// A resource-bound credential and the sole session owner that can use it.

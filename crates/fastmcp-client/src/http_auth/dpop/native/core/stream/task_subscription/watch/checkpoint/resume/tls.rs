@@ -172,6 +172,9 @@ impl Peer {
     }
     pub(super) fn no_extra(&self, expected: usize) {
         assert_eq!(self.proofs.len(), expected);
+        if let Some(cx) = Cx::current() {
+            cx.set_cancel_requested(false);
+        }
         assert!(self.listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
     }
 }

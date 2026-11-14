@@ -33045,18 +33045,18 @@ expect_request notifications/initialized '' absent
             assert_eq!(
                 request.messages,
                 vec![
-                    SamplingRequestMessage::user("sample"),
-                    SamplingRequestMessage::image(
+                    fastmcp_core::SamplingRequestMessage::user("sample"),
+                    fastmcp_core::SamplingRequestMessage::image(
                         SamplingRole::Assistant,
                         "AAECA/8=",
                         "image/png",
                     ),
-                    SamplingRequestMessage::image(
+                    fastmcp_core::SamplingRequestMessage::image(
                         SamplingRole::User,
                         "aW1hZ2U=",
                         "image/svg+xml;charset=utf-8",
                     ),
-                    SamplingRequestMessage::assistant("prior answer"),
+                    fastmcp_core::SamplingRequestMessage::assistant("prior answer"),
                 ]
             );
             assert_eq!(request.max_tokens, 12);

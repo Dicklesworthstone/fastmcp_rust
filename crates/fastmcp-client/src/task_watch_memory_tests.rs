@@ -969,11 +969,15 @@ mod watch_caller_lifetime {
             _: &McpRequestCancellation,
             _: FinalTaskId,
         ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
-            self.record("read", cx);
-            if let Some(cancellation) = &self.cancel_on_read {
-                cancellation.cancel();
-            }
-            std::future::ready(Ok(serde_json::from_value(task("completed", None, 2)).unwrap()))
+            std::future::poll_fn(move |_| {
+                self.record("read", cx);
+                if let Some(cancellation) = &self.cancel_on_read {
+                    cancellation.cancel();
+                }
+                Poll::Ready(Ok(
+                    serde_json::from_value(task("completed", None, 2)).unwrap()
+                ))
+            })
         }
     }
 
@@ -994,9 +998,11 @@ mod watch_caller_lifetime {
             _: SubscriptionFilter,
             owner: &mut Option<RequestId>,
         ) -> impl std::future::Future<Output = McpResult<()>> {
-            self.record("open", cx);
-            *owner = Some(RequestId::Number(17));
-            std::future::ready(Ok(()))
+            std::future::poll_fn(move |_| {
+                self.record("open", cx);
+                *owner = Some(RequestId::Number(17));
+                Poll::Ready(Ok(()))
+            })
         }
 
         async fn next_watch_event(
@@ -1017,8 +1023,10 @@ mod watch_caller_lifetime {
             _: &Cx,
             _: &mut RequestId,
         ) -> impl std::future::Future<Output = McpResult<()>> {
-            self.observed.lock().unwrap().cancelled += 1;
-            std::future::ready(Ok(()))
+            std::future::poll_fn(move |_| {
+                self.observed.lock().unwrap().cancelled += 1;
+                Poll::Ready(Ok(()))
+            })
         }
 
         fn abandon_watch(&mut self, _: RequestId) {

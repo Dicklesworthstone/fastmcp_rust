@@ -3804,11 +3804,21 @@ fn is_canonical_missing_required_client_capability_error(error: &McpError) -> bo
         && has_canonical_missing_required_client_capability_payload(error.data.as_ref())
 }
 
+fn is_upstream_proxy_task_state_unknown_error(error: &McpError) -> bool {
+    error.code == McpErrorCode::InvalidRequest
+        && error.message == "Proxy upstream Task state is unknown; remote work may still exist"
+        && error
+            .data
+            .as_ref()
+            .is_some_and(|data| *data == serde_json::json!({"reason": "UpstreamStateUnknown"}))
+}
+
 fn mask_peer_error(error: McpError, mask_error_details: bool) -> McpError {
     // Preserve only the fixed, reviewed missing-capability error shape while
     // continuing to mask arbitrary custom extension errors, including
     // lookalikes that reuse its code but alter its message or payload.
     if is_canonical_missing_required_client_capability_error(&error)
+        || is_upstream_proxy_task_state_unknown_error(&error)
         || error.code == McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE)
             && error.message == RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE
             && error.data.is_none()
@@ -5568,7 +5578,7 @@ struct FinalSubscriptionRegistryState {
 #[derive(Clone)]
 struct FinalSubscriptionEntry {
     registry_key: usize,
-    _reservation: Arc<FinalSubscriptionReservation>,
+    reservation: Arc<FinalSubscriptionReservation>,
     subscription_id: RequestId,
     modern_http_owner: Option<u64>,
     accepted_filter: SubscriptionFilter,
@@ -6519,7 +6529,7 @@ impl FinalSubscriptionRegistry {
             key,
             FinalSubscriptionEntry {
                 registry_key: key,
-                _reservation: Arc::clone(&reservation),
+                reservation: Arc::clone(&reservation),
                 subscription_id: subscription_id.clone(),
                 modern_http_owner,
                 accepted_filter,
@@ -6860,7 +6870,7 @@ impl FinalSubscriptionRegistry {
                 params_empty,
                 &entry.subscription_id,
             )
-            .and_then(|bytes| self.reserve_event(&entry._reservation, bytes));
+            .and_then(|bytes| self.reserve_event(&entry.reservation, bytes));
             let Some(reservation) = reservation else {
                 deliveries.push((entry, None));
                 continue;
@@ -6945,7 +6955,7 @@ impl FinalSubscriptionRegistry {
                 false,
                 &entry.subscription_id,
             )
-            .and_then(|bytes| self.reserve_event(&entry._reservation, bytes));
+            .and_then(|bytes| self.reserve_event(&entry.reservation, bytes));
             let Some(reservation) = reservation else {
                 deliveries.push((entry, None));
                 continue;
@@ -18591,12 +18601,20 @@ impl Server {
             && result
                 .as_ref()
                 .is_err_and(is_canonical_missing_required_client_capability_error);
-        let result =
-            if graceful_subscription_completion || graceful_subscription_canonical_substitution {
-                result
-            } else {
-                Self::request_context_error(&request_ctx).map_or(result, Err)
-            };
+        // Once an upstream proxy Task commit is quarantined or loses retention
+        // continuity, interruption during best-effort orphan cleanup does not
+        // make the committed remote state clean cancellation.
+        let upstream_task_state_unknown = result
+            .as_ref()
+            .is_err_and(is_upstream_proxy_task_state_unknown_error);
+        let result = if graceful_subscription_completion
+            || graceful_subscription_canonical_substitution
+            || upstream_task_state_unknown
+        {
+            result
+        } else {
+            Self::request_context_error(&request_ctx).map_or(result, Err)
+        };
         // Elect terminal ownership before final progress, logging, or a
         // response writer can run. A cancellation result, or cancellation
         // already elected by response-body drop, suppresses every trailing
@@ -24709,6 +24727,7 @@ impl Server {
 
     /// Authenticates a native HTTP request before session pin, SSE-body
     /// mutation, or exact-2024 admission can observe it.
+    #[cfg(any(test, feature = "legacy-2024-11-05"))]
     fn preauthenticate_http_request(
         &self,
         cx: &Cx,
@@ -28870,6 +28889,9 @@ mod lib_unit_tests {
                         .unwrap()
                         .instructions("native WebSocket instructions")
                         .auth_provider(ModernHttpAuthProvider)
+                        .tool(Probe {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                        })
                         .build()
                         .bind_websocket(&cx, "127.0.0.1:0")
                         .await

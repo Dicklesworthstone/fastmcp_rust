@@ -136,13 +136,14 @@ different things:
   **more than an adapter profile**, which is worth stating precisely because
   the cheap-sounding estimate is wrong. The HTTPS requirement is not one check
   in the conformance adapter: a census of `crates/fastmcp-client/src`, with
-  `cfg(test)` modules excluded, finds **29 production HTTPS enforcement points
-  across 22 files**: 27 independent `scheme() != "https"` or
+  `cfg(test)` modules excluded, finds **30 production HTTPS enforcement points
+  across 23 files**: 28 independent `scheme() != "https"` or
   `starts_with("https://")` refusals in `http_auth.rs`, `device/wire.rs`,
   `challenge.rs`,
   `private_key_jwt.rs`, `metadata_document.rs`, `dpop.rs`,
   `dpop/native/core/stream/task_subscription/watch/checkpoint.rs`, `driver.rs`,
-  `redirect.rs`, `enterprise/identity.rs`, `enterprise/oidc.rs`,
+  `redirect.rs`, `enterprise/identity.rs`, `enterprise/identity/sector.rs`,
+  `enterprise/oidc.rs`,
   `enterprise/policy.rs`, `http_client.rs`, `managed/client.rs`, `resume.rs`,
   `oauth.rs`, `revocation.rs`, `recovery.rs`, `repair.rs`, `http_executor.rs`
   and `parameter_headers.rs`, plus the two central helpers `validate_https`
@@ -257,13 +258,13 @@ different things:
   `HttpStatus`, `HttpRequest` and `HttpMethod` alone account for 680 mentions
   in `fastmcp-server/src` — so its line count measures something else
   entirely.)* Tracked as `bd-iaqgd`.
-  Across every member `src/` file outside the two
-  module trees, the lowercase path spelling `dpop` occurs exactly **twice**, and
-  both are the `pub mod dpop;` declarations that put the modules in the build
-  (`http_auth.rs:35`, `fastmcp-protocol/src/lib.rs:44`); it occurs **zero**
+  Across every member `src/` file outside the three
+  DPoP module trees, the lowercase path spelling `dpop` occurs **three** times, and
+  all three are the `pub mod dpop;` declarations that put the modules in the build
+  (`http_auth.rs:35`, `http_auth/oauth.rs:45`, `fastmcp-protocol/src/lib.rs:44`); it occurs **zero**
   times in every `crates/**` file outside `src/`, so not even a test target
   drives it. Case is the discriminator — Rust spells the path `dpop` while prose
-  and wire values spell it `DPoP`. Beyond those two declarations, the
+  and wire values spell it `DPoP`. Beyond those three declarations, the
   automatic path still states "No automatic login/retry, DPoP, DCR, DNS
   pinning, or OIDC identity authentication is installed"
   (`http_auth/discovery/challenge.rs`), and the client-credentials path still
@@ -1930,7 +1931,7 @@ Use `with_metadata` for a provider-specific JSON object. Leaving
 retain their presence. The `with_model_hints` shorthand replaces only hints
 and retains any configured priorities.
 
-For direct struct construction, the former `SamplingRequest::model_hints`
+For direct struct construction on `SamplingRequest`, the former `model_hints`
 field is now `model_preferences`; initialize `include_context` and
 `metadata` as well, or use the constructors and builders. The former message
 and response `text` fields are now typed `content`, and responses include an

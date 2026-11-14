@@ -381,7 +381,9 @@ mod tests {
                 "notifications/resources/updated",
                 "notifications/resources/list_changed",
             ] {
-                let (mut client, mut peer) = connected(&cx, builder(), json!({})).await;
+                let capabilities = serde_json::from_value(json!({"roots":{}})).unwrap();
+                let (mut client, mut peer) =
+                    connected(&cx, builder().capabilities(capabilities), json!({})).await;
                 let token = McpRequestCancellation::new();
                 let mut complete = Verb::Resource.completed();
                 complete["ttlMs"] = json!(60_000);
@@ -451,7 +453,9 @@ mod tests {
     fn memory_cache_prompt_get_and_input_required_cache_lookalikes_remain_uncached() {
         run(|cx| async move {
             for verb in [Verb::Resource, Verb::Prompt] {
-                let (mut client, mut peer) = connected(&cx, builder(), json!({})).await;
+                let capabilities = serde_json::from_value(json!({"roots":{}})).unwrap();
+                let (mut client, mut peer) =
+                    connected(&cx, builder().capabilities(capabilities), json!({})).await;
                 let token = McpRequestCancellation::new();
                 for id in 2..=3 {
                     let result = match verb {
@@ -469,8 +473,10 @@ mod tests {
                     let result = verb.call(&cx, &mut client, &token).await.unwrap();
                     assert!(matches!(
                         result,
-                        CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. })
-                            | CoreResult::Final(FinalCoreResult::PromptsGet { .. })
+                        CoreResult::Final(
+                            FinalCoreResult::ResourcesReadInputRequired { .. }
+                                | FinalCoreResult::PromptsGet { .. }
+                        )
                     ));
                     receive(&cx, &mut peer, verb.method(), id).await;
                 }

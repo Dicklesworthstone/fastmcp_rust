@@ -1863,7 +1863,7 @@ fn duplicate_registration_error(component: &'static str, key: &str) -> McpError 
 /// Prefixed `as_proxy_typed` may skip one colliding catalog member under
 /// [`crate::DuplicateBehavior::Error`]. Other admission failures (schema,
 /// metadata, panic-during-definition) must still fail the install.
-#[cfg(any(feature = "proxy", test))]
+#[cfg(test)]
 pub(crate) fn is_duplicate_registration_error(error: &McpError) -> bool {
     error.code == McpErrorCode::InvalidRequest
         && error.message.contains(" already exists; component_key=")
@@ -23402,7 +23402,7 @@ mod router_tests {
         };
         runtime.complete_task(&first_id, completion(9), None)
             .expect_err("mutating handler metadata cannot change an admitted Task schema");
-        assert!(matches!(runtime.get_task(&first_id).unwrap().task, fastmcp_protocol::FinalTask::Working(_)));
+        assert!(matches!(runtime.get_task(&first_id).unwrap().task, fastmcp_protocol::Task::Working(_)));
         runtime.complete_task(&first_id, completion(7), None)
             .expect("the originally admitted output still completes");
 

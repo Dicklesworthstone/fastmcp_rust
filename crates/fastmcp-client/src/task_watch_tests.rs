@@ -136,16 +136,16 @@ mod opening_handoff {
     impl TaskInputTransport for CancellingOpen {
         type Error = McpError;
 
-        async fn read(
+        fn read(
             &mut self,
             _: &Cx,
             _: &McpRequestCancellation,
             _: FinalTaskId,
-        ) -> McpResult<FinalTask> {
+        ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
             self.reads += 1;
-            Err(McpError::internal_error(
+            std::future::ready(Err(McpError::internal_error(
                 "unexpected read after cancelled open",
-            ))
+            )))
         }
 
         fn input_context(&self) -> McpResult<(crate::ReverseRequestHandlers, serde_json::Value)> {
@@ -155,17 +155,17 @@ mod opening_handoff {
             ))
         }
 
-        async fn update(
+        fn update(
             &mut self,
             _: &Cx,
             _: &McpRequestCancellation,
             _: &FinalTask,
             _: FinalTaskInputResponses,
-        ) -> McpResult<FinalUpdateTaskResult> {
+        ) -> impl std::future::Future<Output = McpResult<FinalUpdateTaskResult>> {
             self.updates += 1;
-            Err(McpError::internal_error(
+            std::future::ready(Err(McpError::internal_error(
                 "unexpected update after cancelled open",
-            ))
+            )))
         }
     }
 
@@ -173,32 +173,32 @@ mod opening_handoff {
         type Listener = RequestId;
         type Options = ();
 
-        async fn open_drive_watch(
+        fn open_drive_watch(
             &mut self,
             _: &Cx,
             cancellation: &McpRequestCancellation,
             _: SubscriptionFilter,
             (): (),
             listener: &mut Option<Self::Listener>,
-        ) -> McpResult<()> {
+        ) -> impl std::future::Future<Output = McpResult<()>> {
             self.opens += 1;
             *listener = Some(RequestId::Number(41));
             // Commit the listener, then elect cancellation in the same poll.
             // WaitBudget must suppress success without losing this ownership.
             cancellation.cancel();
-            Ok(())
+            std::future::ready(Ok(()))
         }
 
-        async fn next_drive_event(
+        fn next_drive_event(
             &mut self,
             _: &Cx,
             _: &McpRequestCancellation,
             _: &mut Self::Listener,
-        ) -> McpResult<StdioTaskSubscriptionEvent> {
+        ) -> impl std::future::Future<Output = McpResult<StdioTaskSubscriptionEvent>> {
             self.events += 1;
-            Err(McpError::internal_error(
+            std::future::ready(Err(McpError::internal_error(
                 "unexpected event after cancelled open",
-            ))
+            )))
         }
 
         fn abandon_drive_watch(&mut self, listener: Self::Listener) {

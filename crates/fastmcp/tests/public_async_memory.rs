@@ -919,7 +919,7 @@ mod interactions {
 mod apps_resources {
     use super::*;
     use fastmcp_rust::{
-        AbsoluteUri, ClientInfo, CoreResult, FinalCoreResult, MCP_APPS_HTML_MIME_TYPE,
+        ClientInfo, CoreResult, FinalAbsoluteUri, FinalCoreResult, MCP_APPS_HTML_MIME_TYPE,
         McpAppsClientSettings, McpAppsResourceBinding, McpAppsResourceCsp, McpAppsResourceMetadata,
         McpAppsResourcePermission, McpAppsResourcePermissions, McpRequestCancellation,
     };
@@ -937,7 +937,7 @@ mod apps_resources {
             assert!(cx.blocking_pool_handle().is_none());
             asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
                 let mut resource = modern::McpAppsUiResource::try_new(
-                    AbsoluteUri::parse(URI).unwrap(),
+                    FinalAbsoluteUri::parse(URI).unwrap(),
                     "memory-app",
                     HTML,
                 )
@@ -1001,7 +1001,7 @@ mod apps_resources {
                     panic!("the public Apps read must return typed modern contents");
                 };
                 let binding = McpAppsResourceBinding {
-                    resource_uri: AbsoluteUri::parse(URI).unwrap(),
+                    resource_uri: FinalAbsoluteUri::parse(URI).unwrap(),
                     visibility: Vec::new(),
                 };
                 let admitted: fastmcp_rust::modern::McpAppsResourceRead<'_> =

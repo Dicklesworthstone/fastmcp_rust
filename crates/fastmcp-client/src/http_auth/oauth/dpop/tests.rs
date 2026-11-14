@@ -206,14 +206,16 @@ fn hosted_dpop_code_and_explicit_nonce_retry_reach_a_native_typed_resource() {
                         assert_eq!(form["code"], "issued-code");
                         assert_eq!(form["resource"], resource.as_str());
                         assert_eq!(form["redirect_uri"], REDIRECT);
-                        let browser = browser.borrow();
-                        let browser = browser.as_ref().unwrap();
-                        assert_eq!(browser["dpop_jkt"], jkt);
-                        assert_eq!(browser["code_challenge_method"], "S256");
-                        assert_eq!(
-                            pkce_challenge(&form["code_verifier"]).unwrap(),
-                            browser["code_challenge"]
-                        );
+                        {
+                            let browser = browser.borrow();
+                            let browser = browser.as_ref().unwrap();
+                            assert_eq!(browser["dpop_jkt"], jkt);
+                            assert_eq!(browser["code_challenge_method"], "S256");
+                            assert_eq!(
+                                pkce_challenge(&form["code_verifier"]).unwrap(),
+                                browser["code_challenge"]
+                            );
+                        }
                         first_form = Some(form);
                         respond(
                             &mut socket,
@@ -320,7 +322,7 @@ fn hosted_dpop_code_and_explicit_nonce_retry_reach_a_native_typed_resource() {
             drop(native);
             assert!(clone.is_revoked());
         };
-        pair(server, application).await;
+        Box::pin(pair(server, application)).await;
         assert_eq!(posts.get(), 3);
         assert!(
             listener
@@ -347,14 +349,16 @@ fn loopback_dpop_authorization_uses_the_same_pkce_and_key_binding() {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = acceptor.accept(socket).await.unwrap();
             let (head, form) = read_token_request(&mut socket).await.unwrap();
-            let launched = launched.borrow();
-            let launched = launched.as_ref().unwrap();
-            assert_eq!(launched["dpop_jkt"], jkt);
-            assert_eq!(
-                pkce_challenge(&form["code_verifier"]).unwrap(),
-                launched["code_challenge"]
-            );
-            assert_eq!(form["redirect_uri"], launched["redirect_uri"]);
+            {
+                let launched = launched.borrow();
+                let launched = launched.as_ref().unwrap();
+                assert_eq!(launched["dpop_jkt"], jkt);
+                assert_eq!(
+                    pkce_challenge(&form["code_verifier"]).unwrap(),
+                    launched["code_challenge"]
+                );
+                assert_eq!(form["redirect_uri"], launched["redirect_uri"]);
+            }
             assert_eq!(form["code"], "issued-code");
             assert!(proof(&head).1.get("ath").is_none());
             respond(
@@ -719,6 +723,7 @@ fn nonce_continuation_cannot_reset_deadlines_or_restore_withheld_authority() {
                 DpopAuthorizationError::OAuth(expected),
                 "{stop}"
             );
+            cx.set_cancel_requested(false);
             assert!(
                 listener
                     .poll_accept(&mut Context::from_waker(Waker::noop()))
@@ -1359,7 +1364,7 @@ fn rotating_dpop_refresh_preserves_key_nonce_and_scope_bindings_across_generatio
                 );
             }
         };
-        pair(server, application).await;
+        Box::pin(pair(server, application)).await;
         assert_eq!(posts.get(), 6);
         assert!(
             listener
@@ -1738,6 +1743,7 @@ fn quiet_or_abandoned_dpop_refresh_retires_the_session_and_closes_its_socket() {
                 );
             };
             pair(server, application).await;
+            cx.set_cancel_requested(false);
             assert!(
                 listener
                     .poll_accept(&mut Context::from_waker(Waker::noop()))
@@ -1833,6 +1839,7 @@ fn dpop_refresh_nonce_challenge_is_consuming_and_cannot_start_a_retry_loop() {
             };
             pair(server, application).await;
             assert_eq!(posts.get(), if stop == "second_challenge" { 2 } else { 1 });
+            cx.set_cancel_requested(false);
             assert!(
                 listener
                     .poll_accept(&mut Context::from_waker(Waker::noop()))
@@ -2026,7 +2033,7 @@ fn native_client_renewal_preserves_resource_trust_limits_nonces_and_revocation_h
                         .is_err()
                 );
             };
-            pair(server, application).await;
+            Box::pin(pair(server, application)).await;
             assert_eq!(posts.get(), if nonce_required { 3 } else { 2 });
             assert!(
                 listener
@@ -2125,7 +2132,7 @@ fn native_renewal_cannot_promote_token_roots_or_reset_resource_timeouts() {
                     ));
                 }
             };
-            pair(server, application).await;
+            Box::pin(pair(server, application)).await;
             assert!(
                 listener
                     .poll_accept(&mut Context::from_waker(Waker::noop()))

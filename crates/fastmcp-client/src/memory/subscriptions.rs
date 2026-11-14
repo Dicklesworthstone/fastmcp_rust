@@ -1679,12 +1679,12 @@ mod tests {
             else {
                 panic!("a legal large completed Task must be delivered");
             };
-            let fastmcp_protocol::FinalTask::Completed { result, .. } = &notification.params.task
+            let crate::FinalTask::Completed { result, .. } = &notification.params.task
             else {
                 panic!("the admitted event must retain its completed result");
             };
             assert!(matches!(result.result.content.as_slice(),
-                [fastmcp_protocol::ContentBlock::Text { text, .. }] if text.len() == 6 * 1024 * 1024));
+                [fastmcp_protocol::common_types::ContentBlock::Text { text, .. }] if text.len() == 6 * 1024 * 1024));
             assert_eq!(
                 client
                     .subscriptions

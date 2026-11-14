@@ -457,7 +457,7 @@ struct HttpProxyNotificationPermit {
 impl HttpProxyNotificationPermit {
     fn reserve(pending: &Arc<AtomicUsize>) -> McpResult<Self> {
         pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_PENDING_NOTIFICATIONS).then_some(count + 1)
             })
             .map_err(|_| {

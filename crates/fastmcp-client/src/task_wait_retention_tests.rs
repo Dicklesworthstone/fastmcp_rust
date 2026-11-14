@@ -688,10 +688,12 @@ mod caller_authority {
             _: &McpRequestCancellation,
             _: FinalTaskId,
         ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
-            assert_eq!(cx.capabilities().io, self.io_allowed);
-            assert_eq!(Cx::current().unwrap().capabilities().io, self.io_allowed);
-            self.reads += 1;
-            std::future::ready(Ok(task("completed", None, 1)))
+            std::future::poll_fn(move |_| {
+                assert_eq!(cx.capabilities().io, self.io_allowed);
+                assert_eq!(Cx::current().unwrap().capabilities().io, self.io_allowed);
+                self.reads += 1;
+                Poll::Ready(Ok(task("completed", None, 1)))
+            })
         }
     }
 

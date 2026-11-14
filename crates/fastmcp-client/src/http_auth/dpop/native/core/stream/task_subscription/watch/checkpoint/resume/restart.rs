@@ -497,7 +497,7 @@ impl DpopTaskRestart<'_> {
             Ok(()) => {
                 self.attempted += 1;
                 let outcome = &mut self.pending_outcome;
-                let client = &mut self.client;
+                let client = &mut *self.client;
                 let caller = &self.lifetime.caller;
                 let bounds = self.lifetime.bounds;
                 let cancellation = &self.cancellation;

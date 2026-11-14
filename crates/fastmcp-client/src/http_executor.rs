@@ -1078,6 +1078,7 @@ pub struct ModernHttpResponseStream {
     // Ownership remains exclusive, including on cancellation and stream refusal.
     response: Box<ModernHttpNativeResponse>,
     diagnostic_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
+    response_head_admitted: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for ModernHttpResponseStream {
@@ -1123,6 +1124,7 @@ impl ModernHttpResponseStream {
         Ok(ModernHttpSseResponseStream {
             response: Some(self.response),
             diagnostic_credential: self.diagnostic_credential,
+            response_head_admitted: self.response_head_admitted,
             parser: Some(BoundedSseParser::new(limits)),
             pending_events: VecDeque::new(),
             pending_event_bytes: 0,
@@ -1637,6 +1639,7 @@ impl ModernHttpSubscriptionListener {
 
         match message {
             JsonRpcMessage::Response(response) => {
+                self.stream.mark_terminal_admitted();
                 let admission =
                     decode_strict_jsonrpc_response(event.as_bytes(), self.maximum_jsonrpc_bytes)
                         .map_err(ModernHttpSubscriptionListenError::JsonRpcAdmission)?;
@@ -1776,6 +1779,7 @@ impl ModernHttpSubscriptionListener {
                                 },
                             );
                         }
+                        self.stream.mark_terminal_admitted();
                         self.terminal_received = true;
                         Ok(ModernHttpSubscriptionListenEvent::Cancelled {
                             subscription_id: self.request_id.clone(),
@@ -3101,13 +3105,16 @@ impl ModernHttpExtensionListener {
         match decode_strict_jsonrpc_message(event.as_bytes(), self.maximum_jsonrpc_bytes)
             .map_err(ModernHttpFinalCoreListenError::JsonRpcAdmission)?
         {
-            JsonRpcMessage::Response(_) => decode_final_extension_terminal(
-                event.as_bytes(),
-                self.maximum_jsonrpc_bytes,
-                &self.request_id,
-                &self.admission,
-            )
-            .map(Some),
+            JsonRpcMessage::Response(_) => {
+                self.stream.mark_terminal_admitted();
+                decode_final_extension_terminal(
+                    event.as_bytes(),
+                    self.maximum_jsonrpc_bytes,
+                    &self.request_id,
+                    &self.admission,
+                )
+                .map(Some)
+            }
             JsonRpcMessage::Request(request) => {
                 if final_2026_07_28_method(&request.method).is_none() {
                     // Strict envelope admission above already bounded and
@@ -3262,6 +3269,7 @@ impl ModernHttpFinalCoreListener {
 
         match message {
             JsonRpcMessage::Response(response) => {
+                self.stream.mark_terminal_admitted();
                 let admission = match decode_strict_jsonrpc_response(
                     event.as_bytes(),
                     self.maximum_jsonrpc_bytes,
@@ -3625,6 +3633,7 @@ fn decode_final_core_terminal(
 pub struct ModernHttpSseResponseStream {
     response: Option<Box<ModernHttpNativeResponse>>,
     diagnostic_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
+    response_head_admitted: Arc<AtomicBool>,
     parser: Option<BoundedSseParser>,
     pending_events: VecDeque<String>,
     pending_event_bytes: usize,
@@ -3644,6 +3653,10 @@ impl fmt::Debug for ModernHttpSseResponseStream {
 }
 
 impl ModernHttpSseResponseStream {
+    fn mark_terminal_admitted(&self) {
+        self.response_head_admitted.store(true, Ordering::Release);
+    }
+
     /// Releases the owned response body and parser immediately.
     ///
     /// A request-owned listener uses this for cancellation, terminal delivery,
@@ -3674,6 +3687,7 @@ impl ModernHttpSseResponseStream {
         Self {
             response: None,
             diagnostic_credential: None,
+            response_head_admitted: Arc::new(AtomicBool::new(true)),
             parser: None,
             pending_events: VecDeque::new(),
             pending_event_bytes: 0,
@@ -3821,6 +3835,7 @@ impl ModernHttpSseResponseStream {
                     .take()
                     .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
                 let end_of_stream = parser.finish().map_err(ModernHttpExecutorError::SseParse)?;
+                self.mark_terminal_admitted();
                 self.response = None;
                 self.end_of_stream = Some(end_of_stream);
                 return Ok(None);
@@ -3966,6 +3981,7 @@ impl ModernHttpSseResponseStream {
                 .take()
                 .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
             let end_of_stream = parser.finish().map_err(ModernHttpExecutorError::SseParse)?;
+            self.mark_terminal_admitted();
             self.response = None;
             self.end_of_stream = Some(end_of_stream);
             return Ok(Poll::Ready(None));
@@ -4989,7 +5005,9 @@ impl ModernHttpExecutor {
         }
         check_modern_http_effects(cx)?;
         let metadata = validate_response_head(response.head.status, &response.head.headers)?;
-        response_head_admitted.store(true, Ordering::Release);
+        if metadata.kind != ModernHttpResponseKind::Sse {
+            response_head_admitted.store(true, Ordering::Release);
+        }
         let diagnostic_credential = self.bearer_credential.clone().or_else(|| {
             let token = request.authorization.as_deref()?.strip_prefix("Bearer ")?;
             let target = fastmcp_core::CanonicalHttpUrl::parse(request.target()).ok()?;
@@ -5008,6 +5026,7 @@ impl ModernHttpExecutor {
                 body_withheld: response.body_withheld,
             }),
             diagnostic_credential,
+            response_head_admitted,
         })
     }
 }

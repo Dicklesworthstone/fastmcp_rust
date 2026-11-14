@@ -199,7 +199,7 @@ fn gateway(
 
 struct Reply {
     response: Option<JsonRpcResponse>,
-    frames: Vec<JsonRpcMessage>,
+    frames: Vec<JsonRpcRequest>,
 }
 
 async fn dispatch(
@@ -304,18 +304,24 @@ impl Control {
 const CONTROLS: [Control; 3] = [Control::Update, Control::Cancel, Control::Listen];
 
 fn acknowledged(reply: &Reply) -> usize {
-    reply.frames.iter().filter(|frame| {
-        matches!(frame, JsonRpcMessage::Request(request) if matches!(ServerNotification::decode(request), Ok(ServerNotification::SubscriptionsAcknowledged(_))))
-    }).count()
+    reply
+        .frames
+        .iter()
+        .filter(|request| {
+            matches!(
+                ServerNotification::decode(request),
+                Ok(ServerNotification::SubscriptionsAcknowledged(_))
+            )
+        })
+        .count()
 }
 
 fn task_events(reply: &Reply) -> usize {
     reply
         .frames
         .iter()
-        .filter(|frame| {
-            matches!(frame, JsonRpcMessage::Request(request)
-        if request.method == fastmcp_protocol::tasks_extension::TASK_STATUS_NOTIFICATION)
+        .filter(|request| {
+            request.method == fastmcp_protocol::tasks_extension::TASK_STATUS_NOTIFICATION
         })
         .count()
 }

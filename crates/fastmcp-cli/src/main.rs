@@ -8226,12 +8226,12 @@ impl InspectIdentity {
         }
     }
 
-    fn json_value(&self, budget: &mut InspectJsonBudget) -> McpResult<serde_json::Value> {
+    fn json_value(&self, budget: &mut InspectJsonBudget) -> serde_json::Value {
         match self {
-            Self::Legacy(info) => Ok(serde_json::json!({
+            Self::Legacy(info) => serde_json::json!({
                 "name": bounded_json_string(&info.name, budget),
                 "version": bounded_json_string(&info.version, budget),
-            })),
+            }),
             Self::Final(info) => {
                 let mut fields = final_catalog_fields(
                     &info.name,
@@ -8247,7 +8247,7 @@ impl InspectIdentity {
                     info.website_url.as_ref().map(|uri| uri.as_str()),
                 );
                 fields.extend(info.additional.clone());
-                Ok(bounded_inspect_json_value(&fields.into(), 0, budget))
+                bounded_inspect_json_value(&fields.into(), 0, budget)
             }
         }
     }
@@ -9613,9 +9613,7 @@ fn format_inspect_catalog_json(
     let mut budget = InspectJsonBudget::default();
     // `null` when a modern peer advertised no identity, which the 2026-07-28
     // schema permits. Emitting an invented name would be worse than absent.
-    let server = server_info
-        .map(|info| info.json_value(&mut budget))
-        .transpose()?;
+    let server = server_info.map(|info| info.json_value(&mut budget));
     let tool_values =
         tools.json_values(&mut budget, bounded_tool_value, bounded_final_tool_value)?;
     let resource_values = resources.json_values(
@@ -19131,8 +19129,7 @@ IFS= read -r end
                     assert_eq!(
                         identity
                             .unwrap()
-                            .json_value(&mut InspectJsonBudget::default())
-                            .unwrap(),
+                            .json_value(&mut InspectJsonBudget::default()),
                         serde_json::json!({"name": "simple", "version": "2"})
                     );
                 } else {

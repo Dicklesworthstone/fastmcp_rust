@@ -1151,6 +1151,7 @@ fn encode_form(fields: &[(&str, &str)]) -> Result<String, OAuthError> {
     Ok(output)
 }
 
+#[cfg(test)]
 fn decode_form(query: &str) -> Result<BTreeMap<String, String>, OAuthError> {
     decode_form_fields(query, |_| true)
 }
@@ -3094,9 +3095,10 @@ mod tests {
                 let valid_callback_sent = AtomicBool::new(false);
                 let token_posts = AtomicUsize::new(0);
                 let (launch_sender, mut launch_receiver) = oneshot::channel();
+                let launch_cx = cx.clone();
                 let application = client.authorize(&cx, |authorization| async move {
                     launch_sender
-                        .send(authorization)
+                        .send(&launch_cx, authorization)
                         .map_err(|_| OAuthError::BrowserLaunchFailed)?;
                     Ok(())
                 });

@@ -1009,14 +1009,19 @@ fn planted_item_declaration_requires_an_identifier_boundary() {
 /// are the module talking about itself, not a consumer.
 const DPOP_MODULE_PREFIXES: &[&str] = &[
     "crates/fastmcp-client/src/http_auth/dpop",
+    "crates/fastmcp-client/src/http_auth/oauth/dpop",
     "crates/fastmcp-protocol/src/dpop.rs",
 ];
 
-/// The `pub mod dpop;` lines that put the two modules in the build. A module
+/// The `pub mod dpop;` lines that put the modules in the build. A module
 /// declaration is not a consumer: it is what makes the code compile at all,
 /// and the README row says so in the sentence about `ac00c6ad`.
 const DPOP_DECLARATIONS: &[(&str, &str)] = &[
     ("crates/fastmcp-client/src/http_auth.rs", "pub mod dpop;"),
+    (
+        "crates/fastmcp-client/src/http_auth/oauth.rs",
+        "pub mod dpop;",
+    ),
     ("crates/fastmcp-protocol/src/lib.rs", "pub mod dpop;"),
 ];
 
