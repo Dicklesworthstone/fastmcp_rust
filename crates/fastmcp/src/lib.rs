@@ -5342,6 +5342,94 @@ pub mod modern {
             self.inner.ping_with_cx(cx, cancellation).await
         }
 
+        /// Lists one tools page while yielding the caller's Unix runtime.
+        ///
+        /// Tag filters and an optional opaque cursor are sent unchanged. The
+        /// connection-local cache honors the peer's freshness and live catalog
+        /// invalidations. Cancellation remains effective on a cache hit.
+        /// This method does not fetch subsequent pages.
+        #[cfg(unix)]
+        pub async fn list_tools_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListToolsParams,
+        ) -> McpResult<FinalListToolsResult> {
+            match self.inner.list_tools_with_cx(cx, cancellation, params).await? {
+                fastmcp_protocol::CoreResult::Final(FinalCoreResult::ToolsList {
+                    result, ..
+                }) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final tools/list result",
+                )),
+            }
+        }
+
+        /// Lists one resources page with the yielding, caching, and
+        /// cancellation behavior of [Self::list_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_resources_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourcesParams,
+        ) -> McpResult<FinalListResourcesResult> {
+            match self
+                .inner
+                .list_resources_with_cx(cx, cancellation, params)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(FinalCoreResult::ResourcesList {
+                    result, ..
+                }) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final resources/list result",
+                )),
+            }
+        }
+
+        /// Lists one resource-template page with the yielding, caching, and
+        /// cancellation behavior of [Self::list_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_resource_templates_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourceTemplatesParams,
+        ) -> McpResult<FinalListResourceTemplatesResult> {
+            match self
+                .inner
+                .list_resource_templates_with_cx(cx, cancellation, params)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
+                    result, ..
+                }) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final resources/templates/list result",
+                )),
+            }
+        }
+
+        /// Lists one prompts page with the yielding, caching, and
+        /// cancellation behavior of [Self::list_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_prompts_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListPromptsParams,
+        ) -> McpResult<FinalListPromptsResult> {
+            match self.inner.list_prompts_with_cx(cx, cancellation, params).await? {
+                fastmcp_protocol::CoreResult::Final(FinalCoreResult::PromptsList {
+                    result, ..
+                }) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final prompts/list result",
+                )),
+            }
+        }
+
         /// Collects every tools page on the caller's Unix runtime.
         ///
         /// One absolute budget covers discovery, all pages, and the permitted

@@ -1083,6 +1083,13 @@ content operations, completion, liveness checks, and incremental listeners.
 Each method takes the caller's `&Cx` and an explicit
 `&McpRequestCancellation`, and yields between bounded receive turns.
 
+For one page at a time, `list_tools_with_cx`,
+`list_resources_with_cx`, `list_resource_templates_with_cx`, and
+`list_prompts_with_cx` return the corresponding typed final page. They
+preserve include/exclude tag filters and an optional opaque cursor, reuse
+fresh results under the connection's invalidation rules, and do not fetch
+the next page automatically. Pass the returned cursor explicitly to continue.
+
 The four `list_all_*_with_cx` methods return `modern::CollectedCatalog`.
 Its `pages()` contain complete `FinalCoreResult` values, retaining cache
 hints, metadata, unknown result members, and exact numbers. Traversal keeps

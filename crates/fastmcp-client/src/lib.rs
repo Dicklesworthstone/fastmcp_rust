@@ -23632,16 +23632,21 @@ impl Client {
                 .await;
         }
 
-        self.drain_final_cache_invalidations_with_cx(cx, cancellation, budget)
+        let cache_idle = self
+            .drain_final_cache_invalidations_with_cx(cx, cancellation, budget)
             .await?;
         let key = self.final_cache_key(method, semantic_parameters.clone(), cursor, result_set)?;
         let cursor_origin = self.final_result_cache.capture_cursor_origin(&key);
         // Only a first page can use a cached entry. Present opaque cursors
         // always cause a new request, even if their bytes repeat.
-        let lookup = (budget.pages == 1)
+        let lookup = (budget.pages == 1 && cache_idle)
             .then(|| self.final_result_cache.lookup_page_at(&key, Instant::now()));
         let miss = match lookup {
             Some(FinalCachePageLookup::Fresh(page)) => {
+                Self::preserve_pagination_cache_deadline(
+                    budget,
+                    self.check_stdio_cache_lifetime(cx, cancellation, budget.deadline),
+                )?;
                 self.last_final_cache_page = Some(FinalCachePageState {
                     generation: page.generation,
                     scope: page.scope,
@@ -23653,6 +23658,7 @@ impl Client {
             None => None,
         };
         let generation = self.final_result_cache.begin_fetch(key.result_set());
+        let fetch_started = Instant::now();
         let result = match self
             .request_core_with_cx_until(cx, cancellation, method, parameters, Some(budget.deadline))
             .await
@@ -23675,10 +23681,12 @@ impl Client {
             return Err(McpError::request_cancelled());
         }
         let scope = final_cache_hints(&result).map(|(_, scope)| scope);
+        // The yielding decoder records dequeue time. Bound freshness by fetch
+        // start so wire latency or a parked caller cannot extend the peer TTL.
         let receipt = self
             .last_core_result_receipt
             .take()
-            .unwrap_or_else(Instant::now);
+            .map_or(fetch_started, |receipt| receipt.min(fetch_started));
         let page_result_set = key.result_set().clone();
         let _ =
             self.final_result_cache
@@ -23704,23 +23712,36 @@ impl Client {
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         budget: &PaginationBudget,
-    ) -> McpResult<()> {
-        let deadline =
-            (Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW).min(budget.deadline);
-        let connection_cx = self.cx.clone();
-        loop {
-            if cancellation.is_cancel_requested()
-                || cx.checkpoint().is_err()
-                || connection_cx.checkpoint().is_err()
+    ) -> McpResult<bool> {
+        budget.check_deadline()?;
+        let drained = self
+            .drain_ready_stdio_cache_frames(cx, cancellation, budget.deadline)
+            .await;
+        Self::preserve_pagination_cache_deadline(budget, drained)
+    }
+
+    #[cfg(unix)]
+    fn preserve_pagination_cache_deadline<T>(
+        budget: &PaginationBudget,
+        outcome: McpResult<T>,
+    ) -> McpResult<T> {
+        match outcome {
+            Err(error)
+                if error.code == McpErrorCode::InternalError
+                    && error.message == "MRTR operation absolute deadline elapsed"
+                    && error.data == Some(serde_json::json!({"timeoutSource": "absolute"})) =>
             {
-                return Err(McpError::request_cancelled());
+                // Normalize only the common helper's own deadline outcome.
+                budget.check_deadline()?;
+                Err(error)
             }
-            budget.check_deadline()?;
-            if Instant::now() >= deadline {
-                return Ok(());
+            // Preserve transport, protocol, cancellation, and cleanup errors
+            // even if the pagination deadline elapsed during that operation.
+            Err(error) => Err(error),
+            Ok(value) => {
+                budget.check_deadline()?;
+                Ok(value)
             }
-            self.drive_multiplexed_stdio_until(&connection_cx, Some(deadline))?;
-            asupersync::runtime::yield_now().await;
         }
     }
 
@@ -28436,7 +28457,7 @@ impl Client {
 
     /// Replays only after an idle observation by the connection's sole reader.
     /// Every consumed frame keeps its ordinary response/subscription owner.
-    /// A busy peer or an exhausted drain bound forces a fresh request.
+    /// Any input left after the bounded drain forces a fresh request.
     #[cfg(unix)]
     async fn drain_ready_stdio_cache_frames(
         &mut self,
@@ -28444,29 +28465,32 @@ impl Client {
         cancellation: &McpRequestCancellation,
         operation_deadline: Instant,
     ) -> McpResult<bool> {
-        let deadline = (Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW)
-            .min(operation_deadline);
+        let deadline =
+            (Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW).min(operation_deadline);
         let connection_cx = self.cx.clone();
         for _ in 0..MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
             self.check_stdio_cache_lifetime(cx, cancellation, operation_deadline)?;
             if Instant::now() >= deadline {
-                return Ok(false);
+                break;
             }
             let consumed =
                 self.drive_multiplexed_stdio_turn_until(&connection_cx, Some(deadline))?;
             self.check_stdio_cache_lifetime(cx, cancellation, operation_deadline)?;
             if !consumed {
-                let ready = self
-                    .transport
-                    .lock()
-                    .map_err(|_| McpError::internal_error("Stdio receive state is unavailable"))?
-                    .has_ready_input()
-                    .map_err(transport_error_to_mcp)?;
-                return Ok(!ready);
+                break;
             }
             asupersync::runtime::yield_now().await;
         }
-        Ok(false)
+        self.check_stdio_cache_lifetime(cx, cancellation, operation_deadline)?;
+        // A scheduling pause or a consumed frame may exhaust the bound even
+        // when ingress is now idle. Probe without reading beyond that bound.
+        let ready = self
+            .transport
+            .lock()
+            .map_err(|_| McpError::internal_error("Stdio receive state is unavailable"))?
+            .has_ready_input()
+            .map_err(transport_error_to_mcp)?;
+        Ok(!ready)
     }
 
     /// The selected high-level verbs share the synchronous connection cache.
@@ -28573,6 +28597,105 @@ impl Client {
             });
         }
         Ok(result)
+    }
+
+    /// Lists one tools page while yielding the caller's Unix runtime.
+    ///
+    /// Complete modern results use this connection's bounded cache, including
+    /// the exact cursor and tag filters. Ready invalidations are handled before
+    /// a hit; legacy results remain uncached. No cursor is followed.
+    #[cfg(unix)]
+    pub async fn list_tools_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListToolsParams,
+    ) -> McpResult<CoreResult> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout_policy.absolute_timeout())
+            .ok_or_else(|| request_timeout_error(RequestTimeoutSource::Absolute))?;
+        self.cached_final_core_request_with_cx_until(
+            cx,
+            cancellation,
+            "tools/list",
+            list_tools_semantic_parameters(&params),
+            params.cursor.as_deref(),
+            FinalCacheResultSet::Tools,
+            deadline,
+        )
+        .await
+    }
+
+    /// Lists one resource page with the cache and lifetime policy of
+    /// [`Self::list_tools_with_cx`].
+    #[cfg(unix)]
+    pub async fn list_resources_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourcesParams,
+    ) -> McpResult<CoreResult> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout_policy.absolute_timeout())
+            .ok_or_else(|| request_timeout_error(RequestTimeoutSource::Absolute))?;
+        self.cached_final_core_request_with_cx_until(
+            cx,
+            cancellation,
+            "resources/list",
+            list_resources_semantic_parameters(&params),
+            params.cursor.as_deref(),
+            FinalCacheResultSet::Resources,
+            deadline,
+        )
+        .await
+    }
+
+    /// Lists one resource-template page with the cache and lifetime policy of
+    /// [`Self::list_tools_with_cx`].
+    #[cfg(unix)]
+    pub async fn list_resource_templates_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<CoreResult> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout_policy.absolute_timeout())
+            .ok_or_else(|| request_timeout_error(RequestTimeoutSource::Absolute))?;
+        self.cached_final_core_request_with_cx_until(
+            cx,
+            cancellation,
+            "resources/templates/list",
+            list_resource_templates_semantic_parameters(&params),
+            params.cursor.as_deref(),
+            FinalCacheResultSet::ResourceTemplates,
+            deadline,
+        )
+        .await
+    }
+
+    /// Lists one prompt page with the cache and lifetime policy of
+    /// [`Self::list_tools_with_cx`].
+    #[cfg(unix)]
+    pub async fn list_prompts_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListPromptsParams,
+    ) -> McpResult<CoreResult> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout_policy.absolute_timeout())
+            .ok_or_else(|| request_timeout_error(RequestTimeoutSource::Absolute))?;
+        self.cached_final_core_request_with_cx_until(
+            cx,
+            cancellation,
+            "prompts/list",
+            list_prompts_semantic_parameters(&params),
+            params.cursor.as_deref(),
+            FinalCacheResultSet::Prompts,
+            deadline,
+        )
+        .await
     }
 
     /// Sends one ordinary core stdio request while yielding the caller's Unix runtime.
@@ -69787,6 +69910,287 @@ exec sleep 2
             CoreResult::Final(FinalCoreResult::ToolsList { .. })
         ));
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    async fn stdio_async_catalog_test_page(
+        client: &mut Client,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        cursor: Option<String>,
+        include_tag: &str,
+    ) -> McpResult<CoreResult> {
+        let include_tags = Some(vec![include_tag.to_owned()]);
+        let exclude_tags = Some(vec!["hidden".to_owned()]);
+        match method {
+            "tools/list" => {
+                client
+                    .list_tools_with_cx(
+                        cx,
+                        cancellation,
+                        ListToolsParams {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            "resources/list" => {
+                client
+                    .list_resources_with_cx(
+                        cx,
+                        cancellation,
+                        ListResourcesParams {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            "resources/templates/list" => {
+                client
+                    .list_resource_templates_with_cx(
+                        cx,
+                        cancellation,
+                        ListResourceTemplatesParams {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            "prompts/list" => {
+                client
+                    .list_prompts_with_cx(
+                        cx,
+                        cancellation,
+                        ListPromptsParams {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_stdio_async_catalog_pages_keep_cursor_and_tag_cache_identity() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+            ] {
+                let cases = [
+                    (None, "visible", "first"),
+                    (Some(""), "visible", "cursor"),
+                    (None, "different", "filtered"),
+                ];
+                let mut script = stdio_catalog_test_discovery_script();
+                for (index, (cursor, tag, name)) in cases.iter().enumerate() {
+                    let id = index + 2;
+                    script.push_str(&format!(
+                        "IFS= read -r request || exit 40\n\
+                         case \"$request\" in *'\"method\":\"{method}\"'*) ;; *) exit 41 ;; esac\n\
+                         case \"$request\" in *'\"id\":{id},'*|*'\"id\":{id}}}'*) ;; *) exit 42 ;; esac\n\
+                         case \"$request\" in *'\"includeTags\":[\"{tag}\"]'*) ;; *) exit 43 ;; esac\n\
+                         case \"$request\" in *'\"excludeTags\":[\"hidden\"]'*) ;; *) exit 44 ;; esac\n"
+                    ));
+                    if cursor.is_some() {
+                        script.push_str(
+                            "case \"$request\" in *'\"cursor\":\"\"'*) ;; *) exit 45 ;; esac\n",
+                        );
+                    } else {
+                        script.push_str(
+                            "case \"$request\" in *'\"cursor\":'*) exit 46 ;; *) ;; esac\n",
+                        );
+                    }
+                    let mut result = http_catalog_test_result(
+                        method,
+                        name,
+                        (index == 0).then_some(""),
+                        60_000,
+                        "private",
+                    )
+                    .to_string();
+                    result.pop();
+                    result.push_str(",\"vendorExact\":922337203685477580812345678901234567890,\"vendorDecimal\":1.2300e+42}");
+                    script.push_str(&format!(
+                        "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}'\n"
+                    ));
+                }
+                script.push_str("while IFS= read -r unexpected; do exit 47; done\n");
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .client_info("typed-catalog-client", "7.2")
+                    .max_retries(0)
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", &script])
+                    .await
+                    .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                for (index, (cursor, tag, name)) in cases.into_iter().enumerate() {
+                    let first = stdio_async_catalog_test_page(
+                        &mut client,
+                        &cx,
+                        &cancellation,
+                        method,
+                        cursor.map(str::to_owned),
+                        tag,
+                    )
+                    .await
+                    .unwrap();
+                    let original = first.encode().unwrap();
+                    assert!(original.contains(&format!("\"name\":\"{name}\"")));
+                    assert!(original.contains("922337203685477580812345678901234567890"));
+                    assert!(original.contains("1.2300e+42"));
+                    let replay = stdio_async_catalog_test_page(
+                        &mut client,
+                        &cx,
+                        &cancellation,
+                        method,
+                        cursor.map(str::to_owned),
+                        tag,
+                    )
+                    .await
+                    .unwrap();
+                    crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+                        &original,
+                        &replay.encode().unwrap(),
+                        "typed async catalog pages retain the exact admitted payload",
+                    );
+                    assert_eq!(
+                        client.peek_next_request_id(),
+                        u64::try_from(index + 3).unwrap(),
+                    );
+                }
+                let cancelled = McpRequestCancellation::new();
+                cancelled.cancel();
+                assert_eq!(
+                    stdio_async_catalog_test_page(
+                        &mut client,
+                        &cx,
+                        &cancelled,
+                        method,
+                        None,
+                        "different",
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                    McpErrorCode::RequestCancelled,
+                );
+                assert_eq!(client.peek_next_request_id(), 5);
+                assert_eq!(client.final_result_cache_stats().fills, 3);
+                assert_eq!(client.final_result_cache_stats().hits, 3);
+                client.close().unwrap();
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_stdio_async_collector_rebuilds_after_a_fragmented_invalidation() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let mut script = stdio_catalog_test_discovery_script();
+            for (id, name) in [(2, "old"), (3, "intermediate"), (4, "stable")] {
+                script.push_str(&format!(
+                    "IFS= read -r request || exit 50\n\
+                     case \"$request\" in *'\"method\":\"tools/list\"'*) ;; *) exit 51 ;; esac\n\
+                     case \"$request\" in *'\"id\":{id},'*|*'\"id\":{id}}}'*) ;; *) exit 52 ;; esac\n\
+                     case \"$request\" in *'\"includeTags\":[\"visible\"]'*) ;; *) exit 53 ;; esac\n\
+                     case \"$request\" in *'\"excludeTags\":[\"hidden\"]'*) ;; *) exit 54 ;; esac\n"
+                ));
+                if id == 3 {
+                    script.push_str("printf '%s\\n' '}'\n");
+                }
+                let result =
+                    http_catalog_test_result("tools/list", name, None, 60_000, "private");
+                script.push_str(&format!(
+                    "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}'\n"
+                ));
+                if id == 2 {
+                    script.push_str("printf '%s' '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"'\n");
+                }
+            }
+            script.push_str("while IFS= read -r unexpected; do exit 55; done\n");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .client_info("typed-catalog-client", "7.2")
+                .max_retries(0)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", &script])
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let first = stdio_async_catalog_test_page(
+                &mut client,
+                &cx,
+                &cancellation,
+                "tools/list",
+                None,
+                "visible",
+            )
+            .await
+            .unwrap();
+            assert!(first.encode().unwrap().contains("\"name\":\"old\""));
+            let fixture_deadline = Instant::now() + Duration::from_secs(5);
+            while !client.transport.lock().unwrap().has_buffered_input() {
+                assert!(Instant::now() < fixture_deadline);
+                client
+                    .drive_multiplexed_stdio_until(
+                        &cx,
+                        Some(Instant::now() + Duration::from_millis(2)),
+                    )
+                    .unwrap();
+                asupersync::runtime::yield_now().await;
+            }
+            let collected = stdio_async_catalog_test_collect(
+                &mut client,
+                &cx,
+                &cancellation,
+                "tools/list",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(collected.item_count(), 1);
+            assert_eq!(collected.pages().len(), 1);
+            let encoded = collected.pages()[0].encode().unwrap();
+            assert!(encoded.contains("\"name\":\"stable\""));
+            assert!(!encoded.contains("\"name\":\"intermediate\""));
+            let replay = stdio_async_catalog_test_collect(
+                &mut client,
+                &cx,
+                &cancellation,
+                "tools/list",
+                None,
+            )
+            .await
+            .unwrap();
+            crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+                &encoded,
+                &replay.pages()[0].encode().unwrap(),
+                "the collector replays only its stable rebuilt result",
+            );
+            assert_eq!(client.peek_next_request_id(), 5);
+            assert_eq!(client.final_result_cache_stats().fills, 2);
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            assert!(matches!(
+                client.take_final_server_notifications().as_slice(),
+                [ServerNotification::ToolsListChanged(None)],
+            ));
+            client.close().unwrap();
+        });
     }
 
     #[cfg(unix)]

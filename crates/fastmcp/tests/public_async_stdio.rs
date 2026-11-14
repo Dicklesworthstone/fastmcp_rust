@@ -690,6 +690,134 @@ printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$1"
         }
     }
 
+    async fn catalog_page(
+        client: &mut modern::Client,
+        cx: &Cx,
+        cancellation: &modern::McpRequestCancellation,
+        method: &str,
+        params: JsonValue,
+    ) -> McpResult<JsonValue> {
+        let result = match method {
+            "tools/list" => serde_json::to_value(
+                client
+                    .list_tools_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                    .await?,
+            ),
+            "resources/list" => serde_json::to_value(
+                client
+                    .list_resources_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                    .await?,
+            ),
+            "resources/templates/list" => serde_json::to_value(
+                client
+                    .list_resource_templates_with_cx(
+                        cx,
+                        cancellation,
+                        serde_json::from_value(params).unwrap(),
+                    )
+                    .await?,
+            ),
+            "prompts/list" => serde_json::to_value(
+                client
+                    .list_prompts_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                    .await?,
+            ),
+            _ => unreachable!(),
+        };
+        result.map_err(|error| fastmcp_rust::McpError::internal_error(error.to_string()))
+    }
+
+    #[test]
+    fn modern_async_catalog_pages_cache_without_traversing_or_losing_filters() {
+        run(|cx| async move {
+            const CURSOR: &str = " opaque /+=? token ";
+            let catalogs = [
+                ("tools/list", "tools", json!({"name": "echo", "inputSchema": {"type": "object"}})),
+                ("resources/list", "resources", json!({"name": "source", "uri": "test://source"})),
+                ("resources/templates/list", "resourceTemplates", json!({"name": "source", "uriTemplate": "test://source/{name}"})),
+                ("prompts/list", "prompts", json!({"name": "greet"})),
+            ];
+            let mut script = DISCOVER.to_owned();
+            for (method, field, item) in &catalogs {
+                for step in 0..3 {
+                    let include = if step == 1 { "alternate" } else { "visible" };
+                    script.push_str(&format!(
+                        "read_request\n\
+                         case \"$request\" in *'\"method\":\"{method}\"'*) ;; *) exit 90 ;; esac\n\
+                         case \"$request\" in *'\"includeTags\":[\"{include}\"]'*) ;; *) exit 91 ;; esac\n\
+                         case \"$request\" in *'\"excludeTags\":[\"hidden\"]'*) ;; *) exit 92 ;; esac\n"
+                    ));
+                    if step == 2 {
+                        script.push_str(
+                            "case \"$request\" in *'\"cursor\":\" opaque /+=? token \"'*) ;; *) exit 93 ;; esac\n",
+                        );
+                    } else {
+                        script.push_str(
+                            "case \"$request\" in *'\"cursor\":'*) exit 94 ;; esac\n",
+                        );
+                    }
+                    let mut result = json!({
+                        "resultType": "complete",
+                        "ttlMs": if step == 2 { 0 } else { 60000 },
+                        "cacheScope": "private",
+                    });
+                    result[*field] = if step == 1 { json!([]) } else { json!([item]) };
+                    if step == 0 {
+                        result["nextCursor"] = json!(CURSOR);
+                    }
+                    script.push_str(&format!(
+                        "printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{result}}}\\n' \"$id\"\n"
+                    ));
+                }
+            }
+            script.push_str("while IFS= read -r unexpected; do exit 95; done\n");
+            let mut client = connect(&cx, &script, modern::ClientBuilder::new()).await;
+            let cancellation = modern::McpRequestCancellation::new();
+            for (method, field, _) in catalogs {
+                let params = json!({"includeTags": ["visible"], "excludeTags": ["hidden"]});
+                let first = require_send(catalog_page(
+                    &mut client, &cx, &cancellation, method, params.clone(),
+                )).await.unwrap();
+                assert_eq!(first[field].as_array().unwrap().len(), 1);
+                assert_eq!(first["nextCursor"], json!(CURSOR));
+                let hits = client.final_result_cache_stats().hits;
+                let cached = require_send(catalog_page(
+                    &mut client, &cx, &cancellation, method, params.clone(),
+                )).await.unwrap();
+                assert_eq!(cached[field], first[field]);
+                assert_eq!(cached["nextCursor"], first["nextCursor"]);
+                assert_eq!(client.final_result_cache_stats().hits, hits + 1);
+
+                // Changing only the caller's cancellation state refuses a hit
+                // without sending a request or consuming the retained page.
+                let cancelled = modern::McpRequestCancellation::new();
+                cancelled.cancel();
+                let error = require_send(catalog_page(
+                    &mut client, &cx, &cancelled, method, params.clone(),
+                )).await.unwrap_err();
+                assert_eq!(error.code, fastmcp_rust::McpErrorCode::RequestCancelled);
+
+                // Changing only the semantic tag filter must contact the peer;
+                // the empty result cannot be supplied by the warm visible page.
+                let mut alternate = params.clone();
+                alternate["includeTags"] = json!(["alternate"]);
+                let changed = require_send(catalog_page(
+                    &mut client, &cx, &cancellation, method, alternate,
+                )).await.unwrap();
+                assert!(changed[field].as_array().unwrap().is_empty());
+
+                let mut next = params;
+                next["cursor"] = json!(CURSOR);
+                let last = require_send(catalog_page(
+                    &mut client, &cx, &cancellation, method, next,
+                )).await.unwrap();
+                assert_eq!(last[field].as_array().unwrap().len(), 1);
+                assert!(last.get("nextCursor").is_none());
+            }
+            client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
     fn retained_number(extras: &modern::UnknownResultMembers, name: &str) -> String {
         let member = extras.members().iter().find(|member| member.name == name).unwrap();
         let modern::ExactJsonValue::Number(number) = &member.value else {
