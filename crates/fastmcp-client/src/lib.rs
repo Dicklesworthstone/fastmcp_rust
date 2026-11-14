@@ -16068,6 +16068,35 @@ impl HttpClient {
     ) -> Result<CollectedCatalog, HttpClientError> {
         self.collect_http_catalog_with_budget(
             cx,
+            None,
+            "tools/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            FinalCacheResultSet::Tools,
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects every tools page under one request-local cancellation domain.
+    ///
+    /// The bounds, exact page preservation and one-rebuild policy are the same
+    /// as [`Self::list_all_tools`]. The token covers cache lookup, every page
+    /// and any cursorless rebuild. Cancellation closes only this traversal's
+    /// active HTTP exchange and returns no partial collection; independently
+    /// owned requests and the client remain usable.
+    pub async fn list_all_tools_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListToolsParams,
+    ) -> Result<CollectedCatalog, HttpClientError> {
+        self.collect_http_catalog_with_budget(
+            cx,
+            Some(cancellation),
             "tools/list",
             list_catalog_wire_parameters(
                 params.cursor.as_deref(),
@@ -16089,6 +16118,30 @@ impl HttpClient {
     ) -> Result<CollectedCatalog, HttpClientError> {
         self.collect_http_catalog_with_budget(
             cx,
+            None,
+            "resources/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            FinalCacheResultSet::Resources,
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all resource pages under the cancellation and traversal policy
+    /// of [`Self::list_all_tools_with_cancellation`].
+    pub async fn list_all_resources_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourcesParams,
+    ) -> Result<CollectedCatalog, HttpClientError> {
+        self.collect_http_catalog_with_budget(
+            cx,
+            Some(cancellation),
             "resources/list",
             list_catalog_wire_parameters(
                 params.cursor.as_deref(),
@@ -16110,6 +16163,30 @@ impl HttpClient {
     ) -> Result<CollectedCatalog, HttpClientError> {
         self.collect_http_catalog_with_budget(
             cx,
+            None,
+            "resources/templates/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            FinalCacheResultSet::ResourceTemplates,
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all resource-template pages under the cancellation and
+    /// traversal policy of [`Self::list_all_tools_with_cancellation`].
+    pub async fn list_all_resource_templates_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourceTemplatesParams,
+    ) -> Result<CollectedCatalog, HttpClientError> {
+        self.collect_http_catalog_with_budget(
+            cx,
+            Some(cancellation),
             "resources/templates/list",
             list_catalog_wire_parameters(
                 params.cursor.as_deref(),
@@ -16131,6 +16208,30 @@ impl HttpClient {
     ) -> Result<CollectedCatalog, HttpClientError> {
         self.collect_http_catalog_with_budget(
             cx,
+            None,
+            "prompts/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            FinalCacheResultSet::Prompts,
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all prompt pages under the cancellation and traversal policy
+    /// of [`Self::list_all_tools_with_cancellation`].
+    pub async fn list_all_prompts_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListPromptsParams,
+    ) -> Result<CollectedCatalog, HttpClientError> {
+        self.collect_http_catalog_with_budget(
+            cx,
+            Some(cancellation),
             "prompts/list",
             list_catalog_wire_parameters(
                 params.cursor.as_deref(),
@@ -16146,6 +16247,7 @@ impl HttpClient {
     async fn collect_http_catalog_with_budget(
         &mut self,
         cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
         method: &'static str,
         parameters: serde_json::Value,
         result_set: FinalCacheResultSet,
@@ -16157,7 +16259,11 @@ impl HttpClient {
             )
             .into());
         }
-        if cx.checkpoint().is_err() {
+        let stopped = || {
+            cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                || cx.checkpoint().is_err()
+        };
+        if stopped() {
             return Err(McpError::request_cancelled().into());
         }
         budget.check_deadline()?;
@@ -16173,26 +16279,42 @@ impl HttpClient {
         // Bound the outstanding HTTP await as well as work between pages.
         // Dropping this one request future preserves its existing cancellation
         // cleanup; it never cancels the shared client or sibling executions.
-        match asupersync::time::timeout_at(
+        let mut traversal = Box::pin(asupersync::time::timeout_at(
             deadline,
-            self.collect_http_catalog_pages(cx, method, parameters, result_set, &mut budget),
-        )
+            self.collect_http_catalog_pages(cx, cancellation, method, parameters, result_set, &mut budget),
+        ));
+        let mut cancelled = cancellation.map(|signal| Box::pin(signal.cancelled()));
+        std::future::poll_fn(|task_cx| {
+            if stopped()
+                || cancelled
+                    .as_mut()
+                    .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready())
+            {
+                return std::task::Poll::Ready(Err(McpError::request_cancelled().into()));
+            }
+            let result = traversal.as_mut().poll(task_cx);
+            // A cancellation selected by the same poll as a completed page
+            // must not publish that page or a successfully rebuilt catalog.
+            if stopped() {
+                return std::task::Poll::Ready(Err(McpError::request_cancelled().into()));
+            }
+            result.map(|result| match result {
+                Ok(result) => result,
+                Err(_) => Err(McpError::with_data(
+                    McpErrorCode::InternalError,
+                    PAGINATION_DEADLINE_ERROR,
+                    serde_json::json!({"timeoutSource": "absolute"}),
+                )
+                .into()),
+            })
+        })
         .await
-        {
-            Ok(result) => result,
-            Err(_) if cx.checkpoint().is_err() => Err(McpError::request_cancelled().into()),
-            Err(_) => Err(McpError::with_data(
-                McpErrorCode::InternalError,
-                PAGINATION_DEADLINE_ERROR,
-                serde_json::json!({"timeoutSource": "absolute"}),
-            )
-            .into()),
-        }
     }
 
     async fn collect_http_catalog_pages(
         &mut self,
         cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
         method: &'static str,
         parameters: serde_json::Value,
         result_set: FinalCacheResultSet,
@@ -16210,7 +16332,9 @@ impl HttpClient {
             let mut cursor: Option<String> = None;
             let mut baseline = None;
             loop {
-                if cx.checkpoint().is_err() {
+                if cx.checkpoint().is_err()
+                    || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                {
                     return Err(McpError::request_cancelled().into());
                 }
                 budget.begin_page()?;
@@ -16221,14 +16345,16 @@ impl HttpClient {
                 let page = self
                     .request_final_core_with_cache_policy(
                         cx,
-                        None,
+                        cancellation,
                         method,
                         page_parameters,
                         None,
                         budget.pages == 1,
                     )
                     .await;
-                if cx.checkpoint().is_err() {
+                if cx.checkpoint().is_err()
+                    || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                {
                     return Err(McpError::request_cancelled().into());
                 }
                 let (result, state) = match page {
@@ -51458,6 +51584,520 @@ exec sleep 2
     }
 
     #[cfg(unix)]
+    async fn collect_http_catalog_test_with_cancellation(
+        client: &mut HttpClient,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+    ) -> Result<CollectedCatalog, HttpClientError> {
+        let include_tags = Some(vec!["visible".to_owned()]);
+        let exclude_tags = Some(vec!["hidden".to_owned()]);
+        match method {
+            "tools/list" => {
+                client
+                    .list_all_tools_with_cancellation(
+                        cx,
+                        cancellation,
+                        ListToolsParams {
+                            cursor: None,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            "resources/list" => {
+                client
+                    .list_all_resources_with_cancellation(
+                        cx,
+                        cancellation,
+                        ListResourcesParams {
+                            cursor: None,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            "resources/templates/list" => {
+                client
+                    .list_all_resource_templates_with_cancellation(
+                        cx,
+                        cancellation,
+                        ListResourceTemplatesParams {
+                            cursor: None,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            "prompts/list" => {
+                client
+                    .list_all_prompts_with_cancellation(
+                        cx,
+                        cancellation,
+                        ListPromptsParams {
+                            cursor: None,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            _ => unreachable!("catalog test method"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalog_cancellation_api_preserves_complete_pages() {
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let server = http_catalog_test_server(listener, 3, move |index, request| {
+                assert_eq!(request["method"], method);
+                assert_eq!(
+                    request["params"]["includeTags"],
+                    serde_json::json!(["visible"])
+                );
+                assert_eq!(
+                    request["params"]["excludeTags"],
+                    serde_json::json!(["hidden"])
+                );
+                assert_eq!(
+                    request["params"]
+                        .get("cursor")
+                        .and_then(serde_json::Value::as_str),
+                    if index == 0 { None } else { Some("") }
+                );
+                let mut result = http_catalog_test_result(
+                    method,
+                    &format!("page-{index}"),
+                    (index < 2).then_some(""),
+                    0,
+                    "private",
+                )
+                .to_string();
+                result.pop();
+                result.push_str(
+                    ",\"vendorExact\":1.200e+4,\"vendorInteger\":123456789012345678901234567890}",
+                );
+                (
+                    "application/json",
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{result}}}",
+                        request["id"],
+                    ),
+                )
+            });
+            let cancellation = McpRequestCancellation::new();
+            http_test_runtime_block_on(async {
+                let cx = Cx::current().unwrap();
+                let collection = collect_http_catalog_test_with_cancellation(
+                    &mut client,
+                    &cx,
+                    &cancellation,
+                    method,
+                )
+                .await
+                .expect("all four cancellation-aware catalog APIs collect every page");
+                assert_eq!(collection.method(), method);
+                assert_eq!(collection.item_count(), 3);
+                assert_eq!(collection.pages().len(), 3);
+                for (index, page) in collection.pages().iter().enumerate() {
+                    let encoded = page.encode().unwrap();
+                    assert!(encoded.contains(&format!("page-{index}")));
+                    assert!(encoded.contains("\"vendorExact\":1.200e+4"));
+                    assert!(encoded.contains("\"vendorInteger\":123456789012345678901234567890"));
+                }
+                assert!(!cancellation.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+            });
+            assert_eq!(server.join().unwrap().len(), 3);
+            assert_eq!(client.next_id.load(Ordering::Relaxed), 5);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalog_cancellation_precedes_cached_terminal_page() {
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            http_test_runtime_block_on(async {
+                let cx = Cx::current().unwrap();
+                let error = collect_http_catalog_test_with_cancellation(
+                    &mut client,
+                    &cx,
+                    &cancelled,
+                    method,
+                )
+                .await
+                .unwrap_err();
+                assert!(matches!(error, HttpClientError::CoreResult(error)
+                    if error.code == McpErrorCode::RequestCancelled));
+            });
+            assert_eq!(client.next_id.load(Ordering::Relaxed), 2);
+            assert!(matches!(listener.accept(), Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock));
+            let server = http_catalog_test_server(listener, 1, move |_, request| {
+                assert_eq!(request["method"], method);
+                ("application/json", serde_json::json!({
+                    "jsonrpc":"2.0", "id":request["id"],
+                    "result":http_catalog_test_result(method, "cached", None, 60_000, "private"),
+                }).to_string())
+            });
+            http_test_runtime_block_on(async {
+                let cx = Cx::current().unwrap();
+                let live = McpRequestCancellation::new();
+                let collection =
+                    collect_http_catalog_test_with_cancellation(&mut client, &cx, &live, method)
+                        .await
+                        .unwrap();
+                assert_eq!(collection.item_count(), 1);
+                let before = client.final_result_cache_stats();
+                let next_id = client.next_id.load(Ordering::Relaxed);
+                let error = collect_http_catalog_test_with_cancellation(
+                    &mut client,
+                    &cx,
+                    &cancelled,
+                    method,
+                )
+                .await
+                .unwrap_err();
+                assert!(matches!(error, HttpClientError::CoreResult(error)
+                    if error.code == McpErrorCode::RequestCancelled));
+                let after = client.final_result_cache_stats();
+                assert_eq!(
+                    (after.hits, after.misses, after.fills),
+                    (before.hits, before.misses, before.fills),
+                    "a stopped token must not consume or refill the cached page"
+                );
+                let replay =
+                    collect_http_catalog_test_with_cancellation(&mut client, &cx, &live, method)
+                        .await
+                        .unwrap();
+                assert_eq!(replay.item_count(), 1);
+                assert_eq!(client.final_result_cache_stats().hits, before.hits + 1);
+                assert_eq!(client.next_id.load(Ordering::Relaxed), next_id);
+                assert!(cx.checkpoint().is_ok());
+            });
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalog_cancellation_closes_pending_page_and_preserves_sibling() {
+        for phase in ["headers", "json", "sse"] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let (sibling_ready, sibling_observed) = mpsc::channel();
+            let (page_ready, page_observed) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let mut sibling = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut sibling);
+                assert_eq!(request["method"], "tools/list");
+                assert_eq!(request["id"], 2);
+                sibling_ready.send(()).unwrap();
+
+                let mut first = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut first);
+                assert_eq!(request["id"], 3);
+                assert!(request["params"].get("cursor").is_none());
+                let body = serde_json::json!({"jsonrpc":"2.0", "id":3,
+                    "result":http_catalog_test_result("tools/list", "discarded", Some("pending"), 0, "private")});
+                write_http_cache_test_response(
+                    &mut first,
+                    "application/json",
+                    body.to_string().as_bytes(),
+                );
+
+                let mut pending = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut pending);
+                assert_eq!(request["id"], 4);
+                assert_eq!(request["method"], "tools/list");
+                assert_eq!(request["params"]["cursor"], "pending");
+                assert_eq!(
+                    request["params"]["includeTags"],
+                    serde_json::json!(["visible"])
+                );
+                assert_eq!(
+                    request["params"]["excludeTags"],
+                    serde_json::json!(["hidden"])
+                );
+                if phase != "headers" {
+                    let (content_type, prefix) = if phase == "json" {
+                        ("application/json", r#"{"jsonrpc":"2.0","id":4,"result":"#)
+                    } else {
+                        (
+                            "text/event-stream",
+                            "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":",
+                        )
+                    };
+                    write!(pending, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{prefix}").unwrap();
+                    pending.flush().unwrap();
+                }
+                page_ready.send(()).unwrap();
+                assert_abandoned_http_exchange_closed(
+                    &mut pending,
+                    phase != "headers",
+                    "catalog cancellation closes only the pending page socket",
+                );
+                write_http_cache_test_response(&mut sibling, "application/json",
+                    br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#);
+
+                let mut healthy = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut healthy);
+                assert_eq!(
+                    request["id"], 5,
+                    "no page retry or rediscovery follows cancellation"
+                );
+                assert!(request["params"].get("cursor").is_none());
+                let body = serde_json::json!({"jsonrpc":"2.0", "id":5,
+                    "result":http_catalog_test_result("tools/list", "healthy", None, 0, "private")});
+                write_http_cache_test_response(
+                    &mut healthy,
+                    "application/json",
+                    body.to_string().as_bytes(),
+                );
+                listener
+            });
+            http_test_runtime_block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut sibling = client
+                    .execute_core(
+                        &cx,
+                        "tools/list",
+                        serde_json::json!({}),
+                        http_owned_execution_limits(),
+                    )
+                    .unwrap();
+                let sibling_control = sibling.control();
+                let mut sibling_event = Box::pin(sibling.next_event(&cx));
+                wait_for_pending_extension_http(&mut sibling_event, &sibling_observed).await;
+                let cancellation = McpRequestCancellation::new();
+                let mut collection = Box::pin(collect_http_catalog_test_with_cancellation(
+                    &mut client,
+                    &cx,
+                    &cancellation,
+                    "tools/list",
+                ));
+                wait_for_pending_extension_http(&mut collection, &page_observed).await;
+                assert!(
+                    std::future::poll_fn(|task| std::task::Poll::Ready(
+                        collection.as_mut().poll(task)
+                    ))
+                    .await
+                    .is_pending()
+                );
+                cancellation.cancel();
+                let error = asupersync::time::timeout(cx.now(), Duration::from_secs(1), collection)
+                    .await
+                    .expect("cancellation wakes a page without another peer byte")
+                    .unwrap_err();
+                assert!(matches!(error, HttpClientError::CoreResult(error)
+                    if error.code == McpErrorCode::RequestCancelled));
+                assert!(cx.checkpoint().is_ok());
+                assert!(sibling_control.terminal_reason().is_none());
+                assert_eq!(
+                    client.final_result_cache_stats().fills,
+                    0,
+                    "an incomplete cancelled page cannot populate the cache"
+                );
+                assert!(matches!(
+                    sibling_event.await.unwrap().unwrap(),
+                    http_executor::ModernHttpFinalCoreEvent::Terminal(
+                        FinalCoreResult::ToolsList { .. }
+                    )
+                ));
+                let healthy = collect_http_catalog_test_with_cancellation(
+                    &mut client,
+                    &cx,
+                    &McpRequestCancellation::new(),
+                    "tools/list",
+                )
+                .await
+                .unwrap();
+                assert_eq!(healthy.item_count(), 1);
+                assert!(healthy.pages()[0].encode().unwrap().contains("healthy"));
+                assert_eq!(client.next_id.load(Ordering::Relaxed), 6);
+            });
+            let listener = server.join().unwrap();
+            assert!(matches!(listener.accept(), Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalog_cancellation_covers_every_cursorless_rebuild() {
+        for trigger in ["cursor", "scope", "notification", "cached-prefix"] {
+            for cancel_rebuild in [false, true] {
+                let (mut client, listener) = http_owned_execution_fixture();
+                let (rebuild_ready, rebuild_observed) = mpsc::channel();
+                let (disposition, selected) = mpsc::channel();
+                let server = std::thread::spawn(move || {
+                    let mut first = accept_http_catalog_test_request(&listener);
+                    let request = read_http_cache_test_request(&mut first);
+                    assert_eq!(request["id"], 2);
+                    assert!(request["params"].get("cursor").is_none());
+                    let body = serde_json::json!({"jsonrpc":"2.0", "id":2,
+                        "result":http_catalog_test_result("tools/list", "discarded", Some("tail"),
+                            if trigger == "cached-prefix" { 60_000 } else { 0 }, "private")});
+                    write_http_cache_test_response(
+                        &mut first,
+                        "application/json",
+                        body.to_string().as_bytes(),
+                    );
+                    let rebuild_id = if trigger == "cached-prefix" {
+                        3
+                    } else {
+                        let mut tail = accept_http_catalog_test_request(&listener);
+                        let request = read_http_cache_test_request(&mut tail);
+                        assert_eq!(request["id"], 3);
+                        assert_eq!(request["params"]["cursor"], "tail");
+                        let response = if trigger == "cursor" {
+                            serde_json::json!({"jsonrpc":"2.0", "id":3,
+                                "error":{"code":-32602,"message":"stale cursor"}})
+                        } else {
+                            serde_json::json!({"jsonrpc":"2.0", "id":3,
+                                "result":http_catalog_test_result("tools/list", "discarded-tail", None, 0,
+                                    if trigger == "scope" { "public" } else { "private" })})
+                        };
+                        let (content_type, body) = if trigger == "notification" {
+                            (
+                                "text/event-stream",
+                                format!(
+                                    "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\ndata: {response}\n\n",
+                                ),
+                            )
+                        } else {
+                            ("application/json", response.to_string())
+                        };
+                        write_http_cache_test_response(&mut tail, content_type, body.as_bytes());
+                        4
+                    };
+                    let mut rebuild = accept_http_catalog_test_request(&listener);
+                    let request = read_http_cache_test_request(&mut rebuild);
+                    assert_eq!(request["id"], rebuild_id);
+                    assert_eq!(request["method"], "tools/list");
+                    assert!(request["params"].get("cursor").is_none());
+                    assert_eq!(
+                        request["params"]["includeTags"],
+                        serde_json::json!(["visible"])
+                    );
+                    assert_eq!(
+                        request["params"]["excludeTags"],
+                        serde_json::json!(["hidden"])
+                    );
+                    rebuild_ready.send(()).unwrap();
+                    if selected.recv_timeout(Duration::from_secs(5)).unwrap() {
+                        assert_abandoned_http_exchange_closed(
+                            &mut rebuild,
+                            false,
+                            "the original token retires the cursorless rebuild",
+                        );
+                    } else {
+                        let body = serde_json::json!({"jsonrpc":"2.0", "id":rebuild_id,
+                            "result":http_catalog_test_result("tools/list", "rebuilt", None, 0, "private")});
+                        write_http_cache_test_response(
+                            &mut rebuild,
+                            "application/json",
+                            body.to_string().as_bytes(),
+                        );
+                    }
+                    let mut healthy = accept_http_catalog_test_request(&listener);
+                    let request = read_http_cache_test_request(&mut healthy);
+                    assert_eq!(request["id"], rebuild_id + 1);
+                    assert!(request["params"].get("cursor").is_none());
+                    let body = serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "result":http_catalog_test_result("tools/list", "healthy", None, 0, "private")});
+                    write_http_cache_test_response(
+                        &mut healthy,
+                        "application/json",
+                        body.to_string().as_bytes(),
+                    );
+                    listener
+                });
+                http_test_runtime_block_on(async {
+                    let cx = Cx::current().unwrap();
+                    if trigger == "cached-prefix" {
+                        client
+                            .list_tools_with_params(
+                                &cx,
+                                ListToolsParams {
+                                    cursor: None,
+                                    include_tags: Some(vec!["visible".to_owned()]),
+                                    exclude_tags: Some(vec!["hidden".to_owned()]),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    let cancellation = McpRequestCancellation::new();
+                    let mut collection = Box::pin(collect_http_catalog_test_with_cancellation(
+                        &mut client,
+                        &cx,
+                        &cancellation,
+                        "tools/list",
+                    ));
+                    wait_for_pending_extension_http(&mut collection, &rebuild_observed).await;
+                    if cancel_rebuild {
+                        cancellation.cancel();
+                    }
+                    disposition.send(cancel_rebuild).unwrap();
+                    let outcome =
+                        asupersync::time::timeout(cx.now(), Duration::from_secs(1), collection)
+                            .await
+                            .expect("the selected rebuild disposition must settle");
+                    if cancel_rebuild {
+                        assert!(matches!(outcome, Err(HttpClientError::CoreResult(error))
+                            if error.code == McpErrorCode::RequestCancelled));
+                    } else {
+                        let collection = outcome.unwrap();
+                        assert_eq!(collection.pages().len(), 1);
+                        assert_eq!(collection.item_count(), 1);
+                        assert!(collection.pages()[0].encode().unwrap().contains("rebuilt"));
+                    }
+                    assert!(cx.checkpoint().is_ok());
+                    let healthy = collect_http_catalog_test_with_cancellation(
+                        &mut client,
+                        &cx,
+                        &McpRequestCancellation::new(),
+                        "tools/list",
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(healthy.item_count(), 1);
+                    assert!(healthy.pages()[0].encode().unwrap().contains("healthy"));
+                    assert_eq!(
+                        client.next_id.load(Ordering::Relaxed),
+                        if trigger == "cached-prefix" { 5 } else { 6 }
+                    );
+                    assert_eq!(
+                        client.take_final_server_notifications().len(),
+                        usize::from(trigger == "notification")
+                    );
+                });
+                let listener = server.join().unwrap();
+                assert!(matches!(listener.accept(), Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock));
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn cache_03_http_full_catalog_rebuilds_rejected_cursor_once_with_original_filters() {
         for reject_rebuild in [false, true] {
@@ -51797,6 +52437,7 @@ exec sleep 2
             }
             let error = http_test_runtime_block_on(client.collect_http_catalog_with_budget(
                 &Cx::for_request(),
+                None,
                 "tools/list",
                 serde_json::json!({}),
                 FinalCacheResultSet::Tools,
@@ -51901,9 +52542,11 @@ exec sleep 2
                 budget.deadline = Instant::now() + Duration::from_millis(500);
             }
             let started = Instant::now();
+            let cancellation = McpRequestCancellation::new();
             let error = runtime
                 .block_on(client.collect_http_catalog_with_budget(
                     if caller_deadline { &limited } else { &healthy },
+                    caller_deadline.then_some(&cancellation),
                     "tools/list",
                     serde_json::json!({}),
                     FinalCacheResultSet::Tools,

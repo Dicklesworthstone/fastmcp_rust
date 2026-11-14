@@ -1122,6 +1122,15 @@ opaque cursors intact and enforces cumulative page, item, byte, and elapsed
 limits, including the permitted cache rebuild. An error returns no partial
 collection; pass an absent initial cursor.
 
+The modern HTTP facade exposes the same complete catalogs through
+`list_all_tools`, `list_all_resources`, `list_all_resource_templates`, and
+`list_all_prompts`. Each also has a `_with_cancellation` variant accepting a
+request-local `McpRequestCancellation`. One token and one absolute deadline
+cover all pages and the permitted cache rebuild. Cancellation interrupts a
+stalled page and takes precedence over a cache hit, while independently owned
+HTTP executions and the caller's `Cx` remain usable. The returned
+`modern::CollectedCatalog` retains every complete typed page.
+
 ```rust
 use fastmcp_rust::{
     ListToolsParams,

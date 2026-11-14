@@ -5024,14 +5024,18 @@ pub mod modern {
     }
 
     impl CollectedCatalog {
-        #[cfg(unix)]
         fn from_inner(catalog: fastmcp_client::CollectedCatalog) -> McpResult<Self> {
             let method = catalog.method();
             let item_count = catalog.item_count();
             let pages = catalog
                 .into_pages()
                 .into_iter()
-                .map(|page| final_stdio_mrtr_result(method, page))
+                .map(|page| match page {
+                    fastmcp_protocol::CoreResult::Final(result) => Ok(result),
+                    fastmcp_protocol::CoreResult::Legacy(_) => Err(McpError::internal_error(
+                        format!("Modern catalog received a non-final {method} result"),
+                    )),
+                })
                 .collect::<McpResult<Vec<_>>>()?;
             Ok(Self {
                 method,
@@ -7353,6 +7357,134 @@ pub mod modern {
                 ) => Ok(result.payload),
                 _ => Err(unexpected_modern_http_result("prompts/list")),
             }
+        }
+
+        /// Collects every tools page, preserving complete modern result members.
+        ///
+        /// The initial cursor must be absent. Tag filters survive every page
+        /// and the single permitted cursorless rebuild. One absolute deadline
+        /// covers all requests and rebuilds, with ceilings of 1,024 pages,
+        /// 100,000 entries, 64 MiB of encoded results, and 4 KiB per cursor.
+        /// Errors return no partial collection. The local cache consistency
+        /// policy does not establish a server snapshot across pages.
+        pub async fn list_all_tools(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListToolsParams,
+        ) -> Result<CollectedCatalog, HttpClientError> {
+            Ok(CollectedCatalog::from_inner(
+                Box::pin(self.inner.list_all_tools(cx, params)).await?,
+            )?)
+        }
+
+        /// Collects every tools page under one request-local cancellation domain.
+        ///
+        /// The bounds and cache policy of [`Self::list_all_tools`] apply to the
+        /// complete traversal. Cancellation also interrupts a pending HTTP
+        /// response and takes precedence over a ready cache hit. It stops this
+        /// collection while leaving the client, caller context, and independently
+        /// owned executions available for further work.
+        pub async fn list_all_tools_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListToolsParams,
+        ) -> Result<CollectedCatalog, HttpClientError> {
+            Ok(CollectedCatalog::from_inner(
+                Box::pin(
+                    self.inner
+                        .list_all_tools_with_cancellation(cx, cancellation, params),
+                )
+                .await?,
+            )?)
+        }
+
+        /// Collects complete resource pages with the bounds and cache policy of
+        /// [`Self::list_all_tools`]. The initial cursor must be absent.
+        pub async fn list_all_resources(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListResourcesParams,
+        ) -> Result<CollectedCatalog, HttpClientError> {
+            Ok(CollectedCatalog::from_inner(
+                Box::pin(self.inner.list_all_resources(cx, params)).await?,
+            )?)
+        }
+
+        /// Collects resource pages with the cancellation and bounds of
+        /// [`Self::list_all_tools_with_cancellation`].
+        pub async fn list_all_resources_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourcesParams,
+        ) -> Result<CollectedCatalog, HttpClientError> {
+            Ok(CollectedCatalog::from_inner(
+                Box::pin(
+                    self.inner
+                        .list_all_resources_with_cancellation(cx, cancellation, params),
+                )
+                .await?,
+            )?)
+        }
+
+        /// Collects complete resource-template pages with the bounds and cache
+        /// policy of [`Self::list_all_tools`]. The initial cursor must be absent.
+        pub async fn list_all_resource_templates(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListResourceTemplatesParams,
+        ) -> Result<CollectedCatalog, HttpClientError> {
+            Ok(CollectedCatalog::from_inner(
+                Box::pin(self.inner.list_all_resource_templates(cx, params)).await?,
+            )?)
+        }
+
+        /// Collects resource-template pages with the cancellation and bounds of
+        /// [`Self::list_all_tools_with_cancellation`].
+        pub async fn list_all_resource_templates_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourceTemplatesParams,
+        ) -> Result<CollectedCatalog, HttpClientError> {
+            Ok(CollectedCatalog::from_inner(
+                Box::pin(self.inner.list_all_resource_templates_with_cancellation(
+                    cx,
+                    cancellation,
+                    params,
+                ))
+                .await?,
+            )?)
+        }
+
+        /// Collects complete prompt pages with the bounds and cache policy of
+        /// [`Self::list_all_tools`]. The initial cursor must be absent.
+        pub async fn list_all_prompts(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListPromptsParams,
+        ) -> Result<CollectedCatalog, HttpClientError> {
+            Ok(CollectedCatalog::from_inner(
+                Box::pin(self.inner.list_all_prompts(cx, params)).await?,
+            )?)
+        }
+
+        /// Collects prompt pages with the cancellation and bounds of
+        /// [`Self::list_all_tools_with_cancellation`].
+        pub async fn list_all_prompts_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListPromptsParams,
+        ) -> Result<CollectedCatalog, HttpClientError> {
+            Ok(CollectedCatalog::from_inner(
+                Box::pin(
+                    self.inner
+                        .list_all_prompts_with_cancellation(cx, cancellation, params),
+                )
+                .await?,
+            )?)
         }
 
         /// Calls one tool under a caller-owned cancellation domain.

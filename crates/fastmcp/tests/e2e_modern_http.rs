@@ -10763,6 +10763,237 @@ fn e2e_public_http_typed_verbs_resume_stateless_elicitation_with_the_clients_ans
 }
 
 #[test]
+fn e2e_public_http_collects_all_four_catalogs_with_request_cancellation() {
+    let cx = Cx::for_request();
+    let server = HttpServerFixture::spawn_with_configuration(
+        ProtocolPolicy::ModernOnly,
+        None,
+        Some(1),
+        true,
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-full-catalogs", "1.0.0")
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
+    )
+    .expect("modern facade connects to the paginated server");
+    let cancellation = McpRequestCancellation::new();
+    let catalogs = [
+        (
+            "tools/list",
+            3,
+            runtime_block_on_bounded(
+                &cx,
+                client.list_all_tools_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    ListToolsParams::default(),
+                ),
+            )
+            .unwrap(),
+        ),
+        (
+            "resources/list",
+            2,
+            runtime_block_on_bounded(
+                &cx,
+                client.list_all_resources_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    ListResourcesParams::default(),
+                ),
+            )
+            .unwrap(),
+        ),
+        (
+            "resources/templates/list",
+            2,
+            runtime_block_on_bounded(
+                &cx,
+                client.list_all_resource_templates_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    ListResourceTemplatesParams::default(),
+                ),
+            )
+            .unwrap(),
+        ),
+        (
+            "prompts/list",
+            2,
+            runtime_block_on_bounded(
+                &cx,
+                client.list_all_prompts_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    ListPromptsParams::default(),
+                ),
+            )
+            .unwrap(),
+        ),
+    ];
+    for (method, expected, catalog) in catalogs {
+        assert_eq!(catalog.method(), method);
+        assert_eq!(catalog.item_count(), expected, "{method}");
+        assert_eq!(catalog.pages().len(), expected, "one entry per server page");
+        for page in catalog.pages() {
+            let count = match (method, page) {
+                ("tools/list", FinalCoreResult::ToolsList { result, .. }) => {
+                    result.payload.tools.len()
+                }
+                ("resources/list", FinalCoreResult::ResourcesList { result, .. }) => {
+                    result.payload.resources.len()
+                }
+                (
+                    "resources/templates/list",
+                    FinalCoreResult::ResourceTemplatesList { result, .. },
+                ) => result.payload.resource_templates.len(),
+                ("prompts/list", FinalCoreResult::PromptsList { result, .. }) => {
+                    result.payload.prompts.len()
+                }
+                _ => panic!("facade returned another result family for {method}"),
+            };
+            assert_eq!(count, 1);
+        }
+    }
+    assert!(cx.checkpoint().is_ok());
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_catalog_cancellation_precedes_cached_results_and_keeps_client_live() {
+    let cx = Cx::for_request();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server = HttpServerFixture::spawn_with_configuration(
+        ProtocolPolicy::ModernOnly,
+        Some(Arc::new(McpConfigHttpRequestCounter {
+            requests: Arc::clone(&requests),
+        })),
+        Some(8),
+        true,
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-cancel-cached-catalogs", "1.0.0")
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
+    )
+    .unwrap();
+    let warm = [
+        runtime_block_on_bounded(&cx, client.list_all_tools(&cx, ListToolsParams::default()))
+            .unwrap(),
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_resources(&cx, ListResourcesParams::default()),
+        )
+        .unwrap(),
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_resource_templates(&cx, ListResourceTemplatesParams::default()),
+        )
+        .unwrap(),
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_prompts(&cx, ListPromptsParams::default()),
+        )
+        .unwrap(),
+    ];
+    assert!(warm.iter().all(|catalog| catalog.pages().len() == 1));
+    let before = requests.load(Ordering::SeqCst);
+    let hits_before = client.final_result_cache_stats().hits;
+    let cancellation = McpRequestCancellation::new();
+    cancellation.cancel();
+    let cancelled = [
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_tools_with_cancellation(&cx, &cancellation, ListToolsParams::default()),
+        ),
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_resources_with_cancellation(
+                &cx,
+                &cancellation,
+                ListResourcesParams::default(),
+            ),
+        ),
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_resource_templates_with_cancellation(
+                &cx,
+                &cancellation,
+                ListResourceTemplatesParams::default(),
+            ),
+        ),
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_prompts_with_cancellation(
+                &cx,
+                &cancellation,
+                ListPromptsParams::default(),
+            ),
+        ),
+    ];
+    for result in cancelled {
+        assert!(matches!(result,
+            Err(modern::HttpClientError::CoreResult(error))
+                if error.code == McpErrorCode::RequestCancelled));
+    }
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        before,
+        "cancelled traversals make no contact"
+    );
+    assert_eq!(
+        client.final_result_cache_stats().hits,
+        hits_before,
+        "cancellation wins before a cached result is exposed"
+    );
+    assert!(
+        cx.checkpoint().is_ok(),
+        "the request token does not cancel its caller"
+    );
+    let live = McpRequestCancellation::new();
+    let recovered = [
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_tools_with_cancellation(&cx, &live, ListToolsParams::default()),
+        )
+        .unwrap(),
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_resources_with_cancellation(&cx, &live, ListResourcesParams::default()),
+        )
+        .unwrap(),
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_resource_templates_with_cancellation(
+                &cx,
+                &live,
+                ListResourceTemplatesParams::default(),
+            ),
+        )
+        .unwrap(),
+        runtime_block_on_bounded(
+            &cx,
+            client.list_all_prompts_with_cancellation(&cx, &live, ListPromptsParams::default()),
+        )
+        .unwrap(),
+    ];
+    for (catalog, expected) in recovered.iter().zip([3, 2, 2, 2]) {
+        assert_eq!(catalog.item_count(), expected);
+    }
+    assert_eq!(client.final_result_cache_stats().hits, hits_before + 4);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        before,
+        "all four retained terminal pages remain reusable"
+    );
+    runtime_block_on_bounded(&cx, client.ping(&cx)).unwrap();
+    server.shutdown();
+}
+
+#[test]
 fn e2e_public_http_typed_verbs_honor_pre_send_cancellation() {
     let cx = Cx::for_request();
     let server = spawn_modern_facade_http_server(false, None, false);
