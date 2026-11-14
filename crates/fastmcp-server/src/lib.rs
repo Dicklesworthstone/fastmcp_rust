@@ -5348,6 +5348,8 @@ const DEFAULT_MAX_FINAL_SUBSCRIPTION_STREAMS_PER_PRINCIPAL: usize = 32;
 struct FinalSubscriptionAdmissionState {
     total: usize,
     principals: BTreeMap<Option<[u8; 32]>, usize>,
+    event_bytes: usize,
+    principal_event_bytes: BTreeMap<Option<[u8; 32]>, usize>,
 }
 
 /// One charge shared by the opening call, request lease, and every callback
@@ -5375,11 +5377,44 @@ impl Drop for FinalSubscriptionReservation {
     }
 }
 
-/// Per-subscription bounds for events retained by the registry, including its
-/// sole active callback. Concurrent publishers enqueue without waiting for
-/// that callback; exceeding either bound retires only that subscription.
+/// Data events use the LIMIT-01 message and outbound-stream bounds, rather
+/// than the smaller connection-lifetime control-queue allowance. The retained
+/// queue includes its sole active callback; a slow consumer retires only its
+/// own subscription. These encoded-byte limits do not promise decoded heap
+/// sizes or replace the receiving transport's independent admission.
 const MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS: usize = 64;
-const MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES: usize = 256 * 1024;
+const MAX_FINAL_SUBSCRIPTION_EVENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES: usize = 9 * 1024 * 1024;
+const MAX_FINAL_SUBSCRIPTION_PRINCIPAL_EVENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FINAL_SUBSCRIPTION_TOTAL_EVENT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Reserve before making a recipient's payload copy, and retain that charge
+/// through the sender callback. Clearing or removing a stream can release its
+/// waiting events, but cannot release bytes still owned by an active sender.
+struct FinalSubscriptionEventReservation {
+    stream: Arc<FinalSubscriptionReservation>,
+    bytes: usize,
+}
+
+impl Drop for FinalSubscriptionEventReservation {
+    fn drop(&mut self) {
+        let mut admission = self
+            .stream
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.event_bytes -= self.bytes;
+        if let Some(bytes) = admission
+            .principal_event_bytes
+            .get_mut(&self.stream.principal)
+        {
+            *bytes -= self.bytes;
+            if *bytes == 0 {
+                admission.principal_event_bytes.remove(&self.stream.principal);
+            }
+        }
+    }
+}
 
 /// Modern Streamable HTTP has no protocol session identifier.  A listen
 /// response nevertheless owns one connection-local cancellation domain, so
@@ -5502,6 +5537,8 @@ struct FinalSubscriptionRegistry {
     admission: Arc<Mutex<FinalSubscriptionAdmissionState>>,
     max_streams: usize,
     max_streams_per_principal: usize,
+    max_event_bytes: usize,
+    max_event_bytes_per_principal: usize,
     terminating: AtomicBool,
     /// The server and its live listen handles own Task observation. The
     /// runtime keeps only a weak reference; this observer also reaches this
@@ -5839,7 +5876,7 @@ struct FinalSubscriptionEventQueue {
 
 struct FinalSubscriptionQueuedEvent {
     notification: JsonRpcRequest,
-    bytes: usize,
+    reservation: FinalSubscriptionEventReservation,
     admission: Option<Arc<FinalSubscriptionResourceAdmission>>,
     resource: Option<(
         Arc<ResourceSubscriptionBinding>,
@@ -5863,7 +5900,7 @@ impl FinalSubscriptionQueuedEvent {
 
 impl FinalSubscriptionEventQueue {
     fn try_push(&mut self, event: FinalSubscriptionQueuedEvent) -> bool {
-        let bytes = event.bytes;
+        let bytes = event.reservation.bytes;
         if self.retained_events >= MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS
             || bytes > MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES.saturating_sub(self.retained_bytes)
         {
@@ -5900,7 +5937,7 @@ fn final_subscription_event_bytes<T: serde::Serialize>(notification: &T) -> Opti
 
     impl std::io::Write for BoundedSize {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES.saturating_sub(self.0) {
+            if bytes.len() > MAX_FINAL_SUBSCRIPTION_EVENT_BYTES.saturating_sub(self.0) {
                 return Err(std::io::Error::other(
                     "subscription event byte limit exceeded",
                 ));
@@ -5917,6 +5954,56 @@ fn final_subscription_event_bytes<T: serde::Serialize>(notification: &T) -> Opti
     let mut size = BoundedSize(0);
     serde_json::to_writer(&mut size, notification).ok()?;
     Some(size.0)
+}
+
+/// Count the final envelope while borrowing the application's payload. Every
+/// tagged subscription event has an object-valued `params`, including catalog
+/// notifications whose untagged form omitted it.
+fn final_subscription_wire_bytes<T: serde::Serialize>(method: &str, params: &T) -> Option<usize> {
+    #[derive(serde::Serialize)]
+    struct Wire<'a, T> {
+        jsonrpc: &'static str,
+        method: &'a str,
+        params: &'a T,
+    }
+
+    final_subscription_event_bytes(&Wire {
+        jsonrpc: "2.0",
+        method,
+        params,
+    })
+}
+
+/// Replacing one metadata value changes only its encoded length. Inserting
+/// metadata also accounts for the key, braces, colon and any comma. This
+/// admits the exact owner-tagged size before cloning a potentially multi-MiB
+/// Task result or catalog payload; the normal encoder still validates metadata.
+fn final_subscription_tagged_bytes(
+    source_bytes: usize,
+    metadata: Option<&OpenMetadata>,
+    params_empty: bool,
+    subscription_id: &RequestId,
+) -> Option<usize> {
+    let id_bytes = final_subscription_event_bytes(subscription_id)?;
+    let key_bytes = final_subscription_event_bytes(&FINAL_SUBSCRIPTION_ID_META_KEY)?;
+    let bytes = if let Some(metadata) = metadata {
+        if let Some(previous) = metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY) {
+            source_bytes
+                .checked_sub(final_subscription_event_bytes(previous)?)?
+                .checked_add(id_bytes)?
+        } else {
+            source_bytes
+                .checked_add(key_bytes)?
+                .checked_add(1 + id_bytes + usize::from(!metadata.entries().is_empty()))?
+        }
+    } else {
+        source_bytes
+            .checked_add(b"\"_meta\":{}".len())?
+            .checked_add(usize::from(!params_empty))?
+            .checked_add(key_bytes)?
+            .checked_add(1 + id_bytes)?
+    };
+    (bytes <= MAX_FINAL_SUBSCRIPTION_EVENT_BYTES).then_some(bytes)
 }
 
 impl FinalSubscriptionElection {
@@ -6170,6 +6257,8 @@ impl FinalSubscriptionRegistry {
             admission: Arc::new(Mutex::new(FinalSubscriptionAdmissionState::default())),
             max_streams,
             max_streams_per_principal,
+            max_event_bytes: MAX_FINAL_SUBSCRIPTION_TOTAL_EVENT_BYTES,
+            max_event_bytes_per_principal: MAX_FINAL_SUBSCRIPTION_PRINCIPAL_EVENT_BYTES,
             terminating: AtomicBool::new(false),
             #[cfg(feature = "tasks")]
             task_notification_emitter: OnceLock::new(),
@@ -6201,6 +6290,38 @@ impl FinalSubscriptionRegistry {
             admission: Arc::clone(&self.admission),
             principal,
         }))
+    }
+
+    fn reserve_event(
+        &self,
+        stream: &Arc<FinalSubscriptionReservation>,
+        bytes: usize,
+    ) -> Option<FinalSubscriptionEventReservation> {
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let principal_bytes = admission
+            .principal_event_bytes
+            .get(&stream.principal)
+            .copied()
+            .unwrap_or(0);
+        if bytes > self.max_event_bytes.saturating_sub(admission.event_bytes)
+            || bytes
+                > self
+                    .max_event_bytes_per_principal
+                    .saturating_sub(principal_bytes)
+        {
+            return None;
+        }
+        admission.event_bytes += bytes;
+        admission
+            .principal_event_bytes
+            .insert(stream.principal, principal_bytes + bytes);
+        Some(FinalSubscriptionEventReservation {
+            stream: Arc::clone(stream),
+            bytes,
+        })
     }
 
     #[cfg(all(test, feature = "proxy", feature = "tasks"))]
@@ -6534,10 +6655,12 @@ impl FinalSubscriptionRegistry {
             }
             drop(phase);
 
-            let queued_bytes = queued.bytes;
+            let queued_bytes = queued.reservation.bytes;
             let authorized = queued.is_authorized() && !request_cancellation.is_cancel_requested();
+            let event_reservation = queued.reservation;
             let sent = authorized
                 && catch_extension_unwind(|| notification_sender(queued.notification)).is_ok();
+            drop(event_reservation);
             if authorized && !sent {
                 let _ = extension_panic_error("final_subscription_event_sender");
             }
@@ -6628,26 +6751,45 @@ impl FinalSubscriptionRegistry {
                 "only final catalog or resource change notifications may use subscriptions/listen",
             ));
         }
-        // Bound application-owned data before cloning it into recipient-
-        // specific metadata and wire objects. The exact tagged frame is
-        // measured again at each queue, including its subscription ID.
-        let bounded = match &notification {
+        // Borrow the source for sizing; recipient copies are created only
+        // after exact owner-tagged bytes fit both principal and server budgets.
+        let empty_params = fastmcp_protocol::FinalEmptyNotificationParams::default();
+        let (source_bytes, metadata, params_empty) = match &notification {
             ServerNotification::ResourceUpdated(params) => {
-                final_subscription_event_bytes(params).is_some()
+                if params.additional.contains_key("uri") || params.additional.contains_key("_meta") {
+                    return Err(McpError::invalid_params(
+                        "subscription notification additional member collides",
+                    ));
+                }
+                (
+                    final_subscription_wire_bytes(notification.method(), params),
+                    params.meta.as_ref(),
+                    false,
+                )
             }
             ServerNotification::ResourcesListChanged(params)
             | ServerNotification::ToolsListChanged(params)
-            | ServerNotification::PromptsListChanged(params) => params
-                .as_ref()
-                .is_none_or(|params| final_subscription_event_bytes(params).is_some()),
+            | ServerNotification::PromptsListChanged(params) => {
+                let params = params.as_ref().unwrap_or(&empty_params);
+                if params.additional.contains_key("_meta") {
+                    return Err(McpError::invalid_params(
+                        "subscription notification additional member collides",
+                    ));
+                }
+                (
+                    final_subscription_wire_bytes(notification.method(), params),
+                    params.meta.as_ref(),
+                    params.meta.is_none() && params.additional.is_empty(),
+                )
+            }
             _ => unreachable!("only subscription events passed admission above"),
         };
-        if !bounded {
-            return Err(McpError::new(
+        let source_bytes = source_bytes.ok_or_else(|| {
+            McpError::new(
                 McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE),
                 "subscription event byte limit exceeded",
-            ));
-        }
+            )
+        })?;
         let targets = {
             let state = self
                 .inner
@@ -6713,13 +6855,30 @@ impl FinalSubscriptionRegistry {
                 }
                 None
             };
+            let reservation = final_subscription_tagged_bytes(
+                source_bytes,
+                metadata,
+                params_empty,
+                &entry.subscription_id,
+            )
+            .and_then(|bytes| self.reserve_event(&entry._reservation, bytes));
+            let Some(reservation) = reservation else {
+                deliveries.push((entry, None));
+                continue;
+            };
             let event = tag_subscription_notification(&notification, &entry.subscription_id)?;
             let wire = event.encode().map_err(|error| {
                 McpError::internal_error(format!(
                     "failed to encode final subscription notification: {error}"
                 ))
             })?;
-            deliveries.push((entry, wire, resource));
+            let event = FinalSubscriptionQueuedEvent {
+                notification: wire,
+                reservation,
+                admission: entry.resource_admission.clone(),
+                resource,
+            };
+            deliveries.push((entry, Some(event)));
         }
         Ok(self.publish_prepared(deliveries, "final_subscription_event_sender"))
     }
@@ -6745,12 +6904,12 @@ impl FinalSubscriptionRegistry {
         principal: Option<Sha256Digest>,
         target_subscription: Option<(usize, &Arc<FinalSubscriptionElection>)>,
     ) -> McpResult<usize> {
-        if final_subscription_event_bytes(&notification).is_none() {
-            return Err(McpError::new(
+        let source_bytes = final_subscription_event_bytes(&notification).ok_or_else(|| {
+            McpError::new(
                 McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE),
                 "subscription event byte limit exceeded",
-            ));
-        }
+            )
+        })?;
         let task_id = notification.params.task.base().task_id.as_str();
         let targets = {
             let state = self
@@ -6781,26 +6940,36 @@ impl FinalSubscriptionRegistry {
 
         let mut deliveries = Vec::with_capacity(targets.len());
         for entry in targets {
-            let event = tag_task_subscription_notification(&notification, &entry.subscription_id)?;
-            deliveries.push((entry, event, None));
+            let reservation = final_subscription_tagged_bytes(
+                source_bytes,
+                notification.params.meta.as_ref(),
+                false,
+                &entry.subscription_id,
+            )
+            .and_then(|bytes| self.reserve_event(&entry._reservation, bytes));
+            let Some(reservation) = reservation else {
+                deliveries.push((entry, None));
+                continue;
+            };
+            let wire = tag_task_subscription_notification(&notification, &entry.subscription_id)?;
+            let event = FinalSubscriptionQueuedEvent {
+                notification: wire,
+                reservation,
+                admission: entry.resource_admission.clone(),
+                resource: None,
+            };
+            deliveries.push((entry, Some(event)));
         }
         Ok(self.publish_prepared(deliveries, "final_task_subscription_sender"))
     }
 
     fn publish_prepared(
         &self,
-        deliveries: Vec<(
-            FinalSubscriptionEntry,
-            JsonRpcRequest,
-            Option<(
-                Arc<ResourceSubscriptionBinding>,
-                fastmcp_protocol::common_types::AbsoluteUri,
-            )>,
-        )>,
+        deliveries: Vec<(FinalSubscriptionEntry, Option<FinalSubscriptionQueuedEvent>)>,
         panic_boundary: &'static str,
     ) -> usize {
         let mut count = 0;
-        for (entry, notification, resource) in deliveries {
+        for (entry, event) in deliveries {
             if entry
                 .resource_admission
                 .as_ref()
@@ -6809,7 +6978,6 @@ impl FinalSubscriptionRegistry {
                 self.retire_guarded_subscription(&entry);
                 continue;
             }
-            let bytes = final_subscription_event_bytes(&notification);
             let mut phase = entry
                 .election
                 .phase
@@ -6830,14 +6998,7 @@ impl FinalSubscriptionRegistry {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if entry.request_cancellation.is_cancel_requested()
-                || !bytes.is_some_and(|bytes| {
-                    events.try_push(FinalSubscriptionQueuedEvent {
-                        notification,
-                        bytes,
-                        admission: entry.resource_admission.clone(),
-                        resource,
-                    })
-                })
+                || !event.is_some_and(|event| events.try_push(event))
             {
                 events.clear();
                 *phase = FinalSubscriptionPhase::PeerTerminated;
@@ -6918,12 +7079,14 @@ impl FinalSubscriptionRegistry {
         let mut first = true;
         let mut first_delivered = false;
         loop {
-            let bytes = next.bytes;
+            let bytes = next.reservation.bytes;
             let authorized =
                 next.is_authorized() && !entry.request_cancellation.is_cancel_requested();
+            let event_reservation = next.reservation;
             let sent = authorized
                 && catch_extension_unwind(|| (entry.notification_sender)(next.notification))
                     .is_ok();
+            drop(event_reservation);
             if authorized && !sent {
                 let _ = extension_panic_error(panic_boundary);
             }
@@ -7451,10 +7614,11 @@ fn tag_task_subscription_notification(
     JsonRpcRequest::notification_with_raw_params(
         fastmcp_protocol::TASK_STATUS_NOTIFICATION,
         params,
-        // The untagged event was already bounded. Allow owner metadata here;
-        // publish_prepared still enforces the original full event-byte limit
-        // and retires an overflowing subscription through its usual path.
-        2 * MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES,
+        // Publication has already reserved the full owner-tagged frame. The
+        // standalone encoder allows bounded owner metadata growth so callers
+        // can inspect a boundary frame without first allocating an unbounded
+        // result; publication never clones a frame exceeding its event cap.
+        2 * MAX_FINAL_SUBSCRIPTION_EVENT_BYTES,
     )
     .map_err(|error| McpError::internal_error(error.to_string()))
 }
@@ -65847,6 +66011,134 @@ mod lib_unit_tests {
         }
 
         #[test]
+        fn event_fanout_reserves_global_bytes_before_any_recipient_callback() {
+            let event = ServerNotification::ToolsListChanged(None);
+            let event_bytes = serde_json::to_vec(
+                &tag_subscription_notification(&event, &RequestId::Number(1))
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap()
+            .len();
+            let mut registry = FinalSubscriptionRegistry::default();
+            registry.max_event_bytes = 2 * event_bytes;
+            let registry = Arc::new(registry);
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let mut leases = Vec::new();
+            for (owner, subject) in [(100, "alice"), (101, "bob"), (102, "carol")] {
+                let callback_registry = Arc::downgrade(&registry);
+                let callback_observed = Arc::clone(&observed);
+                leases.push(
+                    wire_listen(
+                        &registry,
+                        context(Some(AuthContext::with_subject(subject))),
+                        owner,
+                        Arc::new(move |notification| {
+                            if final_subscription_acknowledgement_notification(&notification) {
+                                return;
+                            }
+                            let registry = callback_registry.upgrade().unwrap();
+                            let bytes = registry.admission.lock().unwrap().event_bytes;
+                            callback_observed.lock().unwrap().push(bytes);
+                        }),
+                    )
+                    .unwrap(),
+                );
+            }
+
+            assert_eq!(registry.publish(event).unwrap(), 2);
+            assert_eq!(*observed.lock().unwrap(), [2 * event_bytes, event_bytes]);
+            assert_eq!(registry.inner.lock().unwrap().entries.len(), 2);
+            assert_eq!(registry.admission.lock().unwrap().event_bytes, 0);
+            assert!(registry.admission.lock().unwrap().principal_event_bytes.is_empty());
+            drop(leases);
+            assert_eq!(registry.admission.lock().unwrap().total, 0);
+        }
+
+        #[test]
+        fn event_principal_budget_survives_removed_active_callback_and_releases_once() {
+            let event = ServerNotification::ToolsListChanged(None);
+            let event_bytes = serde_json::to_vec(
+                &tag_subscription_notification(&event, &RequestId::Number(1))
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap()
+            .len();
+            let mut registry = FinalSubscriptionRegistry::default();
+            registry.max_event_bytes = 2 * event_bytes;
+            registry.max_event_bytes_per_principal = event_bytes;
+            let registry = Arc::new(registry);
+            let alice = context(Some(AuthContext::with_subject("alice")));
+            let bob = context(Some(AuthContext::with_subject("bob")));
+            let (entered_tx, entered_rx) = sync_channel(1);
+            let (release_tx, release_rx) = sync_channel(1);
+            let release_rx = Mutex::new(release_rx);
+            let first = wire_listen(
+                &registry,
+                alice.clone(),
+                110,
+                Arc::new(move |notification| {
+                    if !final_subscription_acknowledgement_notification(&notification) {
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().unwrap().recv().unwrap();
+                    }
+                }),
+            )
+            .unwrap();
+            let first_key = first.key;
+            let first_election = Arc::clone(&first.election);
+            let publishing_registry = Arc::clone(&registry);
+            let publishing = thread::spawn(move || {
+                publishing_registry.publish_selected(
+                    ServerNotification::ToolsListChanged(None),
+                    Some((first_key, &first_election)),
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let second = wire_listen(&registry, alice.clone(), 111, Arc::new(|_| {})).unwrap();
+            let sibling = wire_listen(&registry, bob, 112, Arc::new(|_| {})).unwrap();
+            let refused = registry
+                .publish_selected(event.clone(), Some((second.key, &second.election)))
+                .unwrap();
+            let sibling_published = registry
+                .publish_selected(event.clone(), Some((sibling.key, &sibling.election)))
+                .unwrap();
+            let cancelled = registry.cancel_modern_http_owner(110);
+            drop(first);
+            let retained_after_removal = registry.admission.lock().unwrap().event_bytes;
+            let principal_partitions = registry
+                .admission
+                .lock()
+                .unwrap()
+                .principal_event_bytes
+                .len();
+            // Release before asserting, including on a regression, so the
+            // callback cannot retain a test worker indefinitely.
+            release_tx.send(()).unwrap();
+            assert_eq!(publishing.join().unwrap().unwrap(), 0);
+            assert_eq!(refused, 0, "a second stream cannot evade its principal byte cap");
+            assert_eq!(sibling_published, 1, "another principal retains its allowance");
+            assert!(cancelled);
+            assert_eq!(retained_after_removal, event_bytes);
+            assert_eq!(principal_partitions, 1);
+            assert_eq!(registry.admission.lock().unwrap().event_bytes, 0);
+            assert!(registry.admission.lock().unwrap().principal_event_bytes.is_empty());
+            let replacement = wire_listen(&registry, alice, 113, Arc::new(|_| {})).unwrap();
+            assert_eq!(
+                registry
+                    .publish_selected(event, Some((replacement.key, &replacement.election)))
+                    .unwrap(),
+                1,
+            );
+            drop((second, sibling, replacement));
+            assert_eq!(registry.admission.lock().unwrap().total, 0);
+            assert_eq!(registry.admission.lock().unwrap().event_bytes, 0);
+        }
+
+        #[test]
         fn transport_admission_retains_capacity_until_its_last_body_guard_drops() {
             for fail_delivery in [false, true] {
                 let registry = Arc::new(FinalSubscriptionRegistry::with_capacity(2, 1));
@@ -66342,6 +66634,9 @@ mod lib_unit_tests {
                 .is_empty(),
             "acknowledgement panic must remove the failed opening entry",
         );
+        let admission = registry.admission.lock().unwrap();
+        assert_eq!(admission.event_bytes, 0);
+        assert!(admission.principal_event_bytes.is_empty());
     }
 
     #[test]
@@ -66853,6 +67148,10 @@ mod lib_unit_tests {
                 .contains_key(&held.handle.lease().key),
             "capacity must be released while the failed callback and public handle remain live"
         );
+        assert!(
+            server.final_subscriptions.admission.lock().unwrap().event_bytes > 0,
+            "retiring the queue must not release the still-active callback's bytes"
+        );
         assert_eq!(
             server
                 .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
@@ -66878,6 +67177,135 @@ mod lib_unit_tests {
             "the sibling receives acknowledgement and every publication exactly once"
         );
         assert_eq!(held.max_active.load(Ordering::Acquire), 1);
+        let admission = server.final_subscriptions.admission.lock().unwrap();
+        assert_eq!(admission.event_bytes, 0);
+        assert!(admission.principal_event_bytes.is_empty());
+    }
+
+    #[test]
+    fn final_subscription_event_reservations_match_exact_owner_tagged_wire_bytes() {
+        for owner in [
+            RequestId::Number(1),
+            RequestId::Integer("1.000e+2".to_owned()),
+            RequestId::String("escaped-\"owner\\\n雪".to_owned()),
+        ] {
+            let registry = Arc::new(FinalSubscriptionRegistry::default());
+            let callback_registry = Arc::downgrade(&registry);
+            let delivered = Arc::new(AtomicUsize::new(0));
+            let callback_delivered = Arc::clone(&delivered);
+            let lease = registry
+                .open(
+                    owner,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        resources_list_changed: Some(true),
+                        prompts_list_changed: Some(true),
+                        resource_subscriptions: Some(vec!["file:///budget".to_owned()]),
+                        ..SubscriptionFilter::default()
+                    },
+                    false,
+                    None,
+                    McpRequestCancellation::new(),
+                    None,
+                    Arc::new(move |notification| {
+                        if final_subscription_acknowledgement_notification(&notification) {
+                            return;
+                        }
+                        let registry = callback_registry.upgrade().unwrap();
+                        let bytes = serde_json::to_vec(&notification).unwrap().len();
+                        let admission = registry.admission.lock().unwrap();
+                        assert_eq!(admission.event_bytes, bytes);
+                        assert_eq!(admission.principal_event_bytes.get(&None), Some(&bytes));
+                        callback_delivered.fetch_add(1, Ordering::AcqRel);
+                    }),
+                )
+                .unwrap();
+            assert_eq!(
+                registry
+                    .publish(ServerNotification::ToolsListChanged(None))
+                    .unwrap(),
+                1
+            );
+            for metadata in [
+                None,
+                Some(OpenMetadata::default()),
+                Some(
+                    OpenMetadata::try_from_entries([(
+                        "com.example/note".to_owned(),
+                        serde_json::json!("escaped-\"metadata\\\n雪"),
+                    )])
+                    .unwrap(),
+                ),
+                Some(
+                    OpenMetadata::try_from_entries([
+                        ("com.example/note".to_owned(), serde_json::json!(true)),
+                        (
+                            FINAL_SUBSCRIPTION_ID_META_KEY.to_owned(),
+                            serde_json::json!("old-owner"),
+                        ),
+                    ])
+                    .unwrap(),
+                ),
+            ] {
+                let params = fastmcp_protocol::FinalEmptyNotificationParams {
+                    meta: metadata.clone(),
+                    additional: BTreeMap::new(),
+                };
+                let with_payload = fastmcp_protocol::FinalEmptyNotificationParams {
+                    meta: metadata.clone(),
+                    additional: BTreeMap::from([("payload".to_owned(), serde_json::json!("value"))]),
+                };
+                for notification in [
+                    ServerNotification::ToolsListChanged(Some(params.clone())),
+                    ServerNotification::ResourcesListChanged(Some(with_payload)),
+                    ServerNotification::PromptsListChanged(Some(params)),
+                    ServerNotification::ResourceUpdated(
+                        fastmcp_protocol::FinalResourceUpdatedNotificationParams {
+                            uri: fastmcp_protocol::common_types::AbsoluteUri::parse("file:///budget")
+                                .unwrap(),
+                            meta: metadata,
+                            additional: BTreeMap::new(),
+                        },
+                    ),
+                ] {
+                    assert_eq!(registry.publish(notification).unwrap(), 1);
+                    let admission = registry.admission.lock().unwrap();
+                    assert_eq!(admission.event_bytes, 0);
+                    assert!(admission.principal_event_bytes.is_empty());
+                }
+            }
+            assert_eq!(delivered.load(Ordering::Acquire), 17);
+
+            // Flattened application members must not overwrite the admitted
+            // recipient ID or the resource URI after byte measurement.
+            for notification in [
+                ServerNotification::ToolsListChanged(Some(
+                    fastmcp_protocol::FinalEmptyNotificationParams {
+                        meta: None,
+                        additional: BTreeMap::from([("_meta".to_owned(), serde_json::json!({}))]),
+                    },
+                )),
+                ServerNotification::ResourceUpdated(
+                    fastmcp_protocol::FinalResourceUpdatedNotificationParams {
+                        uri: fastmcp_protocol::common_types::AbsoluteUri::parse("file:///budget")
+                            .unwrap(),
+                        meta: None,
+                        additional: BTreeMap::from([(
+                            "uri".to_owned(),
+                            serde_json::json!("file:///foreign"),
+                        )]),
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    registry.publish(notification).unwrap_err().code,
+                    McpErrorCode::InvalidParams
+                );
+                assert_eq!(delivered.load(Ordering::Acquire), 17);
+                assert_eq!(registry.admission.lock().unwrap().event_bytes, 0);
+                assert!(registry.inner.lock().unwrap().entries.contains_key(&lease.key));
+            }
+        }
     }
 
     #[test]
@@ -66887,8 +67315,15 @@ mod lib_unit_tests {
             let held = HeldFinalSubscription::open(&server, 733);
             let first_server = Arc::clone(&server);
             let first = thread::spawn(move || {
-                first_server
-                    .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                first_server.publish_subscription_notification(ServerNotification::ToolsListChanged(
+                    Some(fastmcp_protocol::FinalEmptyNotificationParams {
+                        meta: None,
+                        additional: BTreeMap::from([(
+                            "payload".to_owned(),
+                            serde_json::json!("x".repeat(2 * 1024 * 1024)),
+                        )]),
+                    }),
+                ))
             });
             held.entered
                 .recv_timeout(Duration::from_secs(2))
@@ -66982,7 +67417,7 @@ mod lib_unit_tests {
                 meta: None,
                 additional: BTreeMap::from([(
                     "payload".to_owned(),
-                    serde_json::json!("x".repeat(MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES + 1)),
+                    serde_json::json!("x".repeat(MAX_FINAL_SUBSCRIPTION_EVENT_BYTES + 1)),
                 )]),
             },
         ));
@@ -67043,8 +67478,8 @@ mod lib_unit_tests {
             serde_json::to_vec(&tag_task_subscription_notification(&empty, &owner_id).unwrap())
                 .unwrap()
                 .len();
-        let exact_padding = MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES - tagged_overhead;
-        let source_bound_padding = MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES - source_overhead;
+        let exact_padding = MAX_FINAL_SUBSCRIPTION_EVENT_BYTES - tagged_overhead;
+        let source_bound_padding = MAX_FINAL_SUBSCRIPTION_EVENT_BYTES - source_overhead;
         for padding in [exact_padding, exact_padding + 1, source_bound_padding] {
             let registry = Arc::new(FinalSubscriptionRegistry::default());
             let mut requested = SubscriptionFilter::default();
@@ -67088,13 +67523,13 @@ mod lib_unit_tests {
             let fits = padding == exact_padding;
             assert_eq!(
                 tagged_bytes,
-                MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES + padding - exact_padding
+                MAX_FINAL_SUBSCRIPTION_EVENT_BYTES + padding - exact_padding
             );
             if padding == source_bound_padding {
-                assert_eq!(untagged_bytes, MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES);
+                assert_eq!(untagged_bytes, MAX_FINAL_SUBSCRIPTION_EVENT_BYTES);
                 let raw: BTreeMap<String, Box<serde_json::value::RawValue>> =
                     serde_json::from_slice(&serde_json::to_vec(&tagged).unwrap()).unwrap();
-                assert!(raw["params"].get().len() > MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES);
+                assert!(raw["params"].get().len() > MAX_FINAL_SUBSCRIPTION_EVENT_BYTES);
             }
             assert_eq!(
                 registry.publish_task(notification).unwrap(),
@@ -67107,7 +67542,7 @@ mod lib_unit_tests {
                 assert_eq!(delivered.method, fastmcp_protocol::TASK_STATUS_NOTIFICATION);
                 assert_eq!(
                     serde_json::to_vec(&delivered).unwrap().len(),
-                    MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES
+                    MAX_FINAL_SUBSCRIPTION_EVENT_BYTES
                 );
                 assert_eq!(
                     delivered.params.as_ref().unwrap()["taskId"],
@@ -67247,6 +67682,9 @@ mod lib_unit_tests {
             }
             let queue = handle.lease().election.opening_events.lock().unwrap();
             assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
+            let admission = server.final_subscriptions.admission.lock().unwrap();
+            assert_eq!(admission.event_bytes, 0);
+            assert!(admission.principal_event_bytes.is_empty());
         }
     }
 
