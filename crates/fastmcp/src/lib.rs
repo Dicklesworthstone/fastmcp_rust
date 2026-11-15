@@ -367,8 +367,12 @@ pub mod client {
 /// the separate doc-hidden [`__private::core`] expansion path.
 pub mod core {
     pub use fastmcp_core::trace::{
-        MAX_BAGGAGE_BYTES, MAX_BAGGAGE_MEMBERS, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES,
-        MAX_TRACESTATE_MEMBERS, TraceContext, TraceContextError, TraceContextRecovery,
+        BaggageForwardingLimits, MAX_BAGGAGE_BYTES, MAX_BAGGAGE_MEMBERS, MAX_TRACE_ORIGIN_BYTES,
+        MAX_TRACE_POLICY_KEY_BYTES, MAX_TRACE_POLICY_KEYS, MAX_TRACE_POLICY_RULES,
+        MAX_TRACE_SCOPE_BYTES, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES, MAX_TRACESTATE_MEMBERS,
+        OutboundTraceDecision, OutboundTracePolicy, TraceContext, TraceContextError,
+        TraceContextRecovery, TraceEndpoint, TracePolicyDiagnostic, TracePolicyError,
+        TracePolicyOutcome, TracePropagationRule, TraceTransport,
     };
     pub use fastmcp_core::{
         ABSOLUTE_URI_HARD_MAX_BYTES, AbsoluteUri, AbsoluteUriComponent, AbsoluteUriError,
@@ -678,8 +682,12 @@ pub use fastmcp_protocol::{
 };
 
 pub use fastmcp_core::trace::{
-    MAX_BAGGAGE_BYTES, MAX_BAGGAGE_MEMBERS, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES,
-    MAX_TRACESTATE_MEMBERS, TraceContextError, TraceContextRecovery,
+    BaggageForwardingLimits, MAX_BAGGAGE_BYTES, MAX_BAGGAGE_MEMBERS, MAX_TRACE_ORIGIN_BYTES,
+    MAX_TRACE_POLICY_KEY_BYTES, MAX_TRACE_POLICY_KEYS, MAX_TRACE_POLICY_RULES,
+    MAX_TRACE_SCOPE_BYTES, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES, MAX_TRACESTATE_MEMBERS,
+    OutboundTraceDecision, OutboundTracePolicy, TraceContextError, TraceContextRecovery,
+    TraceEndpoint, TracePolicyDiagnostic, TracePolicyError, TracePolicyOutcome,
+    TracePropagationRule, TraceTransport,
 };
 /// Bounded public-JWKS and external-signer primitives for the opt-in OIDC
 /// server profile. These APIs intentionally contain no private key material.
@@ -3148,7 +3156,11 @@ pub mod modern {
         StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
         StdioRestartPolicy, SupervisedStdioClient,
     };
-    pub use fastmcp_core::trace::{TraceContextError, TraceContextRecovery};
+    pub use fastmcp_core::trace::{
+        BaggageForwardingLimits, OutboundTraceDecision, OutboundTracePolicy, TraceContextError,
+        TraceContextRecovery, TraceEndpoint, TracePolicyDiagnostic, TracePolicyError,
+        TracePolicyOutcome, TracePropagationRule, TraceTransport,
+    };
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientImplementationInfo, ClientRoot, Cx,
         ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
@@ -12866,6 +12878,11 @@ pub mod prelude {
         TaskRetentionReclamation, TaskRetentionTarget, official_tasks_descriptor,
         official_tasks_empty_settings, register_official_tasks_extension, tasks_extension,
     };
+    pub use crate::{
+        BaggageForwardingLimits, OutboundTraceDecision, OutboundTracePolicy, TraceContext,
+        TraceContextError, TraceContextRecovery, TraceEndpoint, TracePolicyDiagnostic,
+        TracePolicyError, TracePolicyOutcome, TracePropagationRule, TraceTransport,
+    };
     #[cfg(feature = "websocket-experimental")]
     pub use crate::{
         BoundWebSocketServer, WebSocketClient, WebSocketNonquiescentShutdown, WebSocketResponse,
@@ -12934,7 +12951,6 @@ pub mod prelude {
         StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
         StdioRestartPolicy, SupervisedStdioClient,
     };
-    pub use crate::{TraceContext, TraceContextError, TraceContextRecovery};
     #[cfg(feature = "legacy-2024-11-05")]
     pub use crate::{auto, legacy_2024};
 }

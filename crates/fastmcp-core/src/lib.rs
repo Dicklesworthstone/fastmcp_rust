@@ -92,8 +92,12 @@ pub mod trace;
 pub mod uri;
 
 pub use trace::{
-    MAX_BAGGAGE_BYTES, MAX_BAGGAGE_MEMBERS, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES,
-    MAX_TRACESTATE_MEMBERS, TraceContext, TraceContextError, TraceContextRecovery,
+    BaggageForwardingLimits, MAX_BAGGAGE_BYTES, MAX_BAGGAGE_MEMBERS, MAX_TRACE_ORIGIN_BYTES,
+    MAX_TRACE_POLICY_KEY_BYTES, MAX_TRACE_POLICY_KEYS, MAX_TRACE_POLICY_RULES,
+    MAX_TRACE_SCOPE_BYTES, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES, MAX_TRACESTATE_MEMBERS,
+    OutboundTraceDecision, OutboundTracePolicy, TraceContext, TraceContextError,
+    TraceContextRecovery, TraceEndpoint, TracePolicyDiagnostic, TracePolicyError,
+    TracePolicyOutcome, TracePropagationRule, TraceTransport,
 };
 
 pub use stats::{
