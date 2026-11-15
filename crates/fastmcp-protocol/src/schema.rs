@@ -1631,6 +1631,12 @@ fn validate_final_schema_node(
                     "schema array keyword must be an array",
                 )
             })?;
+            if subschemas.is_empty() {
+                return Err(SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "schema array keyword must be nonempty",
+                ));
+            }
             if matches!(keyword, "allOf" | "anyOf" | "oneOf")
                 && subschemas.len() > MAX_COMPOSITION_BRANCHES
             {
@@ -3048,6 +3054,7 @@ fn validate_with_schema_features(
         value,
         "root",
         0,
+        enforce_unevaluated_properties,
         &mut instance_nodes,
         &mut instance_string_work,
         &mut errors,
@@ -3383,6 +3390,7 @@ fn validate_instance_bounds(
     value: &Value,
     path: &str,
     depth: usize,
+    final_semantics: bool,
     node_count: &mut usize,
     string_work: &mut usize,
     errors: &mut Vec<ValidationError>,
@@ -3411,6 +3419,7 @@ fn validate_instance_bounds(
                     item,
                     &format!("{path}[{index}]"),
                     depth + 1,
+                    final_semantics,
                     node_count,
                     string_work,
                     errors,
@@ -3433,6 +3442,7 @@ fn validate_instance_bounds(
                     member,
                     &diagnostic_child_path(path, name),
                     depth + 1,
+                    final_semantics,
                     node_count,
                     string_work,
                     errors,
@@ -3441,7 +3451,21 @@ fn validate_instance_bounds(
                 }
             }
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Value::Number(number) => {
+            // Exact-number bounds apply even when a boolean schema or an
+            // unconstrained field performs no numeric comparison. Admit the
+            // entire instance before applicators can reinterpret a resource
+            // failure as a successful `not` or fallback branch.
+            if final_semantics && ExactDecimal::from_number(number).is_none() {
+                push_error(
+                    errors,
+                    path,
+                    "instance number exceeds exact comparison bound",
+                );
+                return false;
+            }
+        }
+        Value::Null | Value::Bool(_) => {}
     }
     true
 }
@@ -5606,7 +5630,7 @@ impl ExactDecimal {
     }
 
     fn from_number(number: &serde_json::Number) -> Option<Self> {
-        Self::parse(&number.to_string())
+        Self::parse(number.as_str())
     }
 
     fn parse(source: &str) -> Option<Self> {
@@ -5620,7 +5644,7 @@ impl ExactDecimal {
         let (significand, exponent) = match unsigned.split_once(['e', 'E']) {
             Some((significand, exponent)) => {
                 let exponent = exponent.parse::<i64>().ok()?;
-                if exponent.unsigned_abs() as usize > MAX_EXACT_DECIMAL_DIGITS {
+                if exponent.unsigned_abs() > MAX_EXACT_DECIMAL_DIGITS as u64 {
                     return None;
                 }
                 (significand, exponent)
@@ -5650,7 +5674,7 @@ impl ExactDecimal {
             return None;
         }
         let exponent = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
-        if exponent.unsigned_abs() as usize > MAX_EXACT_DECIMAL_DIGITS {
+        if exponent.unsigned_abs() > MAX_EXACT_DECIMAL_DIGITS as u64 {
             return None;
         }
         Some(Self {
@@ -10453,6 +10477,201 @@ mod tests {
         );
     }
 
+    fn schema_instance_numeric_boundary_pairs() -> [(Value, Value); 4] {
+        [
+            (
+                "9".repeat(MAX_EXACT_DECIMAL_DIGITS),
+                "9".repeat(MAX_EXACT_DECIMAL_DIGITS + 1),
+            ),
+            (
+                format!("1e{}", MAX_EXACT_DECIMAL_DIGITS),
+                format!("1e{}", MAX_EXACT_DECIMAL_DIGITS + 1),
+            ),
+            (
+                format!("1e-{}", MAX_EXACT_DECIMAL_DIGITS),
+                format!("1e-{}", MAX_EXACT_DECIMAL_DIGITS + 1),
+            ),
+            (
+                format!("1.0e-{}", MAX_EXACT_DECIMAL_DIGITS - 1),
+                format!("1.0e-{}", MAX_EXACT_DECIMAL_DIGITS),
+            ),
+        ]
+        .map(|(accepted, planted)| {
+            (
+                serde_json::from_str(&accepted).expect("bounded exact JSON number"),
+                serde_json::from_str(&planted).expect("valid JSON outside the exact-number bound"),
+            )
+        })
+    }
+
+    fn schema_instance_numeric_locations(number: &Value) -> [(Value, &'static str); 4] {
+        [
+            (number.clone(), "root"),
+            (json!([number]), "root[0]"),
+            (json!({"declared": number}), "root.declared"),
+            (
+                json!({"uncovered": [{"amount": number}]}),
+                "root.uncovered[0].amount",
+            ),
+        ]
+    }
+
+    #[test]
+    fn admitted_instance_numeric_bounds_positive() {
+        for (number, _) in schema_instance_numeric_boundary_pairs() {
+            for source in [
+                Value::Bool(true),
+                json!({}),
+                json!({"properties": {"declared": true}, "additionalProperties": true}),
+            ] {
+                let schema = admit_final_schema(source.clone()).unwrap();
+                for (instance, _) in schema_instance_numeric_locations(&number) {
+                    schema
+                        .validate(&instance)
+                        .expect("exact numeric boundaries remain admitted in every location");
+                    schema
+                        .validate_strict(&instance)
+                        .expect("strict validation preserves the same numeric boundaries");
+                }
+                assert_eq!(schema.schema(), &source);
+            }
+        }
+    }
+
+    #[test]
+    fn admitted_instance_numeric_bounds_planted_negative() {
+        for (accepted, planted) in schema_instance_numeric_boundary_pairs() {
+            for source in [
+                Value::Bool(true),
+                json!({}),
+                json!({"properties": {"declared": true}, "additionalProperties": true}),
+            ] {
+                let schema = admit_final_schema(source.clone()).unwrap();
+                for ((baseline, _), (instance, path)) in
+                    schema_instance_numeric_locations(&accepted)
+                        .into_iter()
+                        .zip(schema_instance_numeric_locations(&planted))
+                {
+                    schema.validate(&baseline).unwrap();
+                    for strict in [false, true] {
+                        let result = if strict {
+                            schema.validate_strict(&instance)
+                        } else {
+                            schema.validate(&instance)
+                        };
+                        let errors = result.expect_err(
+                            "one extra numeric byte or exponent step must fail before evaluation",
+                        );
+                        assert_eq!(errors.len(), 1);
+                        assert_eq!(errors[0].path, path);
+                        assert_eq!(errors[0].code(), "SchemaResourceLimit");
+                        assert_eq!(
+                            errors[0].message,
+                            "instance number exceeds exact comparison bound"
+                        );
+                    }
+                    schema
+                        .validate(&baseline)
+                        .expect("a rejection does not contaminate subsequent validation");
+                }
+                assert_eq!(schema.schema(), &source);
+            }
+        }
+    }
+
+    #[test]
+    fn admitted_instance_numeric_bounds_cannot_be_swallowed_by_applicators() {
+        let accepted: Value =
+            serde_json::from_str(&format!("-1e{}", MAX_EXACT_DECIMAL_DIGITS)).unwrap();
+        let planted: Value =
+            serde_json::from_str(&format!("-1e{}", MAX_EXACT_DECIMAL_DIGITS + 1)).unwrap();
+        let condition = json!({"properties": {"value": {"minimum": 0}}});
+        for source in [
+            json!({"not": condition.clone()}),
+            json!({"anyOf": [condition.clone(), true]}),
+            json!({"oneOf": [condition.clone(), true]}),
+            json!({"if": condition, "then": false, "else": true}),
+            json!({"$defs": {"unconstrained": true}, "$ref": "#/$defs/unconstrained"}),
+        ] {
+            let schema = admit_final_schema(source.clone()).unwrap();
+            let baseline = json!({"value": accepted.clone()});
+            let instance = json!({"value": planted.clone()});
+            schema.validate(&baseline).unwrap();
+            schema.validate_strict(&baseline).unwrap();
+            for strict in [false, true] {
+                let result = if strict {
+                    schema.validate_strict(&instance)
+                } else {
+                    schema.validate(&instance)
+                };
+                let errors = result.expect_err(
+                    "an unevaluated number cannot become a successful branch mismatch",
+                );
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].path, "root.value");
+                assert_eq!(errors[0].code(), "SchemaResourceLimit");
+            }
+            assert_eq!(schema.schema(), &source);
+        }
+
+        let schema = admit_final_schema(json!({
+            "contains": {"minimum": 0},
+            "minContains": 0
+        }))
+        .unwrap();
+        schema.validate(&json!([accepted])).unwrap();
+        for strict in [false, true] {
+            let instance = json!([planted.clone()]);
+            let result = if strict {
+                schema.validate_strict(&instance)
+            } else {
+                schema.validate(&instance)
+            };
+            let errors = result.expect_err(
+                "minContains zero cannot discard an exact-number resource failure",
+            );
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].path, "root[0]");
+            assert_eq!(errors[0].code(), "SchemaResourceLimit");
+        }
+    }
+
+    #[test]
+    fn exact_number_exponent_bounds_do_not_truncate_on_32_bit_targets() {
+        let schema = admit_final_schema(Value::Bool(true)).unwrap();
+        for source in [
+            "1e4294967296",
+            "1e-4294967296",
+            "0e4294967296",
+            "0e-4294967296",
+            "1.0e4294967296",
+            "1.0e-4294967296",
+        ] {
+            assert!(ExactDecimal::parse(source).is_none());
+            let instance: Value = serde_json::from_str(source).unwrap();
+            let errors = schema
+                .validate(&instance)
+                .expect_err("exponents must be bounded before any target-width conversion");
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].path, "root");
+            assert_eq!(errors[0].code(), "SchemaResourceLimit");
+        }
+    }
+
+    #[test]
+    fn raw_instance_numeric_bounds_preserve_legacy_behavior() {
+        for (_, number) in schema_instance_numeric_boundary_pairs() {
+            for (instance, _) in schema_instance_numeric_locations(&number) {
+                for schema in [Value::Bool(true), json!({})] {
+                    validate(&schema, &instance)
+                        .expect("raw validation retains its historical numeric admission");
+                    validate_strict(&schema, &instance)
+                        .expect("raw strict validation does not select final numeric semantics");
+                }
+            }
+        }
+    }
+
     fn schema_instance_byte_fixture(kind: usize) -> Value {
         let mut value = match kind {
             0 => json!("\u{0001}".repeat(MAX_SCHEMA_INSTANCE_BYTES / 12)),
@@ -10857,6 +11076,62 @@ mod tests {
             accepted["allOf"].as_array().unwrap().len(),
             MAX_COMPOSITION_BRANCHES - 1
         );
+    }
+
+    #[test]
+    fn admitted_schema_array_keywords_reject_empty_arrays_at_all_locations() {
+        for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+            for (path, schema) in [
+                (format!("$.{keyword}"), json!({keyword: []})),
+                (
+                    format!("$.$defs.unused.{keyword}"),
+                    json!({"$defs": {"unused": {keyword: []}}}),
+                ),
+                (
+                    format!("$.else.{keyword}"),
+                    json!({"if": true, "else": {keyword: []}}),
+                ),
+            ] {
+                let error = admit_final_schema(schema)
+                    .expect_err("empty schema arrays must reject even in unused schema locations");
+                assert_eq!(error.path(), path);
+                assert_eq!(error.reason(), "schema array keyword must be nonempty");
+                assert_eq!(error.code(), "InvalidSchema");
+            }
+        }
+    }
+
+    #[test]
+    fn admitted_schema_array_keywords_preserve_singleton_schema_semantics() {
+        for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+            let schema = admit_final_schema(json!({keyword: [{"type": "integer"}]}))
+                .expect("one valid subschema satisfies the schema-array lower bound");
+            let (accepted, rejected) = if keyword == "prefixItems" {
+                (json!([7]), json!(["7"]))
+            } else {
+                (json!(7), json!("7"))
+            };
+            assert!(schema.validate(&accepted).is_ok(), "{keyword}");
+            assert!(schema.validate(&rejected).is_err(), "{keyword}");
+
+            let unconstrained = admit_final_schema(json!({keyword: [true]}))
+                .expect("a singleton true schema is structurally valid");
+            assert!(unconstrained.validate(&json!([null])).is_ok(), "{keyword}");
+            let false_subschema = admit_final_schema(json!({keyword: [false]}))
+                .expect("a singleton false schema is structurally valid");
+            assert!(false_subschema.validate(&json!([null])).is_err(), "{keyword}");
+        }
+    }
+
+    #[test]
+    fn raw_schema_array_keyword_behavior_remains_legacy() {
+        for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+            assert_eq!(
+                validate(&json!({keyword: []}), &json!([0])).is_ok(),
+                matches!(keyword, "prefixItems" | "allOf"),
+                "raw {keyword} behavior must not inherit final-schema admission",
+            );
+        }
     }
 
     #[test]
