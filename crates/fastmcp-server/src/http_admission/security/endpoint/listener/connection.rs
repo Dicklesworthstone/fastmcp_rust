@@ -269,7 +269,7 @@ pub(super) async fn serve(
     )
     .await;
     if peer_departed {
-        // The peer closed or pipelined while the opening ran. Any inline JSON
+        // The peer reset or pipelined while the opening ran. Any inline JSON
         // dispatch has already observed request-local cancellation and
         // settled; an elected SSE stream never started its dispatch. There
         // is no one to deliver to, so close this one-request connection.
@@ -822,8 +822,8 @@ async fn sse(
             }
             match pop_guarded_sse_body_event(&response, &terminal) {
                 Ok(Some(event)) => {
-                    let control = response.is_finished()
-                        && final_subscription_terminal_event(&event);
+                    let control =
+                        response.is_finished() && final_subscription_terminal_event(&event);
                     let complete = final_subscription_terminal_response_event(&event);
                     let bytes = event.to_bytes().map_err(|_| ())?;
                     let prefix = format!("{:X}\r\n", bytes.len());
@@ -860,20 +860,15 @@ async fn sse(
                 Err(_) => return Err(()),
             }
         };
-        finish_sse_body(
-            &terminal,
-            terminal_control,
-            terminal_response,
-            async {
-                guard_response(
-                    cx,
-                    &mut lease,
-                    write_parts(cx, &mut writer, &[b"0\r\n\r\n"], io),
-                )
-                .await
-                .map_err(|_| ())?
-            },
-        )
+        finish_sse_body(&terminal, terminal_control, terminal_response, async {
+            guard_response(
+                cx,
+                &mut lease,
+                write_parts(cx, &mut writer, &[b"0\r\n\r\n"], io),
+            )
+            .await
+            .map_err(|_| ())?
+        })
         .await
     })
     .await;
@@ -889,10 +884,12 @@ async fn sse(
 
 /// Drive request work that runs before any response owner exists while polling
 /// the one outstanding peer read. Unlike [`monitor_response_peer`], a peer
-/// EOF, reset or pipelined byte never drops the work: it only signals the
+/// reset, read error or pipelined byte never drops the work: it only signals the
 /// request-local cancellation domain, and the work is driven to settlement so
-/// its request region and blocking children close normally. The peer read is
-/// never polled again after it completes. Returns whether the peer departed.
+/// its request region and blocking children close normally. A clean EOF after
+/// the complete request body closes only ingress, not the response stream.
+/// The peer read is never polled again after it completes. Returns whether
+/// the response was abandoned, excluding a legal request write-half-close.
 async fn drive_observing_peer<P, F, T>(
     cancellation: &McpRequestCancellation,
     peer: P,
@@ -904,12 +901,16 @@ where
 {
     let mut peer = std::pin::pin!(peer);
     let mut work = std::pin::pin!(work);
+    let mut peer_complete = false;
     let mut departed = false;
     let output = poll_fn(|task| {
-        if !departed && peer.as_mut().poll(task).is_ready() {
-            departed = true;
-            // A finalization that already won keeps its terminal election.
-            cancellation.cancel();
+        if !peer_complete && let Poll::Ready(result) = peer.as_mut().poll(task) {
+            peer_complete = true;
+            if !matches!(result, Ok(0)) {
+                departed = true;
+                // A finalization that already won keeps its terminal election.
+                cancellation.cancel();
+            }
         }
         work.as_mut().poll(task)
     })
@@ -920,12 +921,12 @@ where
 /// Poll the one outstanding peer read before a JSON or SSE response, without a
 /// spawned task or repeatedly cancelling/recreating a partially completed write.
 ///
-/// EOF retires the outstanding request just like a reset. TCP cannot distinguish
-/// a peer dropping its socket from a deliberate write-half-close, so this native
-/// one-request listener requires the client to keep its write side open until
-/// the response completes. Ignoring EOF would leave blocking handlers running
-/// for an absent caller until their deadline, even though they poll cancellation.
-/// Any received byte is unsupported pipelining and also retires the request.
+/// The complete request body has already been admitted. Per RFC 9112 section
+/// 9.6, a clean TCP write-half-close does not abandon the response: retire only
+/// the completed read probe and keep driving the owned response. A full close
+/// cannot be distinguished from that half-close until output fails, so the
+/// existing request-lifetime and write deadlines remain mandatory. A reset,
+/// read error or any extra byte (unsupported pipelining) retires the request.
 ///
 /// Only the existing request-local cancellation domain is signalled; the ambient
 /// Cx and sibling requests are untouched. Its atomic terminal election preserves
@@ -946,10 +947,14 @@ where
     };
     let mut peer = std::pin::pin!(peer);
     let mut response = std::pin::pin!(response);
+    let mut peer_complete = false;
     let result = poll_fn(|task| {
-        if peer.as_mut().poll(task).is_ready() {
-            cancellation.cancel();
-            return Poll::Ready(Err(()));
+        if !peer_complete && let Poll::Ready(result) = peer.as_mut().poll(task) {
+            peer_complete = true;
+            if !matches!(result, Ok(0)) {
+                cancellation.cancel();
+                return Poll::Ready(Err(()));
+            }
         }
         // Do not reject solely because the request token was cancelled: a
         // committed graceful terminal may still need to drain on this socket.
@@ -1001,8 +1006,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Wake, Waker};
 
-    // These tests drive the production response/peer arbitration directly.
-    // They test ownership and scheduling, not TLS or kernel reset behavior.
+    // These probes drive the production response/peer arbitration directly.
+    // The native socket tests below separately exercise kernel FIN and RST.
     struct Tracked<F> {
         future: Pin<Box<F>>,
         polls: Arc<AtomicUsize>,
@@ -1058,7 +1063,10 @@ mod tests {
             let write_polls = AtomicUsize::new(0);
             let peer = poll_fn(|_| {
                 read_polls.fetch_add(1, Ordering::SeqCst);
-                assert!(cx.checkpoint().is_ok(), "ambient shutdown must not masquerade as peer EOF");
+                assert!(
+                    cx.checkpoint().is_ok(),
+                    "ambient shutdown must not masquerade as peer EOF"
+                );
                 match peer_result {
                     0 => Poll::Pending,
                     1 => Poll::Ready(Ok(0)),
@@ -1087,18 +1095,25 @@ mod tests {
             cx.set_cancel_requested(true);
             request.cancel();
             let mut driving = Box::pin(super::super::liveness::drive_connection(
-                &cx, &shutdown, &subscription, Duration::from_secs(1), operation,
+                &cx,
+                &shutdown,
+                &subscription,
+                Duration::from_secs(1),
+                operation,
             ));
             let mut task = Context::from_waker(Waker::noop());
             let result = driving.as_mut().poll(&mut task);
-            if peer_result == 0 {
+            if peer_result <= 1 {
                 assert!(matches!(result, Poll::Ready(Ok(Ok(())))));
                 assert_eq!(write_polls.load(Ordering::SeqCst), 1);
                 assert!(terminal.is_drained());
             } else {
                 assert!(matches!(result, Poll::Ready(Err(_) | Ok(Err(())))));
                 assert_eq!(write_polls.load(Ordering::SeqCst), 0);
-                assert_eq!(terminal.state.load(Ordering::Acquire), crate::FINAL_TERMINAL_FAILED);
+                assert_eq!(
+                    terminal.state.load(Ordering::Acquire),
+                    crate::FINAL_TERMINAL_FAILED
+                );
             }
             assert_eq!(read_polls.load(Ordering::SeqCst), 1);
             assert!(!sibling.is_cancel_requested());
@@ -1130,16 +1145,20 @@ mod tests {
             facts.scopes = vec!["read".to_owned()];
             facts.claims = Some(serde_json::json!({"tenant":"original"}));
             let verifier = crate::StaticTokenVerifier::new([(TOKEN, facts.clone())]).unwrap();
-            let server = Arc::new(Server::new("terminal-lease-test", "1")
-                .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly)
-                .unwrap()
-                .auth_provider(crate::TokenAuthProvider::new(verifier.clone()))
-                .build());
+            let server = Arc::new(
+                Server::new("terminal-lease-test", "1")
+                    .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly)
+                    .unwrap()
+                    .auth_provider(crate::TokenAuthProvider::new(verifier.clone()))
+                    .build(),
+            );
             let request = JsonRpcRequest::new("subscriptions/listen", None, 701_i64);
             let authorization = TransportAuthorization::from_singleton_header(Some(
                 "Bearer native-terminal-lease-token",
             ));
-            let receipt = server.preauthenticate_http_request(&cx, &request, &authorization).unwrap();
+            let receipt = server
+                .preauthenticate_http_request(&cx, &request, &authorization)
+                .unwrap();
             let scopes = ScopeRequestPolicy::new(
                 1,
                 ScopeImplicationPolicy::exact(1).unwrap(),
@@ -1147,18 +1166,38 @@ mod tests {
                     "subscriptions/listen".to_owned(),
                     RequiredScopes::new(vec!["read".to_owned()]).unwrap(),
                 )],
-            ).unwrap();
-            let mut lease = Some(SseAuthorizationLease::new(
-                &cx, server, &request, &authorization, &receipt, scopes,
-                SseRevalidationPolicy::new(Duration::from_millis(100), Duration::from_millis(100), 8).unwrap(),
-            ).unwrap());
+            )
+            .unwrap();
+            let mut lease = Some(
+                SseAuthorizationLease::new(
+                    &cx,
+                    server,
+                    &request,
+                    &authorization,
+                    &receipt,
+                    scopes,
+                    SseRevalidationPolicy::new(
+                        Duration::from_millis(100),
+                        Duration::from_millis(100),
+                        8,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
             match refusal {
                 0 => {}
-                1 => { assert!(verifier.revoke_token(TOKEN).unwrap()); }
+                1 => {
+                    assert!(verifier.revoke_token(TOKEN).unwrap());
+                }
                 2 => {
-                    verifier.replace_tokens_with_expiry([
-                        (TOKEN, facts.clone(), Some(std::time::Instant::now())),
-                    ]).unwrap();
+                    verifier
+                        .replace_tokens_with_expiry([(
+                            TOKEN,
+                            facts.clone(),
+                            Some(std::time::Instant::now()),
+                        )])
+                        .unwrap();
                 }
                 3 => {
                     let mut changed = facts.clone();
@@ -1182,11 +1221,15 @@ mod tests {
             let (subscription, terminal) = elected_drain(&cancellation);
             let writes = AtomicUsize::new(0);
             let operation = async {
-                let result = monitor_response_peer(&cancellation, pending::<io::Result<usize>>(), async {
-                    guard_response(&cx, &mut lease, async {
-                        writes.fetch_add(1, Ordering::SeqCst);
-                    }).await.map_err(|_| ())
-                }).await;
+                let result =
+                    monitor_response_peer(&cancellation, pending::<io::Result<usize>>(), async {
+                        guard_response(&cx, &mut lease, async {
+                            writes.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                        .map_err(|_| ())
+                    })
+                    .await;
                 if result.is_ok() {
                     terminal.mark_drained();
                 } else {
@@ -1196,7 +1239,11 @@ mod tests {
             };
             cx.set_cancel_requested(true);
             let mut driving = Box::pin(super::super::liveness::drive_connection(
-                &cx, &shutdown, &subscription, Duration::from_secs(1), operation,
+                &cx,
+                &shutdown,
+                &subscription,
+                Duration::from_secs(1),
+                operation,
             ));
             let mut task = Context::from_waker(Waker::noop());
             let result = driving.as_mut().poll(&mut task);
@@ -1205,9 +1252,15 @@ mod tests {
                 assert_eq!(writes.load(Ordering::SeqCst), 1);
                 assert!(terminal.is_drained());
             } else {
-                assert!(matches!(result, Poll::Ready(Err(_) | Ok(Err(())))), "refusal={refusal}");
+                assert!(
+                    matches!(result, Poll::Ready(Err(_) | Ok(Err(())))),
+                    "refusal={refusal}"
+                );
                 assert_eq!(writes.load(Ordering::SeqCst), 0);
-                assert_eq!(terminal.state.load(Ordering::Acquire), crate::FINAL_TERMINAL_FAILED);
+                assert_eq!(
+                    terminal.state.load(Ordering::Acquire),
+                    crate::FINAL_TERMINAL_FAILED
+                );
             }
             drop(driving);
             if refusal != 0 {
@@ -1224,11 +1277,11 @@ mod tests {
 
     #[test]
     fn secured_native_subscription_shutdown_flushes_one_owned_cancellation() {
-        use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
         use crate::http_admission::security::endpoint::revalidation::SseRevalidationPolicy;
         use crate::http_admission::security::scope_policy::{
             RequiredScopes, ScopeImplicationPolicy,
         };
+        use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
         const TOKEN: &str = "native-shutdown-transcript-token";
 
         asupersync::runtime::RuntimeBuilder::current_thread()
@@ -1338,6 +1391,337 @@ mod tests {
                     && message.get("result").is_none() && message.get("error").is_none()));
                 assert!(cx.checkpoint().is_ok());
             });
+    }
+
+    #[derive(Default)]
+    struct SecuredPeerControl {
+        released: [AtomicBool; 2],
+        started: [AtomicUsize; 2],
+        effects: [AtomicUsize; 2],
+        cancelled: [AtomicBool; 2],
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum SecuredPeerEvent {
+        Started(usize),
+        Cancelled(usize),
+    }
+
+    struct SecuredPeerTool {
+        control: Arc<SecuredPeerControl>,
+        events: std::sync::mpsc::Sender<SecuredPeerEvent>,
+    }
+
+    impl crate::ToolHandler for SecuredPeerTool {
+        fn definition(&self) -> fastmcp_protocol::Tool {
+            fastmcp_protocol::Tool {
+                name: "secured_peer_probe".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn execution_mode(&self) -> crate::ToolExecutionMode {
+            crate::ToolExecutionMode::Async
+        }
+
+        fn call(
+            &self,
+            _ctx: &fastmcp_core::McpContext,
+            _arguments: serde_json::Value,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::Content>> {
+            panic!("the secured peer probe must run in its owned async request")
+        }
+
+        fn call_final_outcome_async_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            request_cx: &'a Cx,
+            arguments: serde_json::Value,
+        ) -> crate::BoxFuture<'a, fastmcp_core::McpOutcome<crate::FinalToolOutcome>> {
+            struct ObserveCancellation<'a> {
+                tool: &'a SecuredPeerTool,
+                ctx: &'a fastmcp_core::McpContext,
+                request_cx: &'a Cx,
+                slot: usize,
+            }
+
+            impl Drop for ObserveCancellation<'_> {
+                fn drop(&mut self) {
+                    if self.ctx.request_cancellation().is_cancel_requested()
+                        || self.request_cx.is_cancel_requested()
+                    {
+                        self.tool.control.cancelled[self.slot].store(true, Ordering::SeqCst);
+                        let _ = self
+                            .tool
+                            .events
+                            .send(SecuredPeerEvent::Cancelled(self.slot));
+                    }
+                }
+            }
+
+            Box::pin(async move {
+                let slot = arguments["slot"].as_u64().unwrap() as usize;
+                let _cancelled = ObserveCancellation {
+                    tool: self,
+                    ctx,
+                    request_cx,
+                    slot,
+                };
+                self.control.started[slot].fetch_add(1, Ordering::SeqCst);
+                self.events.send(SecuredPeerEvent::Started(slot)).unwrap();
+                loop {
+                    if ctx.checkpoint().is_err() || request_cx.is_cancel_requested() {
+                        return fastmcp_core::Outcome::Cancelled(asupersync::CancelReason::user(
+                            "secured peer probe cancelled before its effect",
+                        ));
+                    }
+                    if self.control.released[slot].load(Ordering::SeqCst) {
+                        break;
+                    }
+                    asupersync::runtime::yield_now().await;
+                }
+                self.control.effects[slot].fetch_add(1, Ordering::SeqCst);
+                if arguments["stream"] == true {
+                    ctx.report_progress_exact(1.into(), Some(1.into()), Some("effect completed"));
+                }
+                let result = crate::handler::promote_legacy_tool_content(vec![
+                    fastmcp_protocol::Content::text(format!("secured effect {slot}")),
+                ])
+                .unwrap();
+                fastmcp_core::Outcome::Ok(crate::FinalToolOutcome::Complete(result))
+            })
+        }
+    }
+
+    fn secured_peer_request(slot: usize, sse: bool) -> Vec<u8> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": slot + 710, "method": "tools/call",
+            "params": {
+                "name": "secured_peer_probe", "arguments": {"slot": slot, "stream": sse},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            },
+        })).unwrap();
+        let accept = if sse {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        let mut request = format!(
+            "POST /mcp HTTP/1.1\r\nhost: service.example\r\nauthorization: Bearer secured-peer-token\r\ncontent-type: application/json\r\naccept: {accept}\r\nmcp-protocol-version: {}\r\nmcp-method: tools/call\r\nmcp-name: secured_peer_probe\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            fastmcp_protocol::FINAL_PROTOCOL_VERSION, body.len(),
+        ).into_bytes();
+        request.extend_from_slice(&body);
+        request
+    }
+
+    fn assert_secured_peer_response(response: &[u8], slot: usize, sse: bool) {
+        let response = std::str::from_utf8(response).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200"), "{response}");
+        let messages = if sse {
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: text/event-stream")
+            );
+            assert!(
+                body.ends_with("0\r\n\r\n"),
+                "the owned stream must flush its terminal chunk"
+            );
+            body.lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+                .collect::<Vec<_>>()
+        } else {
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: application/json")
+            );
+            vec![serde_json::from_str::<serde_json::Value>(body).unwrap()]
+        };
+        let responses = messages
+            .iter()
+            .filter(|message| message.get("id").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            responses.len(),
+            1,
+            "exactly one terminal response: {response}"
+        );
+        assert_eq!(responses[0]["id"], slot + 710);
+        assert!(responses[0].get("error").is_none());
+        assert_eq!(responses[0]["result"]["resultType"], "complete");
+        assert_eq!(
+            responses[0]["result"]["content"][0]["text"],
+            format!("secured effect {slot}")
+        );
+        if sse {
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message["method"] == "notifications/progress")
+            );
+        }
+    }
+
+    fn run_secured_native_peer_case(sse: bool, reset: Option<fn(std::net::TcpStream)>) {
+        use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
+        use std::io::{Read, Write};
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .blocking_threads(1, 4)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let control = Arc::new(SecuredPeerControl::default());
+                let (events, received) = std::sync::mpsc::channel();
+                let verifier = crate::StaticTokenVerifier::new([(
+                    "secured-peer-token",
+                    fastmcp_core::AuthContext::with_subject("secured-peer-owner"),
+                )])
+                .unwrap();
+                let policy = HttpSecurityPolicy::new(
+                    HttpEndpointConfig::new(
+                        "/mcp",
+                        HttpAdmissionLimits::new(32, 8192, 4096).unwrap(),
+                    )
+                    .unwrap(),
+                    "https://service.example",
+                    vec![],
+                )
+                .unwrap();
+                let bound = Box::pin(
+                    Server::new("secured-native-peer", "1")
+                        .protocol_policy(
+                            fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+                        )
+                        .unwrap()
+                        .auth_provider(crate::TokenAuthProvider::new(verifier))
+                        .tool(SecuredPeerTool {
+                            control: Arc::clone(&control),
+                            events,
+                        })
+                        .build()
+                        .bind_secured_http(&cx, "127.0.0.1:0", policy),
+                )
+                .await
+                .unwrap()
+                .with_io_limits(
+                    SecuredHttpIoLimits::new(Duration::from_secs(5), Duration::from_secs(2))
+                        .unwrap(),
+                );
+                let address = bound.local_addr().unwrap();
+                let caller = cx.clone();
+                let observed = Arc::clone(&control);
+                let client = std::thread::spawn(move || -> io::Result<(Vec<u8>, usize)> {
+                    struct StopServer(Cx);
+                    impl Drop for StopServer {
+                        fn drop(&mut self) {
+                            self.0.cancel_with(
+                                asupersync::types::CancelKind::User,
+                                Some("secured peer probe finished"),
+                            );
+                        }
+                    }
+                    let _stop = StopServer(caller);
+                    let open = |slot| -> io::Result<std::net::TcpStream> {
+                        let mut peer = std::net::TcpStream::connect(address)?;
+                        peer.set_read_timeout(Some(Duration::from_secs(5)))?;
+                        peer.set_write_timeout(Some(Duration::from_secs(5)))?;
+                        peer.write_all(&secured_peer_request(slot, sse))?;
+                        peer.flush()?;
+                        assert_eq!(
+                            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+                            SecuredPeerEvent::Started(slot)
+                        );
+                        Ok(peer)
+                    };
+                    let mut peer = open(0)?;
+                    let slot = if let Some(reset_peer) = reset {
+                        let sibling = open(1)?;
+                        reset_peer(peer);
+                        assert_eq!(
+                            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+                            SecuredPeerEvent::Cancelled(0)
+                        );
+                        assert!(!observed.cancelled[1].load(Ordering::SeqCst));
+                        peer = sibling;
+                        1
+                    } else {
+                        // A real FIN on the request direction while the handler
+                        // remains pending must leave the response direction open.
+                        peer.shutdown(std::net::Shutdown::Write)?;
+                        peer.set_read_timeout(Some(Duration::from_millis(100)))?;
+                        let mut probe = [0_u8; 1];
+                        let error = peer
+                            .read(&mut probe)
+                            .expect_err("no response before the handler is released");
+                        assert!(matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ));
+                        assert!(!observed.cancelled[0].load(Ordering::SeqCst));
+                        peer.set_read_timeout(Some(Duration::from_secs(5)))?;
+                        0
+                    };
+                    observed.released[slot].store(true, Ordering::SeqCst);
+                    let mut response = Vec::new();
+                    peer.take(65537).read_to_end(&mut response)?;
+                    assert!(response.len() < 65537, "response must remain bounded");
+                    Ok((response, slot))
+                });
+                let shutdown = Box::pin(bound.serve(&cx)).await.unwrap();
+                let transcript = client.join();
+                if let crate::HttpServerShutdown::Nonquiescent(mut shutdown) = shutdown {
+                    assert_eq!(
+                        shutdown.settle_for(Duration::from_secs(5)).await,
+                        crate::HttpShutdownSettlement::Settled,
+                    );
+                }
+                let (response, slot) = transcript.expect("secured peer client").unwrap();
+                assert_secured_peer_response(&response, slot, sse);
+                assert_eq!(control.started[0].load(Ordering::SeqCst), 1);
+                assert_eq!(control.effects[slot].load(Ordering::SeqCst), 1);
+                assert!(!control.cancelled[slot].load(Ordering::SeqCst));
+                if reset.is_some() {
+                    assert_eq!(control.started[1].load(Ordering::SeqCst), 1);
+                    assert_eq!(control.effects[0].load(Ordering::SeqCst), 0);
+                    assert!(control.cancelled[0].load(Ordering::SeqCst));
+                }
+            });
+    }
+
+    #[test]
+    fn secured_native_http_half_close_preserves_json_and_sse() {
+        for sse in [false, true] {
+            run_secured_native_peer_case(sse, None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secured_native_http_reset_cancels_only_its_request() {
+        for sse in [false, true] {
+            run_secured_native_peer_case(
+                sse,
+                Some(|peer| {
+                    rustix::net::sockopt::set_socket_linger(&peer, Some(Duration::ZERO)).unwrap();
+                    drop(peer);
+                }),
+            );
+        }
     }
 
     async fn registered_body(cx: &Cx) -> (crate::BoundHttpServer, Arc<LiveModernHttpSession>, u64) {
@@ -1582,7 +1966,7 @@ mod tests {
                     let peer = if reset {
                         Err(io::Error::from(io::ErrorKind::ConnectionReset))
                     } else {
-                        Ok(0)
+                        Ok(1)
                     };
                     let result = monitor_response_peer(&cancellation, ready(peer), async {
                         receiver.recv(&cx).await.map_err(|_| ())
@@ -1592,13 +1976,94 @@ mod tests {
                     assert_eq!(
                         receiver.try_recv().unwrap().status.0,
                         201,
-                        "EOF/reset must not consume the queued result"
+                        "pipelining/reset must not consume the queued result"
                     );
                     drop(owner);
                     assert!(cancellation.is_cancel_requested());
                     assert!(registry.retired_dispatches.lock().unwrap().is_empty());
                 }
             });
+    }
+
+    #[test]
+    fn secured_half_close_keeps_response_owned() {
+        for finalized in [false, true] {
+            let cancellation = McpRequestCancellation::new();
+            if finalized {
+                assert!(cancellation.begin_finalization());
+            }
+            let response = Tracked::new(ready(Ok::<_, ()>(7)));
+            let polls = Arc::clone(&response.polls);
+            let drops = Arc::clone(&response.drops);
+            let mut work = Box::pin(monitor_response_peer(&cancellation, ready(Ok(0)), response));
+            let mut task = Context::from_waker(Waker::noop());
+            assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Ok(7)));
+            drop(work);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(!cancellation.is_cancel_requested());
+            assert_eq!(cancellation.is_finalizing(), finalized);
+        }
+    }
+
+    #[test]
+    fn secured_half_close_is_polled_once_during_pending_work() {
+        for abandoned in [false, true] {
+            let cancellation = McpRequestCancellation::new();
+            let peer = Tracked::new(ready(Ok(0)));
+            let peer_polls = Arc::clone(&peer.polls);
+            let release = AtomicBool::new(false);
+            let response = Tracked::new(poll_fn(|_| {
+                if release.load(Ordering::SeqCst) {
+                    Poll::Ready(Ok::<_, ()>(7))
+                } else {
+                    Poll::Pending
+                }
+            }));
+            let drops = Arc::clone(&response.drops);
+            let mut work = Box::pin(monitor_response_peer(&cancellation, peer, response));
+            let mut task = Context::from_waker(Waker::noop());
+            assert!(work.as_mut().poll(&mut task).is_pending());
+            assert!(work.as_mut().poll(&mut task).is_pending());
+            assert!(!cancellation.is_cancel_requested());
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            if !abandoned {
+                release.store(true, Ordering::SeqCst);
+                assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Ok(7)));
+            }
+            drop(work);
+            assert_eq!(peer_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(cancellation.is_cancel_requested(), abandoned);
+        }
+    }
+
+    #[test]
+    fn secured_opening_half_close_preserves_work_and_request() {
+        let cancellation = McpRequestCancellation::new();
+        let peer = Tracked::new(ready(Ok(0)));
+        let peer_polls = Arc::clone(&peer.polls);
+        let release = AtomicBool::new(false);
+        let work = Tracked::new(poll_fn(|_| {
+            if release.load(Ordering::SeqCst) {
+                Poll::Ready(7)
+            } else {
+                Poll::Pending
+            }
+        }));
+        let drops = Arc::clone(&work.drops);
+        let mut opening = Box::pin(drive_observing_peer(&cancellation, peer, work));
+        let mut task = Context::from_waker(Waker::noop());
+        assert!(opening.as_mut().poll(&mut task).is_pending());
+        assert!(opening.as_mut().poll(&mut task).is_pending());
+        assert!(!cancellation.is_cancel_requested());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        release.store(true, Ordering::SeqCst);
+        assert_eq!(opening.as_mut().poll(&mut task), Poll::Ready((7, false)));
+        drop(opening);
+        assert_eq!(peer_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(!cancellation.is_cancel_requested());
     }
 
     #[test]
@@ -1636,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn secured_peer_eof_cancels_only_its_request_context() {
+    fn secured_peer_reset_cancels_only_its_request_context() {
         let cx = Cx::for_testing();
         let cancellation = McpRequestCancellation::new();
         let context = fastmcp_core::McpContext::new(cx.clone(), 7)
@@ -1644,7 +2109,7 @@ mod tests {
         let sibling = fastmcp_core::McpContext::new(cx.clone(), 7);
         let mut work = Box::pin(monitor_response_peer(
             &cancellation,
-            ready(Ok(0)),
+            ready(Err(io::Error::from(io::ErrorKind::ConnectionReset))),
             pending::<Result<(), ()>>(),
         ));
         let mut task = Context::from_waker(Waker::noop());
@@ -1666,9 +2131,9 @@ mod tests {
     #[test]
     fn secured_sse_opening_peer_departure_cancels_but_drives_work_to_settlement() {
         for departure in [
-            Ok(0),
             Ok(1),
             Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+            Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
         ] {
             let cancellation = McpRequestCancellation::new();
             let peer = Tracked::new(ready(departure));
@@ -1712,7 +2177,7 @@ mod tests {
     fn secured_sse_opening_departure_preserves_a_won_finalization() {
         let cancellation = McpRequestCancellation::new();
         assert!(cancellation.begin_finalization());
-        let mut drive = Box::pin(drive_observing_peer(&cancellation, ready(Ok(0)), ready(())));
+        let mut drive = Box::pin(drive_observing_peer(&cancellation, ready(Ok(1)), ready(())));
         let mut task = Context::from_waker(Waker::noop());
         assert_eq!(drive.as_mut().poll(&mut task), Poll::Ready(((), true)));
         assert!(cancellation.is_finalizing());
@@ -1720,9 +2185,9 @@ mod tests {
     }
 
     #[test]
-    fn secured_peer_eof_drops_the_response_without_polling_it() {
+    fn secured_peer_reset_drops_the_response_without_polling_it() {
         let cancellation = McpRequestCancellation::new();
-        let peer = Tracked::new(ready(Ok(0)));
+        let peer = Tracked::new(ready(Err(io::Error::from(io::ErrorKind::ConnectionReset))));
         let reads = Arc::clone(&peer.polls);
         let peer_drops = Arc::clone(&peer.drops);
         let response = Tracked::new(ready(Ok::<_, ()>(7)));
@@ -1747,7 +2212,7 @@ mod tests {
             let peer = if reset {
                 Err(io::Error::from(io::ErrorKind::ConnectionReset))
             } else {
-                Ok(0)
+                Ok(1)
             };
             let mut work = Box::pin(monitor_response_peer(
                 &cancellation,
@@ -1764,7 +2229,7 @@ mod tests {
     }
 
     #[test]
-    fn secured_peer_eof_racing_finalization_has_one_terminal_owner() {
+    fn secured_peer_reset_racing_finalization_has_one_terminal_owner() {
         for _ in 0..64 {
             let cancellation = McpRequestCancellation::new();
             let start = std::sync::Barrier::new(2);
@@ -1775,7 +2240,7 @@ mod tests {
                 });
                 let mut work = Box::pin(monitor_response_peer(
                     &cancellation,
-                    ready(Ok(0)),
+                    ready(Err(io::Error::from(io::ErrorKind::ConnectionReset))),
                     ready(Ok::<_, ()>(7)),
                 ));
                 let mut task = Context::from_waker(Waker::noop());
@@ -1859,6 +2324,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn buffered_delivery_raw_tcp_disconnect_interrupts_post_result_join() {
         asupersync::runtime::RuntimeBuilder::current_thread()
@@ -1934,7 +2400,10 @@ mod tests {
                 .await;
                 assert_eq!(writes.load(Ordering::SeqCst), 0);
                 assert!(!cancellation.is_cancel_requested());
-                drop(peer); // Real FIN, not a fabricated read result or Cx abort.
+                // Use an abortive close: a FIN is also the legal request
+                // write-half-close and cannot establish response abandonment.
+                rustix::net::sockopt::set_socket_linger(&peer, Some(Duration::ZERO)).unwrap();
+                drop(peer);
                 let result =
                     asupersync::time::timeout(cx.now(), Duration::from_secs(2), delivery.as_mut())
                         .await;
@@ -1960,7 +2429,7 @@ mod tests {
                 assert_eq!(
                     writes.load(Ordering::SeqCst),
                     0,
-                    "no buffered response starts after EOF"
+                    "no buffered response starts after reset"
                 );
                 assert!(cancellation.is_cancel_requested());
                 assert!(!sibling.is_cancelled());
@@ -1992,7 +2461,7 @@ mod tests {
                 let disconnected = AtomicBool::new(false);
                 let peer = Tracked::new(poll_fn(|_| {
                     if disconnected.load(Ordering::SeqCst) {
-                        Poll::Ready(Ok(0))
+                        Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)))
                     } else {
                         Poll::Pending
                     }
@@ -2032,7 +2501,7 @@ mod tests {
                 assert_eq!(
                     write_polls.load(Ordering::SeqCst),
                     2,
-                    "no further write poll after observed EOF"
+                    "no further write poll after observed reset"
                 );
                 assert_eq!(write_drops.load(Ordering::SeqCst), 1);
                 assert_eq!(peer_drops.load(Ordering::SeqCst), 1);
