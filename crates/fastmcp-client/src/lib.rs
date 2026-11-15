@@ -14381,6 +14381,92 @@ impl std::error::Error for HttpClientError {
     }
 }
 
+/// Bounds a multi-request HTTP operation on the explicit caller's clock.
+/// The operation must own cleanup of its active exchange when abandoned.
+async fn wait_for_http_operation<T>(
+    cx: &Cx,
+    cancellation: Option<&McpRequestCancellation>,
+    deadline: asupersync::types::Time,
+    timeout_message: &'static str,
+    operation: impl Future<Output = Result<T, HttpClientError>>,
+) -> Result<T, HttpClientError> {
+    // Own the operation, cancellation registrations and timer inside this
+    // guard. Both later polls and destruction retain the admitted authority;
+    // a different host supplies only an intersecting capability ceiling.
+    fastmcp_core::runtime::CallerContextFuture::new(cx, async move {
+        let deadline = cx
+            .budget()
+            .deadline
+            .map_or(deadline, |caller| caller.min(deadline));
+        let check = || -> McpResult<()> {
+            if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                || cx.checkpoint().is_err()
+            {
+                return Err(McpError::request_cancelled());
+            }
+            if cx.now() >= deadline {
+                return Err(McpError::with_data(
+                    McpErrorCode::InternalError,
+                    timeout_message,
+                    serde_json::json!({"timeoutSource": "absolute"}),
+                ));
+            }
+            Ok(())
+        };
+        let mut operation = std::pin::pin!(operation);
+        let mut owner_cancelled = std::pin::pin!(cx.cancelled());
+        let mut cancelled = std::pin::pin!(async {
+            match cancellation {
+                Some(cancellation) => cancellation.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        });
+        let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(deadline));
+        std::future::poll_fn(|task_cx| {
+            // This observer wakes silent work on caller cancellation without
+            // consuming the runtime's or another operation's registration.
+            let _ = owner_cancelled.as_mut().poll(task_cx);
+            if cancelled.as_mut().poll(task_cx).is_ready() {
+                return std::task::Poll::Ready(Err(McpError::request_cancelled().into()));
+            }
+            if let Err(error) = check() {
+                return std::task::Poll::Ready(Err(error.into()));
+            }
+            let result = operation.as_mut().poll(task_cx);
+            // Cancellation or expiry in the completing poll must not publish
+            // a late catalog or repaired tool-call result.
+            if let Err(error) = check() {
+                return std::task::Poll::Ready(Err(error.into()));
+            }
+            if result.is_ready() {
+                return result;
+            }
+            let caller = Cx::current().expect("HTTP operation caller is installed");
+            if !caller.capabilities().time {
+                return std::task::Poll::Ready(Err(McpError::internal_error(
+                    "HTTP operation wait requires caller time capability",
+                )
+                .into()));
+            }
+            if caller.timer_driver().is_none() {
+                return std::task::Poll::Ready(Err(McpError::internal_error(
+                    "HTTP operation wait requires caller timer driver",
+                )
+                .into()));
+            }
+            // Ready cache hits need no timer. Pending work may never register
+            // this sleep on an ambient host's driver or Sleep's fallback.
+            let _ = elapsed.as_mut().poll(task_cx);
+            if let Err(error) = check() {
+                return std::task::Poll::Ready(Err(error.into()));
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    })
+    .await
+}
+
 /// A live final HTTP subscription listener bound to one [`HttpClient`] cache.
 ///
 /// Each accepted catalog or resource event advances the owning client's cache
@@ -16055,6 +16141,8 @@ impl HttpClient {
     /// 1,024 requests/pages, 100,000 entries, 64 MiB of encoded results, 4 KiB
     /// cursors, and the earliest of five minutes, the configured absolute
     /// request timeout, or the caller deadline. Cancellation returns an error.
+    /// Pending traversal uses `cx`'s own clock and timer driver and requires
+    /// its effective time capability; ready cache hits require no timer.
     ///
     /// A cached terminal first page may satisfy the collection. A cached
     /// prefix, rejected continuation cursor, or observed generation/scope
@@ -16259,11 +16347,9 @@ impl HttpClient {
             )
             .into());
         }
-        let stopped = || {
-            cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
-                || cx.checkpoint().is_err()
-        };
-        if stopped() {
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            || cx.checkpoint().is_err()
+        {
             return Err(McpError::request_cancelled().into());
         }
         budget.check_deadline()?;
@@ -16279,35 +16365,20 @@ impl HttpClient {
         // Bound the outstanding HTTP await as well as work between pages.
         // Dropping this one request future preserves its existing cancellation
         // cleanup; it never cancels the shared client or sibling executions.
-        let mut traversal = Box::pin(asupersync::time::timeout_at(
+        wait_for_http_operation(
+            cx,
+            cancellation,
             deadline,
-            self.collect_http_catalog_pages(cx, cancellation, method, parameters, result_set, &mut budget),
-        ));
-        let mut cancelled = cancellation.map(|signal| Box::pin(signal.cancelled()));
-        std::future::poll_fn(|task_cx| {
-            if stopped()
-                || cancelled
-                    .as_mut()
-                    .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready())
-            {
-                return std::task::Poll::Ready(Err(McpError::request_cancelled().into()));
-            }
-            let result = traversal.as_mut().poll(task_cx);
-            // A cancellation selected by the same poll as a completed page
-            // must not publish that page or a successfully rebuilt catalog.
-            if stopped() {
-                return std::task::Poll::Ready(Err(McpError::request_cancelled().into()));
-            }
-            result.map(|result| match result {
-                Ok(result) => result,
-                Err(_) => Err(McpError::with_data(
-                    McpErrorCode::InternalError,
-                    PAGINATION_DEADLINE_ERROR,
-                    serde_json::json!({"timeoutSource": "absolute"}),
-                )
-                .into()),
-            })
-        })
+            PAGINATION_DEADLINE_ERROR,
+            self.collect_http_catalog_pages(
+                cx,
+                cancellation,
+                method,
+                parameters,
+                result_set,
+                &mut budget,
+            ),
+        )
         .await
     }
 
@@ -16970,6 +17041,8 @@ impl HttpClient {
     /// Every refreshed catalog page comes from the peer, including when its
     /// cursor repeats a previously cacheable page. Page/item/byte bounds apply,
     /// and one absolute timeout covers the initial call, refresh and retry.
+    /// The explicit caller owns that timeout and must supply a timer driver
+    /// and effective time capability whenever the operation waits.
     pub async fn call_tool_with_parameter_headers(
         &mut self,
         cx: &Cx,
@@ -16987,46 +17060,42 @@ impl HttpClient {
         });
         let deadline =
             now.saturating_add_nanos(u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX));
-        match asupersync::time::timeout_at(deadline, async {
-            let parameters = serde_json::json!({ "name": name, "arguments": arguments });
-            match self
-                .request_final_core_with_optional_cancellation(
+        wait_for_http_operation(
+            cx,
+            None,
+            deadline,
+            "Parameter-header tool call absolute timeout exceeded",
+            async {
+                let parameters = serde_json::json!({ "name": name, "arguments": arguments });
+                match self
+                    .request_final_core_with_optional_cancellation(
+                        cx,
+                        None,
+                        "tools/call",
+                        parameters.clone(),
+                        Some(reviewed),
+                    )
+                    .await
+                {
+                    Err(HttpClientError::Connection(
+                        ClientHttpConnectionError::ParameterHeaderMismatch { .. },
+                    )) => {}
+                    outcome => return outcome,
+                }
+                let refreshed = self
+                    .refreshed_parameter_headers(cx, reviewed, review)
+                    .await?;
+                self.request_final_core_with_optional_cancellation(
                     cx,
                     None,
                     "tools/call",
-                    parameters.clone(),
-                    Some(reviewed),
+                    parameters,
+                    Some(&refreshed),
                 )
                 .await
-            {
-                Err(HttpClientError::Connection(
-                    ClientHttpConnectionError::ParameterHeaderMismatch { .. },
-                )) => {}
-                outcome => return outcome,
-            }
-            let refreshed = self
-                .refreshed_parameter_headers(cx, reviewed, review)
-                .await?;
-            self.request_final_core_with_optional_cancellation(
-                cx,
-                None,
-                "tools/call",
-                parameters,
-                Some(&refreshed),
-            )
-            .await
-        })
+            },
+        )
         .await
-        {
-            Ok(result) => result,
-            Err(_) if cx.checkpoint().is_err() => Err(McpError::request_cancelled().into()),
-            Err(_) => Err(McpError::with_data(
-                McpErrorCode::InternalError,
-                "Parameter-header tool call absolute timeout exceeded",
-                serde_json::json!({"timeoutSource":"absolute"}),
-            )
-            .into()),
-        }
     }
 
     /// Re-reviews the approved tool from a fresh, uncached `tools/list`.
@@ -30500,6 +30569,313 @@ mod tests {
         assert_eq!(timer.pending_count(), 0);
         assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
         assert!(Cx::current().unwrap().capabilities().io);
+        drop(installed);
+        drop(caller);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn http_operation_wait_uses_only_the_explicit_callers_clock() {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let caller_clock = Arc::new(VirtualClock::new());
+        let caller_timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&caller_clock));
+        let caller_runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(caller_timer.clone())
+            .build()
+            .unwrap();
+        let ambient_clock = Arc::new(VirtualClock::new());
+        let ambient_timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&ambient_clock));
+        let ambient_runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(ambient_timer.clone())
+            .build()
+            .unwrap();
+        let ambient = ambient_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let installed = Cx::set_current(Some(ambient.clone()));
+        let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+
+        for stop in ["deadline", "request", "caller"] {
+            let caller = caller_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let cancellation = McpRequestCancellation::new();
+            let mut waiting = Box::pin(wait_for_http_operation(
+                &caller,
+                Some(&cancellation),
+                caller.now() + Duration::from_secs(1),
+                PAGINATION_DEADLINE_ERROR,
+                std::future::pending::<Result<(), HttpClientError>>(),
+            ));
+            wakes.0.store(0, Ordering::SeqCst);
+            assert!(waiting.as_mut().poll(&mut task).is_pending());
+            assert_eq!(caller_timer.pending_count(), 1);
+            assert_eq!(ambient_timer.pending_count(), 0);
+            assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
+            ambient_clock.advance(2_000_000_000);
+            assert_eq!(ambient_timer.process_timers(), 0);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+            assert!(waiting.as_mut().poll(&mut task).is_pending());
+
+            match stop {
+                "deadline" => {
+                    let fired = caller_runtime.block_on(async {
+                        caller_clock.advance(1_000_000_000);
+                        caller_timer.process_timers()
+                    });
+                    assert_eq!(fired, 1);
+                }
+                "request" => {
+                    cancellation.cancel();
+                }
+                "caller" => caller.cancel_fast(asupersync::types::CancelKind::User),
+                _ => unreachable!(),
+            }
+            assert!(
+                wakes.0.load(Ordering::SeqCst) > 0,
+                "{stop} must wake silent work"
+            );
+            let Poll::Ready(Err(HttpClientError::CoreResult(error))) =
+                waiting.as_mut().poll(&mut task)
+            else {
+                panic!("{stop} must finish without another inner wake");
+            };
+            if stop == "deadline" {
+                assert_eq!(error.message, PAGINATION_DEADLINE_ERROR);
+                assert_eq!(error.data.unwrap()["timeoutSource"], "absolute");
+            } else {
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            }
+            drop(waiting);
+            assert_eq!(caller_timer.pending_count(), 0);
+            assert_eq!(ambient_timer.pending_count(), 0);
+            assert!(ambient.checkpoint().is_ok());
+        }
+
+        // A result produced in the same poll as cancellation or expiry must
+        // never escape the wrapper, even though the inner future is ready.
+        for stop in ["deadline", "request", "caller"] {
+            let caller = caller_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let cancellation = McpRequestCancellation::new();
+            let operation = async {
+                match stop {
+                    "deadline" => {
+                        caller_clock.advance(1_000_000_000);
+                    }
+                    "request" => {
+                        cancellation.cancel();
+                    }
+                    "caller" => caller.cancel_fast(asupersync::types::CancelKind::User),
+                    _ => unreachable!(),
+                }
+                Ok(42)
+            };
+            let mut waiting = Box::pin(wait_for_http_operation(
+                &caller,
+                Some(&cancellation),
+                caller.now() + Duration::from_secs(1),
+                PAGINATION_DEADLINE_ERROR,
+                operation,
+            ));
+            assert!(matches!(
+                waiting.as_mut().poll(&mut task),
+                Poll::Ready(Err(HttpClientError::CoreResult(error)))
+                    if if stop == "deadline" {
+                        error.message == PAGINATION_DEADLINE_ERROR
+                    } else {
+                        error.code == McpErrorCode::RequestCancelled
+                    }
+            ));
+        }
+        assert_eq!(caller_timer.pending_count(), 0);
+        assert_eq!(ambient_timer.pending_count(), 0);
+        drop(installed);
+        drop(ambient);
+        assert!(caller_runtime.shutdown_timeout(Duration::from_secs(1)));
+        assert!(ambient_runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn http_operation_wait_requires_time_only_for_pending_work() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use asupersync::runtime::RuntimeBuilder;
+        use std::task::{Context, Poll, Waker};
+
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let ambient = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let timer = ambient.timer_driver().unwrap();
+        let caller = Cx::for_testing();
+        assert!(caller.timer_driver().is_none());
+        let installed = Cx::set_current(Some(ambient.clone()));
+        let mut task = Context::from_waker(Waker::noop());
+
+        for denied in [false, true] {
+            let restricted =
+                denied.then(|| Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK));
+            let cx = if denied { &ambient } else { &caller };
+            let deadline = cx.now() + Duration::from_secs(60);
+            let mut ready = Box::pin(wait_for_http_operation(
+                cx,
+                None,
+                deadline,
+                PAGINATION_DEADLINE_ERROR,
+                std::future::ready(Ok(42)),
+            ));
+            assert!(matches!(
+                ready.as_mut().poll(&mut task),
+                Poll::Ready(Ok(42))
+            ));
+            drop(ready);
+            let mut pending = Box::pin(wait_for_http_operation(
+                cx,
+                None,
+                deadline,
+                PAGINATION_DEADLINE_ERROR,
+                std::future::pending::<Result<(), HttpClientError>>(),
+            ));
+            let expected = if denied {
+                "HTTP operation wait requires caller time capability"
+            } else {
+                "HTTP operation wait requires caller timer driver"
+            };
+            assert!(matches!(
+                pending.as_mut().poll(&mut task),
+                Poll::Ready(Err(HttpClientError::CoreResult(error)))
+                    if error.code == McpErrorCode::InternalError && error.message == expected
+            ));
+            drop(pending);
+            drop(restricted);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
+        }
+        assert!(caller.checkpoint().is_ok());
+        assert!(ambient.checkpoint().is_ok());
+        drop(installed);
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn http_operation_wait_retains_restrictions_through_completion_and_drop() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use asupersync::runtime::RuntimeBuilder;
+        use std::cell::Cell;
+        use std::task::{Context, Poll, Waker};
+
+        struct DropProbe<'a> {
+            caller: &'a Cx,
+            drops: &'a Cell<usize>,
+            owner_retained: &'a Cell<bool>,
+            io_permitted: &'a Cell<Option<bool>>,
+        }
+        impl Drop for DropProbe<'_> {
+            fn drop(&mut self) {
+                let current = Cx::current();
+                self.owner_retained.set(current.as_ref().is_some_and(|cx| {
+                    cx.task_id() == self.caller.task_id() && cx.timer_driver().is_some()
+                }));
+                self.io_permitted
+                    .set(current.map(|cx| cx.capabilities().io));
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let timer = caller.timer_driver().unwrap();
+        let ambient = Cx::for_testing();
+        let installed = Cx::set_current(Some(ambient.clone()));
+        let mut task = Context::from_waker(Waker::noop());
+
+        for initially_restricted in [false, true] {
+            for complete in [false, true] {
+                let permitted = Cell::new(!initially_restricted);
+                let ready = Cell::new(false);
+                let drops = Cell::new(0);
+                let owner_retained = Cell::new(false);
+                let drop_io = Cell::new(None);
+                let probe = DropProbe {
+                    caller: &caller,
+                    drops: &drops,
+                    owner_retained: &owner_retained,
+                    io_permitted: &drop_io,
+                };
+                let operation = async {
+                    let _probe = probe;
+                    std::future::poll_fn(|_| {
+                        let current = Cx::current().unwrap();
+                        assert_eq!(current.task_id(), caller.task_id());
+                        assert_eq!(current.capabilities().io, permitted.get());
+                        assert!(current.capabilities().time);
+                        if ready.get() {
+                            Poll::Ready(Ok(42))
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await
+                };
+                let restricted = initially_restricted
+                    .then(|| Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK));
+                let mut waiting = Box::pin(wait_for_http_operation(
+                    &caller,
+                    None,
+                    caller.now() + Duration::from_secs(60),
+                    PAGINATION_DEADLINE_ERROR,
+                    operation,
+                ));
+                assert!(waiting.as_mut().poll(&mut task).is_pending());
+                drop(restricted);
+                if !initially_restricted {
+                    let restricted =
+                        Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+                    permitted.set(false);
+                    assert!(waiting.as_mut().poll(&mut task).is_pending());
+                    drop(restricted);
+                }
+                assert_eq!(timer.pending_count(), 1);
+                assert!(Cx::current().unwrap().capabilities().io);
+                if complete {
+                    ready.set(true);
+                    assert!(matches!(
+                        waiting.as_mut().poll(&mut task),
+                        Poll::Ready(Ok(42))
+                    ));
+                    assert_eq!(
+                        drops.get(),
+                        1,
+                        "completion cleans up before restoring the host"
+                    );
+                }
+                drop(waiting);
+                assert_eq!(drops.get(), 1);
+                assert!(owner_retained.get());
+                assert_eq!(drop_io.get(), Some(false));
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
+                assert!(Cx::current().unwrap().capabilities().io);
+            }
+        }
         drop(installed);
         drop(caller);
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
@@ -51346,7 +51722,7 @@ exec sleep 2
             });
             let reviews = std::sync::atomic::AtomicUsize::new(0);
             let outcome = http_test_runtime_block_on(client.call_tool_with_parameter_headers(
-                &Cx::for_request(),
+                &timer_test_caller(),
                 "lookup",
                 serde_json::json!({"region":"east"}),
                 &reviewed,
@@ -51511,7 +51887,7 @@ exec sleep 2
                     ),
                 )
             });
-            let cx = Cx::for_request();
+            let cx = timer_test_caller();
             let include_tags = Some(vec!["visible".to_owned()]);
             let exclude_tags = Some(vec!["hidden".to_owned()]);
             let collection = http_test_runtime_block_on(async {
@@ -51647,6 +52023,211 @@ exec sleep 2
             }
             _ => unreachable!("catalog test method"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalog_foreign_clock_does_not_expire_live_pages() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use fastmcp_core::runtime::CallerContextFuture;
+
+        for cancellable in [false, true] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let caller_timer = TimerDriverHandle::with_virtual_clock(Arc::new(VirtualClock::new()));
+            let runtime = RuntimeBuilder::current_thread()
+                .with_timer_driver(caller_timer.clone())
+                .build()
+                .unwrap();
+            let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let ambient_clock = Arc::new(VirtualClock::new());
+            ambient_clock.advance(3_600_000_000_000);
+            let ambient_timer = TimerDriverHandle::with_virtual_clock(ambient_clock);
+            let ambient_runtime = RuntimeBuilder::current_thread()
+                .with_timer_driver(ambient_timer.clone())
+                .build()
+                .unwrap();
+            let ambient = ambient_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let server = http_catalog_test_server(listener, 2, move |index, request| {
+                assert_eq!(request["method"], "tools/list");
+                assert_eq!(request["id"], 2 + index);
+                assert_eq!(
+                    request["params"]
+                        .get("cursor")
+                        .and_then(serde_json::Value::as_str),
+                    if index == 0 { None } else { Some("tail") }
+                );
+                (
+                    "application/json",
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "result":http_catalog_test_result("tools/list", &format!("page-{index}"),
+                            (index == 0).then_some("tail"), 0, "private")})
+                    .to_string(),
+                )
+            });
+            let cancellation = McpRequestCancellation::new();
+            let collection = runtime
+                .block_on(CallerContextFuture::new(&ambient, async {
+                    if cancellable {
+                        client
+                            .list_all_tools_with_cancellation(
+                                &caller,
+                                &cancellation,
+                                ListToolsParams::default(),
+                            )
+                            .await
+                    } else {
+                        client
+                            .list_all_tools(&caller, ListToolsParams::default())
+                            .await
+                    }
+                }))
+                .expect("a foreign clock cannot expire the explicit caller's traversal");
+            assert_eq!(collection.item_count(), 2);
+            assert_eq!(collection.pages().len(), 2);
+            assert_eq!(server.join().unwrap().len(), 2);
+            assert_eq!(client.next_id.load(Ordering::Relaxed), 4);
+            assert_eq!(caller_timer.pending_count(), 0);
+            assert_eq!(ambient_timer.pending_count(), 0);
+            assert!(caller.checkpoint().is_ok());
+            assert!(ambient.checkpoint().is_ok());
+            assert!(!cancellation.is_cancel_requested());
+            drop(caller);
+            drop(ambient);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            assert!(ambient_runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_http_full_catalog_silent_page_expires_on_callers_clock() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use fastmcp_core::runtime::CallerContextFuture;
+        use std::task::Poll;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let caller_clock = Arc::new(VirtualClock::new());
+        let caller_timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&caller_clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .with_timer_driver(caller_timer.clone())
+            .build()
+            .unwrap();
+        let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let ambient_timer = TimerDriverHandle::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let ambient_runtime = RuntimeBuilder::current_thread()
+            .with_timer_driver(ambient_timer.clone())
+            .build()
+            .unwrap();
+        let ambient = ambient_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (ready, observed) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut discovery = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut discovery);
+            assert_eq!(request["method"], "server/discover");
+            let response =
+                modern_discovery_response("caller-clock-catalog-peer", &[MODERN_PROTOCOL_VERSION]);
+            write_http_cache_test_response(&mut discovery, "application/json", response.as_bytes());
+            let mut first = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut first);
+            assert_eq!(request["id"], 2);
+            assert!(request["params"].get("cursor").is_none());
+            let response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                "result":http_catalog_test_result("tools/list", "partial", Some("pending"), 0, "private")});
+            write_http_cache_test_response(
+                &mut first,
+                "application/json",
+                response.to_string().as_bytes(),
+            );
+            let mut pending = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut pending);
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["params"]["cursor"], "pending");
+            ready.send(()).unwrap();
+            assert_abandoned_http_exchange_closed(
+                &mut pending,
+                false,
+                "the caller's virtual deadline closes the silent page",
+            );
+            let mut healthy = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut healthy);
+            assert_eq!(request["id"], 4, "expiry cannot retry the abandoned page");
+            assert!(request["params"].get("cursor").is_none());
+            let response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                "result":http_catalog_test_result("tools/list", "healthy", None, 0, "private")});
+            write_http_cache_test_response(
+                &mut healthy,
+                "application/json",
+                response.to_string().as_bytes(),
+            );
+            listener
+        });
+        // Set both the facade and its native executor through the builder.
+        // The shared fixture's 2s page timeout would otherwise expire along
+        // with the independently configured 5s traversal timeout below.
+        let policy =
+            RequestTimeoutPolicy::new(Duration::from_secs(30), Duration::from_secs(60)).unwrap();
+        let mut client = runtime
+            .block_on(
+                ClientBuilder::new()
+                    .protocol_plan(http_cache_test_plan(&target))
+                    .request_timeout_policy(policy)
+                    .connect_http_client_with_cx(&caller),
+            )
+            .expect("connect with a longer native page deadline");
+        assert_eq!(client.request_timeout_policy, policy);
+        runtime.block_on(async {
+            let mut budget = PaginationBudget::with_limits(PaginationLimits::DEFAULT);
+            budget.deadline = Instant::now() + Duration::from_secs(5);
+            let mut collection = Box::pin(CallerContextFuture::new(
+                &ambient,
+                client.collect_http_catalog_with_budget(
+                    &caller,
+                    None,
+                    "tools/list",
+                    serde_json::json!({}),
+                    FinalCacheResultSet::Tools,
+                    budget,
+                ),
+            ));
+            wait_for_pending_extension_http(&mut collection, &observed).await;
+            assert_eq!(ambient_timer.pending_count(), 0);
+            // The peer has dispatched both pages and is now completely
+            // silent. Only the caller clock advances; the per-page HTTP
+            // timeout is still far in the future on that same clock.
+            caller_clock.advance(6_000_000_000);
+            assert_eq!(caller_timer.process_timers(), 1);
+            let result = std::future::poll_fn(|task| Poll::Ready(collection.as_mut().poll(task)))
+                .await;
+            assert!(matches!(result,
+                Poll::Ready(Err(HttpClientError::CoreResult(error)))
+                    if error.message == PAGINATION_DEADLINE_ERROR
+                        && error.data.as_ref().is_some_and(|data| data["timeoutSource"] == "absolute")));
+            drop(collection);
+            assert_eq!(caller_timer.pending_count(), 0);
+            assert_eq!(ambient_timer.pending_count(), 0);
+            assert_eq!(client.final_result_cache_stats().fills, 0);
+            assert!(caller.checkpoint().is_ok());
+            let recovered = CallerContextFuture::new(
+                &ambient,
+                client.list_all_tools(&caller, ListToolsParams::default()),
+            )
+            .await
+            .expect("only the expired page was abandoned");
+            assert_eq!(recovered.item_count(), 1);
+            assert!(recovered.pages()[0].encode().unwrap().contains("healthy"));
+        });
+        let listener = server.join().unwrap();
+        assert!(matches!(listener.accept(), Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert_eq!(caller_timer.pending_count(), 0);
+        assert_eq!(ambient_timer.pending_count(), 0);
+        assert!(ambient.checkpoint().is_ok());
+        drop(caller);
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        assert!(ambient_runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
     #[cfg(unix)]
@@ -52134,7 +52715,7 @@ exec sleep 2
                 ("application/json", response.to_string())
             });
             let result = http_test_runtime_block_on(client.list_all_tools(
-                &Cx::for_request(),
+                &timer_test_caller(),
                 ListToolsParams {
                     cursor: None,
                     include_tags: Some(vec!["visible".to_owned()]),
@@ -52280,7 +52861,7 @@ exec sleep 2
             };
             ("application/json", response.to_string())
         });
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         http_test_runtime_block_on(client.list_tools(&cx, None)).unwrap();
         assert!(
             matches!(http_test_runtime_block_on(client.list_tools(&cx, Some("stale"))),
@@ -52331,7 +52912,7 @@ exec sleep 2
                 .to_string(),
             )
         });
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         http_test_runtime_block_on(client.list_tools(&cx, None)).unwrap();
         let collection =
             http_test_runtime_block_on(client.list_all_tools(&cx, ListToolsParams::default()))
@@ -52375,7 +52956,7 @@ exec sleep 2
                     }
                 });
                 let collection = http_test_runtime_block_on(
-                    client.list_all_tools(&Cx::for_request(), ListToolsParams::default()),
+                    client.list_all_tools(&timer_test_caller(), ListToolsParams::default()),
                 )
                 .expect("terminal generation/scope drift gets one whole-list rebuild");
                 assert_eq!(collection.pages().len(), 1);
@@ -52436,7 +53017,7 @@ exec sleep 2
                 _ => unreachable!(),
             }
             let error = http_test_runtime_block_on(client.collect_http_catalog_with_budget(
-                &Cx::for_request(),
+                &timer_test_caller(),
                 None,
                 "tools/list",
                 serde_json::json!({}),
