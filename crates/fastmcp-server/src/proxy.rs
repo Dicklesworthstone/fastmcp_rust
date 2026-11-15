@@ -6,9 +6,9 @@
 #[cfg(feature = "websocket")]
 mod websocket;
 #[cfg(feature = "websocket")]
-pub use websocket::ProxyWebSocketClient;
-#[cfg(feature = "websocket")]
 use websocket::PreparedProxyWebSocketRequest;
+#[cfg(feature = "websocket")]
+pub use websocket::ProxyWebSocketClient;
 
 #[cfg(feature = "tasks")]
 use std::collections::{BTreeSet, VecDeque};
@@ -2253,7 +2253,9 @@ fn final_progress_markers_correlate(
     use fastmcp_protocol::ProgressMarker;
 
     match (expected, observed) {
-        (ProgressMarker::String(expected), ProgressMarker::String(observed)) => expected == observed,
+        (ProgressMarker::String(expected), ProgressMarker::String(observed)) => {
+            expected == observed
+        }
         (ProgressMarker::Number(expected), ProgressMarker::Number(observed)) => {
             RequestId::Integer(expected.as_str().to_owned())
                 .correlates_with(&RequestId::Integer(observed.as_str().to_owned()))
@@ -7757,8 +7759,7 @@ fn relayed_task_filter(
 
 /// Immutable adapter selected for one independently configured upstream leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProxyUpstreamAdapter {
-    /// MCP 2026-07-28 over the upstream stdio adapter.
+pub enum ProxyUpstreamAdapter {    /// MCP 2026-07-28 over the upstream stdio adapter.
     ModernStdio,
     /// Exact MCP 2024-11-05 over the upstream stdio adapter.
     LegacyStdio,
@@ -10211,10 +10212,9 @@ fn forward_final_progress_to_context(
     ctx: &McpContext,
     progress: FinalProgressNotificationParams,
 ) -> McpResult<()> {
-    if !ctx_progress_marker(ctx)
-        .as_ref()
-        .is_some_and(|expected| final_progress_markers_correlate(expected, &progress.progress_token))
-    {
+    if !ctx_progress_marker(ctx).as_ref().is_some_and(|expected| {
+        final_progress_markers_correlate(expected, &progress.progress_token)
+    }) {
         return Ok(());
     }
     let exact_progress = serde_json::from_str(progress.progress.as_str()).map_err(|_| {
@@ -17075,8 +17075,7 @@ IFS= read -r end
     }
 
     #[derive(Clone, Copy, Default)]
-    enum OwnedAsyncFault {
-        #[default]
+    enum OwnedAsyncFault {        #[default]
         None,
         WrongMethod,
         WrongEra,
@@ -28610,7 +28609,11 @@ IFS= read -r end
             super::forward_final_progress_to_context(&context, progress).unwrap();
 
             let delivered = capture.values.lock().unwrap();
-            assert_eq!(delivered.len(), usize::from(matches), "{expected} versus {observed}");
+            assert_eq!(
+                delivered.len(),
+                usize::from(matches),
+                "{expected} versus {observed}"
+            );
             if matches {
                 assert_eq!(
                     delivered.as_slice(),
@@ -28632,7 +28635,8 @@ IFS= read -r end
             .unwrap();
         for (marker, accepted) in [("42", true), ("43", false), (r#""42""#, false)] {
             let state = Arc::new(Mutex::new(OwnedAsyncState::default()));
-            let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::AliasedNumericProgressToken);
+            let proxy =
+                owned_async_proxy(&state, false, OwnedAsyncFault::AliasedNumericProgressToken);
             let capture = Arc::new(ExactProgressCapture::default());
             runtime.block_on(async {
                 let cx = Cx::current().expect("caller runtime is installed");

@@ -118,14 +118,19 @@ impl From<ExitStatus> for StdioProcessExit {
 
 /// An interrupted request's outcome is unknown and explicit reissue is required.
 ///
-/// The server may have committed effects before exiting. This evidence never
+/// The server may have committed effects before the connection was lost. This evidence never
 /// authorizes replay. It is attached to the terminal error delivered to every
 /// outstanding request on the failed generation, including cloned executors.
+/// An absent `process_exit` explicitly means natural exit has not been proven;
+/// connection loss alone cannot authorize process recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StdioInterruptedRequest {
     pub generation: u64,
-    pub process_exit: StdioProcessExit,
+    /// Natural exit proof, when the connection owner observed it before cleanup.
+    /// A send failure reaches pending handles before that OS probe, so those
+    /// handles carry `None`. Missing proof never authorizes a replacement.
+    pub process_exit: Option<StdioProcessExit>,
 }
 
 impl StdioInterruptedRequest {
@@ -149,7 +154,7 @@ impl StdioInterruptedRequest {
     pub(super) fn into_error(self) -> McpError {
         McpError::with_data(
             McpErrorCode::InternalError,
-            "Stdio process exited; request outcome is unknown and explicit reissue is required",
+            "Stdio connection lost; request outcome is unknown and explicit reissue is required",
             serde_json::json!({"stdioInterruption": {
                 "kind": "reissue_required", "outcome": "unknown", "evidence": self,
             }}),
@@ -164,7 +169,46 @@ pub(super) enum StdioRestartObservation {
         generation: u64,
         exit: StdioProcessExit,
     },
+    /// Replacement discovery has no published process generation yet.
+    Provisional,
+    /// Proof survives the handshake's own close so its owner can decide whether
+    /// a further attempt is admissible under the original recovery incident.
+    ProvisionalExited {
+        exit: StdioProcessExit,
+    },
     Refused,
+}
+
+/// A local transport classification retained before terminal send fanout. Peer
+/// error data never constructs this value, and it is not itself exit evidence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StdioDisconnectKind {
+    Closed,
+    BrokenPipe,
+    ConnectionReset,
+    UnexpectedEof,
+}
+
+impl StdioDisconnectKind {
+    pub(crate) fn from_transport(error: &fastmcp_transport::TransportError) -> Option<Self> {
+        use fastmcp_transport::TransportError;
+        match error {
+            TransportError::Closed => Some(Self::Closed),
+            TransportError::Io(error) => match error.kind() {
+                std::io::ErrorKind::BrokenPipe => Some(Self::BrokenPipe),
+                std::io::ErrorKind::ConnectionReset => Some(Self::ConnectionReset),
+                std::io::ErrorKind::UnexpectedEof => Some(Self::UnexpectedEof),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StdioSendDisconnect {
+    pub(crate) generation: u64,
+    pub(crate) kind: StdioDisconnectKind,
 }
 
 /// Emitted only after a new subprocess completes fresh modern discovery.
@@ -374,7 +418,7 @@ impl SupervisedStdioClient {
                 };
                 return Err(owner.fail_and_close(&caller, error).await);
             }
-            owner.client.stdio_restart_observation = Some(StdioRestartObservation::Active(1));
+            owner.client.enable_stdio_supervision(1);
             Ok(owner)
         })
         .await
@@ -439,6 +483,7 @@ impl SupervisedStdioClient {
             return Err(error.clone());
         }
         if self.recovery.is_none() {
+            self.client.settle_supervised_stdio_send_failure();
             let Some(StdioRestartObservation::Exited { generation, exit }) =
                 self.client.stdio_restart_observation
             else {
@@ -546,9 +591,11 @@ impl SupervisedStdioClient {
                         &args,
                         deadline,
                     ) {
-                        Ok(client) => {
+                        Ok(mut client) => {
                             // Store ownership and phase before the handshake's
                             // first await. Cancellation/drop cannot refund spawn.
+                            client.stdio_restart_observation =
+                                Some(StdioRestartObservation::Provisional);
                             self.client = client;
                             self.recovery
                                 .as_mut()
@@ -610,8 +657,7 @@ impl SupervisedStdioClient {
                                     .await);
                             };
                             self.generation = generation;
-                            self.client.stdio_restart_observation =
-                                Some(StdioRestartObservation::Active(generation));
+                            self.client.enable_stdio_supervision(generation);
                             let incident =
                                 self.recovery.take().expect("completed recovery incident");
                             return Ok(StdioRecovery {
@@ -622,6 +668,12 @@ impl SupervisedStdioClient {
                             });
                         }
                         Err(error) => {
+                            let natural_exit = match self.client.stdio_restart_observation {
+                                Some(StdioRestartObservation::ProvisionalExited { exit }) => {
+                                    Some(exit)
+                                }
+                                _ => None,
+                            };
                             // A cancellation before discovery's first write may
                             // return without its internal terminal cleanup. Own
                             // that close here before considering another spawn.
@@ -638,6 +690,13 @@ impl SupervisedStdioClient {
                             if cancellation.is_cancel_requested() || caller.checkpoint().is_err() {
                                 self.schedule_backoff();
                                 return Err(StdioRestartError::Cancelled);
+                            }
+                            if natural_exit.is_some() {
+                                // The failed discovery never exposed a usable
+                                // generation. Only a pre-cleanup natural exit
+                                // admits another attempt in this SAME incident.
+                                self.schedule_backoff();
+                                continue;
                             }
                             // A fresh peer's protocol/handshake rejection is
                             // terminal, not an invitation to start more peers.
@@ -810,11 +869,39 @@ IFS= read -r discovery || exit 81
 case "$discovery" in *'"method":"server/discover"'*) ;; *) exit 82 ;; esac
 case "$discovery" in *'"id":1'*) ;; *) exit 83 ;; esac
 printf '%s\n' discovery >> "$SUPERVISION_LOG"
+first_process=no
+if [ ! -f "$SUPERVISION_FIRST" ]; then first_process=yes; fi
+if [ "$first_process" = no ]; then
+    case "$SUPERVISION_MODE" in
+        recover-discovery-crash)
+            if [ ! -f "$SUPERVISION_FIRST.crashed" ]; then
+                : > "$SUPERVISION_FIRST.crashed"
+                printf '%s\n' discovery-crash-wait >> "$SUPERVISION_LOG"
+                while [ ! -f "$SUPERVISION_GATE" ]; do sleep 0.01; done
+                exit 24
+            fi
+            ;;
+        recover-discovery-malformed)
+            printf '%s\n' 'not-json'
+            exit 24
+            ;;
+        recover-discovery-rejected)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"unsupported"}}'
+            exit 24
+            ;;
+    esac
+fi
 if [ "$SUPERVISION_MODE" = gated ] && [ -f "$SUPERVISION_FIRST" ]; then
     while [ ! -f "$SUPERVISION_GATE" ]; do sleep 0.01; done
 fi
 : > "$SUPERVISION_FIRST"
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"restart-peer","version":"1"}}}}'
+if [ "$SUPERVISION_MODE" = idle-exit ] && [ "$first_process" = yes ]; then exit 23; fi
+if [ "$SUPERVISION_MODE" = live-stdin ]; then
+    exec 0<&-
+    printf '%s\n' stdin-closed >> "$SUPERVISION_LOG"
+    exec sleep 30
+fi
 while IFS= read -r request; do
     case "$request" in
         *'"method":"tools/list"'*)
@@ -984,7 +1071,7 @@ done
                 let (old_executor, mut old_request, error) = crash(&mut owner, &cx).await;
                 let interrupted = StdioInterruptedRequest::from_error(&error).unwrap();
                 assert_eq!(interrupted.generation, 1);
-                assert_eq!(interrupted.process_exit.code, Some(23));
+                assert_eq!(interrupted.process_exit.unwrap().code, Some(23));
                 assert_eq!(fixture.count("effect"), 1);
                 let event = owner
                     .recover(&cx, &McpRequestCancellation::new())
@@ -1025,6 +1112,233 @@ done
                 assert_eq!(fixture.count("effect"), 1);
                 owner.close_with_cx(&cx).await.unwrap();
                 assert!(owner.client().child_cleanup_complete());
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_idle_exit_recovers_after_the_first_send_failure() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let mut owner = fixture.connect(&cx, "idle-exit", quick_policy(2)).await;
+                wait_for_exit(&mut owner, &cx).await;
+                let error = owner
+                    .client_mut()
+                    .unwrap()
+                    .request_core_with_cx(
+                        &cx,
+                        &McpRequestCancellation::new(),
+                        "tools/list",
+                        json!({}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    StdioInterruptedRequest::from_error(&error)
+                        .unwrap()
+                        .generation,
+                    1
+                );
+                assert_eq!(fixture.count("list"), 0);
+                let recovery = owner
+                    .recover(&cx, &McpRequestCancellation::new())
+                    .await
+                    .unwrap();
+                assert_eq!((recovery.previous_generation, recovery.generation), (1, 2));
+                assert_eq!(recovery.process_exit.code, Some(23));
+                assert_eq!(fixture.count("discovery"), 2);
+                assert_eq!(fixture.count("list"), 0, "failed send must not be replayed");
+                owner
+                    .client_mut()
+                    .unwrap()
+                    .request_core_with_cx(
+                        &cx,
+                        &McpRequestCancellation::new(),
+                        "tools/list",
+                        json!({}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(fixture.count("list"), 1);
+                owner.close_with_cx(&cx).await.unwrap();
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_send_failure_publishes_uncertainty_to_existing_handles() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let mut owner = fixture.connect(&cx, "effect", quick_policy(2)).await;
+                let (executor, mut request) = issue_effect(&mut owner, &cx);
+                wait_for_exit(&mut owner, &cx).await;
+                // Observe failure through a cloned public executor, before the
+                // connection owner probes the child or drives an inbound frame.
+                let send_error = executor
+                    .execute(&cx, "tools/list", Some(json!({})))
+                    .unwrap_err();
+                let send_evidence = StdioInterruptedRequest::from_error(&send_error).unwrap();
+                assert_eq!(send_evidence.generation, 1);
+                assert_eq!(send_evidence.process_exit, None);
+                let old_error = executor.try_take_response(&mut request).unwrap_err();
+                assert_eq!(
+                    StdioInterruptedRequest::from_error(&old_error),
+                    Some(send_evidence)
+                );
+                assert_eq!(fixture.count("effect"), 1);
+                let recovery = owner
+                    .recover(&cx, &McpRequestCancellation::new())
+                    .await
+                    .unwrap();
+                assert_eq!(recovery.process_exit.code, Some(23));
+                assert_eq!(recovery.generation, 2);
+                assert_eq!(fixture.count("effect"), 1);
+                assert_eq!(fixture.count("start"), 2);
+                owner.close_with_cx(&cx).await.unwrap();
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_live_stdin_failure_has_uncertainty_but_cannot_restart() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let mut owner = fixture.connect(&cx, "live-stdin", quick_policy(2)).await;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while fixture.count("stdin-closed") == 0 {
+                    assert!(Instant::now() < deadline);
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(2)).await;
+                }
+                assert!(
+                    owner
+                        .client
+                        .child
+                        .as_mut()
+                        .unwrap()
+                        .try_wait()
+                        .unwrap()
+                        .is_none()
+                );
+                let error = owner
+                    .client_mut()
+                    .unwrap()
+                    .request_core_with_cx(
+                        &cx,
+                        &McpRequestCancellation::new(),
+                        "tools/list",
+                        json!({}),
+                    )
+                    .await
+                    .unwrap_err();
+                let evidence = StdioInterruptedRequest::from_error(&error).unwrap();
+                assert_eq!(evidence.process_exit, None);
+                assert!(!error.message.contains("process exited"));
+                assert!(matches!(
+                    owner.recover(&cx, &McpRequestCancellation::new()).await,
+                    Err(StdioRestartError::NotRestartable)
+                ));
+                assert_eq!(fixture.count("start"), 1);
+                assert_eq!(owner.restart_attempts(), 0);
+                assert!(owner.client().child_cleanup_complete());
+                owner.close_with_cx(&cx).await.unwrap();
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_retries_proven_replacement_discovery_exit_within_original_cap() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for attempts in [1, 2] {
+                    let fixture = Fixture::new();
+                    let mut owner = fixture
+                        .connect(&cx, "recover-discovery-crash", quick_policy(attempts))
+                        .await;
+                    let _ = crash(&mut owner, &cx).await;
+                    let token = McpRequestCancellation::new();
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    {
+                        let mut recovery = Box::pin(owner.recover(&cx, &token));
+                        loop {
+                            poll_fn(|task_cx| {
+                                assert!(recovery.as_mut().poll(task_cx).is_pending());
+                                Poll::Ready(())
+                            })
+                            .await;
+                            if fixture.count("discovery-crash-wait") == 1 {
+                                break;
+                            }
+                            assert!(Instant::now() < deadline);
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(2)).await;
+                        }
+                    }
+                    let original_deadline = owner.recovery.as_ref().unwrap().deadline;
+                    assert_eq!(owner.restart_attempts(), 1);
+                    std::fs::write(&fixture.gate, b"exit").unwrap();
+                    wait_for_exit(&mut owner, &cx).await;
+                    let result = owner.recover(&cx, &McpRequestCancellation::new()).await;
+                    if attempts == 1 {
+                        assert!(matches!(result, Err(StdioRestartError::AttemptsExhausted)));
+                        assert_eq!(owner.generation(), 1);
+                        assert_eq!(owner.recovery.as_ref().unwrap().deadline, original_deadline);
+                        assert_eq!(fixture.count("start"), 2);
+                    } else {
+                        let recovery = result.unwrap();
+                        assert_eq!(recovery.attempts, 2);
+                        assert_eq!((recovery.previous_generation, recovery.generation), (1, 2));
+                        assert_eq!(fixture.count("start"), 3);
+                        assert_eq!(fixture.count("discovery"), 3);
+                        owner
+                            .client_mut()
+                            .unwrap()
+                            .request_core_with_cx(
+                                &cx,
+                                &McpRequestCancellation::new(),
+                                "tools/list",
+                                json!({}),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    assert_eq!(owner.restart_attempts(), u64::from(attempts));
+                    assert_eq!(fixture.count("effect"), 1);
+                    owner.close_with_cx(&cx).await.unwrap();
+                }
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_replacement_discovery_protocol_failures_are_not_retried() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for mode in ["recover-discovery-malformed", "recover-discovery-rejected"] {
+                    let fixture = Fixture::new();
+                    let mut owner = fixture.connect(&cx, mode, quick_policy(3)).await;
+                    let _ = crash(&mut owner, &cx).await;
+                    assert!(matches!(
+                        owner.recover(&cx, &McpRequestCancellation::new()).await,
+                        Err(StdioRestartError::Connection(_))
+                    ));
+                    assert_eq!(owner.generation(), 1);
+                    assert_eq!(owner.restart_attempts(), 1);
+                    assert_eq!(fixture.count("start"), 2);
+                    assert!(owner.client().child_cleanup_complete());
+                    owner.close_with_cx(&cx).await.unwrap();
+                }
             });
     }
 

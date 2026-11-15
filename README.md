@@ -998,10 +998,15 @@ with a 100-millisecond initial backoff, a five-second cap, and equal jitter. Att
 the recovery deadline remain charged when a recovery future is dropped or
 cancelled. Dropping an in-progress discovery retains its replacement child for
 resumption; explicit cancellation settles that child before another attempt.
+If a replacement naturally exits during discovery, another attempt can use the
+remaining original budget. Invalid or rejected discovery remains terminal.
 
 An interrupted request carries `StdioInterruptedRequest` diagnostic evidence:
 its outcome is unknown and any reissue must be explicit. Recovery never repeats
 an RPC or transfers old request handles or subscriptions to the replacement.
+Write-side disconnects notify old handles before the process status can be
+checked, so their diagnostic exit evidence can be absent; recovery still
+requires the connection owner's private OS exit proof.
 Protocol errors, application errors, timeouts, cancellation, explicit close,
 EOF from a still-running process, and unverified cleanup do not authorize a
 restart. The command configuration is frozen, but executable file contents are
@@ -1065,8 +1070,8 @@ async fn websocket_gateway(cx: &Cx) -> Result<modern::Server, Box<dyn std::error
 
 The native adapter forwards tools, resources, resource templates, prompts and
 completion, including typed `input_required` continuations and exact unknown
-result fields. Matching progress is forwarded while a request is running;
-accepted log notifications are relayed when that request finishes. Requests
+result fields. Matching progress and requested log notifications are forwarded
+while a request is running, without accumulating them in the retained queue. Requests
 share one cancellation-aware connection owner. Cancelling a queued request has
 no upstream effect, and an active request retains ownership until its native
 cancellation cleanup finishes. Keep the caller runtime alive for the connection.

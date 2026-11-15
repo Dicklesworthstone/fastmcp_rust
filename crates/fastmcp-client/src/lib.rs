@@ -116,11 +116,6 @@ mod session;
 pub mod sse;
 
 pub use builder::ClientBuilder;
-#[cfg(unix)]
-pub use stdio_restart::{
-    StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
-    StdioRestartPolicy, SupervisedStdioClient,
-};
 pub use cache::{
     CachePartitionKey, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,
     FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
@@ -143,7 +138,13 @@ pub use fastmcp_transport::websocket::AsyncWsClientTransport;
 pub use memory::McpAppsMemoryClientWirePolicy;
 pub use memory::{
     MemoryClient, MemoryClientBuilder, MemoryExtensionEvent, MemoryExtensionExecution,
-    MemoryRequestEvent, MemoryRequestExecution, MemorySubscriptionEvent, MemorySubscriptionExecution,
+    MemoryRequestEvent, MemoryRequestExecution, MemorySubscriptionEvent,
+    MemorySubscriptionExecution,
+};
+#[cfg(unix)]
+pub use stdio_restart::{
+    StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
+    StdioRestartPolicy, SupervisedStdioClient,
 };
 // The public re-export is feature-gated, while the client keeps this type
 // internally to reject configuration that names Apps when that feature is
@@ -6970,10 +6971,12 @@ where
     /// is not also retained in [`Self::take_final_progress_notifications`].
     /// Unrelated notifications keep their existing connection ownership.
     ///
-    /// Cancellation before commitment sends no request. After commitment the
-    /// native driver retires the exact request ID and settles its bounded
-    /// cancellation control before returning; a later response cannot satisfy
-    /// another request. The operation is never replayed.
+    /// Cancellation before sending starts writes nothing. Interruption before
+    /// send commitment makes the connection terminal because the request may
+    /// already be partially written. After commitment the native driver retires
+    /// the exact request ID and settles its bounded cancellation control before
+    /// returning; a later response cannot satisfy another request. The
+    /// operation is never replayed.
     pub async fn request_with_raw_result_and_progress(
         &mut self,
         cx: &Cx,
@@ -6981,6 +6984,67 @@ where
         params: Option<serde_json::Value>,
         cancellation: &McpRequestCancellation,
         on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+    ) -> McpResult<WebSocketResponse>
+    where
+        IO: Send + 'static,
+    {
+        self.request_with_raw_result_with_callbacks(
+            cx,
+            method,
+            params,
+            cancellation,
+            on_progress,
+            None,
+        )
+        .await
+    }
+
+    /// Sends one modern request with live progress and log callbacks.
+    ///
+    /// Progress follows [`Self::request_with_raw_result_and_progress`]. Log
+    /// notifications are validated and consumed as they arrive, retaining
+    /// their JSON data and open members without filling the connection queue.
+    /// The log callback runs only when this request's metadata selects a
+    /// `io.modelcontextprotocol/logLevel` and the message meets that floor.
+    /// Valid unrequested or lower-severity logs are consumed without delivery.
+    /// Delivered logs are not repeated by [`Self::take_final_server_notifications`].
+    /// Catalog, resource, and subscription notifications retain their existing
+    /// owners and are never passed to either callback.
+    ///
+    /// Neither callback changes the request's parameters or activates logging
+    /// implicitly. Cancellation and interrupted sends retain the same bounded
+    /// native ownership rules as the progress-only method.
+    pub async fn request_with_raw_result_and_progress_and_logs(
+        &mut self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+        cancellation: &McpRequestCancellation,
+        on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+        on_log: &mut (dyn FnMut(FinalLogMessageParams) + Send),
+    ) -> McpResult<WebSocketResponse>
+    where
+        IO: Send + 'static,
+    {
+        self.request_with_raw_result_with_callbacks(
+            cx,
+            method,
+            params,
+            cancellation,
+            on_progress,
+            Some(on_log),
+        )
+        .await
+    }
+
+    async fn request_with_raw_result_with_callbacks(
+        &mut self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+        cancellation: &McpRequestCancellation,
+        on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+        on_log: Option<&mut (dyn FnMut(FinalLogMessageParams) + Send)>,
     ) -> McpResult<WebSocketResponse>
     where
         IO: Send + 'static,
@@ -6999,12 +7063,13 @@ where
         let method = method.into();
         self.admit_raw_client_request(&method, params.as_ref())?;
         let id = self.allocate_request_id().await?;
-        self.request_admitted_with_raw_result_with_deadline_and_progress(
+        self.request_admitted_with_raw_result_with_deadline_and_callbacks(
             cx,
             JsonRpcRequest::new(method, params, id),
             Some(cancellation),
             None,
             Some(on_progress),
+            on_log,
         )
         .await
     }
@@ -7032,23 +7097,25 @@ where
     where
         IO: Send + 'static,
     {
-        self.request_admitted_with_raw_result_with_deadline_and_progress(
+        self.request_admitted_with_raw_result_with_deadline_and_callbacks(
             cx,
             request,
             cancellation,
             operation_deadline,
             None,
+            None,
         )
         .await
     }
 
-    async fn request_admitted_with_raw_result_with_deadline_and_progress(
+    async fn request_admitted_with_raw_result_with_deadline_and_callbacks(
         &mut self,
         cx: &Cx,
         request: JsonRpcRequest,
         cancellation: Option<&McpRequestCancellation>,
         operation_deadline: Option<Instant>,
         mut on_progress: Option<&mut (dyn FnMut(FinalProgressNotificationParams) + Send)>,
+        mut on_log: Option<&mut (dyn FnMut(FinalLogMessageParams) + Send)>,
     ) -> McpResult<WebSocketResponse>
     where
         IO: Send + 'static,
@@ -7066,6 +7133,23 @@ where
         }
         let timeout_policy = self.request_timeout_policy;
         timeout_policy.validate()?;
+        let log_rank = |level: LoggingLevel| match level {
+            LoggingLevel::Debug => 1,
+            LoggingLevel::Info => 2,
+            LoggingLevel::Notice => 3,
+            LoggingLevel::Warning => 4,
+            LoggingLevel::Error => 5,
+            LoggingLevel::Critical => 6,
+            LoggingLevel::Alert => 7,
+            LoggingLevel::Emergency => 8,
+        };
+        let minimum_log_rank = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get(FINAL_LOG_LEVEL_META_KEY))
+            .and_then(|level| serde_json::from_value::<LoggingLevel>(level.clone()).ok())
+            .map(log_rank);
         let expected_progress_key = request
             .params
             .as_ref()
@@ -7103,7 +7187,8 @@ where
             send_deadline.wait(cx, None, interruptible).await
         };
         if let Err(error) = sent.and_then(|result| result.map_err(transport_error_to_mcp)) {
-            if owner.state.phase.load(Ordering::Acquire) == WebSocketTransientRequestState::WAITING {
+            if owner.state.phase.load(Ordering::Acquire) == WebSocketTransientRequestState::WAITING
+            {
                 // A caller deadline can win in the same poll that commits the
                 // frame. Retire that exact request through the normal control
                 // path, preserving the reusable connection when cleanup wins.
@@ -7255,6 +7340,49 @@ where
             self.expire_live_websocket_subscriptions_at(received_at)
                 .await?;
             let JsonRpcMessage::Response(response) = frame.message() else {
+                if on_log.is_some()
+                    && self.selected_protocol_era() == ProtocolEra::Modern2026
+                    && let JsonRpcMessage::Request(notification) = frame.message()
+                    && notification.method == NOTIFICATIONS_MESSAGE
+                {
+                    // Live logs have no retained-queue owner. Admit the same
+                    // server union first, then decode its own raw parameters
+                    // directly so a Value round trip cannot respell log data.
+                    // No catalog or subscription notification enters this path.
+                    let admitted = (|| -> McpResult<FinalLogMessageParams> {
+                        let raw = raw_notification_params_from_frame(frame.source())?;
+                        let decoded = decode_final_server_notification(notification, raw.as_deref())
+                            .map_err(|error| {
+                                McpError::invalid_request(format!(
+                                    "WebSocket final server notification is invalid: {error}"
+                                ))
+                            })?;
+                        let ServerNotification::Message(message) = decoded else {
+                            unreachable!("notifications/message selects only the log branch");
+                        };
+                        match raw {
+                            Some(raw) => serde_json::from_str(&raw).map_err(|_| {
+                                McpError::invalid_request(
+                                    "WebSocket final log parameters are invalid",
+                                )
+                            }),
+                            None => Ok(message),
+                        }
+                    })();
+                    let message = match admitted {
+                        Ok(message) => message,
+                        Err(error) => return Err(self.terminal_callback_error(cx, error).await),
+                    };
+                    if minimum_log_rank.is_some_and(|floor| log_rank(message.level) >= floor)
+                        && !cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                        && cx.checkpoint().is_ok()
+                    {
+                        on_log
+                            .as_deref_mut()
+                            .expect("live log callback was selected")(message);
+                    }
+                    continue;
+                }
                 let retained_progress = self.final_progress_notifications.len();
                 if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame, received_at).await {
                     return Err(self.terminal_callback_error(cx, error).await);
@@ -20480,7 +20608,35 @@ impl Client {
     /// public calls cannot retry on that connection.
     fn terminate_connection(&mut self, error: McpError) -> McpError {
         #[cfg(unix)]
-        if matches!(self.stdio_restart_observation, Some(stdio_restart::StdioRestartObservation::Active(_))) {
+        let error = {
+            let send_disconnect = self
+                .multiplexed_executor
+                .as_ref()
+                .and_then(|executor| executor.executor.stdio_send_disconnect());
+            let proof = match (self.stdio_restart_observation, send_disconnect) {
+                (
+                    Some(stdio_restart::StdioRestartObservation::Active(generation)),
+                    Some(disconnect),
+                ) if generation == disconnect.generation => match disconnect.kind {
+                    stdio_restart::StdioDisconnectKind::Closed
+                    | stdio_restart::StdioDisconnectKind::BrokenPipe
+                    | stdio_restart::StdioDisconnectKind::ConnectionReset
+                    | stdio_restart::StdioDisconnectKind::UnexpectedEof => {
+                        self.observe_natural_stdio_exit()
+                    }
+                },
+                _ => None,
+            };
+            proof.map_or(error, stdio_restart::StdioInterruptedRequest::into_error)
+        };
+        #[cfg(unix)]
+        if matches!(
+            self.stdio_restart_observation,
+            Some(
+                stdio_restart::StdioRestartObservation::Active(_)
+                    | stdio_restart::StdioRestartObservation::Provisional
+            )
+        ) {
             self.stdio_restart_observation = Some(stdio_restart::StdioRestartObservation::Refused);
         }
         self.initialized.store(false, Ordering::SeqCst);
@@ -20525,36 +20681,82 @@ impl Client {
     /// never become crash evidence merely because termination later kills it.
     fn terminate_stdio_transport_error(&mut self, error: TransportError) -> McpError {
         #[cfg(unix)]
-        if let Some(stdio_restart::StdioRestartObservation::Active(generation)) =
-            self.stdio_restart_observation
-        {
-            let disconnected = match &error {
-                TransportError::Closed => true,
-                TransportError::Io(error) => matches!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::UnexpectedEof
-                ),
-                _ => false,
-            };
-            let cancelled = self.cx.is_cancel_requested()
-                || Cx::current().is_some_and(|cx| cx.is_cancel_requested());
-            if disconnected && !cancelled {
-                if let Some(status) = self.child.as_mut().and_then(|child| child.try_wait().ok().flatten()) {
-                    let exit = stdio_restart::StdioProcessExit::from(status);
-                    self.stdio_restart_observation =
-                        Some(stdio_restart::StdioRestartObservation::Exited { generation, exit });
-                    // Publish this same uncertainty to all old request handles
-                    // before shutting down their executor. No caller is replayed.
-                    return self.terminate_connection(
-                        stdio_restart::StdioInterruptedRequest { generation, process_exit: exit }
-                            .into_error(),
-                    );
-                }
+        if stdio_restart::StdioDisconnectKind::from_transport(&error).is_some() {
+            if let Some(interrupted) = self.observe_natural_stdio_exit() {
+                // Publish this same uncertainty to all old request handles
+                // before shutting down their executor. No caller is replayed.
+                return self.terminate_connection(interrupted.into_error());
             }
         }
         self.terminate_connection(transport_error_to_mcp(error))
+    }
+
+    /// Combines a locally classified disconnect with owned OS evidence. Called
+    /// only before connection cleanup; neither peer error data nor a status
+    /// obtained after signalling can reach this authority boundary.
+    #[cfg(unix)]
+    fn observe_natural_stdio_exit(&mut self) -> Option<stdio_restart::StdioInterruptedRequest> {
+        use stdio_restart::StdioRestartObservation;
+        let observation = self.stdio_restart_observation?;
+        if !matches!(
+            observation,
+            StdioRestartObservation::Active(_) | StdioRestartObservation::Provisional
+        ) || self.cx.is_cancel_requested()
+            || Cx::current().is_some_and(|cx| cx.is_cancel_requested())
+        {
+            return None;
+        }
+        let exit = self.child.as_mut()?.try_wait().ok().flatten()?.into();
+        match observation {
+            StdioRestartObservation::Active(generation) => {
+                self.stdio_restart_observation =
+                    Some(StdioRestartObservation::Exited { generation, exit });
+                Some(stdio_restart::StdioInterruptedRequest {
+                    generation,
+                    process_exit: Some(exit),
+                })
+            }
+            StdioRestartObservation::Provisional => {
+                self.stdio_restart_observation =
+                    Some(StdioRestartObservation::ProvisionalExited { exit });
+                None
+            }
+            _ => unreachable!("only active or provisional subprocesses are observed"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn enable_stdio_supervision(&mut self, generation: u64) {
+        self.stdio_restart_observation =
+            Some(stdio_restart::StdioRestartObservation::Active(generation));
+        if let Some(executor) = &self.multiplexed_executor {
+            executor.executor.enable_stdio_supervision(generation);
+        }
+    }
+
+    /// A cloned executor or a convenience adapter can report a send failure
+    /// before control returns through a Client termination method. Recovery
+    /// settles that already-terminal executor through the same private proof
+    /// check, while this owner still retains the un-signalled child.
+    #[cfg(unix)]
+    fn settle_supervised_stdio_send_failure(&mut self) {
+        let Some(stdio_restart::StdioRestartObservation::Active(generation)) =
+            self.stdio_restart_observation
+        else {
+            return;
+        };
+        let Some(executor) = self.multiplexed_executor.as_ref() else {
+            return;
+        };
+        let Some(disconnect) = executor.executor.stdio_send_disconnect() else {
+            return;
+        };
+        if disconnect.generation != generation {
+            return;
+        }
+        if let Some(error) = executor.executor.terminal_error() {
+            let _ = self.terminate_connection(error);
+        }
     }
 
     /// Returns whether the client has been initialized.
@@ -21081,6 +21283,16 @@ impl Client {
             modern_request_meta,
             &self.session,
         ));
+        #[cfg(unix)]
+        if let Some(stdio_restart::StdioRestartObservation::Active(generation)) =
+            self.stdio_restart_observation
+        {
+            self.multiplexed_executor
+                .as_ref()
+                .expect("executor just installed")
+                .executor
+                .enable_stdio_supervision(generation);
+        }
     }
 
     /// Returns the negotiated shared stdio executor.
@@ -28639,7 +28851,12 @@ impl Client {
     /// reaped within the cleanup deadline.
     pub fn close(&mut self) -> McpResult<()> {
         #[cfg(unix)]
-        if self.stdio_restart_observation.is_some() {
+        if self.stdio_restart_observation.is_some_and(|observation| {
+            !matches!(
+                observation,
+                stdio_restart::StdioRestartObservation::ProvisionalExited { .. }
+            )
+        }) {
             self.stdio_restart_observation = Some(stdio_restart::StdioRestartObservation::Refused);
         }
         let cx = self.cx.clone();
@@ -28668,7 +28885,12 @@ impl Client {
     /// still apply; this does not make arbitrary custom transports nonblocking.
     pub async fn close_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
         #[cfg(unix)]
-        if self.stdio_restart_observation.is_some() {
+        if self.stdio_restart_observation.is_some_and(|observation| {
+            !matches!(
+                observation,
+                stdio_restart::StdioRestartObservation::ProvisionalExited { .. }
+            )
+        }) {
             self.stdio_restart_observation = Some(stdio_restart::StdioRestartObservation::Refused);
         }
         let orderly = self.initialized.load(Ordering::SeqCst);
@@ -34386,20 +34608,16 @@ exec sleep 2
                         assert!(cancellation.cancel());
                     }
                     probe.release();
-                    let outcome = asupersync::time::timeout(
-                        cx.now(),
-                        Duration::from_secs(2),
-                        pending,
-                    )
-                    .await
-                    .expect("request cancellation interrupts a pending native write");
+                    let outcome =
+                        asupersync::time::timeout(cx.now(), Duration::from_secs(2), pending)
+                            .await
+                            .expect("request cancellation interrupts a pending native write");
 
                     if cancel {
                         let error = outcome.unwrap_err();
                         assert_eq!(error.code, McpErrorCode::InternalError);
                         assert_eq!(
-                            error.message,
-                            "WebSocket request send was dropped before commitment",
+                            error.message, "WebSocket request send was dropped before commitment",
                             "uncertain frame commitment remains the retained cleanup error"
                         );
                         assert!(client.is_closed());

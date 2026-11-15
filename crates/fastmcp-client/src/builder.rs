@@ -1071,7 +1071,9 @@ impl ClientBuilder {
             .and_then(std::fs::canonicalize)
             .map_err(|_| McpError::invalid_params("Cannot freeze the stdio working directory"))?;
         if !working_dir.is_dir() {
-            return Err(McpError::invalid_params("Stdio working directory is not a directory"));
+            return Err(McpError::invalid_params(
+                "Stdio working directory is not a directory",
+            ));
         }
         let mut environment = HashMap::new();
         if self.inherit_env {
@@ -1088,18 +1090,24 @@ impl ClientBuilder {
         environment.extend(self.env_vars);
         let mut environment_bytes = 0usize;
         if environment.len() > 4096 {
-            return Err(McpError::invalid_params("Supervised stdio environment exceeds its bound"));
+            return Err(McpError::invalid_params(
+                "Supervised stdio environment exceeds its bound",
+            ));
         }
         for (key, value) in &environment {
             if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
-                return Err(McpError::invalid_params("Invalid supervised stdio environment entry"));
+                return Err(McpError::invalid_params(
+                    "Invalid supervised stdio environment entry",
+                ));
             }
             environment_bytes = environment_bytes
                 .saturating_add(key.len())
                 .saturating_add(value.len());
         }
         if environment_bytes > 2 * 1024 * 1024 {
-            return Err(McpError::invalid_params("Supervised stdio environment exceeds its bound"));
+            return Err(McpError::invalid_params(
+                "Supervised stdio environment exceeds its bound",
+            ));
         }
         let configured = std::path::Path::new(command);
         let executable = if configured.is_absolute() {
@@ -1108,11 +1116,17 @@ impl ClientBuilder {
             working_dir.join(configured)
         } else {
             let path = environment.get("PATH").ok_or_else(|| {
-                McpError::invalid_params("Supervised stdio needs an absolute executable or frozen PATH")
+                McpError::invalid_params(
+                    "Supervised stdio needs an absolute executable or frozen PATH",
+                )
             })?;
             std::env::split_paths(path)
                 .map(|entry| {
-                    let directory = if entry.is_absolute() { entry } else { working_dir.join(entry) };
+                    let directory = if entry.is_absolute() {
+                        entry
+                    } else {
+                        working_dir.join(entry)
+                    };
                     directory.join(configured)
                 })
                 .find(|candidate| {
@@ -1120,14 +1134,20 @@ impl ClientBuilder {
                         metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
                     })
                 })
-                .ok_or_else(|| McpError::invalid_params("Cannot resolve the supervised stdio executable"))?
+                .ok_or_else(|| {
+                    McpError::invalid_params("Cannot resolve the supervised stdio executable")
+                })?
         };
-        let executable = std::fs::canonicalize(executable)
-            .map_err(|_| McpError::invalid_params("Cannot freeze the supervised stdio executable"))?;
-        let metadata = std::fs::metadata(&executable)
-            .map_err(|_| McpError::invalid_params("Cannot inspect the supervised stdio executable"))?;
+        let executable = std::fs::canonicalize(executable).map_err(|_| {
+            McpError::invalid_params("Cannot freeze the supervised stdio executable")
+        })?;
+        let metadata = std::fs::metadata(&executable).map_err(|_| {
+            McpError::invalid_params("Cannot inspect the supervised stdio executable")
+        })?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-            return Err(McpError::invalid_params("Supervised stdio executable is not executable"));
+            return Err(McpError::invalid_params(
+                "Supervised stdio executable is not executable",
+            ));
         }
         let executable = executable.into_os_string().into_string().map_err(|_| {
             McpError::invalid_params("Supervised stdio requires a Unicode executable path")

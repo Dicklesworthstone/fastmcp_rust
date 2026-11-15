@@ -280,13 +280,14 @@ pub use asupersync;
 /// `websocket-experimental` feature cannot expose that caller-upgraded
 /// experimental transport through `fastmcp_rust::client`.
 pub mod client {
-    #[cfg(unix)]
-    pub use crate::{
-        StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
-        StdioRestartPolicy, SupervisedStdioClient,
-    };
+    /// Tasks client APIs are available only with the official Tasks extension.
+    #[cfg(feature = "tasks")]
+    pub use crate::FinalTaskStreamWatch;
     #[cfg(all(feature = "apps", feature = "tasks"))]
     pub use crate::McpAppsServerTaskPolicy;
+    /// MCP Apps client APIs are available only with the Apps extension.
+    #[cfg(all(feature = "apps", feature = "websocket-experimental"))]
+    pub use crate::McpAppsWebSocketClientWirePolicy;
     #[cfg(feature = "websocket-experimental")]
     pub use crate::WebSocketResponse;
     pub use crate::{
@@ -296,13 +297,12 @@ pub mod client {
         ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpExecutor,
         ModernHttpExecutorError, ModernHttpExtensionEvent, ModernHttpExtensionExecution,
         ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError, ModernHttpRequest,
-        ModernHttpRequestControl, ModernHttpRequestExecution,
-        ModernHttpResponseKind, ModernHttpResponseMetadata, ModernHttpResponseStream,
-        ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
-        ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
-        ModernHttpSubscriptionListener, ModernHttpSubscriptionTermination, ServerConfig,
-        SseEndOfStream, SseLimits, SseParseError, claude_desktop_config_path, default_config_paths,
-        validate_response_head,
+        ModernHttpRequestControl, ModernHttpRequestExecution, ModernHttpResponseKind,
+        ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
+        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
+        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
+        ModernHttpSubscriptionTermination, ServerConfig, SseEndOfStream, SseLimits, SseParseError,
+        claude_desktop_config_path, default_config_paths, validate_response_head,
     };
     pub use crate::{
         BoundedListPage, CachePartitionKey, CancellationRequested, Client, ClientBuilder,
@@ -317,46 +317,43 @@ pub mod client {
         HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
         MAX_FINAL_CACHE_MAX_BYTES, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
         MAX_HTTP_RETAINED_EXECUTION_BYTES, MemoryClient, MemoryClientBuilder, MemoryExtensionEvent,
-        MemoryExtensionExecution, MemoryRequestEvent, MemoryRequestExecution, MemorySubscriptionEvent,
-        MemorySubscriptionExecution, OpaquePagination,
-        PaginationBounds, PendingRequestRecord, ProgressCallback, Request, RequestExecution,
-        RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest,
-        ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
-        StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
-        SubscriptionTimeoutPolicy,
+        MemoryExtensionExecution, MemoryRequestEvent, MemoryRequestExecution,
+        MemorySubscriptionEvent, MemorySubscriptionExecution, OpaquePagination, PaginationBounds,
+        PendingRequestRecord, ProgressCallback, Request, RequestExecution, RequestExecutor,
+        RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation,
+        StdioRequestExecution, StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
+        SubscriptionListenCollector, SubscriptionTimeoutPolicy,
     };
-    /// Tasks client APIs are available only with the official Tasks extension.
-    #[cfg(feature = "tasks")]
-    pub use crate::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use crate::{
-        FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle,
-        FinalTaskInputResponses, FinalTaskStatusNotification,
-        FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch, FinalTaskWatchEvent,
-        FinalToolCallOutcome, FinalUpdateTaskResult, StdioTaskSubscriptionEvent,
+        FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle, FinalTaskInputResponses,
+        FinalTaskStatusNotification, FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch,
+        FinalTaskWatchEvent, FinalToolCallOutcome, FinalUpdateTaskResult,
+        StdioTaskSubscriptionEvent,
     };
     /// Exact-2024 client staging is present only with the legacy adapter.
     #[cfg(feature = "legacy-2024-11-05")]
     pub use crate::{
         LegacyHttpRequest, LegacyHttpRequestCommit, LegacySseHttpClient, LegacySseHttpClientError,
     };
-    /// MCP Apps client APIs are available only with the Apps extension.
-    #[cfg(all(feature = "apps", feature = "websocket-experimental"))]
-    pub use crate::McpAppsWebSocketClientWirePolicy;
     #[cfg(feature = "apps")]
     pub use crate::{
         McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
         McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
         McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
-        McpAppsMemoryClientWirePolicy,
-        McpAppsViewCallToolResult, McpAppsViewTool, McpAppsViewToolsPage,
-        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
-        McpAppsWireHostConfiguration,
-        McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostResponse,
-        McpAppsWireHostWithEffects, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+        McpAppsMemoryClientWirePolicy, McpAppsViewCallToolResult, McpAppsViewTool,
+        McpAppsViewToolsPage, McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
+        McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
+        McpAppsWireHostResponse, McpAppsWireHostWithEffects, mcp_apps_in_memory_pair,
+        mcp_apps_in_memory_wire_pair,
     };
     pub use crate::{ResourceSubscriptionRelations, SubscriptionListenRequest};
+    #[cfg(unix)]
+    pub use crate::{
+        StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
+        StdioRestartPolicy, SupervisedStdioClient,
+    };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::mcp_apps;
     pub use fastmcp_client::{http_auth, http_executor, mcp_config, sse};
@@ -463,6 +460,8 @@ pub mod protocol {
 /// [`modern::server_builder`] or [`legacy_2024::server_builder`] instead, so
 /// the protocol policy is fixed before application configuration begins.
 pub mod server {
+    #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
+    pub use fastmcp_server::ProxyWebSocketClient;
     pub use fastmcp_server::ResourceSubscriptionMatcher;
     pub use fastmcp_server::bidirectional;
     #[cfg(feature = "legacy-2024-11-05")]
@@ -520,8 +519,6 @@ pub mod server {
         ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
         ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
     };
-    #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
-    pub use fastmcp_server::ProxyWebSocketClient;
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub use fastmcp_server::{
         ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskCleanupOutcome,
@@ -1137,11 +1134,10 @@ pub use fastmcp_client::{
     MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
     MAX_HTTP_RETAINED_EXECUTION_BYTES, MemoryClient, MemoryClientBuilder, MemoryExtensionEvent,
     MemoryExtensionExecution, MemoryRequestEvent, MemoryRequestExecution, MemorySubscriptionEvent,
-    MemorySubscriptionExecution, OpaquePagination,
-    PaginationBounds, PendingRequestRecord, ProgressCallback, Request, RequestExecution,
-    RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest,
-    ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
-    StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
+    MemorySubscriptionExecution, OpaquePagination, PaginationBounds, PendingRequestRecord,
+    ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
+    RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
+    StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
     SubscriptionTimeoutPolicy,
 };
 pub use fastmcp_client::{ResourceSubscriptionRelations, SubscriptionListenRequest};
@@ -3131,11 +3127,6 @@ pub mod modern {
         ModernHttpSubscriptionTermination,
     };
     pub use fastmcp_client::sse::SseLimits;
-    #[cfg(unix)]
-    pub use fastmcp_client::{
-        StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
-        StdioRestartPolicy, SupervisedStdioClient,
-    };
     pub use fastmcp_client::{
         BoundedListPage, CachePartitionKey, CompletionContext, CompletionParams,
         CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,
@@ -3151,6 +3142,11 @@ pub mod modern {
         PaginationBounds, PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy,
         RequestTimeoutSource, ReverseRequestHandlers, StdioSubscriptionEvent, SubscriptionFilter,
         SubscriptionListenCollector, SubscriptionTimeoutPolicy,
+    };
+    #[cfg(unix)]
+    pub use fastmcp_client::{
+        StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
+        StdioRestartPolicy, SupervisedStdioClient,
     };
     pub use fastmcp_core::trace::{TraceContextError, TraceContextRecovery};
     pub use fastmcp_core::{
@@ -3462,13 +3458,13 @@ pub mod modern {
     #[cfg(feature = "apps")]
     pub use fastmcp_server::providers::McpAppsUiResource;
 
+    #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
+    pub use fastmcp_server::ProxyWebSocketClient;
     #[cfg(feature = "proxy")]
     pub use fastmcp_server::{
         FinalProgressCallback, ProxyUpstreamAdapter, ProxyUpstreamBinding,
         ProxyUpstreamBindingRegistry,
     };
-    #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
-    pub use fastmcp_server::ProxyWebSocketClient;
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub use fastmcp_server::{
         ProxyTaskCleanupOutcome, ProxyTaskLimits, ProxyTaskOrphanAudit, ProxyTaskOrphanReason,
@@ -12619,11 +12615,6 @@ pub mod testing;
 /// use fastmcp_rust::prelude::*;
 /// ```
 pub mod prelude {
-    #[cfg(unix)]
-    pub use crate::{
-        StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
-        StdioRestartPolicy, SupervisedStdioClient,
-    };
     #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
     pub use crate::ProxyWebSocketClient;
     pub use crate::{
@@ -12937,6 +12928,11 @@ pub mod prelude {
     };
     pub use crate::{
         ResourceSubscriptionMatcher, ResourceSubscriptionRelations, SubscriptionListenRequest,
+    };
+    #[cfg(unix)]
+    pub use crate::{
+        StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
+        StdioRestartPolicy, SupervisedStdioClient,
     };
     pub use crate::{TraceContext, TraceContextError, TraceContextRecovery};
     #[cfg(feature = "legacy-2024-11-05")]

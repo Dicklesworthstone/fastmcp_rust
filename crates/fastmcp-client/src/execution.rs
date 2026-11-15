@@ -1385,6 +1385,13 @@ struct ExecutorState<T> {
     next_generation: u64,
     result_peer_era: ResultPeerEra,
     terminal_error: Option<McpError>,
+    /// Opt-in subprocess supervision publishes loss before send-side fanout.
+    /// Only the owning Client can combine this local provenance with OS exit
+    /// evidence; ordinary/custom/WebSocket executors leave both fields empty.
+    #[cfg(unix)]
+    stdio_supervision_generation: Option<u64>,
+    #[cfg(unix)]
+    stdio_send_disconnect: Option<crate::stdio_restart::StdioSendDisconnect>,
     /// An elected real failure remains observable after successful cleanup;
     /// deliberate owner teardown carries a separate fixed observation class.
     terminal_disposition: Option<ExecutorTerminalDisposition>,
@@ -1804,6 +1811,10 @@ where
                 next_generation: 0,
                 result_peer_era,
                 terminal_error: None,
+                #[cfg(unix)]
+                stdio_supervision_generation: None,
+                #[cfg(unix)]
+                stdio_send_disconnect: None,
                 terminal_disposition: None,
                 shutdown: false,
                 shutdown_error: None,
@@ -3655,6 +3666,27 @@ where
         self.state.borrow().terminal_error.clone()
     }
 
+    #[cfg(unix)]
+    pub(crate) fn enable_stdio_supervision(&self, generation: u64) {
+        let mut state = self.state.borrow_mut();
+        debug_assert!(state.pending.is_empty());
+        debug_assert!(state.terminal_error.is_none());
+        debug_assert_eq!(state.result_peer_era, ResultPeerEra::Modern);
+        state.stdio_supervision_generation = Some(generation);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn stdio_send_disconnect(
+        &self,
+    ) -> Option<crate::stdio_restart::StdioSendDisconnect> {
+        let state = self.state.borrow();
+        if state.shutdown {
+            None
+        } else {
+            state.stdio_send_disconnect
+        }
+    }
+
     /// Cancels live owners, releases their waiters, and closes the transport.
     ///
     /// Cleanup runs once across all executor clones. Later calls return the
@@ -3746,6 +3778,26 @@ where
             || matches!(&transport_error, TransportError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         {
             return transport_error_to_mcp(transport_error);
+        }
+        #[cfg(unix)]
+        if state.terminal_error.is_none() {
+            if let (Some(generation), Some(kind)) = (
+                state.stdio_supervision_generation,
+                crate::stdio_restart::StdioDisconnectKind::from_transport(&transport_error),
+            ) {
+                state.stdio_send_disconnect =
+                    Some(crate::stdio_restart::StdioSendDisconnect { generation, kind });
+                // Fail every old waiter immediately. The executor does not own
+                // the child handle, so it must not invent a process exit. The
+                // connection owner obtains that proof before its later cleanup.
+                let error = crate::stdio_restart::StdioInterruptedRequest {
+                    generation,
+                    process_exit: None,
+                }
+                .into_error();
+                state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+                return error;
+            }
         }
         let error = transport_error_to_mcp(transport_error);
         state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);

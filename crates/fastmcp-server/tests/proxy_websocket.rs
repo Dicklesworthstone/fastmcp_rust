@@ -24,16 +24,16 @@ use asupersync::types::CancelKind;
 use asupersync::{Cx, Outcome};
 use fastmcp_client::{ClientBuilder, ClientProtocolPlan, WebSocketClient};
 use fastmcp_core::{
-    ClientCapabilityInfo, McpContext, McpError, McpErrorCode, McpOutcome, McpRequestCancellation,
-    McpResult, NotificationSender, ProgressReporter,
+    ClientCapabilityInfo, McpContext, McpError, McpErrorCode, McpLogLevel, McpOutcome,
+    McpRequestCancellation, McpResult, NotificationSender, ProgressReporter,
 };
 use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
 use fastmcp_protocol::{
     CompleteResult, CompletionValues, Content, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY, FinalCompletionParams,
-    FinalCompletionValues, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
-    Prompt, PromptArgument, PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta,
-    Role, Tool,
+    FINAL_LOG_LEVEL_META_KEY, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
+    FinalCompletionParams, FinalCompletionValues, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    LegacyCompletionParams, Prompt, PromptArgument, PromptMessage, Resource, ResourceContent,
+    ResourceTemplate, ResultMeta, Role, Tool,
 };
 use fastmcp_server::{
     BoxFuture, CompletionHandler, FinalToolOutcome, InboundRequestContext, InboundRequestTransport,
@@ -648,6 +648,37 @@ impl NotificationSender for ProgressCapture {
     }
 }
 
+#[derive(Default)]
+struct LiveNotifications {
+    progress: Mutex<Vec<(String, Option<String>)>>,
+    logs: Mutex<Vec<(McpLogLevel, Value)>>,
+    changed: Notify,
+}
+
+impl NotificationSender for LiveNotifications {
+    fn send_progress(&self, _: f64, _: Option<f64>, _: Option<&str>) {
+        panic!("live modern progress uses exact JSON numbers");
+    }
+
+    fn send_progress_exact(
+        &self,
+        progress: serde_json::Number,
+        total: Option<serde_json::Number>,
+        _: Option<&str>,
+    ) {
+        self.progress
+            .lock()
+            .unwrap()
+            .push((progress.to_string(), total.map(|number| number.to_string())));
+        self.changed.notify_waiters();
+    }
+
+    fn send_log(&self, level: McpLogLevel, _: Option<&str>, data: Value) {
+        self.logs.lock().unwrap().push((level, data));
+        self.changed.notify_waiters();
+    }
+}
+
 #[test]
 fn native_websocket_proxy_preserves_mrtr_state_inputs_and_exact_open_results() {
     run(|cx| async move {
@@ -876,6 +907,108 @@ fn native_websocket_proxy_correlates_numeric_progress_aliases_exactly_once() {
         );
         peer_task.join(&cx).await.unwrap();
         drop(context);
+        drop(proxy);
+    });
+}
+
+#[test]
+fn native_websocket_proxy_streams_bursts_and_scopes_log_intent_to_each_request() {
+    run(|cx| async move {
+        const BURST: usize = 80;
+        let capture = Arc::new(LiveNotifications::default());
+        let peer_capture = Arc::clone(&capture);
+        let listener = WebSocketListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut peer_task = cx
+            .spawn(move |peer_cx| async move {
+                let mut peer = scripted_upstream(&peer_cx, &listener).await;
+                for round in 0..2 {
+                    let call = upstream_request(&mut peer, &peer_cx, "tools/call").await;
+                    let parameters = call.params.as_ref().unwrap();
+                    let marker = format!("live-notifications-{round}");
+                    assert_eq!(parameters["_meta"]["progressToken"], marker);
+                    if round == 0 {
+                        assert_eq!(parameters["_meta"][FINAL_LOG_LEVEL_META_KEY], "info");
+                    } else {
+                        assert!(parameters["_meta"].get(FINAL_LOG_LEVEL_META_KEY).is_none());
+                    }
+                    for sequence in 1..=BURST {
+                        let mut data = json!({"round": round, "sequence": sequence});
+                        data["exact"] = serde_json::from_str(EXACT_INTEGER).unwrap();
+                        data["decimal"] = serde_json::from_str(EXACT_DECIMAL).unwrap();
+                        for (method, parameters) in [
+                            ("notifications/message", json!({
+                                "level": "info", "logger": "upstream.audit", "data": data,
+                            })),
+                            ("notifications/progress", json!({
+                                "progressToken": marker, "progress": sequence, "total": BURST,
+                            })),
+                        ] {
+                            peer.send(
+                                &peer_cx,
+                                &JsonRpcMessage::Request(JsonRpcRequest::notification(method, Some(parameters))),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                    }
+                    // Both callback streams must advance before the terminal
+                    // reply. The burst exceeds the client's bounded retained
+                    // notification queue, which live delivery must bypass.
+                    asupersync::time::timeout(
+                        peer_cx.now(),
+                        BOUND,
+                        peer_capture.changed.wait_until(|| {
+                            peer_capture.progress.lock().unwrap().len() == (round + 1) * BURST
+                                && peer_capture.logs.lock().unwrap().len() == BURST
+                        }),
+                    )
+                    .await
+                    .expect("logs and progress reach their live request owners before completion");
+                    peer.send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            call.id.unwrap(),
+                            json!({"resultType": "complete", "content": [{"type": "text", "text": format!("round-{round}")}]}),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                }
+            })
+            .unwrap();
+        let proxy = connect(&cx, address, 20).await;
+        for round in 0..2 {
+            let mut context = McpContext::new(cx.clone(), 61 + u64::try_from(round).unwrap())
+                .with_log_sender(capture.clone())
+                .with_progress_reporter(ProgressReporter::with_marker(
+                    json!(format!("live-notifications-{round}")),
+                    capture.clone(),
+                ));
+            if round == 0 {
+                context = context.with_min_log_level(Some(McpLogLevel::Info));
+            }
+            let result = proxy
+                .call_tool_typed_async(&context, "confirm", json!({"round": round}))
+                .await
+                .unwrap();
+            let result: Value = serde_json::from_str(&result.encode().unwrap()).unwrap();
+            assert_eq!(result["content"][0]["text"], format!("round-{round}"));
+            assert_eq!(capture.progress.lock().unwrap().len(), (round + 1) * BURST);
+            assert_eq!(capture.logs.lock().unwrap().len(), BURST);
+        }
+        for (index, (progress, total)) in capture.progress.lock().unwrap().iter().enumerate() {
+            assert_eq!(progress, &(index % BURST + 1).to_string());
+            assert_eq!(total.as_deref(), Some("80"));
+        }
+        for (index, (level, data)) in capture.logs.lock().unwrap().iter().enumerate() {
+            assert_eq!(*level, McpLogLevel::Info);
+            assert_eq!(data["round"], 0, "the second request had no logging intent");
+            assert_eq!(data["sequence"], index + 1);
+            assert_eq!(data["exact"].to_string(), EXACT_INTEGER);
+            assert_eq!(data["decimal"].to_string(), EXACT_DECIMAL);
+        }
+        peer_task.join(&cx).await.unwrap();
         drop(proxy);
     });
 }

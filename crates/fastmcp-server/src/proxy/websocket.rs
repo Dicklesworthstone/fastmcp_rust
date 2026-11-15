@@ -27,7 +27,7 @@ use super::{
     ProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyPollTimer,
     await_proxy_request_or_cancellation, catalog_capability, discovery_supports_final_capability,
     discovery_supports_final_completion, inbound_client_capabilities,
-    inbound_identity_implementation, inbound_logging_level, relay_upstream_log_notifications,
+    inbound_identity_implementation, inbound_logging_level, relay_upstream_log_message,
 };
 use crate::handler::BoxFuture;
 
@@ -203,26 +203,26 @@ where
             let _ = client.take_final_server_notifications();
             let _ = client.take_final_progress_notifications();
             let cancellation = McpRequestCancellation::new();
+            let mut forward_log = |message| relay_upstream_log_message(ctx, &message);
             let outcome = drive_native_request(
                 ctx,
                 &cancellation,
-                client.request_with_raw_result_and_progress(
+                client.request_with_raw_result_and_progress_and_logs(
                     ctx.cx(),
                     request.method(),
                     parameters,
                     &cancellation,
                     on_progress,
+                    &mut forward_log,
                 ),
             )
             .await;
-            let notifications = client.take_final_server_notifications();
-            // The native live callback consumes matching progress as it is
-            // admitted. Unrelated retained progress has no downstream owner.
+            // Live callbacks consume matching progress and requested logs as
+            // they are admitted. This core-only adapter owns no downstream
+            // subscription for the remaining connection notifications.
+            let _ = client.take_final_server_notifications();
             let _ = client.take_final_progress_notifications();
             drop(client);
-            if ctx.ensure_live().is_ok() {
-                relay_upstream_log_notifications(ctx, notifications);
-            }
 
             // Preserve native cancellation cleanup failures before consulting
             // the caller's cancellation again. A lost cancellation write must
