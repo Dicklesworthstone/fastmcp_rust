@@ -4617,6 +4617,33 @@ impl CoreResult {
 }
 
 impl LegacyCoreResult {
+    /// Removes reserved trace fields at a proxy boundary. The legacy era does
+    /// not emit modern trace decisions; unrelated metadata remains opaque.
+    pub fn strip_trace_context(&mut self) {
+        fn strip(metadata: &mut Option<LegacyMetadata>) {
+            if let Some(metadata) = metadata {
+                for name in ["traceparent", "tracestate", "baggage"] {
+                    metadata.remove(name);
+                }
+            }
+        }
+        fn strip_opaque(metadata: &mut Option<LegacyOpaqueMetadata>) {
+            if let Some(metadata) = metadata {
+                metadata.entries.retain(|(name, _)| {
+                    !matches!(name.as_str(), "traceparent" | "tracestate" | "baggage")
+                });
+            }
+        }
+        match self {
+            Self::Completion(result) => strip_opaque(&mut result.meta),
+            Self::SamplingCreateMessage(result) => strip_opaque(&mut result.meta),
+            Self::ToolsCall(result) => strip(&mut result.meta),
+            Self::ResourcesRead(result) => strip(&mut result.meta),
+            Self::PromptsGet(result) => strip(&mut result.meta),
+            _ => {}
+        }
+    }
+
     /// Returns the exact method literal that selected this legacy result.
     #[must_use]
     pub const fn method(&self) -> &'static str {
@@ -4665,6 +4692,154 @@ impl LegacyCoreResult {
 }
 
 impl FinalCoreResult {
+    fn ordinary_trace_metadata_mut(&mut self) -> Option<&mut crate::result::ResultMeta> {
+        Some(match self {
+            Self::Discover(_) => return None,
+            #[cfg(feature = "tasks")]
+            Self::ToolsCallTask { .. } => return None,
+            Self::Completion { result, .. } => &mut result.meta,
+            Self::ToolsList { result, .. } => &mut result.meta,
+            Self::ToolsCall { result, .. } => &mut result.meta,
+            Self::ToolsCallInputRequired { result, .. }
+            | Self::ResourcesReadInputRequired { result, .. }
+            | Self::PromptsGetInputRequired { result, .. } => &mut result.meta,
+            Self::ResourcesList { result, .. } => &mut result.meta,
+            Self::ResourceTemplatesList { result, .. } => &mut result.meta,
+            Self::ResourcesRead { result, .. } => &mut result.meta,
+            Self::PromptsList { result, .. } => &mut result.meta,
+            Self::PromptsGet { result, .. } => &mut result.meta,
+            Self::SubscriptionsListen { result, .. } => &mut result.meta,
+        })
+    }
+
+    /// Reads admitted result telemetry without treating it as a forwarding
+    /// grant or authentication. Every final result family is covered.
+    #[must_use]
+    pub fn trace_context(&self) -> fastmcp_core::TraceContext {
+        match self {
+            Self::Discover(result) => result.trace_context(),
+            Self::Completion { result, .. } => result.meta.trace_context(),
+            Self::ToolsList { result, .. } => result.meta.trace_context(),
+            Self::ToolsCall { result, .. } => result.meta.trace_context(),
+            #[cfg(feature = "tasks")]
+            Self::ToolsCallTask { result } => result
+                .meta
+                .as_ref()
+                .map(OpenMetadata::trace_context)
+                .unwrap_or_default(),
+            Self::ToolsCallInputRequired { result, .. }
+            | Self::ResourcesReadInputRequired { result, .. }
+            | Self::PromptsGetInputRequired { result, .. } => result.meta.trace_context(),
+            Self::ResourcesList { result, .. } => result.meta.trace_context(),
+            Self::ResourceTemplatesList { result, .. } => result.meta.trace_context(),
+            Self::ResourcesRead { result, .. } => result.meta.trace_context(),
+            Self::PromptsList { result, .. } => result.meta.trace_context(),
+            Self::PromptsGet { result, .. } => result.meta.trace_context(),
+            Self::SubscriptionsListen { result, .. } => result.meta.trace_context(),
+        }
+    }
+
+    /// Applies one explicit outbound trace hop without projecting application
+    /// values through serde JSON. `None` strips reserved trace fields. If the
+    /// optional projection exceeds carrier or result bounds it is dropped and
+    /// `false` is returned; the application result remains usable.
+    pub fn apply_outbound_trace_context(
+        &mut self,
+        decision: Option<&fastmcp_core::OutboundTraceDecision>,
+    ) -> bool {
+        let had_metadata = match self.ordinary_trace_metadata_mut() {
+            Some(meta) => meta.has_metadata_carrier(),
+            None => match self {
+                Self::Discover(result) => result.has_metadata_carrier(),
+                #[cfg(feature = "tasks")]
+                Self::ToolsCallTask { result } => result.meta.is_some(),
+                _ => unreachable!("every other result has ordinary metadata"),
+            },
+        };
+        let retained = match self {
+            Self::Discover(result) => result.apply_outbound_trace_context(decision),
+            Self::Completion { result, .. } => result.meta.apply_outbound_trace_context(decision),
+            Self::ToolsList { result, .. } => result.meta.apply_outbound_trace_context(decision),
+            Self::ToolsCall { result, .. } => result.meta.apply_outbound_trace_context(decision),
+            #[cfg(feature = "tasks")]
+            Self::ToolsCallTask { result } => {
+                crate::result::apply_open_trace_metadata(&mut result.meta, decision)
+            }
+            Self::ToolsCallInputRequired { result, .. }
+            | Self::ResourcesReadInputRequired { result, .. }
+            | Self::PromptsGetInputRequired { result, .. } => {
+                result.meta.apply_outbound_trace_context(decision)
+            }
+            Self::ResourcesList { result, .. } => {
+                result.meta.apply_outbound_trace_context(decision)
+            }
+            Self::ResourceTemplatesList { result, .. } => {
+                result.meta.apply_outbound_trace_context(decision)
+            }
+            Self::ResourcesRead { result, .. } => {
+                result.meta.apply_outbound_trace_context(decision)
+            }
+            Self::PromptsList { result, .. } => result.meta.apply_outbound_trace_context(decision),
+            Self::PromptsGet { result, .. } => result.meta.apply_outbound_trace_context(decision),
+            Self::SubscriptionsListen { result, .. } => {
+                result.meta.apply_outbound_trace_context(decision)
+            }
+        };
+        if retained && decision.is_some_and(|decision| !decision.context().is_empty()) {
+            // Adding a previously absent _meta also consumes a top-level
+            // member and encoded bytes. Reuse the bounded exact codec, then
+            // drop only telemetry if the enclosing carrier has no room.
+            let fits = self
+                .encode()
+                .ok()
+                .is_some_and(|encoded| crate::result::parse_exact_result_object(&encoded).is_ok());
+            if !fits {
+                self.apply_outbound_trace_context(None);
+                if !had_metadata {
+                    if let Some(meta) = self.ordinary_trace_metadata_mut() {
+                        meta.discard_empty_trace_carrier();
+                    } else {
+                        match self {
+                            Self::Discover(result) => result.discard_empty_trace_carrier(),
+                            #[cfg(feature = "tasks")]
+                            Self::ToolsCallTask { result } => {
+                                if result
+                                    .meta
+                                    .as_ref()
+                                    .is_some_and(|meta| meta.entries().is_empty())
+                                {
+                                    result.meta = None;
+                                }
+                            }
+                            _ => unreachable!("every other result has ordinary metadata"),
+                        }
+                    }
+                }
+                return false;
+            }
+        }
+        retained
+    }
+
+    /// Caps only protocol cache hints. Task retention TTLs and unrelated
+    /// schema-open values are never changed by this cache-safety operation.
+    pub fn cap_cache_ttl_ms(&mut self, maximum: u64) {
+        fn cap(ttl: &mut crate::result::CacheTtl, maximum: u64) {
+            if !ttl.try_as_millis().is_ok_and(|value| value <= maximum) {
+                *ttl = crate::result::CacheTtl::milliseconds(maximum);
+            }
+        }
+        match self {
+            Self::Discover(result) => result.cap_cache_ttl_ms(maximum),
+            Self::ToolsList { result, .. } => cap(&mut result.payload.ttl_ms, maximum),
+            Self::ResourcesList { result, .. } => cap(&mut result.payload.ttl_ms, maximum),
+            Self::ResourceTemplatesList { result, .. } => cap(&mut result.payload.ttl_ms, maximum),
+            Self::ResourcesRead { result, .. } => cap(&mut result.payload.ttl_ms, maximum),
+            Self::PromptsList { result, .. } => cap(&mut result.payload.ttl_ms, maximum),
+            _ => {}
+        }
+    }
+
     /// Returns the exact method literal that selected this final result.
     #[must_use]
     pub const fn method(&self) -> &'static str {

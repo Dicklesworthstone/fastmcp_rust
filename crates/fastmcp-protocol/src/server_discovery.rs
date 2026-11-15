@@ -768,6 +768,73 @@ impl ServerDiscoverResult {
         &self.cache_hints
     }
 
+    /// Returns admitted trace metadata, without forwarding authority.
+    #[must_use]
+    pub fn trace_context(&self) -> fastmcp_core::TraceContext {
+        fastmcp_core::TraceContext::recover(
+            self.metadata.extras.get("traceparent"),
+            self.metadata.extras.get("tracestate"),
+            self.metadata.extras.get("baggage"),
+        )
+        .0
+    }
+
+    pub(crate) fn has_metadata_carrier(&self) -> bool {
+        self.exact_peer_result
+            .as_ref()
+            .map_or(!self.metadata.is_empty(), |exact| {
+                exact.get("_meta").is_some()
+            })
+    }
+
+    pub(crate) fn discard_empty_trace_carrier(&mut self) {
+        if self.metadata.is_empty() {
+            if let Some(exact) = self.exact_peer_result.as_mut() {
+                exact.remove_empty_trace_metadata();
+            }
+        }
+    }
+
+    /// Applies one explicit outbound hop while retaining every unrelated exact
+    /// discovery value. A full carrier drops optional trace instead of failing.
+    pub fn apply_outbound_trace_context(
+        &mut self,
+        decision: Option<&fastmcp_core::OutboundTraceDecision>,
+    ) -> bool {
+        let reserved = usize::from(
+            self.metadata.server_info.is_some() || self.metadata.implementation.is_some(),
+        );
+        let mut retained = crate::result::apply_trace_metadata_entries(
+            &mut self.metadata.extras,
+            decision,
+            reserved,
+        );
+        if retained
+            && decision.is_some_and(|decision| !decision.context().is_empty())
+            && !crate::result::trace_metadata_within_budget(&self.metadata)
+        {
+            crate::result::apply_trace_metadata_entries(&mut self.metadata.extras, None, reserved);
+            retained = false;
+        }
+        if let Some(exact) = self.exact_peer_result.as_mut() {
+            if let Some(ExactJsonValue::Object(metadata)) = exact.get_mut("_meta") {
+                crate::result::apply_exact_trace_metadata(metadata, &self.metadata.extras);
+            } else if self
+                .metadata
+                .extras
+                .keys()
+                .any(|key| matches!(key.as_str(), "traceparent" | "tracestate" | "baggage"))
+            {
+                // An admitted peer may omit _meta entirely. Add only the
+                // approved trace projection; existing siblings remain exact.
+                let mut metadata = ExactJsonObject::default();
+                crate::result::apply_exact_trace_metadata(&mut metadata, &self.metadata.extras);
+                exact.insert_trace_metadata(metadata);
+            }
+        }
+        retained
+    }
+
     /// Caps the advertised cache lifetime without changing its scope.
     ///
     /// Caches use this when replaying an aged result so a downstream consumer

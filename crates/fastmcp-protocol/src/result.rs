@@ -92,6 +92,24 @@ impl ExactJsonObject {
             .map(|member| &mut member.value)
     }
 
+    /// Adds a newly admitted optional trace carrier without rebuilding any
+    /// existing exact sibling. Callers have already checked carrier capacity.
+    pub(crate) fn insert_trace_metadata(&mut self, metadata: Self) {
+        if self.get("_meta").is_none() {
+            self.members.push(ExactJsonMember {
+                name: "_meta".to_owned(),
+                value: ExactJsonValue::Object(metadata),
+            });
+        }
+    }
+
+    pub(crate) fn remove_empty_trace_metadata(&mut self) {
+        if matches!(self.get("_meta"), Some(ExactJsonValue::Object(metadata)) if metadata.members.is_empty())
+        {
+            self.take("_meta");
+        }
+    }
+
     fn take(&mut self, name: &str) -> Option<ExactJsonValue> {
         self.members
             .iter()
@@ -316,6 +334,25 @@ pub struct ResultMeta {
 }
 
 impl ResultMeta {
+    pub(crate) fn has_metadata_carrier(&self) -> bool {
+        self.meta.is_some() || self.exact_meta.is_some() || self.server_info.is_some()
+    }
+
+    pub(crate) fn discard_empty_trace_carrier(&mut self) {
+        if self.server_info.is_none()
+            && self
+                .meta
+                .as_ref()
+                .is_none_or(|meta| meta.entries().is_empty())
+            && self
+                .exact_meta
+                .as_ref()
+                .is_none_or(|meta| meta.members.is_empty())
+        {
+            self.meta = None;
+            self.exact_meta = None;
+        }
+    }
     /// Creates empty metadata for a locally authored result.
     ///
     /// This preserves the absence of the optional `_meta` member on the wire.
@@ -368,6 +405,64 @@ impl ResultMeta {
         }
     }
 
+    /// Returns syntactically admitted telemetry without granting forwarding
+    /// authority. This never interprets application metadata as authentication.
+    #[must_use]
+    pub fn trace_context(&self) -> fastmcp_core::TraceContext {
+        self.meta
+            .as_ref()
+            .map(OpenMetadata::trace_context)
+            .unwrap_or_default()
+    }
+
+    /// Replaces only reserved trace fields with an explicitly evaluated hop.
+    ///
+    /// `None` strips all three fields. Unrelated exact member order, numeric
+    /// spellings and payloads remain unchanged. Optional telemetry is dropped
+    /// as one unit when it would exceed the metadata carrier's bounds; `false`
+    /// reports that local capacity refusal without failing the result.
+    pub fn apply_outbound_trace_context(
+        &mut self,
+        decision: Option<&fastmcp_core::OutboundTraceDecision>,
+    ) -> bool {
+        let present = self.meta.is_some() || self.exact_meta.is_some();
+        let mut entries = self
+            .meta
+            .as_ref()
+            .map(|meta| meta.entries().clone())
+            .unwrap_or_default();
+        let retained = apply_trace_metadata_entries(
+            &mut entries,
+            decision,
+            usize::from(self.server_info.is_some()),
+        );
+        if present || !entries.is_empty() {
+            self.meta = Some(
+                OpenMetadata::try_from_notification_entries(entries.clone())
+                    .expect("replacing bounded trace fields preserves admitted metadata"),
+            );
+            let exact = self.exact_meta.get_or_insert_with(ExactJsonObject::default);
+            apply_exact_trace_metadata(exact, &entries);
+        }
+        if retained && decision.is_some_and(|decision| !decision.context().is_empty()) {
+            let mut members = Vec::new();
+            append_result_meta(&mut members, self);
+            if members
+                .iter()
+                .find(|member| member.name == "_meta")
+                .is_some_and(|member| {
+                    exact_json_value_len(&member.value, 0).map_or(true, |bytes| {
+                        bytes > fastmcp_core::limits::DEFAULT_METADATA_MAX_BYTES
+                    })
+                })
+            {
+                self.apply_outbound_trace_context(None);
+                return false;
+            }
+        }
+        retained
+    }
+
     /// Decodes the final server identity from its reserved metadata location.
     pub fn final_server_info(&self) -> Result<Option<Implementation>, ResultDecodeError> {
         self.meta.as_ref().map_or(Ok(None), |metadata| {
@@ -376,6 +471,122 @@ impl ResultMeta {
             })
         })
     }
+}
+
+/// One carrier admission shared by exact ordinary/discovery result encoders.
+/// Count independently stored reserved entries before adding optional fields.
+pub(crate) fn apply_trace_metadata_entries(
+    entries: &mut BTreeMap<String, Value>,
+    decision: Option<&fastmcp_core::OutboundTraceDecision>,
+    reserved_entries: usize,
+) -> bool {
+    for key in ["traceparent", "tracestate", "baggage"] {
+        entries.remove(key);
+    }
+    let Some(decision) = decision else {
+        return true;
+    };
+    let context = decision.context();
+    let fields = [
+        ("traceparent", context.traceparent()),
+        ("tracestate", context.tracestate()),
+        ("baggage", context.baggage()),
+    ];
+    let count = fields.iter().filter(|(_, value)| value.is_some()).count();
+    if entries
+        .len()
+        .saturating_add(reserved_entries)
+        .saturating_add(count)
+        > crate::common_types::MAX_METADATA_ENTRIES
+        || fields.iter().any(|(_, value)| {
+            value.is_some_and(|value| {
+                serde_json::to_vec(value).map_or(true, |value| {
+                    value.len() > crate::common_types::MAX_METADATA_VALUE_BYTES
+                })
+            })
+        })
+    {
+        return false;
+    }
+    for (name, value) in fields {
+        if let Some(value) = value {
+            entries.insert(name.to_owned(), Value::String(value.to_owned()));
+        }
+    }
+    if serde_json::to_writer(
+        &mut TraceMetadataByteBudget(fastmcp_core::limits::DEFAULT_METADATA_MAX_BYTES),
+        &entries,
+    )
+    .is_err()
+    {
+        for name in ["traceparent", "tracestate", "baggage"] {
+            entries.remove(name);
+        }
+        return false;
+    }
+    true
+}
+
+struct TraceMetadataByteBudget(usize);
+impl std::io::Write for TraceMetadataByteBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or_else(|| std::io::Error::other("trace metadata capacity exceeded"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn trace_metadata_within_budget(metadata: &impl Serialize) -> bool {
+    serde_json::to_writer(
+        &mut TraceMetadataByteBudget(fastmcp_core::limits::DEFAULT_METADATA_MAX_BYTES),
+        metadata,
+    )
+    .is_ok()
+}
+
+pub(crate) fn apply_exact_trace_metadata(
+    exact: &mut ExactJsonObject,
+    entries: &BTreeMap<String, Value>,
+) {
+    exact.members.retain(|member| {
+        !matches!(
+            member.name.as_str(),
+            "traceparent" | "tracestate" | "baggage"
+        )
+    });
+    for name in ["traceparent", "tracestate", "baggage"] {
+        if let Some(Value::String(value)) = entries.get(name) {
+            exact.members.push(ExactJsonMember {
+                name: name.to_owned(),
+                value: ExactJsonValue::String(value.clone()),
+            });
+        }
+    }
+}
+
+#[cfg(feature = "tasks")]
+pub(crate) fn apply_open_trace_metadata(
+    metadata: &mut Option<OpenMetadata>,
+    decision: Option<&fastmcp_core::OutboundTraceDecision>,
+) -> bool {
+    let present = metadata.is_some();
+    let mut entries = metadata
+        .as_ref()
+        .map(|meta| meta.entries().clone())
+        .unwrap_or_default();
+    let retained = apply_trace_metadata_entries(&mut entries, decision, 0);
+    if present || !entries.is_empty() {
+        *metadata = Some(
+            OpenMetadata::try_from_notification_entries(entries)
+                .expect("replacing bounded trace fields preserves admitted metadata"),
+        );
+    }
+    retained
 }
 
 /// Read-only view of optional result metadata.
@@ -2233,6 +2444,120 @@ impl<'a> ExactJsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn obs_01_result_trace_projection_preserves_exact_metadata_and_drops_on_capacity() {
+        use fastmcp_core::{
+            BaggageForwardingLimits, OutboundTracePolicy, TraceContext, TraceEndpoint,
+            TracePropagationRule, TraceTransport,
+        };
+        let parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let source =
+            TraceEndpoint::local(TraceTransport::Memory, "upstream", "tenant", "domain").unwrap();
+        let destination =
+            TraceEndpoint::local(TraceTransport::Memory, "downstream", "tenant", "domain").unwrap();
+        let policy = OutboundTracePolicy::new(9)
+            .unwrap()
+            .with_rule(
+                TracePropagationRule::new(source.clone(), destination.clone())
+                    .with_traceparent()
+                    .with_baggage_keys(["public"], BaggageForwardingLimits::default())
+                    .unwrap(),
+            )
+            .unwrap();
+        let context = TraceContext::try_from_fields(
+            Some(parent),
+            Some("vendor=private"),
+            Some("public=kept,private=hidden"),
+        )
+        .unwrap();
+        let decision = policy.evaluate(&source, &destination, &context, "2026-07-28");
+        for (kind, tail) in [
+            ("complete", ""),
+            ("input_required", ",\"requestState\":\"opaque\""),
+        ] {
+            let input = format!(
+                r#"{{"resultType":"{kind}","_meta":{{"com.example/first":1.20e+4,"traceparent":"{parent}","tracestate":"vendor=private","baggage":"public=kept,private=hidden","com.example/last":1e10000,"com.example/nested":{{"traceparent":"application"}}}}{tail},"extra":-7.30E-12}}"#
+            );
+            let (mut decoded, _) = decode_peer_result(
+                &input,
+                ResultPeerEra::Modern,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .unwrap();
+            let meta = match &mut decoded {
+                DecodedResult::Complete(result) => &mut result.meta,
+                DecodedResult::InputRequired(result) => &mut result.meta,
+                _ => unreachable!(),
+            };
+            assert!(meta.apply_outbound_trace_context(Some(&decision)));
+            assert_eq!(meta.trace_context().baggage(), Some("public=kept"));
+            let expected = format!(
+                r#"{{"resultType":"{kind}","_meta":{{"com.example/first":1.20e+4,"com.example/last":1e10000,"com.example/nested":{{"traceparent":"application"}},"traceparent":"{parent}","baggage":"public=kept"}}{tail},"extra":-7.30E-12}}"#
+            );
+            assert_eq!(encode_result(&decoded), expected);
+            let meta = match &mut decoded {
+                DecodedResult::Complete(result) => &mut result.meta,
+                DecodedResult::InputRequired(result) => &mut result.meta,
+                _ => unreachable!(),
+            };
+            assert!(meta.apply_outbound_trace_context(None));
+            assert!(meta.trace_context().is_empty());
+            assert!(
+                encode_result(&decoded)
+                    .contains(r#""com.example/nested":{"traceparent":"application"}"#)
+            );
+        }
+        let entries = (0..crate::common_types::MAX_METADATA_ENTRIES).map(|index| {
+            (
+                format!("com.example/value-{index}"),
+                Value::String("kept".to_owned()),
+            )
+        });
+        let mut full =
+            ResultMeta::empty().with_metadata(OpenMetadata::try_from_entries(entries).unwrap());
+        let before = full.exact_meta.clone();
+        assert!(!full.apply_outbound_trace_context(Some(&decision)));
+        assert_eq!(
+            full.exact_meta, before,
+            "capacity refusal changes no application metadata"
+        );
+        assert!(full.trace_context().is_empty());
+
+        // A new _meta carrier cannot displace an application member from a
+        // result already at its enclosing object limit. Dropping the optional
+        // projection must also remove the newly introduced empty carrier.
+        let request = crate::CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "tools/call",
+            Some(&serde_json::json!({
+                "name":"trace", "arguments":{}, "_meta":{
+                    "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities":{}
+                }
+            })),
+        )
+        .unwrap();
+        let mut saturated = serde_json::Map::from_iter([
+            (
+                "resultType".to_owned(),
+                Value::String("complete".to_owned()),
+            ),
+            ("content".to_owned(), Value::Array(Vec::new())),
+        ]);
+        for index in 2..MAX_RESULT_CONTAINER_MEMBERS {
+            saturated.insert(format!("extra-{index}"), Value::Null);
+        }
+        let mut decoded = request
+            .decode_result(&serde_json::to_string(&saturated).unwrap())
+            .unwrap();
+        let before = decoded.encode().unwrap();
+        let crate::CoreResult::Final(result) = &mut decoded else {
+            unreachable!();
+        };
+        assert!(!result.apply_outbound_trace_context(Some(&decision)));
+        assert_eq!(decoded.encode().unwrap(), before);
+    }
 
     #[test]
     fn exact_json_string_runs_preserve_unicode_and_every_ascii_escape() {

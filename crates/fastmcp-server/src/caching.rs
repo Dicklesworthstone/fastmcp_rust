@@ -13,6 +13,9 @@
 //! separate stateless domain for standalone middleware use and tests.
 //! Responses whose context emitted progress, logging, or change notifications
 //! bypass memoization: replaying only their result would omit those effects.
+//! Requests and results carrying effective trace context also bypass the cache.
+//! Their protocol TTL is zero where that hint is legal, so a downstream cache
+//! cannot reuse data affected by another request's trace or forwarding policy.
 //! A modern cache hit advertises only its remaining whole-millisecond TTL;
 //! replaying it cannot renew freshness in a downstream client or gateway.
 //!
@@ -503,6 +506,52 @@ fn request_carries_uncacheable_continuation(params: Option<&serde_json::Value>) 
         return false;
     };
     params.contains_key("inputResponses") || params.contains_key("requestState")
+}
+
+fn carries_trace_metadata(payload: &serde_json::Value) -> bool {
+    payload
+        .get("_meta")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|metadata| {
+            ["traceparent", "tracestate", "baggage"]
+                .iter()
+                .any(|key| metadata.contains_key(*key))
+        })
+}
+
+fn request_has_uncacheable_trace(ctx: &McpContext, request: &JsonRpcRequest) -> bool {
+    // Normal dispatch recovers optional metadata before middleware. Also
+    // refuse to hash raw trace fields when middleware is invoked directly;
+    // an unadmitted value must never become a cache identity.
+    !ctx.trace_context().is_empty() || request.params.as_ref().is_some_and(carries_trace_metadata)
+}
+
+fn disable_trace_dependent_cache_hints(method: &str, response: &mut serde_json::Value) {
+    let has_cacheable_shape = method_requires_protocol_cache_hints(method)
+        && (response
+            .get("resultType")
+            .and_then(serde_json::Value::as_str)
+            == Some("complete")
+            || (method == SERVER_DISCOVER_METHOD && is_final_discovery_result(response)));
+    if !has_cacheable_shape {
+        return;
+    }
+    // Cap only hints valid at this stage; the existing server normalization
+    // may already have supplied its own hints. Never introduce them on
+    // legacy/input-required/extension results. Arbitrary-width valid TTLs must
+    // also become zero; a local duration conversion would miss them.
+    if response
+        .get("ttlMs")
+        .is_some_and(|ttl| serde_json::from_value::<CacheTtl>(ttl.clone()).is_ok())
+        && matches!(
+            response
+                .get("cacheScope")
+                .and_then(serde_json::Value::as_str),
+            Some("private" | "public")
+        )
+    {
+        response["ttlMs"] = serde_json::Value::from(0);
+    }
 }
 
 /// Returns whether a response can be stored by the internal memoization cache.
@@ -1476,6 +1525,9 @@ impl Middleware for ResponseCachingMiddleware {
         if self.instance_id == 0 {
             return Ok(MiddlewareDecision::Continue);
         }
+        if request_has_uncacheable_trace(ctx, request) {
+            return Ok(MiddlewareDecision::Continue);
+        }
         // Check if this method should be cached
         if !self.should_cache_method(&request.method, request.params.as_ref()) {
             return Ok(MiddlewareDecision::Continue);
@@ -1581,10 +1633,21 @@ impl Middleware for ResponseCachingMiddleware {
         request: &JsonRpcRequest,
         mut response: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
+        let (response_trace, _) =
+            fastmcp_protocol::common_types::recover_payload_trace_context(&mut response);
+        let trace_dependent =
+            request_has_uncacheable_trace(ctx, request) || !response_trace.is_empty();
         if self.instance_id == 0 {
+            if trace_dependent {
+                disable_trace_dependent_cache_hints(&request.method, &mut response);
+            }
             return Ok(response);
         }
         self.apply_protocol_cache_hints(&request.method, &mut response);
+        if trace_dependent {
+            disable_trace_dependent_cache_hints(&request.method, &mut response);
+            return Ok(response);
+        }
         let final_discovery_policy = (request.method == SERVER_DISCOVER_METHOD
             && is_final_discovery_result(&response))
         .then(|| final_discovery_cache_policy(&response))
@@ -1808,6 +1871,192 @@ mod tests {
             "ttlMs": ttl_ms,
             "cacheScope": cache_scope,
         })
+    }
+
+    const OBS_01_TRACE_PARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    fn obs_01_catalog_response(label: &str) -> serde_json::Value {
+        serde_json::json!({
+            "resultType": "complete", "tools": [], "ttlMs": 30_000,
+            "cacheScope": "private", "com.example/value": label,
+        })
+    }
+
+    #[test]
+    fn obs_01_trace_context_bypasses_existing_cache_without_partition_pollution() {
+        let middleware = ResponseCachingMiddleware::new();
+        let request = test_request("tools/list", None);
+        let ordinary = test_context();
+        let baseline = obs_01_catalog_response("ordinary");
+        assert!(matches!(
+            middleware.on_request(&ordinary, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(&ordinary, &request, baseline.clone())
+            .unwrap();
+        assert_eq!(middleware.stats().entries, 1);
+
+        let trace = fastmcp_core::TraceContext::try_from_fields(
+            Some(OBS_01_TRACE_PARENT),
+            None,
+            Some("tenant=first"),
+        )
+        .unwrap();
+        let traced = test_context().with_trace_context(trace);
+        assert!(
+            matches!(
+                middleware.on_request(&traced, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ),
+            "trace context must not reuse the otherwise identical request"
+        );
+        let delivered = middleware
+            .on_response(
+                &traced,
+                &request,
+                obs_01_catalog_response("trace-dependent"),
+            )
+            .unwrap();
+        assert_eq!(delivered["ttlMs"], serde_json::json!(0));
+        assert_eq!(delivered["com.example/value"], "trace-dependent");
+        assert_eq!(middleware.stats().entries, 1);
+
+        let MiddlewareDecision::Respond(replayed) =
+            middleware.on_request(&test_context(), &request).unwrap()
+        else {
+            panic!("the ordinary partition must retain its prior result");
+        };
+        assert_replay_preserves_result_within_ttl(&baseline, &replayed, 30_000);
+    }
+
+    #[test]
+    fn obs_01_raw_trace_never_enters_a_direct_middleware_cache_key() {
+        for (key, value) in [
+            ("traceparent", serde_json::json!(OBS_01_TRACE_PARENT)),
+            ("tracestate", serde_json::json!("orphan=value")),
+            ("baggage", serde_json::json!("tenant=first")),
+            (
+                "traceparent",
+                serde_json::json!({"unadmitted": "x".repeat(20_000)}),
+            ),
+        ] {
+            let middleware = ResponseCachingMiddleware::new();
+            let ctx = test_context();
+            let metadata = serde_json::Map::from_iter([(key.to_owned(), value)]);
+            let request = test_request("tools/list", Some(serde_json::json!({"_meta": metadata})));
+            assert!(matches!(
+                middleware.on_request(&ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            let delivered = middleware
+                .on_response(&ctx, &request, obs_01_catalog_response("fresh"))
+                .unwrap();
+            assert_eq!(delivered["ttlMs"], serde_json::json!(0));
+            assert_eq!(middleware.stats().entries, 0);
+            assert_eq!(
+                middleware.stats().misses,
+                0,
+                "unadmitted trace is not hashed"
+            );
+        }
+    }
+
+    #[test]
+    fn obs_01_trace_in_a_result_disables_local_and_downstream_cache_reuse() {
+        for metadata in [
+            serde_json::json!({"traceparent": OBS_01_TRACE_PARENT, "tracestate": "vendor=value"}),
+            serde_json::json!({"baggage": "tenant=first"}),
+        ] {
+            let middleware = ResponseCachingMiddleware::new();
+            let ctx = test_context();
+            let request = test_request("tools/list", None);
+            assert!(matches!(
+                middleware.on_request(&ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            let mut response = obs_01_catalog_response("result-trace");
+            response["_meta"] = metadata.clone();
+            let delivered = middleware.on_response(&ctx, &request, response).unwrap();
+            assert_eq!(delivered["_meta"], metadata);
+            assert_eq!(delivered["ttlMs"], serde_json::json!(0));
+            assert_eq!(middleware.stats().entries, 0);
+            assert!(matches!(
+                middleware.on_request(&test_context(), &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+        }
+    }
+
+    #[test]
+    fn obs_01_malformed_result_trace_recovers_without_poisoning_cache_contents() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let request = test_request("tools/list", None);
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        let mut expected = obs_01_catalog_response("ordinary");
+        expected["_meta"] = serde_json::json!({
+            "com.example/kept": {"traceparent": "application data", "n": 17}
+        });
+        let mut response = expected.clone();
+        response["_meta"]["traceparent"] = serde_json::json!(17);
+        response["_meta"]["tracestate"] = serde_json::json!("orphan=value");
+        response["_meta"]["baggage"] = serde_json::json!("key=%GG");
+        let delivered = middleware.on_response(&ctx, &request, response).unwrap();
+        assert_eq!(delivered, expected);
+        assert_eq!(middleware.stats().entries, 1);
+        let MiddlewareDecision::Respond(replayed) =
+            middleware.on_request(&test_context(), &request).unwrap()
+        else {
+            panic!("recovered optional telemetry must preserve ordinary caching");
+        };
+        assert_replay_preserves_result_within_ttl(&expected, &replayed, 30_000);
+    }
+
+    #[test]
+    fn obs_01_uncacheable_trace_preserves_result_families_and_bounds_huge_ttls() {
+        let trace =
+            fastmcp_core::TraceContext::try_from_fields(Some(OBS_01_TRACE_PARENT), None, None)
+                .unwrap();
+        let ctx = test_context().with_trace_context(trace);
+        let middleware = ResponseCachingMiddleware::new();
+        let request = test_request("tools/list", None);
+        let legacy = serde_json::json!({"tools": []});
+        assert_eq!(
+            middleware
+                .on_response(&ctx, &request, legacy.clone())
+                .unwrap(),
+            legacy
+        );
+        let input_required =
+            serde_json::json!({"resultType": "input_required", "inputRequests": {}});
+        assert_eq!(
+            middleware
+                .on_response(&ctx, &request, input_required.clone())
+                .unwrap(),
+            input_required,
+        );
+        let mut huge = obs_01_catalog_response("huge-ttl");
+        huge["ttlMs"] = serde_json::from_str("18446744073709551616").unwrap();
+        assert_eq!(
+            middleware.on_response(&ctx, &request, huge).unwrap()["ttlMs"],
+            serde_json::json!(0),
+        );
+        let discovery = final_discovery_request(FINAL_PROTOCOL_VERSION);
+        assert_eq!(
+            middleware
+                .on_response(
+                    &ctx,
+                    &discovery,
+                    final_discovery_response(30_000, "private")
+                )
+                .unwrap()["ttlMs"],
+            serde_json::json!(0),
+        );
+        assert_eq!(middleware.stats().entries, 0);
     }
 
     fn assert_replay_preserves_result_within_ttl(

@@ -822,6 +822,13 @@ pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheS
     let CoreResult::Final(result) = result else {
         return None;
     };
+    // A peer may attach valid telemetry even when this request sent none.
+    // Replaying it would expose one response's context to a later caller.
+    // Inspect only recovered, effective trace; malformed optional telemetry
+    // already discarded by the result codec must not poison application data.
+    if !result.trace_context().is_empty() {
+        return None;
+    }
     match result {
         FinalCoreResult::Discover(result) => {
             let hints = result.cache_hints();
@@ -982,6 +989,93 @@ mod tests {
 
     fn tools_result(ttl_ms: u64, scope: &str, extra: Option<&str>) -> CoreResult {
         tools_result_with_ttl(&ttl_ms.to_string(), scope, extra)
+    }
+
+    #[test]
+    fn obs01_unsolicited_result_trace_retires_only_its_previous_cache_entry() {
+        for trace_metadata in [
+            r#""_meta":{"traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}"#,
+            r#""_meta":{"baggage":"region=us"}"#,
+        ] {
+            let mut cache = FinalResultCache::default();
+            let cache_key = key("credential-a", None);
+            let sibling_key = key("credential-a", Some("other-page"));
+            let receipt = Instant::now();
+            let generation = cache.begin_fetch(cache_key.result_set());
+            for retained_key in [&cache_key, &sibling_key] {
+                assert_eq!(
+                    cache.insert_if_current_at(
+                        retained_key.clone(),
+                        generation,
+                        tools_result(60_000, "private", None),
+                        receipt,
+                    ),
+                    FinalCacheInsert::Stored,
+                );
+            }
+            assert!(matches!(
+                cache.lookup_at(&cache_key, receipt),
+                FinalCacheLookup::Fresh(_)
+            ));
+            let traced = tools_result(60_000, "private", Some(trace_metadata));
+            let CoreResult::Final(final_result) = &traced else {
+                unreachable!()
+            };
+            assert!(!final_result.trace_context().is_empty());
+            assert_eq!(
+                cache.insert_if_current_at(cache_key.clone(), generation, traced, receipt),
+                FinalCacheInsert::NotCacheable,
+            );
+            assert_eq!(cache.stats().fills, 2);
+            assert_eq!(cache.begin_fetch(cache_key.result_set()), generation);
+            assert!(matches!(
+                cache.lookup_at(&cache_key, receipt),
+                FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+            ));
+            assert!(matches!(
+                cache.lookup_at(&sibling_key, receipt),
+                FinalCacheLookup::Fresh(_)
+            ));
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(
+                cache.retained_bytes,
+                cache.entries.get(&sibling_key).unwrap().encoded_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn obs01_recovered_malformed_result_trace_remains_cacheable_and_exact() {
+        let result = tools_result(
+            60_000,
+            "private",
+            Some(
+                r#""_meta":{"traceparent":"invalid","tracestate":"vendor=orphan","baggage":false,"example.test/exact":1.2300e+42},"vendorNumber":922337203685477580812345678901234567890"#,
+            ),
+        );
+        let CoreResult::Final(final_result) = &result else {
+            unreachable!()
+        };
+        assert!(final_result.trace_context().is_empty());
+        assert!(final_cache_hints(&result).is_some());
+        let expected = result.encode().unwrap();
+        assert!(!expected.contains("\"traceparent\""));
+        assert!(!expected.contains("\"tracestate\""));
+        assert!(!expected.contains("\"baggage\""));
+        assert!(expected.contains("1.2300e+42"));
+        assert!(expected.contains("922337203685477580812345678901234567890"));
+        let mut cache = FinalResultCache::default();
+        let cache_key = key("credential-a", None);
+        let receipt = Instant::now();
+        let generation = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), generation, result, receipt),
+            FinalCacheInsert::Stored,
+        );
+        let FinalCacheLookup::Fresh(replayed) = cache.lookup_at(&cache_key, receipt) else {
+            panic!("recovered telemetry must not disable ordinary result caching");
+        };
+        assert_eq!(replayed.encode().unwrap(), expected);
     }
 
     #[test]
