@@ -15,7 +15,7 @@ use asupersync::{Budget, Cx, Outcome, RegionId, TaskId, Time};
 #[cfg(test)]
 use asupersync::time::wall_now;
 
-use crate::{AuthContext, McpError, McpResult, SessionState};
+use crate::{AuthContext, McpError, McpResult, SessionState, TraceContext, TraceContextRecovery};
 
 const REQUEST_LEASE_UNMANAGED: u8 = 0;
 const REQUEST_LEASE_ACTIVE: u8 = 1;
@@ -1746,6 +1746,11 @@ pub struct McpContext {
     request_cancellation: McpRequestCancellation,
     /// Unique request identifier for tracing (from JSON-RPC id).
     request_id: u64,
+    /// Validated, request-local telemetry. It never grants authority or an
+    /// implicit right to forward baggage to another service.
+    trace_context: TraceContext,
+    /// Bounded field-recovery diagnostics; rejected peer values are not retained.
+    trace_recovery: TraceContextRecovery,
     /// Whether this request was admitted on the MCP 2026-07-28 surface.
     ///
     /// Nested component access follows this surface so a modern parent cannot
@@ -1846,6 +1851,8 @@ impl std::fmt::Debug for McpContext {
                 &self.request_cancellation.is_cancel_requested(),
             )
             .field("request_id", &self.request_id)
+            .field("trace_context", &self.trace_context)
+            .field("trace_recovery", &self.trace_recovery)
             .field("final_request_surface", &self.final_request_surface)
             .field(
                 "retained_continuation_owner",
@@ -2033,6 +2040,8 @@ impl McpContext {
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
             request_cancellation: McpRequestCancellation::new(),
             request_id,
+            trace_context: TraceContext::default(),
+            trace_recovery: TraceContextRecovery::default(),
             final_request_surface: false,
             retained_continuation_owner: false,
             http_parameter_headers: None,
@@ -2082,6 +2091,8 @@ impl McpContext {
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
             request_cancellation: McpRequestCancellation::new(),
             request_id,
+            trace_context: TraceContext::default(),
+            trace_recovery: TraceContextRecovery::default(),
             final_request_surface: false,
             retained_continuation_owner: false,
             http_parameter_headers: None,
@@ -2132,6 +2143,8 @@ impl McpContext {
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
             request_cancellation: McpRequestCancellation::new(),
             request_id,
+            trace_context: TraceContext::default(),
+            trace_recovery: TraceContextRecovery::default(),
             final_request_surface: false,
             retained_continuation_owner: false,
             http_parameter_headers: None,
@@ -2186,6 +2199,8 @@ impl McpContext {
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
             request_cancellation: McpRequestCancellation::new(),
             request_id,
+            trace_context: TraceContext::default(),
+            trace_recovery: TraceContextRecovery::default(),
             final_request_surface: false,
             retained_continuation_owner: false,
             http_parameter_headers: None,
@@ -2215,6 +2230,43 @@ impl McpContext {
             resource_subscriptions: None,
             catalog_publisher: None,
         }
+    }
+
+    /// Attaches already validated telemetry to this request context.
+    ///
+    /// Clones and nested handler calls retain this view. Creating a new
+    /// request context starts with no trace, so unrelated requests never
+    /// inherit a previous peer's telemetry. Outbound forwarding still requires
+    /// an explicit destination policy; trace identity is not authentication.
+    #[must_use]
+    pub fn with_trace_context(mut self, trace: TraceContext) -> Self {
+        self.trace_context = trace;
+        self.trace_recovery = TraceContextRecovery::default();
+        self
+    }
+
+    /// Attaches an admitted trace and its redacted field-recovery report.
+    #[must_use]
+    pub fn with_recovered_trace_context(
+        mut self,
+        trace: TraceContext,
+        recovery: TraceContextRecovery,
+    ) -> Self {
+        self.trace_context = trace;
+        self.trace_recovery = recovery;
+        self
+    }
+
+    /// Returns this request's valid, untrusted trace metadata.
+    #[must_use]
+    pub fn trace_context(&self) -> &TraceContext {
+        &self.trace_context
+    }
+
+    /// Returns only bounded rejection categories and counts, never peer bytes.
+    #[must_use]
+    pub fn trace_recovery(&self) -> &TraceContextRecovery {
+        &self.trace_recovery
     }
 
     /// Attaches a progress reporter without changing the request-accounting domain.

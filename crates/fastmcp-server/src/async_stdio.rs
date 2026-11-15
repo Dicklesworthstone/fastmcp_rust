@@ -2130,13 +2130,11 @@ impl NativeProtocol {
         }
         // FinalRequestMeta retains additional fields without validating their
         // reserved values. Apply the common metadata admission as well, so a
-        // malformed log level, key, or trace field cannot select an era and
-        // keep a connection open after a terminal opening error. Version support
-        // remains a separate check after this structural admission.
-        let Ok(metadata) = serde_json::from_value::<OpenMetadata>(metadata.clone()) else {
-            return false;
-        };
-        fastmcp_protocol::common_types::TraceContext::try_from_metadata(&metadata).is_ok()
+        // malformed log level or key cannot select an era and keep a connection
+        // open after a terminal opening error. Optional trace metadata recovers
+        // independently and cannot change negotiation or connection lifetime.
+        // Version support remains a separate structural-admission check.
+        serde_json::from_value::<OpenMetadata>(metadata.clone()).is_ok()
     }
 
     fn refuse_opening(
@@ -7744,6 +7742,126 @@ mod tests {
                     Err(TransportError::Closed)
                 ));
                 assert!(serving.join(cx).await.unwrap().is_err());
+            }
+
+            #[test]
+            fn obs_01_memory_auto_recovers_trace_on_modern_opening_and_preserves_connection() {
+                run_native(|cx| async move {
+                    let parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+                    let fields = [
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "traceparent": "malformed-parent", "tracestate": "vendor=state",
+                            "baggage": "independent=valid",
+                        }),
+                        serde_json::json!({"tracestate": "orphaned=state"}),
+                        serde_json::json!({
+                            "traceparent": 7, "tracestate": [], "baggage": {"not": "a string"},
+                        }),
+                        serde_json::json!({
+                            "traceparent": parent, "tracestate": "vendor=one,vendor=two",
+                            "baggage": "valid=yes,malformed-member",
+                        }),
+                        serde_json::json!({
+                            "traceparent": format!("01{}-{}", &parent[2..], "x".repeat(4096)),
+                            "tracestate": format!("vendor={}", "x".repeat(512)),
+                            "baggage": format!("large={}", "x".repeat(8192)),
+                        }),
+                    ];
+                    let mut expected_discovery = None;
+                    for fields in fields {
+                        let gate = Arc::new(Gate::default());
+                        let (mut peer, serving) =
+                            connect(&cx, configured(ProtocolPolicy::Auto, &gate).build());
+                        let JsonRpcMessage::Request(mut opening) = discover(170) else {
+                            unreachable!()
+                        };
+                        opening.params.as_mut().unwrap()["_meta"]
+                            .as_object_mut()
+                            .unwrap()
+                            .extend(fields.as_object().unwrap().clone());
+                        peer.send_async(&cx, &JsonRpcMessage::Request(opening))
+                            .await
+                            .unwrap();
+                        let discovered = response(&cx, &mut peer, 170).await;
+                        assert!(
+                            discovered.error.is_none(),
+                            "optional trace cannot reject Auto opening: {discovered:?}"
+                        );
+                        if let Some(expected) = &expected_discovery {
+                            assert_eq!(&discovered.result, expected);
+                        } else {
+                            expected_discovery = Some(discovered.result.clone());
+                        }
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+
+                        peer.send_async(&cx, &call(171, false)).await.unwrap();
+                        let completed = response(&cx, &mut peer, 171).await;
+                        assert!(completed.error.is_none());
+                        assert_eq!(completed.result.unwrap()["resultType"], "complete");
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                        peer.send_async(&cx, &initialize(172)).await.unwrap();
+                        assert_eq!(
+                            response(&cx, &mut peer, 172)
+                                .await
+                                .error
+                                .unwrap()
+                                .code
+                                .as_i32(),
+                            Some(-32601),
+                            "trace recovery must still select and retain the modern era",
+                        );
+                        peer.send_async(&cx, &call(173, false)).await.unwrap();
+                        assert!(response(&cx, &mut peer, 173).await.error.is_none());
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 2);
+                        stop(&cx, peer, serving).await;
+                        assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
+                    }
+                });
+            }
+
+            #[test]
+            fn obs_01_memory_auto_keeps_required_modern_metadata_errors_terminal() {
+                run_native(|cx| async move {
+                    for metadata in [
+                        serde_json::json!({
+                            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        }),
+                        serde_json::json!({
+                            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                            "io.modelcontextprotocol/clientCapabilities": [],
+                        }),
+                        serde_json::json!({
+                            "io.modelcontextprotocol/protocolVersion": 7,
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        }),
+                    ] {
+                        for with_trace in [false, true] {
+                            let gate = Arc::new(Gate::default());
+                            let (mut peer, serving) =
+                                connect(&cx, configured(ProtocolPolicy::Auto, &gate).build());
+                            let JsonRpcMessage::Request(mut opening) = discover(180) else {
+                                unreachable!()
+                            };
+                            let mut metadata = metadata.clone();
+                            if with_trace {
+                                metadata["traceparent"] = serde_json::json!("malformed-parent");
+                                metadata["tracestate"] = serde_json::json!("vendor=state");
+                                metadata["baggage"] = serde_json::json!(false);
+                            }
+                            opening.params.as_mut().unwrap()["_meta"] = metadata;
+                            peer.send_async(&cx, &JsonRpcMessage::Request(opening))
+                                .await
+                                .unwrap();
+                            let refused = response(&cx, &mut peer, 180).await;
+                            assert!(refused.result.is_none());
+                            assert_eq!(refused.error.unwrap().code.as_i32(), Some(-32602));
+                            refused_connection(&cx, &mut peer, serving).await;
+                            assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                            assert_eq!(gate.dropped.load(Ordering::Acquire), 0);
+                        }
+                    }
+                });
             }
 
             #[test]

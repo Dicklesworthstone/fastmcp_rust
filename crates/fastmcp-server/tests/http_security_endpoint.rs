@@ -30,19 +30,23 @@
 
 use std::future::Future;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
 use asupersync::Cx;
-use fastmcp_core::{AuthContext, McpContext, McpResult};
-use fastmcp_protocol::{Content, FINAL_PROTOCOL_VERSION, Tool, protocol_policy::ProtocolPolicy};
+use fastmcp_core::{AuthContext, McpContext, McpResult, TraceContext, TraceContextRecovery};
+use fastmcp_protocol::{
+    Content, FINAL_PROTOCOL_VERSION, JsonRpcRequest, Tool, protocol_policy::ProtocolPolicy,
+};
 use fastmcp_server::http_admission::security::HttpSecurityPolicy;
 use fastmcp_server::http_admission::security::endpoint::SecuredHttpEndpointError;
 use fastmcp_server::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
 use fastmcp_server::{
-    AuthProvider, AuthRequest, HttpServerConfig, HttpServerShutdown, Server, ServerHttpEndpoint,
-    ServerHttpEndpointResponse, StaticTokenVerifier, TokenAuthProvider, ToolHandler,
+    AuthProvider, AuthRequest, BoxFuture, FinalToolOutcome, HttpServerConfig, HttpServerShutdown,
+    Middleware, MiddlewareDecision, Server, ServerHttpEndpoint, ServerHttpEndpointResponse,
+    StaticTokenVerifier, TokenAuthProvider, ToolExecutionMode, ToolHandler,
+    promote_legacy_tool_content,
 };
 use fastmcp_transport::http::{HttpHandlerConfig, HttpMethod, HttpRequest};
 use serde_json::json;
@@ -181,6 +185,365 @@ fn secured_http_native_post_reaches_real_authentication_and_tool_once() {
         assert_eq!(result["result"]["content"][0]["text"], "verified-subject");
         assert_eq!(probe.counts(), (1, 1));
         assert!(!response.headers.contains_key("access-control-allow-origin"));
+    });
+}
+
+const TRACE_PARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+const TRACE_STATE: &str = "vendor=opaque, other=value";
+const TRACE_BAGGAGE: &str = "tenant=example%20tenant;flag, tenant=second";
+
+#[derive(Clone, Debug, PartialEq)]
+struct TraceObservation {
+    handler: &'static str,
+    trace: TraceContext,
+    recovery: TraceContextRecovery,
+    subject: Option<String>,
+    depth: u32,
+}
+
+#[derive(Clone)]
+struct TraceProbe {
+    probe: Probe,
+    observations: Arc<Mutex<Vec<TraceObservation>>>,
+    auth_metadata: Arc<Mutex<Vec<[Option<serde_json::Value>; 3]>>>,
+    middleware_metadata: Arc<Mutex<Vec<[Option<serde_json::Value>; 3]>>>,
+    name: &'static str,
+    call_inner: bool,
+}
+
+fn trace_metadata_fields(params: Option<&serde_json::Value>) -> [Option<serde_json::Value>; 3] {
+    ["traceparent", "tracestate", "baggage"].map(|name| {
+        params
+            .and_then(|params| params.get("_meta")?.get(name))
+            .cloned()
+    })
+}
+
+impl AuthProvider for TraceProbe {
+    fn authenticate(&self, ctx: &McpContext, request: AuthRequest<'_>) -> McpResult<AuthContext> {
+        self.auth_metadata
+            .lock()
+            .unwrap()
+            .push(trace_metadata_fields(request.params));
+        self.probe.authenticate(ctx, request)
+    }
+}
+
+impl Middleware for TraceProbe {
+    fn on_request(
+        &self,
+        _: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<MiddlewareDecision> {
+        self.middleware_metadata
+            .lock()
+            .unwrap()
+            .push(trace_metadata_fields(request.params.as_ref()));
+        Ok(MiddlewareDecision::Continue)
+    }
+}
+
+impl ToolHandler for TraceProbe {
+    fn definition(&self) -> Tool {
+        let mut definition = self.probe.definition();
+        definition.name = self.name.to_owned();
+        definition
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Async
+    }
+
+    fn call(&self, _: &McpContext, _: serde_json::Value) -> McpResult<Vec<Content>> {
+        panic!("trace probe must use its request-owned async hook")
+    }
+
+    fn call_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _: &'a Cx,
+        _: serde_json::Value,
+    ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            self.probe.execution.fetch_add(1, Ordering::AcqRel);
+            let snapshot = |context: &McpContext| TraceObservation {
+                handler: self.name,
+                trace: context.trace_context().clone(),
+                recovery: *context.trace_recovery(),
+                subject: context.auth().and_then(|auth| auth.subject),
+                depth: context.tool_call_depth(),
+            };
+            let observed = snapshot(ctx);
+            assert_eq!(
+                snapshot(&ctx.clone()),
+                observed,
+                "context clone lost trace or authority"
+            );
+            self.observations.lock().unwrap().push(observed);
+            let text = if self.call_inner {
+                match ctx.call_tool("trace_inner", json!({})).await {
+                    Ok(result) => {
+                        assert!(!result.is_error);
+                        result.content[0].as_text().unwrap().to_owned()
+                    }
+                    Err(error) => return fastmcp_core::Outcome::Err(error),
+                }
+            } else {
+                ctx.auth().and_then(|auth| auth.subject).unwrap_or_default()
+            };
+            match promote_legacy_tool_content(vec![Content::text(text)]) {
+                Ok(result) => fastmcp_core::Outcome::Ok(FinalToolOutcome::Complete(result)),
+                Err(error) => fastmcp_core::Outcome::Err(error),
+            }
+        })
+    }
+}
+
+fn trace_endpoint(call_inner: bool) -> (ServerHttpEndpoint, TraceProbe) {
+    let probe = TraceProbe {
+        probe: Probe::new(),
+        observations: Arc::new(Mutex::new(Vec::new())),
+        auth_metadata: Arc::new(Mutex::new(Vec::new())),
+        middleware_metadata: Arc::new(Mutex::new(Vec::new())),
+        name: "security_probe",
+        call_inner,
+    };
+    let inner = TraceProbe {
+        name: "trace_inner",
+        call_inner: false,
+        ..probe.clone()
+    };
+    let builder = Server::new("trace-http", "1.0.0")
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .unwrap()
+        .auth_provider(probe.clone())
+        .middleware(probe.clone())
+        .tool(probe.clone())
+        .tool(inner);
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    let endpoint = builder.build_http_endpoint();
+    #[cfg(feature = "legacy-2024-11-05")]
+    let endpoint = builder.build_http_endpoint("http://service.example");
+    (endpoint.unwrap(), probe)
+}
+
+fn trace_request(fields: serde_json::Value) -> HttpRequest {
+    let request = request();
+    let mut body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    body["params"]["_meta"]
+        .as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    request.with_body(serde_json::to_vec(&body).unwrap())
+}
+
+#[test]
+fn obs_01_secured_http_preserves_valid_trace_in_handler_clones() {
+    run(|cx| async move {
+        let (endpoint, probe) = trace_endpoint(true);
+        let response = Box::pin(endpoint.handle_secured_async(
+            &cx,
+            &policy(),
+            trace_request(json!({
+                "traceparent": TRACE_PARENT, "tracestate": TRACE_STATE, "baggage": TRACE_BAGGAGE,
+            })),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.response().status.0, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.response().body).unwrap();
+        assert!(body.get("error").is_none());
+        assert_eq!(body["result"]["content"][0]["text"], "verified-subject");
+        assert_eq!(probe.probe.counts(), (1, 2));
+        let expected_fields =
+            [TRACE_PARENT, TRACE_STATE, TRACE_BAGGAGE].map(|field| Some(json!(field)));
+        assert_eq!(
+            *probe.auth_metadata.lock().unwrap(),
+            vec![expected_fields.clone()]
+        );
+        assert_eq!(
+            *probe.middleware_metadata.lock().unwrap(),
+            vec![expected_fields]
+        );
+        let observations = probe.observations.lock().unwrap();
+        assert_eq!(
+            observations.len(),
+            2,
+            "outer and actual nested handler must execute"
+        );
+        assert_eq!(observations[0].handler, "security_probe");
+        assert_eq!(observations[0].depth, 0);
+        assert_eq!(observations[1].handler, "trace_inner");
+        assert_eq!(observations[1].depth, 1);
+        for observed in observations.iter() {
+            assert_eq!(observed.trace.traceparent(), Some(TRACE_PARENT));
+            assert_eq!(observed.trace.tracestate(), Some(TRACE_STATE));
+            assert_eq!(observed.trace.baggage(), Some(TRACE_BAGGAGE));
+            assert!(observed.recovery.is_empty());
+            assert_eq!(observed.subject.as_deref(), Some("verified-subject"));
+        }
+    });
+}
+
+#[test]
+fn obs_01_secured_http_recovers_optional_trace_without_application_changes() {
+    run(|cx| async move {
+        let (endpoint, probe) = trace_endpoint(false);
+        let cases = [
+            (
+                json!({
+                    "traceparent": "invalid-parent-secret", "tracestate": TRACE_STATE,
+                    "baggage": TRACE_BAGGAGE,
+                }),
+                [None, None, Some(TRACE_BAGGAGE)],
+                [true, true, false],
+            ),
+            (
+                json!({
+                    "traceparent": TRACE_PARENT, "tracestate": "vendor=one,vendor=two",
+                    "baggage": TRACE_BAGGAGE,
+                }),
+                [Some(TRACE_PARENT), None, Some(TRACE_BAGGAGE)],
+                [false, true, false],
+            ),
+            (
+                json!({
+                    "traceparent": TRACE_PARENT, "tracestate": TRACE_STATE,
+                    "baggage": "safe=yes,broken-member-secret",
+                }),
+                [Some(TRACE_PARENT), Some(TRACE_STATE), None],
+                [false, false, true],
+            ),
+            (
+                json!({
+                    "traceparent": 7, "tracestate": TRACE_STATE,
+                    "baggage": {"not": "a W3C string"},
+                }),
+                [None, None, None],
+                [true, true, true],
+            ),
+            (
+                json!({
+                    "tracestate": TRACE_STATE, "baggage": TRACE_BAGGAGE,
+                }),
+                [None, None, Some(TRACE_BAGGAGE)],
+                [false, true, false],
+            ),
+            (
+                json!({
+                    "traceparent": TRACE_PARENT, "tracestate": TRACE_STATE,
+                    "baggage": format!("oversized={}", "x".repeat(fastmcp_core::MAX_BAGGAGE_BYTES)),
+                }),
+                [Some(TRACE_PARENT), Some(TRACE_STATE), None],
+                [false, false, true],
+            ),
+        ];
+        for (index, (fields, expected, rejected)) in cases.into_iter().enumerate() {
+            let control = Box::pin(endpoint.handle_secured_async(&cx, &policy(), request()))
+                .await
+                .unwrap();
+            assert_eq!(control.response().status.0, 200);
+            let baseline = probe.observations.lock().unwrap().pop().unwrap();
+            assert!(baseline.trace.is_empty());
+            assert!(baseline.recovery.is_empty());
+            assert_eq!(
+                probe.auth_metadata.lock().unwrap().pop().unwrap(),
+                [None, None, None]
+            );
+            assert_eq!(
+                probe.middleware_metadata.lock().unwrap().pop().unwrap(),
+                [None, None, None]
+            );
+
+            let recovered =
+                Box::pin(endpoint.handle_secured_async(&cx, &policy(), trace_request(fields)))
+                    .await
+                    .unwrap();
+            assert!(!recovered.is_streaming());
+            assert_eq!(recovered.response().status, control.response().status);
+            assert_eq!(recovered.response().body, control.response().body);
+            assert_eq!(probe.probe.counts(), (2 * (index + 1), 2 * (index + 1)));
+            let observed = probe.observations.lock().unwrap().pop().unwrap();
+            assert_eq!(observed.subject, baseline.subject);
+            assert_eq!(observed.trace.traceparent(), expected[0]);
+            assert_eq!(observed.trace.tracestate(), expected[1]);
+            assert_eq!(observed.trace.baggage(), expected[2]);
+            let effective_fields = expected.map(|field| field.map(|field| json!(field)));
+            assert_eq!(
+                probe.auth_metadata.lock().unwrap().pop().unwrap(),
+                effective_fields,
+                "invalid optional trace must be removed before the authentication provider",
+            );
+            assert_eq!(
+                probe.middleware_metadata.lock().unwrap().pop().unwrap(),
+                effective_fields,
+                "committing authentication custody must not restore rejected metadata",
+            );
+            assert_eq!(observed.recovery.traceparent_rejected(), rejected[0]);
+            assert_eq!(observed.recovery.tracestate_rejected(), rejected[1]);
+            assert_eq!(observed.recovery.baggage_rejected(), rejected[2]);
+            assert_eq!(
+                usize::from(observed.recovery.rejected_count()),
+                rejected.into_iter().filter(|rejected| *rejected).count(),
+            );
+        }
+        assert!(probe.observations.lock().unwrap().is_empty());
+        assert!(probe.auth_metadata.lock().unwrap().is_empty());
+        assert!(probe.middleware_metadata.lock().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn obs_01_secured_http_trace_identity_never_authenticates() {
+    run(|cx| async move {
+        let (endpoint, probe) = trace_endpoint(false);
+        let claimed_identity = json!({
+            "traceparent": TRACE_PARENT, "tracestate": TRACE_STATE,
+            "baggage": "subject=attacker,scope=admin",
+        });
+        let mut control = None;
+        for (index, fields) in [
+            json!({}),
+            claimed_identity.clone(),
+            json!({"traceparent": "invalid", "baggage": "subject=verified-subject,broken"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = Box::pin(endpoint.handle_secured_async(
+                &cx,
+                &policy(),
+                trace_request(fields).with_header("authorization", "Bearer wrong-token"),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(response.response().status.0, 401);
+            assert!(response.response().headers.contains_key("www-authenticate"));
+            if let Some(expected) = &control {
+                assert_eq!(&response.response().body, expected);
+            } else {
+                control = Some(response.response().body.clone());
+            }
+            assert_eq!(probe.probe.counts(), (index + 1, 0));
+            assert!(probe.observations.lock().unwrap().is_empty());
+        }
+        let response = Box::pin(endpoint.handle_secured_async(
+            &cx,
+            &policy(),
+            trace_request(claimed_identity),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.response().status.0, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.response().body).unwrap();
+        assert_eq!(body["result"]["content"][0]["text"], "verified-subject");
+        assert_eq!(probe.probe.counts(), (4, 1));
+        let observed = probe.observations.lock().unwrap().pop().unwrap();
+        assert_eq!(observed.subject.as_deref(), Some("verified-subject"));
+        assert_eq!(
+            observed.trace.baggage(),
+            Some("subject=attacker,scope=admin")
+        );
     });
 }
 

@@ -1319,12 +1319,14 @@ pub(crate) fn decode_peer_result_with_metadata_role(
     }
     match policy.decide(&result_type.0) {
         ResultDiscriminatorDecision::Rejected => {
+            recover_deferred_result_trace(&mut members)?;
             return Err(ResultDecodeError::rejected_extension(RawResultEnvelope {
                 discriminator: result_type.0,
                 members,
             }));
         }
         ResultDiscriminatorDecision::DeferredExtension => {
+            recover_deferred_result_trace(&mut members)?;
             return Ok((
                 DecodedResult::Deferred(RawResultEnvelope {
                     discriminator: result_type.0,
@@ -1490,18 +1492,50 @@ fn validate_known_member_names(names: &[&str]) -> Result<(), ResultDecodeError> 
     Ok(())
 }
 
+fn remove_rejected_exact_trace(
+    metadata: &mut ExactJsonObject,
+    report: fastmcp_core::TraceContextRecovery,
+) {
+    for (name, rejected) in [
+        ("traceparent", report.traceparent_rejected()),
+        ("tracestate", report.tracestate_rejected()),
+        ("baggage", report.baggage_rejected()),
+    ] {
+        if rejected {
+            metadata.take(name);
+        }
+    }
+}
+
+fn recover_deferred_result_trace(members: &mut ExactJsonObject) -> Result<(), ResultDecodeError> {
+    if let Some(ExactJsonValue::Object(metadata)) = members.get_mut("_meta") {
+        let entries = exact_result_metadata_entries(metadata)?;
+        let (_, report) = fastmcp_core::TraceContext::recover(
+            entries.get("traceparent"),
+            entries.get("tracestate"),
+            entries.get("baggage"),
+        );
+        remove_rejected_exact_trace(metadata, report);
+    }
+    Ok(())
+}
+
 fn decode_result_meta(
     members: &mut ExactJsonObject,
     metadata_role: FinalResultMetadataRole,
 ) -> Result<ResultMeta, ResultDecodeError> {
     let (meta, exact_meta) = match members.take("_meta") {
         None => (None, None),
-        Some(ExactJsonValue::Object(value)) => {
+        Some(ExactJsonValue::Object(mut value)) => {
             let entries = exact_result_metadata_entries(&value)?;
             validate_final_result_metadata_entries(&entries, metadata_role)?;
             let metadata = OpenMetadata::try_from_notification_entries(entries).map_err(|_| {
                 ResultDecodeError::new(ResultDecodeErrorKind::InvalidKnownMember, "$._meta")
             })?;
+            // Re-encoding and proxy forwarding use exact_meta, so removing a
+            // rejected value from only the typed view would resurrect it.
+            // Keep every unrelated member and numeric lexeme byte-faithful.
+            remove_rejected_exact_trace(&mut value, metadata.trace_recovery());
             (Some(metadata), Some(value))
         }
         Some(_) => {
@@ -2654,6 +2688,145 @@ mod tests {
         .expect("rejection does not mutate subsequent final result admission");
         assert_eq!(diagnostic, None);
         assert_eq!(encode_result(&reaccepted), baseline_wire);
+    }
+
+    #[test]
+    fn obs_01_result_recovery_cannot_resurrect_rejected_exact_metadata() {
+        for (kind, tail) in [
+            ("complete", r#","extension":-7.30E-12"#),
+            (
+                "input_required",
+                r#","requestState":"resume","extension":-7.30E-12"#,
+            ),
+        ] {
+            // These fragments are kept raw so the assertions cover the exact
+            // sidecar, including numeric spellings that Value may normalize.
+            let expected = format!(
+                r#"{{"resultType":"{kind}","_meta":{{"baggage":"user=opaque;flag","com.example/decimal":1.20e+4,"com.example/huge":1e10000,"com.example/nested":{{"traceparent":"application data"}}}}{tail}}}"#
+            );
+            for invalid in [
+                r#""private-invalid-parent""#.to_owned(),
+                "null".to_owned(),
+                "true".to_owned(),
+                "1e10000".to_owned(),
+                r#"{"nested":[1e10000]}"#.to_owned(),
+                format!(
+                    "\"{}\"",
+                    "x".repeat(crate::common_types::MAX_METADATA_VALUE_BYTES + 1)
+                ),
+            ] {
+                let source = format!(
+                    r#"{{"resultType":"{kind}","_meta":{{"traceparent":{invalid},"tracestate":"vendor=private-state","baggage":"user=opaque;flag","com.example/decimal":1.20e+4,"com.example/huge":1e10000,"com.example/nested":{{"traceparent":"application data"}}}}{tail}}}"#
+                );
+                let (decoded, diagnostic) = decode_peer_result(
+                    &source,
+                    ResultPeerEra::Modern,
+                    &CoreResultDiscriminatorPolicy,
+                )
+                .expect("malformed optional trace cannot fail an admitted application result");
+                assert_eq!(diagnostic, None);
+                let meta = match &decoded {
+                    DecodedResult::Complete(result) => &result.meta,
+                    DecodedResult::InputRequired(result) => &result.meta,
+                    DecodedResult::Deferred(_) => panic!("a core result keeps its discriminator"),
+                };
+                assert_eq!(meta.metadata().get("traceparent"), None);
+                assert_eq!(meta.metadata().get("tracestate"), None);
+                assert_eq!(
+                    meta.metadata().get("baggage"),
+                    Some(&ExactJsonValue::String("user=opaque;flag".to_owned()))
+                );
+                assert_eq!(
+                    meta.metadata().get("com.example/decimal"),
+                    Some(&ExactJsonValue::Number("1.20e+4".to_owned()))
+                );
+                assert_eq!(
+                    meta.metadata().get("com.example/huge"),
+                    Some(&ExactJsonValue::Number("1e10000".to_owned()))
+                );
+                assert_eq!(encode_result(&decoded), expected);
+                let (redecoded, _) = decode_peer_result(
+                    &encode_result(&decoded),
+                    ResultPeerEra::Modern,
+                    &CoreResultDiscriminatorPolicy,
+                )
+                .expect("recovered output remains admissible");
+                assert_eq!(encode_result(&redecoded), expected);
+                assert!(!format!("{decoded:?}").contains("private-invalid-parent"));
+                assert!(!format!("{decoded:?}").contains("private-state"));
+            }
+        }
+    }
+
+    #[test]
+    fn obs_01_result_recovery_preserves_valid_parent_when_other_fields_fail() {
+        let parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        for (state, baggage, retained) in [
+            (
+                r#""vendor=one,vendor=two""#,
+                r#""k=v""#,
+                r#","baggage":"k=v""#,
+            ),
+            (
+                r#""vendor=value""#,
+                "1e10000",
+                r#","tracestate":"vendor=value""#,
+            ),
+            ("1e10000", r#"{"nested":1e10000}"#, ""),
+        ] {
+            let source = format!(
+                r#"{{"resultType":"complete","_meta":{{"traceparent":"{parent}","tracestate":{state},"baggage":{baggage},"com.example/decimal":1.20e+4}},"answer":7}}"#
+            );
+            let expected = format!(
+                r#"{{"resultType":"complete","_meta":{{"traceparent":"{parent}"{retained},"com.example/decimal":1.20e+4}},"answer":7}}"#
+            );
+            let (decoded, _) = decode_peer_result(
+                &source,
+                ResultPeerEra::Modern,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .expect("invalid state and baggage recover independently from a valid parent");
+            assert_eq!(encode_result(&decoded), expected);
+        }
+    }
+
+    #[test]
+    fn obs_01_deferred_and_rejected_results_drop_trace_without_rewriting_open_values() {
+        let expected = r#"{"before":1.20e+4,"resultType":"example/extension","_meta":{"baggage":"user=opaque","com.example/number":-7.30E-12,"com.example/huge":1e10000},"after":123456789012345678901234567890}"#;
+        for invalid in [
+            r#""private-invalid-parent""#,
+            "1e10000",
+            r#"{"nested":1e10000}"#,
+        ] {
+            let source = format!(
+                r#"{{"before":1.20e+4,"resultType":"example/extension","_meta":{{"traceparent":{invalid},"tracestate":"vendor=private-state","baggage":"user=opaque","com.example/number":-7.30E-12,"com.example/huge":1e10000}},"after":123456789012345678901234567890}}"#
+            );
+            let (deferred, diagnostic) = decode_peer_result(
+                &source,
+                ResultPeerEra::Modern,
+                &DeferringResultDiscriminatorPolicy,
+            )
+            .expect("optional telemetry cannot change an extension's deferred disposition");
+            assert_eq!(diagnostic, None);
+            assert!(matches!(deferred, DecodedResult::Deferred(_)));
+            assert_eq!(encode_result(&deferred), expected);
+
+            let error = decode_peer_result(
+                &source,
+                ResultPeerEra::Modern,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .expect_err("the same unclaimed extension remains rejected by the core policy");
+            assert_eq!(error.kind(), ResultDecodeErrorKind::RejectedExtension);
+            assert_eq!(error.path(), "$.resultType");
+            let envelope = error
+                .raw_envelope()
+                .expect("the inert envelope is retained");
+            assert_eq!(envelope.discriminator(), "example/extension");
+            assert_eq!(encode_exact_object(&envelope.members), expected);
+            assert!(!format!("{error:?}").contains("private-invalid-parent"));
+            assert!(!format!("{error:?}").contains("private-state"));
+        }
     }
 
     #[test]

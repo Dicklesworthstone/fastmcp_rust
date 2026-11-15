@@ -88,7 +88,13 @@ use fastmcp_core::runtime::block_on;
 pub mod runtime;
 mod state;
 pub mod stats;
+pub mod trace;
 pub mod uri;
+
+pub use trace::{
+    MAX_BAGGAGE_BYTES, MAX_BAGGAGE_MEMBERS, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES,
+    MAX_TRACESTATE_MEMBERS, TraceContext, TraceContextError, TraceContextRecovery,
+};
 
 pub use stats::{
     OperatorConnectionCapacity, OperatorConnectionCounters, OperatorCorrelationCapacity,

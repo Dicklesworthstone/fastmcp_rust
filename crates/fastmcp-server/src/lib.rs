@@ -2066,7 +2066,34 @@ fn retained_raw_params<'a>(
     admitted: Option<&serde_json::Value>,
     current: Option<&serde_json::Value>,
 ) -> Option<&'a str> {
-    raw_params.filter(|_| admitted == current)
+    raw_params.filter(|_| {
+        if admitted == current {
+            return true;
+        }
+        // The exact source remains useful for ordered MRTR input responses
+        // when the only change was optional trace recovery. Core decoding
+        // repeats this same recovery before comparing the source, and its
+        // typed metadata never retains the rejected fields. Credential or
+        // application mutations still invalidate the sidecar.
+        let Some(mut recovered) = admitted.cloned() else {
+            return false;
+        };
+        fastmcp_protocol::common_types::recover_payload_trace_context(&mut recovered);
+        current == Some(&recovered)
+    })
+}
+
+fn recover_request_trace_context(context: McpContext, request: &mut JsonRpcRequest) -> McpContext {
+    let (trace, recovery) = request.params.as_mut().map_or_else(
+        || {
+            (
+                fastmcp_core::TraceContext::default(),
+                fastmcp_core::TraceContextRecovery::default(),
+            )
+        },
+        fastmcp_protocol::common_types::recover_payload_trace_context,
+    );
+    context.with_recovered_trace_context(trace, recovery)
 }
 
 /// Re-admits a middleware-produced final core response through the request's
@@ -16872,6 +16899,10 @@ impl Server {
                     .with_request_cancellation(cancellation.clone()),
             ),
         );
+        // This notification owns its ingress copy. Recover before either
+        // authentication or extension authorization observes the metadata,
+        // retaining the report through the request-owned child context.
+        let context = recover_request_trace_context(context, &mut notification);
         // Runtime children inherit the held Cx's mask, not this poll's
         // ambient ceiling. Retain the admitted intersection before opening
         // their region so a broader inbound caller cannot restore a denied
@@ -17927,6 +17958,7 @@ impl Server {
         // below by a metadata-stripped copy.
         let admitted_params = request.params.as_ref();
         let mut admission_request = request.clone();
+        let request_ctx = recover_request_trace_context(request_ctx, &mut admission_request);
         if let Err(error) = self.authenticate_modern_request(
             &request_ctx,
             inbound,
@@ -18279,6 +18311,7 @@ impl Server {
                 "request scope could not be established",
             ));
         };
+        request_ctx = recover_request_trace_context(request_ctx, &mut request);
         if let Err(error) = self.authenticate_modern_request(
             &request_ctx,
             inbound,
@@ -24736,6 +24769,15 @@ impl Server {
         request: &JsonRpcRequest,
         transport_authorization: &TransportAuthorization,
     ) -> Result<AuthAdmissionReceipt, HttpResponse> {
+        // Authentication and the receipt observe the same effective metadata.
+        // Keep the original ingress request untouched so dispatch can retain
+        // its bounded recovery report instead of recovering an already-clean
+        // copy and losing the rejection categories.
+        let mut request = request.clone();
+        let request_ctx = recover_request_trace_context(
+            McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref())),
+            &mut request,
+        );
         let auth_request = transport_authorization.auth_request(
             &request.method,
             request.params.as_ref(),
@@ -24750,22 +24792,20 @@ impl Server {
         let budget = self.create_request_budget(cx);
         Self::enforce_request_budget(cx, budget)
             .map_err(|_| native_http_authentication_rejection())?;
-        let (request_ctx, _request_lease_guard) =
-            McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref()))
-                .with_budget_ceiling(budget)
-                .begin_request_scope()
-                .ok_or_else(native_http_authentication_rejection)?;
+        let (request_ctx, _request_lease_guard) = request_ctx
+            .with_budget_ceiling(budget)
+            .begin_request_scope()
+            .ok_or_else(native_http_authentication_rejection)?;
         let admitted = self.authenticate_request_without_commit(&request_ctx, auth_request);
         Self::enforce_request_context(&request_ctx)
             .map_err(|_| native_http_authentication_rejection())?;
         admitted
             .map(|(fingerprint, authenticated)| {
-                let mut sanitized = request.clone();
-                auth::strip_recognized_access_credentials(&mut sanitized.params);
+                auth::strip_recognized_access_credentials(&mut request.params);
                 AuthAdmissionReceipt {
-                    method: sanitized.method,
-                    request_id: sanitized.id,
-                    sanitized_params: sanitized.params,
+                    method: request.method,
+                    request_id: request.id,
+                    sanitized_params: request.params,
                     fingerprint,
                     authenticated,
                 }
@@ -24795,6 +24835,12 @@ impl Server {
         transport_authorization: &TransportAuthorization,
         cancellation: Option<&McpRequestCancellation>,
     ) -> Result<AuthAdmissionReceipt, HttpResponse> {
+        let mut request = request.clone();
+        let request_ctx = recover_request_trace_context(
+            McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref()))
+                .with_request_cancellation(cancellation.cloned().unwrap_or_default()),
+            &mut request,
+        );
         let auth_request = transport_authorization.auth_request(
             &request.method,
             request.params.as_ref(),
@@ -24809,12 +24855,10 @@ impl Server {
         let budget = self.create_request_budget(cx);
         Self::enforce_request_budget(cx, budget)
             .map_err(|_| native_http_authentication_unavailable())?;
-        let (request_ctx, _request_lease_guard) =
-            McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref()))
-                .with_request_cancellation(cancellation.cloned().unwrap_or_default())
-                .with_budget_ceiling(budget)
-                .begin_request_scope()
-                .ok_or_else(native_http_authentication_unavailable)?;
+        let (request_ctx, _request_lease_guard) = request_ctx
+            .with_budget_ceiling(budget)
+            .begin_request_scope()
+            .ok_or_else(native_http_authentication_unavailable)?;
         let admitted = self
             .authenticate_request_without_commit_async(&request_ctx, auth_request)
             .await;
@@ -24822,12 +24866,11 @@ impl Server {
             .map_err(|_| native_http_authentication_unavailable())?;
         match admitted {
             Ok((fingerprint, authenticated)) => {
-                let mut sanitized = request.clone();
-                auth::strip_recognized_access_credentials(&mut sanitized.params);
+                auth::strip_recognized_access_credentials(&mut request.params);
                 Ok(AuthAdmissionReceipt {
-                    method: sanitized.method,
-                    request_id: sanitized.id,
-                    sanitized_params: sanitized.params,
+                    method: request.method,
+                    request_id: request.id,
+                    sanitized_params: request.params,
                     fingerprint,
                     authenticated,
                 })
@@ -24884,14 +24927,14 @@ impl Server {
         #[cfg(feature = "websocket")]
         let _frame_rejection =
             WebSocketFrameRejectionCleanup(auth_receipt, request_id_to_u64(request.id.as_ref()));
-        let context = inbound.request_context();
+        let mut sanitized = request.clone();
+        let context = recover_request_trace_context(inbound.request_context(), &mut sanitized);
         let budget = self.create_request_budget(context.cx());
         let (context, _lease) = context
             .with_budget_ceiling(budget)
             .begin_request_scope()
             .ok_or_else(|| McpError::internal_error("request scope could not be established"))?;
         Self::enforce_request_context(&context)?;
-        let mut sanitized = request.clone();
         let (fingerprint, authenticated) = match auth_receipt {
             Some(receipt) => (
                 receipt.commit(
@@ -24904,7 +24947,7 @@ impl Server {
             ),
             None => self.authenticate_request_without_commit(
                 &context,
-                inbound.auth_request(&request.method, request.params.as_ref()),
+                inbound.auth_request(&sanitized.method, sanitized.params.as_ref()),
             )?,
         };
         Self::enforce_request_context(&context)?;
@@ -24936,7 +24979,8 @@ impl Server {
         #[cfg(feature = "websocket")]
         let _frame_rejection =
             WebSocketFrameRejectionCleanup(auth_receipt, request_id_to_u64(request.id.as_ref()));
-        let context = inbound.request_context();
+        let mut sanitized = request.clone();
+        let context = recover_request_trace_context(inbound.request_context(), &mut sanitized);
         let budget = self.create_request_budget(context.cx());
         let (context, _lease) = context
             .with_budget_ceiling(budget)
@@ -24945,21 +24989,21 @@ impl Server {
         Self::enforce_request_context(&context)?;
         let fingerprint = match auth_receipt {
             Some(receipt) => {
-                receipt.commit(&context, inbound, request, websocket_connection_generation)?
+                receipt.commit(&context, inbound, &mut sanitized, websocket_connection_generation)?
             }
             None => {
                 let fingerprint = self.authenticate_request(
                     &context,
-                    inbound.auth_request(&request.method, request.params.as_ref()),
+                    inbound.auth_request(&sanitized.method, sanitized.params.as_ref()),
                 )?;
-                auth::strip_recognized_access_credentials(&mut request.params);
+                auth::strip_recognized_access_credentials(&mut sanitized.params);
                 fingerprint
             }
         };
         let cancellation = CancellationWireMessage::decode(
             ProtocolEra::Modern2026,
             CancellationSender::Client,
-            request,
+            &sanitized,
         )
         .map_err(|error| McpError::invalid_params(error.to_string()))?;
         if !inbound.verify_existing_principal(fingerprint) {
@@ -24969,6 +25013,7 @@ impl Server {
             ));
         }
         Self::enforce_request_context(&context)?;
+        *request = sanitized;
         Ok(cancellation)
     }
 

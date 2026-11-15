@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+pub use fastmcp_core::{TraceContext, TraceContextRecovery};
+
 /// A structural rejection at the protocol wire boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommonTypeError {
@@ -63,7 +65,8 @@ pub const MAX_ICON_SIZE_BYTES: usize = 128;
 /// size of one LIMIT-01 decoded binary content block (3 MiB),
 /// `4 * ceil(3 MiB / 3)`.
 pub const MAX_CONTENT_ENCODED_BYTES: usize = 4 * 1024 * 1024;
-/// Maximum UTF-8 bytes in each W3C trace field.
+/// Historical common trace-field budget. Actual W3C admission uses the
+/// field-specific bounds in [`fastmcp_core::trace`].
 pub const MAX_TRACE_FIELD_BYTES: usize = 4 * 1024;
 /// Maximum bytes retained for one exact finite final progress number lexeme.
 pub const MAX_EXACT_PROGRESS_NUMBER_BYTES: usize = 256;
@@ -1161,9 +1164,17 @@ impl<'de> Deserialize<'de> for Implementation {
 }
 
 /// Open `_meta` values with typed access to final reserved keys.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(transparent)]
-pub struct OpenMetadata(BTreeMap<String, Value>);
+pub struct OpenMetadata(BTreeMap<String, Value>, #[serde(skip)] TraceContextRecovery);
+
+impl PartialEq for OpenMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for OpenMetadata {}
 
 impl OpenMetadata {
     /// Validates every key and preserves valid unknown peer entries exactly.
@@ -1180,7 +1191,8 @@ impl OpenMetadata {
     ///
     /// The final schema gives only `subscriptionId` a typed meaning in
     /// notification metadata. Every other syntactically valid key/value is
-    /// retained exactly and remains inert.
+    /// retained exactly and remains inert, except that optional W3C trace
+    /// fields receive the same strip-and-continue recovery in every role.
     pub fn try_from_notification_entries(
         entries: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<Self, CommonTypeError> {
@@ -1195,10 +1207,19 @@ impl OpenMetadata {
     ) -> Result<Self, CommonTypeError> {
         let mut values = BTreeMap::new();
         for (key, value) in entries {
-            let value_bytes = serde_json::to_vec(&value)
-                .map_err(|_| CommonTypeError::Invalid("metadata value"))?
-                .len();
-            if values.len() == MAX_METADATA_ENTRIES
+            // Optional telemetry has independent limits and cannot invalidate
+            // an otherwise admitted application envelope. Hold at most its
+            // three reserved fields until cross-field recovery below; never
+            // serialize an oversized rejected value merely to measure it.
+            let trace_field = matches!(key.as_str(), "traceparent" | "tracestate" | "baggage");
+            let value_bytes = if trace_field {
+                0
+            } else {
+                serde_json::to_vec(&value)
+                    .map_err(|_| CommonTypeError::Invalid("metadata value"))?
+                    .len()
+            };
+            if values.len() == MAX_METADATA_ENTRIES + 3
                 || key.len() > MAX_METADATA_KEY_BYTES
                 || value_bytes > MAX_METADATA_VALUE_BYTES
                 || !valid_key(&key)
@@ -1207,7 +1228,11 @@ impl OpenMetadata {
                 return Err(CommonTypeError::Invalid("metadata key"));
             }
         }
-        Ok(Self(values))
+        let (_, recovery) = recover_trace_metadata_entries(&mut values);
+        if values.len() > MAX_METADATA_ENTRIES {
+            return Err(CommonTypeError::Invalid("metadata key"));
+        }
+        Ok(Self(values, recovery))
     }
 
     /// Returns the exact retained entry for a valid unknown key.
@@ -1220,6 +1245,24 @@ impl OpenMetadata {
     #[must_use]
     pub fn entries(&self) -> &BTreeMap<String, Value> {
         &self.0
+    }
+
+    /// Returns only the effective, validated trace fields. Trace data never
+    /// grants authentication or permission to propagate across a trust boundary.
+    #[must_use]
+    pub fn trace_context(&self) -> TraceContext {
+        TraceContext::recover(
+            self.get("traceparent"),
+            self.get("tracestate"),
+            self.get("baggage"),
+        )
+        .0
+    }
+
+    /// Bounded recovery categories and count, without rejected peer values.
+    #[must_use]
+    pub fn trace_recovery(&self) -> TraceContextRecovery {
+        self.1
     }
 
     /// Reads the typed protocol version, if this metadata role declares it.
@@ -1409,73 +1452,52 @@ fn valid_reverse_dns_prefix(prefix: &str) -> bool {
         })
 }
 
-/// Bounded trace-context fields preserved from open metadata.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TraceContext {
-    /// W3C trace parent value.
-    pub traceparent: Option<String>,
-    /// W3C trace state value.
-    pub tracestate: Option<String>,
-    /// W3C baggage value.
-    pub baggage: Option<String>,
-}
-
-impl TraceContext {
-    /// Extracts trace fields only when they are strings in valid metadata.
-    pub fn try_from_metadata(metadata: &OpenMetadata) -> Result<Self, CommonTypeError> {
-        let field = |name| {
-            metadata.optional_string(name).and_then(|value| {
-                if value.is_some_and(|field| {
-                    field.len() > MAX_TRACE_FIELD_BYTES
-                        || !field.is_ascii()
-                        || field.bytes().any(|byte| byte <= 0x20 || byte == 0x7f)
-                }) {
-                    Err(CommonTypeError::TooLong("trace context"))
-                } else {
-                    Ok(value.map(ToOwned::to_owned))
-                }
-            })
-        };
-        let traceparent = field("traceparent")?;
-        if traceparent
-            .as_deref()
-            .is_some_and(|value| !valid_traceparent(value))
-        {
-            return Err(CommonTypeError::Invalid("traceparent"));
+/// Removes rejected W3C fields from the effective open metadata map.
+///
+/// This applies equally to requests, notifications, results, and error data.
+/// Unknown metadata remains untouched. Callers may retain the bounded report,
+/// but must not log, cache under, or forward rejected raw values.
+pub fn recover_trace_metadata_entries(
+    metadata: &mut BTreeMap<String, Value>,
+) -> (TraceContext, TraceContextRecovery) {
+    let (trace, recovery) = TraceContext::recover(
+        metadata.get("traceparent"),
+        metadata.get("tracestate"),
+        metadata.get("baggage"),
+    );
+    for (key, rejected) in [
+        ("traceparent", recovery.traceparent_rejected()),
+        ("tracestate", recovery.tracestate_rejected()),
+        ("baggage", recovery.baggage_rejected()),
+    ] {
+        if rejected {
+            metadata.remove(key);
         }
-        Ok(Self {
-            traceparent,
-            tracestate: field("tracestate")?,
-            baggage: field("baggage")?,
-        })
     }
+    (trace, recovery)
 }
 
-fn valid_traceparent(value: &str) -> bool {
-    let mut fields = value.split('-');
-    let (Some(version), Some(trace_id), Some(parent_id), Some(flags), None) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
-        return false;
+/// Recovers optional trace metadata on one MCP payload without traversing
+/// application arguments or nested user data.
+pub fn recover_payload_trace_context(payload: &mut Value) -> (TraceContext, TraceContextRecovery) {
+    let Some(metadata) = payload.get_mut("_meta").and_then(Value::as_object_mut) else {
+        return (TraceContext::default(), TraceContextRecovery::default());
     };
-    valid_lower_hex(version, 2)
-        && version != "ff"
-        && valid_lower_hex(trace_id, 32)
-        && trace_id.bytes().any(|byte| byte != b'0')
-        && valid_lower_hex(parent_id, 16)
-        && parent_id.bytes().any(|byte| byte != b'0')
-        && valid_lower_hex(flags, 2)
-}
-
-fn valid_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    let (trace, recovery) = TraceContext::recover(
+        metadata.get("traceparent"),
+        metadata.get("tracestate"),
+        metadata.get("baggage"),
+    );
+    for (key, rejected) in [
+        ("traceparent", recovery.traceparent_rejected()),
+        ("tracestate", recovery.tracestate_rejected()),
+        ("baggage", recovery.baggage_rejected()),
+    ] {
+        if rejected {
+            metadata.remove(key);
+        }
+    }
+    (trace, recovery)
 }
 
 /// A peer cancellation request identifier.
@@ -2572,8 +2594,7 @@ impl FinalCommonTypesSchema {
                 return Err(CommonTypeError::Invalid("request metadata"));
             }
             (_, Some(meta)) => {
-                let metadata = Self::validate_open_metadata(meta)?;
-                let _ = TraceContext::try_from_metadata(&metadata)?;
+                let _ = Self::validate_open_metadata(meta)?;
             }
             (_, None) => {}
         }
@@ -2661,7 +2682,6 @@ impl FinalCommonTypesSchema {
             return Err(CommonTypeError::Invalid("required request metadata"));
         }
         let _ = metadata.client_info()?;
-        let _ = TraceContext::try_from_metadata(&metadata)?;
         Ok(())
     }
 
@@ -3501,10 +3521,7 @@ mod tests {
             Some("2026-07-28")
         );
         assert_eq!(
-            TraceContext::try_from_metadata(&metadata)
-                .expect("trace")
-                .traceparent
-                .as_deref(),
+            metadata.trace_context().traceparent(),
             Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
         );
 

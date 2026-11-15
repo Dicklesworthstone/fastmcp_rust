@@ -3,6 +3,9 @@
 //! These functions intentionally live at the integration-test harness root: the frozen RCH
 //! runners invoke their literal names with `--exact`, so nested unit-test names are insufficient.
 
+use fastmcp_core::{
+    MAX_BAGGAGE_BYTES, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES, TraceContextError,
+};
 use fastmcp_protocol::FinalListParams;
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, CancellationNotification, CancellationRequestId, CommonTypeError,
@@ -10,14 +13,14 @@ use fastmcp_protocol::common_types::{
     Implementation, MAX_ABSOLUTE_URI_BYTES, MAX_CONTENT_ENCODED_BYTES, MAX_CURSOR_BYTES,
     MAX_ICON_DATA_URI_DECODED_BYTES, MAX_ICON_DATA_URI_ENCODED_BYTES,
     MAX_ICON_DATA_URI_PREFIX_BYTES, MAX_ICON_SIZE_BYTES, MAX_ICON_SIZE_ENTRIES,
-    MAX_METADATA_ENTRIES, MAX_TRACE_FIELD_BYTES, OpaqueCursor, OpenMetadata,
+    MAX_METADATA_ENTRIES, MAX_METADATA_VALUE_BYTES, OpaqueCursor, OpenMetadata,
     PRT_02_A_ICON_CONTENT_MANIFEST_V1, PRT_02_A_METADATA_MANIFEST_V1,
     PRT_02_A_URI_CURSOR_CANCEL_MANIFEST_V1, PRT_02_B_BOUNDS_DIRECTION_MANIFEST_V1,
     PRT_02_B_OPEN_GOLDENS_MANIFEST_V1, PRT_02_B_SERDE_SCHEMA_MANIFEST_V1, RawIcon, TraceContext,
     parse_prt_02_manifest_rows, prt_02_a_icon_content_manifest_digest,
     prt_02_a_metadata_manifest_digest, prt_02_a_uri_cursor_cancel_manifest_digest,
     prt_02_b_bounds_direction_manifest_digest, prt_02_b_open_goldens_manifest_digest,
-    prt_02_b_serde_schema_manifest_digest,
+    prt_02_b_serde_schema_manifest_digest, recover_payload_trace_context,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -163,9 +166,10 @@ fn prt_02_a_positive() {
     );
     metadata_ledger.observe("PRT-A-01.07");
 
-    let trace = TraceContext::try_from_metadata(&metadata).expect("trace context");
-    assert_eq!(trace.tracestate.as_deref(), Some("vendor=value"));
-    assert_eq!(trace.baggage.as_deref(), Some("user=opaque"));
+    let trace = metadata.trace_context();
+    assert_eq!(trace.tracestate(), Some("vendor=value"));
+    assert_eq!(trace.baggage(), Some("user=opaque"));
+    assert!(metadata.trace_recovery().is_empty());
     metadata_ledger.observe("PRT-A-01.08");
 
     // --- PRT-A-02: URI owners, cursor presence, cancellation -----------
@@ -629,30 +633,40 @@ fn prt_02_b_positive() {
         .expect("content at encoded N-1 bound");
     ContentBlock::image("A".repeat(MAX_CONTENT_ENCODED_BYTES), "image/png")
         .expect("content at encoded bound");
-    let trace_n_minus_one = OpenMetadata::try_from_entries([
-        (
-            "traceparent".to_owned(),
-            json!("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
-        ),
-        (
-            "tracestate".to_owned(),
-            json!("x".repeat(MAX_TRACE_FIELD_BYTES - 1)),
-        ),
-    ])
-    .expect("trace metadata");
-    TraceContext::try_from_metadata(&trace_n_minus_one).expect("trace at N-1");
-    let trace_n = OpenMetadata::try_from_entries([
-        (
-            "traceparent".to_owned(),
-            json!("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
-        ),
-        (
-            "tracestate".to_owned(),
-            json!("x".repeat(MAX_TRACE_FIELD_BYTES)),
-        ),
-    ])
-    .expect("trace metadata");
-    TraceContext::try_from_metadata(&trace_n).expect("trace at bound");
+    // Each field has its own W3C grammar and admission bound. An arbitrary
+    // repeated string is not a valid tracestate or baggage fixture.
+    for below_bound in [1, 0] {
+        let future_prefix = "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-";
+        for (field, value, bound) in [
+            (
+                "traceparent",
+                format!(
+                    "{future_prefix}{}",
+                    "x".repeat(MAX_TRACEPARENT_BYTES - future_prefix.len() - below_bound)
+                ),
+                MAX_TRACEPARENT_BYTES,
+            ),
+            (
+                "tracestate",
+                format!("a={},b={}", "x".repeat(256), "y".repeat(251 - below_bound)),
+                MAX_TRACESTATE_BYTES,
+            ),
+            (
+                "baggage",
+                format!("k={}", "x".repeat(MAX_BAGGAGE_BYTES - 2 - below_bound)),
+                MAX_BAGGAGE_BYTES,
+            ),
+        ] {
+            let mut entries = request_metadata().entries().clone();
+            entries.insert(field.to_owned(), json!(value));
+            let metadata = OpenMetadata::try_from_entries(entries).expect("trace at N-1 or N");
+            assert!(metadata.trace_recovery().is_empty(), "{field} at its bound");
+            assert_eq!(
+                metadata.get(field).and_then(Value::as_str).map(str::len),
+                Some(bound - below_bound)
+            );
+        }
+    }
 
     assert_eq!(
         OpenMetadata::try_from_entries(
@@ -686,6 +700,17 @@ fn prt_02_b_positive() {
         ContentBlock::image("A".repeat(MAX_CONTENT_ENCODED_BYTES + 1), "image/png"),
         Err(CommonTypeError::TooLong("binary content"))
     );
+    let state_n_plus_one = format!("a={},b={}", "x".repeat(256), "y".repeat(252));
+    assert_eq!(state_n_plus_one.len(), MAX_TRACESTATE_BYTES + 1);
+    assert_eq!(
+        TraceContext::try_from_fields(
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            Some(&state_n_plus_one),
+            None,
+        ),
+        Err(TraceContextError::TracestateLimitExceeded),
+        "local producers must reject an over-limit tracestate"
+    );
     let trace_n_plus_one = OpenMetadata::try_from_entries([
         (
             "traceparent".to_owned(),
@@ -693,14 +718,14 @@ fn prt_02_b_positive() {
         ),
         (
             "tracestate".to_owned(),
-            json!("x".repeat(MAX_TRACE_FIELD_BYTES + 1)),
+            json!(state_n_plus_one),
         ),
     ])
-    .expect("bounded metadata value");
-    assert_eq!(
-        TraceContext::try_from_metadata(&trace_n_plus_one),
-        Err(CommonTypeError::TooLong("trace context"))
-    );
+    .expect("invalid optional telemetry cannot reject application metadata");
+    assert!(trace_n_plus_one.trace_context().traceparent().is_some());
+    assert!(trace_n_plus_one.get("tracestate").is_none());
+    assert!(trace_n_plus_one.trace_recovery().tracestate_rejected());
+    assert_eq!(trace_n_plus_one.trace_recovery().rejected_count(), 1);
 
     // --- PRT-02 B ordered matrices -------------------------------------
     // The declared row set comes from the shipped manifests, never from this
@@ -799,8 +824,8 @@ fn prt_02_b_positive() {
         serde_ledger.observe(subcase);
     }
 
-    let trace = TraceContext::try_from_metadata(&metadata).expect("trace");
-    assert_eq!(trace.tracestate.as_deref(), Some("vendor=value"));
+    let trace = metadata.trace_context();
+    assert_eq!(trace.tracestate(), Some("vendor=value"));
     serde_ledger.observe("PRT-B-01.11");
 
     let subscription = OpenMetadata::try_from_entries([(
@@ -1064,4 +1089,289 @@ fn prt_02_b_planted_negative() {
         Err(CommonTypeError::Invalid("cancellation direction")),
         "only the notification direction is reversed"
     );
+}
+
+#[test]
+fn obs_01_schema_and_payload_recover_trace_fields_independently() {
+    let parent = json!("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    let state = json!("vendor=value");
+    let baggage = json!("user=opaque;property");
+    let over_metadata_bound = json!("x".repeat(MAX_METADATA_VALUE_BYTES + 1));
+    let cases = [
+        ("absent", None, None, None, [false, false, false]),
+        (
+            "valid",
+            Some(parent.clone()),
+            Some(state.clone()),
+            Some(baggage.clone()),
+            [false, false, false],
+        ),
+        (
+            "future version and opaque spelling",
+            Some(json!(
+                "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff-future.Value"
+            )),
+            Some(json!(" \t,vendor= leading and interior spaces, \t")),
+            Some(json!("user=one,user=two;flag;prop=%ff")),
+            [false, false, false],
+        ),
+        (
+            "valid empty tracestate",
+            Some(parent.clone()),
+            Some(json!("")),
+            None,
+            [false, false, false],
+        ),
+        (
+            "independent baggage",
+            None,
+            None,
+            Some(baggage.clone()),
+            [false, false, false],
+        ),
+        (
+            "invalid parent discards state",
+            Some(json!("private-malformed-parent")),
+            Some(state.clone()),
+            Some(baggage.clone()),
+            [true, true, false],
+        ),
+        (
+            "orphaned state",
+            None,
+            Some(state.clone()),
+            Some(baggage.clone()),
+            [false, true, false],
+        ),
+        (
+            "invalid state preserves parent",
+            Some(parent.clone()),
+            Some(json!("vendor=one,vendor=two")),
+            Some(baggage.clone()),
+            [false, true, false],
+        ),
+        (
+            "one bad baggage member discards the field",
+            Some(parent.clone()),
+            Some(state.clone()),
+            Some(json!("valid=opaque,private-malformed-member")),
+            [false, false, true],
+        ),
+        (
+            "non-string parent",
+            Some(Value::Null),
+            Some(state.clone()),
+            Some(baggage.clone()),
+            [true, true, false],
+        ),
+        (
+            "non-string state",
+            Some(parent.clone()),
+            Some(json!(17)),
+            Some(baggage.clone()),
+            [false, true, false],
+        ),
+        (
+            "non-string baggage",
+            Some(parent.clone()),
+            Some(state.clone()),
+            Some(json!({"private": "malformed"})),
+            [false, false, true],
+        ),
+        (
+            "all fields malformed",
+            Some(json!("")),
+            Some(json!([])),
+            Some(json!(true)),
+            [true, true, true],
+        ),
+        (
+            "parent exceeds even the ordinary metadata bound",
+            Some(over_metadata_bound.clone()),
+            Some(state.clone()),
+            Some(baggage.clone()),
+            [true, true, false],
+        ),
+        (
+            "state exceeds even the ordinary metadata bound",
+            Some(parent.clone()),
+            Some(over_metadata_bound.clone()),
+            Some(baggage.clone()),
+            [false, true, false],
+        ),
+        (
+            "baggage exceeds even the ordinary metadata bound",
+            Some(parent),
+            Some(state),
+            Some(over_metadata_bound),
+            [false, false, true],
+        ),
+    ];
+
+    for (case, parent, state, baggage, rejected) in cases {
+        let mut wire = json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "com.example/unknown": [1, {"traceparent": "application data", "z": null}]
+            },
+            "arguments": {"_meta": {"baggage": "arbitrary application data"}},
+            "value": "application result"
+        });
+        for (key, value) in [
+            ("traceparent", parent),
+            ("tracestate", state),
+            ("baggage", baggage),
+        ] {
+            if let Some(value) = value {
+                wire["_meta"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(key.to_owned(), value);
+            }
+        }
+        let mut expected = wire.clone();
+        for (key, rejected) in ["traceparent", "tracestate", "baggage"]
+            .into_iter()
+            .zip(rejected)
+        {
+            if rejected {
+                expected["_meta"].as_object_mut().unwrap().remove(key);
+            }
+        }
+
+        // The same application payload succeeds in every declared direction,
+        // regardless of whether its optional telemetry needs recovery.
+        for direction in [
+            CommonWireDirection::Request,
+            CommonWireDirection::Notification,
+            CommonWireDirection::Result,
+        ] {
+            FinalCommonTypesSchema::validate(direction, &wire).expect(case);
+        }
+        let entries: BTreeMap<_, _> = wire["_meta"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let metadata = OpenMetadata::try_from_entries(entries.clone()).expect(case);
+        let notification_metadata =
+            OpenMetadata::try_from_notification_entries(entries).expect(case);
+        assert_eq!(
+            metadata.entries(),
+            notification_metadata.entries(),
+            "{case}"
+        );
+        assert_eq!(
+            serde_json::to_value(&metadata).unwrap(),
+            expected["_meta"],
+            "{case}"
+        );
+
+        let (trace, report) = recover_payload_trace_context(&mut wire);
+        assert_eq!(
+            [
+                report.traceparent_rejected(),
+                report.tracestate_rejected(),
+                report.baggage_rejected(),
+            ],
+            rejected,
+            "{case}"
+        );
+        assert_eq!(
+            report.rejected_count() as usize,
+            rejected.into_iter().filter(|rejected| *rejected).count(),
+            "{case}"
+        );
+        assert_eq!(metadata.trace_recovery(), report, "{case}");
+        assert_eq!(metadata.trace_context(), trace, "{case}");
+        assert_eq!(
+            wire, expected,
+            "{case}: application and unknown metadata are unchanged"
+        );
+
+        let round_trip: OpenMetadata = serde_json::from_value(wire["_meta"].clone()).unwrap();
+        assert_eq!(round_trip.entries(), metadata.entries(), "{case}");
+        assert!(round_trip.trace_recovery().is_empty(), "{case}");
+        let (again, report) = recover_payload_trace_context(&mut wire);
+        assert_eq!(again, trace, "{case}: recovery is idempotent");
+        assert!(report.is_empty(), "{case}");
+        assert_eq!(wire, expected, "{case}");
+    }
+}
+
+#[test]
+fn obs_01_rejected_trace_does_not_consume_application_metadata_slots() {
+    let mut entries: BTreeMap<_, _> = (0..MAX_METADATA_ENTRIES)
+        .map(|index| (format!("com.example/key{index}"), json!({"value": index})))
+        .collect();
+    let expected = entries.clone();
+    for key in ["traceparent", "tracestate", "baggage"] {
+        entries.insert(key.to_owned(), json!("invalid"));
+    }
+    let metadata = OpenMetadata::try_from_entries(entries.clone())
+        .expect("discarded telemetry cannot displace accepted application metadata");
+    assert_eq!(metadata.entries(), &expected);
+    assert_eq!(metadata.trace_recovery().rejected_count(), 3);
+    assert!(metadata.trace_context().is_empty());
+
+    entries.insert("com.example/one-too-many".to_owned(), Value::Null);
+    assert_eq!(
+        OpenMetadata::try_from_entries(entries),
+        Err(CommonTypeError::Invalid("metadata key")),
+        "recovery cannot weaken the bound on ordinary metadata"
+    );
+
+    let mut entries = expected;
+    entries.insert("baggage".to_owned(), json!("valid=value"));
+    assert_eq!(
+        OpenMetadata::try_from_entries(entries),
+        Err(CommonTypeError::Invalid("metadata key")),
+        "retained trace fields count toward the final metadata map bound"
+    );
+}
+
+#[test]
+fn obs_01_recovery_does_not_weaken_application_schema_validation() {
+    let baseline = json!({"_meta": request_metadata(), "arguments": {"value": 7}});
+    for invalid_application_metadata in [
+        json!({}),
+        json!({
+            "io.modelcontextprotocol/protocolVersion": 17,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }),
+        json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "com.example/value": "x".repeat(MAX_METADATA_VALUE_BYTES + 1)
+        }),
+        json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/unknownReservedKey": true
+        }),
+    ] {
+        let mut wire = baseline.clone();
+        wire["_meta"] = invalid_application_metadata;
+        let original_error = FinalCommonTypesSchema::validate(CommonWireDirection::Request, &wire)
+            .expect_err("the application metadata itself is invalid");
+        for key in ["traceparent", "tracestate", "baggage"] {
+            wire["_meta"]
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_owned(), json!("invalid"));
+        }
+        assert_eq!(
+            FinalCommonTypesSchema::validate(CommonWireDirection::Request, &wire),
+            Err(original_error.clone()),
+            "optional telemetry cannot replace the application admission result"
+        );
+        let (_, report) = recover_payload_trace_context(&mut wire);
+        assert_eq!(report.rejected_count(), 3);
+        assert_eq!(
+            FinalCommonTypesSchema::validate(CommonWireDirection::Request, &wire),
+            Err(original_error)
+        );
+    }
 }

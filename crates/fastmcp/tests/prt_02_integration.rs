@@ -277,8 +277,13 @@ fn prt_02_integration_open_final_join() {
     FinalCommonTypesSchema::validate(CommonWireDirection::Result, &text_wire).expect("schema");
     ledger.observe("PRT-I-02.07");
 
-    let trace = TraceContext::try_from_metadata(&metadata).expect("trace context");
-    assert_eq!(trace.tracestate.as_deref(), Some("vendor=value"));
+    let trace = metadata.trace_context();
+    assert_eq!(trace.tracestate(), Some("vendor=value"));
+    assert_eq!(
+        TraceContext::try_from_fields(trace.traceparent(), trace.tracestate(), trace.baggage())
+            .expect("strict public trace constructor"),
+        trace
+    );
     ledger.observe("PRT-I-02.08");
 
     ledger.settle(8);

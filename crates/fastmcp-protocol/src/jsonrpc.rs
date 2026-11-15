@@ -1398,8 +1398,23 @@ pub struct JsonRpcError {
     /// Error message.
     pub message: String,
     /// Additional error data.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_error_data"
+    )]
     pub data: Option<Value>,
+}
+
+fn deserialize_error_data<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut data = Option::<Value>::deserialize(deserializer)?;
+    if let Some(data) = &mut data {
+        crate::common_types::recover_payload_trace_context(data);
+    }
+    Ok(data)
 }
 
 /// Immutable local endpoint role for raw JSON-RPC ingress disposition.
@@ -3084,6 +3099,139 @@ mod tests {
         assert_eq!(admission.raw_result(), Some(source));
         assert!(admission.response().retained_result.is_none());
         assert_eq!(admission.response(), &typed);
+    }
+
+    #[test]
+    fn obs_01_response_source_recovery_preserves_unrelated_exact_numbers() {
+        use crate::result::{
+            CoreResultDiscriminatorPolicy, ResultPeerEra, decode_peer_result, encode_result,
+        };
+
+        let source = r#"{"resultType":"complete","_meta":{"traceparent":1e10000,"tracestate":"vendor=private-state","baggage":"user=opaque","com.example/decimal":1.20e+4},"extension":{"second":-7.30E-12,"first":123456789012345678901234567890}}"#;
+        let expected = r#"{"resultType":"complete","_meta":{"baggage":"user=opaque","com.example/decimal":1.20e+4},"extension":{"second":-7.30E-12,"first":123456789012345678901234567890}}"#;
+        let frame = format!(r#"{{"jsonrpc":"2.0","result":{source},"id":7}}"#);
+        let admission = decode_strict_jsonrpc_response(frame.as_bytes(), frame.len())
+            .expect("the admitted huge exponent remains syntactically valid JSON");
+        let (decoded, _) = decode_peer_result(
+            admission
+                .raw_result()
+                .expect("success retains its exact result source"),
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("invalid optional telemetry cannot fail the application result");
+        let recovered_source = encode_result(&decoded);
+        assert_eq!(recovered_source, expected);
+
+        let forwarded = JsonRpcResponse::success_with_raw_result(
+            RequestId::Number(7),
+            recovered_source,
+            expected.len(),
+        )
+        .expect("the recovered exact result remains admissible for re-encoding");
+        assert_eq!(forwarded.retained_result_source(), Some(expected));
+        for response in [&forwarded, &forwarded.clone()] {
+            let encoded = serde_json::to_string(response).unwrap();
+            let raw: std::collections::BTreeMap<String, Box<RawValue>> =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(raw["result"].get(), expected);
+            assert!(!encoded.contains("private-state"));
+        }
+    }
+
+    #[test]
+    fn obs_01_trace_recovery_invalidates_stale_request_and_response_sources() {
+        let source = r#"{"z":1.20e+4,"_meta":{"traceparent":"private-invalid-parent","tracestate":"vendor=private-state","baggage":"user=opaque","com.example/number":123456789012345678901234567890},"a":{"_meta":{"traceparent":"application data"}}}"#;
+        let mut notification = JsonRpcRequest::notification_with_raw_params(
+            "notifications/source",
+            source.to_owned(),
+            source.len(),
+        )
+        .unwrap();
+        let mut response = JsonRpcResponse::success_with_raw_result(
+            RequestId::Number(7),
+            source.to_owned(),
+            source.len(),
+        )
+        .unwrap();
+        assert_eq!(response.retained_result_source(), Some(source));
+        for payload in [
+            notification.params.as_mut().unwrap(),
+            response.result.as_mut().unwrap(),
+        ] {
+            let (trace, report) = crate::common_types::recover_payload_trace_context(payload);
+            assert_eq!(report.rejected_count(), 2);
+            assert_eq!(trace.traceparent(), None);
+            assert_eq!(trace.tracestate(), None);
+            assert_eq!(trace.baggage(), Some("user=opaque"));
+            assert_eq!(payload["a"]["_meta"]["traceparent"], "application data");
+        }
+        assert!(response.retained_result_source().is_none());
+        for request in [&notification, &notification.clone()] {
+            let encoded = serde_json::to_string(request).unwrap();
+            let wire: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(wire.get("params"), request.params.as_ref());
+            assert!(!encoded.contains("private-invalid-parent"));
+            assert!(!encoded.contains("private-state"));
+            assert_eq!(wire["params"]["_meta"]["baggage"], "user=opaque");
+        }
+        for response in [&response, &response.clone()] {
+            assert!(response.retained_result_source().is_none());
+            let encoded = serde_json::to_string(response).unwrap();
+            let wire: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(wire.get("result"), response.result.as_ref());
+            assert!(!encoded.contains("private-invalid-parent"));
+            assert!(!encoded.contains("private-state"));
+            assert_eq!(wire["result"]["_meta"]["baggage"], "user=opaque");
+        }
+    }
+
+    #[test]
+    fn obs_01_error_data_recovers_trace_without_changing_application_error() {
+        let parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        for (trace_fields, retained) in [
+            (
+                r#""traceparent":1e10000,"tracestate":"vendor=private-state","baggage":"user=opaque""#.to_owned(),
+                r#""baggage":"user=opaque""#.to_owned(),
+            ),
+            (
+                format!(r#""traceparent":"{parent}","tracestate":1e10000,"baggage":"user=opaque""#),
+                format!(r#""traceparent":"{parent}","baggage":"user=opaque""#),
+            ),
+            (
+                format!(r#""traceparent":"{parent}","tracestate":"vendor=value","baggage":{{"nested":1e10000}}"#),
+                format!(r#""traceparent":"{parent}","tracestate":"vendor=value""#),
+            ),
+        ] {
+            let source = format!(
+                r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"application failure","data":{{"_meta":{{{trace_fields},"com.example/number":1.20e+4}},"detail":{{"_meta":{{"traceparent":"application data"}}}}}}}},"id":7}}"#
+            );
+            let expected: Value = serde_json::from_str(&format!(
+                r#"{{"_meta":{{{retained},"com.example/number":1.20e+4}},"detail":{{"_meta":{{"traceparent":"application data"}}}}}}"#
+            ))
+            .unwrap();
+            let admission = decode_strict_jsonrpc_response(source.as_bytes(), source.len())
+                .expect("malformed optional trace cannot replace the peer's application error");
+            let response = admission.response();
+            assert_eq!(response.id, Some(RequestId::Number(7)));
+            assert!(admission.raw_result().is_none());
+            let error = response.error.as_ref().expect("the error outcome remains an error");
+            assert_eq!(serde_json::to_value(&error.code).unwrap(), json!(-32602));
+            assert_eq!(error.message, "application failure");
+            assert_eq!(error.data.as_ref(), Some(&expected));
+            let direct: JsonRpcResponse = serde_json::from_str(&source).unwrap();
+            assert_eq!(&direct, response);
+            assert_eq!(
+                serde_json::from_str::<Value>(&serde_json::to_string(response).unwrap()).unwrap()
+                    ["error"]["data"],
+                expected,
+                "serialized error data must already be recovered before any typed re-decode"
+            );
+            let round_trip: JsonRpcResponse =
+                serde_json::from_str(&serde_json::to_string(response).unwrap()).unwrap();
+            assert_eq!(round_trip.error.as_ref().unwrap().data.as_ref(), Some(&expected));
+            assert!(!format!("{response:?}").contains("private-state"));
+        }
     }
 
     #[test]

@@ -369,6 +369,10 @@ pub mod client {
 /// construction remains an application responsibility; procedural macros use
 /// the separate doc-hidden [`__private::core`] expansion path.
 pub mod core {
+    pub use fastmcp_core::trace::{
+        MAX_BAGGAGE_BYTES, MAX_BAGGAGE_MEMBERS, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES,
+        MAX_TRACESTATE_MEMBERS, TraceContext, TraceContextError, TraceContextRecovery,
+    };
     pub use fastmcp_core::{
         ABSOLUTE_URI_HARD_MAX_BYTES, AbsoluteUri, AbsoluteUriComponent, AbsoluteUriError,
         AbsoluteUriScheme, AccessToken, AdmissionController, AdmissionError, AdmissionPartition,
@@ -403,16 +407,15 @@ pub mod core {
         OperatorOutputCounters, OperatorProfile, OperatorReadiness, OperatorReason,
         OperatorRequestCapacity, OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource,
         OperatorStdioOutput, OperatorStdioSnapshot, Outcome, OutcomeExt,
-        PROTOCOL_LIMITS_INITIAL_GENERATION,
-        ParseDurationError, PercentEncodingPolicy, PreAuthSourceBucketKey, ProgressReporter,
-        PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole, ProtocolLimit,
-        ProtocolLimits, ProtocolLimitsBuilder, ProtocolLimitsError, QueryPolicy, QuotaPartitionKey,
-        RandomDrawError, RegionId, ResourceContentItem, ResourceEndpointPathPolicy,
-        ResourceReadResult, ResourceReader, ResultExt, RootsProvider, SECURITY_IDENTIFIER_BYTES,
-        SHA256_DIGEST_BYTES, SamplingIncludeContext, SamplingMessageContent, SamplingModelHint,
+        PROTOCOL_LIMITS_INITIAL_GENERATION, ParseDurationError, PercentEncodingPolicy,
+        PreAuthSourceBucketKey, ProgressReporter, PromptCaller, PromptGetResult, PromptMessageItem,
+        PromptMessageRole, ProtocolLimit, ProtocolLimits, ProtocolLimitsBuilder,
+        ProtocolLimitsError, QueryPolicy, QuotaPartitionKey, RandomDrawError, RegionId,
+        ResourceContentItem, ResourceEndpointPathPolicy, ResourceReadResult, ResourceReader,
+        ResultExt, RootsProvider, SECURITY_IDENTIFIER_BYTES, SHA256_DIGEST_BYTES,
+        SamplingIncludeContext, SamplingMessageContent, SamplingModelHint,
         SamplingModelPreferences, SamplingRequest, SamplingRequestMessage, SamplingResponse,
-        SamplingRole, SamplingSender,
-        SamplingStopReason, SchemeHostCasePolicy, Scope,
+        SamplingRole, SamplingSender, SamplingStopReason, SchemeHostCasePolicy, Scope,
         SealedAdmissionKeyError, SecurityIdentifier, ServerCapabilityInfo, SessionState,
         Sha256Digest, SyntaxViolationPolicy, TaskId, ToolCallResult, ToolCaller, ToolContentItem,
         TrailingSlashPolicy, UriComponentState, UserinfoPolicy, WEBSOCKET_MASK_BYTES,
@@ -420,7 +423,7 @@ pub mod core {
         draw_nonce_domain_material, draw_security_identifier, draw_websocket_mask, err, ok,
         parse_duration, sha256_bounded,
     };
-    pub use fastmcp_core::{combinator, crypto, limits, logging, persistent, restore, uri};
+    pub use fastmcp_core::{combinator, crypto, limits, logging, persistent, restore, trace, uri};
 }
 pub use fastmcp_derive as derive;
 /// Curated core protocol namespaces for advanced consumers.
@@ -677,6 +680,10 @@ pub use fastmcp_protocol::{
     McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
 };
 
+pub use fastmcp_core::trace::{
+    MAX_BAGGAGE_BYTES, MAX_BAGGAGE_MEMBERS, MAX_TRACEPARENT_BYTES, MAX_TRACESTATE_BYTES,
+    MAX_TRACESTATE_MEMBERS, TraceContextError, TraceContextRecovery,
+};
 /// Bounded public-JWKS and external-signer primitives for the opt-in OIDC
 /// server profile. These APIs intentionally contain no private key material.
 #[cfg(feature = "builtin-auth-server")]
@@ -3139,12 +3146,13 @@ pub mod modern {
         MAX_FINAL_CACHE_MAX_BYTES, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
         MAX_HTTP_RETAINED_EXECUTION_BYTES, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
         MAX_MRTR_TOTAL_INPUT_RESPONSES, MemoryClient, MemoryClientBuilder, MemoryExtensionEvent,
-        MemoryExtensionExecution, MemoryRequestEvent, MemoryRequestExecution, MemorySubscriptionEvent,
-        MemorySubscriptionExecution, MrtrInputResponses,
-        OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback,
-        RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequestHandlers, StdioSubscriptionEvent,
-        SubscriptionFilter, SubscriptionListenCollector, SubscriptionTimeoutPolicy,
+        MemoryExtensionExecution, MemoryRequestEvent, MemoryRequestExecution,
+        MemorySubscriptionEvent, MemorySubscriptionExecution, MrtrInputResponses, OpaquePagination,
+        PaginationBounds, PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy,
+        RequestTimeoutSource, ReverseRequestHandlers, StdioSubscriptionEvent, SubscriptionFilter,
+        SubscriptionListenCollector, SubscriptionTimeoutPolicy,
     };
+    pub use fastmcp_core::trace::{TraceContextError, TraceContextRecovery};
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientImplementationInfo, ClientRoot, Cx,
         ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
@@ -3155,9 +3163,8 @@ pub mod modern {
         PromptGetResult, PromptMessageItem, PromptMessageRole, ResourceContentItem,
         ResourceReadResult, ResourceReader, RootsProvider, SamplingIncludeContext,
         SamplingMessageContent, SamplingModelHint, SamplingModelPreferences, SamplingRequest,
-        SamplingRequestMessage, SamplingResponse,
-        SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
-        ToolCallResult, ToolCaller, ToolContentItem,
+        SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
+        ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::{
@@ -12931,6 +12938,7 @@ pub mod prelude {
     pub use crate::{
         ResourceSubscriptionMatcher, ResourceSubscriptionRelations, SubscriptionListenRequest,
     };
+    pub use crate::{TraceContext, TraceContextError, TraceContextRecovery};
     #[cfg(feature = "legacy-2024-11-05")]
     pub use crate::{auto, legacy_2024};
 }

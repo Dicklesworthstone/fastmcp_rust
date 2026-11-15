@@ -4010,12 +4010,20 @@ impl CoreRequest {
         // The exact parse already holds this source's value; converting it
         // (numbers through serde_json's own number parser) equals decoding the
         // source again, without a second pass over its bytes.
-        let raw_value =
+        let mut raw_value =
             exact_json_to_serde(&exact).map_err(|_| CoreDispatchError::InvalidParams {
                 era,
                 method: method_literal,
             })?;
-        if params != Some(&raw_value) {
+        let matches_raw = params == Some(&raw_value);
+        if !matches_raw {
+            // Optional trace recovery cannot reorder a retry's inputResponses
+            // or erase exact numbers. Only these reserved fields may differ
+            // from the retained source; credentials and application values
+            // still have to match exactly.
+            crate::common_types::recover_payload_trace_context(&mut raw_value);
+        }
+        if !matches_raw && params != Some(&raw_value) {
             return Err(CoreDispatchError::InvalidParams {
                 era,
                 method: method_literal,
@@ -7901,6 +7909,104 @@ mod tests {
                 ),
                 "changing only one raw {method} value cannot attach another frame's source"
             );
+        }
+    }
+
+    #[test]
+    fn obs_01_core_raw_params_accept_only_trace_recovery_differences() {
+        for (method, owner_field, owner_value) in [
+            (TOOLS_CALL, "name", "weather"),
+            (RESOURCES_READ, "uri", "file:///workspace/status"),
+            (PROMPTS_GET, "name", "status"),
+        ] {
+            for invalid in [
+                r#""private-invalid-parent""#,
+                "1e10000",
+                r#"{"nested":1e10000}"#,
+            ] {
+                let raw = format!(
+                    r#"{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{{}},"traceparent":{invalid},"tracestate":"vendor=private-state","baggage":"user=opaque","com.example/credential":"original-owner","com.example/number":4.2e1}},"{owner_field}":"{owner_value}","inputResponses":{{"second":{{"roots":[]}},"first":{{"roots":[]}}}},"requestState":"retry-1"}}"#
+                );
+                let mut admitted: Value = serde_json::from_str(&raw)
+                    .expect("malformed trace values remain syntactically valid parameters");
+                let (_, report) = crate::common_types::recover_payload_trace_context(&mut admitted);
+                assert_eq!(report.rejected_count(), 2);
+                let decoded = CoreRequest::decode_with_raw_params(
+                    ProtocolEra::Modern2026,
+                    method,
+                    Some(&admitted),
+                    Some(&raw),
+                )
+                .expect("the admitted source may differ only by optional trace recovery");
+                let (metadata, responses) = match &decoded {
+                    CoreRequest::Final(FinalCoreRequest::ToolsCall(params)) => {
+                        (&params.meta, params.input_responses.as_ref())
+                    }
+                    CoreRequest::Final(FinalCoreRequest::ResourcesRead(params)) => {
+                        (&params.meta, params.input_responses.as_ref())
+                    }
+                    CoreRequest::Final(FinalCoreRequest::PromptsGet(params)) => {
+                        (&params.meta, params.input_responses.as_ref())
+                    }
+                    _ => panic!("raw parameters select the matching final request type"),
+                };
+                assert!(metadata.get("traceparent").is_none());
+                assert!(metadata.get("tracestate").is_none());
+                assert_eq!(metadata.trace_context().baggage(), Some("user=opaque"));
+                assert_eq!(
+                    responses
+                        .unwrap()
+                        .entries()
+                        .iter()
+                        .map(|(key, _)| key.as_str())
+                        .collect::<Vec<_>>(),
+                    ["second", "first"],
+                    "trace recovery must preserve the retry map's received order"
+                );
+                assert_eq!(decoded.encode_params().unwrap(), Some(admitted.clone()));
+                assert!(!format!("{decoded:?}").contains("private-invalid-parent"));
+                assert!(!format!("{decoded:?}").contains("private-state"));
+
+                let mut changed_owner = admitted.clone();
+                changed_owner[owner_field] = serde_json::json!(if owner_field == "uri" {
+                    "file:///workspace/different"
+                } else {
+                    "different"
+                });
+                let mut changed_credential = admitted.clone();
+                changed_credential["_meta"]["com.example/credential"] =
+                    serde_json::json!("different-owner");
+                let mut changed_number = admitted.clone();
+                changed_number["_meta"]["com.example/number"] = serde_json::json!(43);
+                let mut changed_state = admitted.clone();
+                changed_state["requestState"] = serde_json::json!("retry-2");
+                let mut changed_valid_trace = admitted.clone();
+                changed_valid_trace["_meta"]["baggage"] = serde_json::json!("other=value");
+                for planted in [
+                    changed_owner,
+                    changed_credential,
+                    changed_number,
+                    changed_state,
+                    changed_valid_trace,
+                ] {
+                    assert!(
+                        matches!(
+                            CoreRequest::decode_with_raw_params(
+                                ProtocolEra::Modern2026,
+                                method,
+                                Some(&planted),
+                                Some(&raw),
+                            ),
+                            Err(CoreDispatchError::InvalidParams {
+                                era: ProtocolEra::Modern2026,
+                                method: rejected_method,
+                            }) if rejected_method == method
+                        ),
+                        "trace recovery cannot attach a source with different application or retained trace data"
+                    );
+                }
+                assert_eq!(decoded.encode_params().unwrap(), Some(admitted));
+            }
         }
     }
 
