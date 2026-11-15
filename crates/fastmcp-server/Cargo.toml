@@ -54,7 +54,10 @@ proxy-legacy = [
 ]
 proxy-tasks = ["proxy", "tasks"]
 # Enables the server-owned WebSocket listener and HTTP Upgrade bridge.
-websocket = ["fastmcp-transport/websocket-experimental"]
+websocket = [
+    "fastmcp-transport/websocket-experimental",
+    "fastmcp-client?/websocket-experimental",
+]
 # Retained while the facade's caller-upgraded transport profile remains named
 # `websocket-experimental`; it does not enable the turnkey listener.
 websocket-experimental = ["fastmcp-transport/websocket-experimental"]
@@ -124,6 +127,11 @@ required-features = ["legacy-2024-11-05"]
 name = "http_continuation_recovery"
 path = "tests/http_continuation_recovery.rs"
 required-features = ["proxy", "native-tls-roots"]
+
+[[test]]
+name = "proxy_websocket"
+path = "tests/proxy_websocket.rs"
+required-features = ["proxy", "websocket"]
 
 [[test]]
 # TASK-02-B's durability proofs (bd-mcp-task-02-b-x5r3). `FinalTaskStore`,

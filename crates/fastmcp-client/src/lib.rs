@@ -6849,6 +6849,33 @@ where
             .expect("negotiated WebSocket clients always select an era")
     }
 
+    /// Whether the connection has entered terminal shutdown.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Whether request, subscription, retirement, or callback ownership remains.
+    ///
+    /// This bounded local inspection does not read the socket. A false result
+    /// permits transferring an otherwise live connection to a new exclusive
+    /// driver; it does not attest peer liveness or an empty network buffer.
+    /// Completed callback handles still count until their cleanup is observed.
+    #[must_use]
+    pub fn has_pending_protocol_work(&self) -> bool {
+        let pending = self.transient_request.is_some()
+            || self.live_catalog_subscription.is_some()
+            || !self.retired_requests.is_empty()
+            || self
+                .reverse_callback_pool
+                .tasks
+                .lock()
+                .map_or(true, |tasks| !tasks.is_empty());
+        #[cfg(feature = "tasks")]
+        let pending = pending || self.live_task_subscription.is_some();
+        pending
+    }
+
     /// Whether complete modern catalog and initial resource results are cached.
     /// The bounded cache belongs to this connection, including public results.
     #[must_use]
@@ -6928,6 +6955,53 @@ where
             .await
     }
 
+    /// Sends one modern request with caller cancellation and live progress.
+    ///
+    /// The supplied parameters retain their exact admitted metadata. Only
+    /// strictly increasing progress for this request's `progressToken` reaches
+    /// the callback, before waiting for the terminal result. Delivered progress
+    /// is not also retained in [`Self::take_final_progress_notifications`].
+    /// Unrelated notifications keep their existing connection ownership.
+    ///
+    /// Cancellation before commitment sends no request. After commitment the
+    /// native driver retires the exact request ID and settles its bounded
+    /// cancellation control before returning; a later response cannot satisfy
+    /// another request. The operation is never replayed.
+    pub async fn request_with_raw_result_and_progress(
+        &mut self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+        cancellation: &McpRequestCancellation,
+        on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+    ) -> McpResult<WebSocketResponse>
+    where
+        IO: Send + 'static,
+    {
+        if cx.checkpoint().is_err() || cancellation.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        if self.selected_protocol_era() != ProtocolEra::Modern2026 {
+            return Err(McpError::invalid_request(
+                "Live final WebSocket progress requires the modern protocol era",
+            ));
+        }
+        let method = method.into();
+        self.admit_raw_client_request(&method, params.as_ref())?;
+        let id = self.allocate_request_id().await?;
+        self.request_admitted_with_raw_result_with_deadline_and_progress(
+            cx,
+            JsonRpcRequest::new(method, params, id),
+            Some(cancellation),
+            None,
+            Some(on_progress),
+        )
+        .await
+    }
+
     async fn request_admitted_with_raw_result(
         &mut self,
         cx: &Cx,
@@ -6947,6 +7021,27 @@ where
         request: JsonRpcRequest,
         cancellation: Option<&McpRequestCancellation>,
         operation_deadline: Option<Instant>,
+    ) -> McpResult<WebSocketResponse>
+    where
+        IO: Send + 'static,
+    {
+        self.request_admitted_with_raw_result_with_deadline_and_progress(
+            cx,
+            request,
+            cancellation,
+            operation_deadline,
+            None,
+        )
+        .await
+    }
+
+    async fn request_admitted_with_raw_result_with_deadline_and_progress(
+        &mut self,
+        cx: &Cx,
+        request: JsonRpcRequest,
+        cancellation: Option<&McpRequestCancellation>,
+        operation_deadline: Option<Instant>,
+        mut on_progress: Option<&mut (dyn FnMut(FinalProgressNotificationParams) + Send)>,
     ) -> McpResult<WebSocketResponse>
     where
         IO: Send + 'static,
@@ -6976,13 +7071,50 @@ where
         })?;
         let owner =
             self.begin_websocket_request(id.clone(), request.method == "subscriptions/listen")?;
-        if let Err(error) = WebSocketOwnedSend::new(
-            self.send_message(cx, &JsonRpcMessage::Request(request)),
-            Arc::clone(&owner.state),
-        )
-        .await
-        {
-            return Err(self.terminal_transport_error(cx, error).await);
+        let mut send_deadline = WebSocketConnectDeadline::new(cx, timeout_policy)?;
+        if let Some(deadline) = operation_deadline {
+            send_deadline.absolute = send_deadline
+                .absolute
+                .min(cx.now() + deadline.saturating_duration_since(Instant::now()));
+        }
+        let sent = {
+            let message = JsonRpcMessage::Request(request);
+            let mut send = std::pin::pin!(WebSocketOwnedSend::new(
+                self.send_message(cx, &message),
+                Arc::clone(&owner.state),
+            ));
+            let mut cancelled = cancellation.map(|signal| Box::pin(signal.cancelled()));
+            let interruptible = std::future::poll_fn(|task_cx| {
+                if cancelled
+                    .as_mut()
+                    .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready())
+                {
+                    return std::task::Poll::Ready(Err(TransportError::Cancelled));
+                }
+                send.as_mut().poll(task_cx)
+            });
+            send_deadline.wait(cx, None, interruptible).await
+        };
+        if let Err(error) = sent.and_then(|result| result.map_err(transport_error_to_mcp)) {
+            if owner.state.phase.load(Ordering::Acquire) == WebSocketTransientRequestState::WAITING {
+                // A caller deadline can win in the same poll that commits the
+                // frame. Retire that exact request through the normal control
+                // path, preserving the reusable connection when cleanup wins.
+                let cleanup = self
+                    .retire_committed_request_after_cancellation(id, false)
+                    .await;
+                return Err(if cleanup.code == McpErrorCode::RequestCancelled {
+                    error
+                } else {
+                    cleanup
+                });
+            }
+            // Dropping a pending owned send marks the writer uncertain before
+            // releasing it. Close therefore drops the native halves without
+            // flushing any abandoned frame suffix or sending another frame.
+            self.closed = true;
+            self.settle_close(cx).await?;
+            return Err(error);
         }
 
         // Response budgets begin only after the send commits. Keep their
@@ -6997,6 +7129,7 @@ where
         }
         let mut last_progress = None;
         let mut last_final_progress = None;
+        let mut last_forwarded_progress = None;
         loop {
             self.expire_live_websocket_subscriptions().await?;
             if cx.checkpoint().is_err()
@@ -7160,6 +7293,28 @@ where
                     if advances {
                         idle_deadline = received_at + timeout_policy.idle_timeout();
                     }
+                }
+                if let Some(callback) = on_progress.as_deref_mut()
+                    && self.final_progress_notifications.len() > retained_progress
+                    && let Some(expected_key) = expected_progress_key.as_ref()
+                    && let JsonRpcMessage::Request(notification) = frame.message()
+                    && let Some(params) = notification.params.as_ref()
+                    && !["total", "message", "_meta"].iter().any(|member| {
+                        params.get(*member).is_some_and(serde_json::Value::is_null)
+                    })
+                    && let Some(progress) = self.final_progress_notifications.back()
+                    && execution::progress_marker_key(&progress.progress_token).as_ref()
+                        == Some(expected_key)
+                    && last_forwarded_progress
+                        .as_ref()
+                        .is_none_or(|last| progress.progress.cmp(last).is_gt())
+                {
+                    last_forwarded_progress = Some(progress.progress.clone());
+                    let progress = self
+                        .final_progress_notifications
+                        .pop_back()
+                        .expect("matching progress was just admitted");
+                    callback(progress);
                 }
                 continue;
             };
@@ -34113,6 +34268,112 @@ exec sleep 2
                 } else {
                     client.close(&cx).await.unwrap();
                     assert_eq!(probe.accepted.lock().unwrap().len(), 8);
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_request_token_cancellation_interrupts_pending_send_without_flushing_suffix() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for prefix in [0, 3] {
+                for cancel in [false, true] {
+                    let (mut client, mut peer_io, probe) =
+                        connect_probed_modern_websocket(&cx).await;
+                    let cancellation = McpRequestCancellation::new();
+                    let parameters = client
+                        .with_modern_request_metadata(serde_json::json!({}))
+                        .unwrap();
+                    probe.arm(0x01, prefix, false);
+                    let mut on_progress = |_| panic!("catalog request has no progress token");
+                    let mut pending = Box::pin(client.request_with_raw_result_and_progress(
+                        &cx,
+                        "tools/list",
+                        Some(parameters),
+                        &cancellation,
+                        &mut on_progress,
+                    ));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(pending.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending()
+                    );
+                    assert!(probe.started.load(Ordering::Acquire));
+                    let accepted_prefix = probe.accepted.lock().unwrap().clone();
+                    assert_eq!(accepted_prefix.len(), prefix);
+
+                    // Both branches have a ready response and a newly healthy
+                    // writer. Only the request-local cancellation differs; it
+                    // must win before any abandoned suffix can be resumed.
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &serde_json::to_string(&JsonRpcResponse::success(
+                            RequestId::Number(2),
+                            async_modern_tools_list_result(),
+                        ))
+                        .unwrap(),
+                    )
+                    .await;
+                    if cancel {
+                        assert!(cancellation.cancel());
+                    }
+                    probe.release();
+                    let outcome = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(2),
+                        pending,
+                    )
+                    .await
+                    .expect("request cancellation interrupts a pending native write");
+
+                    if cancel {
+                        let error = outcome.unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::InternalError);
+                        assert_eq!(
+                            error.message,
+                            "WebSocket request send was dropped before commitment",
+                            "uncertain frame commitment remains the retained cleanup error"
+                        );
+                        assert!(client.is_closed());
+                        assert!(client.close_settled);
+                        assert!(client.transient_request.is_none());
+                        assert!(client.receiver.is_none());
+                        assert!(client.sender.try_lock().unwrap().is_none());
+                        assert!(probe.dropped.load(Ordering::Acquire));
+                        assert_eq!(*probe.accepted.lock().unwrap(), accepted_prefix);
+                        let next_id = client.next_id;
+                        assert!(client.list_tools(&cx, None).await.is_err());
+                        assert_eq!(client.next_id, next_id);
+                        let repeated = client.close(&cx).await.unwrap_err();
+                        assert_eq!(repeated.code, error.code);
+                        assert_eq!(repeated.message, error.message);
+                        assert_eq!(
+                            *probe.accepted.lock().unwrap(),
+                            accepted_prefix,
+                            "neither a later request nor close flushes a suffix or second frame"
+                        );
+                    } else {
+                        assert_eq!(
+                            outcome.unwrap().response.result,
+                            Some(async_modern_tools_list_result())
+                        );
+                        assert!(!client.is_closed());
+                        assert!(client.transient_request.is_none());
+                        assert!(probe.accepted.lock().unwrap().len() > prefix);
+                        client.close(&cx).await.unwrap();
+                        let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                        for method in [SERVER_DISCOVER_METHOD, "tools/list"] {
+                            let JsonRpcMessage::Request(request) = peer.recv(&cx).await.unwrap()
+                            else {
+                                panic!("uncancelled frame commits once");
+                            };
+                            assert_eq!(request.method, method);
+                        }
+                        assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                    }
+                    assert!(!cx.is_cancel_requested());
                 }
             }
         });

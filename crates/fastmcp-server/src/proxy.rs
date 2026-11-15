@@ -3,6 +3,13 @@
 //! This module provides lightweight proxy handlers that forward tool/resource/prompt
 //! calls to another MCP server via a backend client.
 
+#[cfg(feature = "websocket")]
+mod websocket;
+#[cfg(feature = "websocket")]
+pub use websocket::ProxyWebSocketClient;
+#[cfg(feature = "websocket")]
+use websocket::PreparedProxyWebSocketRequest;
+
 #[cfg(feature = "tasks")]
 use std::collections::{BTreeSet, VecDeque};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1405,6 +1412,17 @@ pub trait ProxyBackend: Send {
         Ok(None)
     }
 
+    /// Reserves a native WebSocket request whose bounded cancellation cleanup
+    /// must finish before the shared connection is released. Only the native
+    /// backend can construct this sealed request owner.
+    #[doc(hidden)]
+    #[cfg(feature = "websocket")]
+    fn prepare_native_websocket_request(
+        &mut self,
+    ) -> McpResult<Option<PreparedProxyWebSocketRequest>> {
+        Ok(None)
+    }
+
     /// Lists available tools.
     fn list_tools(&mut self) -> McpResult<Vec<Tool>>;
 
@@ -2223,6 +2241,25 @@ pub trait ProxyBackend: Send {
 fn ctx_progress_marker(ctx: &McpContext) -> Option<fastmcp_protocol::ProgressMarker> {
     ctx.progress_marker()
         .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+/// Progress markers share JSON-RPC's exact integer/string identity. Equivalent
+/// integral spellings correlate without changing either retained wire value;
+/// a numeric marker never acquires ownership of a string marker.
+fn final_progress_markers_correlate(
+    expected: &fastmcp_protocol::ProgressMarker,
+    observed: &fastmcp_protocol::ProgressMarker,
+) -> bool {
+    use fastmcp_protocol::ProgressMarker;
+
+    match (expected, observed) {
+        (ProgressMarker::String(expected), ProgressMarker::String(observed)) => expected == observed,
+        (ProgressMarker::Number(expected), ProgressMarker::Number(observed)) => {
+            RequestId::Integer(expected.as_str().to_owned())
+                .correlates_with(&RequestId::Integer(observed.as_str().to_owned()))
+        }
+        _ => false,
+    }
 }
 
 struct ProxyHttpInboundReverseGuard {
@@ -7727,6 +7764,9 @@ pub enum ProxyUpstreamAdapter {
     LegacyStdio,
     /// MCP 2026-07-28 Streamable HTTP request/response transport.
     ModernHttp,
+    /// MCP 2026-07-28 over an already-negotiated native WebSocket connection.
+    #[cfg(feature = "websocket")]
+    ModernWebSocket,
     /// Exact MCP 2024-11-05 advertised-POST plus SSE transport.
     LegacyHttpSse,
 }
@@ -10171,7 +10211,10 @@ fn forward_final_progress_to_context(
     ctx: &McpContext,
     progress: FinalProgressNotificationParams,
 ) -> McpResult<()> {
-    if ctx_progress_marker(ctx).as_ref() != Some(&progress.progress_token) {
+    if !ctx_progress_marker(ctx)
+        .as_ref()
+        .is_some_and(|expected| final_progress_markers_correlate(expected, &progress.progress_token))
+    {
         return Ok(());
     }
     let exact_progress = serde_json::from_str(progress.progress.as_str()).map_err(|_| {
@@ -11571,6 +11614,42 @@ impl ProxyClient {
         let binding = binding_from_live_stdio_client(&client, 0)?;
         let upstream_protocol_version = client.protocol_version().to_owned();
         Self::from_backend_with_upstream_binding(client, binding, &upstream_protocol_version)
+    }
+
+    /// Uses an already-negotiated modern WebSocket as one independent upstream.
+    ///
+    /// The selected era and policy come from the actual client handshake. This
+    /// operation never renegotiates, downgrades, or projects a legacy catalog.
+    /// Use [`Self::catalog_typed_with_cx`] and asynchronous proxy handlers; the
+    /// backend runs exclusively on the caller's context and owns the sole
+    /// receive driver. Core request results and MRTR continuations retain their
+    /// exact upstream representation. Tasks and catalog subscriptions are not
+    /// activated by this core transport adapter.
+    #[cfg(feature = "websocket")]
+    pub fn from_websocket<IO>(
+        client: fastmcp_client::WebSocketClient<IO>,
+        configuration_generation: u64,
+    ) -> McpResult<Self>
+    where
+        IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        if client.selected_protocol_era() != ProtocolEra::Modern2026 {
+            return Err(McpError::invalid_request(
+                "WebSocket proxy upstream requires the modern protocol era",
+            ));
+        }
+        let binding = ProxyUpstreamBinding {
+            era: ProtocolEra::Modern2026,
+            adapter: ProxyUpstreamAdapter::ModernWebSocket,
+            policy: client.session().protocol_plan().policy(),
+            configuration_generation,
+        };
+        let backend = ProxyWebSocketClient::new(client)?;
+        Self::from_backend_with_upstream_binding(
+            backend,
+            binding,
+            ProtocolEra::Modern2026.version().as_str(),
+        )
     }
 
     /// Creates a proxy client from a backend implementation.
@@ -13909,7 +13988,7 @@ impl ProxyClient {
             .upstream_binding
             .map(|binding| binding.era())
             .or(self.observed_protocol_era()?);
-        let Some((era, execution)) = self.with_backend(|backend| {
+        let Some((era, execution, native_cancellation)) = self.with_backend(|backend| {
             let Some(era) = backend.async_protocol_era() else {
                 return Ok(None);
             };
@@ -13918,9 +13997,13 @@ impl ProxyClient {
                     "Proxy async backend era contradicts the selected route",
                 ));
             }
+            #[cfg(feature = "websocket")]
+            if let Some(request) = backend.prepare_native_websocket_request()? {
+                return Ok(Some((era, request.into_execution(), true)));
+            }
             backend
                 .prepare_async_request()
-                .map(|request| request.map(|request| (era, request)))
+                .map(|request| request.map(|request| (era, request, false)))
         })?
         else {
             return Ok(None);
@@ -13972,7 +14055,9 @@ impl ProxyClient {
                 return;
             }
             if era != ProtocolEra::Modern2026
-                || expected_progress.as_ref() != Some(&progress.progress_token)
+                || !expected_progress.as_ref().is_some_and(|expected| {
+                    final_progress_markers_correlate(expected, &progress.progress_token)
+                })
                 || previous_progress
                     .as_ref()
                     .is_some_and(|previous| &progress.progress <= previous)
@@ -13989,7 +14074,7 @@ impl ProxyClient {
         };
         // Delaying execute itself until this future is polled makes the
         // cancellation-first boundary cover user future construction as well.
-        let result = await_proxy_request_or_cancellation(ctx, async {
+        let operation = async {
             let mut operation = execution.execute(ctx, request, &mut forward_progress);
             std::future::poll_fn(|task_cx| {
                 let result = operation.as_mut().poll(task_cx);
@@ -14003,8 +14088,16 @@ impl ProxyClient {
                 result
             })
             .await
-        })
-        .await?;
+        };
+        // A native WebSocket owns the committed request ID and must finish its
+        // bounded cancellation control before releasing the sole reader. The
+        // sealed preparation hook cannot be supplied by arbitrary backends.
+        // Custom executors retain cancellation-first polling at this boundary.
+        let result = if native_cancellation {
+            operation.await
+        } else {
+            await_proxy_request_or_cancellation(ctx, operation).await
+        }?;
         ctx.ensure_live()?;
         if result.era() != era || final_result_retains_task(&result) {
             return Err(McpError::invalid_request(
@@ -16988,6 +17081,7 @@ IFS= read -r end
         WrongMethod,
         WrongEra,
         WrongProgressToken,
+        AliasedNumericProgressToken,
         RegressingProgress,
     }
 
@@ -17066,10 +17160,14 @@ IFS= read -r end
                         .push((ctx.request_id(), method.to_owned(), params.clone()));
                 }
                 if let Some(marker) = ctx.progress_marker() {
-                    let token = if matches!(self.fault, OwnedAsyncFault::WrongProgressToken) {
-                        serde_json::json!("unrelated-request")
-                    } else {
-                        marker.clone()
+                    let token = match self.fault {
+                        OwnedAsyncFault::WrongProgressToken => {
+                            serde_json::json!("unrelated-request")
+                        }
+                        OwnedAsyncFault::AliasedNumericProgressToken => {
+                            serde_json::from_str("4.2e1").unwrap()
+                        }
+                        _ => marker.clone(),
                     };
                     on_progress(final_progress_from_wire(&format!(
                         r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":{token},"progress":1.20e+4,"total":12000.0,"message":"owned"}}}}"#,
@@ -28477,6 +28575,106 @@ IFS= read -r end
             panic!("fixture decodes as final progress");
         };
         progress
+    }
+
+    #[test]
+    fn proxy_final_progress_correlates_integer_aliases_without_crossing_token_kinds() {
+        for (expected, observed, matches) in [
+            ("42", "4.2e1", true),
+            ("42.0", "4.20e+1", true),
+            ("0", "-0e50", true),
+            (
+                "922337203685477580812345678901234567890",
+                "922337203685477580812345678901234567890.0",
+                true,
+            ),
+            ("42", "43", false),
+            ("42", r#""42""#, false),
+            (r#""42""#, "42", false),
+            (r#""same""#, r#""same""#, true),
+            (r#""same""#, r#""different""#, false),
+        ] {
+            let capture = Arc::new(ExactProgressCapture::default());
+            let context = McpContext::with_progress(
+                Cx::for_testing(),
+                506,
+                ProgressReporter::with_marker(
+                    serde_json::from_str(expected).unwrap(),
+                    Arc::clone(&capture) as Arc<dyn NotificationSender>,
+                ),
+            );
+            let progress = final_progress_from_wire(&format!(
+                r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":{observed},"progress":1.20e+4,"total":12000.0,"message":"aliased"}}}}"#,
+            ));
+
+            super::forward_final_progress_to_context(&context, progress).unwrap();
+
+            let delivered = capture.values.lock().unwrap();
+            assert_eq!(delivered.len(), usize::from(matches), "{expected} versus {observed}");
+            if matches {
+                assert_eq!(
+                    delivered.as_slice(),
+                    &[(
+                        "1.20e+4".to_owned(),
+                        Some("12000.0".to_owned()),
+                        Some("aliased".to_owned()),
+                    )],
+                    "correlation does not respell the forwarded progress values"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_custom_async_request_accepts_only_correlated_integer_progress_aliases() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for (marker, accepted) in [("42", true), ("43", false), (r#""42""#, false)] {
+            let state = Arc::new(Mutex::new(OwnedAsyncState::default()));
+            let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::AliasedNumericProgressToken);
+            let capture = Arc::new(ExactProgressCapture::default());
+            runtime.block_on(async {
+                let cx = Cx::current().expect("caller runtime is installed");
+                let context = McpContext::with_progress(
+                    cx,
+                    507,
+                    ProgressReporter::with_marker(
+                        serde_json::from_str(marker).unwrap(),
+                        Arc::clone(&capture) as Arc<dyn NotificationSender>,
+                    ),
+                );
+                let result = proxy
+                    .call_tool_typed_async(&context, "owned", serde_json::json!({}))
+                    .await;
+                if accepted {
+                    assert!(matches!(
+                        result.unwrap(),
+                        CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                    ));
+                } else {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+                }
+            });
+            let delivered = capture.values.lock().unwrap();
+            assert_eq!(delivered.len(), usize::from(accepted), "marker {marker}");
+            if accepted {
+                assert_eq!(
+                    delivered.as_slice(),
+                    &[(
+                        "1.20e+4".to_owned(),
+                        Some("12000.0".to_owned()),
+                        Some("owned".to_owned()),
+                    )]
+                );
+            }
+            let state = state.lock().unwrap();
+            assert_eq!(state.prepared, 1);
+            assert_eq!(state.executed, 1);
+            assert_eq!(state.dropped, 1);
+            assert_eq!(state.synchronous_calls, 0);
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
     #[test]

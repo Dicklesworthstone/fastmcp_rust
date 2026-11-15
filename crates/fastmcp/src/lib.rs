@@ -512,6 +512,8 @@ pub mod server {
         ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
         ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
     };
+    #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
+    pub use fastmcp_server::ProxyWebSocketClient;
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub use fastmcp_server::{
         ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyTaskCleanupOutcome,
@@ -1030,6 +1032,9 @@ pub use fastmcp_server::{
     ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
     ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
+
+#[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
+pub use fastmcp_server::ProxyWebSocketClient;
 
 /// Final Tasks proxy control, retention, and listener APIs require both features.
 #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -3440,6 +3445,8 @@ pub mod modern {
         FinalProgressCallback, ProxyUpstreamAdapter, ProxyUpstreamBinding,
         ProxyUpstreamBindingRegistry,
     };
+    #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
+    pub use fastmcp_server::ProxyWebSocketClient;
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub use fastmcp_server::{
         ProxyTaskCleanupOutcome, ProxyTaskLimits, ProxyTaskOrphanAudit, ProxyTaskOrphanReason,
@@ -3817,6 +3824,17 @@ pub mod modern {
         #[must_use]
         pub const fn session(&self) -> &fastmcp_client::ClientSession {
             self.inner.session()
+        }
+
+        /// Transfers an idle, negotiated connection into a modern proxy route.
+        /// Fetch its catalog with `catalog_typed_with_cx` before installing it
+        /// through `ServerBuilder::as_proxy_typed`.
+        #[cfg(feature = "proxy")]
+        pub fn into_proxy(self, configuration_generation: u64) -> McpResult<crate::ProxyClient>
+        where
+            IO: Send + 'static,
+        {
+            crate::ProxyClient::from_websocket(self.inner, configuration_generation)
         }
 
         /// Reports live bilateral Apps activation on this caller-upgraded stream.
@@ -12564,6 +12582,8 @@ pub mod testing;
 /// use fastmcp_rust::prelude::*;
 /// ```
 pub mod prelude {
+    #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
+    pub use crate::ProxyWebSocketClient;
     pub use crate::{
         // Context and errors
         AccessToken,

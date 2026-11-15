@@ -939,7 +939,10 @@ defaults to 30 seconds; the non-resettable absolute deadline defaults to 120
 seconds. Serialization, sending, and teardown are outside these timers.
 Unix subprocess sends have a separate two-second bound covering writer-lock
 acquisition and the native pipe commit. These commits remain synchronous;
-non-Unix sends retain blocking-I/O limits. Only a valid matching progress
+non-Unix sends retain blocking-I/O limits. Native WebSocket request sends have
+their own absolute bound and observe request-local cancellation while writing;
+an interrupted partial frame retires the connection without flushing its suffix.
+Only a valid matching progress
 notification on a request that actually supplied a progress token can reset idle.
 
 On Unix, eager `ClientBuilder::connect_stdio_with_cx` initialization also
@@ -1006,6 +1009,34 @@ stdio receive turns and reject cursor cycles without returning a partial
 catalog. Stdio writes and individual receive turns retain their synchronous
 I/O limits. Backends without an upstream binding retain their synchronous
 catalog implementation.
+
+With `proxy` and `websocket-experimental` enabled, an idle modern WebSocket
+client can also become a proxy upstream:
+
+```rust
+use fastmcp_rust::{AsyncWsClientTransport, Cx, modern};
+
+async fn websocket_gateway(cx: &Cx) -> Result<modern::Server, Box<dyn std::error::Error>> {
+    let transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:8080/mcp").await?;
+    let upstream = modern::client_builder().connect_websocket_with_cx(cx, transport).await?;
+    let proxy = upstream.into_proxy(1)?;
+    let catalog = proxy.catalog_typed_with_cx(cx).await?;
+    Ok(modern::server_builder("gateway", "1.0")
+        .as_proxy_typed("remote", proxy, catalog)?
+        .build())
+}
+```
+
+The native adapter forwards tools, resources, resource templates, prompts and
+completion, including typed `input_required` continuations and exact unknown
+result fields. Matching progress is forwarded while a request is running;
+accepted log notifications are relayed when that request finishes. Requests
+share one cancellation-aware connection owner. Cancelling a queued request has
+no upstream effect, and an active request retains ownership until its native
+cancellation cleanup finishes. Keep the caller runtime alive for the connection.
+This adapter currently provides core requests; catalog/resource subscription
+relays and Tasks are not advertised. `ProxyClient::from_websocket` exposes the
+same adapter for callers using the lower-level native client.
 
 Exact-2024 proxy invocations preserve complete upstream `tools/call`,
 `resources/read`, and `prompts/get` results, including content annotations,

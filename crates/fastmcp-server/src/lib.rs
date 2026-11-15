@@ -159,6 +159,8 @@ pub use proxy::{
     ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
     ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
+#[cfg(all(feature = "proxy", feature = "websocket"))]
+pub use proxy::ProxyWebSocketClient;
 #[cfg(feature = "proxy")]
 use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyCatalogRelay};
 #[cfg(all(feature = "proxy", feature = "tasks"))]
