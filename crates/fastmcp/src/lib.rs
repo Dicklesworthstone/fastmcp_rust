@@ -280,6 +280,11 @@ pub use asupersync;
 /// `websocket-experimental` feature cannot expose that caller-upgraded
 /// experimental transport through `fastmcp_rust::client`.
 pub mod client {
+    #[cfg(unix)]
+    pub use crate::{
+        StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
+        StdioRestartPolicy, SupervisedStdioClient,
+    };
     #[cfg(all(feature = "apps", feature = "tasks"))]
     pub use crate::McpAppsServerTaskPolicy;
     #[cfg(feature = "websocket-experimental")]
@@ -1133,6 +1138,11 @@ pub use fastmcp_client::{
     SubscriptionTimeoutPolicy,
 };
 pub use fastmcp_client::{ResourceSubscriptionRelations, SubscriptionListenRequest};
+#[cfg(unix)]
+pub use fastmcp_client::{
+    StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
+    StdioRestartPolicy, SupervisedStdioClient,
+};
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
 
@@ -3114,6 +3124,11 @@ pub mod modern {
         ModernHttpSubscriptionTermination,
     };
     pub use fastmcp_client::sse::SseLimits;
+    #[cfg(unix)]
+    pub use fastmcp_client::{
+        StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
+        StdioRestartPolicy, SupervisedStdioClient,
+    };
     pub use fastmcp_client::{
         BoundedListPage, CachePartitionKey, CompletionContext, CompletionParams,
         CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,
@@ -3744,6 +3759,21 @@ pub mod modern {
                 .connect_stdio_with_cx(cx, command, args)
                 .await
                 .map(Client::from_inner)
+        }
+
+        /// Connects a supervised modern Unix subprocess. Recovery is explicit,
+        /// repeats discovery, and never replays an interrupted application RPC.
+        #[cfg(unix)]
+        pub async fn connect_supervised_stdio_with_cx(
+            self,
+            cx: &Cx,
+            command: &str,
+            args: &[&str],
+            policy: StdioRestartPolicy,
+        ) -> Result<SupervisedStdioClient, StdioRestartError> {
+            self.inner
+                .connect_supervised_stdio_with_cx(cx, command, args, policy)
+                .await
         }
 
         /// Negotiates an owned native async WebSocket transport under the
@@ -12582,6 +12612,11 @@ pub mod testing;
 /// use fastmcp_rust::prelude::*;
 /// ```
 pub mod prelude {
+    #[cfg(unix)]
+    pub use crate::{
+        StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
+        StdioRestartPolicy, SupervisedStdioClient,
+    };
     #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
     pub use crate::ProxyWebSocketClient;
     pub use crate::{

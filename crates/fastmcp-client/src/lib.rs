@@ -52,6 +52,8 @@ mod builder;
 mod cache;
 mod execution;
 mod memory;
+#[cfg(unix)]
+mod stdio_restart;
 #[cfg(feature = "tasks")]
 mod task_wait;
 #[cfg(feature = "tasks")]
@@ -114,6 +116,11 @@ mod session;
 pub mod sse;
 
 pub use builder::ClientBuilder;
+#[cfg(unix)]
+pub use stdio_restart::{
+    StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
+    StdioRestartPolicy, SupervisedStdioClient,
+};
 pub use cache::{
     CachePartitionKey, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,
     FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
@@ -19238,6 +19245,10 @@ pub struct Client {
     /// Latest retryable process-cleanup failure. This is cleared when a later
     /// close proves that the retained ownership scope is quiescent.
     pending_process_cleanup_error: Option<McpError>,
+    /// Private, typed evidence for opt-in subprocess recovery. Ordinary clients
+    /// never acquire it; cleanup-induced exits cannot manufacture it.
+    #[cfg(unix)]
+    stdio_restart_observation: Option<stdio_restart::StdioRestartObservation>,
     /// Independently owned stdio reader. Callback workers never borrow this
     /// half, so the sole reader can continue admitting cancellation frames.
     /// The sequential adapter and cloned multiplexed request handles share
@@ -19731,6 +19742,8 @@ impl Client {
             child_cleanup_phase: ClientChildCleanupPhase::Active,
             cleanup_error: None,
             pending_process_cleanup_error: None,
+            #[cfg(unix)]
+            stdio_restart_observation: None,
             transport,
             response_sender,
             selected_io: None,
@@ -19941,6 +19954,8 @@ impl Client {
             child_cleanup_phase: ClientChildCleanupPhase::Active,
             cleanup_error: None,
             pending_process_cleanup_error: None,
+            #[cfg(unix)]
+            stdio_restart_observation: None,
             transport,
             response_sender,
             selected_io,
@@ -20013,6 +20028,8 @@ impl Client {
             child_cleanup_phase: ClientChildCleanupPhase::Active,
             cleanup_error: None,
             pending_process_cleanup_error: None,
+            #[cfg(unix)]
+            stdio_restart_observation: None,
             transport,
             response_sender,
             selected_io: None,
@@ -20462,6 +20479,10 @@ impl Client {
     /// every waiter before dropping stdin and reaping the owned child so later
     /// public calls cannot retry on that connection.
     fn terminate_connection(&mut self, error: McpError) -> McpError {
+        #[cfg(unix)]
+        if matches!(self.stdio_restart_observation, Some(stdio_restart::StdioRestartObservation::Active(_))) {
+            self.stdio_restart_observation = Some(stdio_restart::StdioRestartObservation::Refused);
+        }
         self.initialized.store(false, Ordering::SeqCst);
         self.responses.fail_all(error.clone());
         if let Some(executor) = &self.multiplexed_executor {
@@ -20497,6 +20518,43 @@ impl Client {
         );
         combine_operation_and_cleanup::<()>(Err(error), cleanup)
             .expect_err("a terminal operation error cannot become a successful cleanup result")
+    }
+
+    /// Records a naturally observed process exit before cleanup can signal it.
+    /// A live child closing stdout, a codec failure, cancellation and a deadline
+    /// never become crash evidence merely because termination later kills it.
+    fn terminate_stdio_transport_error(&mut self, error: TransportError) -> McpError {
+        #[cfg(unix)]
+        if let Some(stdio_restart::StdioRestartObservation::Active(generation)) =
+            self.stdio_restart_observation
+        {
+            let disconnected = match &error {
+                TransportError::Closed => true,
+                TransportError::Io(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                _ => false,
+            };
+            let cancelled = self.cx.is_cancel_requested()
+                || Cx::current().is_some_and(|cx| cx.is_cancel_requested());
+            if disconnected && !cancelled {
+                if let Some(status) = self.child.as_mut().and_then(|child| child.try_wait().ok().flatten()) {
+                    let exit = stdio_restart::StdioProcessExit::from(status);
+                    self.stdio_restart_observation =
+                        Some(stdio_restart::StdioRestartObservation::Exited { generation, exit });
+                    // Publish this same uncertainty to all old request handles
+                    // before shutting down their executor. No caller is replayed.
+                    return self.terminate_connection(
+                        stdio_restart::StdioInterruptedRequest { generation, process_exit: exit }
+                            .into_error(),
+                    );
+                }
+            }
+        }
+        self.terminate_connection(transport_error_to_mcp(error))
     }
 
     /// Returns whether the client has been initialized.
@@ -21834,7 +21892,7 @@ impl Client {
                 }
                 return Ok(false);
             }
-            Err(error) => return Err(self.terminate_connection(transport_error_to_mcp(error))),
+            Err(error) => return Err(self.terminate_stdio_transport_error(error)),
         };
         executor
             .service_at(cx, received_at)
@@ -23103,7 +23161,7 @@ impl Client {
                     McpError::request_cancelled(),
                 ));
             }
-            Err(error) => return Err(self.terminate_connection(transport_error_to_mcp(error))),
+            Err(error) => return Err(self.terminate_stdio_transport_error(error)),
         };
         *admitted_ingress = true;
         if let Some(source) = deadlines.expired_at(received_at) {
@@ -23644,7 +23702,7 @@ impl Client {
                         return Err(self.terminate_connection(McpError::request_cancelled()));
                     }
                     Err(error) => {
-                        return Err(self.terminate_connection(transport_error_to_mcp(error)));
+                        return Err(self.terminate_stdio_transport_error(error));
                     }
                 };
                 self.process_selected_ingress_frame(&cx, frame)?;
@@ -24294,11 +24352,11 @@ impl Client {
         error: TransportError,
     ) -> McpError {
         let is_connection_terminal = !matches!(&error, TransportError::Codec(_));
-        let error = transport_error_to_mcp(error);
-
         if is_connection_terminal {
-            return self.terminate_connection(error);
-        } else if let Some(request_id) = request_id {
+            return self.terminate_stdio_transport_error(error);
+        }
+        let error = transport_error_to_mcp(error);
+        if let Some(request_id) = request_id {
             self.responses.fail(request_id, error.clone());
         }
 
@@ -24839,7 +24897,7 @@ impl Client {
                     );
                 }
                 Err(error) => {
-                    return Err(self.terminate_connection(transport_error_to_mcp(error)));
+                    return Err(self.terminate_stdio_transport_error(error));
                 }
             };
             if let Some(kind) = deadlines.expired_at(received_at) {
@@ -28580,6 +28638,10 @@ impl Client {
     /// cannot be established, signalling fails, or the subprocess cannot be
     /// reaped within the cleanup deadline.
     pub fn close(&mut self) -> McpResult<()> {
+        #[cfg(unix)]
+        if self.stdio_restart_observation.is_some() {
+            self.stdio_restart_observation = Some(stdio_restart::StdioRestartObservation::Refused);
+        }
         let cx = self.cx.clone();
         let orderly = self.initialized.load(Ordering::SeqCst);
         let deferred_retirement_result = self.begin_close(&cx);
@@ -28605,6 +28667,10 @@ impl Client {
     /// snapshots remain synchronous. Platform limits from [`Self::close`]
     /// still apply; this does not make arbitrary custom transports nonblocking.
     pub async fn close_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+        #[cfg(unix)]
+        if self.stdio_restart_observation.is_some() {
+            self.stdio_restart_observation = Some(stdio_restart::StdioRestartObservation::Refused);
+        }
         let orderly = self.initialized.load(Ordering::SeqCst);
         let deferred_retirement_result = self.begin_close(cx);
         self.reverse_callback_pool.join_bounded_with_cx(cx).await?;

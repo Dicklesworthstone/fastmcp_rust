@@ -973,6 +973,42 @@ async fn connect(cx: &Cx) -> McpResult<Client> {
 }
 ```
 
+### Supervised stdio recovery (Unix)
+
+`modern::ClientBuilder::connect_supervised_stdio_with_cx` creates an explicitly
+supervised subprocess connection. Use `client_mut()` for application operations
+and call `recover(cx, cancellation)` after a confirmed subprocess exit. Recovery
+cleans up the failed generation, waits with bounded exponential backoff and
+jitter, starts a replacement from frozen command, arguments, environment and
+working directory, and completes fresh modern discovery before publishing a
+new generation.
+
+```rust
+use fastmcp_rust::{Cx, StdioRestartError, StdioRestartPolicy, SupervisedStdioClient, modern};
+
+async fn connect_supervised(cx: &Cx) -> Result<SupervisedStdioClient, StdioRestartError> {
+    modern::client_builder()
+        .connect_supervised_stdio_with_cx(cx, "my-mcp-server", &[], StdioRestartPolicy::default())
+        .await
+}
+```
+
+The default policy permits three replacement attempts in a sixty-second window,
+with a 100-millisecond initial backoff, a five-second cap, and equal jitter. Attempts and
+the recovery deadline remain charged when a recovery future is dropped or
+cancelled. Dropping an in-progress discovery retains its replacement child for
+resumption; explicit cancellation settles that child before another attempt.
+
+An interrupted request carries `StdioInterruptedRequest` diagnostic evidence:
+its outcome is unknown and any reissue must be explicit. Recovery never repeats
+an RPC or transfers old request handles or subscriptions to the replacement.
+Protocol errors, application errors, timeouts, cancellation, explicit close,
+EOF from a still-running process, and unverified cleanup do not authorize a
+restart. The command configuration is frozen, but executable file contents are
+not snapshotted. Call `close_with_cx` to await final process cleanup.
+
+### Proxy upstreams
+
 A live modern `subscriptions/listen` can stay open on the same stdio
 `Client` while other requests complete. Call
 `Client::open_subscriptions_listener` and then

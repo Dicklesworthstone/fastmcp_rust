@@ -1048,6 +1048,126 @@ impl ClientBuilder {
         .await
     }
 
+    /// Freezes every inherited spawn input before the first supervised child.
+    /// A replacement never re-reads the host's environment, PATH, or cwd.
+    #[cfg(unix)]
+    pub(crate) fn freeze_stdio_restart(mut self, command: &str) -> McpResult<(Self, String)> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        self.validate_feature_configuration()?;
+        self.timeout_policy.validate()?;
+        if self.protocol_plan.policy() != ProtocolPolicy::ModernOnly
+            || self.protocol_plan.http_endpoints().is_some()
+        {
+            return Err(McpError::invalid_params(
+                "Supervised stdio requires an explicit ModernOnly stdio protocol plan",
+            ));
+        }
+        self.validate_reverse_callback_configuration(&self.protocol_plan)?;
+        let working_dir = self
+            .working_dir
+            .clone()
+            .map_or_else(std::env::current_dir, Ok)
+            .and_then(std::fs::canonicalize)
+            .map_err(|_| McpError::invalid_params("Cannot freeze the stdio working directory"))?;
+        if !working_dir.is_dir() {
+            return Err(McpError::invalid_params("Stdio working directory is not a directory"));
+        }
+        let mut environment = HashMap::new();
+        if self.inherit_env {
+            for (key, value) in std::env::vars_os() {
+                let key = key.into_string().map_err(|_| {
+                    McpError::invalid_params("Supervised stdio requires a Unicode environment")
+                })?;
+                let value = value.into_string().map_err(|_| {
+                    McpError::invalid_params("Supervised stdio requires a Unicode environment")
+                })?;
+                environment.insert(key, value);
+            }
+        }
+        environment.extend(self.env_vars);
+        let mut environment_bytes = 0usize;
+        if environment.len() > 4096 {
+            return Err(McpError::invalid_params("Supervised stdio environment exceeds its bound"));
+        }
+        for (key, value) in &environment {
+            if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
+                return Err(McpError::invalid_params("Invalid supervised stdio environment entry"));
+            }
+            environment_bytes = environment_bytes
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+        }
+        if environment_bytes > 2 * 1024 * 1024 {
+            return Err(McpError::invalid_params("Supervised stdio environment exceeds its bound"));
+        }
+        let configured = std::path::Path::new(command);
+        let executable = if configured.is_absolute() {
+            configured.to_path_buf()
+        } else if command.contains('/') {
+            working_dir.join(configured)
+        } else {
+            let path = environment.get("PATH").ok_or_else(|| {
+                McpError::invalid_params("Supervised stdio needs an absolute executable or frozen PATH")
+            })?;
+            std::env::split_paths(path)
+                .map(|entry| {
+                    let directory = if entry.is_absolute() { entry } else { working_dir.join(entry) };
+                    directory.join(configured)
+                })
+                .find(|candidate| {
+                    std::fs::metadata(candidate).is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                })
+                .ok_or_else(|| McpError::invalid_params("Cannot resolve the supervised stdio executable"))?
+        };
+        let executable = std::fs::canonicalize(executable)
+            .map_err(|_| McpError::invalid_params("Cannot freeze the supervised stdio executable"))?;
+        let metadata = std::fs::metadata(&executable)
+            .map_err(|_| McpError::invalid_params("Cannot inspect the supervised stdio executable"))?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(McpError::invalid_params("Supervised stdio executable is not executable"));
+        }
+        let executable = executable.into_os_string().into_string().map_err(|_| {
+            McpError::invalid_params("Supervised stdio requires a Unicode executable path")
+        })?;
+        self.working_dir = Some(working_dir);
+        self.env_vars = environment;
+        self.inherit_env = false;
+        // The supervisor owns the only attempt counter and elapsed window.
+        self.max_retries = 0;
+        self.retry_policy = None;
+        self.auto_initialize = false;
+        Ok((self, executable))
+    }
+
+    /// Transfers an uninitialized replacement into the supervisor before any
+    /// await. Dropping recovery can therefore never abandon an unowned child.
+    #[cfg(unix)]
+    pub(crate) fn spawn_supervised_stdio(
+        &self,
+        cx: &Cx,
+        command: &str,
+        args: &[&str],
+        deadline: Instant,
+    ) -> McpResult<Client> {
+        match self.try_connect_with_protocol_plan(
+            command,
+            args,
+            cx,
+            self.protocol_plan.clone(),
+            true,
+            false,
+            ConnectionRetryDeadline(Some(deadline)),
+        )? {
+            StdioConnectionAttempt::Connected(client) => Ok(*client),
+            StdioConnectionAttempt::Fallback(_) => {
+                unreachable!("a deferred ModernOnly spawn cannot select legacy fallback")
+            }
+        }
+    }
+
     /// Performs the one bounded stdio attempt used by fixed-plan constructors.
     ///
     /// This deliberately does not implement retry waiting. Public configurable
