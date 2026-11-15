@@ -5172,6 +5172,7 @@ pub struct ModernHttpClient {
     client_info: ClientInfo,
     client_implementation: Option<fastmcp_protocol::common_types::Implementation>,
     final_log_level: Option<LoggingLevel>,
+    outbound_trace_context: Option<fastmcp_core::OutboundTraceDecision>,
     client_capabilities: ClientCapabilities,
     mcp_apps_settings: Option<McpAppsClientSettings>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
@@ -8479,6 +8480,7 @@ impl ModernHttpClient {
             serde_json::json!({}),
             Some(RequestId::Number(1)),
             client_extensions.as_ref(),
+            None,
         )?;
 
         let probe_response = ModernHttpExecutor::with_bearer_credential(bearer_credential.clone())
@@ -8531,6 +8533,7 @@ impl ModernHttpClient {
                     client_info,
                     client_implementation,
                     final_log_level: None,
+                    outbound_trace_context: None,
                     client_capabilities,
                     mcp_apps_settings,
                     client_extension_runtime,
@@ -8581,6 +8584,28 @@ impl ModernHttpClient {
     #[must_use]
     pub fn modern_post_target(&self) -> &str {
         &self.modern_post_target
+    }
+
+    /// Installs a policy decision only for this exact modern HTTP origin.
+    /// Cloned request handles retain their own decision; changing one cannot
+    /// alter an already prepared exchange or another handle's telemetry.
+    pub fn set_outbound_trace_context(
+        &mut self,
+        decision: Option<fastmcp_core::OutboundTraceDecision>,
+    ) -> McpResult<()> {
+        crate::trace::validate_destination(
+            decision.as_ref(),
+            fastmcp_core::TraceTransport::Http,
+            Some(ProtocolEra::Modern2026),
+            Some(&self.modern_post_target),
+        )?;
+        self.outbound_trace_context = decision;
+        Ok(())
+    }
+
+    /// Returns this handle's approved fields and redacted policy decision.
+    pub fn outbound_trace_context(&self) -> Option<&fastmcp_core::OutboundTraceDecision> {
+        self.outbound_trace_context.as_ref()
     }
 
     /// Returns the exact typed discovery result that selected modern HTTP.
@@ -8697,7 +8722,9 @@ impl ModernHttpClient {
             .client_extension_runtime
             .as_ref()
             .ok_or(ModernHttpClientError::ExtensionNotificationNotAdmitted)?;
-        let parameters = runtime
+        let mut parameters = parameters;
+        crate::trace::apply_parameters(&mut parameters, None);
+        let mut parameters = runtime
             .prepare_notification(
                 &self.discovery_state.server_discovery,
                 extension_id,
@@ -8705,6 +8732,7 @@ impl ModernHttpClient {
                 parameters,
             )
             .map_err(|_| ModernHttpClientError::ExtensionNotificationNotAdmitted)?;
+        crate::trace::apply_parameters(&mut parameters, self.outbound_trace_context.as_ref());
         check_modern_http_context(cx).map_err(ModernHttpClientError::Executor)?;
         let request =
             ModernHttpRequest::notification(&self.modern_post_target, method, parameters)?;
@@ -8792,6 +8820,7 @@ impl ModernHttpClient {
             parameters,
             request_id,
             client_extensions.as_ref(),
+            self.outbound_trace_context.as_ref(),
         )?;
         match self.gateway_tool_headers.as_deref() {
             Some(gateway) => request
@@ -9423,6 +9452,7 @@ impl ModernHttpClient {
             parameters,
             Some(request_id),
             client_extensions.as_ref(),
+            self.outbound_trace_context.as_ref(),
         )
     }
 
@@ -10350,6 +10380,7 @@ impl ModernHttpClient {
             parameters,
             request_id.clone(),
             &client_extensions,
+            self.outbound_trace_context.as_ref(),
         )?;
         if let Some(task) = input_task {
             crate::task_wait::admit_input_retention(task)
@@ -13347,6 +13378,7 @@ fn merge_client_extensions(
     (!merged.is_empty()).then_some(merged)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_modern_request_with_extensions(
     target: &str,
     client_info: &fastmcp_protocol::common_types::Implementation,
@@ -13355,6 +13387,7 @@ fn build_modern_request_with_extensions(
     parameters: serde_json::Value,
     request_id: Option<RequestId>,
     client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+    outbound_trace: Option<&fastmcp_core::OutboundTraceDecision>,
 ) -> Result<ModernHttpRequest, ModernHttpClientError> {
     validate_final_method(method, request_id.is_some())?;
     build_modern_request_after_method_validation(
@@ -13365,6 +13398,7 @@ fn build_modern_request_with_extensions(
         parameters,
         request_id,
         client_extensions,
+        outbound_trace,
     )
 }
 
@@ -13375,6 +13409,7 @@ fn build_modern_request_with_extensions(
 /// extension methods are not part of the core method registry and must never
 /// become reachable through the ungated raw request surface.
 #[cfg(feature = "tasks")]
+#[allow(clippy::too_many_arguments)]
 fn build_modern_tasks_request(
     target: &str,
     client_info: &fastmcp_protocol::common_types::Implementation,
@@ -13383,6 +13418,7 @@ fn build_modern_tasks_request(
     parameters: serde_json::Value,
     request_id: RequestId,
     client_extensions: &BTreeMap<String, serde_json::Value>,
+    outbound_trace: Option<&fastmcp_core::OutboundTraceDecision>,
 ) -> Result<ModernHttpRequest, ModernHttpClientError> {
     if !matches!(method, TASK_GET | TASK_UPDATE | TASK_CANCEL) {
         return Err(ModernHttpClientError::TasksRequestEncoding { method });
@@ -13398,6 +13434,7 @@ fn build_modern_tasks_request(
         parameters,
         Some(request_id),
         Some(client_extensions),
+        outbound_trace,
     )
 }
 
@@ -13436,6 +13473,7 @@ fn retain_inbound_core_client_capabilities(
 
 /// Adds final HTTP metadata after the caller has validated that the method is
 /// reachable through its own core or extension-specific admission path.
+#[allow(clippy::too_many_arguments)]
 fn build_modern_request_after_method_validation(
     target: &str,
     client_info: &fastmcp_protocol::common_types::Implementation,
@@ -13444,6 +13482,7 @@ fn build_modern_request_after_method_validation(
     parameters: serde_json::Value,
     request_id: Option<RequestId>,
     client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+    outbound_trace: Option<&fastmcp_core::OutboundTraceDecision>,
 ) -> Result<ModernHttpRequest, ModernHttpClientError> {
     let mut parameters = parameters
         .as_object()
@@ -13492,6 +13531,7 @@ fn build_modern_request_after_method_validation(
         metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), inbound_log_level);
     }
     retain_inbound_core_client_capabilities(&mut metadata, inbound_capabilities);
+    crate::trace::apply_metadata(&mut metadata, outbound_trace);
     parameters.insert("_meta".to_owned(), serde_json::Value::Object(metadata));
 
     let request = match request_id {

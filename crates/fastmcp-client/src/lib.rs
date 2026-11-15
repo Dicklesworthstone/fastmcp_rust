@@ -114,6 +114,7 @@ pub mod mcp_config;
 mod negotiation;
 mod session;
 pub mod sse;
+mod trace;
 
 pub use builder::ClientBuilder;
 pub use cache::{
@@ -128,7 +129,7 @@ pub use execution::{
     PendingRequestRecord, Request, RequestExecution, RequestExecutor, ReverseRequest,
     ReverseRequestCancellation, clt_01_a_manifest_digest, clt_01_b_manifest_digest,
 };
-pub use fastmcp_core::CanonicalHttpUrl;
+pub use fastmcp_core::{CanonicalHttpUrl, OutboundTraceDecision};
 pub use fastmcp_protocol::common_types::LoggingLevel;
 #[cfg(feature = "apps")]
 pub use fastmcp_protocol::extensions::McpAppsClientSettings;
@@ -6446,6 +6447,34 @@ impl<IO> WebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Binds an evaluated policy to this already upgraded modern peer. The
+    /// host asserts the peer identity because an upgraded I/O object carries
+    /// no independently verifiable URL. Discovery never propagates telemetry.
+    pub fn set_outbound_trace_context(
+        &mut self,
+        decision: Option<OutboundTraceDecision>,
+    ) -> McpResult<()> {
+        trace::validate_destination(
+            decision.as_ref(),
+            fastmcp_core::TraceTransport::WebSocket,
+            Some(self.selected_protocol_era()),
+            None,
+        )?;
+        self.final_result_cache.set_trace_uncacheable(
+            decision
+                .as_ref()
+                .is_some_and(|decision| decision.requires_uncacheable_response()),
+        );
+        self.last_final_cache_page = None;
+        self.session.outbound_trace_context = decision;
+        Ok(())
+    }
+
+    /// Returns this peer's approved trace and redacted policy decision.
+    pub fn outbound_trace_context(&self) -> Option<&OutboundTraceDecision> {
+        self.session.outbound_trace_context.as_ref()
+    }
+
     /// Negotiates a native, already-established async WebSocket transport.
     ///
     /// Pending wire operations and handshake cleanup require the explicit
@@ -6944,7 +6973,7 @@ where
         &mut self,
         cx: &Cx,
         method: impl Into<String>,
-        params: Option<serde_json::Value>,
+        mut params: Option<serde_json::Value>,
     ) -> McpResult<WebSocketResponse>
     where
         IO: Send + 'static,
@@ -6954,6 +6983,9 @@ where
         }
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        if let Some(parameters) = params.as_mut() {
+            trace::apply_parameters(parameters, self.session.outbound_trace_context.as_ref());
         }
         let method = method.into();
         self.admit_raw_client_request(&method, params.as_ref())?;
@@ -6965,7 +6997,8 @@ where
 
     /// Sends one modern request with caller cancellation and live progress.
     ///
-    /// The supplied parameters retain their exact admitted metadata. Only
+    /// Application parameters and non-trace metadata retain their admitted
+    /// values; trace fields follow this handle's explicit outbound policy. Only
     /// strictly increasing progress for this request's `progressToken` reaches
     /// the callback, before waiting for the terminal result. Delivered progress
     /// is not also retained in [`Self::take_final_progress_notifications`].
@@ -7041,7 +7074,7 @@ where
         &mut self,
         cx: &Cx,
         method: impl Into<String>,
-        params: Option<serde_json::Value>,
+        mut params: Option<serde_json::Value>,
         cancellation: &McpRequestCancellation,
         on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
         on_log: Option<&mut (dyn FnMut(FinalLogMessageParams) + Send)>,
@@ -7059,6 +7092,9 @@ where
             return Err(McpError::invalid_request(
                 "Live final WebSocket progress requires the modern protocol era",
             ));
+        }
+        if let Some(parameters) = params.as_mut() {
+            trace::apply_parameters(parameters, self.session.outbound_trace_context.as_ref());
         }
         let method = method.into();
         self.admit_raw_client_request(&method, params.as_ref())?;
@@ -7111,7 +7147,7 @@ where
     async fn request_admitted_with_raw_result_with_deadline_and_callbacks(
         &mut self,
         cx: &Cx,
-        request: JsonRpcRequest,
+        mut request: JsonRpcRequest,
         cancellation: Option<&McpRequestCancellation>,
         operation_deadline: Option<Instant>,
         mut on_progress: Option<&mut (dyn FnMut(FinalProgressNotificationParams) + Send)>,
@@ -7120,6 +7156,9 @@ where
     where
         IO: Send + 'static,
     {
+        if let Some(parameters) = request.params.as_mut() {
+            trace::apply_parameters(parameters, self.session.outbound_trace_context.as_ref());
+        }
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
         {
@@ -9290,6 +9329,7 @@ where
         result_set: FinalCacheResultSet,
     ) -> McpResult<FinalCacheKey> {
         let mut projection = parameters.clone();
+        trace::apply_parameters(&mut projection, None);
         let object = projection.as_object_mut().ok_or_else(|| {
             McpError::invalid_params("WebSocket cache parameters must be an object")
         })?;
@@ -11633,6 +11673,7 @@ where
                 }
             }
         }
+        trace::apply_metadata(generated, self.session.outbound_trace_context.as_ref());
         object.insert("_meta".to_owned(), metadata);
         Ok(params)
     }
@@ -15210,6 +15251,40 @@ impl FinalTaskWatch<'_, '_> {
 }
 
 impl HttpClient {
+    /// Installs an explicit policy decision for the negotiated modern POST
+    /// origin. Configuration cannot redirect the connection or authenticate
+    /// a request. Trace-bearing responses bypass this client's result cache.
+    pub fn set_outbound_trace_context(
+        &mut self,
+        decision: Option<OutboundTraceDecision>,
+    ) -> McpResult<()> {
+        trace::validate_destination(
+            decision.as_ref(),
+            fastmcp_core::TraceTransport::Http,
+            Some(self.selected_protocol_era()),
+            None,
+        )?;
+        let uncacheable = decision
+            .as_ref()
+            .is_some_and(|decision| decision.requires_uncacheable_response());
+        match &mut self.connection {
+            ClientHttpConnection::Modern(client) => client.set_outbound_trace_context(decision)?,
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => {}
+        }
+        self.final_result_cache.set_trace_uncacheable(uncacheable);
+        Ok(())
+    }
+
+    /// Returns the approved fields and redacted decision for this origin.
+    pub fn outbound_trace_context(&self) -> Option<&OutboundTraceDecision> {
+        match &self.connection {
+            ClientHttpConnection::Modern(client) => client.outbound_trace_context(),
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => None,
+        }
+    }
+
     /// Connects one immutable HTTP plan and completes the selected era's
     /// required lifecycle before exposing the client.
     pub async fn connect(
@@ -15649,7 +15724,11 @@ impl HttpClient {
     }
 
     /// Returns mutable access to the underlying policy-bound HTTP transport.
+    /// This fences retained and in-flight cache entries before exposing inner
+    /// configuration. The next cacheable request reconciles trace eligibility
+    /// with that connection's actual decision.
     pub fn connection_mut(&mut self) -> &mut ClientHttpConnection {
+        self.final_result_cache.set_trace_uncacheable(true);
         &mut self.connection
     }
 
@@ -16134,6 +16213,11 @@ impl HttpClient {
         {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
+        let trace_uncacheable = self
+            .outbound_trace_context()
+            .is_some_and(OutboundTraceDecision::requires_uncacheable_response);
+        self.final_result_cache
+            .synchronize_trace_uncacheable(trace_uncacheable);
         let core_parameters = self.core_request_parameters(&parameters)?;
         let core_request =
             CoreRequest::decode(self.selected_protocol_era(), method, Some(&core_parameters))
@@ -18190,7 +18274,9 @@ impl HttpClient {
         parameters: &serde_json::Value,
     ) -> Result<serde_json::Value, HttpClientError> {
         if self.selected_protocol_era() != ProtocolEra::Modern2026 {
-            return Ok(parameters.clone());
+            let mut parameters = parameters.clone();
+            trace::apply_parameters(&mut parameters, None);
+            return Ok(parameters);
         }
         let mut parameters = parameters.as_object().cloned().ok_or_else(|| {
             HttpClientError::CoreResult(McpError::invalid_params(
@@ -18219,6 +18305,7 @@ impl HttpClient {
                     object.entry(key.clone()).or_insert_with(|| value.clone());
                 }
             }
+            trace::apply_metadata(object, self.outbound_trace_context());
         }
         parameters.insert("_meta".to_owned(), metadata);
         Ok(serde_json::Value::Object(parameters))
@@ -18246,6 +18333,7 @@ impl HttpClient {
         mut semantic_parameters: serde_json::Value,
         result_set: FinalCacheResultSet,
     ) -> Result<FinalCacheKey, HttpClientError> {
+        trace::apply_parameters(&mut semantic_parameters, None);
         // Cursor bytes have their own presence-aware identity below. Keep the
         // query projection independent of the page so a rejected continuation
         // can be tied to the exact cached query that supplied it.
@@ -18410,6 +18498,7 @@ pub struct StdioRequestExecutor {
     timeout_policy: Arc<Mutex<RequestTimeoutPolicy>>,
     peer_era: ProtocolEra,
     modern_request_meta: Option<Arc<FinalRequestMeta>>,
+    outbound_trace_context: Option<OutboundTraceDecision>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     negotiated_extensions: Option<Arc<fastmcp_protocol::extensions::NegotiatedExtensionSet>>,
     extension_notification_discovery: Option<Arc<ServerDiscoverResult>>,
@@ -18580,6 +18669,7 @@ impl StdioRequestExecutor {
             timeout_policy: Arc::new(Mutex::new(timeout_policy)),
             peer_era,
             modern_request_meta: modern_request_meta.map(Arc::new),
+            outbound_trace_context: session.outbound_trace_context.clone(),
             client_extension_runtime,
             negotiated_extensions: session.negotiated_extensions().cloned().map(Arc::new),
             extension_notification_discovery,
@@ -18946,6 +19036,7 @@ impl StdioRequestExecutor {
                 McpError::invalid_params("Modern MCP request metadata must be an object")
             })?;
         metadata.extend(std::mem::take(configured));
+        trace::apply_metadata(metadata, self.outbound_trace_context.as_ref());
 
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
@@ -19012,8 +19103,11 @@ impl StdioRequestExecutor {
                     "Final extension notification requires retained server/discover state",
                 )
             })?;
-        let parameters =
+        let mut parameters = parameters;
+        trace::apply_parameters(&mut parameters, None);
+        let mut parameters =
             runtime.prepare_notification(discovery, extension_id, method, parameters)?;
+        trace::apply_parameters(&mut parameters, self.outbound_trace_context.as_ref());
         self.executor
             .send_notification(cx, JsonRpcRequest::notification(method, Some(parameters)))
     }
@@ -19079,6 +19173,10 @@ impl StdioRequestExecutor {
         metadata_policy: StdioRequestMetadata,
     ) -> McpResult<Option<serde_json::Value>> {
         let Some(final_metadata) = self.modern_request_meta.as_ref() else {
+            let mut params = params;
+            if let Some(parameters) = params.as_mut() {
+                trace::apply_parameters(parameters, None);
+            }
             return Ok(params);
         };
         let mut params = params.unwrap_or_else(|| serde_json::json!({}));
@@ -19109,6 +19207,7 @@ impl StdioRequestExecutor {
                 }
             }
         }
+        trace::apply_metadata(metadata, self.outbound_trace_context.as_ref());
         Ok(Some(params))
     }
 
@@ -19121,8 +19220,11 @@ impl StdioRequestExecutor {
     pub fn execute_tasks_subscription(
         &self,
         cx: &Cx,
-        request: JsonRpcRequest,
+        mut request: JsonRpcRequest,
     ) -> McpResult<StdioRequestExecution> {
+        if let Some(parameters) = request.params.as_mut() {
+            trace::apply_parameters(parameters, self.outbound_trace_context.as_ref());
+        }
         let execution = self.executor.execute_tasks_subscription(cx, request)?;
         Ok(StdioRequestExecution {
             execution,
@@ -19149,13 +19251,14 @@ impl StdioRequestExecutor {
     pub fn execute_final_tasks_subscription_with_timeout_policy(
         &self,
         cx: &Cx,
-        parameters: serde_json::Value,
+        mut parameters: serde_json::Value,
         timeout_policy: SubscriptionTimeoutPolicy,
     ) -> McpResult<StdioRequestExecution> {
         timeout_policy.validate()?;
         if let Some(error) = self.executor.terminal_error() {
             return Err(error);
         }
+        trace::apply_parameters(&mut parameters, self.outbound_trace_context.as_ref());
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
         let execution = self
@@ -19493,6 +19596,35 @@ impl ClientInitialization {
 }
 
 impl Client {
+    /// Binds a policy decision to this negotiated stdio peer. The host
+    /// supplies its local peer identity; inbound `_meta` cannot opt itself
+    /// into propagation. Setting or clearing the decision fences old cache
+    /// fills, and nonempty propagation disables cache lookup and insertion.
+    pub fn set_outbound_trace_context(
+        &mut self,
+        decision: Option<OutboundTraceDecision>,
+    ) -> McpResult<()> {
+        trace::validate_destination(
+            decision.as_ref(),
+            fastmcp_core::TraceTransport::Stdio,
+            self.session.selected_era(),
+            None,
+        )?;
+        self.final_result_cache.set_trace_uncacheable(
+            decision
+                .as_ref()
+                .is_some_and(|decision| decision.requires_uncacheable_response()),
+        );
+        self.last_final_cache_page = None;
+        self.session.outbound_trace_context = decision;
+        Ok(())
+    }
+
+    /// Returns the approved trace and redacted policy decision for this peer.
+    pub fn outbound_trace_context(&self) -> Option<&OutboundTraceDecision> {
+        self.session.outbound_trace_context.as_ref()
+    }
+
     fn retain_cleanup_error(&mut self, error: McpError) {
         self.cleanup_error = Some(match self.cleanup_error.take() {
             Some(previous) => combine_cleanup_errors(previous, error),
@@ -21229,6 +21361,16 @@ impl Client {
         cx: &Cx,
         message: &JsonRpcMessage,
     ) -> Result<(), TransportError> {
+        let prepared = if let JsonRpcMessage::Request(request) = message {
+            let mut request = request.clone();
+            if let Some(parameters) = request.params.as_mut() {
+                trace::apply_parameters(parameters, self.session.outbound_trace_context.as_ref());
+            }
+            Some(JsonRpcMessage::Request(request))
+        } else {
+            None
+        };
+        let message = prepared.as_ref().unwrap_or(message);
         let (mut sender, deadline) = lock_child_sender(&self.response_sender)?;
         send_child_frame(&mut sender, cx, message, deadline)
     }
@@ -21299,13 +21441,17 @@ impl Client {
     ///
     /// The ordinary `Client` convenience methods remain sequential adapters.
     /// Callers may clone this executor and commit several request-owned
-    /// handles before the Client drives selected ingress.
+    /// handles before the Client drives selected ingress. Each returned handle
+    /// freezes the current outbound trace decision. Later client configuration
+    /// does not change an existing handle or its sibling requests.
     pub fn multiplexed_stdio_executor(&self) -> McpResult<StdioRequestExecutor> {
-        self.multiplexed_executor.clone().ok_or_else(|| {
+        let mut executor = self.multiplexed_executor.clone().ok_or_else(|| {
             McpError::invalid_request(
                 "Negotiated stdio multiplexing is unavailable before initialization",
             )
-        })
+        })?;
+        executor.outbound_trace_context = self.session.outbound_trace_context.clone();
+        Ok(executor)
     }
 
     /// Commits one raw JSON-RPC request through the negotiated shared stdio
@@ -22302,6 +22448,7 @@ impl Client {
                 }
             }
         }
+        trace::apply_metadata(metadata, self.session.outbound_trace_context.as_ref());
         Ok(params)
     }
 
@@ -22350,11 +22497,12 @@ impl Client {
 
     fn prepare_request_parameters(
         &self,
-        params: serde_json::Value,
+        mut params: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
         if self.session.selected_era() == Some(ProtocolEra::Modern2026) {
             self.with_modern_request_metadata(params)
         } else {
+            trace::apply_parameters(&mut params, None);
             Ok(params)
         }
     }
@@ -23732,10 +23880,11 @@ impl Client {
     fn final_cache_key(
         &self,
         method: &str,
-        semantic_parameters: serde_json::Value,
+        mut semantic_parameters: serde_json::Value,
         cursor: Option<&str>,
         result_set: FinalCacheResultSet,
     ) -> McpResult<FinalCacheKey> {
+        trace::apply_parameters(&mut semantic_parameters, None);
         let normalized_capabilities = serde_json::to_string(self.session.client_capabilities())
             .map_err(|_| {
                 McpError::internal_error("Client capabilities could not form a cache key")
@@ -29488,6 +29637,7 @@ impl Client {
             // rejects a collision with an explicitly chosen raw-request token.
             let token = self.next_request_id()?;
             metadata.insert("progressToken".to_owned(), serde_json::json!(token));
+            trace::apply_metadata(metadata, self.session.outbound_trace_context.as_ref());
             request = self
                 .prepared_core_request(method, &parameters)?
                 .ok_or_else(|| McpError::invalid_params("Unsupported selected-era core request"))?;
@@ -32820,6 +32970,81 @@ exec sleep 2
 
     #[cfg(unix)]
     #[test]
+    fn obs01_stdio_wire_freezes_decisions_per_handle_and_prepared_request() {
+        let discovery = modern_discovery_response("trace-peer", &[MODERN_PROTOCOL_VERSION]);
+        let (cx, mut client) =
+            stdio_metadata_echo_client(&discovery, ClientCapabilities::default());
+        let unconfigured = client.multiplexed_stdio_executor().unwrap();
+        let parameters = serde_json::json!({"_meta": {
+            "traceparent": trace::TEST_TRACEPARENT,
+            "tracestate": "caller=untrusted",
+            "baggage": "authorization=caller-secret",
+            "example.test/kept": "application-data"
+        }});
+        let assert_observed = |response: JsonRpcResponse, expected: bool| {
+            let result = response.result.unwrap();
+            let metadata = &result["observed"]["params"]["_meta"];
+            assert_eq!(metadata["example.test/kept"], "application-data");
+            if expected {
+                assert_eq!(metadata["traceparent"], trace::TEST_TRACEPARENT);
+                assert_eq!(metadata["tracestate"], "vendor=kept");
+                assert_eq!(metadata["baggage"], "region=us");
+            } else {
+                for field in ["traceparent", "tracestate", "baggage"] {
+                    assert!(
+                        metadata.get(field).is_none(),
+                        "unconfigured peer leaked {field}"
+                    );
+                }
+            }
+        };
+        let mut execution = unconfigured
+            .execute(&cx, "tools/list", Some(parameters.clone()))
+            .unwrap();
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        assert_observed(
+            unconfigured
+                .try_take_response(&mut execution)
+                .unwrap()
+                .unwrap(),
+            false,
+        );
+
+        client
+            .set_outbound_trace_context(Some(trace::test_decision(
+                fastmcp_core::TraceTransport::Stdio,
+                "owned-stdio-peer",
+            )))
+            .unwrap();
+        let approved = client.multiplexed_stdio_executor().unwrap();
+        let mut prepared = client
+            .start_yielding_final_catalog_request(&cx, "tools/list", parameters.clone())
+            .unwrap()
+            .execution;
+        client.set_outbound_trace_context(None).unwrap();
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        assert_observed(
+            approved.try_take_response(&mut prepared).unwrap().unwrap(),
+            true,
+        );
+
+        // Existing executor handles keep their explicit snapshot. An older
+        // unconfigured sibling never inherits a later caller's context.
+        for (executor, expected) in [(&approved, true), (&unconfigured, false)] {
+            let mut execution = executor
+                .execute(&cx, "tools/list", Some(parameters.clone()))
+                .unwrap();
+            client.drive_multiplexed_stdio(&cx).unwrap();
+            assert_observed(
+                executor.try_take_response(&mut execution).unwrap().unwrap(),
+                expected,
+            );
+        }
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stdio_executor_keeps_configured_metadata_authority_on_the_wire() {
         let discovery = modern_discovery_response("metadata-peer", &[MODERN_PROTOCOL_VERSION]);
         let (cx, mut client) = stdio_metadata_echo_client(
@@ -33090,6 +33315,122 @@ exec sleep 2
         let client_addr: SocketAddr = "127.0.0.1:45101".parse().expect("client address");
         let server_addr: SocketAddr = "127.0.0.1:45102".parse().expect("server address");
         asupersync::net::tcp::VirtualTcpStream::pair(client_addr, server_addr)
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn obs01_websocket_wire_scopes_local_peer_policy_and_cache_bypass() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (client_io, peer_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+                    let JsonRpcMessage::Request(discovery) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("expected discovery");
+                    };
+                    assert_eq!(discovery.method, "server/discover");
+                    assert!(
+                        discovery.params.as_ref().unwrap()["_meta"]
+                            .get("traceparent")
+                            .is_none()
+                    );
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discovery.id.unwrap(),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    for traced in [false, true, true, false] {
+                        let JsonRpcMessage::Request(request) = server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("expected tools request");
+                        };
+                        assert_eq!(request.method, "tools/list");
+                        let metadata = &request.params.as_ref().unwrap()["_meta"];
+                        if traced {
+                            assert_eq!(metadata["traceparent"], trace::TEST_TRACEPARENT);
+                            assert_eq!(metadata["tracestate"], "vendor=kept");
+                            assert_eq!(metadata["baggage"], "region=us");
+                        } else {
+                            for field in ["traceparent", "tracestate", "baggage"] {
+                                assert!(metadata.get(field).is_none());
+                            }
+                        }
+                        server
+                            .send(
+                                &peer_cx,
+                                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    request.id.unwrap(),
+                                    serde_json::json!({
+                                        "resultType": "complete", "tools": [], "ttlMs": 60_000,
+                                        "cacheScope": "private"
+                                    }),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .unwrap();
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            let mut parameters = client
+                .with_modern_request_metadata(serde_json::json!({}))
+                .unwrap();
+            parameters["_meta"]["traceparent"] = serde_json::json!(trace::TEST_TRACEPARENT);
+            parameters["_meta"]["tracestate"] = serde_json::json!("caller=untrusted");
+            parameters["_meta"]["baggage"] = serde_json::json!("authorization=caller-secret");
+            client
+                .request_with_raw_result(&cx, "tools/list", Some(parameters))
+                .await
+                .unwrap();
+            let next_id = client.next_id;
+            let wrong_transport = trace::test_decision(
+                fastmcp_core::TraceTransport::Http,
+                "https://peer.example/mcp",
+            );
+            assert!(
+                client
+                    .set_outbound_trace_context(Some(wrong_transport))
+                    .is_err()
+            );
+            assert_eq!(client.next_id, next_id);
+            client
+                .set_outbound_trace_context(Some(trace::test_decision(
+                    fastmcp_core::TraceTransport::WebSocket,
+                    "owned-websocket-peer",
+                )))
+                .unwrap();
+            client.set_final_result_cache_enabled(true);
+            client.list_tools(&cx, None).await.unwrap();
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 0);
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            client.set_outbound_trace_context(None).unwrap();
+            client.list_tools(&cx, None).await.unwrap();
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            client.close(&cx).await.unwrap();
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
     }
 
     #[cfg(feature = "websocket-experimental")]
@@ -45326,6 +45667,152 @@ exec sleep 2
             .set_nonblocking(true)
             .expect("observe unexpected contact");
         (client, listener)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn obs01_http_wire_binds_origin_strips_raw_trace_and_fences_cache() {
+        let (mut client, listener) = http_owned_execution_fixture();
+        let target = client
+            .protocol_plan()
+            .modern_post_target()
+            .unwrap()
+            .to_owned();
+        let peer = http_catalog_test_server(listener, 4, |index, request| {
+            ("application/json", serde_json::json!({
+                "jsonrpc": "2.0", "id": request["id"],
+                "result": http_catalog_test_result("tools/list", &format!("page-{index}"), None, 60_000, "private")
+            }).to_string())
+        });
+        http_test_runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            client
+                .request_final_core(
+                    &cx,
+                    "tools/list",
+                    serde_json::json!({"_meta": {
+                        "traceparent": trace::TEST_TRACEPARENT,
+                        "tracestate": "caller=untrusted",
+                        "baggage": "authorization=caller-secret",
+                        "example.test/kept": "application-data"
+                    }}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+
+            let decision = trace::test_decision(fastmcp_core::TraceTransport::Http, &target);
+            client.set_outbound_trace_context(Some(decision)).unwrap();
+            client.set_final_result_cache_enabled(true);
+            client.list_tools(&cx, None).await.unwrap();
+            let next_id = client.next_id.load(Ordering::Relaxed);
+            let foreign = trace::test_decision(
+                fastmcp_core::TraceTransport::Http,
+                "https://foreign.example/mcp",
+            );
+            assert!(client.set_outbound_trace_context(Some(foreign)).is_err());
+            assert_eq!(client.next_id.load(Ordering::Relaxed), next_id);
+            assert_eq!(client.outbound_trace_context().unwrap().revision(), 19);
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+
+            client.set_outbound_trace_context(None).unwrap();
+            client.list_tools(&cx, None).await.unwrap();
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 2);
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+        });
+        let requests = peer.join().unwrap();
+        for index in [0, 3] {
+            let metadata = &requests[index]["params"]["_meta"];
+            for field in ["traceparent", "tracestate", "baggage"] {
+                assert!(
+                    metadata.get(field).is_none(),
+                    "unconfigured request leaked {field}"
+                );
+            }
+        }
+        assert_eq!(
+            requests[0]["params"]["_meta"]["example.test/kept"],
+            "application-data"
+        );
+        for index in [1, 2] {
+            let metadata = &requests[index]["params"]["_meta"];
+            assert_eq!(metadata["traceparent"], trace::TEST_TRACEPARENT);
+            assert_eq!(metadata["tracestate"], "vendor=kept");
+            assert_eq!(metadata["baggage"], "region=us");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn obs01_http_mutable_inner_connection_cannot_bypass_trace_cache_isolation() {
+        let (mut client, listener) = http_owned_execution_fixture();
+        let target = client
+            .protocol_plan()
+            .modern_post_target()
+            .unwrap()
+            .to_owned();
+        let peer = http_catalog_test_server(listener, 5, |index, request| {
+            ("application/json", serde_json::json!({
+                "jsonrpc": "2.0", "id": request["id"],
+                "result": http_catalog_test_result("tools/list", &format!("page-{index}"), None, 60_000, "private")
+            }).to_string())
+        });
+        http_test_runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            client.list_tools(&cx, None).await.unwrap();
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+
+            match client.connection_mut() {
+                ClientHttpConnection::Modern(inner) => inner
+                    .set_outbound_trace_context(Some(trace::test_decision(
+                        fastmcp_core::TraceTransport::Http,
+                        &target,
+                    )))
+                    .unwrap(),
+                #[cfg(feature = "legacy-2024-11-05")]
+                ClientHttpConnection::LegacySse(_) => panic!("fixture must select modern HTTP"),
+            }
+            client.set_final_result_cache_enabled(false);
+            client.set_final_result_cache_enabled(true);
+            client.list_tools(&cx, None).await.unwrap();
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+
+            client.set_final_result_cache_enabled(false);
+            match client.connection_mut() {
+                ClientHttpConnection::Modern(inner) => {
+                    inner.set_outbound_trace_context(None).unwrap()
+                }
+                #[cfg(feature = "legacy-2024-11-05")]
+                ClientHttpConnection::LegacySse(_) => panic!("fixture must select modern HTTP"),
+            }
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            client.set_final_result_cache_enabled(true);
+            client.list_tools(&cx, None).await.unwrap();
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 2);
+            assert_eq!(client.final_result_cache_stats().hits, 2);
+        });
+        let requests = peer.join().unwrap();
+        for (index, request) in requests.iter().enumerate() {
+            let metadata = &request["params"]["_meta"];
+            if matches!(index, 1 | 2) {
+                assert_eq!(metadata["traceparent"], trace::TEST_TRACEPARENT);
+                assert_eq!(metadata["baggage"], "region=us");
+            } else {
+                for field in ["traceparent", "tracestate", "baggage"] {
+                    assert!(metadata.get(field).is_none());
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

@@ -323,6 +323,35 @@ impl fastmcp_core::OperatorSnapshotSource<fastmcp_core::OperatorExecutorCapacity
 }
 
 impl MemoryClient {
+    /// Binds an explicitly evaluated outbound policy to this owned memory
+    /// peer. The host supplies its local peer identity; discovery and caller
+    /// metadata never grant forwarding authority. Trace-bearing responses are
+    /// uncacheable, including if caching is subsequently enabled by the host.
+    pub fn set_outbound_trace_context(
+        &mut self,
+        decision: Option<fastmcp_core::OutboundTraceDecision>,
+    ) -> McpResult<()> {
+        crate::trace::validate_destination(
+            decision.as_ref(),
+            fastmcp_core::TraceTransport::Memory,
+            self.session.selected_era(),
+            None,
+        )?;
+        self.subscriptions.final_result_cache.set_trace_uncacheable(
+            decision
+                .as_ref()
+                .is_some_and(|decision| decision.requires_uncacheable_response()),
+        );
+        self.session.outbound_trace_context = decision;
+        Ok(())
+    }
+
+    /// Returns the retained policy revision, redacted decision and approved
+    /// fields for this peer. No raw caller metadata is retained here.
+    pub fn outbound_trace_context(&self) -> Option<&fastmcp_core::OutboundTraceDecision> {
+        self.session.outbound_trace_context.as_ref()
+    }
+
     /// Starts configuration for an owned bounded memory endpoint.
     #[must_use]
     pub fn builder(client_info: ClientInfo) -> MemoryClientBuilder {
@@ -765,7 +794,7 @@ impl MemoryClient {
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         method: &str,
-        parameters: Value,
+        mut parameters: Value,
         timeout_policy: RequestTimeoutPolicy,
         admission: ClientExtensionResultAdmission,
         mut before_send: F,
@@ -776,6 +805,10 @@ impl MemoryClient {
         self.ensure_open()?;
         checkpoint(cx, cancellation)?;
         before_send()?;
+        crate::trace::apply_parameters(
+            &mut parameters,
+            self.session.outbound_trace_context.as_ref(),
+        );
         let next_id = self
             .next_id
             .checked_add(1)
@@ -1440,6 +1473,12 @@ impl MemoryClient {
                     .or_insert_with(|| value.clone());
             }
         }
+        crate::trace::apply_metadata(
+            metadata
+                .as_object_mut()
+                .expect("typed metadata is an object"),
+            self.session.outbound_trace_context.as_ref(),
+        );
         object.insert("_meta".to_owned(), metadata);
         Ok(parameters)
     }
@@ -1816,6 +1855,102 @@ mod tests {
                 None => panic!("execution lost its result"),
             }
         }
+    }
+
+    #[test]
+    fn obs01_memory_wire_requires_policy_bounds_metadata_and_bypasses_cache() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx).await;
+            let cancellation = McpRequestCancellation::new();
+            let raw_trace = json!({"_meta": {
+                "traceparent": crate::trace::TEST_TRACEPARENT,
+                "tracestate": "untrusted=caller",
+                "baggage": "authorization=caller-secret",
+                "example.test/kept": "application-data"
+            }});
+            let mut execution = client
+                .execute_core(&cx, &cancellation, "tools/list", raw_trace.clone())
+                .await
+                .unwrap();
+            let wire = receive(&cx, &mut peer, "tools/list", Some(2)).await;
+            let metadata = &wire.params.unwrap()["_meta"];
+            for field in ["traceparent", "tracestate", "baggage"] {
+                assert!(
+                    metadata.get(field).is_none(),
+                    "raw {field} is not authority"
+                );
+            }
+            assert_eq!(metadata["example.test/kept"], "application-data");
+            peer.send_async(&cx, &response(2, tools())).await.unwrap();
+            result(&cx, &mut client, &mut execution).await;
+
+            let decision = crate::trace::test_decision(
+                fastmcp_core::TraceTransport::Memory,
+                "owned-memory-peer",
+            );
+            client.set_outbound_trace_context(Some(decision)).unwrap();
+            let mut execution = client
+                .execute_core(&cx, &cancellation, "tools/list", raw_trace)
+                .await
+                .unwrap();
+            let wire = receive(&cx, &mut peer, "tools/list", Some(3)).await;
+            let metadata = &wire.params.unwrap()["_meta"];
+            assert_eq!(metadata["traceparent"], crate::trace::TEST_TRACEPARENT);
+            assert_eq!(metadata["tracestate"], "vendor=kept");
+            assert_eq!(metadata["baggage"], "region=us");
+            assert_eq!(metadata["example.test/kept"], "application-data");
+            peer.send_async(&cx, &response(3, tools())).await.unwrap();
+            result(&cx, &mut client, &mut execution).await;
+
+            // Saturate the application carrier after the three required
+            // request fields. The policy remains installed, but telemetry
+            // must disappear instead of rejecting this valid request.
+            let metadata = (0..fastmcp_protocol::common_types::MAX_METADATA_ENTRIES - 3)
+                .map(|index| (format!("example.test/key{index}"), Value::Null))
+                .collect::<serde_json::Map<_, _>>();
+            let mut execution = client
+                .execute_core(&cx, &cancellation, "tools/list", json!({"_meta": metadata}))
+                .await
+                .unwrap();
+            let wire = receive(&cx, &mut peer, "tools/list", Some(4)).await;
+            let parameters = wire.params.unwrap();
+            let metadata = parameters["_meta"].as_object().unwrap();
+            assert_eq!(
+                metadata.len(),
+                fastmcp_protocol::common_types::MAX_METADATA_ENTRIES
+            );
+            assert!(!metadata.contains_key("traceparent"));
+            assert!(!metadata.contains_key("tracestate"));
+            assert!(!metadata.contains_key("baggage"));
+            peer.send_async(&cx, &response(4, tools())).await.unwrap();
+            result(&cx, &mut client, &mut execution).await;
+
+            client.set_final_result_cache_enabled(true);
+            for id in [5, 6] {
+                let mut cacheable = tools();
+                cacheable["ttlMs"] = json!(60_000);
+                peer.send_async(&cx, &response(id, cacheable))
+                    .await
+                    .unwrap();
+                client.list_tools(&cx, &cancellation, None).await.unwrap();
+                let wire = receive(&cx, &mut peer, "tools/list", Some(id)).await;
+                assert_eq!(wire.params.unwrap()["_meta"]["baggage"], "region=us");
+            }
+            assert_eq!(client.final_result_cache_stats().fills, 0);
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+
+            client.set_outbound_trace_context(None).unwrap();
+            let mut cacheable = tools();
+            cacheable["ttlMs"] = json!(60_000);
+            peer.send_async(&cx, &response(7, cacheable)).await.unwrap();
+            client.list_tools(&cx, &cancellation, None).await.unwrap();
+            let wire = receive(&cx, &mut peer, "tools/list", Some(7)).await;
+            assert!(wire.params.unwrap()["_meta"].get("traceparent").is_none());
+            client.list_tools(&cx, &cancellation, None).await.unwrap();
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            client.close(&cx).unwrap();
+        });
     }
 
     #[test]

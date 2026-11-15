@@ -796,6 +796,8 @@ pub struct ClientSession {
     selected_era: Option<ProtocolEra>,
     /// Immutable policy and configured endpoint bundle for this client.
     protocol_plan: ClientProtocolPlan,
+    /// Explicit host-approved propagation for this already negotiated peer.
+    pub(crate) outbound_trace_context: Option<fastmcp_core::OutboundTraceDecision>,
 }
 
 impl ClientSession {
@@ -850,6 +852,7 @@ impl ClientSession {
         Self {
             client_info,
             client_implementation: None,
+            outbound_trace_context: None,
             client_capabilities,
             server_info,
             server_capabilities,
@@ -991,7 +994,12 @@ impl ClientSession {
                 "Final extension notification requires retained server/discover state",
             )
         })?;
-        runtime.prepare_notification(discovery, extension_id, method, parameters)
+        let mut parameters = parameters;
+        crate::trace::apply_parameters(&mut parameters, None);
+        let mut parameters =
+            runtime.prepare_notification(discovery, extension_id, method, parameters)?;
+        crate::trace::apply_parameters(&mut parameters, self.outbound_trace_context.as_ref());
+        Ok(parameters)
     }
 
     pub(crate) fn set_mcp_apps_activation_receipt(

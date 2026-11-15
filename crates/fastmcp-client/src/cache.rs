@@ -329,6 +329,7 @@ impl From<&FinalCacheResultSet> for FinalCacheGenerationSet {
 #[derive(Debug)]
 pub struct FinalResultCache {
     enabled: bool,
+    trace_uncacheable: bool,
     capacity: usize,
     max_bytes: usize,
     retained_bytes: usize,
@@ -352,6 +353,7 @@ impl FinalResultCache {
     pub fn with_limits(capacity: usize, max_bytes: usize) -> Self {
         Self {
             enabled: true,
+            trace_uncacheable: false,
             capacity: capacity.clamp(1, MAX_FINAL_CACHE_CAPACITY),
             max_bytes: max_bytes.clamp(1, MAX_FINAL_CACHE_MAX_BYTES),
             retained_bytes: 0,
@@ -366,7 +368,7 @@ impl FinalResultCache {
     /// Returns whether lookups and fills are enabled.
     #[must_use]
     pub const fn is_enabled(&self) -> bool {
-        self.enabled
+        self.enabled && !self.trace_uncacheable
     }
 
     /// Enables or disables cache use without discarding retained entries.
@@ -380,6 +382,23 @@ impl FinalResultCache {
     pub fn set_enabled(&mut self, enabled: bool) {
         if self.enabled != enabled && self.advance_epoch() {
             self.enabled = enabled;
+        }
+    }
+
+    /// A trace-bearing request may change the peer's observable result. Do
+    /// not share its results across callers or re-enable fills through the
+    /// ordinary cache switch. A changed policy also fences old in-flight work.
+    pub(crate) fn set_trace_uncacheable(&mut self, uncacheable: bool) {
+        self.clear();
+        self.trace_uncacheable = uncacheable;
+    }
+
+    /// Reconciles a conservatively fenced mutable-connection escape with its
+    /// actual policy before lookup. Repeated unchanged observations preserve
+    /// ordinary untraced cache entries.
+    pub(crate) fn synchronize_trace_uncacheable(&mut self, uncacheable: bool) {
+        if self.trace_uncacheable != uncacheable {
+            self.set_trace_uncacheable(uncacheable);
         }
     }
 
@@ -445,7 +464,7 @@ impl FinalResultCache {
     /// drain queued invalidations; the subsequent ordinary lookup remains
     /// the authority for freshness and generation at the time of replay.
     pub(crate) fn has_fresh_entry_at(&self, key: &FinalCacheKey, now: Instant) -> bool {
-        self.enabled
+        self.is_enabled()
             && self.entries.get(key).is_some_and(|entry| {
                 Self::entry_miss_at(entry, self.begin_fetch(key.result_set()), now).is_none()
             })
@@ -472,7 +491,7 @@ impl FinalResultCache {
         key: &FinalCacheKey,
         now: Instant,
     ) -> FinalCachePageLookup {
-        if !self.enabled {
+        if !self.is_enabled() {
             self.stats.misses = self.stats.misses.saturating_add(1);
             return FinalCachePageLookup::Miss(FinalCacheMiss::Disabled);
         }
@@ -534,7 +553,7 @@ impl FinalResultCache {
         result: CoreResult,
         receipt: Instant,
     ) -> FinalCacheInsert {
-        if !self.enabled || captured_generation != self.begin_fetch(key.result_set()) {
+        if !self.is_enabled() || captured_generation != self.begin_fetch(key.result_set()) {
             return FinalCacheInsert::InvalidatedDuringFetch;
         }
 
