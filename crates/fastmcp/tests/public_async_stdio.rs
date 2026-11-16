@@ -658,6 +658,272 @@ printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$1"
             .unwrap()
     }
 
+    /// The response cannot arrive until the caller has observed a Pending poll.
+    /// The peer's finite loop also turns a synchronous-wait regression into a
+    /// bounded failure instead of hanging this single-worker test indefinitely.
+    struct DiscoveryRelease {
+        path: std::path::PathBuf,
+    }
+
+    impl DiscoveryRelease {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "fastmcp-facade-discovery-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::File::create_new(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &str {
+            self.path.to_str().unwrap()
+        }
+
+        fn release(&self) {
+            std::fs::write(&self.path, b"ready\n").unwrap();
+        }
+    }
+
+    impl Drop for DiscoveryRelease {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    const DEFERRED_METADATA_PEER: &str = r#"
+IFS= read -r request || exit 90
+case "$3" in
+    modern)
+        case "$request" in *'"method":"server/discover"'*) ;; *) exit 91 ;; esac
+        ;;
+    legacy)
+        case "$request" in *'"method":"initialize"'*) ;; *) exit 92 ;; esac
+        case "$request" in *'"protocolVersion":"2024-11-05"'*) ;; *) exit 92 ;; esac
+        ;;
+    *) exit 93 ;;
+esac
+id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\)[,}].*/\1/p')
+[ "$id" = 1 ] || exit 94
+turn=0
+while [ ! -s "$2" ]; do
+    turn=$((turn + 1))
+    [ "$turn" -le 3000 ] || exit 95
+    sleep 0.001
+done
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$1"
+if [ "$3" = legacy ]; then
+    IFS= read -r initialized || exit 96
+    case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 97 ;; esac
+    printf 'initialized\n' > "$2"
+fi
+while IFS= read -r unexpected; do exit 98; done
+"#;
+
+    async fn deferred_metadata_client(
+        cx: &Cx,
+        release: &DiscoveryRelease,
+        discovery: &JsonValue,
+    ) -> modern::Client {
+        modern::ClientBuilder::new()
+            .auto_initialize(true)
+            .max_retries(0)
+            .request_timeout_policy(
+                modern::RequestTimeoutPolicy::new(
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+            )
+            .connect_stdio_with_cx(
+                cx,
+                "sh",
+                &[
+                    "-c",
+                    DEFERRED_METADATA_PEER,
+                    "public-deferred-metadata-peer",
+                    &discovery.to_string(),
+                    release.path(),
+                    "modern",
+                ],
+            )
+            .await
+            .unwrap()
+    }
+
+    fn discovery_with_instructions() -> JsonValue {
+        let mut result: JsonValue = serde_json::from_str(&discovery()).unwrap();
+        result["instructions"] = json!("Use only the admitted peer's instructions.");
+        result
+    }
+
+    #[test]
+    fn modern_deferred_metadata_yields_and_resumes_the_same_handshake() {
+        run(|cx| async move {
+            let release = DiscoveryRelease::new();
+            let expected = discovery_with_instructions();
+            let mut client = deferred_metadata_client(&cx, &release, &expected).await;
+            let mut discovering =
+                Box::pin(require_send(client.server_discovery_with_cx(&cx)));
+            let yielded = std::future::poll_fn(|task_cx| {
+                Poll::Ready(discovering.as_mut().poll(task_cx).is_pending())
+            })
+            .await;
+            assert!(yielded, "deferred discovery must yield before the peer replies");
+            drop(discovering);
+
+            // A dropped metadata read preserves the one published discovery
+            // request. The peer accepts ID 1 once and never answers a duplicate.
+            release.release();
+            assert_eq!(
+                require_send(client.instructions_with_cx(&cx)).await.unwrap(),
+                expected["instructions"].as_str(),
+            );
+            require_send(client.ensure_initialized_with_cx(&cx))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    require_send(client.server_discovery_with_cx(&cx))
+                        .await
+                        .unwrap(),
+                )
+                .unwrap(),
+                expected,
+            );
+            assert_eq!(client.protocol_version(), modern::PROTOCOL_VERSION);
+            assert!(cx.checkpoint().is_ok());
+            client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn modern_deferred_metadata_cancellation_before_publication_preserves_connection() {
+        run(|cx| async move {
+            let release = DiscoveryRelease::new();
+            let expected = discovery_with_instructions();
+            let mut client = deferred_metadata_client(&cx, &release, &expected).await;
+
+            // A separate cancelled caller cannot borrow the healthy ambient
+            // runtime's authority or consume the connection's first request ID.
+            let cancelled = Cx::for_request();
+            cancelled.set_cancel_requested(true);
+            let error = require_send(client.ensure_initialized_with_cx(&cancelled))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, fastmcp_rust::McpErrorCode::RequestCancelled);
+            let error = require_send(client.server_discovery_with_cx(&cancelled))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, fastmcp_rust::McpErrorCode::RequestCancelled);
+            let error = require_send(client.instructions_with_cx(&cancelled))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, fastmcp_rust::McpErrorCode::RequestCancelled);
+
+            release.release();
+            assert_eq!(
+                require_send(client.instructions_with_cx(&cx)).await.unwrap(),
+                expected["instructions"].as_str(),
+            );
+            assert!(cx.checkpoint().is_ok());
+            client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn modern_deferred_metadata_never_exposes_an_unsupported_peers_instructions() {
+        run(|cx| async move {
+            let release = DiscoveryRelease::new();
+            let mut unsupported = discovery_with_instructions();
+            unsupported["supportedVersions"] = json!(["1999-01-01"]);
+            let mut client = deferred_metadata_client(&cx, &release, &unsupported).await;
+            release.release();
+
+            let rejected = require_send(client.instructions_with_cx(&cx))
+                .await
+                .expect_err("an incompatible peer cannot supply admitted instructions");
+            let retained = require_send(client.server_discovery_with_cx(&cx))
+                .await
+                .expect_err("metadata access cannot restart a rejected handshake");
+            assert_eq!(retained.code, rejected.code);
+            assert_eq!(retained.message, rejected.message);
+            assert!(cx.checkpoint().is_ok());
+            client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_deferred_metadata_and_close_stay_on_the_caller_runtime() {
+        run(|cx| async move {
+            let release = DiscoveryRelease::new();
+            let response = json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {"name": "deferred-legacy-peer", "version": "1.0"},
+                "instructions": "Exact legacy instructions.",
+            });
+            let mut client = fastmcp_rust::legacy_2024::ClientBuilder::new()
+                .auto_initialize(true)
+                .max_retries(0)
+                .request_timeout_policy(
+                    modern::RequestTimeoutPolicy::new(
+                        Duration::from_secs(5),
+                        Duration::from_secs(5),
+                    )
+                    .unwrap(),
+                )
+                .connect_stdio_with_cx(
+                    &cx,
+                    "sh",
+                    &[
+                        "-c",
+                        DEFERRED_METADATA_PEER,
+                        "public-deferred-legacy-peer",
+                        &response.to_string(),
+                        release.path(),
+                        "legacy",
+                    ],
+                )
+                .await
+                .unwrap();
+            assert!(!client.is_initialized());
+            let mut initializing =
+                Box::pin(require_send(client.ensure_initialized_with_cx(&cx)));
+            let yielded = std::future::poll_fn(|task_cx| {
+                Poll::Ready(initializing.as_mut().poll(task_cx).is_pending())
+            })
+            .await;
+            assert!(yielded, "deferred legacy initialization must yield");
+            drop(initializing);
+            release.release();
+
+            assert_eq!(
+                require_send(client.instructions_with_cx(&cx)).await.unwrap(),
+                Some("Exact legacy instructions."),
+            );
+            assert!(client.is_initialized());
+            assert_eq!(client.protocol_version(), "2024-11-05");
+            assert_eq!(client.server_info().name, "deferred-legacy-peer");
+            require_send(client.ensure_initialized_with_cx(&cx))
+                .await
+                .unwrap();
+            // Observe the peer accepting the exact lifecycle notification;
+            // a child exit code during close is not that acknowledgement.
+            while std::fs::read(&release.path).unwrap() != b"initialized\n" {
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            require_send(client.close_with_cx(&cx)).await.unwrap();
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
     async fn collect(
         client: &mut modern::Client,
         cx: &Cx,

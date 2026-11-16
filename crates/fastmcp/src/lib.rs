@@ -5320,6 +5320,47 @@ pub mod modern {
             MODERN_PROTOCOL_VERSION
         }
 
+        /// Completes deferred final discovery on the caller's Unix runtime.
+        ///
+        /// Dropping the future retains an already published handshake and its
+        /// original deadline for the next operation. Caller cancellation before
+        /// publication leaves the connection untouched; cancellation after
+        /// publication terminates that connection. Pipe writes and subprocess
+        /// operations retain their bounded synchronous behavior.
+        #[cfg(unix)]
+        pub async fn ensure_initialized_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+            self.inner.ensure_initialized_with_cx(cx).await
+        }
+
+        /// Returns final discovery metadata without blocking the caller's Unix
+        /// runtime while a deferred handshake waits for its peer.
+        ///
+        /// The returned value borrows the retained discovery result; this does
+        /// not send another discovery request after initialization completes.
+        #[cfg(unix)]
+        pub async fn server_discovery_with_cx(
+            &mut self,
+            cx: &Cx,
+        ) -> McpResult<&ServerDiscoverResult> {
+            self.ensure_initialized_with_cx(cx).await?;
+            self.inner.server_discovery().ok_or_else(|| {
+                McpError::internal_error(
+                    "ModernOnly client completed initialization without server/discover",
+                )
+            })
+        }
+
+        /// Returns server instructions after caller-owned final discovery.
+        ///
+        /// This shares the yielding initialization, cancellation, and retained
+        /// handshake behavior of [Self::ensure_initialized_with_cx]. A missing
+        /// value means the successfully admitted peer omitted instructions.
+        #[cfg(unix)]
+        pub async fn instructions_with_cx(&mut self, cx: &Cx) -> McpResult<Option<&str>> {
+            self.ensure_initialized_with_cx(cx).await?;
+            Ok(self.inner.instructions())
+        }
+
         /// Returns the exact final discovery result that admitted this client.
         ///
         /// When construction deferred discovery, this performs that required
@@ -10116,6 +10157,18 @@ pub mod legacy_2024 {
             self.inner.ensure_initialized()
         }
 
+        /// Completes deferred exact-2024 initialization on the caller's Unix
+        /// runtime, including the required initialized notification.
+        ///
+        /// Dropping the future retains the published handshake and its original
+        /// deadline. Caller cancellation before publication leaves the
+        /// connection untouched; cancellation after publication terminates it.
+        /// Pipe writes and subprocess operations remain bounded and synchronous.
+        #[cfg(unix)]
+        pub async fn ensure_initialized_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+            self.inner.ensure_initialized_with_cx(cx).await
+        }
+
         /// Returns whether the exact legacy initialization lifecycle completed.
         #[must_use]
         pub fn is_initialized(&self) -> bool {
@@ -10151,6 +10204,17 @@ pub mod legacy_2024 {
         #[must_use]
         pub fn instructions(&self) -> Option<&str> {
             self.inner.instructions()
+        }
+
+        /// Completes deferred initialization on the caller's Unix runtime and
+        /// returns the admitted exact-2024 peer's instructions, when present.
+        ///
+        /// Cancellation and dropped-future behavior match
+        /// [Self::ensure_initialized_with_cx]; this never selects a modern era.
+        #[cfg(unix)]
+        pub async fn instructions_with_cx(&mut self, cx: &Cx) -> McpResult<Option<&str>> {
+            self.ensure_initialized_with_cx(cx).await?;
+            Ok(self.inner.instructions())
         }
 
         /// Sends `notifications/roots/list_changed` on this exact-2024 stdio
@@ -10817,6 +10881,13 @@ pub mod legacy_2024 {
         /// Closes the exact legacy client and its owned subprocess resources.
         pub fn close(&mut self) -> McpResult<()> {
             self.inner.close()
+        }
+
+        /// Closes the exact legacy client while yielding during bounded
+        /// subprocess and callback cleanup on the caller's runtime.
+        /// Caller cancellation does not abandon owned subprocess resources.
+        pub async fn close_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+            self.inner.close_with_cx(cx).await
         }
     }
 
