@@ -1,23 +1,30 @@
 //! Explicit, bounded recovery of an owned modern stdio subprocess.
 //!
-//! Recovery replaces a settled connection and repeats discovery. It does not
-//! repeat an RPC, restore a subscription, or transfer a request handle between
-//! generations. Applications must reconcile effects before choosing to reissue.
+//! Recovery replaces a settled connection and repeats discovery. Explicitly
+//! configured catalog subscriptions are re-established with fresh IDs and a
+//! visible observation gap. It never repeats an application RPC or transfers a
+//! request handle between generations. Applications must reconcile effects
+//! before choosing to reissue.
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
+use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::runtime::{CallerContextFuture, with_caller_context};
 use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation, McpResult};
+use fastmcp_protocol::RequestId;
 use serde::{Deserialize, Serialize};
 
-use crate::{Client, ClientBuilder, is_cleanup_unverified};
+use crate::{
+    Client, ClientBuilder, StdioSubscriptionEvent, SubscriptionListenRequest,
+    SubscriptionTimeoutPolicy, is_cleanup_unverified,
+};
 
 const MAX_ATTEMPTS: u32 = 8;
 const MAX_WINDOW: Duration = Duration::from_secs(300);
@@ -211,14 +218,29 @@ pub(crate) struct StdioSendDisconnect {
     pub(crate) kind: StdioDisconnectKind,
 }
 
-/// Emitted only after a new subprocess completes fresh modern discovery.
+/// A configured listener was acknowledged on a replacement connection.
+///
+/// Events between these two IDs may have been lost. Applications must refresh
+/// the affected catalogs/resources; this is not a replay or continuity receipt.
+/// The old ID remains terminal. The replacement's acknowledgement is still the
+/// first event returned by [`SupervisedStdioClient::next_subscription_event_with_cx`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StdioSubscriptionRecovery {
+    pub previous_subscription_id: RequestId,
+    pub subscription_id: RequestId,
+}
+
+/// Emitted only after a new subprocess completes fresh modern discovery and
+/// any configured catalog listener receives a valid acknowledgement.
 /// All handles and subscriptions from `previous_generation` remain terminal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StdioRecovery {
     pub previous_generation: u64,
     pub generation: u64,
     pub process_exit: StdioProcessExit,
     pub attempts: u32,
+    /// A fresh listener, with an explicit gap requiring application resync.
+    pub catalog_subscription: Option<StdioSubscriptionRecovery>,
 }
 
 /// A bounded supervision failure. No variant promises that an RPC had no effect.
@@ -227,6 +249,8 @@ pub enum StdioRestartError {
     Configuration(McpError),
     Connection(McpError),
     Cleanup(McpError),
+    /// A configured subscription could not be opened or restored.
+    Subscription(McpError),
     /// Caller or request-local cancellation won; the same owner retains limits.
     Cancelled,
     /// No admissible natural exit was observed at the terminal I/O boundary.
@@ -249,6 +273,9 @@ impl fmt::Display for StdioRestartError {
             ),
             Self::Connection(error) => write!(formatter, "Stdio replacement failed: {error}"),
             Self::Cleanup(error) => write!(formatter, "Stdio cleanup did not settle: {error}"),
+            Self::Subscription(error) => {
+                write!(formatter, "Supervised stdio subscription failed: {error}")
+            }
             Self::Cancelled => formatter.write_str("Stdio recovery cancelled"),
             Self::NotRestartable => {
                 formatter.write_str("Stdio failure is not an admissible subprocess exit")
@@ -273,6 +300,7 @@ enum RecoveryPhase {
     Settling,
     Waiting { until: Instant },
     Initializing,
+    Restoring,
 }
 
 #[derive(Debug)]
@@ -282,6 +310,14 @@ struct RecoveryIncident {
     deadline: Instant,
     attempts: u32,
     phase: RecoveryPhase,
+    acknowledgement_deadline: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct ConfiguredCatalogSubscription {
+    request: SubscriptionListenRequest,
+    timeout_policy: SubscriptionTimeoutPolicy,
+    request_id: RequestId,
 }
 
 /// A caller-owned Unix subprocess connection with explicit crash recovery.
@@ -296,7 +332,10 @@ struct RecoveryIncident {
 /// construction. This freezes configuration, not executable file contents.
 /// The owner retains its replacement client and counters if a recovery future
 /// is cancelled or dropped. Explicitly close it to report cleanup failures.
-/// Legacy/Auto selection and automatic subscription recovery are not provided.
+/// [`Self::open_subscriptions_listener`] opts one catalog/resource listener into
+/// recovery. Recovery acknowledges a fresh listener before publishing the new
+/// generation and reports the observation gap. Legacy/Auto selection and Tasks
+/// listener recovery are not provided.
 ///
 /// ```no_run
 /// use fastmcp_client::{
@@ -337,6 +376,10 @@ pub struct SupervisedStdioClient {
     total_attempts: u64,
     jitter_seed: u64,
     jitter_counter: u64,
+    /// Every replacement, including its discovery, starts above IDs allocated
+    /// by any previous attempt. Failed and dropped attempts consume IDs too.
+    request_id_floor: u64,
+    catalog_subscription: Option<ConfiguredCatalogSubscription>,
     recovery: Option<RecoveryIncident>,
     circuit: Option<StdioRestartError>,
     closed: bool,
@@ -397,6 +440,8 @@ impl SupervisedStdioClient {
                 total_attempts: 0,
                 jitter_seed: u64::from_le_bytes(seed),
                 jitter_counter: 0,
+                request_id_floor: 1,
+                catalog_subscription: None,
                 recovery: None,
                 circuit: None,
                 closed: false,
@@ -419,6 +464,7 @@ impl SupervisedStdioClient {
                 return Err(owner.fail_and_close(&caller, error).await);
             }
             owner.client.enable_stdio_supervision(1);
+            owner.retain_request_id_floor();
             Ok(owner)
         })
         .await
@@ -457,6 +503,176 @@ impl SupervisedStdioClient {
         Ok(&mut self.client)
     }
 
+    /// Opens one catalog/resource listener and opts it into process recovery.
+    ///
+    /// The request and local resource relationships are bounded by the ordinary
+    /// subscription admission rules. This commits the initial listen; consume
+    /// its acknowledgement through [`Self::next_subscription_event_with_cx`].
+    /// Every replacement uses the same requested filter and timeout policy,
+    /// but negotiates a new accepted subset and reports a gap in [`StdioRecovery`].
+    /// Tasks listeners and application requests are never replayed.
+    pub async fn open_subscriptions_listener(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        notifications: impl Into<SubscriptionListenRequest>,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> Result<RequestId, StdioRestartError> {
+        let request = notifications.into();
+        request
+            .validate()
+            .map_err(StdioRestartError::Configuration)?;
+        timeout_policy
+            .validate()
+            .map_err(StdioRestartError::Configuration)?;
+        CallerContextFuture::new(cx, async move {
+            self.client_mut()?;
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                return Err(StdioRestartError::Cancelled);
+            }
+            self.client
+                .open_subscriptions_listener_with_timeout_policy(request.clone(), timeout_policy)
+                .map_err(StdioRestartError::Subscription)?;
+            let request_id = self
+                .client
+                .live_catalog_subscription
+                .as_ref()
+                .expect("a successful listen installs its owner")
+                .execution
+                .request_id()
+                .clone();
+            self.catalog_subscription = Some(ConfiguredCatalogSubscription {
+                request,
+                timeout_policy,
+                request_id: request_id.clone(),
+            });
+            self.retain_request_id_floor();
+            Ok(request_id)
+        })
+        .await
+    }
+
+    /// Observes the configured listener without introducing another reader.
+    ///
+    /// Dropping this wait preserves its listener. Explicit cancellation or a
+    /// validated peer terminal also removes the recovery configuration, so a
+    /// later process restart cannot resurrect it. A naturally observed process
+    /// exit preserves the configuration for an explicit [`Self::recover`].
+    /// Use this adapter to observe the configured listener; a terminal consumed
+    /// directly through [`Self::client_mut`] is conservatively not restored.
+    pub async fn next_subscription_event_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> Result<StdioSubscriptionEvent, StdioRestartError> {
+        CallerContextFuture::new(cx, async move {
+            self.client_mut()?;
+            let owns_listener = self
+                .catalog_subscription
+                .as_ref()
+                .is_some_and(|configured| {
+                    self.client
+                        .live_catalog_subscription
+                        .as_ref()
+                        .is_some_and(|live| {
+                            configured
+                                .request_id
+                                .correlates_with(live.execution.request_id())
+                        })
+                });
+            if !owns_listener {
+                self.catalog_subscription = None;
+                return Err(StdioRestartError::Subscription(McpError::invalid_request(
+                    "No supervised catalog subscription is active",
+                )));
+            }
+            let result = loop {
+                match self
+                    .client
+                    .try_next_subscription_event_preserving_connection_loss(cx, cancellation, true)
+                {
+                    Ok(Some(event)) => break Ok(event),
+                    Ok(None) => asupersync::runtime::yield_now().await,
+                    Err(error) => break Err(error),
+                }
+            };
+            if cancellation.is_cancel_requested()
+                || cx.checkpoint().is_err()
+                || matches!(result, Ok(StdioSubscriptionEvent::Terminal))
+            {
+                self.catalog_subscription = None;
+            } else if result.is_err() {
+                let naturally_exited = matches!(
+                    self.client.stdio_restart_observation,
+                    Some(StdioRestartObservation::Exited { generation, .. })
+                        if generation == self.generation
+                );
+                if naturally_exited {
+                    self.retain_restartable_catalog_subscription();
+                } else {
+                    self.catalog_subscription = None;
+                }
+            }
+            result.map_err(StdioRestartError::Subscription)
+        })
+        .await
+    }
+
+    /// Cancels only the configured listener and permanently removes its opt-in.
+    ///
+    /// A failed wire cancellation still removes the recovery configuration;
+    /// its underlying listener/error remains owned by the client for cleanup.
+    pub fn cancel_live_catalog_subscription(&mut self, cx: &Cx) -> Result<(), StdioRestartError> {
+        self.client_mut()?;
+        let Some(configured) = self.catalog_subscription.take() else {
+            return Ok(());
+        };
+        let Some(live) = &self.client.live_catalog_subscription else {
+            return Ok(());
+        };
+        if !configured
+            .request_id
+            .correlates_with(live.execution.request_id())
+        {
+            return Err(StdioRestartError::Subscription(McpError::invalid_request(
+                "The live catalog subscription is not owned by the supervisor",
+            )));
+        }
+        self.client
+            .cancel_live_catalog_subscription(cx)
+            .map_err(StdioRestartError::Subscription)
+    }
+
+    fn retain_request_id_floor(&mut self) {
+        self.request_id_floor = self
+            .request_id_floor
+            .max(self.client.peek_next_request_id());
+    }
+
+    fn retain_restartable_catalog_subscription(&mut self) {
+        let restartable = self
+            .catalog_subscription
+            .as_ref()
+            .is_some_and(|configured| {
+                self.client
+                    .live_catalog_subscription
+                    .as_ref()
+                    .is_some_and(|live| {
+                        configured
+                            .request_id
+                            .correlates_with(live.execution.request_id())
+                            && live.cancellation_failure.is_none()
+                            && matches!(
+                                live.execution.execution.terminal_reason(),
+                                None | Some(crate::ExecutionTerminalReason::ConnectionLost)
+                            )
+                    })
+            });
+        if !restartable {
+            self.catalog_subscription = None;
+        }
+    }
+
     /// Recovers only a child exit proven before cleanup began. Protocol errors,
     /// application errors, cancellation, timeouts, explicit shutdown and EOF
     /// from a still-live process cannot authorize a replacement.
@@ -489,6 +705,8 @@ impl SupervisedStdioClient {
             else {
                 return Err(StdioRestartError::NotRestartable);
             };
+            self.retain_restartable_catalog_subscription();
+            self.retain_request_id_floor();
             let now = Instant::now();
             while self
                 .attempts
@@ -505,9 +723,11 @@ impl SupervisedStdioClient {
                 deadline: bounded_deadline(cx, self.policy.window),
                 attempts: 0,
                 phase: RecoveryPhase::Settling,
+                acknowledgement_deadline: None,
             });
         }
         loop {
+            self.retain_request_id_floor();
             let phase = self
                 .recovery
                 .as_ref()
@@ -530,12 +750,14 @@ impl SupervisedStdioClient {
                 }
                 self.schedule_backoff();
             }
-            if matches!(phase, RecoveryPhase::Initializing)
-                && (cancellation.is_cancel_requested() || cx.checkpoint().is_err())
+            if matches!(
+                phase,
+                RecoveryPhase::Initializing | RecoveryPhase::Restoring
+            ) && (cancellation.is_cancel_requested() || cx.checkpoint().is_err())
             {
                 // Explicit cancellation settles a retained provisional child.
                 // Dropping the future instead leaves that child owned so a
-                // later call can resume its single in-flight discovery.
+                // later call can resume its single in-flight discovery/listen.
                 if let Err(error) = self.client.close_with_cx(cx).await {
                     let error = StdioRestartError::Cleanup(error);
                     self.circuit = Some(error.clone());
@@ -596,6 +818,9 @@ impl SupervisedStdioClient {
                             // first await. Cancellation/drop cannot refund spawn.
                             client.stdio_restart_observation =
                                 Some(StdioRestartObservation::Provisional);
+                            client
+                                .next_id
+                                .fetch_max(self.request_id_floor, Ordering::SeqCst);
                             self.client = client;
                             self.recovery
                                 .as_mut()
@@ -651,21 +876,42 @@ impl SupervisedStdioClient {
                                     .fail_and_close(&caller, StdioRestartError::WindowExpired)
                                     .await);
                             }
-                            let Some(generation) = self.generation.checked_add(1) else {
-                                return Err(self
-                                    .fail_and_close(&caller, StdioRestartError::AttemptsExhausted)
-                                    .await);
-                            };
-                            self.generation = generation;
-                            self.client.enable_stdio_supervision(generation);
-                            let incident =
-                                self.recovery.take().expect("completed recovery incident");
-                            return Ok(StdioRecovery {
-                                previous_generation: incident.previous_generation,
-                                generation,
-                                process_exit: incident.exit,
-                                attempts: incident.attempts,
-                            });
+                            if let Some(configured) = &self.catalog_subscription {
+                                if let Err(error) =
+                                    self.client.open_subscriptions_listener_with_timeout_policy(
+                                        configured.request.clone(),
+                                        configured.timeout_policy,
+                                    )
+                                {
+                                    return Err(self
+                                        .fail_and_close(
+                                            &caller,
+                                            StdioRestartError::Subscription(error),
+                                        )
+                                        .await);
+                                }
+                                let acknowledgement_wait = self
+                                    .client
+                                    .timeout_policy
+                                    .idle_timeout()
+                                    .min(self.client.timeout_policy.absolute_timeout());
+                                let incident = self
+                                    .recovery
+                                    .as_mut()
+                                    .expect("restoring recovery incident retained");
+                                incident.acknowledgement_deadline = Some(
+                                    Instant::now()
+                                        .checked_add(acknowledgement_wait)
+                                        .unwrap_or(incident.deadline)
+                                        .min(incident.deadline),
+                                );
+                                // Publication follows acknowledgement, not just
+                                // the write. This phase and the client retain
+                                // the one sent request across dropped futures.
+                                incident.phase = RecoveryPhase::Restoring;
+                                continue;
+                            }
+                            return self.publish_recovery(&caller, cancellation, None).await;
                         }
                         Err(error) => {
                             let natural_exit = match self.client.stdio_restart_observation {
@@ -706,8 +952,140 @@ impl SupervisedStdioClient {
                         }
                     }
                 }
+                RecoveryPhase::Restoring => {
+                    if incident
+                        .acknowledgement_deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        return Err(self
+                            .fail_and_close(
+                                &caller,
+                                StdioRestartError::Subscription(McpError::internal_error(
+                                    "Supervised subscription acknowledgement deadline elapsed",
+                                )),
+                            )
+                            .await);
+                    }
+                    let event = self
+                        .client
+                        .try_next_subscription_event(&caller, cancellation);
+                    if cancellation.is_cancel_requested() || caller.checkpoint().is_err() {
+                        // The top-of-loop cancellation path settles the child
+                        // before returning and keeps the original attempt/window.
+                        continue;
+                    }
+                    match event {
+                        Ok(Some(StdioSubscriptionEvent::Acknowledged(_))) => {
+                            let live = self
+                                .client
+                                .live_catalog_subscription
+                                .as_mut()
+                                .expect("an acknowledged listener retains its owner");
+                            let subscription_id = live.execution.request_id().clone();
+                            // Recovery privately checked this acknowledgement;
+                            // its first public delivery still belongs to the
+                            // caller's event loop after publication.
+                            live.acknowledgement_delivered = false;
+                            let previous_subscription_id = self
+                                .catalog_subscription
+                                .as_ref()
+                                .expect("restoration retains its configuration")
+                                .request_id
+                                .clone();
+                            return self
+                                .publish_recovery(
+                                    &caller,
+                                    cancellation,
+                                    Some(StdioSubscriptionRecovery {
+                                        previous_subscription_id,
+                                        subscription_id,
+                                    }),
+                                )
+                                .await;
+                        }
+                        Ok(None) => asupersync::runtime::yield_now().await,
+                        Ok(Some(_)) => {
+                            return Err(self
+                                .fail_and_close(
+                                    &caller,
+                                    StdioRestartError::Subscription(McpError::invalid_request(
+                                        "Restored subscription ended before acknowledgement",
+                                    )),
+                                )
+                                .await);
+                        }
+                        Err(error) => {
+                            return Err(self
+                                .fail_and_close(&caller, StdioRestartError::Subscription(error))
+                                .await);
+                        }
+                    }
+                }
             }
         }
+    }
+
+    async fn publish_recovery(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        catalog_subscription: Option<StdioSubscriptionRecovery>,
+    ) -> Result<StdioRecovery, StdioRestartError> {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            if let Err(error) = self.client.close_with_cx(cx).await {
+                let error = StdioRestartError::Cleanup(error);
+                self.circuit = Some(error.clone());
+                return Err(error);
+            }
+            if !self.cleanly_settled() {
+                return Err(self
+                    .fail_and_close(
+                        cx,
+                        StdioRestartError::Cleanup(McpError::internal_error(
+                            "Cancelled replacement is not settled",
+                        )),
+                    )
+                    .await);
+            }
+            self.schedule_backoff();
+            return Err(StdioRestartError::Cancelled);
+        }
+        let incident = self
+            .recovery
+            .as_ref()
+            .expect("publication retains recovery incident");
+        if Instant::now() >= incident.deadline
+            || incident
+                .acknowledgement_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(self
+                .fail_and_close(cx, StdioRestartError::WindowExpired)
+                .await);
+        }
+        let Some(generation) = self.generation.checked_add(1) else {
+            return Err(self
+                .fail_and_close(cx, StdioRestartError::AttemptsExhausted)
+                .await);
+        };
+        if let Some(restored) = &catalog_subscription {
+            let configured = self
+                .catalog_subscription
+                .as_mut()
+                .expect("restoration retains its configuration");
+            configured.request_id = restored.subscription_id.clone();
+        }
+        self.generation = generation;
+        self.client.enable_stdio_supervision(generation);
+        self.retain_request_id_floor();
+        let incident = self.recovery.take().expect("completed recovery incident");
+        Ok(StdioRecovery {
+            previous_generation: incident.previous_generation,
+            generation,
+            process_exit: incident.exit,
+            attempts: incident.attempts,
+            catalog_subscription,
+        })
     }
 
     fn cleanly_settled(&self) -> bool {
@@ -718,6 +1096,7 @@ impl SupervisedStdioClient {
     }
 
     fn schedule_backoff(&mut self) {
+        self.retain_request_id_floor();
         let attempts = self
             .recovery
             .as_ref()
@@ -725,10 +1104,9 @@ impl SupervisedStdioClient {
             .attempts;
         let delay = jittered_delay(self.policy, attempts, self.jitter_seed, self.jitter_counter);
         self.jitter_counter = self.jitter_counter.wrapping_add(1);
-        self.recovery
-            .as_mut()
-            .expect("recovery incident retained")
-            .phase = RecoveryPhase::Waiting {
+        let incident = self.recovery.as_mut().expect("recovery incident retained");
+        incident.acknowledgement_deadline = None;
+        incident.phase = RecoveryPhase::Waiting {
             until: Instant::now() + delay,
         };
     }
@@ -756,6 +1134,7 @@ impl SupervisedStdioClient {
     /// Calling again retries unfinished cleanup; it can never spawn a process.
     pub async fn close_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
         self.closed = true;
+        self.catalog_subscription = None;
         CallerContextFuture::new(cx, self.client.close_with_cx(cx)).await
     }
 }
@@ -856,7 +1235,7 @@ mod tests {
     };
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -867,8 +1246,10 @@ mod tests {
 printf '%s\n' start >> "$SUPERVISION_LOG"
 IFS= read -r discovery || exit 81
 case "$discovery" in *'"method":"server/discover"'*) ;; *) exit 82 ;; esac
-case "$discovery" in *'"id":1'*) ;; *) exit 83 ;; esac
+discovery_id=$(printf '%s\n' "$discovery" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+case "$discovery_id" in ''|*[!0-9]*) exit 83 ;; esac
 printf '%s\n' discovery >> "$SUPERVISION_LOG"
+printf 'discovery-id:%s\n' "$discovery_id" >> "$SUPERVISION_LOG"
 first_process=no
 if [ ! -f "$SUPERVISION_FIRST" ]; then first_process=yes; fi
 if [ "$first_process" = no ]; then
@@ -886,7 +1267,7 @@ if [ "$first_process" = no ]; then
             exit 24
             ;;
         recover-discovery-rejected)
-            printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"unsupported"}}'
+            printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"unsupported"}}\n' "$discovery_id"
             exit 24
             ;;
     esac
@@ -895,7 +1276,7 @@ if [ "$SUPERVISION_MODE" = gated ] && [ -f "$SUPERVISION_FIRST" ]; then
     while [ ! -f "$SUPERVISION_GATE" ]; do sleep 0.01; done
 fi
 : > "$SUPERVISION_FIRST"
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"restart-peer","version":"1"}}}}'
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"restart-peer","version":"1"}}}}\n' "$discovery_id"
 if [ "$SUPERVISION_MODE" = idle-exit ] && [ "$first_process" = yes ]; then exit 23; fi
 if [ "$SUPERVISION_MODE" = live-stdin ]; then
     exec 0<&-
@@ -903,10 +1284,39 @@ if [ "$SUPERVISION_MODE" = live-stdin ]; then
     exec sleep 30
 fi
 while IFS= read -r request; do
+    request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
     case "$request" in
         *'"method":"tools/list"'*)
             printf '%s\n' list >> "$SUPERVISION_LOG"
-            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[]}}'
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[]}}\n' "$request_id"
+            ;;
+        *'"method":"subscriptions/listen"'*)
+            printf '%s\n' listen >> "$SUPERVISION_LOG"
+            printf 'listen-id:%s\n' "$request_id" >> "$SUPERVISION_LOG"
+            accepted='{"toolsListChanged":true}'
+            if [ "$first_process" = no ]; then
+                case "$SUPERVISION_MODE" in
+                    restore-rejected)
+                        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"unsupported"}}\n' "$request_id"
+                        continue
+                        ;;
+                    restore-broadens) accepted='{"toolsListChanged":true,"promptsListChanged":true}' ;;
+                    restore-silent) continue ;;
+                    restore-gated)
+                        printf '%s\n' restore-wait >> "$SUPERVISION_LOG"
+                        while [ ! -f "$SUPERVISION_GATE" ]; do sleep 0.01; done
+                        ;;
+                esac
+            fi
+            printf '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":%s},"notifications":%s}}\n' "$request_id" "$accepted"
+            if [ "$SUPERVISION_MODE" = subscription-terminal ]; then
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":%s}}}\n' "$request_id" "$request_id"
+            else
+                printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":%s}}}\n' "$request_id"
+            fi
+            ;;
+        *'"method":"notifications/cancelled"'*)
+            printf '%s\n' cancel >> "$SUPERVISION_LOG"
             ;;
         *'"method":"tools/call"'*)
             case "$SUPERVISION_MODE" in
@@ -921,7 +1331,7 @@ while IFS= read -r request; do
                     exit 0
                     ;;
                 application)
-                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Rejected by application"}}'
+                    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"Rejected by application"}}\n' "$request_id"
                     ;;
                 *)
                     printf '%s\n' effect >> "$SUPERVISION_LOG"
@@ -968,6 +1378,16 @@ done
                 .lines()
                 .filter(|line| *line == event)
                 .count()
+        }
+
+        fn ids(&self, kind: &str) -> Vec<i64> {
+            let prefix = format!("{kind}-id:");
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.strip_prefix(&prefix))
+                .map(|id| id.parse().unwrap())
+                .collect()
         }
 
         fn builder(&self, mode: &str) -> ClientBuilder {
@@ -1056,6 +1476,502 @@ done
             .drive_multiplexed_stdio(cx)
             .unwrap_err();
         (executor, request, error)
+    }
+
+    fn catalog_filter() -> fastmcp_protocol::SubscriptionFilter {
+        fastmcp_protocol::SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..Default::default()
+        }
+    }
+
+    async fn open_catalog(owner: &mut SupervisedStdioClient, cx: &Cx) -> RequestId {
+        let cancellation = McpRequestCancellation::new();
+        let id = owner
+            .open_subscriptions_listener(
+                cx,
+                &cancellation,
+                catalog_filter(),
+                SubscriptionTimeoutPolicy::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            owner.next_subscription_event_with_cx(cx, &cancellation).await.unwrap(),
+            StdioSubscriptionEvent::Acknowledged(filter) if filter == catalog_filter(),
+        ));
+        assert!(matches!(
+            owner
+                .next_subscription_event_with_cx(cx, &cancellation)
+                .await
+                .unwrap(),
+            StdioSubscriptionEvent::Notification(crate::ServerNotification::ToolsListChanged(_)),
+        ));
+        id
+    }
+
+    async fn drop_recovery_after_listen(
+        owner: &mut SupervisedStdioClient,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        fixture: &Fixture,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut recovery = Box::pin(owner.recover(cx, cancellation));
+        loop {
+            poll_fn(|task_cx| {
+                assert!(recovery.as_mut().poll(task_cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            if fixture.count("listen") == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement listen was never committed"
+            );
+            asupersync::time::sleep(cx.now(), Duration::from_millis(2)).await;
+        }
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_recovery_reports_gap_and_fresh_ids_without_rpc_replay() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let mut owner = fixture.connect(&cx, "effect", quick_policy(3)).await;
+                let old_subscription = open_catalog(&mut owner, &cx).await;
+                let (old_executor, mut old_request, error) = crash(&mut owner, &cx).await;
+                let interrupted = StdioInterruptedRequest::from_error(&error).unwrap();
+                let old_request_id = old_request.request_id().clone();
+                assert!(matches!(
+                    owner
+                        .next_subscription_event_with_cx(&cx, &McpRequestCancellation::new())
+                        .await,
+                    Err(StdioRestartError::Subscription(_)),
+                ));
+                assert!(
+                    owner.client.live_catalog_subscription.is_some(),
+                    "the supervised error observation retains the interrupted listener owner"
+                );
+                let recovery = owner
+                    .recover(&cx, &McpRequestCancellation::new())
+                    .await
+                    .unwrap();
+                assert_eq!((recovery.previous_generation, recovery.generation), (1, 2));
+                let restored = recovery.catalog_subscription.unwrap();
+                assert_eq!(restored.previous_subscription_id, old_subscription);
+                assert_ne!(restored.subscription_id, old_subscription);
+                assert_ne!(restored.subscription_id, old_request_id);
+                let discoveries = fixture.ids("discovery");
+                let listeners = fixture.ids("listen");
+                assert_eq!(discoveries.len(), 2);
+                assert_eq!(listeners.len(), 2);
+                assert!(discoveries[1] > listeners[0]);
+                assert!(listeners[1] > discoveries[1]);
+                assert_eq!(restored.subscription_id, RequestId::Number(listeners[1]));
+                assert_eq!(fixture.count("effect"), 1);
+                let old_error = old_executor
+                    .try_take_response(&mut old_request)
+                    .unwrap_err();
+                assert_eq!(
+                    StdioInterruptedRequest::from_error(&old_error),
+                    Some(interrupted)
+                );
+                let cancellation = McpRequestCancellation::new();
+                assert!(matches!(
+                    owner.next_subscription_event_with_cx(&cx, &cancellation).await.unwrap(),
+                    StdioSubscriptionEvent::Acknowledged(filter) if filter == catalog_filter(),
+                ));
+                assert!(matches!(
+                    owner
+                        .next_subscription_event_with_cx(&cx, &cancellation)
+                        .await
+                        .unwrap(),
+                    StdioSubscriptionEvent::Notification(
+                        crate::ServerNotification::ToolsListChanged(_)
+                    ),
+                ));
+                owner
+                    .client_mut()
+                    .unwrap()
+                    .request_core_with_cx(&cx, &cancellation, "tools/list", json!({}))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.count("list"),
+                    1,
+                    "ordinary RPCs remain usable beside the listener"
+                );
+                assert_eq!(
+                    fixture.count("effect"),
+                    1,
+                    "restoration never replays the uncertain tool call"
+                );
+                owner.close_with_cx(&cx).await.unwrap();
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_cancelled_through_either_api_is_not_resurrected() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for raw_client in [false, true] {
+                    let fixture = Fixture::new();
+                    let mut owner = fixture.connect(&cx, "effect", quick_policy(3)).await;
+                    open_catalog(&mut owner, &cx).await;
+                    if raw_client {
+                        owner
+                            .client_mut()
+                            .unwrap()
+                            .cancel_live_catalog_subscription(&cx)
+                            .unwrap();
+                    } else {
+                        owner.cancel_live_catalog_subscription(&cx).unwrap();
+                    }
+                    let _ = crash(&mut owner, &cx).await;
+                    let recovery = owner
+                        .recover(&cx, &McpRequestCancellation::new())
+                        .await
+                        .unwrap();
+                    assert!(recovery.catalog_subscription.is_none());
+                    assert!(owner.catalog_subscription.is_none());
+                    assert_eq!(fixture.count("listen"), 1);
+                    assert_eq!(fixture.count("effect"), 1);
+                    owner.close_with_cx(&cx).await.unwrap();
+                }
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_raw_retirement_after_observed_exit_is_not_resurrected() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for raw_cancel in [false, true] {
+                    let fixture = Fixture::new();
+                    let mut owner = fixture.connect(&cx, "effect", quick_policy(3)).await;
+                    open_catalog(&mut owner, &cx).await;
+                    let _ = crash(&mut owner, &cx).await;
+                    let cancellation = McpRequestCancellation::new();
+                    assert!(matches!(
+                        owner
+                            .next_subscription_event_with_cx(&cx, &cancellation)
+                            .await,
+                        Err(StdioRestartError::Subscription(_)),
+                    ));
+                    assert!(owner.catalog_subscription.is_some());
+                    assert!(owner.client.live_catalog_subscription.is_some());
+                    if raw_cancel {
+                        owner
+                            .client_mut()
+                            .unwrap()
+                            .cancel_live_catalog_subscription(&cx)
+                            .unwrap();
+                    } else {
+                        assert!(
+                            owner
+                                .client_mut()
+                                .unwrap()
+                                .next_subscription_event_with_cx(&cx, &cancellation)
+                                .await
+                                .is_err()
+                        );
+                    }
+                    assert!(owner.client.live_catalog_subscription.is_none());
+                    let recovery = owner.recover(&cx, &cancellation).await.unwrap();
+                    assert!(recovery.catalog_subscription.is_none());
+                    assert!(owner.catalog_subscription.is_none());
+                    assert_eq!(fixture.count("listen"), 1);
+                    assert_eq!(fixture.count("effect"), 1);
+                    owner.close_with_cx(&cx).await.unwrap();
+                }
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_terminal_consumed_through_raw_client_is_not_resurrected() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let mut owner = fixture
+                    .connect(&cx, "subscription-terminal", quick_policy(3))
+                    .await;
+                let cancellation = McpRequestCancellation::new();
+                owner
+                    .open_subscriptions_listener(
+                        &cx,
+                        &cancellation,
+                        catalog_filter(),
+                        SubscriptionTimeoutPolicy::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    owner
+                        .client_mut()
+                        .unwrap()
+                        .next_subscription_event_with_cx(&cx, &cancellation)
+                        .await
+                        .unwrap(),
+                    StdioSubscriptionEvent::Acknowledged(_)
+                ));
+                assert!(matches!(
+                    owner
+                        .client_mut()
+                        .unwrap()
+                        .next_subscription_event_with_cx(&cx, &cancellation)
+                        .await
+                        .unwrap(),
+                    StdioSubscriptionEvent::Terminal
+                ));
+                let _ = crash(&mut owner, &cx).await;
+                let recovery = owner.recover(&cx, &cancellation).await.unwrap();
+                assert!(recovery.catalog_subscription.is_none());
+                assert!(owner.catalog_subscription.is_none());
+                assert_eq!(fixture.count("listen"), 1);
+                owner.close_with_cx(&cx).await.unwrap();
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_dropped_restoration_resumes_one_committed_listen() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let mut owner = fixture.connect(&cx, "restore-gated", quick_policy(3)).await;
+                let old_id = open_catalog(&mut owner, &cx).await;
+                let _ = crash(&mut owner, &cx).await;
+                let cancellation = McpRequestCancellation::new();
+                drop_recovery_after_listen(&mut owner, &cx, &cancellation, &fixture).await;
+                assert!(matches!(
+                    owner.recovery.as_ref().unwrap().phase,
+                    RecoveryPhase::Restoring
+                ));
+                let original_deadline = owner.recovery.as_ref().unwrap().deadline;
+                let original_ack_deadline =
+                    owner.recovery.as_ref().unwrap().acknowledgement_deadline;
+                let id = owner
+                    .client
+                    .live_catalog_subscription
+                    .as_ref()
+                    .unwrap()
+                    .execution
+                    .request_id()
+                    .clone();
+                assert_eq!(
+                    owner.generation(),
+                    1,
+                    "an unacknowledged replacement stays unpublished"
+                );
+                assert!(matches!(
+                    owner.client_mut(),
+                    Err(StdioRestartError::RecoveryInProgress)
+                ));
+                drop_recovery_after_listen(&mut owner, &cx, &cancellation, &fixture).await;
+                assert_eq!(owner.recovery.as_ref().unwrap().deadline, original_deadline);
+                assert_eq!(
+                    owner.recovery.as_ref().unwrap().acknowledgement_deadline,
+                    original_ack_deadline
+                );
+                std::fs::write(&fixture.gate, b"acknowledge").unwrap();
+                let recovery = owner.recover(&cx, &cancellation).await.unwrap();
+                assert_eq!(
+                    recovery.catalog_subscription,
+                    Some(StdioSubscriptionRecovery {
+                        previous_subscription_id: old_id,
+                        subscription_id: id,
+                    })
+                );
+                assert_eq!(owner.restart_attempts(), 1);
+                assert_eq!(fixture.count("start"), 2);
+                assert_eq!(fixture.count("listen"), 2);
+                assert_eq!(fixture.count("effect"), 1);
+                owner.close_with_cx(&cx).await.unwrap();
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_cancelled_restoration_settles_then_uses_fresh_attempt_ids() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let mut owner = fixture.connect(&cx, "restore-gated", quick_policy(3)).await;
+                let old_id = open_catalog(&mut owner, &cx).await;
+                let _ = crash(&mut owner, &cx).await;
+                let cancellation = McpRequestCancellation::new();
+                drop_recovery_after_listen(&mut owner, &cx, &cancellation, &fixture).await;
+                let original_deadline = owner.recovery.as_ref().unwrap().deadline;
+                cancellation.cancel();
+                assert!(matches!(
+                    owner.recover(&cx, &cancellation).await,
+                    Err(StdioRestartError::Cancelled)
+                ));
+                assert!(owner.client.child_cleanup_complete());
+                assert_eq!(owner.generation(), 1);
+                assert_eq!(owner.restart_attempts(), 1);
+                assert_eq!(owner.recovery.as_ref().unwrap().deadline, original_deadline);
+                std::fs::write(&fixture.gate, b"acknowledge").unwrap();
+                let recovery = owner
+                    .recover(&cx, &McpRequestCancellation::new())
+                    .await
+                    .unwrap();
+                assert_eq!(recovery.attempts, 2);
+                assert_eq!(
+                    recovery
+                        .catalog_subscription
+                        .as_ref()
+                        .unwrap()
+                        .previous_subscription_id,
+                    old_id
+                );
+                let listeners = fixture.ids("listen");
+                let discoveries = fixture.ids("discovery");
+                assert_eq!(listeners.len(), 3);
+                assert_eq!(discoveries.len(), 3);
+                assert!(listeners.windows(2).all(|pair| pair[0] < pair[1]));
+                assert!(discoveries.windows(2).all(|pair| pair[0] < pair[1]));
+                assert!(
+                    discoveries[2] > listeners[1],
+                    "cancelled attempts cannot refund IDs"
+                );
+                assert_eq!(fixture.count("effect"), 1);
+                owner.close_with_cx(&cx).await.unwrap();
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_rejection_or_broadened_ack_keeps_replacement_unpublished() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for mode in ["restore-rejected", "restore-broadens"] {
+                    let fixture = Fixture::new();
+                    let mut owner = fixture.connect(&cx, mode, quick_policy(3)).await;
+                    open_catalog(&mut owner, &cx).await;
+                    let _ = crash(&mut owner, &cx).await;
+                    assert!(matches!(
+                        owner.recover(&cx, &McpRequestCancellation::new()).await,
+                        Err(StdioRestartError::Subscription(_))
+                    ));
+                    assert_eq!(owner.generation(), 1);
+                    assert!(owner.client.child_cleanup_complete());
+                    assert!(matches!(
+                        owner.recover(&cx, &McpRequestCancellation::new()).await,
+                        Err(StdioRestartError::Subscription(_))
+                    ));
+                    assert_eq!(owner.restart_attempts(), 1);
+                    assert_eq!(fixture.count("listen"), 2);
+                    assert_eq!(fixture.count("effect"), 1);
+                    owner.close_with_cx(&cx).await.unwrap();
+                }
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_expired_ack_or_recovery_budget_never_publishes() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for acknowledgement in [true, false] {
+                    let fixture = Fixture::new();
+                    let mut owner = fixture
+                        .connect(&cx, "restore-silent", quick_policy(3))
+                        .await;
+                    open_catalog(&mut owner, &cx).await;
+                    let _ = crash(&mut owner, &cx).await;
+                    let cancellation = McpRequestCancellation::new();
+                    drop_recovery_after_listen(&mut owner, &cx, &cancellation, &fixture).await;
+                    let incident = owner.recovery.as_mut().unwrap();
+                    assert!(incident.acknowledgement_deadline.unwrap() <= incident.deadline);
+                    // Deterministically cross the retained boundary after the live
+                    // write, without a load-sensitive sleep or an extra request.
+                    if acknowledgement {
+                        incident.acknowledgement_deadline = Some(Instant::now());
+                    } else {
+                        incident.deadline = Instant::now();
+                    }
+                    let error = owner.recover(&cx, &cancellation).await.unwrap_err();
+                    assert!(matches!(
+                        error,
+                        StdioRestartError::Subscription(_) | StdioRestartError::WindowExpired
+                    ));
+                    assert_eq!(owner.generation(), 1);
+                    assert_eq!(owner.restart_attempts(), 1);
+                    assert!(owner.client.child_cleanup_complete());
+                    assert_eq!(fixture.count("listen"), 2);
+                    assert_eq!(fixture.count("effect"), 1);
+                    owner.close_with_cx(&cx).await.unwrap();
+                }
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_invalid_configuration_and_pre_cancel_do_not_send() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let mut owner = fixture.connect(&cx, "effect", quick_policy(3)).await;
+                let before = owner.client().peek_next_request_id();
+                let invalid = fastmcp_protocol::SubscriptionFilter {
+                    resource_subscriptions: Some(vec!["relative/path".to_owned()]),
+                    ..catalog_filter()
+                };
+                assert!(matches!(
+                    owner
+                        .open_subscriptions_listener(
+                            &cx,
+                            &McpRequestCancellation::new(),
+                            invalid,
+                            SubscriptionTimeoutPolicy::default(),
+                        )
+                        .await,
+                    Err(StdioRestartError::Configuration(_))
+                ));
+                let cancellation = McpRequestCancellation::new();
+                cancellation.cancel();
+                assert!(matches!(
+                    owner
+                        .open_subscriptions_listener(
+                            &cx,
+                            &cancellation,
+                            catalog_filter(),
+                            SubscriptionTimeoutPolicy::default(),
+                        )
+                        .await,
+                    Err(StdioRestartError::Cancelled)
+                ));
+                assert_eq!(owner.client().peek_next_request_id(), before);
+                assert!(owner.catalog_subscription.is_none());
+                assert!(owner.client.live_catalog_subscription.is_none());
+                assert_eq!(fixture.count("listen"), 0);
+                owner.close_with_cx(&cx).await.unwrap();
+            });
     }
 
     #[test]

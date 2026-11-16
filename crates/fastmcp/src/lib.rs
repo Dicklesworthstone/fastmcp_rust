@@ -352,7 +352,7 @@ pub mod client {
     #[cfg(unix)]
     pub use crate::{
         StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
-        StdioRestartPolicy, SupervisedStdioClient,
+        StdioRestartPolicy, StdioSubscriptionRecovery, SupervisedStdioClient,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::mcp_apps;
@@ -1152,7 +1152,7 @@ pub use fastmcp_client::{ResourceSubscriptionRelations, SubscriptionListenReques
 #[cfg(unix)]
 pub use fastmcp_client::{
     StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
-    StdioRestartPolicy, SupervisedStdioClient,
+    StdioRestartPolicy, StdioSubscriptionRecovery, SupervisedStdioClient,
 };
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
@@ -3154,7 +3154,7 @@ pub mod modern {
     #[cfg(unix)]
     pub use fastmcp_client::{
         StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
-        StdioRestartPolicy, SupervisedStdioClient,
+        StdioRestartPolicy, StdioSubscriptionRecovery, SupervisedStdioClient,
     };
     pub use fastmcp_core::trace::{
         BaggageForwardingLimits, OutboundTraceDecision, OutboundTracePolicy, TraceContextError,
@@ -13549,7 +13549,7 @@ pub mod prelude {
     #[cfg(unix)]
     pub use crate::{
         StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
-        StdioRestartPolicy, SupervisedStdioClient,
+        StdioRestartPolicy, StdioSubscriptionRecovery, SupervisedStdioClient,
     };
     #[cfg(feature = "legacy-2024-11-05")]
     pub use crate::{auto, legacy_2024};

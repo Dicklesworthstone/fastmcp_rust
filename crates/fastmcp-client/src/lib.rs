@@ -145,7 +145,7 @@ pub use memory::{
 #[cfg(unix)]
 pub use stdio_restart::{
     StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
-    StdioRestartPolicy, SupervisedStdioClient,
+    StdioRestartPolicy, StdioSubscriptionRecovery, SupervisedStdioClient,
 };
 // The public re-export is feature-gated, while the client keeps this type
 // internally to reject configuration that names Apps when that feature is
@@ -28444,6 +28444,7 @@ impl Client {
 
     fn take_ready_catalog_subscription_event(
         &mut self,
+        preserve_connection_loss: bool,
     ) -> McpResult<Option<StdioSubscriptionEvent>> {
         // Function-local drain state; the wide terminal variant never leaves
         // this call frame, so boxing only adds indirection.
@@ -28495,7 +28496,18 @@ impl Client {
             ReadyCatalog::Event(event) => Ok(Some(event)),
             ReadyCatalog::Waiting => Ok(None),
             ReadyCatalog::Failed(error) => {
-                self.live_catalog_subscription = None;
+                // A supervisor retains the failed owner as its evidence that
+                // this configured listener was interrupted by the lost
+                // connection. Raw observation and explicit cancellation still
+                // retire it, so they cannot resurrect a consumed listener.
+                if !preserve_connection_loss
+                    || self.live_catalog_subscription.as_ref().is_none_or(|subscription| {
+                        subscription.execution.execution.terminal_reason()
+                            != Some(ExecutionTerminalReason::ConnectionLost)
+                    })
+                {
+                    self.live_catalog_subscription = None;
+                }
                 Err(error)
             }
             ReadyCatalog::Terminal {
@@ -28564,6 +28576,15 @@ impl Client {
         cx: &Cx,
         cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<Option<StdioSubscriptionEvent>> {
+        self.try_next_subscription_event_preserving_connection_loss(cx, cancellation, false)
+    }
+
+    fn try_next_subscription_event_preserving_connection_loss(
+        &mut self,
+        cx: &Cx,
+        cancellation: &fastmcp_core::McpRequestCancellation,
+        preserve_connection_loss: bool,
+    ) -> McpResult<Option<StdioSubscriptionEvent>> {
         const STDIO_CATALOG_LISTEN_RECEIVE_BOUND: Duration = Duration::from_millis(20);
         if let Some(error) = self
             .live_catalog_subscription
@@ -28582,7 +28603,7 @@ impl Client {
                 .map_err(|error| self.terminate_connection(error))?;
         }
         self.harvest_live_catalog_subscription_notifications()?;
-        if let Some(event) = self.take_ready_catalog_subscription_event()? {
+        if let Some(event) = self.take_ready_catalog_subscription_event(preserve_connection_loss)? {
             return Ok(Some(event));
         }
         self.drive_multiplexed_stdio_until(
@@ -28594,7 +28615,7 @@ impl Client {
             return Err(McpError::request_cancelled());
         }
         self.harvest_live_catalog_subscription_notifications()?;
-        self.take_ready_catalog_subscription_event()
+        self.take_ready_catalog_subscription_event(preserve_connection_loss)
     }
 
     /// Moves already-queued connection notifications into the live catalog

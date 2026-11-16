@@ -1003,7 +1003,7 @@ remaining original budget. Invalid or rejected discovery remains terminal.
 
 An interrupted request carries `StdioInterruptedRequest` diagnostic evidence:
 its outcome is unknown and any reissue must be explicit. Recovery never repeats
-an RPC or transfers old request handles or subscriptions to the replacement.
+an application RPC or transfers old request handles to the replacement.
 Write-side disconnects notify old handles before the process status can be
 checked, so their diagnostic exit evidence can be absent; recovery still
 requires the connection owner's private OS exit proof.
@@ -1011,6 +1011,29 @@ Protocol errors, application errors, timeouts, cancellation, explicit close,
 EOF from a still-running process, and unverified cleanup do not authorize a
 restart. The command configuration is frozen, but executable file contents are
 not snapshotted. Call `close_with_cx` to await final process cleanup.
+
+To keep observing catalog or resource changes across a subprocess restart, open
+the listener through `SupervisedStdioClient::open_subscriptions_listener`, with
+the caller context, cancellation token, `SubscriptionListenRequest` (or
+`SubscriptionFilter`), and `SubscriptionTimeoutPolicy`. This explicitly opts
+one listener into recovery. Read its events through the supervisor's
+`next_subscription_event_with_cx` method.
+
+After fresh discovery, recovery sends a new listen request and waits for a valid
+acknowledgement before publishing the replacement connection. Request IDs keep
+increasing across generations, including failed replacement attempts.
+`StdioRecovery::catalog_subscription` reports the old and new listener IDs when
+a listener was restored. This reports an observation gap: refresh the affected
+catalogs or resources before relying on new events, because events during the
+outage are not replayed. The new acknowledgement remains the first event the
+application receives, and it may accept a narrower filter than the old peer.
+
+Explicit listener cancellation and consumed subscription-terminal events remove
+the recovery configuration. Dropping an in-progress restoration retains its one
+committed listen request; resuming recovery does not send it again. Invalid acknowledgements,
+subscription errors, and acknowledgement deadlines keep the replacement
+unpublished and settle its subprocess. Listeners opened directly on `client_mut()`
+and Tasks listeners require application-managed recovery.
 
 ### Proxy upstreams
 
