@@ -5726,6 +5726,7 @@ impl LegacyHttpRequest {
         if self.terminal {
             return Ok(LegacyPersistentWaiterRetirement::AlreadyTerminal);
         }
+        let mut effects = LegacySseDeferredEffects::default();
         let mut state = self
             .state
             .lock()
@@ -5734,11 +5735,11 @@ impl LegacyHttpRequest {
             &mut state,
             &self.key,
             self.commit.request_id.clone(),
+            &mut effects,
         );
-        let gate = Arc::clone(&state.post_gate);
         drop(state);
-        gate.wake_stopped_posts();
         self.terminal = true;
+        drop(effects);
         retirement
     }
 }
@@ -10661,15 +10662,17 @@ struct LegacyPendingPost<'a> {
 impl Drop for LegacyPendingPost<'_> {
     fn drop(&mut self) {
         if self.armed {
+            let mut effects = LegacySseDeferredEffects::default();
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ =
-                retire_abandoned_persistent_waiter(&mut state, self.key, self.request_id.clone());
-            let gate = Arc::clone(&state.post_gate);
-            drop(state);
-            gate.wake_stopped_posts();
+            let _ = retire_abandoned_persistent_waiter(
+                &mut state,
+                self.key,
+                self.request_id.clone(),
+                &mut effects,
+            );
         }
     }
 }
@@ -10793,6 +10796,32 @@ const fn cancellation_control_is_authorized(retirement: LegacyPersistentWaiterRe
     matches!(retirement, LegacyPersistentWaiterRetirement::Cancelled)
 }
 
+/// Wake-capable objects removed by a receiver-state transaction.
+///
+/// Declare this before taking the state lock, so early returns and unwinding
+/// release the lock before dropping senders or invoking caller wakers.
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Default)]
+struct LegacySseDeferredEffects {
+    reader_wakers: Vec<Waker>,
+    retired_waiters: Vec<LegacyPersistentResponseWaiter>,
+    stopped_gates: Vec<Arc<LegacySsePostGate>>,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl Drop for LegacySseDeferredEffects {
+    fn drop(&mut self) {
+        for gate in self.stopped_gates.drain(..) {
+            gate.wake_stopped_posts();
+        }
+        for waker in self.reader_wakers.drain(..) {
+            waker.wake();
+        }
+        // Dropping a oneshot sender also wakes its waiting caller.
+        self.retired_waiters.clear();
+    }
+}
+
 /// Small shared state touched only at message-routing and caller-admission
 /// boundaries. The reader owns all I/O; callers cannot poll or consume its
 /// SSE stream directly.
@@ -10818,12 +10847,12 @@ impl LegacySsePersistentState {
         (self.pending.len(), self.pending_since, self.stopped)
     }
 
-    fn pending_changed(&mut self) {
+    fn pending_changed(&mut self, effects: &mut LegacySseDeferredEffects) {
         if self.pending.is_empty() {
             self.pending_since = None;
         }
         if let Some(waker) = self.reader_waker.take() {
-            waker.wake();
+            effects.reader_wakers.push(waker);
         }
     }
 
@@ -10854,20 +10883,25 @@ impl LegacySsePersistentState {
         }
     }
 
-    fn stop_with_error(&mut self, error: LegacySseHttpClientError) {
+    fn stop_with_error(
+        &mut self,
+        error: LegacySseHttpClientError,
+        effects: &mut LegacySseDeferredEffects,
+    ) {
         if !self.stopped {
             self.failure = Some(Arc::new(error));
         }
-        self.stop();
+        self.stop(effects);
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self, effects: &mut LegacySseDeferredEffects) {
         self.post_gate.invalidate();
         self.stopped = true;
-        self.pending.clear();
+        effects.retired_waiters.extend(self.pending.drain().map(|(_, waiter)| waiter));
+        effects.stopped_gates.push(Arc::clone(&self.post_gate));
         self.cancelled_response_ids.clear();
         self.notifications.clear();
-        self.pending_changed();
+        self.pending_changed(effects);
     }
 }
 
@@ -10876,18 +10910,39 @@ fn stop_legacy_persistent_state(
     state: &std::sync::Mutex<LegacySsePersistentState>,
     error: Option<LegacySseHttpClientError>,
 ) {
-    let gate = {
+    let mut effects = LegacySseDeferredEffects::default();
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(error) = error {
+        state.stop_with_error(error, &mut effects);
+    } else {
+        state.stop(&mut effects);
+    }
+}
+
+/// Replace the reader registration without cloning or dropping an arbitrary
+/// caller waker under the receiver lock. Admission is rechecked after cloning.
+#[cfg(feature = "legacy-2024-11-05")]
+fn register_legacy_reader_waker(
+    state: &std::sync::Mutex<LegacySsePersistentState>,
+    expected_activity: Option<(usize, Option<Time>, bool)>,
+    waker: &Waker,
+) -> bool {
+    let replacement = waker.clone();
+    let previous = {
         let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(error) = error {
-            state.stop_with_error(error);
-        } else {
-            state.stop();
+        if Some(state.pending_activity()) != expected_activity {
+            drop(state);
+            drop(replacement);
+            return false;
         }
-        Arc::clone(&state.post_gate)
+        state.reader_waker.replace(replacement)
     };
-    gate.wake_stopped_posts();
+    drop(previous);
+    true
 }
 
 /// Retires a caller that stopped waiting while preserving ownership of its
@@ -10898,17 +10953,52 @@ fn retire_abandoned_persistent_waiter(
     state: &mut LegacySsePersistentState,
     key: &CorrelationKey,
     request_id: RequestId,
+    effects: &mut LegacySseDeferredEffects,
 ) -> Result<LegacyPersistentWaiterRetirement, ClientHttpConnectionError> {
-    if state.pending.remove(key).is_none() {
+    let Some(waiter) = state.pending.remove(key) else {
         return Ok(LegacyPersistentWaiterRetirement::ReaderWon);
-    }
-    state.pending_changed();
+    };
+    effects.retired_waiters.push(waiter);
+    state.pending_changed(effects);
     if state.cancelled_response_ids.len() >= MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS {
-        state.stop();
+        state.stop(effects);
         return Err(ClientHttpConnectionError::LegacyCancelledResponseQueueFull);
     }
     state.cancelled_response_ids.push_back(request_id);
     Ok(LegacyPersistentWaiterRetirement::Cancelled)
+}
+
+/// Elect a pending request for peer cancellation under the state lock, then
+/// deliver its terminal outcome after releasing that lock.
+#[cfg(feature = "legacy-2024-11-05")]
+fn cancel_legacy_persistent_request(
+    state: &std::sync::Mutex<LegacySsePersistentState>,
+    cx: &Cx,
+    request_id: RequestId,
+) -> Result<bool, ClientHttpConnectionError> {
+    let Ok(key) = request_id.correlation_key() else {
+        return Ok(false);
+    };
+    let mut effects = LegacySseDeferredEffects::default();
+    let waiter = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(waiter) = state.pending.remove(&key) else {
+            return Ok(false);
+        };
+        state.pending_changed(&mut effects);
+        if state.cancelled_response_ids.len() >= MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS {
+            effects.retired_waiters.push(waiter);
+            state.stop(&mut effects);
+            return Err(ClientHttpConnectionError::LegacyCancelledResponseQueueFull);
+        }
+        state.cancelled_response_ids.push_back(request_id);
+        waiter
+    };
+    let _ = waiter.sender.send(cx, LegacyPersistentResponse::Cancelled);
+    drop(effects);
+    Ok(true)
 }
 
 /// Connection-owned dispatch for server-to-client exact-2024 callbacks.
@@ -11350,33 +11440,28 @@ impl LegacySsePersistentReceiver {
                     };
                     match message {
                         JsonRpcMessage::Request(notification) if notification.is_notification() => {
-                            let mut state = task_state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if let Some(request_id) = legacy_cancelled_request_id(&notification) {
+                                // Callback cancellation can wake application code. It must
+                                // not run while the receiver-state mutex is held.
                                 if task_reverse_callbacks.cancel(&request_id) {
                                     continue;
                                 }
-                                let key = request_id.correlation_key().ok();
-                                if let Some(key) = key
-                                    && let Some(waiter) = state.pending.remove(&key)
-                                {
-                                    state.pending_changed();
-                                    if state.cancelled_response_ids.len()
-                                        < MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS
-                                    {
-                                        state.cancelled_response_ids.push_back(request_id);
-                                        let _ = waiter
-                                            .sender
-                                            .send(&child_cx, LegacyPersistentResponse::Cancelled);
-                                        continue;
-                                    }
-                                    state.stop();
-                                    break;
+                                match cancel_legacy_persistent_request(
+                                    &task_state,
+                                    &child_cx,
+                                    request_id,
+                                ) {
+                                    Ok(true) => continue,
+                                    Ok(false) => {}
+                                    Err(_) => break,
                                 }
                             }
+                            let mut effects = LegacySseDeferredEffects::default();
+                            let mut state = task_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if state.notifications.len() >= MAX_QUEUED_LEGACY_NOTIFICATIONS {
-                                state.stop();
+                                state.stop(&mut effects);
                                 break;
                             }
                             if notification.method == NOTIFICATIONS_PROGRESS
@@ -11404,10 +11489,7 @@ impl LegacySsePersistentReceiver {
                                 Arc::clone(&task_state),
                                 &server_request,
                             ) else {
-                                let mut state = task_state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                state.stop();
+                                stop_legacy_persistent_state(&task_state, None);
                                 break;
                             };
                             if let LegacySseReverseRequestDispatch::Immediate(response) = dispatch
@@ -11428,19 +11510,14 @@ impl LegacySsePersistentReceiver {
                         }
                         JsonRpcMessage::Response(response) => {
                             let Some(response_id) = response.id.clone() else {
-                                let mut state = task_state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                state.stop();
+                                stop_legacy_persistent_state(&task_state, None);
                                 break;
                             };
                             let Ok(key) = response_id.correlation_key() else {
-                                let mut state = task_state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                state.stop();
+                                stop_legacy_persistent_state(&task_state, None);
                                 break;
                             };
+                            let mut effects = LegacySseDeferredEffects::default();
                             let routed = {
                                 let mut state = task_state
                                     .lock()
@@ -11454,7 +11531,7 @@ impl LegacySsePersistentReceiver {
                                     continue;
                                 }
                                 if let Some(waiter) = state.pending.remove(&key) {
-                                    state.pending_changed();
+                                    state.pending_changed(&mut effects);
                                     let deadline = waiter
                                         .deadline
                                         .lock()
@@ -11473,7 +11550,7 @@ impl LegacySsePersistentReceiver {
                                         .next()
                                         .map(|(_, waiter)| waiter)
                                         .expect("sole pending legacy waiter must exist");
-                                    state.stop();
+                                    state.stop(&mut effects);
                                     Some((
                                         waiter,
                                         LegacyPersistentResponse::IdMismatch {
@@ -11481,7 +11558,7 @@ impl LegacySsePersistentReceiver {
                                         },
                                     ))
                                 } else {
-                                    state.stop();
+                                    state.stop(&mut effects);
                                     None
                                 }
                             };
@@ -11489,6 +11566,7 @@ impl LegacySsePersistentReceiver {
                                 break;
                             };
                             let _ = waiter.sender.send(&child_cx, response);
+                            drop(effects);
                         }
                     }
                 }
@@ -11554,6 +11632,7 @@ impl LegacySsePersistentReceiver {
             })?,
         ));
         let (sender, receiver) = oneshot::channel();
+        let mut effects = LegacySseDeferredEffects::default();
         {
             let mut state = self
                 .state
@@ -11589,7 +11668,7 @@ impl LegacySsePersistentReceiver {
                         deadline: Arc::clone(&deadline),
                     },
                 );
-            state.pending_changed();
+            state.pending_changed(&mut effects);
         }
         let mut pending_post = LegacyPendingPost {
             state: &self.state,
@@ -11597,6 +11676,7 @@ impl LegacySsePersistentReceiver {
             request_id: &request_id,
             armed: true,
         };
+        drop(effects);
         let request = JsonRpcRequest::new(method, Some(parameters), request_id.clone());
         let sent = self
             .outbound
@@ -11609,6 +11689,7 @@ impl LegacySsePersistentReceiver {
             request_may_have_reached_peer,
         }) = sent
         {
+            let mut effects = LegacySseDeferredEffects::default();
             let mut state = self
                 .state
                 .lock()
@@ -11635,15 +11716,17 @@ impl LegacySsePersistentReceiver {
                     );
                 }
                 if request_may_have_reached_peer {
-                    let retired =
-                        retire_abandoned_persistent_waiter(&mut state, &key, request_id);
-                    let gate = Arc::clone(&state.post_gate);
-                    drop(state);
-                    gate.wake_stopped_posts();
-                    retired?;
+                    retire_abandoned_persistent_waiter(
+                        &mut state,
+                        &key,
+                        request_id,
+                        &mut effects,
+                    )?;
                 } else {
-                    state.pending.remove(&key);
-                    state.pending_changed();
+                    if let Some(waiter) = state.pending.remove(&key) {
+                        effects.retired_waiters.push(waiter);
+                    }
+                    state.pending_changed(&mut effects);
                 }
                 return Err(ClientHttpConnectionError::Legacy(error));
             }
@@ -12850,14 +12933,10 @@ impl LegacySseResponseStream {
             let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
             let mut expiry = std::pin::pin!(asupersync::time::sleep_until(wake_at));
             let frame = poll_fn(|task_cx| {
-                if let Some(state) = persistent_state {
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if Some(state.pending_activity()) != pending_activity {
-                        return Poll::Ready(Err(LegacySseWaitInterrupt::PendingChanged));
-                    }
-                    state.reader_waker = Some(task_cx.waker().clone());
+                if let Some(state) = persistent_state
+                    && !register_legacy_reader_waker(state, pending_activity, task_cx.waker())
+                {
+                    return Poll::Ready(Err(LegacySseWaitInterrupt::PendingChanged));
                 }
                 if cancellation.as_mut().poll(task_cx).is_ready() {
                     return Poll::Ready(Err(LegacySseWaitInterrupt::Cancelled));
@@ -14813,8 +14892,13 @@ mod tests {
         let request_id = RequestId::Number(41);
         let (mut state, key) = persistent_state_with_waiter(request_id.clone(), VecDeque::new());
 
-        let retirement = retire_abandoned_persistent_waiter(&mut state, &key, request_id.clone())
-            .expect("one cancelled caller retains its exact late-response tombstone");
+        let retirement = retire_abandoned_persistent_waiter(
+            &mut state,
+            &key,
+            request_id.clone(),
+            &mut super::LegacySseDeferredEffects::default(),
+        )
+        .expect("one cancelled caller retains its exact late-response tombstone");
 
         assert_eq!(retirement, LegacyPersistentWaiterRetirement::Cancelled);
         assert!(cancellation_control_is_authorized(retirement));
@@ -14832,8 +14916,13 @@ mod tests {
         // Force the reader-wins state: it has removed the waiter to deliver a
         // terminal response, but the handle has not yet observed its oneshot.
         let _terminal_waiter = state.pending.remove(&key);
-        let retirement = retire_abandoned_persistent_waiter(&mut state, &key, request_id)
-            .expect("reader-won retirement is not a queue failure");
+        let retirement = retire_abandoned_persistent_waiter(
+            &mut state,
+            &key,
+            request_id,
+            &mut super::LegacySseDeferredEffects::default(),
+        )
+        .expect("reader-won retirement is not a queue failure");
 
         assert_eq!(retirement, LegacyPersistentWaiterRetirement::ReaderWon);
         assert!(state.cancelled_response_ids.is_empty());
@@ -14854,7 +14943,12 @@ mod tests {
             persistent_state_with_waiter(request_id.clone(), cancelled_response_ids);
 
         assert!(matches!(
-            retire_abandoned_persistent_waiter(&mut state, &key, request_id),
+            retire_abandoned_persistent_waiter(
+                &mut state,
+                &key,
+                request_id,
+                &mut super::LegacySseDeferredEffects::default(),
+            ),
             Err(ClientHttpConnectionError::LegacyCancelledResponseQueueFull)
         ));
         assert!(state.stopped);
@@ -14882,7 +14976,7 @@ mod tests {
             ..LegacySsePersistentState::default()
         };
 
-        state.stop();
+        state.stop(&mut super::LegacySseDeferredEffects::default());
 
         assert!(state.stopped);
         assert!(state.pending.is_empty());
@@ -14895,10 +14989,16 @@ mod tests {
     #[test]
     fn persistent_receiver_preserves_first_failure_and_error_source() {
         let (mut state, _) = persistent_state_with_waiter(RequestId::Number(43), VecDeque::new());
-        state.stop_with_error(LegacySseHttpClientError::MessageDecodeFailed);
+        state.stop_with_error(
+            LegacySseHttpClientError::MessageDecodeFailed,
+            &mut super::LegacySseDeferredEffects::default(),
+        );
         let first = state.stopped_error();
-        state.stop_with_error(LegacySseHttpClientError::Cancelled);
-        state.stop();
+        state.stop_with_error(
+            LegacySseHttpClientError::Cancelled,
+            &mut super::LegacySseDeferredEffects::default(),
+        );
+        state.stop(&mut super::LegacySseDeferredEffects::default());
         let later = state.stopped_error();
         let (
             ClientHttpConnectionError::LegacyPersistentReceiverFailed(first),
@@ -14922,8 +15022,14 @@ mod tests {
 
         // Changing only the first cause keeps the established lifetime API.
         let mut state = LegacySsePersistentState::default();
-        state.stop_with_error(LegacySseHttpClientError::SseIdleLifetimeExceeded);
-        state.stop_with_error(LegacySseHttpClientError::MessageDecodeFailed);
+        state.stop_with_error(
+            LegacySseHttpClientError::SseIdleLifetimeExceeded,
+            &mut super::LegacySseDeferredEffects::default(),
+        );
+        state.stop_with_error(
+            LegacySseHttpClientError::MessageDecodeFailed,
+            &mut super::LegacySseDeferredEffects::default(),
+        );
         assert!(matches!(
             state.stopped_error(),
             ClientHttpConnectionError::Legacy(LegacySseHttpClientError::SseIdleLifetimeExceeded)
@@ -15016,6 +15122,274 @@ mod tests {
                 drop(state);
                 drop(done);
                 peer.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[derive(Default)]
+    struct LegacyReceiverWakeObservations {
+        wakes: AtomicUsize,
+        drops: AtomicUsize,
+        locked: AtomicUsize,
+        pending: AtomicUsize,
+        tombstones: AtomicUsize,
+        stopped: AtomicUsize,
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    struct LegacyReceiverReentrantWake {
+        state: std::sync::Weak<std::sync::Mutex<LegacySsePersistentState>>,
+        observations: Arc<LegacyReceiverWakeObservations>,
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    impl LegacyReceiverReentrantWake {
+        fn observe(&self) {
+            let Some(state) = self.state.upgrade() else {
+                return;
+            };
+            match state.try_lock() {
+                Ok(state) => {
+                    self.observations.pending.store(state.pending.len(), Ordering::SeqCst);
+                    self.observations.tombstones.store(
+                        state.cancelled_response_ids.len(),
+                        Ordering::SeqCst,
+                    );
+                    self.observations.stopped.store(usize::from(state.stopped), Ordering::SeqCst);
+                }
+                Err(_) => {
+                    self.observations.locked.fetch_add(1, Ordering::SeqCst);
+                }
+            };
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    impl Wake for LegacyReceiverReentrantWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observations.wakes.fetch_add(1, Ordering::SeqCst);
+            self.observe();
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    impl Drop for LegacyReceiverReentrantWake {
+        fn drop(&mut self) {
+            self.observations.drops.fetch_add(1, Ordering::SeqCst);
+            self.observe();
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn legacy_receiver_reentrant_waker(
+        state: &Arc<std::sync::Mutex<LegacySsePersistentState>>,
+    ) -> (Waker, Arc<LegacyReceiverWakeObservations>) {
+        let observations = Arc::new(LegacyReceiverWakeObservations::default());
+        let waker = Waker::from(Arc::new(LegacyReceiverReentrantWake {
+            state: Arc::downgrade(state),
+            observations: Arc::clone(&observations),
+        }));
+        (waker, observations)
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_receiver_pending_change_wakes_after_unlock() {
+        let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
+        let (waker, observations) = legacy_receiver_reentrant_waker(&state);
+        assert!(super::register_legacy_reader_waker(
+            &state, Some((0, None, false)), &waker,
+        ));
+        drop(waker);
+        let (sender, _receiver) = oneshot::channel();
+        let mut effects = super::LegacySseDeferredEffects::default();
+        {
+            let mut state = state.lock().unwrap();
+            state.pending.insert(
+                RequestId::Number(51).correlation_key().unwrap(),
+                legacy_test_response_waiter(sender),
+            );
+            state.pending_changed(&mut effects);
+            assert_eq!(observations.wakes.load(Ordering::SeqCst), 0);
+            assert_eq!(observations.drops.load(Ordering::SeqCst), 0);
+        }
+        drop(effects);
+        assert_eq!(observations.wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.locked.load(Ordering::SeqCst), 0);
+        assert_eq!(observations.pending.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.stopped.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_receiver_reader_waker_replacement_drops_after_unlock() {
+        for change_activity in [false, true] {
+            let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
+            let (first, first_observations) = legacy_receiver_reentrant_waker(&state);
+            assert!(super::register_legacy_reader_waker(
+                &state, Some((0, None, false)), &first,
+            ));
+            drop(first);
+            let (replacement, _) = legacy_receiver_reentrant_waker(&state);
+            // Changing only the admission snapshot must preserve the previous
+            // reader registration and refuse the replacement.
+            if change_activity {
+                state.lock().unwrap().stopped = true;
+            }
+            assert_eq!(
+                super::register_legacy_reader_waker(
+                    &state, Some((0, None, false)), &replacement,
+                ),
+                !change_activity,
+            );
+            assert_eq!(
+                first_observations.drops.load(Ordering::SeqCst),
+                usize::from(!change_activity),
+            );
+            assert_eq!(first_observations.locked.load(Ordering::SeqCst), 0);
+            let retained = state.lock().unwrap().reader_waker.take();
+            drop(retained);
+            assert_eq!(first_observations.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(first_observations.locked.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_receiver_pending_post_drop_retires_after_unlock() {
+        for armed in [false, true] {
+            let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
+            let request_id = RequestId::Number(52);
+            let key = request_id.correlation_key().unwrap();
+            let (sender, mut receiver) = oneshot::channel();
+            state.lock().unwrap().pending.insert(
+                key.clone(), legacy_test_response_waiter(sender),
+            );
+            let cx = Cx::for_request();
+            let (waker, observations) = legacy_receiver_reentrant_waker(&state);
+            let mut receive = std::pin::pin!(receiver.recv(&cx));
+            assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            drop(super::LegacyPendingPost {
+                state: &state, key: &key, request_id: &request_id, armed,
+            });
+            assert_eq!(observations.locked.load(Ordering::SeqCst), 0);
+            if armed {
+                assert!(observations.wakes.load(Ordering::SeqCst) > 0);
+                assert_eq!(observations.pending.load(Ordering::SeqCst), 0);
+                assert_eq!(observations.tombstones.load(Ordering::SeqCst), 1);
+                assert!(matches!(
+                    receive.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Err(_)),
+                ));
+            } else {
+                assert_eq!(observations.wakes.load(Ordering::SeqCst), 0);
+                assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                assert_eq!(state.lock().unwrap().pending.len(), 1);
+                assert!(state.lock().unwrap().cancelled_response_ids.is_empty());
+            }
+            assert!(!state.lock().unwrap().stopped);
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_receiver_stop_wakes_waiters_after_unlock() {
+        let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
+        let (sender, mut receiver) = oneshot::channel();
+        state.lock().unwrap().pending.insert(
+            RequestId::Number(53).correlation_key().unwrap(),
+            legacy_test_response_waiter(sender),
+        );
+        let (reader, reader_observations) = legacy_receiver_reentrant_waker(&state);
+        assert!(super::register_legacy_reader_waker(
+            &state, Some((1, None, false)), &reader,
+        ));
+        drop(reader);
+        let cx = Cx::for_request();
+        let (waker, observations) = legacy_receiver_reentrant_waker(&state);
+        let mut receive = std::pin::pin!(receiver.recv(&cx));
+        assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+
+        super::stop_legacy_persistent_state(
+            &state, Some(LegacySseHttpClientError::MessageDecodeFailed),
+        );
+
+        for observed in [&observations, &reader_observations] {
+            assert!(observed.wakes.load(Ordering::SeqCst) > 0);
+            assert_eq!(observed.locked.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.pending.load(Ordering::SeqCst), 0);
+            assert_eq!(observed.stopped.load(Ordering::SeqCst), 1);
+        }
+        assert!(matches!(
+            receive.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Err(_)),
+        ));
+        assert!(state.lock().unwrap().post_gate.state.lock().unwrap().closed);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_receiver_cancellation_delivers_after_unlock() {
+        for (matching, full) in [(true, false), (false, false), (true, true)] {
+            let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
+            let request_id = RequestId::Number(1_000_000);
+            let (sender, mut receiver) = oneshot::channel();
+            {
+                let mut state = state.lock().unwrap();
+                state.pending.insert(
+                    request_id.correlation_key().unwrap(), legacy_test_response_waiter(sender),
+                );
+                if full {
+                    state.cancelled_response_ids = (0..MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS)
+                        .map(|id| RequestId::Number(id as i64))
+                        .collect();
+                }
+            }
+            let cx = Cx::for_request();
+            let (waker, observations) = legacy_receiver_reentrant_waker(&state);
+            let mut receive = std::pin::pin!(receiver.recv(&cx));
+            assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            let result = super::cancel_legacy_persistent_request(
+                &state, &cx,
+                if matching { request_id.clone() } else { RequestId::Number(1_000_001) },
+            );
+            assert_eq!(observations.locked.load(Ordering::SeqCst), 0);
+            if !matching {
+                assert!(matches!(result, Ok(false)));
+                assert_eq!(observations.wakes.load(Ordering::SeqCst), 0);
+                assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                assert_eq!(state.lock().unwrap().pending.len(), 1);
+                assert!(state.lock().unwrap().cancelled_response_ids.is_empty());
+            } else if full {
+                assert!(matches!(result, Err(
+                    ClientHttpConnectionError::LegacyCancelledResponseQueueFull,
+                )));
+                assert!(observations.wakes.load(Ordering::SeqCst) > 0);
+                assert_eq!(observations.stopped.load(Ordering::SeqCst), 1);
+                assert!(matches!(
+                    receive.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(Err(_)),
+                ));
+                assert!(state.lock().unwrap().cancelled_response_ids.is_empty());
+            } else {
+                assert!(matches!(result, Ok(true)));
+                assert!(observations.wakes.load(Ordering::SeqCst) > 0);
+                assert_eq!(observations.pending.load(Ordering::SeqCst), 0);
+                assert_eq!(observations.tombstones.load(Ordering::SeqCst), 1);
+                assert_eq!(observations.stopped.load(Ordering::SeqCst), 0);
+                assert!(matches!(
+                    receive.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Ok(LegacyPersistentResponse::Cancelled)),
+                ));
+                assert_eq!(
+                    state.lock().unwrap().cancelled_response_ids,
+                    VecDeque::from([request_id]),
+                );
             }
         }
     }
