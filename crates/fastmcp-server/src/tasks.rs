@@ -3180,6 +3180,9 @@ const IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT: StdDuration = StdDuration::from_se
 impl InMemoryFinalTaskStore {
     /// The clock is application code and may change process identity. Recheck
     /// its return boundary before the caller observes or mutates retained state.
+    /// State-dependent operations must hold the state mutex before sampling:
+    /// a timestamp obtained before waiting for that lock can already be expired
+    /// when retained payloads, cancellation, or retention receipts are observed.
     fn sample_clock(&self) -> McpResult<Instant> {
         self.process.verify()?;
         let now = (self.clock)();
@@ -3507,11 +3510,11 @@ impl InMemoryFinalTaskStore {
     #[must_use]
     pub fn task_count(&self) -> usize {
         self.process.assert_current();
-        let now = self.sample_clock_or_panic();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock_or_panic();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         state.tasks.len()
     }
@@ -3523,11 +3526,11 @@ impl InMemoryFinalTaskStore {
         task_id: &FinalTaskId,
     ) -> Option<FinalTaskStatusNotification> {
         self.process.assert_current();
-        let now = self.sample_clock_or_panic();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock_or_panic();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         state.latest_notifications.get(task_id).cloned()
     }
@@ -3639,11 +3642,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     ) -> McpResult<TaskRetentionReclamation> {
         self.process.verify()?;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock()?;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
         let key = (task_id.clone(), generation);
         if let Some(entry) = state
@@ -3741,11 +3744,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         self.process.verify()?;
         validate_task_retention_page_limit(limit)?;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock()?;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
         let journal = &mut state.retention_journal;
         journal.prune(now);
@@ -3974,22 +3977,22 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
 
     fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
         self.process.verify()?;
-        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         Ok(state.tasks.get(task_id).cloned())
     }
 
     fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
         self.process.verify()?;
-        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let Some(task) = state.tasks.get(task_id).cloned() else {
             return Ok(None);
@@ -4933,11 +4936,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
 
     fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
         self.process.verify()?;
-        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if !state.tasks.contains_key(task_id) {
             return Err(McpError::invalid_params("Task not found"));
@@ -4956,11 +4959,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         generation: u64,
     ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
         self.process.verify()?;
-        let now = self.sample_clock()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&generation) {
             return Ok(None);
@@ -20599,6 +20602,299 @@ mod tests {
             state.tasks.get(&task_id),
             Some(FinalTask::Working(_))
         ));
+    }
+
+
+    /// A controlled clock boundary shared by the expiry-bearing read tests.
+    /// The clock parks after taking its sample. Only an operation that sampled
+    /// before locking lets the other thread acquire state and advance time
+    /// across expiry. Channel handshakes make that ordering deterministic;
+    /// the timeouts bound broken fixtures and never choose the interleaving.
+    struct FinalTaskReadClockProbe {
+        store: Arc<InMemoryFinalTaskStore>,
+        now: Arc<Mutex<Instant>>,
+        armed: Arc<AtomicBool>,
+        sampled: std::sync::mpsc::Receiver<Instant>,
+        release: std::sync::mpsc::SyncSender<()>,
+    }
+
+    impl FinalTaskReadClockProbe {
+        fn new() -> Self {
+            let now = Arc::new(Mutex::new(Instant::now()));
+            let clock_now = Arc::clone(&now);
+            let armed = Arc::new(AtomicBool::new(false));
+            let clock_armed = Arc::clone(&armed);
+            let (sampled_sender, sampled) = std::sync::mpsc::sync_channel(1);
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            let released = Mutex::new(released);
+            let clock = Arc::new(move || {
+                let sampled_now = *clock_now.lock().unwrap();
+                if clock_armed.swap(false, AtomicOrdering::SeqCst) {
+                    sampled_sender.send(sampled_now).unwrap();
+                    released
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(StdDuration::from_secs(5))
+                        .expect("clock probe must be released");
+                }
+                sampled_now
+            });
+            let policy = TaskRetentionPolicy::new(
+                4,
+                TaskRetentionPolicy::MIN_JOURNAL_BYTES,
+                StdDuration::from_secs(1),
+            )
+            .unwrap();
+            let store = Arc::new(
+                InMemoryFinalTaskStore::with_clock(1, clock)
+                    .unwrap()
+                    .with_retention_policy(policy)
+                    .unwrap(),
+            );
+            Self {
+                store,
+                now,
+                armed,
+                sampled,
+                release,
+            }
+        }
+
+        fn run<T: Send + 'static>(
+            &self,
+            operation: impl FnOnce(&InMemoryFinalTaskStore) -> T + Send + 'static,
+        ) -> (bool, T) {
+            self.armed.store(true, AtomicOrdering::SeqCst);
+            let store = Arc::clone(&self.store);
+            let worker = thread::spawn(move || operation(&store));
+            let sampled_at = self
+                .sampled
+                .recv_timeout(StdDuration::from_secs(5))
+                .expect("operation must reach the armed clock");
+            let parent_won_state_lock = match self.store.state.try_lock() {
+                Ok(state) => {
+                    // Plant the forbidden interleaving: an unlocked sample
+                    // ages past expiry before its operation can read state.
+                    *self.now.lock().unwrap() =
+                        sampled_at.checked_add(StdDuration::from_millis(1)).unwrap();
+                    drop(state);
+                    true
+                }
+                Err(std::sync::TryLockError::WouldBlock) => false,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("clock probe state must not be poisoned");
+                }
+            };
+            self.release.send(()).unwrap();
+            let result = worker.join().expect("clock probe worker must finish");
+            (parent_won_state_lock, result)
+        }
+    }
+
+    fn check_final_task_read_clock_linearization(
+        read: fn(&InMemoryFinalTaskStore, &FinalTaskId, u64) -> bool,
+    ) {
+        let probe = FinalTaskReadClockProbe::new();
+        let task = final_working_task_with_ttl("retention-clock-read", 1_000);
+        let task_id = task.base().task_id.clone();
+        probe
+            .store
+            .create_task(task.clone(), final_task_notification(&task))
+            .unwrap();
+        probe.store.request_cancellation(&task_id).unwrap();
+        let generation = probe
+            .store
+            .get_task_snapshot(&task_id)
+            .unwrap()
+            .unwrap()
+            .generation();
+        let expires_at = probe.store.state.lock().unwrap().expires_at[&task_id];
+        *probe.now.lock().unwrap() =
+            expires_at.checked_sub(StdDuration::from_millis(1)).unwrap();
+        let worker_task_id = task_id.clone();
+        let (sampled_without_lock, retained) =
+            probe.run(move |store| read(store, &worker_task_id, generation));
+        assert_eq!(
+            retained,
+            !sampled_without_lock,
+            "a pre-lock clock sample cannot expose a task after its retention deadline"
+        );
+        // With serialized sampling the first read is the positive, live side
+        // of the boundary. Moving only the clock to expiry must hide the same
+        // task, payload, notification, cancellation intent, and deadline.
+        *probe.now.lock().unwrap() = expires_at;
+        assert!(!read(&probe.store, &task_id, generation));
+        assert_eq!(probe.store.task_count(), 0);
+        assert_eq!(probe.store.retained_payload_bytes(), 0);
+    }
+
+    #[test]
+    fn task_03_final_task_read_clock_is_linearized_with_retention() {
+        check_final_task_read_clock_linearization(|store, task_id, _| {
+            store.get_task(task_id).unwrap().is_some()
+        });
+    }
+
+    #[test]
+    fn task_03_final_snapshot_read_clock_is_linearized_with_retention() {
+        check_final_task_read_clock_linearization(|store, task_id, _| {
+            store.get_task_snapshot(task_id).unwrap().is_some()
+        });
+    }
+
+    #[test]
+    fn task_03_final_notification_read_clock_is_linearized_with_retention() {
+        check_final_task_read_clock_linearization(|store, task_id, _| {
+            store.latest_notification(task_id).is_some()
+        });
+    }
+
+    #[test]
+    fn task_03_final_task_count_clock_is_linearized_with_retention() {
+        check_final_task_read_clock_linearization(|store, _, _| store.task_count() == 1);
+    }
+
+    #[test]
+    fn task_03_final_cancellation_read_clock_is_linearized_with_retention() {
+        check_final_task_read_clock_linearization(|store, task_id, _| {
+            match store.is_cancellation_requested(task_id) {
+                Ok(requested) => {
+                    assert!(requested, "live cancellation intent must remain visible");
+                    true
+                }
+                Err(error) => {
+                    assert_eq!(error.message, "Task not found");
+                    false
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn task_03_final_deadline_read_clock_is_linearized_with_retention() {
+        check_final_task_read_clock_linearization(|store, task_id, generation| {
+            store
+                .task_retention_deadline_if_current(task_id, generation)
+                .unwrap()
+                .is_some()
+        });
+    }
+
+    fn seed_final_task_clock_retention_receipt(
+        probe: &FinalTaskReadClockProbe,
+    ) -> (FinalTaskId, u64, TaskRetentionReceipt, Instant) {
+        let working = final_working_task_without_ttl("retention-clock-receipt");
+        let task_id = working.base().task_id.clone();
+        probe
+            .store
+            .create_task(working.clone(), final_task_notification(&working))
+            .unwrap();
+        let cancelled = FinalTask::Cancelled(
+            transition_terminal_final_task_base(
+                working.base().clone(),
+                FinalTaskStatus::Cancelled,
+                None,
+            )
+            .unwrap(),
+        );
+        probe
+            .store
+            .replace_task(cancelled.clone(), final_task_notification(&cancelled))
+            .unwrap();
+        let generation = probe
+            .store
+            .get_task_snapshot(&task_id)
+            .unwrap()
+            .unwrap()
+            .generation();
+        let outcome = probe
+            .store
+            .reclaim_terminal_task_if_current(
+                &Cx::for_testing(),
+                &task_id,
+                generation,
+                TaskRetentionReason::OperatorRequest,
+            )
+            .unwrap();
+        let TaskRetentionReclamation::Reclaimed(receipt) = outcome else {
+            panic!("terminal task must produce a retention receipt");
+        };
+        let expires_at = probe.store.state.lock().unwrap().retention_journal.entries
+            [&receipt.sequence()]
+            .expires_at;
+        *probe.now.lock().unwrap() =
+            expires_at.checked_sub(StdDuration::from_millis(1)).unwrap();
+        (task_id, generation, receipt, expires_at)
+    }
+
+    #[test]
+    fn task_03_final_retention_audit_clock_is_linearized_with_receipt_expiry() {
+        let probe = FinalTaskReadClockProbe::new();
+        let (_, _, receipt, expires_at) = seed_final_task_clock_retention_receipt(&probe);
+        let (sampled_without_lock, page) = probe.run(|store| {
+            store.task_retention_audit(&Cx::for_testing(), None, 1).unwrap()
+        });
+        assert_eq!(
+            page.records().len(),
+            usize::from(!sampled_without_lock),
+            "a pre-lock sample cannot retain an expired audit receipt"
+        );
+        if !sampled_without_lock {
+            assert_eq!(page.records(), std::slice::from_ref(&receipt));
+        }
+        *probe.now.lock().unwrap() = expires_at;
+        let expired = probe
+            .store
+            .task_retention_audit(&Cx::for_testing(), None, 1)
+            .unwrap();
+        assert!(expired.records().is_empty());
+        assert_eq!(expired.retained_records(), 0);
+        assert_eq!(expired.retained_bytes(), 0);
+        assert!(expired.next_after().is_none());
+    }
+
+    #[test]
+    fn task_03_final_retention_reclaim_clock_is_linearized_with_receipt_expiry() {
+        let probe = FinalTaskReadClockProbe::new();
+        let (task_id, generation, receipt, expires_at) =
+            seed_final_task_clock_retention_receipt(&probe);
+        let worker_task_id = task_id.clone();
+        let (sampled_without_lock, outcome) = probe.run(move |store| {
+            store
+                .reclaim_terminal_task_if_current(
+                    &Cx::for_testing(),
+                    &worker_task_id,
+                    generation,
+                    TaskRetentionReason::OperatorRequest,
+                )
+                .unwrap()
+        });
+        assert_eq!(
+            outcome,
+            if sampled_without_lock {
+                TaskRetentionReclamation::NotCurrent
+            } else {
+                TaskRetentionReclamation::AlreadyReclaimed(receipt.clone())
+            },
+            "a pre-lock sample cannot replay a reclamation receipt after its expiry"
+        );
+        *probe.now.lock().unwrap() = expires_at;
+        assert_eq!(
+            probe
+                .store
+                .reclaim_terminal_task_if_current(
+                    &Cx::for_testing(),
+                    &task_id,
+                    generation,
+                    TaskRetentionReason::OperatorRequest,
+                )
+                .unwrap(),
+            TaskRetentionReclamation::NotCurrent
+        );
+        let state = probe.store.state.lock().unwrap();
+        assert!(state.tasks.is_empty());
+        assert_eq!(state.retention_journal.next_sequence, receipt.sequence());
+        assert_eq!(state.payload_accounting.total, 0);
     }
 
     #[test]
