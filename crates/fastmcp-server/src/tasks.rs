@@ -6811,7 +6811,9 @@ struct FinalTaskCancellationWake {
 
 #[derive(Default)]
 struct FinalTaskCancellationWakeState {
-    active: BTreeMap<FinalTaskId, Option<std::task::Waker>>,
+    // Sharing the stored waker lets cancellation snapshot its owner without
+    // invoking a caller's RawWaker clone callback under the registry lock.
+    active: BTreeMap<FinalTaskId, Option<Arc<std::task::Waker>>>,
 }
 
 /// RAII registration that makes an elected handoff immediately wakeable by
@@ -6849,13 +6851,35 @@ impl FinalTaskCancellationWake {
     }
 
     fn register_waker(&self, task_id: &FinalTaskId, waker: &std::task::Waker) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(registered) = state.active.get_mut(task_id) {
-            *registered = Some(waker.clone());
+        let needs_update = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.active.get(task_id).is_some_and(|registered| {
+                registered
+                    .as_ref()
+                    .is_none_or(|current| !current.will_wake(waker))
+            })
+        };
+        if !needs_update {
+            return;
         }
+        // Waker cloning and destruction can execute caller code. Retain a
+        // local Arc until after unlocking, including when registration ended
+        // while the caller's clone callback was running.
+        let replacement = Arc::new(waker.clone());
+        let retired = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .active
+                .get_mut(task_id)
+                .and_then(|registered| registered.replace(Arc::clone(&replacement)))
+        };
+        drop(retired);
     }
 
     fn wake_if_active(&self, task_id: &FinalTaskId) {
@@ -6867,7 +6891,7 @@ impl FinalTaskCancellationWake {
             state.active.get(task_id).cloned().flatten()
         };
         if let Some(waker) = waker {
-            waker.wake();
+            waker.wake_by_ref();
         }
     }
 }
@@ -6880,12 +6904,15 @@ impl FinalTaskCancellationWakeRegistration {
 
 impl Drop for FinalTaskCancellationWakeRegistration {
     fn drop(&mut self) {
-        let mut state = self
-            .wake
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.active.remove(&self.task_id);
+        let retired = {
+            let mut state = self
+                .wake
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.active.remove(&self.task_id)
+        };
+        drop(retired);
     }
 }
 
@@ -7044,7 +7071,29 @@ fn final_task_execution_caller(cx: &Cx) -> McpResult<Cx> {
 /// cancelling one task must not give a pending sibling an application poll.
 struct FinalTaskHandoffWake {
     ready: AtomicBool,
-    parent: Mutex<Option<std::task::Waker>>,
+    parent: Mutex<Option<Arc<std::task::Waker>>>,
+}
+
+impl FinalTaskHandoffWake {
+    fn register_parent(&self, waker: &std::task::Waker) {
+        let unchanged = self
+            .parent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker));
+        if unchanged {
+            return;
+        }
+        let replacement = Arc::new(waker.clone());
+        let retired = {
+            self.parent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .replace(replacement)
+        };
+        drop(retired);
+    }
 }
 
 impl std::task::Wake for FinalTaskHandoffWake {
@@ -7060,7 +7109,7 @@ impl std::task::Wake for FinalTaskHandoffWake {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(parent) = parent {
-            parent.wake();
+            parent.wake_by_ref();
         }
     }
 }
@@ -9206,7 +9255,9 @@ impl FinalTaskRuntime {
             ));
         }
         if service.sender.is_closed() {
-            *signal = None;
+            let retired = signal.take();
+            drop(signal);
+            drop(retired);
             return Err(McpError::internal_error(
                 "Task service wakeup authority closed before runner start",
             ));
@@ -9232,18 +9283,35 @@ impl FinalTaskRuntime {
     }
 
     fn signal_task_service(&self, task_id: FinalTaskId) {
-        let mut signal = self
-            .service_signal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(service) = signal.as_ref() else {
-            return;
+        let (service_id, sender) = {
+            let signal = self
+                .service_signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(service) = signal.as_ref() else {
+                return;
+            };
+            (service.service_id, service.sender.clone())
         };
-        if service.sender.try_send(task_id).is_err() && service.sender.is_closed() {
-            // A completed or cancelled runner releases this process-local
-            // signal. The durable accepted-input record stays untouched for a
-            // later service generation to recover.
-            *signal = None;
+        // Committing to the channel may synchronously wake the receiver, whose
+        // executor can reenter readiness or cancellation on this runtime.
+        if sender.try_send(task_id).is_err() && sender.is_closed() {
+            let retired = {
+                let mut signal = self
+                    .service_signal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if signal.as_ref().is_some_and(|service| {
+                    service.service_id == service_id && service.sender.is_closed()
+                }) {
+                    // A stale failed send must not remove a replacement runner.
+                    // Durable work remains available to that runner's recovery.
+                    signal.take()
+                } else {
+                    None
+                }
+            };
+            drop(retired);
         }
     }
 
@@ -9516,12 +9584,7 @@ impl AuthorizedTaskServiceRunner {
                         return std::task::Poll::Ready(Turn::Cancelled);
                     }
                     for (index, handoff) in active.iter_mut().enumerate() {
-                        *handoff
-                            .wake
-                            .parent
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(task_context.waker().clone());
+                        handoff.wake.register_parent(task_context.waker());
                         if !handoff.wake.ready.swap(false, TaskServiceOrdering::AcqRel) {
                             continue;
                         }
@@ -11046,20 +11109,25 @@ impl Drop for FinalTaskServiceReadinessLease {
 impl Drop for AuthorizedTaskServiceRunner {
     fn drop(&mut self) {
         self.receiver.close();
-        let mut signal = self
-            .runtime
-            .service_signal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A runner is the sole owner of its generation. Its exit or future
-        // drop revokes readiness immediately, but a stale generation must not
-        // clear a newly installed service that won a close/install interleave.
-        if signal
-            .as_ref()
-            .is_some_and(|service| service.service_id == self.service_id)
-        {
-            *signal = None;
-        }
+        let retired = {
+            let mut signal = self
+                .runtime
+                .service_signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A runner is the sole owner of its generation. Its exit or future
+            // drop revokes readiness immediately, but a stale generation must not
+            // clear a newly installed service that won a close/install interleave.
+            if signal
+                .as_ref()
+                .is_some_and(|service| service.service_id == self.service_id)
+            {
+                signal.take()
+            } else {
+                None
+            }
+        };
+        drop(retired);
     }
 }
 
@@ -11278,6 +11346,247 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
     use std::time::Duration;
+
+    mod cancellation_wake_custody_tests {
+        use super::*;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        #[derive(Default)]
+        struct CallbackCounts {
+            wakes: AtomicUsize,
+            drops: AtomicUsize,
+            locked: AtomicUsize,
+        }
+
+        struct InspectingWake {
+            inspect: Box<dyn Fn() -> bool + Send + Sync>,
+            counts: Arc<CallbackCounts>,
+        }
+
+        impl InspectingWake {
+            fn inspect_lock(&self) {
+                if !(self.inspect)() {
+                    self.counts.locked.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+            }
+        }
+
+        impl Wake for InspectingWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.inspect_lock();
+                self.counts.wakes.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        impl Drop for InspectingWake {
+            fn drop(&mut self) {
+                self.inspect_lock();
+                self.counts.drops.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        fn inspecting_waker(
+            inspect: impl Fn() -> bool + Send + Sync + 'static,
+        ) -> (Waker, Arc<CallbackCounts>) {
+            let counts = Arc::new(CallbackCounts::default());
+            let waker = Waker::from(Arc::new(InspectingWake {
+                inspect: Box::new(inspect),
+                counts: Arc::clone(&counts),
+            }));
+            (waker, counts)
+        }
+
+        fn cancellation_waker(
+            registry: &Arc<FinalTaskCancellationWake>,
+        ) -> (Waker, Arc<CallbackCounts>) {
+            let registry = Arc::downgrade(registry);
+            inspecting_waker(move || {
+                let Some(registry) = registry.upgrade() else {
+                    return true;
+                };
+                // A bounded probe makes the old lock-held callback fail an
+                // assertion instead of hanging the test process.
+                if registry.state.try_lock().is_err() {
+                    return false;
+                }
+                let id = FinalTaskId::parse("callback-reentry").unwrap();
+                registry.activate(&id).is_ok()
+            })
+        }
+
+        #[test]
+        fn task_cancellation_waker_replacement_releases_old_callback_after_unlock() {
+            let registry = Arc::new(FinalTaskCancellationWake::default());
+            let id = FinalTaskId::parse("replace-waker").unwrap();
+            let registration = registry.activate(&id).unwrap();
+            let (waker, counts) = cancellation_waker(&registry);
+            registration.register_waker(&waker);
+            registration.register_waker(&waker);
+            drop(waker);
+            assert_eq!(counts.drops.load(AtomicOrdering::SeqCst), 0);
+
+            registration.register_waker(Waker::noop());
+
+            assert_eq!(counts.drops.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(counts.locked.load(AtomicOrdering::SeqCst), 0);
+            assert!(registry.state.lock().unwrap().active.contains_key(&id));
+        }
+
+        #[test]
+        fn task_cancellation_registration_retirement_releases_callback_after_unlock() {
+            let registry = Arc::new(FinalTaskCancellationWake::default());
+            let id = FinalTaskId::parse("retire-waker").unwrap();
+            let registration = registry.activate(&id).unwrap();
+            let (waker, counts) = cancellation_waker(&registry);
+            registration.register_waker(&waker);
+            drop(waker);
+            assert_eq!(counts.drops.load(AtomicOrdering::SeqCst), 0);
+
+            drop(registration);
+
+            assert_eq!(counts.drops.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(counts.locked.load(AtomicOrdering::SeqCst), 0);
+            assert!(!registry.state.lock().unwrap().active.contains_key(&id));
+            let replacement = registry.activate(&id).unwrap();
+            replacement.register_waker(Waker::noop());
+        }
+
+        #[test]
+        fn task_cancellation_wakes_only_the_current_registered_owner() {
+            let registry = Arc::new(FinalTaskCancellationWake::default());
+            let id = FinalTaskId::parse("active-waker").unwrap();
+            let sibling_id = FinalTaskId::parse("sibling-waker").unwrap();
+            let registration = registry.activate(&id).unwrap();
+            let sibling = registry.activate(&sibling_id).unwrap();
+            let (first, first_counts) = cancellation_waker(&registry);
+            let (second, second_counts) = cancellation_waker(&registry);
+            let (sibling_waker, sibling_counts) = cancellation_waker(&registry);
+            registration.register_waker(&first);
+            sibling.register_waker(&sibling_waker);
+
+            registry.wake_if_active(&id);
+            registry.wake_if_active(&id);
+            assert_eq!(first_counts.wakes.load(AtomicOrdering::SeqCst), 2);
+            assert_eq!(sibling_counts.wakes.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(first_counts.locked.load(AtomicOrdering::SeqCst), 0);
+
+            registration.register_waker(&second);
+            registry.wake_if_active(&id);
+            assert_eq!(first_counts.wakes.load(AtomicOrdering::SeqCst), 2);
+            assert_eq!(second_counts.wakes.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(second_counts.locked.load(AtomicOrdering::SeqCst), 0);
+            drop(registration);
+            registry.wake_if_active(&id);
+            assert_eq!(second_counts.wakes.load(AtomicOrdering::SeqCst), 1);
+
+            registry.wake_if_active(&sibling_id);
+            assert_eq!(sibling_counts.wakes.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(sibling_counts.locked.load(AtomicOrdering::SeqCst), 0);
+        }
+
+        #[test]
+        fn task_handoff_parent_replacement_and_wakes_run_after_unlock() {
+            let handoff = Arc::new(FinalTaskHandoffWake {
+                ready: AtomicBool::new(false),
+                parent: Mutex::new(None),
+            });
+            let parent = Arc::downgrade(&handoff);
+            let (first, first_counts) = inspecting_waker(move || {
+                parent
+                    .upgrade()
+                    .is_none_or(|parent| parent.parent.try_lock().is_ok())
+            });
+            handoff.register_parent(&first);
+            drop(first);
+            assert_eq!(first_counts.drops.load(AtomicOrdering::SeqCst), 0);
+
+            let parent = Arc::downgrade(&handoff);
+            let (second, second_counts) = inspecting_waker(move || {
+                parent
+                    .upgrade()
+                    .is_none_or(|parent| parent.parent.try_lock().is_ok())
+            });
+            handoff.register_parent(&second);
+            assert_eq!(first_counts.drops.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(first_counts.locked.load(AtomicOrdering::SeqCst), 0);
+            handoff.register_parent(&second);
+            assert_eq!(second_counts.drops.load(AtomicOrdering::SeqCst), 0);
+
+            let child_waker = Waker::from(Arc::clone(&handoff));
+            child_waker.wake_by_ref();
+            assert!(handoff.ready.swap(false, AtomicOrdering::SeqCst));
+            child_waker.wake_by_ref();
+            assert!(handoff.ready.load(AtomicOrdering::SeqCst));
+            assert_eq!(second_counts.wakes.load(AtomicOrdering::SeqCst), 2);
+            assert_eq!(second_counts.locked.load(AtomicOrdering::SeqCst), 0);
+            drop(second);
+            handoff.register_parent(Waker::noop());
+            assert_eq!(second_counts.drops.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(second_counts.locked.load(AtomicOrdering::SeqCst), 0);
+        }
+
+        fn ready_service() -> (FinalTaskRuntime, mpsc::Receiver<FinalTaskId>) {
+            let runtime = FinalTaskRuntime::in_memory(
+                FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+                Arc::new(|_| {}),
+            );
+            let (sender, receiver) = mpsc::channel(1);
+            *runtime.service_signal.lock().unwrap() = Some(FinalTaskServiceSignal {
+                service_id: 1,
+                sender,
+                ready_generation: Some(1),
+                last_ready_generation: 1,
+                cancellation_wake: Arc::new(FinalTaskCancellationWake::default()),
+            });
+            (runtime, receiver)
+        }
+
+        #[test]
+        fn task_service_channel_wake_can_reenter_runtime_readiness() {
+            let (runtime, mut receiver) = ready_service();
+            let callback_runtime = runtime.clone();
+            let (waker, counts) = inspecting_waker(move || {
+                if callback_runtime.service_signal.try_lock().is_err() {
+                    return false;
+                }
+                callback_runtime.is_task_service_ready()
+            });
+            let cx = Cx::for_testing();
+            let mut receive = Box::pin(receiver.recv(&cx));
+            let mut context = Context::from_waker(&waker);
+            assert!(receive.as_mut().poll(&mut context).is_pending());
+            assert_eq!(counts.wakes.load(AtomicOrdering::SeqCst), 0);
+            let id = FinalTaskId::parse("queued-cancellation").unwrap();
+
+            runtime.signal_task_service_cancellation(id.clone());
+
+            assert_eq!(counts.wakes.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(counts.locked.load(AtomicOrdering::SeqCst), 0);
+            assert!(matches!(
+                receive.as_mut().poll(&mut context),
+                Poll::Ready(Ok(received)) if received == id
+            ));
+            assert!(runtime.is_task_service_ready());
+        }
+
+        #[test]
+        fn task_service_full_queue_preserves_readiness_and_closed_queue_retires_it() {
+            let (runtime, mut receiver) = ready_service();
+            let first = FinalTaskId::parse("first-durable-wakeup").unwrap();
+            runtime.signal_task_service(first.clone());
+            runtime.signal_task_service(FinalTaskId::parse("coalesced-durable-wakeup").unwrap());
+            assert!(runtime.is_task_service_ready());
+            assert_eq!(receiver.try_recv().unwrap(), first);
+
+            receiver.close();
+            runtime.signal_task_service(FinalTaskId::parse("closed-service-wakeup").unwrap());
+            assert!(!runtime.has_installed_task_service());
+        }
+    }
 
     fn test_take_input(
         store: &InMemoryFinalTaskStore,
