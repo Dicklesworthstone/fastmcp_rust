@@ -99,7 +99,7 @@ const SCHEMA_STRING_WORK_UNIT_BYTES: usize = 64 * 1024;
 /// Maximum work units performed by one validation call, including schema
 /// applications, local-resource traversal, branch probes, regular-expression
 /// compilation and matching, object-property annotation bookkeeping, and
-/// additional 64 KiB chunks of large-string traversal or comparison.
+/// additional 64 KiB chunks of textual scalar traversal or comparison.
 pub const MAX_SCHEMA_VALIDATION_WORK: usize = 4_096;
 
 /// Maximum local `$ref` hops on a single validation path.
@@ -3325,7 +3325,7 @@ impl<'a> ValidationContext<'a> {
 }
 
 // Raw validation retains its historical small-instance work allowances, but
-// new large-string byte charges always debit the same finite validation fuel.
+// large string and number byte charges always debit the same finite validation fuel.
 fn consume_required_work_units(
     context: &mut ValidationContext<'_>,
     units: usize,
@@ -3463,6 +3463,17 @@ fn validate_instance_bounds(
                     "instance number exceeds exact comparison bound",
                 );
                 return false;
+            }
+            if !final_semantics {
+                // Arbitrary-precision numbers retain their complete source
+                // spelling in raw mode, including unevaluated fields. Bound
+                // and charge that text before serialization or applicators.
+                let bytes = number.as_str().len();
+                if bytes > MAX_SCHEMA_INSTANCE_BYTES {
+                    push_error(errors, path, "instance number byte limit exceeded");
+                    return false;
+                }
+                *string_work += additional_string_work(bytes);
             }
         }
         Value::Null | Value::Bool(_) => {}
@@ -5896,9 +5907,9 @@ fn trim_decimal_integer(value: &mut String) {
     }
 }
 
-/// Compares schema values while charging large strings in both validation
-/// modes. Admitted final schemas additionally charge each recursive step and
-/// compare numbers mathematically; raw schemas retain representation equality.
+/// Compares schema values while charging large textual scalars in both
+/// validation modes. Admitted final schemas additionally charge each recursive
+/// step and compare numbers mathematically; raw schemas retain representation equality.
 fn json_schema_equal_with_work(
     left: &Value,
     right: &Value,
@@ -5916,6 +5927,14 @@ fn json_schema_equal_with_work(
                     .zip(ExactDecimal::from_number(right))
                     .is_some_and(|(left, right)| left.compare(&right) == Ordering::Equal),
             )
+        }
+        (Value::Number(left), Value::Number(right)) => {
+            let bytes = left.as_str().len();
+            if bytes != right.as_str().len() {
+                return Some(false);
+            }
+            consume_required_work_units(context, additional_string_work(bytes), path, errors)
+                .then(|| left == right)
         }
         (Value::String(left), Value::String(right)) => {
             if left.len() != right.len() {
@@ -5954,8 +5973,8 @@ fn json_schema_equal_with_work(
 }
 
 // Raw uniqueItems preserves its historical serialized-representation equality.
-// Charge the newly admitted large strings before serializing and hashing each
-// item, including strings inside nested arrays and objects.
+// Charge large strings and arbitrary-precision number spellings before
+// serializing and hashing each item, including nested arrays and objects.
 fn charge_large_string_tree(
     value: &Value,
     path: &str,
@@ -5972,7 +5991,13 @@ fn charge_large_string_tree(
         Value::Object(values) => values
             .values()
             .all(|value| charge_large_string_tree(value, path, errors, context)),
-        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+        Value::Number(value) => consume_required_work_units(
+            context,
+            additional_string_work(value.as_str().len()),
+            path,
+            errors,
+        ),
+        Value::Null | Value::Bool(_) => true,
     }
 }
 
@@ -5987,6 +6012,26 @@ fn validate_number(
 ) {
     if final_semantics {
         validate_exact_number(schema, n, path, errors, context);
+        return;
+    }
+    // Raw mode intentionally retains f64 semantics, but conversion still
+    // scans arbitrary-precision source text. Charge both the instance and
+    // numeric schema operands before any conversion, including values whose
+    // conversion returns None rather than a finite f64.
+    let mut operand_work = additional_string_work(n.as_str().len());
+    for keyword in [
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    ] {
+        if let Some(bound) = schema.get(keyword).and_then(Value::as_number) {
+            operand_work =
+                operand_work.saturating_add(additional_string_work(bound.as_str().len()));
+        }
+    }
+    if !consume_required_work_units(context, operand_work, path, errors) {
         return;
     }
     let val = n.as_f64().unwrap_or(0.0);
@@ -10919,6 +10964,175 @@ mod tests {
             );
             assert_eq!(schema.schema(), &source);
         }
+    }
+
+    fn raw_large_decimal(integer: u8) -> Value {
+        serde_json::from_str(&format!(
+            "{integer}.{}",
+            "0".repeat(2 * SCHEMA_STRING_WORK_UNIT_BYTES)
+        ))
+        .expect("a finite number retaining more than two 64 KiB chunks of decimal text")
+    }
+
+    #[test]
+    fn schema_raw_numeric_text_preflight_bounds_and_work() {
+        let instance = json!({"unevaluated": [raw_large_decimal(1)]});
+        let mut nodes = 0;
+        let mut work = 0;
+        let mut errors = Vec::new();
+        assert!(validate_instance_bounds(
+            &instance,
+            "root",
+            0,
+            false,
+            &mut nodes,
+            &mut work,
+            &mut errors,
+        ));
+        assert_eq!(work, 2);
+        assert!(errors.is_empty());
+        validate(&Value::Bool(true), &instance)
+            .expect("raw boolean schemas retain bounded unevaluated numbers");
+
+        let accepted = arbitrary_precision_number(MAX_SCHEMA_INSTANCE_BYTES);
+        let planted = arbitrary_precision_number(MAX_SCHEMA_INSTANCE_BYTES + 1);
+        for source in [Value::Bool(true), json!({})] {
+            validate(&source, &accepted).expect("the exact raw numeric byte boundary remains valid");
+            for result in [
+                validate(&source, &planted),
+                validate_strict(&source, &planted),
+            ] {
+                let errors = result.expect_err("one extra byte must fail before numeric traversal");
+                assert_eq!(errors[0].message, "instance number byte limit exceeded");
+                assert_eq!(errors[0].code(), "SchemaResourceLimit");
+            }
+        }
+        assert_eq!(
+            accepted.as_number().unwrap().as_str().len(),
+            MAX_SCHEMA_INSTANCE_BYTES
+        );
+    }
+
+    #[test]
+    fn schema_raw_numeric_text_equality_charges_nested_number_scans() {
+        let instance = json!({"nested": [raw_large_decimal(1)]});
+        for keyword in ["const", "enum"] {
+            let assertion = if keyword == "enum" {
+                json!([instance.clone()])
+            } else {
+                instance.clone()
+            };
+            let source = json!({keyword: assertion});
+            // One schema application plus two additional scalar-text chunks.
+            for (fuel, accepted) in [(3, true), (2, false)] {
+                let mut context = ValidationContext::new(&source, false);
+                context.remaining_work = fuel;
+                let mut errors = Vec::new();
+                validate_internal(&source, &instance, "root", &mut errors, &mut context);
+                assert_eq!(errors.is_empty(), accepted, "{keyword}, fuel {fuel}");
+                assert_eq!(context.work_exhausted, !accepted);
+                if !accepted {
+                    assert_eq!(errors[0].message, "schema validation work limit exceeded");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn schema_raw_numeric_text_uniqueness_charges_nested_serialization() {
+        let source = json!({"uniqueItems": true});
+        let instance = json!([
+            {"nested": [raw_large_decimal(1)]},
+            {"nested": [raw_large_decimal(2)]}
+        ]);
+        // One schema application and two additional chunks for each number.
+        for (fuel, accepted) in [(5, true), (4, false)] {
+            let mut context = ValidationContext::new(&source, false);
+            context.remaining_work = fuel;
+            let mut errors = Vec::new();
+            validate_internal(&source, &instance, "root", &mut errors, &mut context);
+            assert_eq!(errors.is_empty(), accepted);
+            assert_eq!(context.work_exhausted, !accepted);
+            if !accepted {
+                assert_eq!(errors[0].message, "schema validation work limit exceeded");
+            }
+        }
+    }
+
+    #[test]
+    fn schema_raw_numeric_text_conversion_charges_both_operands() {
+        let instance = raw_large_decimal(1);
+        for (keyword, bound) in [
+            ("minimum", 1),
+            ("maximum", 1),
+            ("exclusiveMinimum", 0),
+            ("exclusiveMaximum", 2),
+            ("multipleOf", 1),
+        ] {
+            let source = json!({keyword: raw_large_decimal(bound)});
+            // Both finite operands have two additional chunks; only fuel changes.
+            for (fuel, accepted) in [(5, true), (4, false)] {
+                let mut context = ValidationContext::new(&source, false);
+                context.remaining_work = fuel;
+                let mut errors = Vec::new();
+                validate_internal(&source, &instance, "root", &mut errors, &mut context);
+                assert_eq!(errors.is_empty(), accepted, "{keyword}, fuel {fuel}");
+                assert_eq!(context.work_exhausted, !accepted);
+                if !accepted {
+                    assert_eq!(errors[0].message, "schema validation work limit exceeded");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn schema_raw_numeric_text_work_cannot_be_swallowed_by_fallback() {
+        let group = json!({"allOf": vec![json!({"$ref": "#/$defs/bound"}); 64]});
+        let accepted = json!({
+            "$defs": {"bound": {"minimum": 1.0}},
+            "anyOf": [{"allOf": vec![group; 16]}, true]
+        });
+        let mut planted = accepted.clone();
+        planted["$defs"]["bound"]["minimum"] = raw_large_decimal(1);
+        let instance = json!(1.0);
+        validate(&accepted, &instance).expect("ordinary numeric references fit the work budget");
+        validate_strict(&accepted, &instance)
+            .expect("strict raw validation keeps the same ordinary numeric result");
+        for result in [
+            validate(&planted, &instance),
+            validate_strict(&planted, &instance),
+        ] {
+            let errors = result.expect_err(
+                "equivalent large numeric text must exhaust fuel before a true fallback can admit",
+            );
+            assert!(errors.iter().any(|error| {
+                error.message == "schema validation work limit exceeded"
+                    && error.code() == "SchemaResourceLimit"
+            }));
+        }
+        assert_eq!(accepted["$defs"]["bound"]["minimum"], json!(1.0));
+    }
+
+    #[test]
+    fn schema_raw_numeric_text_charging_preserves_small_number_semantics() {
+        let source = json!({
+            "minimum": 0.25,
+            "maximum": 1.5,
+            "exclusiveMinimum": 0.0,
+            "exclusiveMaximum": 2.0,
+            "multipleOf": 0.125
+        });
+        validate(&source, &json!(1.0)).expect("ordinary finite arithmetic remains valid");
+        assert!(validate(&source, &json!(0.0)).is_err());
+        validate(&json!({"const": 1.0}), &json!(1.0))
+            .expect("raw identical numeric representations still match");
+        assert!(validate(&json!({"const": 1}), &json!(1.0)).is_err());
+        validate(&json!({"uniqueItems": true}), &json!([1, 1.0]))
+            .expect("raw uniqueness retains representation semantics");
+        admit_final_schema(json!({"const": 1}))
+            .unwrap()
+            .validate(&json!(1.0))
+            .expect("admitted final numeric equality remains mathematical");
     }
 
     fn schema_raw_large_string_work_fixtures(excess: usize) -> Vec<(Value, Value)> {
