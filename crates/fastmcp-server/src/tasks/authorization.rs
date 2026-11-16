@@ -3108,7 +3108,11 @@ mod tests {
         let runner = runtime
             .install_task_service(1, Arc::new(IdleSupervisor))
             .unwrap();
-        let cx = Cx::for_testing();
+        let service_owner = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = service_owner.request_cx_with_budget(asupersync::Budget::INFINITE);
         let mut service = Box::pin(runner.run(&cx));
         let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(matches!(

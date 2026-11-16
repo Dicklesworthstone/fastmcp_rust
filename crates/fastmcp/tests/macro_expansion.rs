@@ -1816,7 +1816,7 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
         let service_runner = runtime
             .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
             .expect("the facade installs an application-owned task service");
-        let service_cx = Cx::for_testing();
+        let service_cx = Cx::current().expect("the caller runtime owns the Task service");
         let mut running_service = Box::pin(service_runner.run(&service_cx));
         let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(matches!(
@@ -1889,7 +1889,7 @@ fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
         let service_runner = runtime
             .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
             .expect("the facade installs an application-owned task service");
-        let service_cx = Cx::for_testing();
+        let service_cx = Cx::current().expect("the caller runtime owns the Task service");
         let mut running_service = Box::pin(service_runner.run(&service_cx));
         let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(matches!(

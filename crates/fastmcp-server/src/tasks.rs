@@ -79,7 +79,7 @@ use base64::Engine as _;
 use fastmcp_core::crypto::Sha256Digest;
 #[cfg(test)]
 use fastmcp_core::logging::{debug, info, targets, warn};
-use fastmcp_core::runtime::{ProcessGeneration, ProcessGenerationGuard};
+use fastmcp_core::runtime::{CallerContextFuture, ProcessGeneration, ProcessGenerationGuard};
 use fastmcp_core::{McpContext, McpError, McpResult, draw_security_identifier};
 use fastmcp_protocol::tasks_extension::TaskStatusNotificationParams as FinalTaskStatusNotificationParams;
 use fastmcp_protocol::{
@@ -7067,6 +7067,20 @@ fn final_task_execution_caller(cx: &Cx) -> McpResult<Cx> {
     Ok(caller)
 }
 
+/// Admits the caller before publishing readiness or claiming work. Both service
+/// modes are persistent loops: even an empty store needs the recovery timer on
+/// its first pending poll. A driverless context must not silently borrow the
+/// host's driver or start asupersync's process-global fallback timer.
+fn final_task_service_caller(cx: &Cx) -> McpResult<Cx> {
+    let caller = final_task_execution_caller(cx)?;
+    if caller.timer_driver().is_none() {
+        return Err(McpError::internal_error(
+            "A Task service requires the caller's timer driver",
+        ));
+    }
+    Ok(caller)
+}
+
 /// Only the handoff that was woken is polled on a service turn. In particular,
 /// cancelling one task must not give a pending sibling an application poll.
 struct FinalTaskHandoffWake {
@@ -9398,8 +9412,11 @@ impl AuthorizedTaskServiceRunner {
     /// [`Self::run_service`] instead. That retained-runner surface can be
     /// re-entered by the caller after its prior service future exits, allowing
     /// recovery to remain inside one caller-owned structured region.
-    pub async fn run(mut self, cx: &Cx) -> McpResult<()> {
-        self.run_service(cx).await
+    pub fn run(self, cx: &Cx) -> impl Future<Output = McpResult<()>> + Send + '_ {
+        CallerContextFuture::new(cx, async move {
+            let mut runner = self;
+            runner.run_service_on_caller(cx).await
+        })
     }
 
     /// Runs recovery and bounded wakeup handling while retaining this
@@ -9433,6 +9450,12 @@ impl AuthorizedTaskServiceRunner {
     /// separately installed runners only when the durable store supplies the
     /// necessary cross-owner fencing.
     ///
+    /// The explicit caller owns recovery timers, cancellation and execution
+    /// authority even when a different host polls the future. The host's
+    /// capability restrictions are retained at construction and on every poll,
+    /// including abandonment. A caller without a timer driver is refused before
+    /// the service publishes readiness or claims durable work.
+    ///
     /// ```compile_fail
     /// # use fastmcp_server::AuthorizedTaskServiceRunner;
     /// # async fn cannot_start_two_service_loops(
@@ -9444,7 +9467,16 @@ impl AuthorizedTaskServiceRunner {
     /// let _ = (first, second);
     /// # }
     /// ```
-    pub async fn run_service(&mut self, cx: &Cx) -> McpResult<()> {
+    pub fn run_service<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = McpResult<()>> + Send + 'a {
+        CallerContextFuture::new(cx, self.run_service_on_caller(cx))
+    }
+
+    async fn run_service_on_caller(&mut self, cx: &Cx) -> McpResult<()> {
+        let caller = final_task_service_caller(cx)?;
+        let cx = &caller;
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
         self.runtime.store.execution_limits()?;
@@ -9472,8 +9504,18 @@ impl AuthorizedTaskServiceRunner {
                     FINAL_TASK_RECOVERY_WAKE_INTERVAL,
                 ));
                 std::future::poll_fn(|task_context| {
+                    // A resumed host can narrow the admitted ceiling. Refuse
+                    // before polling Sleep: without TIME it would otherwise
+                    // start a process-global fallback timer.
+                    if let Err(error) = final_task_service_caller(cx) {
+                        return std::task::Poll::Ready(Err(error));
+                    }
                     if let std::task::Poll::Ready(result) = receiver.as_mut().poll(task_context) {
-                        return std::task::Poll::Ready(result.map(Some));
+                        return std::task::Poll::Ready(result.map(Some).map_err(|error| {
+                            McpError::internal_error(format!(
+                                "Task service wakeup receive failed: {error}"
+                            ))
+                        }));
                     }
                     if recovery_wake.as_mut().poll(task_context).is_ready() {
                         return std::task::Poll::Ready(Ok(None));
@@ -9486,11 +9528,7 @@ impl AuthorizedTaskServiceRunner {
                 Ok(Some(task_id)) => Some(task_id),
                 Ok(None) => None,
                 Err(_) if cx.checkpoint().is_err() => return Ok(()),
-                Err(error) => {
-                    return Err(McpError::internal_error(format!(
-                        "Task service wakeup receive failed: {error}"
-                    )));
-                }
+                Err(error) => return Err(error),
             };
             if let Some(task_id) = task_id {
                 if let Err(error) = self.resume_task(cx, &task_id).await {
@@ -9514,6 +9552,7 @@ impl AuthorizedTaskServiceRunner {
             Completed(usize, McpResult<()>),
             Recover,
             Cancelled,
+            CallerFailed(McpError),
             ReceiveFailed(String),
         }
 
@@ -9527,6 +9566,10 @@ impl AuthorizedTaskServiceRunner {
             if cx.checkpoint().is_err() {
                 Self::settle_active_handoffs(&mut active).await;
                 return Ok(());
+            }
+            if let Err(error) = final_task_service_caller(cx) {
+                Self::settle_active_handoffs(&mut active).await;
+                return Err(error);
             }
             if let Err(error) = self.runtime.expire_pending_execution(cx) {
                 Self::settle_active_handoffs(&mut active).await;
@@ -9582,6 +9625,9 @@ impl AuthorizedTaskServiceRunner {
                 std::future::poll_fn(|task_context| {
                     if cx.checkpoint().is_err() {
                         return std::task::Poll::Ready(Turn::Cancelled);
+                    }
+                    if let Err(error) = final_task_service_caller(cx) {
+                        return std::task::Poll::Ready(Turn::CallerFailed(error));
                     }
                     for (index, handoff) in active.iter_mut().enumerate() {
                         handoff.wake.register_parent(task_context.waker());
@@ -9657,6 +9703,12 @@ impl AuthorizedTaskServiceRunner {
                     Self::settle_active_handoffs(&mut active).await;
                     return Ok(());
                 }
+                Turn::CallerFailed(error) => {
+                    // Preserve the ordinary error path's child settlement;
+                    // capability loss cannot abandon active handoffs.
+                    Self::settle_active_handoffs(&mut active).await;
+                    return Err(error);
+                }
                 Turn::ReceiveFailed(error) => {
                     Self::settle_active_handoffs(&mut active).await;
                     return Err(McpError::internal_error(format!(
@@ -9711,6 +9763,7 @@ impl AuthorizedTaskServiceRunner {
         cx: &Cx,
         excluded_task_ids: &BTreeSet<FinalTaskId>,
     ) -> McpResult<Option<(FinalTaskRecoveryKind, FinalTaskSupervisorHandoff)>> {
+        final_task_service_caller(cx)?;
         self.runtime.expire_pending_execution(cx)?;
         // These are admission scan cursors, distinct from the concurrent
         // runner's last-polled checkpoints. Skipping cleanup-owned tasks
@@ -9822,6 +9875,7 @@ impl AuthorizedTaskServiceRunner {
     }
 
     async fn resume_task(&self, cx: &Cx, task_id: &FinalTaskId) -> McpResult<()> {
+        final_task_service_caller(cx)?;
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
         if let Some(initial) =
@@ -11658,6 +11712,27 @@ mod tests {
         )
     }
 
+
+    fn task_service_test_caller() -> (asupersync::runtime::Runtime, Cx) {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("build the test's caller-owned Task runtime");
+        let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+        (runtime, caller)
+    }
+
+    fn task_service_test_future<'a>(
+        runner: &'a mut Option<AuthorizedTaskServiceRunner>,
+        cx: &'a Cx,
+        consume: bool,
+    ) -> Pin<Box<dyn Future<Output = McpResult<()>> + Send + 'a>> {
+        if consume {
+            Box::pin(runner.take().expect("one-shot runner is present").run(cx))
+        } else {
+            Box::pin(runner.as_mut().expect("retained runner is present").run_service(cx))
+        }
+    }
 
     fn with_task_test_runtime(scenario: impl Future<Output = ()>) {
         let runtime = RuntimeBuilder::current_thread()
@@ -16712,7 +16787,7 @@ mod tests {
         let service_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("installing a caller-owned service reserves the runner");
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let _running_service = enter_task_service_runner(service_runner, &service_cx);
 
         let task_id = runtime
@@ -17371,7 +17446,7 @@ mod tests {
         let runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .unwrap();
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let _running_service = enter_task_service_runner(runner, &service_cx);
         let result = match phase {
             AtomicTaskCommitPhase::Create => {
@@ -17567,7 +17642,7 @@ mod tests {
             let runner = runtime
                 .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
                 .unwrap();
-            let cx = Cx::for_testing();
+            let (_service_owner, cx) = task_service_test_caller();
             let _service = enter_task_service_runner(runner, &cx);
             let created = runtime
                 .create_task_with_work(final_test_work_descriptor(), None)
@@ -18147,7 +18222,7 @@ mod tests {
         let service_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("installing a caller-owned service reserves the runner");
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let _running_service = enter_task_service_runner(service_runner, &service_cx);
         let first = runtime
             .create_task_with_work(final_test_work_descriptor(), None)
@@ -19008,7 +19083,7 @@ mod tests {
         let service_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install caller-owned service runner for task creation");
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let _running_service = enter_task_service_runner(service_runner, &service_cx);
 
         let created = runtime
@@ -19710,7 +19785,7 @@ mod tests {
             let runner = runtime
                 .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
                 .unwrap();
-            let cx = Cx::for_testing();
+            let (_service_owner, cx) = task_service_test_caller();
             let _running = enter_task_service_runner(runner, &cx);
             let error = runtime
                 .create_task_with_work(final_test_work_descriptor(), None)
@@ -19795,7 +19870,7 @@ mod tests {
         let service_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install caller-owned service runner for task creation");
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let _running_service = enter_task_service_runner(service_runner, &service_cx);
 
         let created = runtime
@@ -23459,7 +23534,7 @@ mod tests {
         let dummy_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install initial dummy runner to create tasks");
-        let dummy_cx = Cx::for_testing();
+        let (_dummy_owner, dummy_cx) = task_service_test_caller();
         let running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
 
         // Start with ONLY task 1 created before runner starts.
@@ -23549,7 +23624,7 @@ mod tests {
         let dummy_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install initial dummy runner to create tasks");
-        let dummy_cx = Cx::for_testing();
+        let (_dummy_owner, dummy_cx) = task_service_test_caller();
         let running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
 
         let created = runtime
@@ -23867,7 +23942,7 @@ mod tests {
         let dummy_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install initial dummy runner to create tasks");
-        let dummy_cx = Cx::for_testing();
+        let (_dummy_owner, dummy_cx) = task_service_test_caller();
         let running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
 
         runtime
@@ -23948,7 +24023,7 @@ mod tests {
         let dummy_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install initial dummy runner to create tasks");
-        let dummy_cx = Cx::for_testing();
+        let (_dummy_owner, dummy_cx) = task_service_test_caller();
         let running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
 
         let created = runtime
@@ -24019,7 +24094,7 @@ mod tests {
         let dummy_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install initial dummy runner to create tasks");
-        let dummy_cx = Cx::for_testing();
+        let (_dummy_owner, dummy_cx) = task_service_test_caller();
         let running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
 
         let created = runtime
@@ -25159,7 +25234,7 @@ mod tests {
         let service_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install caller-owned service runner before task advertisement");
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let _running_service = enter_task_service_runner(service_runner, &service_cx);
 
         let created = runtime
@@ -25462,7 +25537,7 @@ mod tests {
         let runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install a ready service before public task creation");
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let _running_service = enter_task_service_runner(runner, &service_cx);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -26476,7 +26551,7 @@ mod tests {
             runtime.ensure_task_service_ready().is_err(),
             "the probe remains false until the runner has entered"
         );
-        let readiness_cx = Cx::for_testing();
+        let (_readiness_owner, readiness_cx) = task_service_test_caller();
         let running_service = enter_task_service_runner(runner, &readiness_cx);
         runtime
             .ensure_task_service_ready()
@@ -26553,7 +26628,7 @@ mod tests {
         let runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install caller-owned task service runner");
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let running_service = enter_task_service_runner(runner, &service_cx);
 
         runtime
@@ -26577,7 +26652,7 @@ mod tests {
             .with_admission_capacity(3, 1, 4_096, 2_048).unwrap();
         let runtime = FinalTaskRuntime::new(store.clone(), config, Arc::new(|_| {}));
         let mut runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
-        let cx = Cx::for_testing();
+        let (_service_owner, cx) = task_service_test_caller();
         let mut running = Box::pin(runner.run_service(&cx));
         let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(running.as_mut().poll(&mut poll).is_pending());
@@ -26624,7 +26699,7 @@ mod tests {
             .with_admission_capacity(1, 1, 4_096, 4_096).unwrap();
         let runtime = FinalTaskRuntime::new(store.clone(), config, Arc::new(|_| {}));
         let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
-        let cx = Cx::for_testing();
+        let (_service_owner, cx) = task_service_test_caller();
         let running = enter_task_service_runner(runner, &cx);
         let mut permit = runtime.reserve_task_creation(None, 1_000, None).unwrap();
         assert!(permit.admit_commit(&runtime, None).is_ok());
@@ -26651,7 +26726,7 @@ mod tests {
         );
         store.observe_service_signal(Arc::clone(&runtime.service_signal));
         let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
-        let cx = Cx::for_testing();
+        let (_service_owner, cx) = task_service_test_caller();
         let running = enter_task_service_runner(runner, &cx);
         let cancelled = fastmcp_core::McpRequestCancellation::new();
         let hook_cancellation = cancelled.clone();
@@ -26704,6 +26779,292 @@ mod tests {
             !store.observed_unlocked_ready_service.load(AtomicOrdering::SeqCst),
             "a rejected creation cannot call the durable store"
         );
+    }
+
+    #[test]
+    fn task_03_final_service_recovery_uses_and_releases_only_callers_timer() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use std::task::{Context, Poll, Waker};
+
+        for concurrency in [1, 2] {
+            for consume in [false, true] {
+                for cancel in [false, true] {
+                    let caller_clock = Arc::new(VirtualClock::new());
+                    let caller_timer =
+                        TimerDriverHandle::with_virtual_clock(Arc::clone(&caller_clock));
+                    let caller_runtime = RuntimeBuilder::current_thread()
+                        .blocking_threads(0, 0)
+                        .with_timer_driver(caller_timer.clone())
+                        .build()
+                        .unwrap();
+                    let caller = caller_runtime.request_cx_with_budget(Budget::INFINITE);
+                    let host_clock = Arc::new(VirtualClock::new());
+                    host_clock.advance(4_000_000_000);
+                    let host_timer =
+                        TimerDriverHandle::with_virtual_clock(Arc::clone(&host_clock));
+                    let host_runtime = RuntimeBuilder::current_thread()
+                        .blocking_threads(0, 0)
+                        .with_timer_driver(host_timer.clone())
+                        .build()
+                        .unwrap();
+                    let host = host_runtime.request_cx_with_budget(Budget::INFINITE);
+                    let store = Arc::new(InMemoryFinalTaskStore::default());
+                    let task_runtime = final_task_runtime(
+                        Arc::clone(&store),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    let mut runner = Some(
+                        task_runtime
+                            .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
+                            .unwrap()
+                            .with_max_concurrent_handoffs(concurrency)
+                            .unwrap(),
+                    );
+                    let installed = Cx::set_current(Some(host.clone()));
+                    let mut service = task_service_test_future(&mut runner, &caller, consume);
+                    let mut context = Context::from_waker(Waker::noop());
+
+                    assert!(service.as_mut().poll(&mut context).is_pending());
+                    assert!(task_runtime.is_task_service_ready());
+                    assert_eq!(caller_timer.pending_count(), 1);
+                    assert_eq!(host_timer.pending_count(), 0);
+                    assert_eq!(Cx::current().unwrap().now(), host.now());
+                    assert_ne!(Cx::current().unwrap().now(), caller.now());
+
+                    // A foreign clock and cancellation token cannot advance or
+                    // end the explicit caller's service.
+                    host_clock.advance(2_000_000_000);
+                    assert_eq!(host_timer.process_timers(), 0);
+                    host.cancel_with(CancelKind::User, None);
+                    assert!(service.as_mut().poll(&mut context).is_pending());
+                    assert!(caller.checkpoint().is_ok());
+                    assert!(task_runtime.is_task_service_ready());
+                    assert_eq!(caller_timer.pending_count(), 1);
+
+                    // Loan the caller's worker to this poll so it cannot consume
+                    // the virtual timer between advance and observation.
+                    let fired = caller_runtime.block_on(async {
+                        caller_clock.advance(1_000_000_000);
+                        caller_timer.process_timers()
+                    });
+                    assert_eq!(fired, 1);
+                    assert!(service.as_mut().poll(&mut context).is_pending());
+                    assert_eq!(caller_timer.pending_count(), 1);
+                    assert_eq!(host_timer.pending_count(), 0);
+
+                    if cancel {
+                        caller.cancel_with(CancelKind::User, None);
+                        assert!(matches!(
+                            service.as_mut().poll(&mut context),
+                            Poll::Ready(Ok(()))
+                        ));
+                    }
+                    drop(service);
+                    assert!(!task_runtime.is_task_service_ready());
+                    assert_eq!(caller_timer.pending_count(), 0);
+                    assert_eq!(host_timer.pending_count(), 0);
+                    assert_eq!(store.task_count(), 0);
+                    assert!(task_runtime
+                        .create_task_with_work(final_test_work_descriptor(), None)
+                        .is_err());
+                    assert_eq!(Cx::current().unwrap().now(), host.now());
+                    assert_ne!(Cx::current().unwrap().now(), caller.now());
+                    drop(runner);
+                    drop(installed);
+                    drop(caller);
+                    drop(host);
+                    assert!(caller_runtime.shutdown_timeout(StdDuration::from_secs(1)));
+                    assert!(host_runtime.shutdown_timeout(StdDuration::from_secs(1)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task_03_final_service_refuses_driverless_caller_before_readiness_or_claims() {
+        use std::task::{Context, Poll, Waker};
+
+        for concurrency in [1, 2] {
+            for consume in [false, true] {
+                let (host_runtime, host) = task_service_test_caller();
+                let host_timer = host.timer_driver().unwrap();
+                let installed = Cx::set_current(Some(host.clone()));
+                let caller = Cx::for_testing();
+                assert!(caller.timer_driver().is_none());
+                let store = Arc::new(InMemoryFinalTaskStore::default());
+                let advertised = Arc::new(AtomicBool::new(false));
+                let task_runtime = final_task_runtime(Arc::clone(&store), Arc::clone(&advertised));
+                let task = final_working_task_without_ttl("service-driverless-caller");
+                let task_id = task.base().task_id.clone();
+                let work = final_test_work_descriptor();
+                store
+                    .create_task_with_work(
+                        task.clone(),
+                        final_task_notification(&task),
+                        work.clone(),
+                    )
+                    .unwrap();
+                let mut runner = Some(
+                    task_runtime
+                        .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
+                        .unwrap()
+                        .with_max_concurrent_handoffs(concurrency)
+                        .unwrap(),
+                );
+                let mut service = task_service_test_future(&mut runner, &caller, consume);
+                let mut context = Context::from_waker(Waker::noop());
+
+                assert!(matches!(
+                    service.as_mut().poll(&mut context),
+                    Poll::Ready(Err(error))
+                        if error.message == "A Task service requires the caller's timer driver"
+                ));
+                assert!(!task_runtime.is_task_service_ready());
+                assert_eq!(store.active_task_count(), 0);
+                assert_eq!(store.task_count(), 1);
+                assert_exact_initial_work_is_recoverable(&store, &task_id, &work);
+                assert!(!advertised.load(AtomicOrdering::SeqCst));
+                assert_eq!(host_timer.pending_count(), 0);
+                assert!(host.checkpoint().is_ok());
+                drop(service);
+                drop(runner);
+                drop(installed);
+                drop(host);
+                assert!(host_runtime.shutdown_timeout(StdDuration::from_secs(1)));
+            }
+        }
+    }
+
+    #[test]
+    fn task_03_final_service_latches_construction_capabilities_before_first_poll() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use std::task::{Context, Poll, Waker};
+
+        for mask in [
+            CapSet::<false, true, true, true, true>::MASK,
+            CapSet::<true, false, true, true, true>::MASK,
+        ] {
+            for concurrency in [1, 2] {
+                for consume in [false, true] {
+                    let (caller_runtime, caller) = task_service_test_caller();
+                    let timer = caller.timer_driver().unwrap();
+                    let installed = Cx::set_current(Some(caller.clone()));
+                    let store = Arc::new(InMemoryFinalTaskStore::default());
+                    let task_runtime = final_task_runtime(
+                        Arc::clone(&store),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    let mut runner = Some(
+                        task_runtime
+                            .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
+                            .unwrap()
+                            .with_max_concurrent_handoffs(concurrency)
+                            .unwrap(),
+                    );
+                    let restriction = Cx::push_restriction(mask);
+                    let mut service = task_service_test_future(&mut runner, &caller, consume);
+                    drop(restriction);
+                    assert!(Cx::current().unwrap().capabilities().spawn);
+                    assert!(Cx::current().unwrap().capabilities().time);
+                    let mut context = Context::from_waker(Waker::noop());
+
+                    assert!(matches!(
+                        service.as_mut().poll(&mut context),
+                        Poll::Ready(Err(error)) if error.message.contains("capabilities")
+                    ));
+                    assert!(!task_runtime.is_task_service_ready());
+                    assert_eq!(store.task_count(), 0);
+                    assert_eq!(timer.pending_count(), 0);
+                    assert!(caller.checkpoint().is_ok());
+                    assert!(caller.capabilities().spawn);
+                    assert!(caller.capabilities().time);
+                    drop(service);
+                    drop(runner);
+                    drop(installed);
+                    drop(caller);
+                    assert!(caller_runtime.shutdown_timeout(StdDuration::from_secs(1)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task_03_final_service_rechecks_poll_capabilities_before_recovery() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use std::task::{Context, Poll, Waker};
+
+        for mask in [
+            CapSet::<false, true, true, true, true>::MASK,
+            CapSet::<true, false, true, true, true>::MASK,
+        ] {
+            for concurrency in [1, 2] {
+                for consume in [false, true] {
+                    let timer =
+                        TimerDriverHandle::with_virtual_clock(Arc::new(VirtualClock::new()));
+                    let caller_runtime = RuntimeBuilder::current_thread()
+                        .blocking_threads(0, 0)
+                        .with_timer_driver(timer.clone())
+                        .build()
+                        .unwrap();
+                    let caller = caller_runtime.request_cx_with_budget(Budget::INFINITE);
+                    let installed = Cx::set_current(Some(caller.clone()));
+                    let store = Arc::new(InMemoryFinalTaskStore::default());
+                    let task_runtime = final_task_runtime(
+                        Arc::clone(&store),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    let mut runner = Some(
+                        task_runtime
+                            .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
+                            .unwrap()
+                            .with_max_concurrent_handoffs(concurrency)
+                            .unwrap(),
+                    );
+                    let mut service = task_service_test_future(&mut runner, &caller, consume);
+                    let mut context = Context::from_waker(Waker::noop());
+                    assert!(service.as_mut().poll(&mut context).is_pending());
+                    assert!(task_runtime.is_task_service_ready());
+                    assert_eq!(timer.pending_count(), 1);
+
+                    // Insert recoverable work without a service signal. Losing
+                    // authority before the next poll must not claim it, nor
+                    // replace the caller's timer with a global fallback.
+                    let task = final_working_task_without_ttl("service-restricted-resume");
+                    let task_id = task.base().task_id.clone();
+                    let work = final_test_work_descriptor();
+                    store
+                        .create_task_with_work(
+                            task.clone(),
+                            final_task_notification(&task),
+                            work.clone(),
+                        )
+                        .unwrap();
+                    let restriction = Cx::push_restriction(mask);
+                    assert!(matches!(
+                        service.as_mut().poll(&mut context),
+                        Poll::Ready(Err(error)) if error.message.contains("capabilities")
+                    ));
+                    drop(restriction);
+
+                    assert!(!task_runtime.is_task_service_ready());
+                    assert_eq!(timer.pending_count(), 0);
+                    assert_eq!(store.active_task_count(), 0);
+                    assert_eq!(store.task_count(), 1);
+                    assert_exact_initial_work_is_recoverable(&store, &task_id, &work);
+                    assert!(caller.checkpoint().is_ok());
+                    let restored = Cx::current().unwrap();
+                    assert!(restored.timer_driver().is_some());
+                    assert!(restored.capabilities().spawn);
+                    assert!(restored.capabilities().time);
+                    drop(service);
+                    drop(runner);
+                    drop(installed);
+                    drop(caller);
+                    assert!(caller_runtime.shutdown_timeout(StdDuration::from_secs(1)));
+                }
+            }
+        }
     }
 
     #[test]
@@ -26929,7 +27290,7 @@ mod tests {
                 }),
             )
             .expect("install the only retained service runner");
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let mut service = Box::pin(runner.run_service(&service_cx));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
 
@@ -26957,7 +27318,7 @@ mod tests {
         let mut runner = runtime
             .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
             .expect("install retained task service runner");
-        let first_cx = Cx::for_testing();
+        let (_first_owner, first_cx) = task_service_test_caller();
         let mut first_service = Box::pin(runner.run_service(&first_cx));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
 
@@ -26975,7 +27336,7 @@ mod tests {
             "dropping the first service future revokes its readiness lease"
         );
 
-        let second_cx = Cx::for_testing();
+        let (_second_owner, second_cx) = task_service_test_caller();
         let mut second_service = Box::pin(runner.run_service(&second_cx));
         assert!(matches!(
             Future::poll(second_service.as_mut(), &mut context),
@@ -27004,7 +27365,7 @@ mod tests {
         let runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install caller-owned service runner before task advertisement");
-        let readiness_cx = Cx::for_testing();
+        let (_readiness_owner, readiness_cx) = task_service_test_caller();
         let running_service = enter_task_service_runner(runner, &readiness_cx);
         let task_id = runtime
             .create_task_with_work(work_descriptor.clone(), None)
@@ -27828,7 +28189,7 @@ mod tests {
         let runner = runtime
             .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
             .expect("a task service is installed before public task creation");
-        let service_cx = Cx::for_testing();
+        let (_service_owner, service_cx) = task_service_test_caller();
         let mut service = Box::pin(runner.run(&service_cx));
         let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(matches!(
