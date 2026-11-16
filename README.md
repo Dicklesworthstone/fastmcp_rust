@@ -1273,6 +1273,32 @@ keeps its own connection-level cancellation rules, and dropped request
 cancellation is flushed by the next drive, send, or close. Subprocess
 creation and bounded pipe writes retain their synchronous limits.
 
+### Explicit cancellation for exact-2024 stdio requests (Unix)
+
+The sealed `legacy_2024::Client` supports a separate
+`McpRequestCancellation` token for tool calls, ping, logging-level changes,
+and resource subscribe/unsubscribe requests through their
+`*_with_cx_and_cancellation` methods. Each method takes the caller's `&Cx`
+followed by `&McpRequestCancellation`, then its ordinary arguments.
+
+The component-level
+`request_legacy_core_with_cx_and_cancellation` accepts the same token with
+a typed `LegacyCoreRequest`. It keeps the caller and token attached to the
+execution before publication, including while the future is parked. A
+pre-cancelled token sends no application request. After initialization,
+cancelling or dropping one published request retires that execution; queued
+cancellation controls are serviced on the next drive, send, or close.
+Cancelling a published initialization handshake retains its connection-level
+cleanup behavior.
+
+Responses still use exact-2024 decoding from their admitted wire source.
+Control acknowledgements must be empty, modern result discriminators are
+rejected, and resource updates or log messages received while waiting remain
+available through the typed notification accessors. Ordinary peer errors
+and tool-level error results keep their existing request-local behavior.
+Response waits yield on the caller's runtime; bounded pipe writes and
+subprocess creation remain synchronous.
+
 ### Live exact stdio progress (current source tree, Unix)
 
 Modern stdio clients can observe progress while awaiting a tool, resource,

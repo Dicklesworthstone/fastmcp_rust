@@ -11277,6 +11277,149 @@ pub mod legacy_2024 {
         }
     }
 
+
+    #[cfg(unix)]
+    impl Client {
+        /// Checks exact-2024 peer liveness with an explicit cancellation token.
+        ///
+        /// Cancellation before publication sends no request. Once published,
+        /// cancellation retires only this execution; the retained connection
+        /// and unrelated requests remain usable after initialization.
+        pub async fn ping_with_cx_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<()> {
+            match self
+                .inner
+                .request_legacy_core_with_cx_and_cancellation(
+                    cx,
+                    cancellation,
+                    LegacyCoreRequest::Ping,
+                )
+                .await?
+            {
+                LegacyCoreResult::Ping(_) => Ok(()),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected ping result",
+                )),
+            }
+        }
+
+        /// Calls one exact-2024 tool with a retained cancellation token.
+        ///
+        /// Response waits yield the caller's runtime. The original caller and
+        /// token keep ownership while the future is parked or another request
+        /// drives the shared connection. Tool-level errors remain typed results.
+        pub async fn call_tool_with_cx_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<CallToolResult> {
+            match self
+                .inner
+                .request_legacy_core_with_cx_and_cancellation(
+                    cx,
+                    cancellation,
+                    LegacyCoreRequest::ToolsCall(CallToolParams {
+                        name: name.to_owned(),
+                        arguments: Some(arguments),
+                        meta: None,
+                    }),
+                )
+                .await?
+            {
+                LegacyCoreResult::ToolsCall(result) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected tools/call result",
+                )),
+            }
+        }
+
+        /// Starts a resource subscription with explicit request cancellation.
+        ///
+        /// The URI is passed unchanged and the peer must return an exact empty
+        /// acknowledgement. Updates received before that acknowledgement remain
+        /// available through [Self::take_server_notifications].
+        pub async fn subscribe_resource_with_cx_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> McpResult<()> {
+            match self
+                .inner
+                .request_legacy_core_with_cx_and_cancellation(
+                    cx,
+                    cancellation,
+                    LegacyCoreRequest::ResourcesSubscribe(SubscribeResourceParams {
+                        uri: uri.to_owned(),
+                    }),
+                )
+                .await?
+            {
+                LegacyCoreResult::ResourcesSubscribe(_) => Ok(()),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected resources/subscribe result",
+                )),
+            }
+        }
+
+        /// Ends a resource subscription with explicit request cancellation.
+        /// Cancellation before publication sends no unsubscribe request.
+        pub async fn unsubscribe_resource_with_cx_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> McpResult<()> {
+            match self
+                .inner
+                .request_legacy_core_with_cx_and_cancellation(
+                    cx,
+                    cancellation,
+                    LegacyCoreRequest::ResourcesUnsubscribe(UnsubscribeResourceParams {
+                        uri: uri.to_owned(),
+                    }),
+                )
+                .await?
+            {
+                LegacyCoreResult::ResourcesUnsubscribe(_) => Ok(()),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected resources/unsubscribe result",
+                )),
+            }
+        }
+
+        /// Sets the exact-2024 logging level with explicit request cancellation.
+        ///
+        /// This sends legacy logging/setLevel and requires an exact empty
+        /// acknowledgement. Retained log notifications preserve their data.
+        pub async fn set_log_level_with_cx_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            level: LogLevel,
+        ) -> McpResult<()> {
+            match self
+                .inner
+                .request_legacy_core_with_cx_and_cancellation(
+                    cx,
+                    cancellation,
+                    LegacyCoreRequest::SetLogLevel(SetLogLevelParams { level }),
+                )
+                .await?
+            {
+                LegacyCoreResult::SetLogLevel(_) => Ok(()),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected logging/setLevel result",
+                )),
+            }
+        }
+    }
+
     /// A builder sealed to exact MCP 2024-11-05.
     ///
     /// This wrapper intentionally has no raw protocol-plan surface: callers

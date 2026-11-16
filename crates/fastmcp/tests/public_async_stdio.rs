@@ -1459,6 +1459,429 @@ while IFS= read -r unexpected; do exit 85; done
                 }
             });
         }
+        mod cancellation_controls {
+            use super::*;
+
+            async fn connect(cx: &Cx, script: &str, release: &str) -> legacy::Client {
+                let mut client = super::connect(cx, script, release).await;
+                require_send(client.ensure_initialized_with_cx(cx))
+                    .await
+                    .unwrap();
+                client
+            }
+
+            const WAIT_FOR_RELEASE: &str = r#"
+turn=0
+while [ ! -s "$1" ]; do
+    turn=$((turn + 1))
+    [ "$turn" -le 3000 ] || exit 90
+    sleep 0.001
+done
+"#;
+
+            fn exchange(
+                script: &mut String,
+                method: &str,
+                checks: &str,
+                result: &JsonValue,
+                defer: bool,
+            ) {
+                script.push_str(&format!(
+                    "read_request\n\
+                     case \"$request\" in *'\"method\":\"{method}\"'*) ;; *) exit 91 ;; esac\n\
+                     {checks}\n"
+                ));
+                if defer {
+                    script.push_str(WAIT_FOR_RELEASE);
+                }
+                script.push_str(&format!(
+                    "printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}}\\n' \"$id\" '{result}'\n"
+                ));
+            }
+
+            fn finish_with_ping(script: &mut String) {
+                exchange(script, "ping", "", &json!({}), false);
+                script.push_str("while IFS= read -r unexpected; do exit 92; done\n");
+            }
+
+            async fn after_pending<F: Future + Send>(
+                future: F,
+                release: &DiscoveryRelease,
+            ) -> F::Output {
+                let mut future = Box::pin(require_send(future));
+                let yielded = std::future::poll_fn(|task_cx| {
+                    Poll::Ready(future.as_mut().poll(task_cx).is_pending())
+                })
+                .await;
+                assert!(
+                    yielded,
+                    "an unanswered legacy operation must yield to its caller"
+                );
+                release.release();
+                future.await
+            }
+
+            async fn control(
+                client: &mut legacy::Client,
+                cx: &Cx,
+                cancellation: &legacy::McpRequestCancellation,
+                method: &str,
+            ) -> McpResult<()> {
+                match method {
+                    "resources/subscribe" => {
+                        client
+                            .subscribe_resource_with_cx_and_cancellation(
+                                cx,
+                                cancellation,
+                                "test://watch",
+                            )
+                            .await
+                    }
+                    "resources/unsubscribe" => {
+                        client
+                            .unsubscribe_resource_with_cx_and_cancellation(
+                                cx,
+                                cancellation,
+                                "test://watch",
+                            )
+                            .await
+                    }
+                    "logging/setLevel" => {
+                        client
+                            .set_log_level_with_cx_and_cancellation(
+                                cx,
+                                cancellation,
+                                legacy::LogLevel::Debug,
+                            )
+                            .await
+                    }
+                    "ping" => client.ping_with_cx_and_cancellation(cx, cancellation).await,
+                    _ => unreachable!(),
+                }
+            }
+
+            #[test]
+            fn legacy_async_control_tokens_are_local_and_notifications_are_retained() {
+                run(|cx| async move {
+                    let release = DiscoveryRelease::new();
+                    let mut script = INITIALIZE.to_owned();
+                    exchange(
+                        &mut script,
+                        "resources/subscribe",
+                        r#"
+case "$request" in *'"uri":"test://watch"'*) ;; *) exit 93 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"test://watch"}}'
+"#,
+                        &json!({}),
+                        true,
+                    );
+                    exchange(
+                        &mut script,
+                        "logging/setLevel",
+                        r#"
+case "$request" in *'"level":"debug"'*) ;; *) exit 94 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"debug","logger":"legacy-peer","data":{"message":"logging enabled","retained":[1,2]}}}'
+"#,
+                        &json!({}),
+                        false,
+                    );
+                    exchange(
+                        &mut script,
+                        "resources/unsubscribe",
+                        r#"case "$request" in *'"uri":"test://watch"'*) ;; *) exit 95 ;; esac"#,
+                        &json!({}),
+                        false,
+                    );
+                    finish_with_ping(&mut script);
+
+                    let mut client = connect(&cx, &script, release.path()).await;
+                    let cancellation = legacy::McpRequestCancellation::new();
+                    let cancelled = legacy::McpRequestCancellation::new();
+                    cancelled.cancel();
+                    for method in [
+                        "resources/subscribe",
+                        "logging/setLevel",
+                        "resources/unsubscribe",
+                        "ping",
+                    ] {
+                        let error = require_send(control(&mut client, &cx, &cancelled, method))
+                            .await
+                            .unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    }
+                    after_pending(
+                        control(&mut client, &cx, &cancellation, "resources/subscribe"),
+                        &release,
+                    )
+                    .await
+                    .unwrap();
+                    let notifications = client.take_server_notifications().unwrap();
+                    let [legacy::ServerNotification::ResourceUpdated(updated)] =
+                        notifications.as_slice()
+                    else {
+                        panic!("subscription acknowledgement must retain the preceding update");
+                    };
+                    assert_eq!(updated.uri, "test://watch");
+
+                    require_send(control(&mut client, &cx, &cancellation, "logging/setLevel"))
+                        .await
+                        .unwrap();
+                    let notifications = client.take_server_notifications().unwrap();
+                    let [legacy::ServerNotification::Message(message)] = notifications.as_slice()
+                    else {
+                        panic!("logging acknowledgement must retain the preceding log message");
+                    };
+                    assert_eq!(message.level, legacy::LogLevel::Debug);
+                    assert_eq!(message.logger.as_deref(), Some("legacy-peer"));
+                    assert_eq!(
+                        message.data,
+                        json!({"message": "logging enabled", "retained": [1, 2]}),
+                    );
+
+                    require_send(control(
+                        &mut client,
+                        &cx,
+                        &cancellation,
+                        "resources/unsubscribe",
+                    ))
+                    .await
+                    .unwrap();
+                    assert!(client.take_server_notifications().unwrap().is_empty());
+                    require_send(client.ping_with_cx_and_cancellation(&cx, &cancellation))
+                        .await
+                        .unwrap();
+                    assert!(cx.checkpoint().is_ok());
+                    client.close_with_cx(&cx).await.unwrap();
+                });
+            }
+
+            #[test]
+            fn legacy_async_token_controls_reject_nonempty_and_modern_acknowledgements() {
+                run(|cx| async move {
+                    for method in [
+                        "resources/subscribe",
+                        "resources/unsubscribe",
+                        "logging/setLevel",
+                        "ping",
+                    ] {
+                        for invalid in [json!({"resultType": "complete"}), json!({"unexpected": true})] {
+                            let mut script = INITIALIZE.to_owned();
+                            exchange(&mut script, method, "", &invalid, false);
+                            script.push_str("while IFS= read -r unexpected; do exit 96; done\n");
+                            let mut client = connect(&cx, &script, "").await;
+                            let cancellation = legacy::McpRequestCancellation::new();
+                            let error = require_send(control(
+                                &mut client,
+                                &cx,
+                                &cancellation,
+                                method,
+                            ))
+                            .await
+                            .unwrap_err();
+                            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                            assert!(client.ping_with_cx(&cx).await.is_err());
+                            assert!(cx.checkpoint().is_ok());
+                            client.close_with_cx(&cx).await.unwrap();
+                        }
+                    }
+                });
+            }
+
+            #[test]
+            fn legacy_async_tool_token_yields_and_preserves_tool_level_errors() {
+                run(|cx| async move {
+                    let release = DiscoveryRelease::new();
+                    let mut script = INITIALIZE.to_owned();
+                    let success = json!({
+                        "content": [{"type": "text", "text": "legacy payload"}],
+                        "_meta": {"retained": true},
+                        "receipt": {"kind": "legacy"},
+                    });
+                    let tool_error = json!({
+                        "content": [{"type": "text", "text": "tool reported failure"}],
+                        "isError": true,
+                    });
+                    exchange(
+                        &mut script,
+                        "tools/call",
+                        r#"
+case "$request" in *'"name":"echo"'*) ;; *) exit 97 ;; esac
+case "$request" in *'"arguments":{"message":"legacy payload"}'*) ;; *) exit 98 ;; esac
+"#,
+                        &success,
+                        true,
+                    );
+                    exchange(
+                        &mut script,
+                        "tools/call",
+                        r#"case "$request" in *'"name":"fail"'*) ;; *) exit 99 ;; esac"#,
+                        &tool_error,
+                        false,
+                    );
+                    finish_with_ping(&mut script);
+
+                    let mut client = connect(&cx, &script, release.path()).await;
+                    let cancellation = legacy::McpRequestCancellation::new();
+                    let cancelled = legacy::McpRequestCancellation::new();
+                    cancelled.cancel();
+                    let error = require_send(client.call_tool_with_cx_and_cancellation(
+                        &cx,
+                        &cancelled,
+                        "echo",
+                        json!({"message": "legacy payload"}),
+                    ))
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    let result: legacy::CallToolResult = after_pending(
+                        client.call_tool_with_cx_and_cancellation(
+                            &cx,
+                            &cancellation,
+                            "echo",
+                            json!({"message": "legacy payload"}),
+                        ),
+                        &release,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!result.is_error);
+                    assert_eq!(serde_json::to_value(result).unwrap(), success);
+                    let result: legacy::CallToolResult =
+                        require_send(client.call_tool_with_cx_and_cancellation(
+                            &cx,
+                            &cancellation,
+                            "fail",
+                            json!({}),
+                        ))
+                        .await
+                        .unwrap();
+                    assert!(result.is_error);
+                    assert_eq!(serde_json::to_value(result).unwrap(), tool_error);
+                    require_send(client.ping_with_cx_and_cancellation(&cx, &cancellation))
+                        .await
+                        .unwrap();
+                    assert!(cx.checkpoint().is_ok());
+                    client.close_with_cx(&cx).await.unwrap();
+                });
+            }
+
+            #[test]
+            fn legacy_async_tool_token_cancels_one_published_request_and_preserves_siblings() {
+                run(|cx| async move {
+                    let script = format!(
+                        "{INITIALIZE}\n\
+                         read_request\n\
+                         case \"$request\" in *'\"method\":\"tools/call\"'*) ;; *) exit 100 ;; esac\n\
+                         case \"$request\" in *'\"name\":\"wait\"'*) ;; *) exit 101 ;; esac\n\
+                         pending_id=$id\n\
+                         IFS= read -r cancelled || exit 102\n\
+                         case \"$cancelled\" in *'\"method\":\"notifications/cancelled\"'*) ;; *) exit 103 ;; esac\n\
+                         cancelled_id=$(printf '%s\\n' \"$cancelled\" | sed -n 's/.*\"requestId\":\\([0-9][0-9]*\\)[,}}].*/\\1/p')\n\
+                         [ \"$cancelled_id\" = \"$pending_id\" ] || exit 104\n\
+                         read_request\n\
+                         case \"$request\" in *'\"method\":\"ping\"'*) ;; *) exit 105 ;; esac\n\
+                         printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"late result\"}}]}}}}\\n' \"$pending_id\"\n\
+                         printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{}}}}\\n' \"$id\"\n\
+                         while IFS= read -r unexpected; do exit 106; done\n"
+                    );
+                    let mut client = connect(&cx, &script, "").await;
+                    let cancellation = legacy::McpRequestCancellation::new();
+                    let mut calling = Box::pin(require_send(
+                        client.call_tool_with_cx_and_cancellation(
+                            &cx,
+                            &cancellation,
+                            "wait",
+                            json!({}),
+                        ),
+                    ));
+                    let yielded = std::future::poll_fn(|task_cx| {
+                        Poll::Ready(calling.as_mut().poll(task_cx).is_pending())
+                    })
+                    .await;
+                    assert!(yielded, "the peer retains this published request");
+                    cancellation.cancel();
+                    assert_eq!(
+                        calling.await.unwrap_err().code,
+                        McpErrorCode::RequestCancelled,
+                    );
+                    assert!(cx.checkpoint().is_ok());
+                    // The strict peer expects exactly one cancellation for the
+                    // published ID, then a fresh ping. A late result cannot
+                    // replace the sibling's acknowledgement.
+                    let sibling = legacy::McpRequestCancellation::new();
+                    require_send(client.ping_with_cx_and_cancellation(&cx, &sibling))
+                        .await
+                        .unwrap();
+                    assert!(cx.checkpoint().is_ok());
+                    client.close_with_cx(&cx).await.unwrap();
+                });
+            }
+
+            #[test]
+            fn legacy_async_completion_preserves_explicit_request_progress_metadata() {
+                run(|cx| async move {
+                    let release = DiscoveryRelease::new();
+                    let mut script = INITIALIZE.to_owned();
+                    let expected = json!({
+                        "completion": {"values": ["Ada", "Alice"], "total": 2, "hasMore": false},
+                        "_meta": {"retained": "legacy"},
+                    });
+                    exchange(
+                        &mut script,
+                        "completion/complete",
+                        r#"
+case "$request" in *'"progressToken":"legacy completion /+=? marker"'*) ;; *) exit 107 ;; esac
+case "$request" in *'"type":"ref/prompt"'*) ;; *) exit 108 ;; esac
+case "$request" in *'"argument":{"name":"name","value":"A"}'*) ;; *) exit 109 ;; esac
+case "$request" in *'"context":'*) exit 110 ;; esac
+"#,
+                        &expected,
+                        true,
+                    );
+                    finish_with_ping(&mut script);
+
+                    let mut client = connect(&cx, &script, release.path()).await;
+                    let cancellation = legacy::McpRequestCancellation::new();
+                    let cancelled = legacy::McpRequestCancellation::new();
+                    cancelled.cancel();
+                    let params = legacy::LegacyCompletionParams {
+                        reference: legacy::LegacyCompletionReference::Prompt {
+                            name: "greet".to_owned(),
+                        },
+                        argument: legacy::LegacyCompletionArgument {
+                            name: "name".to_owned(),
+                            value: "A".to_owned(),
+                        },
+                        meta: Some(legacy::RequestMeta {
+                            progress_marker: Some(legacy::ProgressMarker::String(
+                                "legacy completion /+=? marker".to_owned(),
+                            )),
+                        }),
+                    };
+                    let error = require_send(client.complete_with_cx(
+                        &cx,
+                        &cancelled,
+                        params.clone(),
+                    ))
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    let result: legacy::LegacyCompletionResult = after_pending(
+                        client.complete_with_cx(&cx, &cancellation, params),
+                        &release,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(serde_json::to_value(result).unwrap(), expected);
+                    require_send(client.ping_with_cx_and_cancellation(&cx, &cancellation))
+                        .await
+                        .unwrap();
+                    assert!(cx.checkpoint().is_ok());
+                    client.close_with_cx(&cx).await.unwrap();
+                });
+            }
+        }
+
     }
 
     async fn collect(

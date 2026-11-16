@@ -22176,6 +22176,56 @@ impl Client {
         }
     }
 
+    /// Sends an exact-2024 typed request under an explicit cancellation domain.
+    ///
+    /// The request executor retains the original caller and cancellation token
+    /// before publication. Cancellation retires only this execution after
+    /// initialization, including when a different caller services the shared
+    /// connection. Dropping a published request queues its cancellation for the
+    /// next drive or close. A published initialization handshake retains its
+    /// connection-level cancellation rules.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    pub async fn request_legacy_core_with_cx_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: LegacyCoreRequest,
+    ) -> McpResult<LegacyCoreResult> {
+        self.ensure_initialized_with_cancellation(cx, Some(cancellation))
+            .await?;
+        self.require_legacy_exact_result_session(request.method())?;
+        let request = CoreRequest::Legacy(request);
+        let method = request.method();
+        let params = request.encode_params().map_err(|error| {
+            McpError::invalid_params(format!(
+                "Legacy client request parameters are invalid: {error}"
+            ))
+        })?;
+        let received = self
+            .send_yielding_prepared_request(cx, cancellation, method, params)
+            .await?;
+        // Ordinary peer errors settle only this request in the yielding
+        // executor. Successful results still require their original admitted
+        // bytes so duplicate members and cross-era fields cannot be hidden.
+        let raw_result = received.raw_result.as_deref().ok_or_else(|| {
+            self.terminate_connection(McpError::invalid_request(
+                "Exact-2024 typed response lost its admitted result source",
+            ))
+        })?;
+        let (result, _) = decode_core_result_with_cache_ttl_from_source(
+            &request,
+            &received.result,
+            Some(raw_result),
+        )
+        .map_err(|error| self.terminate_connection(error))?;
+        match result {
+            CoreResult::Legacy(result) => Ok(result),
+            CoreResult::Final(_) => Err(self.terminate_connection(McpError::internal_error(
+                "Exact-2024 typed request received a final result",
+            ))),
+        }
+    }
+
     fn cancel_multiplexed_request_with_connection_cx(
         &mut self,
         connection_cx: &Cx,
