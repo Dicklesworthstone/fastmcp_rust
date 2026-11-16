@@ -24,21 +24,23 @@ use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
+#[cfg(test)]
+use fastmcp_protocol::encode_result;
 use fastmcp_protocol::http_headers::NonSensitiveHeaderExposure;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     AdmittedFinalFormSchema, CacheScope, CacheTtl, CallToolResult, CompleteResult,
     CompletionValues, Content, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue,
-    FinalCallToolResult, FinalCompletionParams, FinalCompletionReference, FinalCompletionValues,
-    FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
+    FinalCallToolResult, FinalCompletionParams, FinalCompletionReference, FinalCompletionResult,
+    FinalCompletionValues, FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
     FinalEmbeddedFormElicitationParams, FinalEmbeddedInputRequest, FinalEmbeddedRootsListParams,
     FinalEmbeddedUrlElicitationParams, FinalGetPromptResult, FinalProgressNotificationParams,
     FinalPrompt, FinalPromptMessage, FinalReadResourceResult, FinalResource, FinalResourceTemplate,
     FinalTool, GetPromptResult, Icon, InputRequiredResult, JsonRpcRequest, LegacyCompletionParams,
-    LegacyCompletionReference, LegacyResourceContent, LogLevel, LogMessageParams, ProgressMarker,
-    ProgressParams, Prompt, PromptMessage, ReadResourceResult, Resource, ResourceContent,
-    ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations, decode_peer_result,
-    encode_result, exact_json_from_serde,
+    LegacyCompletionReference, LegacyCompletionResult, LegacyResourceContent, LogLevel,
+    LogMessageParams, ProgressMarker, ProgressParams, Prompt, PromptMessage, ReadResourceResult,
+    Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations,
+    decode_peer_result, exact_json_from_serde,
 };
 
 use crate::bidirectional::MrtrCompletedInputs;
@@ -1240,14 +1242,9 @@ fn admit_declared_final_tool_outcome(
 /// URI template parameters extracted from a matched resource URI.
 pub type UriParams = HashMap<String, String>;
 
-/// Encodes a router-produced modern success through the final result contract.
-///
-/// Legacy dispatch continues to serialize its method-specific result structs
-/// directly. The stateless router, by contrast, calls this helper after a
-/// shipped handler has completed so every successful modern response carries
-/// the explicit `resultType: "complete"` discriminator and is admitted by the
-/// same bounded protocol codec used for peer results. Method-specific payloads
-/// may not pre-populate the discriminator; only this boundary selects it.
+/// Exercises final result admission for untyped payload regression fixtures.
+/// Production dispatch uses each method's typed complete-result codec.
+#[cfg(test)]
 pub(crate) fn encode_final_complete_result<T: serde::Serialize>(
     payload: T,
 ) -> McpResult<serde_json::Value> {
@@ -2791,8 +2788,9 @@ pub trait PromptHandler: Send + Sync {
 /// The two request parameter types deliberately remain distinct: the final
 /// form carries required request metadata and optional completion context,
 /// while the exact legacy form does not. Each callback returns its exact
-/// era-specific completion payload; the router selects the matching result
-/// envelope and final `resultType` contract.
+/// era-specific completion payload. The request-owned result hooks also retain
+/// opaque result metadata and final open members; the router validates values
+/// and emits the matching era's result envelope.
 pub trait CompletionHandler: Send + Sync {
     /// Returns an optional handler-specific timeout.
     ///
@@ -2845,6 +2843,28 @@ pub trait CompletionHandler: Send + Sync {
         self.complete_legacy_async(ctx, params)
     }
 
+    /// Completes one exact-legacy request without discarding result metadata.
+    ///
+    /// The default retains the existing request-owned value hook. Override
+    /// this method to return opaque `_meta` from an application or upstream
+    /// result. The router keeps its value bound, cancellation, deadline and
+    /// panic checks around this hook.
+    fn complete_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: LegacyCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<LegacyCompletionResult>> {
+        Box::pin(async move {
+            self.complete_legacy_async_in_request(ctx, request_cx, params)
+                .await
+                .map(|completion| LegacyCompletionResult {
+                    completion,
+                    meta: None,
+                })
+        })
+    }
+
     /// Asynchronously completes one final request.
     ///
     /// The default delegates to [`Self::complete_final`].
@@ -2872,6 +2892,28 @@ pub trait CompletionHandler: Send + Sync {
         params: FinalCompletionParams,
     ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
         self.complete_final_async(ctx, params)
+    }
+
+    /// Completes one final request while retaining its exact result envelope.
+    ///
+    /// The default retains the existing request-owned value hook and adds
+    /// empty result metadata. Override this method to preserve admitted
+    /// metadata and inert open members, including exact JSON numbers, through
+    /// gateway and mounted handlers. The protocol codec validates the final
+    /// result before emission; this hook cannot select another result kind.
+    fn complete_final_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCompletionResult>>> {
+        Box::pin(async move {
+            self.complete_final_async_in_request(ctx, request_cx, params)
+                .await
+                .map(|completion| {
+                    CompleteResult::new(FinalCompletionResult { completion }, ResultMeta::empty())
+                })
+        })
     }
 }
 
@@ -4482,6 +4524,32 @@ impl CompletionHandler for MountedCompletionHandler {
         self.inner
             .complete_final_async_in_request(ctx, request_cx, self.rewrite_final(params))
     }
+
+    fn complete_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: LegacyCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<LegacyCompletionResult>> {
+        self.inner.complete_legacy_result_async_in_request(
+            ctx,
+            request_cx,
+            self.rewrite_legacy(params),
+        )
+    }
+
+    fn complete_final_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCompletionResult>>> {
+        self.inner.complete_final_result_async_in_request(
+            ctx,
+            request_cx,
+            self.rewrite_final(params),
+        )
+    }
 }
 
 /// Strips a mount prefix from fallback `completion/complete` references.
@@ -4595,6 +4663,32 @@ impl CompletionHandler for PrefixedFallbackCompletionHandler {
     ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
         self.inner
             .complete_final_async_in_request(ctx, request_cx, self.rewrite_final(params))
+    }
+
+    fn complete_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: LegacyCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<LegacyCompletionResult>> {
+        self.inner.complete_legacy_result_async_in_request(
+            ctx,
+            request_cx,
+            self.rewrite_legacy(params),
+        )
+    }
+
+    fn complete_final_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCompletionResult>>> {
+        self.inner.complete_final_result_async_in_request(
+            ctx,
+            request_cx,
+            self.rewrite_final(params),
+        )
     }
 }
 

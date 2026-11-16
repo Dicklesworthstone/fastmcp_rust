@@ -6302,6 +6302,7 @@ mod tests {
 
         // ── Proxy registration ─────────────────────────────────────────
 
+        #[derive(Clone)]
         struct CompletionProxyBackend {
             supported: bool,
             result: CoreResult,
@@ -6379,6 +6380,16 @@ mod tests {
         }
 
         impl crate::proxy::ProxyBackend for CompletionProxyBackend {
+            fn async_protocol_era(&self) -> Option<ProtocolEra> {
+                Some(self.result.era())
+            }
+
+            fn prepare_async_request(
+                &mut self,
+            ) -> McpResult<Option<Box<dyn crate::proxy::ProxyAsyncRequest>>> {
+                Ok(Some(Box::new(self.clone())))
+            }
+
             fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
                 Ok(Vec::new())
             }
@@ -6433,6 +6444,33 @@ mod tests {
                     .expect("completion proxy call log is not poisoned")
                     .push(params);
                 Ok(self.result.clone())
+            }
+        }
+
+        impl crate::proxy::ProxyAsyncRequest for CompletionProxyBackend {
+            fn client_implementation(&self) -> Implementation {
+                Implementation::try_new("completion-gateway", "1.0").unwrap()
+            }
+
+            fn execute<'a>(
+                self: Box<Self>,
+                ctx: &'a McpContext,
+                request: fastmcp_protocol::CoreRequest,
+                _on_progress: &'a mut (
+                            dyn FnMut(fastmcp_protocol::FinalProgressNotificationParams) + Send
+                        ),
+            ) -> crate::handler::BoxFuture<'a, McpResult<CoreResult>> {
+                Box::pin(async move {
+                    ctx.checkpoint()?;
+                    assert_eq!(request.method(), "completion/complete");
+                    // Decode the actual request emitted by the proxy once.
+                    // The completion input API omits framework-owned metadata.
+                    let mut params = request.encode_params().unwrap().unwrap();
+                    params.as_object_mut().unwrap().remove("_meta");
+                    let params = serde_json::from_value(params).unwrap();
+                    self.calls.lock().unwrap().push(params);
+                    Ok(self.result)
+                })
             }
         }
 
@@ -6523,31 +6561,28 @@ mod tests {
                         total: Some(1),
                         has_more: Some(false),
                     },
-                    meta: None,
+                    meta: Some(
+                        serde_json::from_str(
+                            r#"{"com.example/completion":{"source":"legacy","exact":1.20e+4}}"#,
+                        )
+                        .unwrap(),
+                    ),
                 },
             ))
         }
 
         fn final_completion_proxy_result() -> CoreResult {
-            CoreResult::Final(FinalCoreResult::Completion {
-                result: CompleteResult::new(
-                    fastmcp_protocol::FinalCompletionResult {
-                        completion: fastmcp_protocol::FinalCompletionValues {
-                            values: vec!["final-staging".to_owned()],
-                            total: Some(
-                                serde_json::from_str("92233720368547758081234567890")
-                                    .expect("the fixed exact completion total is a JSON integer"),
-                            ),
-                            has_more: Some(false),
-                        },
-                    },
-                    ResultMeta::server_generated(
-                        Implementation::try_new("completion-upstream", "1.0")
-                            .expect("the fixed completion implementation is valid"),
-                    ),
-                ),
-                diagnostic: None,
-            })
+            let request = final_completion_request(1);
+            fastmcp_protocol::CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                "completion/complete",
+                request.params.as_ref(),
+            )
+            .unwrap()
+            .decode_result(
+                r#"{"resultType":"complete","completion":{"values":["final-staging"],"total":92233720368547758081234567890,"hasMore":false},"_meta":{"com.example/completion":{"source":"final","exact":1.20e+4}},"upstreamExtra":{"exact":9.870e+123,"nested":[true,{"retained":"opaque"}]}}"#,
+            )
+            .expect("the exact completion envelope is admitted")
         }
 
         fn final_completion_request(id: i64) -> JsonRpcRequest {
@@ -8526,6 +8561,14 @@ mod tests {
                 legacy["completion"]["values"],
                 serde_json::json!(["legacy-staging"])
             );
+            assert_eq!(
+                legacy,
+                serde_json::from_str::<serde_json::Value>(
+                    &legacy_completion_proxy_result().encode().unwrap()
+                )
+                .unwrap(),
+                "the legacy proxy must retain the entire result, including opaque metadata"
+            );
 
             let final_inbound = crate::InboundRequestContext::new(
                 Cx::for_testing(),
@@ -8547,6 +8590,34 @@ mod tests {
                 final_response["completion"]["total"],
                 serde_json::json!(92233720368547758081234567890_u128),
                 "the proxy retains the final arbitrary-precision completion total"
+            );
+            assert_eq!(
+                final_response,
+                serde_json::from_str::<serde_json::Value>(
+                    &final_completion_proxy_result().encode().unwrap()
+                )
+                .unwrap(),
+                "the final proxy must retain metadata and inert open result members"
+            );
+            assert_eq!(
+                final_response["_meta"]["com.example/completion"]["exact"]
+                    .as_number()
+                    .unwrap()
+                    .as_str(),
+                "1.20e+4"
+            );
+            assert_eq!(
+                final_response["upstreamExtra"]["exact"]
+                    .as_number()
+                    .unwrap()
+                    .as_str(),
+                "9.870e+123"
+            );
+            assert!(
+                final_response["_meta"]
+                    .get("io.modelcontextprotocol/clientCapabilities")
+                    .is_none(),
+                "request capabilities are not result metadata"
             );
 
             let legacy_calls = legacy_calls
@@ -8576,6 +8647,246 @@ mod tests {
                 Some(&"us-east-1".to_owned()),
                 "the proxy forwards final completion context unchanged"
             );
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn public_mounted_proxy_completion_retains_exact_result_envelopes() {
+            let legacy_calls = Arc::new(Mutex::new(Vec::new()));
+            let final_calls = Arc::new(Mutex::new(Vec::new()));
+            let child = ServerBuilder::new("completion-child", "1.0")
+                .proxy_typed(
+                    bound_proxy_client(
+                        CompletionProxyBackend {
+                            supported: true,
+                            result: legacy_completion_proxy_result(),
+                            calls: Arc::clone(&legacy_calls),
+                        },
+                        ProtocolEra::Legacy2024,
+                    ),
+                    legacy_completion_proxy_catalog(),
+                )
+                .unwrap()
+                .proxy_typed(
+                    bound_proxy_client(
+                        CompletionProxyBackend {
+                            supported: true,
+                            result: final_completion_proxy_result(),
+                            calls: Arc::clone(&final_calls),
+                        },
+                        ProtocolEra::Modern2026,
+                    ),
+                    final_completion_proxy_catalog(),
+                )
+                .unwrap()
+                .build();
+            let server = ServerBuilder::new("completion-parent", "1.0")
+                .mount(child, Some("nested"))
+                .build();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+            let mut legacy_session = initialized_legacy_proxy_session(&server);
+            let notification_sender: crate::NotificationSender = Arc::new(|_| {});
+            let request_sender = crate::RequestSender::new(
+                Arc::new(crate::PendingRequests::new()),
+                Arc::new(|_| Err("unexpected reverse request".to_owned())),
+            );
+            let legacy_request = legacy_completion_request(
+                825,
+                serde_json::json!({"type":"ref/prompt", "name":"nested/legacy-deploy"}),
+            );
+            let legacy = runtime
+                .block_on(server.dispatch_request(
+                    &cx,
+                    &mut legacy_session,
+                    legacy_request,
+                    &notification_sender,
+                    &request_sender,
+                ))
+                .unwrap();
+            assert!(legacy.error.is_none(), "{legacy:?}");
+            assert_eq!(
+                legacy.result.unwrap(),
+                serde_json::from_str::<serde_json::Value>(
+                    &legacy_completion_proxy_result().encode().unwrap()
+                )
+                .unwrap()
+            );
+
+            let mut request = final_completion_request(826);
+            request.params.as_mut().unwrap()["ref"]["name"] =
+                serde_json::json!("nested/final-deploy");
+            let inbound =
+                crate::InboundRequestContext::new(cx, 826, crate::InboundRequestTransport::Memory);
+            let response = runtime
+                .block_on(server.dispatch_stateless(&inbound, &request))
+                .unwrap();
+            assert!(response.error.is_none(), "{response:?}");
+            assert_eq!(
+                response.result.unwrap(),
+                serde_json::from_str::<serde_json::Value>(
+                    &final_completion_proxy_result().encode().unwrap()
+                )
+                .unwrap()
+            );
+            let legacy_calls = legacy_calls.lock().unwrap();
+            let final_calls = final_calls.lock().unwrap();
+            assert_eq!(legacy_calls.len(), 1);
+            assert_eq!(final_calls.len(), 1);
+            assert!(matches!(
+                &legacy_calls[0].reference,
+                fastmcp_client::CompletionReference::Prompt { name } if name == "legacy-deploy"
+            ));
+            assert!(matches!(
+                &final_calls[0].reference,
+                fastmcp_client::CompletionReference::PromptWithTitle { name, title }
+                    if name == "final-deploy" && title == "Final Deploy"
+            ));
+        }
+
+        #[test]
+        fn public_proxy_completion_exact_result_preserves_validation_and_visibility() {
+            for invalid in ["too-many-values", "negative-total", "request-metadata"] {
+                let mut upstream = final_completion_proxy_result();
+                let CoreResult::Final(FinalCoreResult::Completion { result, .. }) = &mut upstream
+                else {
+                    panic!("fixture is a final completion");
+                };
+                match invalid {
+                    "too-many-values" => {
+                        result.payload.completion.values = vec!["sensitive".to_owned(); 101];
+                    }
+                    "negative-total" => {
+                        result.payload.completion.total =
+                            Some(fastmcp_protocol::JsonInteger::from(-1_i64));
+                    }
+                    "request-metadata" => {
+                        result.meta = ResultMeta::empty().with_metadata(
+                            fastmcp_protocol::common_types::OpenMetadata::try_from_entries([(
+                                "io.modelcontextprotocol/clientCapabilities".to_owned(),
+                                serde_json::json!({}),
+                            )])
+                            .unwrap(),
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let server = ServerBuilder::new("completion-negative", "1.0")
+                    .proxy_typed(
+                        bound_proxy_client(
+                            CompletionProxyBackend {
+                                supported: true,
+                                result: upstream,
+                                calls: Arc::clone(&calls),
+                            },
+                            ProtocolEra::Modern2026,
+                        ),
+                        final_completion_proxy_catalog(),
+                    )
+                    .unwrap()
+                    .build();
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .unwrap();
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+                let inbound = crate::InboundRequestContext::new(
+                    cx,
+                    827,
+                    crate::InboundRequestTransport::Memory,
+                );
+                let request = final_completion_request(827);
+                let response = runtime
+                    .block_on(server.dispatch_stateless(&inbound, &request))
+                    .unwrap();
+                assert!(response.result.is_none(), "{invalid}: {response:?}");
+                assert_eq!(
+                    response.error.unwrap().code,
+                    i32::from(fastmcp_core::McpErrorCode::InternalError).into(),
+                    "{invalid} must be rejected by the exact-result boundary"
+                );
+                assert_eq!(calls.lock().unwrap().len(), 1);
+
+                // Changing only the reference must still refuse before the
+                // upstream can observe or reveal another completion target.
+                let mut hidden = request;
+                hidden.params.as_mut().unwrap()["ref"]["name"] = serde_json::json!("hidden");
+                let refused = runtime
+                    .block_on(server.dispatch_stateless(&inbound, &hidden))
+                    .unwrap();
+                assert!(refused.result.is_none());
+                assert_eq!(
+                    refused.error.unwrap().code,
+                    i32::from(fastmcp_core::McpErrorCode::InvalidParams).into()
+                );
+                assert_eq!(
+                    calls.lock().unwrap().len(),
+                    1,
+                    "hidden target reached upstream"
+                );
+            }
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn public_legacy_proxy_completion_exact_result_rejects_final_metadata() {
+            let mut upstream = legacy_completion_proxy_result();
+            let CoreResult::Legacy(fastmcp_protocol::LegacyCoreResult::Completion(result)) =
+                &mut upstream
+            else {
+                panic!("fixture is a legacy completion");
+            };
+            result.meta = Some(
+                serde_json::from_str(r#"{"io.modelcontextprotocol/clientCapabilities":{}}"#)
+                    .unwrap(),
+            );
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let server = ServerBuilder::new("completion-legacy-negative", "1.0")
+                .proxy_typed(
+                    bound_proxy_client(
+                        CompletionProxyBackend {
+                            supported: true,
+                            result: upstream,
+                            calls: Arc::clone(&calls),
+                        },
+                        ProtocolEra::Legacy2024,
+                    ),
+                    legacy_completion_proxy_catalog(),
+                )
+                .unwrap()
+                .build();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+            let mut session = initialized_legacy_proxy_session(&server);
+            let notification_sender: crate::NotificationSender = Arc::new(|_| {});
+            let request_sender = crate::RequestSender::new(
+                Arc::new(crate::PendingRequests::new()),
+                Arc::new(|_| Err("unexpected reverse request".to_owned())),
+            );
+            let request = legacy_completion_request(
+                828,
+                serde_json::json!({"type":"ref/prompt", "name":"legacy-deploy"}),
+            );
+            let response = runtime
+                .block_on(server.dispatch_request(
+                    &cx,
+                    &mut session,
+                    request,
+                    &notification_sender,
+                    &request_sender,
+                ))
+                .unwrap();
+            assert!(response.result.is_none());
+            assert_eq!(
+                response.error.unwrap().code,
+                i32::from(fastmcp_core::McpErrorCode::InternalError).into(),
+                "final-only metadata must not leak into an exact legacy result"
+            );
+            assert_eq!(calls.lock().unwrap().len(), 1);
         }
 
         #[test]

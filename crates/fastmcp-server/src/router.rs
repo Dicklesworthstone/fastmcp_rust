@@ -18,7 +18,7 @@ use crate::bidirectional::{
 use crate::handler::{
     BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
     FinalResourceUriUse, FinalToolOutcome, ProgressNotificationSender, ResourceUriUsePolicy,
-    UriParams, empty_final_result_meta, encode_final_complete_result,
+    UriParams, empty_final_result_meta,
 };
 use crate::handler::{
     BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
@@ -67,8 +67,8 @@ use fastmcp_protocol::{
     FinalReadResourceResult, FinalResource, FinalResourceTemplate, FinalTool, FinalToolAnnotations,
     GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, InputRequiredResult,
     JsonRpcRequest, LegacyCompletionParams, LegacyCompletionResult, LegacyContent,
-    LegacyCoreRequest, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
-    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    LegacyCoreRequest, LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent,
+    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
     ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
     ProgressMarker, Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
     ResourceContent, ResourceTemplate, Role, ServerBehavior, ServerBehaviorRegistry, TemplateValue,
@@ -640,12 +640,18 @@ fn decode_final_catalog_cursor_offset(
     Ok(offset)
 }
 
-/// Converts a completed stateless handler result through the final result
-/// contract while preserving the original typed [`McpError`] on refusal.
-fn encode_stateless_handler_result<T: serde::Serialize>(
-    result: McpResult<T>,
+/// Emits the admitted completion envelope without erasing its metadata or
+/// inert open members. The selected codec rejects invalid result metadata.
+fn encode_final_completion_result(
+    result: McpResult<CompleteResult<FinalCompletionResult>>,
 ) -> McpResult<serde_json::Value> {
-    encode_final_complete_result(result?)
+    let encoded = CoreResult::Final(FinalCoreResult::Completion {
+        result: result?,
+        diagnostic: None,
+    })
+    .encode()
+    .map_err(|error| McpError::internal_error(error.to_string()))?;
+    serde_json::from_str(&encoded).map_err(McpError::from)
 }
 
 /// Encodes a handler-authored final tool result without reprojecting it through
@@ -4433,11 +4439,13 @@ impl Router {
             ));
         };
 
-        serde_json::to_value(
-            self.handle_completion_legacy_in_request(request_ctx, request_cx, params)
-                .await?,
-        )
-        .map_err(McpError::from)
+        let result = self
+            .handle_completion_legacy_in_request(request_ctx, request_cx, params)
+            .await?;
+        let encoded = CoreResult::Legacy(LegacyCoreResult::Completion(result))
+            .encode()
+            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        serde_json::from_str(&encoded).map_err(McpError::from)
     }
 
     /// Handles one exact MCP 2024-11-05 completion request.
@@ -4509,18 +4517,20 @@ impl Router {
             effective_budget,
             "completion",
             None,
-            |child_cx| handler.complete_legacy_async_in_request(&handler_ctx, child_cx, params),
+            |child_cx| {
+                handler.complete_legacy_result_async_in_request(&handler_ctx, child_cx, params)
+            },
         )
         .await?;
 
-        let completion = match outcome {
-            Outcome::Ok(completion) => {
-                if completion.values.len() > fastmcp_protocol::MAX_COMPLETION_VALUES {
+        let result = match outcome {
+            Outcome::Ok(result) => {
+                if result.completion.values.len() > fastmcp_protocol::MAX_COMPLETION_VALUES {
                     return Err(McpError::internal_error(
                         "completion handler returned more than 100 values",
                     ));
                 }
-                completion
+                result
             }
             Outcome::Err(error) => {
                 return Err(sanitize_handler_error(
@@ -4535,10 +4545,7 @@ impl Router {
             }
         };
 
-        Ok(LegacyCompletionResult {
-            completion,
-            meta: None,
-        })
+        Ok(result)
     }
 
     async fn handle_completion_final_in_request(
@@ -4547,7 +4554,7 @@ impl Router {
         request_cx: &Cx,
         params: FinalCompletionParams,
         handler_admission: Option<&crate::FinalHandlerAdmission>,
-    ) -> McpResult<FinalCompletionResult> {
+    ) -> McpResult<CompleteResult<FinalCompletionResult>> {
         let dispatch_started_at = request_ctx.cx().now();
         if request_cx_cancellation_is_visible(request_cx) {
             return Err(McpError::request_cancelled());
@@ -4657,19 +4664,25 @@ impl Router {
             effective_budget,
             "completion",
             handler_admission,
-            |child_cx| handler.complete_final_async_in_request(&handler_ctx, child_cx, params),
+            |child_cx| {
+                handler.complete_final_result_async_in_request(&handler_ctx, child_cx, params)
+            },
         )
         .await?;
 
-        let completion = match outcome {
-            Outcome::Ok(completion) => {
-                if completion.values.len() > fastmcp_protocol::MAX_COMPLETION_VALUES {
+        let result = match outcome {
+            Outcome::Ok(result) => {
+                if result.payload.completion.values.len() > fastmcp_protocol::MAX_COMPLETION_VALUES {
                     return Err(McpError::internal_error(
                         "completion handler returned more than 100 values",
                     ));
                 }
-                completion.validate().map_err(McpError::internal_error)?;
-                completion
+                result
+                    .payload
+                    .completion
+                    .validate()
+                    .map_err(McpError::internal_error)?;
+                result
             }
             Outcome::Err(error) => {
                 return Err(sanitize_handler_error(
@@ -4684,7 +4697,7 @@ impl Router {
             }
         };
 
-        Ok(FinalCompletionResult { completion })
+        Ok(result)
     }
 
     /// Dispatches a modern request through the transport-neutral final router.
@@ -4991,7 +5004,7 @@ impl Router {
                         "modern completion dispatch selected another core request",
                     ));
                 };
-                encode_stateless_handler_result(
+                encode_final_completion_result(
                     self.handle_completion_final_in_request(
                         request_ctx,
                         request_cx,
@@ -15715,6 +15728,48 @@ mod router_tests {
                 has_more: Some(false),
             })
         }
+
+        fn complete_legacy_result_async_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            params: LegacyCompletionParams,
+        ) -> BoxFuture<'a, McpOutcome<LegacyCompletionResult>> {
+            Box::pin(async move {
+                match self.complete_legacy(ctx, params) {
+                    Ok(completion) => Outcome::Ok(LegacyCompletionResult {
+                        completion,
+                        meta: Some(
+                            serde_json::from_str(r#"{"com.example/completion":1.20e+4}"#).unwrap(),
+                        ),
+                    }),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
+        }
+
+        fn complete_final_result_async_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            params: FinalCompletionParams,
+        ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCompletionResult>>> {
+            Box::pin(async move {
+                match self.complete_final(ctx, params) {
+                    Ok(completion) => Outcome::Ok(CompleteResult::new(
+                        FinalCompletionResult { completion },
+                        fastmcp_protocol::ResultMeta::empty().with_metadata(
+                            OpenMetadata::try_from_entries([(
+                                "com.example/completion".to_owned(),
+                                serde_json::from_str("1.20e+4").unwrap(),
+                            )])
+                            .unwrap(),
+                        ),
+                    )),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
+        }
     }
 
     // Exact-2024 era: observes the mount through the legacy completion route.
@@ -15939,12 +15994,44 @@ mod router_tests {
             serde_json::json!(["staging"])
         );
 
+        let request = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "ref": {"type": "ref/prompt", "name": "ns/prompt-argument-boundary"},
+                "argument": {"name": "topic", "value": "sta"},
+            })),
+            415_i64,
+        );
+        let modern = block_on(main.dispatch_stateless(&request_ctx, &request))
+            .expect("the mounted fallback retains its exact final result hook");
+        for result in [&legacy, &modern] {
+            assert_eq!(
+                result["_meta"]["com.example/completion"]
+                    .as_number()
+                    .unwrap()
+                    .as_str(),
+                "1.20e+4",
+                "mounting a fallback cannot discard its exact result metadata"
+            );
+        }
+        assert_eq!(modern["completion"], legacy["completion"]);
+        assert_eq!(modern["resultType"], "complete");
+
+        cx.set_cancel_requested(true);
+        let cancelled = block_on(main.dispatch_stateless(&request_ctx, &request))
+            .expect_err("cancellation still prevents an exact completion result hook from running");
+        assert_eq!(cancelled.code, McpErrorCode::RequestCancelled);
+
         let seen = seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             seen.as_slice(),
-            ["prompt-argument-boundary"],
+            ["prompt-argument-boundary", "prompt-argument-boundary"],
             "the child's server-wide handler must observe the original prompt name"
         );
     }

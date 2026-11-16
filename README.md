@@ -1113,6 +1113,19 @@ transformations forward these hooks; mounted resources rewrite their known URI
 fields while retaining opaque extension data. Ordinary handlers retain the
 checked conversion from their existing application result types.
 
+Completion handlers preserve their result envelopes too. Modern
+`completion/complete` proxy results retain `_meta`, unknown result members, and
+exact JSON number spellings; exact-2024 results retain their opaque `_meta`.
+Custom handlers can override
+`CompletionHandler::complete_final_result_async_in_request` or
+`complete_legacy_result_async_in_request` to return these complete results.
+The defaults delegate to the existing request-owned completion value hooks.
+Mounted target handlers and server-wide fallback handlers forward the result
+hooks while rewriting the request reference to its original child name.
+The router still checks completion value limits, final totals, and the selected
+protocol era's metadata before emission. Target visibility, caller cancellation,
+handler timeouts, and panic handling also apply to these hooks.
+
 Exact-2024 resource subscribe/unsubscribe hooks also have awaited variants:
 `ResourceHandler::on_subscribe_async` and `on_unsubscribe_async`. The live
 dispatcher and mounted resources forward these hooks on the caller runtime.

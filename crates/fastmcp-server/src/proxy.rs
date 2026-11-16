@@ -72,15 +72,16 @@ use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
     CompletionValues, Content, CoreRequest, CoreResult, ElicitationCapability,
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
-    FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
-    FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
+    FinalCallToolResult, FinalCompletionParams, FinalCompletionResult, FinalCompletionValues,
+    FinalCoreResult, FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
     FinalReadResourceResult, FinalRequestMeta, FormElicitationCapability, GetPromptResult,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
-    LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
-    LegacyResourceContent, ProgressParams, Prompt, PromptMessage, ReadResourceResult, RequestId,
-    Resource, ResourceContent, ResourceTemplate, RootsCapability, SamplingCapability,
-    ServerDiscoverResult, ServerNotification, SubscriptionFilter, Tool, ToolAnnotations,
-    UrlElicitationCapability, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
+    LegacyCompletionReference, LegacyCompletionResult, LegacyContent, LegacyCoreResult,
+    LegacyPromptMessage, LegacyResourceContent, ProgressParams, Prompt, PromptMessage,
+    ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate, RootsCapability,
+    SamplingCapability, ServerDiscoverResult, ServerNotification, SubscriptionFilter, Tool,
+    ToolAnnotations, UrlElicitationCapability, decode_strict_jsonrpc_message,
+    decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::{
@@ -14405,6 +14406,56 @@ impl CompletionHandler for ProxyCompletionHandler {
             match self.client.complete_typed_async(ctx, params).await {
                 Ok(CoreResult::Final(FinalCoreResult::Completion { result, .. })) => {
                     Outcome::Ok(result.payload.completion)
+                }
+                Ok(CoreResult::Legacy(LegacyCoreResult::Completion(_))) => {
+                    Outcome::Err(McpError::invalid_request(
+                        "Proxy cannot use an exact legacy completion result for a final handler path",
+                    ))
+                }
+                Ok(_) => Outcome::Err(unexpected_proxy_result("completion/complete")),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    fn complete_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        params: LegacyCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<LegacyCompletionResult>> {
+        Box::pin(async move {
+            let params = match self.rewrite_legacy(params) {
+                Ok(params) => params,
+                Err(error) => return Outcome::Err(error),
+            };
+            match self.client.complete_typed_async(ctx, params).await {
+                Ok(CoreResult::Legacy(LegacyCoreResult::Completion(result))) => Outcome::Ok(result),
+                Ok(CoreResult::Final(FinalCoreResult::Completion { .. })) => {
+                    Outcome::Err(McpError::invalid_request(
+                        "Proxy cannot use an exact final completion result for a legacy handler path",
+                    ))
+                }
+                Ok(_) => Outcome::Err(unexpected_proxy_result("completion/complete")),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    fn complete_final_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCompletionResult>>> {
+        Box::pin(async move {
+            let params = match self.rewrite_final(params) {
+                Ok(params) => params,
+                Err(error) => return Outcome::Err(error),
+            };
+            match self.client.complete_typed_async(ctx, params).await {
+                Ok(CoreResult::Final(FinalCoreResult::Completion { result, .. })) => {
+                    Outcome::Ok(result)
                 }
                 Ok(CoreResult::Legacy(LegacyCoreResult::Completion(_))) => {
                     Outcome::Err(McpError::invalid_request(
