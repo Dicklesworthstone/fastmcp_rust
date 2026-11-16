@@ -68,14 +68,14 @@ flate2 = { version = "=1.1.11" }
 chrono = { version = "=0.4.45", default-features = false, features = ["std", "clock"] }
 
 # File watching
-notify = { version = "=8.2.1" }
+notify = { version = "=8.2.2" }
 glob = { version = "=0.3.4" }
 
 # Console output
 console = { version = "=0.16.6" }
 
 # Configuration file parsing
-toml = { version = "=1.2.0" }
+toml = { version = "=1.2.1" }
 dirs = { version = "=7.0.0" }
 
 # FND-01 foundation pins (exact feature surfaces)
