@@ -21469,9 +21469,17 @@ impl Client {
         if let Some(error) = self.responses.terminal_error() {
             return Err(error);
         }
+        if cx.checkpoint().is_err()
+            || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+        {
+            return Err(McpError::request_cancelled());
+        }
         let executor = self.multiplexed_stdio_executor()?;
+        // Shared control maintenance belongs to the connection. The caller
+        // below owns only the new execution, including while its future is
+        // parked and another executor clone services this connection.
         executor
-            .service(cx)
+            .service(&self.cx)
             .map_err(|error| self.terminate_connection(error))?;
         let params = match params {
             Some(params) => Some(self.prepare_request_parameters(params)?),
@@ -22042,7 +22050,10 @@ impl Client {
     /// The supplied context owns only this operation. It is checked before
     /// and after each connection-owned receive turn; cancellation explicitly
     /// selects and services this execution with the retained connection
-    /// context before returning. Connection-context cancellation, framing,
+    /// context before returning. The registry also retains that caller's
+    /// cancellation and deadline while this future is not being polled, so
+    /// another executor's service turn can retire it without touching siblings.
+    /// Connection-context cancellation, framing,
     /// and transport failures retain their existing terminal connection
     /// behavior.
     #[cfg(unix)]
@@ -22070,7 +22081,10 @@ impl Client {
         if cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
-        let mut execution = self.start_multiplexed_request(&connection_cx, method, params)?;
+        // Retain the real caller in the request registry. Checking it only
+        // from this future leaves cancellation and deadlines invisible while
+        // the future is parked and a healthy sibling drives shared ingress.
+        let mut execution = self.start_multiplexed_request(cx, method, params)?;
         if cx.checkpoint().is_err() {
             self.cancel_multiplexed_request_with_connection_cx(
                 &connection_cx,
@@ -65685,6 +65699,333 @@ while IFS= read -r unexpected; do exit 15; done
                 }
             }
         });
+    }
+
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn raw_async_caller_lifetime_probe(legacy: bool, typed: bool) {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+
+        for stop in ["active", "context", "deadline"] {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer)
+                .build()
+                .unwrap();
+            let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            runtime.block_on(async {
+                let discovery = if legacy {
+                    serde_json::json!({
+                        "jsonrpc":"2.0", "id":1,
+                        "result":{
+                            "protocolVersion":"2024-11-05", "capabilities":{},
+                            "serverInfo":{"name":"raw-origin-peer","version":"1"},
+                        },
+                    })
+                    .to_string()
+                } else {
+                    modern_discovery_response("raw-origin-peer", &[MODERN_PROTOCOL_VERSION])
+                };
+                let tool_result = if legacy {
+                    r#"{"content":[{"type":"text","text":"owned"}]}"#
+                } else {
+                    r#"{"resultType":"complete","content":[{"type":"text","text":"owned"}]}"#
+                };
+                let list_prefix = if legacy {
+                    ""
+                } else {
+                    r#""resultType":"complete","ttlMs":0,"cacheScope":"private","#
+                };
+                let script = r#"
+numeric_id() {
+    printf '%s\n' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\)[,}].*/\1/p'
+}
+IFS= read -r initialize || exit 10
+printf '%s\n' "$1"
+if [ "$2" = legacy ]; then
+    IFS= read -r initialized || exit 11
+    case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 12 ;; esac
+fi
+IFS= read -r sibling || exit 13
+case "$sibling" in *'"method":"tools/list"'*) ;; *) exit 14 ;; esac
+sibling_id=$(numeric_id "$sibling")
+IFS= read -r pending || exit 15
+case "$pending" in *'"method":"tools/call"'*) ;; *) exit 16 ;; esac
+pending_id=$(numeric_id "$pending")
+IFS= read -r next || exit 17
+control=null
+if [ "$3" != active ]; then
+    case "$next" in *'"method":"notifications/cancelled"'*) ;; *) exit 18 ;; esac
+    cancelled_id=$(printf '%s\n' "$next" | sed -n 's/.*"requestId":\([0-9][0-9]*\)[,}].*/\1/p')
+    [ "$cancelled_id" = "$pending_id" ] || exit 19
+    control=$next
+    IFS= read -r next || exit 20
+fi
+case "$next" in *'"method":"tools/list"'*) ;; *) exit 21 ;; esac
+service_id=$(numeric_id "$next")
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$pending_id" "$4"
+printf '{"jsonrpc":"2.0","id":%s,"result":{%s"tools":[],"owner":"sibling"}}\n' "$sibling_id" "$5"
+printf '{"jsonrpc":"2.0","id":%s,"result":{%s"tools":[],"observed":%s,"control":%s}}\n' "$service_id" "$5" "$pending" "$control"
+IFS= read -r fresh || exit 22
+case "$fresh" in *'"method":"tools/list"'*) ;; *) exit 23 ;; esac
+fresh_id=$(numeric_id "$fresh")
+printf '{"jsonrpc":"2.0","id":%s,"result":{%s"tools":[],"owner":"fresh"}}\n' "$fresh_id" "$5"
+while IFS= read -r unexpected; do exit 24; done
+"#;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(if legacy {
+                        ProtocolPolicy::LegacyOnly
+                    } else {
+                        ProtocolPolicy::ModernOnly
+                    }))
+                    .request_timeout_policy(
+                        RequestTimeoutPolicy::new(
+                            Duration::from_secs(30),
+                            Duration::from_secs(30),
+                        )
+                        .unwrap(),
+                    )
+                    .connect_stdio_with_cx(
+                        &healthy,
+                        "sh",
+                        &[
+                            "-c",
+                            script,
+                            "raw-origin-peer",
+                            &discovery,
+                            if legacy { "legacy" } else { "modern" },
+                            stop,
+                            tool_result,
+                            list_prefix,
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                let executor = client.multiplexed_stdio_executor().unwrap();
+                let mut sibling = executor
+                    .execute(&healthy, "tools/list", Some(serde_json::json!({})))
+                    .unwrap();
+                let sibling_before = executor.executor.pending_records()[0].clone();
+                let origin = runtime.request_cx_with_budget(
+                    asupersync::Budget::INFINITE
+                        .with_deadline(healthy.now() + Duration::from_secs(1)),
+                );
+                let mut pending = Box::pin(async {
+                    if typed {
+                        client
+                            .request_legacy_core_with_cx(
+                                &origin,
+                                LegacyCoreRequest::ToolsCall(CallToolParams {
+                                    name: "work".to_owned(),
+                                    arguments: Some(serde_json::json!({})),
+                                    meta: None,
+                                }),
+                            )
+                            .await
+                            .map(|result| {
+                                let LegacyCoreResult::ToolsCall(result) = result else {
+                                    panic!("typed legacy request must keep its result kind");
+                                };
+                                serde_json::to_value(result).unwrap()
+                            })
+                    } else {
+                        client
+                            .request_with_cx(
+                                &origin,
+                                "tools/call",
+                                Some(serde_json::json!({"name":"work","arguments":{}})),
+                            )
+                            .await
+                            .map(|response| response.result.unwrap())
+                    }
+                });
+                assert!(
+                    std::future::poll_fn(|task_cx| {
+                        std::task::Poll::Ready(pending.as_mut().poll(task_cx))
+                    })
+                    .await
+                    .is_pending(),
+                    "the peer waits for an independent service request",
+                );
+                let owned_id = executor
+                    .executor
+                    .pending_records()
+                    .into_iter()
+                    .find(|record| record.request_id != *sibling.request_id())
+                    .unwrap()
+                    .request_id;
+                match stop {
+                    "active" => {}
+                    "context" => {
+                        origin.set_cancel_requested(true);
+                    }
+                    "deadline" => {
+                        clock.advance(1_000_000_000);
+                    }
+                    _ => unreachable!(),
+                }
+
+                // Keep the original future parked. The clone, not another poll
+                // of that future, must observe its actual owner's lifetime.
+                let mut service = executor
+                    .clone()
+                    .execute(&healthy, "tools/list", Some(serde_json::json!({})))
+                    .unwrap();
+                let stopped = stop != "active";
+                let records = executor.executor.pending_records();
+                assert_eq!(
+                    records.iter().any(|record| record.request_id == owned_id),
+                    !stopped,
+                    "legacy={legacy}, typed={typed}, stop={stop}",
+                );
+                assert_eq!(
+                    records.iter().find(|record| record.request_id == *sibling.request_id()),
+                    Some(&sibling_before),
+                );
+                let events = executor.executor.take_cancellation_events();
+                assert_eq!(events.len(), usize::from(stopped));
+                if stopped {
+                    assert_eq!(events[0].request_id, owned_id);
+                    assert_eq!(events[0].reason, ExecutionTerminalReason::CallerCancelled);
+                    let terminals = executor.executor.terminal_records();
+                    assert_eq!(terminals.len(), 1);
+                    assert!(terminals[0].cancellation_committed);
+                    assert_eq!(terminals[0].cancellation_transport_attempts, 1);
+                    assert!(!terminals[0].final_delivered);
+                }
+                executor.service(&healthy).unwrap();
+                assert!(executor.executor.take_cancellation_events().is_empty());
+
+                let result = pending.await;
+                if stopped {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                } else {
+                    assert_eq!(result.unwrap()["content"][0]["text"], "owned");
+                }
+                let fresh = client
+                    .request_with_cx(&healthy, "tools/list", Some(serde_json::json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(fresh.result.unwrap()["owner"], "fresh");
+                assert_eq!(
+                    executor.try_take_response(&mut sibling).unwrap().unwrap()
+                        .result.unwrap()["owner"],
+                    "sibling",
+                );
+                let observed = executor
+                    .try_take_response(&mut service)
+                    .unwrap()
+                    .unwrap()
+                    .result
+                    .unwrap();
+                if stopped {
+                    assert_eq!(
+                        observed["control"]["params"]["requestId"],
+                        serde_json::to_value(&owned_id).unwrap(),
+                    );
+                    assert!(observed["control"].get("id").is_none());
+                } else {
+                    assert!(observed["control"].is_null());
+                }
+                assert_eq!(observed["observed"]["method"], "tools/call");
+                assert!(executor.executor.pending_records().is_empty());
+                assert!(executor.executor.take_cancellation_events().is_empty());
+                assert!(executor.executor.terminal_error().is_none());
+                assert!(healthy.checkpoint().is_ok());
+                // A frozen virtual clock cannot drive asynchronous process
+                // cleanup. There are no reverse tasks in this fixture.
+                assert!(client.reverse_callback_pool.tasks.lock().unwrap().is_empty());
+                client.close().unwrap();
+                assert!(client.child_cleanup_complete());
+            });
+            drop(healthy);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn clt_01_raw_modern_async_request_retains_parked_caller_lifetime() {
+        raw_async_caller_lifetime_probe(false, false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn clt_01_raw_legacy_async_request_retains_parked_caller_lifetime() {
+        raw_async_caller_lifetime_probe(true, false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn leg_03_typed_async_request_retains_parked_caller_lifetime() {
+        raw_async_caller_lifetime_probe(true, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_cancelled_raw_start_preserves_connection_and_sibling() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            let discovery =
+                modern_discovery_response("raw-cancelled-start", &[MODERN_PROTOCOL_VERSION]);
+            let script = r#"
+IFS= read -r discover || exit 10
+printf '%s\n' "$1"
+IFS= read -r sibling || exit 11
+case "$sibling" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 12 ;; esac
+IFS= read -r fresh || exit 13
+case "$fresh" in *'"method":"tools/list"'*'"id":3'*) ;; *) exit 14 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","owner":"sibling"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","owner":"fresh"}}'
+while IFS= read -r unexpected; do exit 15; done
+"#;
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .connect_stdio_with_cx(
+                    &healthy, "sh", &["-c", script, "raw-cancelled-start", &discovery],
+                )
+                .await
+                .unwrap();
+            let executor = client.multiplexed_stdio_executor().unwrap();
+            let mut sibling = executor
+                .execute(&healthy, "tools/list", Some(serde_json::json!({})))
+                .unwrap();
+            let before = executor.executor.pending_records();
+            let next_id = client.peek_next_request_id();
+            let cancelled = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            cancelled.set_cancel_requested(true);
+            let error = match client.start_multiplexed_request(
+                &cancelled, "tools/list", Some(serde_json::json!({})),
+            ) {
+                Ok(_) => panic!("a cancelled caller cannot start a request"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(client.peek_next_request_id(), next_id);
+            assert_eq!(executor.executor.pending_records(), before);
+            assert!(executor.executor.terminal_error().is_none());
+            assert!(executor.executor.take_cancellation_events().is_empty());
+            let fresh = client
+                .request_with_cx(&healthy, "tools/list", Some(serde_json::json!({})))
+                .await
+                .unwrap();
+            assert_eq!(fresh.result.unwrap()["owner"], "fresh");
+            assert_eq!(
+                executor.try_take_response(&mut sibling).unwrap().unwrap()
+                    .result.unwrap()["owner"],
+                "sibling",
+            );
+            assert!(healthy.checkpoint().is_ok());
+            client.close_with_cx(&healthy).await.unwrap();
+        });
+        drop(healthy);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
     #[cfg(unix)]
