@@ -243,6 +243,15 @@ pub struct StdioRecovery {
     pub catalog_subscription: Option<StdioSubscriptionRecovery>,
 }
 
+impl StdioRecovery {
+    /// Returns the restored catalog listener recovery record when a configured
+    /// subscription was re-established on the replacement subprocess.
+    #[must_use]
+    pub const fn catalog_subscription(&self) -> Option<&StdioSubscriptionRecovery> {
+        self.catalog_subscription.as_ref()
+    }
+}
+
 /// A bounded supervision failure. No variant promises that an RPC had no effect.
 #[derive(Clone, Debug)]
 pub enum StdioRestartError {

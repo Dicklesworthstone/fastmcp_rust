@@ -932,10 +932,12 @@ mod tests {
                 },
             });
             let payload = serde_json::to_string_pretty(&update).unwrap();
-            let mut framed = payload
-                .lines()
-                .map(|line| format!("data: {line}\r\n"))
-                .collect::<String>();
+            let mut framed = String::new();
+            for line in payload.lines() {
+                framed.push_str("data: ");
+                framed.push_str(line);
+                framed.push_str("\r\n");
+            }
             framed.push_str("\r\n");
             assert!(payload.len() > 1024 * 1024);
             assert!(framed.len() > payload.len() + 64);
