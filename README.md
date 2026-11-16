@@ -1351,6 +1351,47 @@ one request and preserve the complete typed result, including
 They use the existing yielding receive path; subprocess creation and bounded
 pipe writes retain their synchronous limits.
 
+### Calling a tool and waiting for its Task (current source tree, optional)
+
+On Unix, build the CLI with `--features tasks` and use `call --wait` to keep
+the originating stdio process or HTTP client alive while an accepted Task
+finishes. The peer must support the Tasks extension, and the protocol policy
+must be explicitly `modern-only`:
+
+```bash
+fastmcp call generate-report --wait --protocol-policy modern-only \
+  --server ./report-server --arguments '{"format":"pdf"}' --timeout 120 --json
+
+fastmcp call generate-report --wait --protocol-policy modern-only \
+  --http-url http://127.0.0.1:8000/mcp \
+  --arguments '{"format":"pdf"}' --timeout 120 --json
+```
+
+The CLI sends the creating tool call once and prints its accepted Task receipt
+before waiting. It observes that Task through the same client and request-ID
+allocator, honoring the initial and subsequent `pollIntervalMs` values. An
+immediate complete result or already terminal Task produces one JSON line.
+A working Task produces its creation receipt followed by the latest admitted
+Task snapshot when observation ends. The latter has no `resultType` wrapper
+or copied creation-envelope metadata; completed result source is preserved.
+Treat this output as newline-delimited JSON, including on a failed command.
+
+Successful completion exits zero. Failed or cancelled Tasks, completed results
+with `isError: true`, input-required pauses, expired retention, and local
+observation failures exit nonzero. The accepted receipt remains available even
+when observation fails. Waiting submits no input, repeats no tool call, and
+does not send `tasks/cancel`. Manual input capabilities and continuation files
+cannot be combined with `--wait`.
+
+One `--timeout` covers connection setup, the creating call, and observation.
+Each admitted Task output has a separate settlement of up to 250 ms for
+ordinary Unix pipes and sockets; regular files and devices retain their OS
+I/O behavior. Stdio cleanup is also bounded and may finish after the
+active-work deadline. A blocked output pipe fails without starting another
+request. The CLI cleans up a child it started, so recovery of a process-local
+stdio Task after exit still requires server-owned persistence. This command
+does not add durable Task storage or automatic reconnects.
+
 ### Tasks commands (current source tree, optional)
 
 Build the CLI with `--features tasks` to expose `tasks get`, `watch`, `update`,

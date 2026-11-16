@@ -107,11 +107,14 @@ mod memory {
         (client, handle, peer)
     }
 
-
     async fn just_created(
         cx: &Cx,
         mut initial: Value,
-    ) -> (MemoryClient, fastmcp_protocol::CreateTaskResult, MemoryTransport) {
+    ) -> (
+        MemoryClient,
+        fastmcp_protocol::CreateTaskResult,
+        MemoryTransport,
+    ) {
         let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
         peer.send_async(cx, &serde_json::from_value(discovery()).unwrap())
             .await
@@ -1879,7 +1882,13 @@ fn creation_receipt(mut task: Value) -> fastmcp_protocol::CreateTaskResult {
 
 #[test]
 fn created_task_handle_retains_every_status_without_consuming_creation_receipt() {
-    for status in ["working", "input_required", "completed", "failed", "cancelled"] {
+    for status in [
+        "working",
+        "input_required",
+        "completed",
+        "failed",
+        "cancelled",
+    ] {
         let mut initial = task(status, Some(25));
         initial["createdAt"] = json!("2026-07-28T08:00:00-04:00");
         let created = creation_receipt(initial);
@@ -1919,7 +1928,9 @@ fn created_task_handle_preserves_exact_completed_result_source() {
         retained.contains(RESULT),
         "Task adoption must not rebuild nested result numbers or member order",
     );
-    let handle = handle.into_driver(FinalTaskDrivePolicy::default()).into_handle();
+    let handle = handle
+        .into_driver(FinalTaskDrivePolicy::default())
+        .into_handle();
     assert_eq!(serde_json::to_string(handle.task()).unwrap(), retained);
     assert_eq!(serde_json::to_string(&created).unwrap(), receipt);
 }
@@ -1928,7 +1939,13 @@ fn created_task_handle_preserves_exact_completed_result_source() {
 fn created_task_handle_rejects_locally_mutated_status_and_payload() {
     use fastmcp_protocol::tasks_extension::TaskStatus;
 
-    for status in ["working", "input_required", "completed", "failed", "cancelled"] {
+    for status in [
+        "working",
+        "input_required",
+        "completed",
+        "failed",
+        "cancelled",
+    ] {
         let mut created = creation_receipt(task(status, None));
         assert!(FinalTaskHandle::from_created(&created).is_ok());
         let base = match &mut created.task {
@@ -2070,8 +2087,8 @@ fn public_http_task_creating_call_preserves_typed_outcomes_without_replay() {
             assert_eq!(request["params"]["name"], "start-work");
             assert_eq!(request["params"]["arguments"], json!({"value": 7}));
             assert_eq!(
-                request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
-                    ["extensions"][fastmcp_protocol::TASKS_EXTENSION],
+                request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    [fastmcp_protocol::TASKS_EXTENSION],
                 json!({}),
             );
             write(

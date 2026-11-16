@@ -5142,3 +5142,485 @@ done
         }
     }
 }
+
+
+// Exercise call --wait through the public binary: creation and observation must
+// share the connection's request-ID allocator and exactly one tool dispatch.
+#[cfg(all(unix, feature = "tasks"))]
+mod call_task_wait {
+    use super::*;
+    use serde_json::{Value, json};
+
+    const PEER: &str = r#"
+import http.server
+import json
+import os
+import sys
+import time
+
+mode, task_id, log_path, transport, ready_path = sys.argv[1:]
+poll_ms = 5000 if mode == "working" else 80
+called_at = None
+raw_result = r'{"content":[{"type":"text","text":"done"}],"isError":false,"com.example\/number":1.20e+4,"com.example/big":9007199254740993,"_meta":{"com.example/result":"preserved"}}'
+
+def task(status, result_type):
+    fields = {
+        "resultType": result_type,
+        "taskId": task_id,
+        "status": status,
+        "statusMessage": "x" * 400000 if mode == "blocked_output" else "public\n\u001b[31m\u202epeer",
+        "createdAt": "2026-11-16T00:00:00Z",
+        "lastUpdatedAt": "2026-11-16T00:00:00Z",
+        "ttlMs": None,
+        "pollIntervalMs": poll_ms,
+    }
+    if result_type == "task":
+        fields["_meta"] = {"com.example/receipt": "accepted"}
+        fields["com.example/creation"] = {"kept": True}
+    if status == "failed":
+        fields["error"] = {"code": -32603, "message": "task stopped",
+                           "com.example/error": "preserved"}
+    if status == "input_required":
+        fields["inputRequests"] = {"roots": {"method": "roots/list"}}
+    if mode == "wrong_task" and result_type == "complete":
+        fields["taskId"] = "another-" + task_id
+    encoded = json.dumps(fields, separators=(",", ":"))
+    if status == "completed":
+        result = raw_result.replace('"isError":false', '"isError":true') if mode == "is_error" else raw_result
+        encoded = encoded[:-1] + ',"result":' + result + "}"
+    return encoded
+
+def respond(request):
+    global called_at
+    method = request["method"]
+    event = {"request": request, "pid": os.getpid()}
+    if called_at is not None:
+        event["elapsed_ms"] = (time.monotonic() - called_at) * 1000
+    with open(log_path, "a", encoding="utf-8") as output:
+        output.write(json.dumps(event, separators=(",", ":")) + "\n")
+    if method == "server/discover":
+        capabilities = {"tools": {}}
+        if mode != "core_only":
+            capabilities["extensions"] = {"io.modelcontextprotocol/tasks": {}}
+        result = json.dumps({
+            "resultType": "complete", "supportedVersions": ["2026-07-28"],
+            "capabilities": capabilities, "ttlMs": 0, "cacheScope": "private",
+            "_meta": {"io.modelcontextprotocol/serverInfo": {
+                "name": "call-wait-peer", "version": "1"}},
+        })
+    elif method == "tools/call":
+        assert called_at is None, "tool creation must never replay"
+        params = request["params"]
+        assert params["name"] == "background"
+        assert params["arguments"] == {"work": task_id}
+        assert params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]["io.modelcontextprotocol/tasks"] == {}
+        assert "task" not in params and "ttlMs" not in params
+        called_at = time.monotonic()
+        if mode == "sync":
+            result = '{"resultType":"complete","content":[{"type":"text","text":"immediate"}]}'
+        else:
+            result = task("completed" if mode == "immediate" else "working", "task")
+    elif method == "tasks/get":
+        assert called_at is not None, "observation must follow creation"
+        assert request["params"]["taskId"] == task_id
+        assert event["elapsed_ms"] >= 70, "creation pollIntervalMs was shortened"
+        status = mode if mode in ("failed", "cancelled", "input_required", "working") else "completed"
+        result = task(status, "complete")
+    else:
+        raise AssertionError("unexpected request or callback: " + method)
+    return '{"jsonrpc":"2.0","id":' + json.dumps(request["id"]) + ',"result":' + result + "}"
+
+if transport == "stdio":
+    for line in sys.stdin:
+        request = json.loads(line)
+        if "id" in request:
+            print(respond(request), flush=True)
+        else:
+            with open(log_path, "a", encoding="utf-8") as output:
+                output.write(json.dumps({"notification": request, "pid": os.getpid()}) + "\n")
+else:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def do_POST(self):
+            assert self.path == "/mcp"
+            length = int(self.headers["Content-Length"])
+            assert 0 < length <= 65536
+            request = json.loads(self.rfile.read(length))
+            payload = respond(request).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+            self.close_connection = True
+        def log_message(self, *args):
+            pass
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    with open(ready_path, "w", encoding="utf-8") as ready:
+        ready.write("http://127.0.0.1:" + str(server.server_port) + "/mcp")
+    server.serve_forever()
+"#;
+
+    fn call(mode: &str, http: bool, json_output: bool, extra: &[&str]) -> (Output, Vec<Value>) {
+        let root = TestTempDir::new("call-wait");
+        let task_id = root.file_name().unwrap().to_str().unwrap();
+        let script = root.join("peer.py");
+        let log = root.join("requests.jsonl");
+        let ready = root.join("ready");
+        std::fs::write(&script, PEER).unwrap();
+        let peer_arguments = [
+            mode,
+            task_id,
+            log.to_str().unwrap(),
+            if http { "http" } else { "stdio" },
+            ready.to_str().unwrap(),
+        ];
+        let mut command = Command::new(get_binary_path());
+        command.args([
+            "call",
+            "background",
+            "--wait",
+            "--protocol-policy",
+            "modern-only",
+            "--timeout",
+            if mode == "working" { "1" } else { "5" },
+            "--arguments",
+            &json!({"work": task_id}).to_string(),
+        ]);
+        if json_output {
+            command.arg("--json");
+        }
+        let mut peer = if http {
+            let mut peer_command = Command::new("python3");
+            peer_command
+                .arg(&script)
+                .args(peer_arguments)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            let peer = ProcessGroupGuard::spawn(&mut peer_command);
+            let started = Instant::now();
+            let endpoint = loop {
+                if let Ok(endpoint) = std::fs::read_to_string(&ready) {
+                    if endpoint.starts_with("http://") {
+                        break endpoint;
+                    }
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "HTTP task peer did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            command.args(["--http-url", &endpoint]);
+            Some(peer)
+        } else {
+            command
+                .args(["--server", "python3", "--server-arg"])
+                .arg(&script);
+            for argument in peer_arguments {
+                command.args(["--server-arg", argument]);
+            }
+            None
+        };
+        command.args(extra);
+        let output =
+            run_with_deadline(command, Duration::from_secs(15)).expect("bounded call --wait");
+        if let Some(peer) = peer.as_mut() {
+            peer.kill_and_reap().expect("HTTP peer cleanup");
+        }
+        let events = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (output, events)
+    }
+
+    fn documents(output: &Output) -> Vec<Value> {
+        stdout_str(output)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one admitted JSON value per line"))
+            .collect()
+    }
+
+    fn assert_exchange(events: &[Value], expected: &[&str]) {
+        let methods = events
+            .iter()
+            .map(|event| event["request"]["method"].as_str().unwrap_or("notification"))
+            .collect::<Vec<_>>();
+        assert_eq!(methods, expected, "no callbacks, mutation, replay, or reconnect");
+        let pid = &events[0]["pid"];
+        let mut previous_id = None;
+        for event in events {
+            assert_eq!(&event["pid"], pid, "one live peer owns creation and polling");
+            let id = event["request"]["id"].as_u64().expect("numeric request ID");
+            if let Some(previous) = previous_id {
+                assert!(id > previous, "one request-ID allocator must survive creation");
+            }
+            previous_id = Some(id);
+        }
+        if let Some(call) = events
+            .iter()
+            .find(|event| event["request"]["method"] == "tools/call")
+        {
+            let params = &call["request"]["params"];
+            assert_eq!(
+                params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    ["io.modelcontextprotocol/tasks"],
+                json!({})
+            );
+            assert!(params.get("task").is_none(), "no obsolete task request hint");
+            assert!(params.get("ttlMs").is_none(), "no undeclared creation TTL");
+        }
+    }
+
+    #[test]
+    fn call_wait_keeps_stdio_and_http_creation_alive_and_preserves_exact_results() {
+        for http in [false, true] {
+            let (output, events) = call("completed", http, true, &[]);
+            assert!(output.status.success(), "{}", stderr_str(&output));
+            assert_exchange(&events, &["server/discover", "tools/call", "tasks/get"]);
+            let documents = documents(&output);
+            assert_eq!(documents.len(), 2);
+            let task_id = &events[1]["request"]["params"]["arguments"]["work"];
+            assert_eq!(documents[0]["resultType"], "task");
+            assert_eq!(documents[0]["taskId"], *task_id);
+            assert_eq!(documents[0]["status"], "working");
+            assert_eq!(documents[0]["_meta"]["com.example/receipt"], "accepted");
+            assert_eq!(documents[0]["com.example/creation"], json!({"kept": true}));
+            assert_eq!(documents[1]["taskId"], *task_id);
+            assert_eq!(documents[1]["status"], "completed");
+            assert!(documents[1].get("resultType").is_none());
+            assert!(documents[1].get("_meta").is_none(), "no stale creation metadata");
+            assert_eq!(
+                documents[1]["result"]["_meta"]["com.example/result"],
+                "preserved"
+            );
+            assert!(stdout_str(&output).contains(r#""com.example\/number":1.20e+4"#));
+            assert!(stdout_str(&output).contains(r#""com.example/big":9007199254740993"#));
+            assert!(events[2]["elapsed_ms"].as_f64().unwrap() >= 70.0);
+        }
+    }
+
+    #[test]
+    fn call_wait_immediate_results_do_not_poll_or_emit_duplicate_receipts() {
+        for http in [false, true] {
+            for mode in ["sync", "immediate"] {
+                let (output, events) = call(mode, http, true, &[]);
+                assert!(output.status.success(), "{}", stderr_str(&output));
+                assert_exchange(&events, &["server/discover", "tools/call"]);
+                let documents = documents(&output);
+                assert_eq!(documents.len(), 1);
+                if mode == "sync" {
+                    assert_eq!(documents[0]["resultType"], "complete");
+                    assert_eq!(documents[0]["content"][0]["text"], "immediate");
+                } else {
+                    assert_eq!(documents[0]["resultType"], "task");
+                    assert_eq!(documents[0]["status"], "completed");
+                    assert!(stdout_str(&output).contains(r#""com.example\/number":1.20e+4"#));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn call_wait_task_failures_and_input_requests_exit_nonzero_without_actions() {
+        for http in [false, true] {
+            for (mode, expected_status) in [
+                ("failed", "failed"),
+                ("cancelled", "cancelled"),
+                ("input_required", "input_required"),
+                ("is_error", "completed"),
+            ] {
+                let (output, events) = call(mode, http, true, &[]);
+                assert!(!output.status.success(), "{mode} must not report success");
+                assert_exchange(&events, &["server/discover", "tools/call", "tasks/get"]);
+                let documents = documents(&output);
+                assert_eq!(documents.len(), 2, "receipt and authoritative failure survive");
+                assert_eq!(documents[1]["status"], expected_status);
+                if mode == "input_required" {
+                    assert_eq!(
+                        documents[1]["inputRequests"]["roots"]["method"],
+                        "roots/list"
+                    );
+                    assert!(stderr_str(&output).contains("no input was submitted"));
+                } else if mode == "is_error" {
+                    assert_eq!(documents[1]["result"]["isError"], true);
+                } else if mode == "failed" {
+                    assert_eq!(documents[1]["error"]["com.example/error"], "preserved");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn call_wait_original_deadline_preserves_receipt_without_early_poll_or_cancel() {
+        for http in [false, true] {
+            let started = Instant::now();
+            let (output, events) = call("working", http, true, &[]);
+            assert!(!output.status.success());
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert_exchange(&events, &["server/discover", "tools/call"]);
+            let documents = documents(&output);
+            assert_eq!(documents.len(), 2);
+            assert_eq!(documents[0]["resultType"], "task");
+            assert_eq!(documents[0]["taskId"], documents[1]["taskId"]);
+            assert_eq!(documents[1]["status"], "working");
+            assert!(stderr_str(&output).contains("--timeout"));
+            assert!(stderr_str(&output).contains("no action was retried"));
+        }
+    }
+
+    #[test]
+    fn call_wait_blocked_receipt_pipe_does_not_hold_the_server_or_dispatch_a_poll() {
+        let root = TestTempDir::new("call-wait-blocked");
+        let task_id = root.file_name().unwrap().to_str().unwrap();
+        let script = root.join("peer.py");
+        let log = root.join("requests.jsonl");
+        let ready = root.join("unused-ready");
+        std::fs::write(&script, PEER).unwrap();
+        let mut command = Command::new(get_binary_path());
+        command
+            .args([
+                "call", "background", "--wait", "--protocol-policy", "modern-only",
+                "--timeout", "30", "--json", "--arguments",
+                &json!({"work": task_id}).to_string(), "--server", "python3",
+                "--server-arg",
+            ])
+            .arg(script);
+        for argument in [
+            "blocked_output", task_id, log.to_str().unwrap(), "stdio",
+            ready.to_str().unwrap(),
+        ] {
+            command.args(["--server-arg", argument]);
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = ProcessGroupGuard::spawn(&mut command);
+        // Hold the stdout pipe without draining it. Its capacity is smaller
+        // than the admitted receipt, while the active work budget is 30s.
+        let status = child
+            .wait_until(Duration::from_secs(5))
+            .expect("a blocked receipt pipe must settle before the active deadline");
+        assert!(!status.success());
+        let events = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect::<Vec<Value>>();
+        assert_exchange(&events, &["server/discover", "tools/call"]);
+    }
+
+    #[test]
+    fn call_wait_rejects_mismatched_observations_and_retains_the_accepted_task() {
+        for http in [false, true] {
+            let (output, events) = call("wrong_task", http, true, &[]);
+            assert!(!output.status.success());
+            assert_exchange(&events, &["server/discover", "tools/call", "tasks/get"]);
+            let documents = documents(&output);
+            assert_eq!(documents.len(), 2);
+            assert_eq!(documents[0]["taskId"], documents[1]["taskId"]);
+            assert_eq!(documents[1]["status"], "working");
+            assert!(stderr_str(&output).contains("no action was retried"));
+        }
+    }
+
+    #[test]
+    fn call_wait_requires_tasks_negotiation_before_tools_call_on_both_transports() {
+        for http in [false, true] {
+            let (output, events) = call("core_only", http, true, &[]);
+            assert!(!output.status.success());
+            assert_exchange(&events, &["server/discover"]);
+        }
+    }
+
+    #[test]
+    fn call_wait_human_output_sanitizes_peer_fields_and_help_explains_json_lines() {
+        let (output, events) = call("completed", false, false, &[]);
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        assert_exchange(&events, &["server/discover", "tools/call", "tasks/get"]);
+        assert!(stdout_str(&output).contains("task accepted"));
+        assert!(stdout_str(&output).contains("task completed"));
+        assert!(!stdout_str(&output).contains('\u{1b}'));
+        assert!(!stdout_str(&output).contains('\u{202e}'));
+        let help = run_cli(&["call", "--help"]);
+        assert!(help.status.success());
+        let help = stdout_str(&help).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("--wait"));
+        assert!(help.contains("one or two JSON lines"));
+        assert!(help.contains("250ms"));
+    }
+
+    #[test]
+    fn call_wait_refuses_auto_or_manual_continuation_before_contact() {
+        for arguments in [
+            vec![
+                "call", "background", "--wait", "--protocol-policy", "auto",
+                "--http-url", "http://127.0.0.1:1/mcp", "--json",
+            ],
+            vec![
+                "call", "background", "--wait", "--protocol-policy", "modern-only",
+                "--http-url", "http://127.0.0.1:1/mcp",
+                "--input-capability", "roots", "--json",
+            ],
+            vec![
+                "call", "background", "--wait", "--protocol-policy", "modern-only",
+                "--http-url", "http://127.0.0.1:1/mcp",
+                "--resume-result-file", "/not-opened/result",
+                "--input-responses-file", "/not-opened/answers", "--json",
+            ],
+        ] {
+            let output = run_cli(&arguments);
+            assert!(!output.status.success());
+            assert!(
+                stderr_str(&output).contains("call --wait requires")
+                    || stderr_str(&output).contains("FeatureUnavailable"),
+                "{}",
+                stderr_str(&output)
+            );
+            assert!(!stderr_str(&output).contains("could not establish"));
+            assert_eq!(documents(&output).len(), 1);
+        }
+    }
+}
+
+#[cfg(not(feature = "tasks"))]
+#[test]
+fn call_wait_without_tasks_feature_is_hidden_and_fails_before_connecting() {
+    let output = run_cli(&[
+        "call",
+        "background",
+        "--wait",
+        "--protocol-policy",
+        "modern-only",
+        "--http-url",
+        "http://127.0.0.1:1/mcp",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    assert!(stderr_str(&output).contains("FeatureUnavailable"));
+    assert!(stderr_str(&output).contains("--features tasks"));
+    assert!(!stderr_str(&output).contains("could not establish"));
+    let help = run_cli(&["call", "--help"]);
+    assert!(help.status.success());
+    assert!(!stdout_str(&help).contains("--wait"));
+}
+
+#[cfg(all(not(unix), feature = "tasks"))]
+#[test]
+fn call_wait_without_bounded_platform_output_fails_before_connecting() {
+    let output = run_cli(&[
+        "call",
+        "background",
+        "--wait",
+        "--protocol-policy",
+        "modern-only",
+        "--http-url",
+        "http://127.0.0.1:1/mcp",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    assert!(stderr_str(&output).contains("requires Unix bounded Task receipt output"));
+    assert!(!stderr_str(&output).contains("could not establish"));
+}

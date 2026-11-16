@@ -681,6 +681,14 @@ enum Commands {
     Call {
         /// Exact tool name.
         name: String,
+        /// Observe an accepted Task on the same connection (Unix, modern-only).
+        /// Emits acceptance, then the latest Task snapshot when observation ends;
+        /// --json emits one or two JSON lines. No callbacks, task cancellation,
+        /// or tool-call retries are performed. Requires Tasks support.
+        /// Snapshot output to ordinary Unix pipes/sockets has a separate 250ms
+        /// settlement bound; regular files/devices follow OS blocking behavior.
+        #[arg(long, hide = !cfg!(feature = "tasks"))]
+        wait: bool,
         #[command(flatten)]
         connection: OperationConnection,
         #[command(flatten)]
@@ -1280,6 +1288,13 @@ fn main() -> ExitCode {
         Err(error) => error.exit(),
     };
     let machine_output = cli.command.machine_output();
+    #[cfg(not(feature = "tasks"))]
+    if matches!(&cli.command, Commands::Call { wait: true, .. }) {
+        let error = fastmcp_core::McpError::invalid_params(
+            "FeatureUnavailable: call --wait requires fastmcp-cli built with --features tasks",
+        );
+        return report_cli_failure(machine_output, CliFailureCategory::CommandFailed, &error);
+    }
     // An unavailable policy is refused before the runtime, reactor, child,
     // listener, credential read, or protocol byte exists.
     if let Some(refusal) = cli
@@ -1367,12 +1382,14 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             name,
             connection,
             arguments,
+            wait,
         } => {
             Box::pin(cmd_operation(
                 cx,
                 &connection,
                 CoreOperation::Call(&name),
                 &arguments,
+                wait,
             ))
             .await
         }
@@ -1382,6 +1399,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 &connection,
                 CoreOperation::Read(&uri),
                 &OperationArguments::default(),
+                false,
             ))
             .await
         }
@@ -1395,6 +1413,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 &connection,
                 CoreOperation::Prompt(&name),
                 &arguments,
+                false,
             ))
             .await
         }
@@ -6558,11 +6577,30 @@ async fn cmd_operation(
     connection: &OperationConnection,
     operation: CoreOperation<'_>,
     arguments: &OperationArguments,
+    wait: bool,
 ) -> McpResult<()> {
     let budget = OperationBudget::new(connection.timeout)?;
     budget.remaining(cx)?;
     validate_cli_protocol_policy(connection.protocol_policy)?;
     validate_operation_input_policy(connection)?;
+    #[cfg(not(unix))]
+    if wait {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "call --wait requires Unix bounded Task receipt output; ordinary HTTP calls remain available",
+        ));
+    }
+    if wait
+        && (!cfg!(feature = "tasks")
+            || !matches!(operation, CoreOperation::Call(_))
+            || connection.protocol_policy != CliProtocolPolicy::ModernOnly
+            || !connection.input_capability.is_empty()
+            || connection.resume_result_file.is_some()
+            || connection.input_responses_file.is_some())
+    {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "call --wait requires Tasks support and --protocol-policy modern-only, without manual input capabilities or resume files",
+        ));
+    }
     let mut parameters = operation.parameters(arguments)?;
     let has_http = connection.http_url.is_some()
         || connection.legacy_sse_url.is_some()
@@ -6588,6 +6626,7 @@ async fn cmd_operation(
                 operation.method(),
                 parameters,
                 budget,
+                wait,
             ))
             .await?
         }
@@ -6605,10 +6644,14 @@ async fn cmd_operation(
             operation.method(),
             parameters,
             budget,
+            wait,
         ))
         .await?
     };
-    let outcome = operation_outcome(operation.method(), &result)?;
+    let Some(result) = result else {
+        return Ok(());
+    };
+    let outcome = operation_outcome(operation.method(), &result, wait)?;
     let output = render_operation_result(&result, outcome, connection.json)?;
     write_operation_output(cx, budget, &output)?;
     match outcome {
@@ -6620,7 +6663,15 @@ async fn cmd_operation(
         )),
         OperationOutcome::Complete => Ok(()),
         #[cfg(feature = "tasks")]
-        OperationOutcome::TaskAccepted => Ok(()),
+        OperationOutcome::TaskAccepted | OperationOutcome::TaskCompleted => Ok(()),
+        #[cfg(feature = "tasks")]
+        OperationOutcome::TaskFailed => Err(fastmcp_core::McpError::internal_error(
+            "task failed or was cancelled; its snapshot was emitted and no action was retried",
+        )),
+        #[cfg(feature = "tasks")]
+        OperationOutcome::TaskInputRequired => Err(fastmcp_core::McpError::invalid_request(
+            "task requires input; its snapshot was emitted; no input was submitted",
+        )),
     }
 }
 
@@ -6632,7 +6683,8 @@ async fn stdio_operation(
     method: &'static str,
     parameters: serde_json::Value,
     budget: OperationBudget,
-) -> McpResult<fastmcp_protocol::CoreResult> {
+    wait: bool,
+) -> McpResult<Option<fastmcp_protocol::CoreResult>> {
     let remaining = budget.remaining(cx)?;
     let args = connection
         .server_arg
@@ -6661,6 +6713,15 @@ async fn stdio_operation(
         let remaining = budget.remaining(cx)?;
         client.set_request_timeout_policy(OperationBudget::request_policy(remaining)?)?;
         let cancellation = fastmcp_core::McpRequestCancellation::new();
+        #[cfg(feature = "tasks")]
+        if wait {
+            return Box::pin(waiting_stdio_tool_call(
+                cx, &mut client, connection, parameters, budget, &cancellation,
+            ))
+            .await;
+        }
+        #[cfg(not(feature = "tasks"))]
+        debug_assert!(!wait);
         asupersync::time::timeout(
             cx.now(),
             remaining,
@@ -6669,6 +6730,7 @@ async fn stdio_operation(
         .await
         .map_err(|_| OperationBudget::timeout_error())?
         .map_err(|error| operation_failure(error, "MCP request failed; no action was retried"))
+        .map(Some)
     }
     .await;
     // Cleanup owns a separate bounded settlement phase, including after the
@@ -6694,7 +6756,8 @@ async fn http_operation(
     method: &'static str,
     parameters: serde_json::Value,
     budget: OperationBudget,
-) -> McpResult<fastmcp_protocol::CoreResult> {
+    wait: bool,
+) -> McpResult<Option<fastmcp_protocol::CoreResult>> {
     let plan = http_inspect_protocol_plan(
         connection.http_url.as_deref(),
         connection.legacy_sse_url.as_deref(),
@@ -6704,35 +6767,347 @@ async fn http_operation(
     let builder = http_client_builder(plan, connection.bearer_token_file.as_deref())?
         .capabilities(operation_input_capabilities(&connection.input_capability));
     let remaining = budget.remaining(cx)?;
-    asupersync::time::timeout(
+    let mut client = asupersync::time::timeout(
         cx.now(),
         remaining,
-        Box::pin(async {
-            let mut client = builder
+        Box::pin(
+            builder
                 .request_timeout_policy(OperationBudget::request_policy(remaining)?)
-                .connect_http_client_with_cx(cx)
-                .await
-                .map_err(|_| {
-                    fastmcp_core::McpError::internal_error(
-                        "could not establish the HTTP MCP connection",
-                    )
-                })?;
-            budget.remaining(cx)?;
-            let cancellation = fastmcp_core::McpRequestCancellation::new();
-            // One core dispatch; no MRTR retry, authentication retry, or fallback
-            // after this action starts. Dropping the future closes its HTTP stream.
-            client
-                .request_final_core_with_cancellation(cx, &cancellation, method, parameters)
-                .await
-                .map_err(|_| {
-                    fastmcp_core::McpError::internal_error(
-                        "MCP HTTP request failed; no action was retried",
-                    )
-                })
-        }),
+                .connect_http_client_with_cx(cx),
+        ),
     )
     .await
     .map_err(|_| OperationBudget::timeout_error())?
+    .map_err(|_| {
+        fastmcp_core::McpError::internal_error("could not establish the HTTP MCP connection")
+    })?;
+    let remaining = budget.remaining(cx)?;
+    let cancellation = fastmcp_core::McpRequestCancellation::new();
+    #[cfg(feature = "tasks")]
+    if wait {
+        return Box::pin(waiting_http_tool_call(
+            cx,
+            &mut client,
+            connection,
+            parameters,
+            budget,
+            &cancellation,
+        ))
+        .await;
+    }
+    #[cfg(not(feature = "tasks"))]
+    debug_assert!(!wait);
+    // One core dispatch; no MRTR retry, authentication retry, or fallback after
+    // this action starts. Recompute from the original deadline after connect.
+    let result = asupersync::time::timeout(
+        cx.now(),
+        remaining,
+        Box::pin(client.request_final_core_with_cancellation(
+            cx,
+            &cancellation,
+            method,
+            parameters,
+        )),
+    )
+    .await
+    .map_err(|_| OperationBudget::timeout_error())?
+    .map_err(|_| {
+        fastmcp_core::McpError::internal_error("MCP HTTP request failed; no action was retried")
+    })?;
+    Ok(Some(result))
+}
+
+/// Keep the accepted Task on the same process and request-ID allocator that
+/// created it. The ordinary core stdio API intentionally does not advertise
+/// Tasks, so a waiting tool call must select the Tasks-aware typed API.
+#[cfg(all(unix, feature = "tasks"))]
+async fn waiting_stdio_tool_call(
+    cx: &Cx,
+    client: &mut Client,
+    connection: &OperationConnection,
+    parameters: serde_json::Value,
+    budget: OperationBudget,
+    cancellation: &fastmcp_core::McpRequestCancellation,
+) -> McpResult<Option<fastmcp_protocol::CoreResult>> {
+    let name = parameters
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            fastmcp_core::McpError::invalid_params("task observation requires a tool name")
+        })?;
+    let arguments = parameters
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let remaining = budget.remaining(cx)?;
+    let created = asupersync::time::timeout(
+        cx.now(),
+        remaining,
+        Box::pin(client.call_tool_final_outcome_with_cx(cx, cancellation, name, arguments)),
+    )
+    .await
+    .map_err(|_| OperationBudget::timeout_error())?
+    .map_err(|error| operation_failure(error, "MCP request failed; no action was retried"))?;
+    let result = operation_final_tool_result(created);
+    let Some(mut task) = prepare_operation_task_wait(connection, &result)? else {
+        return Ok(Some(result));
+    };
+    if !matches!(task.task(), fastmcp_protocol::tasks_extension::Task::Working(_)) {
+        return emitted_operation_task_outcome(task.task()).map(|()| None);
+    }
+    let remaining = budget.remaining(cx)?;
+    client.set_request_timeout_policy(OperationBudget::request_policy(remaining)?)?;
+    let policy = operation_task_wait_policy(remaining)?;
+    let outcome = asupersync::time::timeout(
+        cx.now(),
+        remaining,
+        task.wait_with_stdio(cx, client, cancellation, policy),
+    )
+    .await
+    .map_err(|_| OperationBudget::timeout_error())
+    .and_then(|result| {
+        result.map_err(|error| {
+            operation_failure(error, "task observation failed; no action was retried")
+        })
+    });
+    finish_operation_task_wait(connection, task.task(), outcome)?;
+    Ok(None)
+}
+
+#[cfg(feature = "tasks")]
+async fn waiting_http_tool_call(
+    cx: &Cx,
+    client: &mut fastmcp_client::HttpClient,
+    connection: &OperationConnection,
+    parameters: serde_json::Value,
+    budget: OperationBudget,
+    cancellation: &fastmcp_core::McpRequestCancellation,
+) -> McpResult<Option<fastmcp_protocol::CoreResult>> {
+    let name = parameters
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            fastmcp_core::McpError::invalid_params("task observation requires a tool name")
+        })?;
+    let arguments = parameters
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let created = asupersync::time::timeout(
+        cx.now(),
+        budget.remaining(cx)?,
+        Box::pin(client.call_tool_final_outcome_with_cancellation(
+            cx,
+            cancellation,
+            name,
+            arguments,
+        )),
+    )
+    .await
+    .map_err(|_| OperationBudget::timeout_error())?
+    .map_err(|_| {
+        fastmcp_core::McpError::internal_error("MCP HTTP request failed; no action was retried")
+    })?;
+    let result = operation_final_tool_result(created);
+    let Some(mut task) = prepare_operation_task_wait(connection, &result)? else {
+        return Ok(Some(result));
+    };
+    if !matches!(task.task(), fastmcp_protocol::tasks_extension::Task::Working(_)) {
+        return emitted_operation_task_outcome(task.task()).map(|()| None);
+    }
+    let remaining = budget.remaining(cx)?;
+    let policy = operation_task_wait_policy(remaining)?;
+    let outcome = asupersync::time::timeout(
+        cx.now(),
+        remaining,
+        task.wait(cx, client, cancellation, policy),
+    )
+    .await
+    .map_err(|_| OperationBudget::timeout_error())
+    .and_then(|result| {
+        result.map_err(|_| {
+            fastmcp_core::McpError::internal_error(
+                "task observation failed; no action was retried",
+            )
+        })
+    });
+    finish_operation_task_wait(connection, task.task(), outcome)?;
+    Ok(None)
+}
+
+#[cfg(feature = "tasks")]
+fn operation_final_tool_result(
+    outcome: fastmcp_client::FinalToolCallOutcome,
+) -> fastmcp_protocol::CoreResult {
+    use fastmcp_client::FinalToolCallOutcome;
+    use fastmcp_protocol::{CoreResult, FinalCoreResult};
+    CoreResult::Final(match outcome {
+        FinalToolCallOutcome::Complete(result) => FinalCoreResult::ToolsCall {
+            result,
+            diagnostic: None,
+        },
+        FinalToolCallOutcome::Task(result) => FinalCoreResult::ToolsCallTask { result },
+        FinalToolCallOutcome::InputRequired(result) => FinalCoreResult::ToolsCallInputRequired {
+            result,
+            diagnostic: None,
+        },
+    })
+}
+
+#[cfg(feature = "tasks")]
+fn operation_task_wait_policy(
+    remaining: std::time::Duration,
+) -> McpResult<fastmcp_client::FinalTaskWaitPolicy> {
+    fastmcp_client::FinalTaskWaitPolicy::new(remaining, 4096, std::time::Duration::from_secs(1))
+}
+
+/// Publish every admitted creation receipt before any local cancellation,
+/// deadline or handle-validation check can discard the caller's only task ID.
+/// Settlement does not use Cx and cannot extend an RPC deadline. Adoption does
+/// no immediate tasks/get, preserving the first poll interval and original TTL.
+#[cfg(feature = "tasks")]
+fn prepare_operation_task_wait(
+    connection: &OperationConnection,
+    result: &fastmcp_protocol::CoreResult,
+) -> McpResult<Option<fastmcp_client::FinalTaskHandle>> {
+    prepare_operation_task_wait_with(result, connection.json, write_operation_task_receipt)
+}
+
+#[cfg(feature = "tasks")]
+fn prepare_operation_task_wait_with(
+    result: &fastmcp_protocol::CoreResult,
+    json: bool,
+    publish: impl FnOnce(&str) -> McpResult<()>,
+) -> McpResult<Option<fastmcp_client::FinalTaskHandle>> {
+    use fastmcp_protocol::{CoreResult, FinalCoreResult};
+    let CoreResult::Final(FinalCoreResult::ToolsCallTask { result: created }) = result else {
+        return Ok(None);
+    };
+    let outcome = if matches!(
+        created.task,
+        fastmcp_protocol::tasks_extension::Task::Working(_)
+    ) {
+        OperationOutcome::TaskAccepted
+    } else {
+        operation_outcome("tools/call", result, true)?
+    };
+    let output = render_operation_result(result, outcome, json)?;
+    publish(&output)?;
+    fastmcp_client::FinalTaskHandle::from_created(created).map(Some)
+}
+
+/// A receipt is already admitted protocol data, so its bounded publication
+/// survives cancellation or expiry of the active-work budget. A blocked Unix
+/// pipe cannot turn this settlement into an unbounded wait.
+#[cfg(feature = "tasks")]
+fn write_operation_task_receipt(output: &str) -> McpResult<()> {
+    write_operation_task_receipt_with(output, |bytes, bound| {
+        #[cfg(unix)]
+        {
+            fastmcp_transport::AsyncStdout::new().write_all_bounded(bytes, bound)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (bytes, bound);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bounded Task receipt output requires Unix",
+            ))
+        }
+    })
+}
+
+#[cfg(feature = "tasks")]
+fn write_operation_task_receipt_with(
+    output: &str,
+    write: impl FnOnce(&[u8], std::time::Duration) -> io::Result<()>,
+) -> McpResult<()> {
+    let total_bytes = output.len().saturating_add(1);
+    if total_bytes > CLI_OUTPUT_MAX_BYTES {
+        return Err(output_too_large("MCP Task receipt", total_bytes));
+    }
+    let mut bytes = Vec::with_capacity(total_bytes);
+    bytes.extend_from_slice(output.as_bytes());
+    bytes.push(b'\n');
+    STDOUT_STARTED.store(true, std::sync::atomic::Ordering::Release);
+    write(&bytes, std::time::Duration::from_millis(250)).map_err(|_| {
+        fastmcp_core::McpError::internal_error(
+            "could not emit the admitted Task snapshot within its bounded output settlement; no action was retried",
+        )
+    })
+}
+
+#[cfg(feature = "tasks")]
+fn finish_operation_task_wait(
+    connection: &OperationConnection,
+    task: &fastmcp_protocol::tasks_extension::Task,
+    outcome: McpResult<fastmcp_client::FinalTaskWaitOutcome>,
+) -> McpResult<()> {
+    use fastmcp_client::FinalTaskWaitOutcome;
+    let status = match outcome.as_ref() {
+        Ok(FinalTaskWaitOutcome::Completed) => "task completed",
+        Ok(FinalTaskWaitOutcome::Failed) => "task failed",
+        Ok(FinalTaskWaitOutcome::Cancelled) => "task cancelled",
+        Ok(FinalTaskWaitOutcome::InputRequired) => "task input required; no input submitted",
+        _ => "task observation stopped; latest admitted snapshot",
+    };
+    let output = if connection.json {
+        // Serialize the authoritative Task itself. Do not attach stale
+        // creation-response metadata or rebuild its exact nested result.
+        serde_json::to_string(task)
+    } else {
+        serde_json::to_value(task)
+            .map(|value| {
+                task_terminal_fields(bounded_json_preview_inner(
+                    &value,
+                    0,
+                    &mut JsonPreviewBudget::default(),
+                ))
+            })
+            .and_then(|preview| serde_json::to_string_pretty(&preview))
+            .map(|preview| format!("{status} (MCP 2026-07-28)\n{preview}"))
+    }
+    .map_err(|_| {
+        fastmcp_core::McpError::internal_error("could not encode the latest task snapshot")
+    })?;
+    // The latest authoritative snapshot also belongs to the caller on failed
+    // observation, including when the original timeout has just elapsed.
+    write_operation_task_receipt(&output)?;
+    match outcome? {
+        FinalTaskWaitOutcome::DeadlineElapsed => Err(OperationBudget::timeout_error()),
+        FinalTaskWaitOutcome::TaskExpired => Err(fastmcp_core::McpError::invalid_request(
+            "task retention expired during observation; remote completion is unknown and no action was retried",
+        )),
+        FinalTaskWaitOutcome::PollLimitReached => Err(fastmcp_core::McpError::internal_error(
+            "task observation reached its polling limit; remote completion is unknown and no action was retried",
+        )),
+        FinalTaskWaitOutcome::ObservationCancelled => {
+            Err(fastmcp_core::McpError::request_cancelled())
+        }
+        FinalTaskWaitOutcome::TimerUnavailable => Err(fastmcp_core::McpError::internal_error(
+            "task observation requires the caller's timer driver; no action was retried",
+        )),
+        FinalTaskWaitOutcome::Completed
+        | FinalTaskWaitOutcome::Failed
+        | FinalTaskWaitOutcome::Cancelled
+        | FinalTaskWaitOutcome::InputRequired => emitted_operation_task_outcome(task),
+    }
+}
+
+#[cfg(feature = "tasks")]
+fn emitted_operation_task_outcome(
+    task: &fastmcp_protocol::tasks_extension::Task,
+) -> McpResult<()> {
+    use fastmcp_protocol::tasks_extension::Task;
+    match task {
+        Task::Completed { result, .. } if !result.result.is_error => Ok(()),
+        Task::InputRequired { .. } => Err(fastmcp_core::McpError::invalid_request(
+            "task requires input; its snapshot was emitted; no input was submitted",
+        )),
+        _ => Err(fastmcp_core::McpError::internal_error(
+            "task failed, was cancelled, or returned isError=true; its snapshot was emitted and no action was retried",
+        )),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -6742,13 +7117,22 @@ enum OperationOutcome {
     InputRequired,
     #[cfg(feature = "tasks")]
     TaskAccepted,
+    #[cfg(feature = "tasks")]
+    TaskCompleted,
+    #[cfg(feature = "tasks")]
+    TaskFailed,
+    #[cfg(feature = "tasks")]
+    TaskInputRequired,
 }
 
 fn operation_outcome(
     method: &str,
     result: &fastmcp_protocol::CoreResult,
+    wait: bool,
 ) -> McpResult<OperationOutcome> {
     use fastmcp_protocol::{CoreResult, FinalCoreResult, LegacyCoreResult};
+    #[cfg(not(feature = "tasks"))]
+    debug_assert!(!wait);
     if result.method() != method {
         return Err(fastmcp_core::McpError::internal_error(
             "MCP operation received a different method's result",
@@ -6779,8 +7163,22 @@ fn operation_outcome(
             | FinalCoreResult::PromptsGetInputRequired { .. },
         ) => Ok(OperationOutcome::InputRequired),
         #[cfg(feature = "tasks")]
-        CoreResult::Final(FinalCoreResult::ToolsCallTask { .. }) => {
-            Ok(OperationOutcome::TaskAccepted)
+        CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+            if !wait {
+                return Ok(OperationOutcome::TaskAccepted);
+            }
+            use fastmcp_protocol::tasks_extension::Task;
+            match &result.task {
+                Task::Completed { result, .. } if result.result.is_error => {
+                    Ok(OperationOutcome::ToolError)
+                }
+                Task::Completed { .. } => Ok(OperationOutcome::TaskCompleted),
+                Task::Failed { .. } | Task::Cancelled(_) => Ok(OperationOutcome::TaskFailed),
+                Task::InputRequired { .. } => Ok(OperationOutcome::TaskInputRequired),
+                Task::Working(_) => Err(fastmcp_core::McpError::internal_error(
+                    "task observation stopped before completion; no action was retried",
+                )),
+            }
         }
         _ => Err(fastmcp_core::McpError::internal_error(
             "MCP operation received an unsupported result family",
@@ -6807,6 +7205,12 @@ fn render_operation_result(
         OperationOutcome::InputRequired => "input required; no continuation submitted",
         #[cfg(feature = "tasks")]
         OperationOutcome::TaskAccepted => "task accepted; completion has not been observed",
+        #[cfg(feature = "tasks")]
+        OperationOutcome::TaskCompleted => "task completed",
+        #[cfg(feature = "tasks")]
+        OperationOutcome::TaskFailed => "task failed or cancelled",
+        #[cfg(feature = "tasks")]
+        OperationOutcome::TaskInputRequired => "task input required; no input submitted",
     };
     let version = match result.era() {
         ProtocolEra::Modern2026 => "2026-07-28",
@@ -14506,6 +14910,91 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn call_wait_receipt_survives_cancelled_or_expired_work_budget_without_io() {
+        for cancelled in [false, true] {
+            for status in ["working", "completed"] {
+                let completion = if status == "completed" {
+                    r#","result":{"content":[],"com.example\/number":1.20e+4}"#
+                } else {
+                    ""
+                };
+                let wire = format!(
+                    r#"{{"resultType":"task","taskId":"receipt-custody","status":"{status}","createdAt":"2020-01-01T00:00:00Z","lastUpdatedAt":"2020-01-01T00:00:00Z","ttlMs":1,"pollIntervalMs":1000,"_meta":{{"com.example/receipt":"keep"}}{completion}}}"#,
+                );
+                let created: fastmcp_protocol::CreateTaskResult =
+                    serde_json::from_str(&wire).unwrap();
+                let result = fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsCallTask { result: created },
+                );
+                let runtime = build_cli_runtime().expect("CLI runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("ambient Cx");
+                    let budget = if cancelled {
+                        cx.set_cancel_requested(true);
+                        OperationBudget::new(30).unwrap()
+                    } else {
+                        OperationBudget {
+                            deadline: std::time::Instant::now(),
+                        }
+                    };
+                    assert!(budget.remaining(&cx).is_err());
+                    let mut receipt = Vec::new();
+                    let mut writes = 0;
+                    let handle = prepare_operation_task_wait_with(&result, true, |output| {
+                        write_operation_task_receipt_with(output, |bytes, bound| {
+                            writes += 1;
+                            assert_eq!(bound, std::time::Duration::from_millis(250));
+                            receipt.extend_from_slice(bytes);
+                            Ok(())
+                        })
+                    })
+                    .expect("admitted receipt survives local cancellation and retention expiry")
+                    .expect("Task handle");
+                    assert_eq!(writes, 1, "no output retry");
+                    assert_eq!(handle.task_id().as_str(), "receipt-custody");
+                    let receipt_text = std::str::from_utf8(&receipt).unwrap();
+                    let value: serde_json::Value = serde_json::from_str(receipt_text).unwrap();
+                    assert_eq!(value["status"], status);
+                    assert_eq!(value["_meta"]["com.example/receipt"], "keep");
+                    if status == "completed" {
+                        assert!(receipt_text.contains(r#""com.example\/number":1.20e+4"#));
+                    }
+                    assert!(budget.remaining(&cx).is_err(), "receipt cannot renew active work");
+                    // There is deliberately no client or transport here: local
+                    // adoption cannot turn cancellation/expiry into tasks/get.
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn call_wait_receipt_output_failure_is_bounded_and_never_retried() {
+        let mut writes = 0;
+        let error = write_operation_task_receipt_with("{}", |_, bound| {
+            writes += 1;
+            assert_eq!(bound, std::time::Duration::from_millis(250));
+            Err(io::Error::new(io::ErrorKind::TimedOut, "blocked pipe"))
+        })
+        .expect_err("receipt settlement must surface a bounded output failure");
+        assert_eq!(writes, 1);
+        assert!(error.message.contains("bounded output settlement"));
+        assert!(error.message.contains("no action was retried"));
+
+        let mut invoked = false;
+        let oversized = "x".repeat(CLI_OUTPUT_MAX_BYTES);
+        assert!(
+            write_operation_task_receipt_with(&oversized, |_, _| {
+                invoked = true;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!invoked, "reject oversized receipt before attempting output");
     }
 
     #[test]
