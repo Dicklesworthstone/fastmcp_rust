@@ -215,7 +215,7 @@ impl ManagedTasksClient {
         let request = listen_request(&self.metadata, &state.task_ids)?;
         let limits = ManagedSubscriptionLimits::new(
             self.limits.request_bytes.min(MAX_SELECTION_BYTES),
-            self.limits.frame_bytes.min(MAX_SELECTION_BYTES),
+            self.limits.frame_bytes,
             policy.maximum_records,
             policy.timeout,
         )?;

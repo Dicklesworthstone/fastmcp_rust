@@ -7,11 +7,14 @@ use fastmcp_client::http_auth::managed::subscriptions::{
     ManagedSubscription, ManagedSubscriptionError, ManagedSubscriptionEvent,
     ManagedSubscriptionLimits,
 };
+use fastmcp_client::http_auth::managed::tasks::watch::{
+    ManagedTaskSnapshotCause, ManagedTaskWatchPolicy,
+};
 use fastmcp_client::http_auth::managed::tasks::{
     ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTasksClient,
     ManagedTasksLimits,
 };
-use fastmcp_protocol::tasks_extension::{TASKS_EXTENSION, Task, task_subscription_ids};
+use fastmcp_protocol::tasks_extension::{TASKS_EXTENSION, Task, TaskId, task_subscription_ids};
 use fastmcp_protocol::{ClientCapabilities, FINAL_SUBSCRIPTION_ID_META_KEY, FinalRequestMeta};
 
 const WATCH_CASE: &str = "FASTMCP_TEST_TASK_SUBSCRIPTION_CASE";
@@ -33,6 +36,12 @@ enum WatchCase {
     Deadline,
     Limit,
     NoReplay,
+    LargeResult,
+    ExactFrameBound,
+    OverFrameBound,
+    ObservedLargeResult,
+    BomExactFrameBound,
+    BomOverFrameBound,
 }
 
 fn isolated_watch(name: &str, case: WatchCase) {
@@ -195,6 +204,248 @@ async fn reopen_after_gap(peer: &Peer, session: &ManagedOAuthSession, cx: &Cx) {
     pair(server, client).await;
 }
 
+async fn large_task_result(
+    peer: &Peer,
+    session: &ManagedOAuthSession,
+    cx: &Cx,
+    case: WatchCase,
+) {
+    let text = "x".repeat(128 * 1024);
+    let content = json!([{"type":"text","text":text}]);
+    let completed = task_event(2, "task-one", "completed")
+        .replace("\"content\":[]", &format!("\"content\":{content}"));
+    // Valid JSON whitespace exercises a multiline SSE document whose framing
+    // costs more than a fixed 64-byte allowance, without changing its result.
+    let payload = format!("{}{completed}", "\n".repeat(32));
+    assert!(payload.len() > 64 * 1024);
+    let refused = matches!(case, WatchCase::OverFrameBound);
+    let limits = if matches!(case, WatchCase::LargeResult) {
+        ManagedSubscriptionLimits::default()
+    } else {
+        ManagedSubscriptionLimits::new(
+            4096,
+            payload.len() - usize::from(refused),
+            8,
+            Duration::from_secs(15),
+        )
+        .unwrap()
+    };
+    let server = Box::pin(async {
+        let mut tls = begin_watch(peer, 1, DISCOVER).await;
+        event(&mut tls, &ack(2, filter()), false).await;
+        let mut framed = String::new();
+        for line in payload.lines() {
+            framed.push_str("data: ");
+            framed.push_str(line);
+            framed.push('\n');
+        }
+        framed.push('\n');
+        tls.write_all(format!("{:X}\r\n{framed}\r\n", framed.len()).as_bytes())
+            .await
+            .unwrap();
+        tls.flush().await.unwrap();
+        if !refused {
+            event(&mut tls, &done(2), true).await;
+        } else {
+            let mut byte = [0];
+            assert!(!matches!(tls.read(&mut byte).await, Ok(n) if n > 0));
+        }
+    });
+    let application = Box::pin(async {
+        let mut watch = session
+            .subscribe_tasks(
+                cx,
+                requested(),
+                RequestId::Number(1),
+                RequestId::Number(2),
+                limits,
+            )
+            .await
+            .unwrap();
+        assert_eq!(consume_ack(&mut watch, cx).await, filter());
+        if refused {
+            assert!(matches!(
+                watch.next_event(cx).await,
+                Err(ManagedSubscriptionError::InvalidResponse)
+            ));
+            assert!(matches!(
+                watch.next_event(cx).await,
+                Err(ManagedSubscriptionError::Closed)
+            ));
+            assert!(cx.checkpoint().is_ok());
+        } else {
+            let completed = consume_task(&mut watch, cx).await;
+            assert!(matches!(completed, Task::Completed { .. }));
+            let serialized = serde_json::to_string(&completed).unwrap();
+            assert!(serialized.contains("900719925474099312345"));
+            assert!(serialized.contains("1.20e+4"));
+            let value: Value = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(value["result"]["content"], content);
+            consume_done(&mut watch, cx, 2).await;
+        }
+    });
+    pair(server, application).await;
+    assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
+    peer.quiet();
+    if refused {
+        reopen_after_gap(peer, session, cx).await;
+        assert_eq!(peer.posts.load(Ordering::SeqCst), 4);
+    }
+}
+
+async fn observed_exchange(peer: &Peer, number: usize, method: &str, result: &str) {
+    let (mut tls, bytes) = peer.request(false).await;
+    let request: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(request["id"], format!("large:{number}"));
+    assert_eq!(request["method"], method);
+    if method == "tasks/get" {
+        assert_eq!(request["params"]["taskId"], "task-one");
+    }
+    json_reply(
+        &mut tls,
+        &format!(r#"{{"jsonrpc":"2.0","id":"large:{number}","result":{result}}}"#),
+    )
+    .await;
+}
+
+async fn bom_acknowledgement(
+    peer: &Peer,
+    session: &ManagedOAuthSession,
+    cx: &Cx,
+    refused: bool,
+) {
+    let payload = format!("{}{}", ack(2, filter()), " ".repeat(128 * 1024));
+    let limits = ManagedSubscriptionLimits::new(
+        4096,
+        payload.len() - usize::from(refused),
+        8,
+        Duration::from_secs(15),
+    )
+    .unwrap();
+    let server = Box::pin(async {
+        let mut tls = begin_watch(peer, 1, DISCOVER).await;
+        // The BOM is legal only at stream start. Raw line admission sees its
+        // three bytes before the parser strips it from the JSON payload.
+        let framed = format!("\u{feff}data: {payload}\r\n\r\n");
+        tls.write_all(format!("{:X}\r\n{framed}\r\n", framed.len()).as_bytes())
+            .await
+            .unwrap();
+        tls.flush().await.unwrap();
+        if refused {
+            let mut byte = [0];
+            assert!(!matches!(tls.read(&mut byte).await, Ok(n) if n > 0));
+        } else {
+            event(&mut tls, &done(2), true).await;
+        }
+    });
+    let application = Box::pin(async {
+        let mut watch = session
+            .subscribe_tasks(
+                cx,
+                requested(),
+                RequestId::Number(1),
+                RequestId::Number(2),
+                limits,
+            )
+            .await
+            .unwrap();
+        if refused {
+            assert!(matches!(
+                watch.next_event(cx).await,
+                Err(ManagedSubscriptionError::InvalidResponse)
+            ));
+            assert!(watch.accepted_filter().is_none());
+            assert!(matches!(
+                watch.next_event(cx).await,
+                Err(ManagedSubscriptionError::Closed)
+            ));
+        } else {
+            assert_eq!(consume_ack(&mut watch, cx).await, filter());
+            consume_done(&mut watch, cx, 2).await;
+        }
+    });
+    pair(server, application).await;
+    assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
+}
+
+async fn observe_large_task_result(peer: &Peer, session: &ManagedOAuthSession, cx: &Cx) {
+    let mut snapshot = json!({
+        "resultType":"complete", "taskId":"task-one", "status":"working",
+        "createdAt":"2026-09-16T00:00:00Z", "lastUpdatedAt":"2026-09-16T00:00:01Z",
+        "ttlMs":60000,
+    });
+    let working = snapshot.to_string();
+    snapshot["status"] = json!("completed");
+    snapshot["result"] = json!({"content":[{"type":"text","text":"fresh snapshot"}]});
+    let completed = snapshot.to_string();
+    let content = json!([{"type":"text","text":"x".repeat(128 * 1024)}]);
+    let notification = task_event(2, "task-one", "completed")
+        .replace("\"content\":[]", &format!("\"content\":{content}"))
+        .replace(
+            "\"io.modelcontextprotocol/subscriptionId\":2",
+            "\"io.modelcontextprotocol/subscriptionId\":\"large:1\"",
+        );
+    let server = Box::pin(async {
+        observed_exchange(peer, 0, "server/discover", DISCOVER).await;
+        let (mut tls, bytes) = peer.request(false).await;
+        let listen: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(listen["id"], "large:1");
+        assert_eq!(listen["method"], "subscriptions/listen");
+        assert_eq!(
+            listen["params"]["notifications"],
+            json!({"taskIds":["task-one"]})
+        );
+        sse_head(&mut tls).await;
+        event(
+            &mut tls,
+            &json!({
+                "jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
+                "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):"large:1"},
+                    "notifications":{"taskIds":["task-one"]}},
+            })
+            .to_string(),
+            false,
+        )
+        .await;
+        observed_exchange(peer, 2, "server/discover", DISCOVER).await;
+        observed_exchange(peer, 3, "tasks/get", &working).await;
+        event(&mut tls, &notification, false).await;
+        observed_exchange(peer, 4, "server/discover", DISCOVER).await;
+        observed_exchange(peer, 5, "tasks/get", &completed).await;
+        let mut byte = [0];
+        assert!(!matches!(tls.read(&mut byte).await, Ok(n) if n > 0));
+    });
+    let application = Box::pin(async {
+        let client = ManagedTasksClient::new(
+            session.clone(),
+            FinalRequestMeta::new(ClientCapabilities::default()),
+            ManagedTasksLimits::default(),
+        )
+        .unwrap();
+        let mut watch = client
+            .watch_tasks(
+                cx,
+                vec![TaskId::parse("task-one").unwrap()],
+                "large".to_owned(),
+                ManagedTaskWatchPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let initial = watch.next_snapshot(cx).await.unwrap().unwrap();
+        assert_eq!(initial.cause, ManagedTaskSnapshotCause::Initial);
+        assert!(matches!(*initial.task, Task::Working(_)));
+        let current = watch.next_snapshot(cx).await.unwrap().unwrap();
+        assert_eq!(current.cause, ManagedTaskSnapshotCause::ChangeNotification);
+        assert!(matches!(*current.task, Task::Completed { .. }));
+        let value = serde_json::to_value(current.task).unwrap();
+        assert_eq!(value["result"]["content"][0]["text"], "fresh snapshot");
+        assert_eq!(watch.remaining_tasks(), 0);
+        assert!(watch.next_snapshot(cx).await.unwrap().is_none());
+    });
+    pair(server, application).await;
+    assert_eq!(peer.posts.load(Ordering::SeqCst), 6);
+}
+
 fn run_watch(case: WatchCase) {
     RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(Box::pin(async {
         let cx = Cx::current().unwrap();
@@ -214,6 +465,15 @@ fn run_watch(case: WatchCase) {
             ).unwrap();
             let cancellation = McpRequestCancellation::new();
             match case {
+                WatchCase::LargeResult | WatchCase::ExactFrameBound | WatchCase::OverFrameBound => {
+                    large_task_result(&peer, &session, &cx, case).await;
+                }
+                WatchCase::ObservedLargeResult => {
+                    observe_large_task_result(&peer, &session, &cx).await;
+                }
+                WatchCase::BomExactFrameBound | WatchCase::BomOverFrameBound => {
+                    bom_acknowledgement(&peer, &session, &cx, matches!(case, WatchCase::BomOverFrameBound)).await;
+                }
                 WatchCase::Live => {
                     let (release_tx, mut release_rx) = oneshot::channel::<()>();
                     let server = Box::pin(async {
@@ -420,6 +680,48 @@ fn task_watch_delivers_mixed_events_and_allows_live_input_update() {
     isolated_watch(
         "task_watch_delivers_mixed_events_and_allows_live_input_update",
         WatchCase::Live,
+    );
+}
+#[test]
+fn task_watch_default_limits_admit_large_completed_results() {
+    isolated_watch(
+        "task_watch_default_limits_admit_large_completed_results",
+        WatchCase::LargeResult,
+    );
+}
+#[test]
+fn task_watch_exact_document_limit_excludes_sse_framing() {
+    isolated_watch(
+        "task_watch_exact_document_limit_excludes_sse_framing",
+        WatchCase::ExactFrameBound,
+    );
+}
+#[test]
+fn task_watch_one_byte_over_document_limit_retires_only_its_stream() {
+    isolated_watch(
+        "task_watch_one_byte_over_document_limit_retires_only_its_stream",
+        WatchCase::OverFrameBound,
+    );
+}
+#[test]
+fn managed_task_watch_large_notifications_trigger_fresh_snapshots() {
+    isolated_watch(
+        "managed_task_watch_large_notifications_trigger_fresh_snapshots",
+        WatchCase::ObservedLargeResult,
+    );
+}
+#[test]
+fn task_watch_exact_document_limit_allows_stream_leading_bom() {
+    isolated_watch(
+        "task_watch_exact_document_limit_allows_stream_leading_bom",
+        WatchCase::BomExactFrameBound,
+    );
+}
+#[test]
+fn task_watch_bom_allowance_does_not_widen_document_limit() {
+    isolated_watch(
+        "task_watch_bom_allowance_does_not_widen_document_limit",
+        WatchCase::BomOverFrameBound,
     );
 }
 #[test]

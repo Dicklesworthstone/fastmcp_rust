@@ -37,7 +37,10 @@ use fastmcp_protocol::{CoreResult, ExtensionDirection, FinalCoreResult};
 
 #[cfg(feature = "tasks")]
 use super::OAuthCredentialSnapshot;
-use super::{ManagedOAuthResponse, ManagedOAuthSession, OAuthSessionError, deadline_after};
+use super::{
+    MAX_MANAGED_MCP_MESSAGE_BYTES, ManagedOAuthResponse, ManagedOAuthSession, OAuthSessionError,
+    deadline_after,
+};
 use crate::http_executor::{
     ModernHttpRequest, ModernHttpResponseKind, ModernHttpSubscriptionListenError,
     ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
@@ -58,8 +61,8 @@ pub struct ManagedSubscriptionLimits {
 impl Default for ManagedSubscriptionLimits {
     fn default() -> Self {
         Self {
-            request_bytes: 64 * 1024,
-            frame_bytes: 64 * 1024,
+            request_bytes: MAX_MANAGED_MCP_MESSAGE_BYTES,
+            frame_bytes: MAX_MANAGED_MCP_MESSAGE_BYTES,
             records: 1024,
             timeout: Duration::from_mins(15),
         }
@@ -69,8 +72,9 @@ impl Default for ManagedSubscriptionLimits {
 impl ManagedSubscriptionLimits {
     /// `records` includes the acknowledgement and terminal result, not just
     /// change notifications. Reaching the limit without a terminal is failure,
-    /// never successful EOF. `frame_bytes` bounds the native SSE line/event
-    /// representation including framing overhead as well as its JSON payload.
+    /// never successful EOF. `frame_bytes` bounds each decoded JSON-RPC
+    /// document, with a separate finite allowance for SSE framing. Request and
+    /// document limits may be tightened from the default 8 MiB ceiling.
     /// Credential acquisition, Tasks discovery, and caller pauses are included
     /// in the one deadline. Discovery uses the same per-document byte bounds.
     pub fn new(
@@ -79,8 +83,8 @@ impl ManagedSubscriptionLimits {
         records: usize,
         timeout: Duration,
     ) -> Result<Self, ManagedSubscriptionError> {
-        if !(1..=64 * 1024).contains(&request_bytes)
-            || !(1..=64 * 1024).contains(&frame_bytes)
+        if !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&request_bytes)
+            || !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&frame_bytes)
             || !(2..=4096).contains(&records)
             || timeout.is_zero()
             || timeout > Duration::from_secs(3600)
@@ -485,11 +489,21 @@ impl ManagedSubscription {
             generation,
             revocation,
         } = response;
-        let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
-            .ok_or(ManagedSubscriptionError::InvalidLimits)?;
+        // Keep the payload budget independent of SSE syntax. The bounded
+        // line allowance also includes a stream-leading UTF-8 BOM, which the
+        // parser counts before stripping it. The default event bound is
+        // LIMIT-01's 9 MiB; smaller JSON limits remain exact below.
+        let framing = SseLimits::with_data_lines(
+            limits.frame_bytes + 16,
+            limits.frame_bytes + 1024 * 1024,
+            64,
+            4096,
+        )
+        .ok_or(ManagedSubscriptionError::InvalidLimits)?;
         let listener = response
             .into_final_subscriptions_listener(request_id.clone(), requested, framing)
-            .map_err(admission_error)?;
+            .map_err(admission_error)?
+            .with_maximum_jsonrpc_bytes(limits.frame_bytes);
         Ok(Self {
             listener: Some(Box::new(listener)),
             session,
@@ -968,12 +982,61 @@ mod tests {
     }
 
     #[test]
+    fn subscription_requests_above_64_kib_keep_exact_configured_bounds() {
+        let mut meta =
+            serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        meta["com.example/context"] = json!("x".repeat(128 * 1024));
+        let params = json!({"_meta":meta,"notifications":{"toolsListChanged":true}});
+        let make_request = || {
+            CoreRequest::decode(ProtocolEra::Modern2026, "subscriptions/listen", Some(&params))
+                .unwrap()
+        };
+        let id = RequestId::Number(1);
+        let (wire, _) = prepare(
+            "https://mcp.example/mcp",
+            make_request(),
+            &id,
+            ManagedSubscriptionLimits::default(),
+        )
+        .unwrap();
+        let size = wire.body().len();
+        assert!(size > 64 * 1024);
+        let limits = |request_bytes| {
+            ManagedSubscriptionLimits::new(request_bytes, 1024, 4, Duration::from_secs(1)).unwrap()
+        };
+        let (exact, _) = prepare(
+            "https://mcp.example/mcp",
+            make_request(),
+            &id,
+            limits(size),
+        )
+        .unwrap();
+        assert_eq!(exact.body(), wire.body());
+        assert!(matches!(
+            prepare(
+                "https://mcp.example/mcp",
+                make_request(),
+                &id,
+                limits(size - 1)
+            ),
+            Err(ManagedSubscriptionError::RequestTooLarge)
+        ));
+    }
+
+    #[test]
     fn subscription_limits_and_errors_do_not_hide_unbounded_work_or_peer_text() {
         let second = Duration::from_secs(1);
         assert!(ManagedSubscriptionLimits::new(1024, 1024, 2, second).is_ok());
+        let maximum = 8 * 1024 * 1024;
+        let defaults = ManagedSubscriptionLimits::default();
+        assert_eq!(defaults.request_bytes, maximum);
+        assert_eq!(defaults.frame_bytes, maximum);
+        assert!(ManagedSubscriptionLimits::new(maximum, maximum, 2, second).is_ok());
         for (request, frame, records, timeout) in [
             (0, 1024, 2, second),
             (1024, 0, 2, second),
+            (maximum + 1, 1024, 2, second),
+            (1024, maximum + 1, 2, second),
             (1024, 1024, 1, second),
             (1024, 1024, 4097, second),
             (1024, 1024, 2, Duration::ZERO),

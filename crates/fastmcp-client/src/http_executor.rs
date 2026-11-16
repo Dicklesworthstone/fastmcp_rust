@@ -1481,6 +1481,13 @@ impl HttpSubscriptionCollectionBudget {
 }
 
 impl ModernHttpSubscriptionListener {
+    /// Tightens decoded JSON admission independently of the SSE framing
+    /// allowance. Managed callers use this before consuming any stream event.
+    pub(crate) fn with_maximum_jsonrpc_bytes(mut self, maximum_bytes: usize) -> Self {
+        self.maximum_jsonrpc_bytes = self.maximum_jsonrpc_bytes.min(maximum_bytes);
+        self
+    }
+
     /// Returns the JSON-RPC request ID that owns this listener.
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
