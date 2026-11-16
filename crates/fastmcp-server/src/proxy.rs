@@ -2652,21 +2652,6 @@ fn implementation_has_extras(implementation: &Implementation) -> bool {
         || !implementation.icons.is_empty()
 }
 
-/// Maps a gateway resource URI onto the upstream URI for exact-2024 subscribe.
-///
-/// Prefixed proxy catalogs expose `{prefix}/{upstream}` where `upstream`
-/// contains `://`. A nested prefix such as `tenant/remote` must not be
-/// peeled with `split_once('/')`, which would leave `remote/db://orders`.
-fn proxy_upstream_resource_uri(inbound_uri: &str) -> &str {
-    let Some(scheme_sep) = inbound_uri.find("://") else {
-        return inbound_uri;
-    };
-    match inbound_uri[..scheme_sep].rfind('/') {
-        Some(slash) => &inbound_uri[slash + 1..],
-        None => inbound_uri,
-    }
-}
-
 fn overlay_legacy_progress_token(
     parameters: &mut serde_json::Value,
     marker: &serde_json::Value,
@@ -12432,47 +12417,60 @@ impl ProxyClient {
         self.with_backend(|backend| backend.supports_completion())
     }
 
-    /// Subscribes the upstream to one resource and remembers the inbound URI
-    /// so later `resources/updated` can be republished onto the gateway session.
+    /// Subscribes to one exact upstream resource URI.
+    ///
+    /// URI syntax never determines a gateway namespace. Registered proxy
+    /// resource handlers retain and apply their own explicit prefix mapping.
     /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
-    pub fn subscribe_resource(&self, ctx: &McpContext, inbound_uri: &str) -> McpResult<()> {
-        ctx.checkpoint()?;
+    pub fn subscribe_resource(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
+        self.change_resource_subscription(ctx, uri, uri, true)
+    }
+
+    /// Ends the subscription to one exact upstream resource URI.
+    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
+    pub fn unsubscribe_resource(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
+        self.change_resource_subscription(ctx, uri, uri, false)
+    }
+
+    fn change_resource_subscription(
+        &self,
+        ctx: &McpContext,
+        inbound_uri: &str,
+        upstream_uri: &str,
+        subscribe: bool,
+    ) -> McpResult<()> {
+        ctx.ensure_live()?;
         if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
             return Ok(());
         }
-        let upstream_uri = proxy_upstream_resource_uri(inbound_uri);
-        self.with_backend(|backend| backend.subscribe_resource(upstream_uri))?;
-        self.subscription_rewrites
+        self.with_backend(|backend| {
+            if subscribe {
+                backend.subscribe_resource(upstream_uri)
+            } else {
+                backend.unsubscribe_resource(upstream_uri)
+            }
+        })?;
+        ctx.ensure_live()?;
+        let mut rewrites = self
+            .subscription_rewrites
             .lock()
-            .map_err(|_| McpError::internal_error("Proxy subscription rewrite lock poisoned"))?
-            .insert(upstream_uri.to_owned(), inbound_uri.to_owned());
-        Ok(())
-    }
-
-    /// Ends the matching upstream resource subscription.
-    /// Over an exact-2024 HTTP upstream, the proxy must be connected on a runtime-backed caller `Cx`.
-    pub fn unsubscribe_resource(&self, ctx: &McpContext, inbound_uri: &str) -> McpResult<()> {
-        ctx.checkpoint()?;
-        if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
-            return Ok(());
+            .map_err(|_| McpError::internal_error("Proxy subscription rewrite lock poisoned"))?;
+        if subscribe {
+            rewrites.insert(upstream_uri.to_owned(), inbound_uri.to_owned());
+        } else {
+            rewrites.remove(upstream_uri);
         }
-        let upstream_uri = proxy_upstream_resource_uri(inbound_uri);
-        self.with_backend(|backend| backend.unsubscribe_resource(upstream_uri))?;
-        self.subscription_rewrites
-            .lock()
-            .map_err(|_| McpError::internal_error("Proxy subscription rewrite lock poisoned"))?
-            .remove(upstream_uri);
         Ok(())
     }
 
-    /// Subscribes through the native upstream on the caller runtime.
+    /// Subscribes to an exact URI through the native upstream on the caller runtime.
     /// Commits the notification URI rewrite only after a live, typed response.
     pub async fn subscribe_resource_async(
         &self,
         ctx: &McpContext,
-        inbound_uri: &str,
+        uri: &str,
     ) -> McpResult<()> {
-        self.change_resource_subscription_async(ctx, inbound_uri, true)
+        self.change_resource_subscription_async(ctx, uri, uri, true)
             .await
     }
 
@@ -12481,9 +12479,9 @@ impl ProxyClient {
     pub async fn unsubscribe_resource_async(
         &self,
         ctx: &McpContext,
-        inbound_uri: &str,
+        uri: &str,
     ) -> McpResult<()> {
-        self.change_resource_subscription_async(ctx, inbound_uri, false)
+        self.change_resource_subscription_async(ctx, uri, uri, false)
             .await
     }
 
@@ -12491,13 +12489,13 @@ impl ProxyClient {
         &self,
         ctx: &McpContext,
         inbound_uri: &str,
+        upstream_uri: &str,
         subscribe: bool,
     ) -> McpResult<()> {
         ctx.ensure_live()?;
         if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
             return Ok(());
         }
-        let upstream_uri = proxy_upstream_resource_uri(inbound_uri);
         #[cfg(feature = "legacy-2024-11-05")]
         let completed = {
             self.start_legacy_receive_pump()?;
@@ -14877,6 +14875,24 @@ impl ProxyResourceHandler {
             .and_then(|prefix| uri.strip_prefix(prefix))
             .unwrap_or(uri)
     }
+
+    fn subscription_upstream_uri<'a>(&'a self, uri: &'a str) -> McpResult<&'a str> {
+        let outside_namespace = || {
+            McpError::invalid_params("Resource is outside the proxy subscription namespace")
+        };
+        if self.template.is_none() {
+            return (uri == self.resource.uri)
+                .then_some(self.external_uri.as_str())
+                .ok_or_else(outside_namespace);
+        }
+        // The router already resolved the concrete template URI. Only the
+        // prefix installed with this handler may be removed; opaque URI
+        // schemes and embedded `://` sequences are upstream identity bytes.
+        match self.uri_prefix.as_deref() {
+            Some(prefix) => uri.strip_prefix(prefix).ok_or_else(outside_namespace),
+            None => Ok(uri),
+        }
+    }
 }
 
 impl ResourceHandler for ProxyResourceHandler {
@@ -14895,11 +14911,21 @@ impl ResourceHandler for ProxyResourceHandler {
     fn on_subscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
         // Keep the inbound gateway URI so `resources/updated` can be
         // republished under the prefixed catalog name.
-        self.client.subscribe_resource(ctx, uri)
+        self.client.change_resource_subscription(
+            ctx,
+            uri,
+            self.subscription_upstream_uri(uri)?,
+            true,
+        )
     }
 
     fn on_unsubscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
-        self.client.unsubscribe_resource(ctx, uri)
+        self.client.change_resource_subscription(
+            ctx,
+            uri,
+            self.subscription_upstream_uri(uri)?,
+            false,
+        )
     }
 
     fn on_subscribe_async<'a>(
@@ -14907,7 +14933,16 @@ impl ResourceHandler for ProxyResourceHandler {
         ctx: &'a McpContext,
         uri: &'a str,
     ) -> BoxFuture<'a, McpResult<()>> {
-        Box::pin(self.client.subscribe_resource_async(ctx, uri))
+        Box::pin(async move {
+            self.client
+                .change_resource_subscription_async(
+                    ctx,
+                    uri,
+                    self.subscription_upstream_uri(uri)?,
+                    true,
+                )
+                .await
+        })
     }
 
     fn on_unsubscribe_async<'a>(
@@ -14915,7 +14950,16 @@ impl ResourceHandler for ProxyResourceHandler {
         ctx: &'a McpContext,
         uri: &'a str,
     ) -> BoxFuture<'a, McpResult<()>> {
-        Box::pin(self.client.unsubscribe_resource_async(ctx, uri))
+        Box::pin(async move {
+            self.client
+                .change_resource_subscription_async(
+                    ctx,
+                    uri,
+                    self.subscription_upstream_uri(uri)?,
+                    false,
+                )
+                .await
+        })
     }
 
     fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
@@ -22092,7 +22136,12 @@ IFS= read -r end
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
-    fn proxy_resource_hooks_caller_runtime_probe(http: bool, unsubscribe: bool, interrupt: u8) {
+    fn proxy_resource_hooks_caller_runtime_probe(
+        http: bool,
+        unsubscribe: bool,
+        interrupt: u8,
+        opaque_uri: bool,
+    ) {
         use crate::lib_unit_tests::RunnableClock;
         use fastmcp_protocol::JsonRpcRequest;
         use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpStatus};
@@ -22129,7 +22178,11 @@ IFS= read -r end
         ));
         std::fs::create_dir(&control).unwrap();
         let subject = control.file_name().unwrap().to_str().unwrap().to_owned();
-        let uri = format!("file:///{subject}");
+        let uri = if opaque_uri {
+            format!("urn:{subject}:path/https://origin.test/item")
+        } else {
+            format!("file:///{subject}")
+        };
         let method = if unsubscribe {
             "resources/unsubscribe"
         } else {
@@ -22501,7 +22554,7 @@ IFS= read -r end
     fn proxy_resource_hooks_caller_runtime_positive() {
         for http in [false, true] {
             for unsubscribe in [false, true] {
-                proxy_resource_hooks_caller_runtime_probe(http, unsubscribe, 0);
+                proxy_resource_hooks_caller_runtime_probe(http, unsubscribe, 0, false);
             }
         }
     }
@@ -22512,8 +22565,18 @@ IFS= read -r end
         for http in [false, true] {
             for unsubscribe in [false, true] {
                 for interrupt in 1..=4 {
-                    proxy_resource_hooks_caller_runtime_probe(http, unsubscribe, interrupt);
+                    proxy_resource_hooks_caller_runtime_probe(http, unsubscribe, interrupt, false);
                 }
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn proxy_resource_hooks_preserve_opaque_uri_on_native_transports() {
+        for http in [false, true] {
+            for unsubscribe in [false, true] {
+                proxy_resource_hooks_caller_runtime_probe(http, unsubscribe, 0, true);
             }
         }
     }
@@ -22534,6 +22597,7 @@ IFS= read -r end
                         index % 2 == 0,
                         index / 2 % 2 == 1,
                         0,
+                        false,
                     );
                 })
             })
@@ -37375,28 +37439,194 @@ printf '%s\n' '{discovery}'
     }
 
     #[test]
-    fn proxy_upstream_resource_uri_strips_nested_prefix_before_scheme() {
-        assert_eq!(
-            super::proxy_upstream_resource_uri("tenant/remote/db://orders"),
-            "db://orders"
-        );
-        assert_eq!(
-            super::proxy_upstream_resource_uri("ext/file://docs/readme"),
-            "file://docs/readme"
-        );
-        assert_eq!(
-            super::proxy_upstream_resource_uri("file://docs/readme"),
-            "file://docs/readme"
-        );
-        assert_eq!(
-            super::proxy_upstream_resource_uri("no-scheme/path"),
-            "no-scheme/path"
-        );
-        assert_ne!(
-            super::proxy_upstream_resource_uri("tenant/remote/db://orders"),
-            "remote/db://orders",
-            "split_once('/') would leave the rest of a nested prefix on the upstream URI"
-        );
+    fn proxy_resource_subscription_client_preserves_exact_uri() {
+        for uri in [
+            "urn:example:orders",
+            "urn:example:path/https://origin.test/item",
+            "file:/var/data/orders",
+            "data:text/plain,https://origin.test/item",
+            "file://docs/readme",
+        ] {
+            for asynchronous in [false, true] {
+                let backend = TestBackend::default();
+                let state = Arc::clone(&backend.state);
+                let client = ProxyClient::from_backend(backend);
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                if asynchronous {
+                    block_on(client.subscribe_resource_async(&ctx, uri)).unwrap();
+                } else {
+                    client.subscribe_resource(&ctx, uri).unwrap();
+                }
+                assert_eq!(state.lock().unwrap().last_subscribe.as_deref(), Some(uri));
+                assert_eq!(
+                    client
+                        .subscription_rewrites_for_test()
+                        .get(uri)
+                        .map(String::as_str),
+                    Some(uri),
+                    "a direct API call cannot infer a namespace from URI syntax"
+                );
+                if asynchronous {
+                    block_on(client.unsubscribe_resource_async(&ctx, uri)).unwrap();
+                } else {
+                    client.unsubscribe_resource(&ctx, uri).unwrap();
+                }
+                assert_eq!(state.lock().unwrap().last_unsubscribe.as_deref(), Some(uri));
+                assert!(client.subscription_rewrites_for_test().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_resource_subscription_hooks_preserve_registered_namespaces() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+        use fastmcp_protocol::ResourceTemplate;
+
+        for (upstream, template) in [
+            ("urn:example:orders", "urn:example:{table}"),
+            ("file:/var/data/orders", "file:/var/data/{table}"),
+            ("mailto:orders@example.test", "mailto:{table}@example.test"),
+            ("data:text/plain,orders", "data:text/plain,{table}"),
+            (
+                "urn:example:orders/https://origin.test/item",
+                "urn:example:{table}/https://origin.test/item",
+            ),
+        ] {
+            for prefix in [None, Some("tenant/remote")] {
+                for templated in [false, true] {
+                    for asynchronous in [false, true] {
+                        let backend = TestBackend {
+                            pending_updated_uris: vec![upstream.to_owned()],
+                            ..TestBackend::default()
+                        };
+                        let state = Arc::clone(&backend.state);
+                        let client = ProxyClient::from_backend(backend);
+                        let handler = if templated {
+                            let template = ResourceTemplate {
+                                uri_template: template.to_owned(),
+                                name: "orders".to_owned(),
+                                description: None,
+                                mime_type: None,
+                                icon: None,
+                                version: None,
+                                tags: Vec::new(),
+                            };
+                            match prefix {
+                                Some(prefix) => ProxyResourceHandler::from_template_with_prefix(
+                                    template,
+                                    prefix,
+                                    client.clone(),
+                                ),
+                                None => {
+                                    ProxyResourceHandler::from_template(template, client.clone())
+                                }
+                            }
+                        } else {
+                            let resource = Resource {
+                                uri: upstream.to_owned(),
+                                name: "orders".to_owned(),
+                                description: None,
+                                mime_type: None,
+                                icon: None,
+                                version: None,
+                                tags: Vec::new(),
+                            };
+                            match prefix {
+                                Some(prefix) => {
+                                    ProxyResourceHandler::with_prefix(resource, prefix, client.clone())
+                                }
+                                None => ProxyResourceHandler::new(resource, client.clone()),
+                            }
+                        };
+                        let inbound = prefix.map_or_else(
+                            || upstream.to_owned(),
+                            |prefix| format!("{prefix}/{upstream}"),
+                        );
+                        let captured = Arc::new(ResourceUpdateCapture(Mutex::new(Vec::new())));
+                        let ctx = McpContext::new(Cx::for_testing(), 1)
+                            .with_log_sender(
+                                Arc::clone(&captured) as Arc<dyn fastmcp_core::NotificationSender>,
+                            )
+                            .with_resource_subscriptions([inbound.clone()]);
+                        if prefix.is_some() {
+                            for wrong in [
+                                upstream.to_owned(),
+                                format!("other/{upstream}"),
+                                format!("tenant/remotely/{upstream}"),
+                            ] {
+                                let (subscribe, unsubscribe) = if asynchronous {
+                                    (
+                                        block_on(handler.on_subscribe_async(&ctx, &wrong)),
+                                        block_on(handler.on_unsubscribe_async(&ctx, &wrong)),
+                                    )
+                                } else {
+                                    (
+                                        handler.on_subscribe(&ctx, &wrong),
+                                        handler.on_unsubscribe(&ctx, &wrong),
+                                    )
+                                };
+                                assert_eq!(
+                                    subscribe.unwrap_err().code,
+                                    McpErrorCode::InvalidParams
+                                );
+                                assert_eq!(
+                                    unsubscribe.unwrap_err().code,
+                                    McpErrorCode::InvalidParams
+                                );
+                                assert!(state.lock().unwrap().last_subscribe.is_none());
+                                assert!(state.lock().unwrap().last_unsubscribe.is_none());
+                                assert!(client.subscription_rewrites_for_test().is_empty());
+                            }
+                        }
+                        if asynchronous {
+                            block_on(handler.on_subscribe_async(&ctx, &inbound)).unwrap();
+                        } else {
+                            handler.on_subscribe(&ctx, &inbound).unwrap();
+                        }
+                        assert_eq!(
+                            state.lock().unwrap().last_subscribe.as_deref(),
+                            Some(upstream)
+                        );
+                        assert_eq!(
+                            client.subscription_rewrites_for_test().get(upstream),
+                            Some(&inbound),
+                            "the authoritative handler mapping must preserve both URI spellings"
+                        );
+                        client.relay_resource_updated_notifications(&ctx).unwrap();
+                        assert_eq!(captured.0.lock().unwrap().as_slice(), [inbound.clone()]);
+
+                        let cancellation = McpRequestCancellation::new();
+                        assert!(cancellation.cancel());
+                        let cancelled = ctx.clone().with_request_cancellation(cancellation);
+                        let error = if asynchronous {
+                            block_on(handler.on_unsubscribe_async(&cancelled, &inbound))
+                                .unwrap_err()
+                        } else {
+                            handler.on_unsubscribe(&cancelled, &inbound).unwrap_err()
+                        };
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                        assert!(state.lock().unwrap().last_unsubscribe.is_none());
+                        assert_eq!(
+                            client.subscription_rewrites_for_test().get(upstream),
+                            Some(&inbound),
+                            "cancelled unsubscribe cannot retire the notification rewrite"
+                        );
+
+                        if asynchronous {
+                            block_on(handler.on_unsubscribe_async(&ctx, &inbound)).unwrap();
+                        } else {
+                            handler.on_unsubscribe(&ctx, &inbound).unwrap();
+                        }
+                        assert_eq!(
+                            state.lock().unwrap().last_unsubscribe.as_deref(),
+                            Some(upstream)
+                        );
+                        assert!(client.subscription_rewrites_for_test().is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
