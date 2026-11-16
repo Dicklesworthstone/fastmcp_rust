@@ -50,6 +50,38 @@ use fastmcp_protocol::{
 use serde_json::json;
 
 use super::{ManagedOAuthProvider, ManagedOAuthResource, check_cx, core_request};
+use crate::handler::BoxFuture;
+
+// Only the native provider adapters construct these owners. Both login kinds
+// retain the existing strict decoders; this seam shares resource selection and
+// downstream projection without creating a second wire protocol.
+pub(super) trait ResourceUpdateStream: Send {
+    fn credential_generation(&self) -> u64;
+    fn close(&mut self);
+    fn next_event<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, McpResult<Option<ManagedSubscriptionEvent>>>;
+}
+
+struct ManagedResourceUpdateStream(ManagedSubscription);
+
+impl ResourceUpdateStream for ManagedResourceUpdateStream {
+    fn credential_generation(&self) -> u64 {
+        self.0.credential_generation()
+    }
+
+    fn close(&mut self) {
+        self.0.close();
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, McpResult<Option<ManagedSubscriptionEvent>>> {
+        Box::pin(async move { self.0.next_event(cx).await.map_err(subscription_error) })
+    }
+}
 
 /// One exact resource selected through a handler from this provider family.
 ///
@@ -112,7 +144,7 @@ impl ManagedOAuthProvider {
             json!({"notifications": requested}),
             None,
         )?;
-        let mut upstream = self
+        let upstream = self
             .session
             .subscribe_core_with_cancellation(
                 cx,
@@ -123,23 +155,15 @@ impl ManagedOAuthProvider {
             )
             .await
             .map_err(subscription_error)?;
-        let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) =
-            upstream.next_event(cx).await.map_err(subscription_error)?
-        else {
-            return Err(unexpected_event());
-        };
-        // Native admission has already proved this is a subset of the exact
-        // requested core filter. Retain the accepted set, never the broader
-        // request, as the final resource gate immediately before publication.
-        let accepted_resources = accepted_filter.resource_subscriptions.unwrap_or_default();
-        Ok(ManagedOAuthResourceUpdates {
-            upstream,
-            accepted_resources,
-        })
+        ManagedOAuthResourceUpdates::acknowledge(
+            cx,
+            Box::new(ManagedResourceUpdateStream(upstream)),
+        )
+        .await
     }
 }
 
-fn resource_filter(
+pub(super) fn resource_filter(
     origin: &Arc<AtomicU64>,
     resources: &[ManagedOAuthResourceSelector],
 ) -> McpResult<SubscriptionFilter> {
@@ -178,7 +202,7 @@ fn resource_filter(
 /// cancellation guards are checked on every read before an event is delivered;
 /// the socket is released on a failed read, explicit close, or drop.
 pub struct ManagedOAuthResourceUpdates {
-    upstream: ManagedSubscription,
+    upstream: Box<dyn ResourceUpdateStream>,
     accepted_resources: Vec<String>,
 }
 
@@ -199,6 +223,25 @@ pub struct ManagedOAuthResourceRelayOutcome {
 }
 
 impl ManagedOAuthResourceUpdates {
+    pub(super) async fn acknowledge(
+        cx: &Cx,
+        mut upstream: Box<dyn ResourceUpdateStream>,
+    ) -> McpResult<Self> {
+        let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) =
+            upstream.next_event(cx).await?
+        else {
+            return Err(unexpected_event());
+        };
+        // Each native decoder has already proved the exact requested-filter
+        // subset. Both authentication profiles retain only that accepted set
+        // as the final resource gate immediately before publication.
+        let accepted_resources = accepted_filter.resource_subscriptions.unwrap_or_default();
+        Ok(Self {
+            upstream,
+            accepted_resources,
+        })
+    }
+
     /// Exact accepted URI set. It can be narrower than the requested set,
     /// including empty; the relay never widens it or silently resubscribes.
     #[must_use]
@@ -237,11 +280,7 @@ impl ManagedOAuthResourceUpdates {
         let mut forwarded_updates = 0usize;
         let mut downstream_deliveries = 0usize;
         loop {
-            let event = self
-                .upstream
-                .next_event(cx)
-                .await
-                .map_err(subscription_error)?;
+            let event = self.upstream.next_event(cx).await?;
             let end = match event {
                 Some(ManagedSubscriptionEvent::Notification(notification)) => {
                     let notification = resource_update(*notification, &self.accepted_resources)?;

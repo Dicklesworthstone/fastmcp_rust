@@ -21,16 +21,28 @@ use fastmcp_client::http_auth::discovery::client_credentials::rpc::{
 use fastmcp_client::http_auth::discovery::client_credentials::{
     ClientCredentialsClient, ClientCredentialsError,
 };
+use fastmcp_client::http_auth::discovery::client_credentials::subscriptions::{
+    ClientCredentialsCoreSubscription, ClientCredentialsCoreSubscriptionError,
+    ClientCredentialsCoreSubscriptionLimits, ModernHttpSubscriptionListenEvent,
+};
+use fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionEvent;
 use fastmcp_client::http_auth::rpc::catalog::ManagedCatalogError;
 use fastmcp_client::http_auth::rpc::{ManagedCoreEvent, ManagedCoreLimits};
-use fastmcp_core::{McpContext, McpError, McpResult};
-use fastmcp_protocol::{CoreRequest, CoreResult, FinalCoreResult, RequestId};
+use fastmcp_core::{McpContext, McpError, McpRequestCancellation, McpResult};
+use fastmcp_protocol::{
+    ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta, RequestId,
+    SubscriptionFilter,
+};
 use serde_json::json;
 
 use super::super::{
     BoxFuture, CoreBackend, Forwarder, ManagedOAuthPrompt, ManagedOAuthResource, ManagedOAuthTool,
     UNEXPECTED_RESULT, allocate_request_id, build_prompts, build_resources, build_tools, check_cx,
     core_request, forward_notification, upstream_error,
+};
+use super::super::subscriptions::{
+    ManagedOAuthResourceSelector, ManagedOAuthResourceUpdates, ResourceUpdateStream,
+    resource_filter,
 };
 use super::{ManagedOAuthResourceTemplate, build_templates};
 use interaction::{InteractiveMachineResponse, MachineInputs, interaction_error};
@@ -62,9 +74,11 @@ const CATALOG_FAILURE: &str = "Machine-authenticated upstream catalog acquisitio
 ///
 /// By default only complete modern core results are forwarded. Explicitly
 /// installing `with_input_handler` enables bounded host-resolved input-required
-/// rounds, not transparent downstream continuation state. Neither path installs
-/// legacy execution, Tasks or subscriptions. No failed POST is retried and no
-/// runtime is created.
+/// rounds, not transparent downstream continuation state. Resource updates use
+/// the explicit, caller-owned `open_resource_updates` relay; it installs no
+/// per-downstream proxy subscription or automatic reconnect. Legacy execution
+/// and Tasks relay remain separate. No failed POST is retried and no runtime
+/// is created.
 ///
 /// ```ignore
 /// use fastmcp_server::providers::ClientCredentialsProvider;
@@ -211,6 +225,45 @@ impl ClientCredentialsProvider {
         build_templates(Arc::clone(&self.forwarder), entries)
     }
 
+    /// Opens authenticated updates for resources selected from this provider.
+    ///
+    /// Concrete resources and reversibly matched template instances use the
+    /// same selectors as the interactive provider. Foreign, empty, duplicate
+    /// or oversized selections fail before ID allocation, grant acquisition
+    /// or network work. Provider clones share the selector origin and the
+    /// discovery/operation ID allocator with ordinary calls and catalog reads.
+    ///
+    /// The native machine subscriber performs fresh same-token discovery and
+    /// admits the first acknowledgment before returning. Inspect the returned
+    /// `accepted_resources()`: a valid peer may narrow the requested filter,
+    /// including to an empty set. Relay through the server's
+    /// `subscription_publisher().publish` to apply downstream authorization,
+    /// filtering, correlation and backpressure.
+    ///
+    /// The returned owner retains a machine-client clone and the original
+    /// credential generation, expiry, cancellation and whole-listen deadline.
+    /// An explicit machine-client close still retires the stream. The caller
+    /// owns polling and shutdown; there is no worker, retry, reconnect, replay,
+    /// legacy subscribe hook, or automatic remote Task cancellation.
+    pub async fn open_resource_updates(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        resources: &[ManagedOAuthResourceSelector],
+        limits: ClientCredentialsCoreSubscriptionLimits,
+    ) -> McpResult<ManagedOAuthResourceUpdates> {
+        check_subscription_caller(cx, cancellation)?;
+        let filter = resource_filter(&self.forwarder.next_id, resources)?;
+        let upstream = self
+            .source
+            .subscribe(cx, cancellation, &self.forwarder.next_id, filter, limits)
+            .await?;
+        check_subscription_caller(cx, cancellation)?;
+        let updates = ManagedOAuthResourceUpdates::acknowledge(cx, upstream).await?;
+        check_subscription_caller(cx, cancellation)?;
+        Ok(updates)
+    }
+
     async fn catalog(&self, cx: &Cx, method: &'static str) -> McpResult<Vec<CoreResult>> {
         check_cx(cx)?;
         let result = self
@@ -247,6 +300,15 @@ trait MachineSource: Send + Sync {
         cx: &'a Cx,
         call: MachineCall,
     ) -> BoxFuture<'a, McpResult<Box<dyn MachineResponse>>>;
+
+    fn subscribe<'a>(
+        &'a self,
+        cx: &'a Cx,
+        cancellation: &'a McpRequestCancellation,
+        ids: &'a AtomicU64,
+        filter: SubscriptionFilter,
+        limits: ClientCredentialsCoreSubscriptionLimits,
+    ) -> BoxFuture<'a, McpResult<Box<dyn ResourceUpdateStream>>>;
 }
 
 trait MachineResponse: Send {
@@ -344,6 +406,123 @@ impl MachineSource for NativeMachineSource {
                 .map_err(machine_error)?;
             Ok(Box::new(NativeMachineResponse(call)) as Box<dyn MachineResponse>)
         })
+    }
+
+    fn subscribe<'a>(
+        &'a self,
+        cx: &'a Cx,
+        cancellation: &'a McpRequestCancellation,
+        ids: &'a AtomicU64,
+        filter: SubscriptionFilter,
+        limits: ClientCredentialsCoreSubscriptionLimits,
+    ) -> BoxFuture<'a, McpResult<Box<dyn ResourceUpdateStream>>> {
+        Box::pin(async move {
+            let (discovery_id, request_id) = next_pair(ids)?;
+            let upstream = self
+                .0
+                .subscribe_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    FinalRequestMeta::new(ClientCapabilities::default()),
+                    discovery_id,
+                    request_id,
+                    filter,
+                    limits,
+                )
+                .await
+                .map_err(machine_subscription_error)?;
+            Ok(Box::new(NativeMachineResourceUpdates {
+                upstream,
+                _owner: self.0.clone(),
+            }) as Box<dyn ResourceUpdateStream>)
+        })
+    }
+}
+
+struct NativeMachineResourceUpdates {
+    upstream: ClientCredentialsCoreSubscription,
+    // A live relay is an explicit machine-client owner. Administrative close
+    // still revokes the shared lineage; merely dropping the provider cannot
+    // orphan or accidentally revoke the separately retained response.
+    _owner: ClientCredentialsClient,
+}
+
+impl ResourceUpdateStream for NativeMachineResourceUpdates {
+    fn credential_generation(&self) -> u64 {
+        self.upstream.credential_generation()
+    }
+
+    fn close(&mut self) {
+        self.upstream.close();
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, McpResult<Option<ManagedSubscriptionEvent>>> {
+        Box::pin(async move {
+            let event = self
+                .upstream
+                .next_event(cx)
+                .await
+                .map_err(machine_subscription_error)?;
+            event.map(machine_subscription_event).transpose()
+        })
+    }
+}
+
+// The native decoder owns ACK ordering, requested-filter subset admission,
+// credential lifetime and terminal correlation. This is only a vocabulary
+// adapter into the existing resource relay; no peer bytes are parsed here.
+// A direct client dependency may enable Tasks without the server Tasks feature.
+// Preserve a closed core relay under Cargo feature unification as well.
+#[allow(clippy::unnecessary_wraps, unreachable_patterns)]
+fn machine_subscription_event(
+    event: ModernHttpSubscriptionListenEvent,
+) -> McpResult<ManagedSubscriptionEvent> {
+    match event {
+        ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter } => {
+            Ok(ManagedSubscriptionEvent::Acknowledged { accepted_filter })
+        }
+        ModernHttpSubscriptionListenEvent::Notification(notification) => {
+            Ok(ManagedSubscriptionEvent::Notification(Box::new(notification)))
+        }
+        ModernHttpSubscriptionListenEvent::Terminal {
+            subscription_id,
+            result,
+        } => Ok(ManagedSubscriptionEvent::Terminal {
+            subscription_id,
+            result: Box::new(result),
+        }),
+        ModernHttpSubscriptionListenEvent::Cancelled {
+            subscription_id,
+            params,
+        } => Ok(ManagedSubscriptionEvent::Cancelled {
+            subscription_id,
+            params: Box::new(params),
+        }),
+        _ => Err(McpError::invalid_request(
+            "Machine resource subscription returned an unsupported event",
+        )),
+    }
+}
+
+fn check_subscription_caller(cx: &Cx, cancellation: &McpRequestCancellation) -> McpResult<()> {
+    check_cx(cx)?;
+    if cancellation.is_cancel_requested() {
+        return Err(McpError::request_cancelled());
+    }
+    Ok(())
+}
+
+fn machine_subscription_error(error: ClientCredentialsCoreSubscriptionError) -> McpError {
+    match error {
+        ClientCredentialsCoreSubscriptionError::Authentication(
+            ClientCredentialsError::Discovery(
+                OAuthDiscoveryError::Cancelled | OAuthDiscoveryError::TimedOut,
+            ),
+        ) => McpError::request_cancelled(),
+        _ => McpError::invalid_request("Machine-authenticated resource subscription failed"),
     }
 }
 
