@@ -14354,13 +14354,19 @@ impl CompletionHandler for ProxyCompletionHandler {
         ctx: &McpContext,
         params: FinalCompletionParams,
     ) -> McpResult<FinalCompletionValues> {
+        Ok(self.complete_final_result(ctx, params)?.payload.completion)
+    }
+
+    fn complete_final_result(
+        &self,
+        ctx: &McpContext,
+        params: FinalCompletionParams,
+    ) -> McpResult<CompleteResult<fastmcp_protocol::FinalCompletionResult>> {
         match self
             .client
             .complete_typed(ctx, self.rewrite_final(params)?)?
         {
-            CoreResult::Final(FinalCoreResult::Completion { result, .. }) => {
-                Ok(result.payload.completion)
-            }
+            CoreResult::Final(FinalCoreResult::Completion { result, .. }) => Ok(result),
             CoreResult::Legacy(LegacyCoreResult::Completion(_)) => Err(McpError::invalid_request(
                 "Proxy cannot use an exact legacy completion result for a final handler path",
             )),
@@ -14399,13 +14405,28 @@ impl CompletionHandler for ProxyCompletionHandler {
         params: FinalCompletionParams,
     ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
         Box::pin(async move {
+            match self.complete_final_result_async(ctx, params).await {
+                Outcome::Ok(result) => Outcome::Ok(result.payload.completion),
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => Outcome::Panicked(payload),
+            }
+        })
+    }
+
+    fn complete_final_result_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<fastmcp_protocol::FinalCompletionResult>>> {
+        Box::pin(async move {
             let params = match self.rewrite_final(params) {
                 Ok(params) => params,
                 Err(error) => return Outcome::Err(error),
             };
             match self.client.complete_typed_async(ctx, params).await {
                 Ok(CoreResult::Final(FinalCoreResult::Completion { result, .. })) => {
-                    Outcome::Ok(result.payload.completion)
+                    Outcome::Ok(result)
                 }
                 Ok(CoreResult::Legacy(LegacyCoreResult::Completion(_))) => {
                     Outcome::Err(McpError::invalid_request(
@@ -15676,7 +15697,8 @@ mod tests {
 
     #[cfg(feature = "tasks")]
     fn relay_test_context(cx: Cx, request_id: u64) -> McpContext {
-        McpContext::new(cx, request_id).with_auth(relay_test_auth())
+        McpContext::with_state(cx, request_id, fastmcp_core::SessionState::new())
+            .with_auth(relay_test_auth())
     }
 
     #[cfg(feature = "tasks")]
@@ -26561,6 +26583,7 @@ IFS= read -r end
                         HttpRequest::new(HttpMethod::Post, "/mcp")
                             .with_header("content-type", "application/json")
                             .with_header("accept", "text/event-stream")
+                            .with_header("authorization", "Bearer relay-test-token")
                             .with_header("mcp-protocol-version", "2026-07-28")
                             .with_header("mcp-method", "subscriptions/listen")
                             .with_body(serde_json::to_vec(&request).unwrap()),
@@ -26585,7 +26608,17 @@ IFS= read -r end
                         JsonRpcMessage::Response(response) => break Some(response),
                         JsonRpcMessage::Request(notification) => {
                             let method = notification.method.clone();
-                            notifications.push(serde_json::to_value(notification).unwrap());
+                            let value = serde_json::to_value(notification).unwrap();
+                            if method == "notifications/cancelled" {
+                                assert_eq!(value["params"]["requestId"], 892);
+                                assert_eq!(
+                                    value["params"]["_meta"]
+                                        [fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY],
+                                    892
+                                );
+                                break None;
+                            }
+                            notifications.push(value);
                             observed.send(method.clone()).unwrap();
                             if finish == MixedHttpFinish::Cancel
                                 && method == fastmcp_protocol::TASK_STATUS_NOTIFICATION
@@ -26617,26 +26650,15 @@ IFS= read -r end
             .expect("mixed native HTTP operation has a finite deadline")
         });
         let (tasks_wire, _) = peer.join().expect("both native upstream sockets quiesced");
-        if matches!(
-            finish,
-            MixedHttpFinish::Terminal
-                | MixedHttpFinish::EmptyTaskAcknowledgement
-                | MixedHttpFinish::PeerCancellation
-        ) {
-            let response = response.unwrap();
-            assert!(
-                response.error.is_none(),
-                "unexpected mixed listen error: {:?}",
-                response.error
-            );
-            assert_eq!(response.id, Some(892_i64.into()));
-            assert_eq!(response.result.unwrap()["resultType"], "complete");
-        } else if finish == MixedHttpFinish::Cancel {
-            assert!(response.is_none());
-        } else {
+        if finish == MixedHttpFinish::NarrowAcknowledgement {
             let response = response.unwrap();
             assert!(response.result.is_none());
             assert!(response.error.is_some());
+        } else {
+            assert!(
+                response.is_none(),
+                "admitted listen terminates via notifications/cancelled: {response:?}"
+            );
         }
         let expected = match finish {
             MixedHttpFinish::NarrowAcknowledgement => 0,

@@ -422,17 +422,17 @@ fn validate_trace_scope(value: &str) -> Result<(), TracePolicyError> {
 /// Repeated keys consume member budget, but share one distinct-key slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BaggageForwardingLimits {
-    max_bytes: usize,
-    max_members: usize,
-    max_distinct_keys: usize,
+    bytes: usize,
+    members: usize,
+    distinct_keys: usize,
 }
 
 impl Default for BaggageForwardingLimits {
     fn default() -> Self {
         Self {
-            max_bytes: MAX_BAGGAGE_BYTES,
-            max_members: MAX_BAGGAGE_MEMBERS,
-            max_distinct_keys: MAX_BAGGAGE_MEMBERS,
+            bytes: MAX_BAGGAGE_BYTES,
+            members: MAX_BAGGAGE_MEMBERS,
+            distinct_keys: MAX_BAGGAGE_MEMBERS,
         }
     }
 }
@@ -454,9 +454,9 @@ impl BaggageForwardingLimits {
             return Err(TracePolicyError::InvalidBaggageLimits);
         }
         Ok(Self {
-            max_bytes,
-            max_members,
-            max_distinct_keys,
+            bytes: max_bytes,
+            members: max_members,
+            distinct_keys: max_distinct_keys,
         })
     }
 }
@@ -912,9 +912,9 @@ fn filter_baggage(
         }
         let new_key = !distinct.contains(&key);
         let additional_bytes = member.len() + usize::from(!retained.is_empty());
-        if retained.len() == rule.baggage_limits.max_members
-            || bytes + additional_bytes > rule.baggage_limits.max_bytes
-            || (new_key && distinct.len() == rule.baggage_limits.max_distinct_keys)
+        if retained.len() == rule.baggage_limits.members
+            || bytes + additional_bytes > rule.baggage_limits.bytes
+            || (new_key && distinct.len() == rule.baggage_limits.distinct_keys)
         {
             return (None, true);
         }

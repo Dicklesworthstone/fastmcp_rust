@@ -580,25 +580,31 @@ impl FinalTaskCallToolResult {
         if members.contains_key("resultType") {
             return Err(TaskWireError::Invalid("result"));
         }
-        let meta: Option<OpenMetadata> = members
-            .remove("_meta")
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|_| TaskWireError::Invalid("result"))?;
+        let meta: Option<OpenMetadata> = match members.remove("_meta") {
+            None => None,
+            Some(Value::Object(entries)) => Some(
+                OpenMetadata::try_from_entries(entries)
+                    .map_err(|_| TaskWireError::Invalid("result"))?,
+            ),
+            Some(_) => return Err(TaskWireError::Invalid("result")),
+        };
         if meta
             .as_ref()
             .is_some_and(|meta| meta.entries().contains_key(RELATED_TASK_META_KEY))
         {
             return Err(TaskWireError::Invalid("result"));
         }
+        let structured_content = members.remove("structuredContent");
         let mut result_members = Map::new();
-        for key in ["content", "isError", "structuredContent"] {
+        for key in ["content", "isError"] {
             if let Some(value) = members.remove(key) {
                 result_members.insert(key.to_owned(), value);
             }
         }
-        let result = serde_json::from_value(Value::Object(result_members))
-            .map_err(|_| TaskWireError::Invalid("result"))?;
+        let mut result: FinalCallToolResult =
+            serde_json::from_value(Value::Object(result_members))
+                .map_err(|_| TaskWireError::Invalid("result"))?;
+        result.structured_content = structured_content;
         Ok(Self {
             result,
             meta,
@@ -613,13 +619,21 @@ impl FinalTaskCallToolResult {
         else {
             return Err(TaskWireError::Invalid("result"));
         };
+        if let Some(structured_content) = &self.result.structured_content {
+            members.insert("structuredContent".to_owned(), structured_content.clone());
+        }
         if let Some(meta) = &self.meta {
             if meta.entries().contains_key(RELATED_TASK_META_KEY) {
                 return Err(TaskWireError::Invalid("result"));
             }
             members.insert(
                 "_meta".to_owned(),
-                serde_json::to_value(meta).map_err(|_| TaskWireError::Invalid("result"))?,
+                Value::Object(
+                    meta.entries()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ),
             );
         }
         for (key, value) in &self.additional {

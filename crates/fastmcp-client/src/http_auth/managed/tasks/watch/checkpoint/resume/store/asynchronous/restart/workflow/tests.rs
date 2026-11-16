@@ -197,7 +197,7 @@ async fn close(cx: &Cx, lane: &CredentialIoLane, commit: RestartCommit<Vault>) {
 fn terminal_result_is_retained_until_explicit_durable_acknowledgement() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let (store, saved) = populated(&cx, &lane, &directory, vault.clone()).await;
@@ -231,7 +231,7 @@ fn terminal_result_is_retained_until_explicit_durable_acknowledgement() {
 fn active_controls_are_saved_and_stale_cleanup_cannot_replace_them() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let (store, saved) = populated(&cx, &lane, &directory, vault.clone()).await;
@@ -275,7 +275,7 @@ fn active_controls_are_saved_and_stale_cleanup_cannot_replace_them() {
 fn abandoned_acknowledgement_resumes_one_write_and_keeps_its_result() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let _release = Release(Arc::clone(&vault.gate));
@@ -315,7 +315,7 @@ fn abandoned_acknowledgement_resumes_one_write_and_keeps_its_result() {
 fn failed_protection_retains_terminal_result_and_original_checkpoint() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let (store, saved) = populated(&cx, &lane, &directory, vault.clone()).await;
@@ -341,7 +341,7 @@ fn failed_protection_retains_terminal_result_and_original_checkpoint() {
 fn explicit_keep_disposition_leaves_unavailable_checkpoint_untouched() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let (store, saved) = populated(&cx, &lane, &directory, vault.clone()).await;

@@ -4791,8 +4791,7 @@ impl FinalCoreResult {
             // drop only telemetry if the enclosing carrier has no room.
             let fits = self
                 .encode()
-                .ok()
-                .is_some_and(|encoded| crate::result::parse_exact_result_object(&encoded).is_ok());
+                .is_ok_and(|encoded| crate::result::parse_exact_result_object(&encoded).is_ok());
             if !fits {
                 self.apply_outbound_trace_context(None);
                 if !had_metadata {

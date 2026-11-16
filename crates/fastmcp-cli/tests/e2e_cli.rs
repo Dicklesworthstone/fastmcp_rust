@@ -1484,11 +1484,16 @@ fn e2e_cli_inspect_modern_only_refuses_legacy_only_shipped_echo_server() {
         "modern-only must not downgrade to a legacy-only server: stdout={}",
         stdout_str(&refused)
     );
-    assert_eq!(
-        stdout_str(&refused),
-        "",
-        "a refused negotiation reports no catalog"
-    );
+    let refused_json = inspect_json_stdout(&refused);
+    assert_eq!(refused_json["schema"], "fastmcp.cli.error/v2", "{refused_json}");
+    assert_eq!(refused_json["command"], "inspect", "{refused_json}");
+    assert_eq!(refused_json["success"], false, "{refused_json}");
+    for key in ["server", "tools", "resources", "prompts"] {
+        assert!(
+            refused_json.get(key).is_none(),
+            "a refused negotiation reports no catalog ({key}): {refused_json}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -2382,6 +2387,20 @@ mod authenticated_http {
         backend.kill_and_reap().expect("framework HTTP cleanup");
     }
 
+    fn assert_inspect_error_no_catalog(output: &Output) -> Value {
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["schema"], "fastmcp.cli.error/v2", "{document}");
+        assert_eq!(document["command"], "inspect", "{document}");
+        assert_eq!(document["success"], false, "{document}");
+        for key in ["server", "tools", "resources", "prompts"] {
+            assert!(
+                document.get(key).is_none(),
+                "error document must not expose {key}: {document}"
+            );
+        }
+        document
+    }
+
     #[test]
     fn cli_http_bearer_file_planted_negative() {
         let root = TestTempDir::new("bearer-inspect-negative");
@@ -2394,7 +2413,7 @@ mod authenticated_http {
         .unwrap();
         let rejected = proxy.run("wrong-token", INSPECT);
         assert!(!rejected.status.success());
-        assert!(rejected.stdout.is_empty());
+        assert_inspect_error_no_catalog(&rejected);
         let rows = proxy.observations();
         assert_eq!(rows.len(), 1, "no authenticated fallback or retry");
         assert_eq!(rows[0]["authorized"], false);
@@ -2440,7 +2459,8 @@ mod authenticated_http {
         let rejected = run_command(command);
         std::fs::write(proxy.root.join("untrusted.stderr"), &rejected.stderr).unwrap();
         assert!(!rejected.status.success());
-        assert!(rejected.stdout.is_empty());
+        assert_inspect_error_no_catalog(&rejected);
+        assert!(!stdout_str(&rejected).contains(&proxy.token));
         assert!(!stderr_str(&rejected).contains(&proxy.token));
         assert!(
             proxy.observations().is_empty(),
@@ -2461,7 +2481,13 @@ mod authenticated_http {
         std::fs::write(proxy.root.join("reflect-error"), "enabled").unwrap();
         let rejected = proxy.run("reflected", INSPECT);
         assert!(!rejected.status.success());
-        assert!(rejected.stdout.is_empty());
+        let document = assert_inspect_error_no_catalog(&rejected);
+        assert!(
+            document["error"]["message"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("payload withheld")),
+            "{document}"
+        );
         assert!(stderr_str(&rejected).contains("payload withheld"));
         let rows = proxy.observations();
         assert_eq!(rows.len(), before + 1);
@@ -4566,17 +4592,17 @@ os.close(fd)
 
     fn check_watch_poll_interval(http: bool, short_budget: bool) {
         let mut fixture = TaskFixture::new(false);
-        // Server declares a minimum poll interval of 1500ms.
-        let poll_interval_ms = 1500u64;
+        // Server declares a minimum poll interval of 3000ms.
+        let poll_interval_ms = 3000u64;
         fixture.task["pollIntervalMs"] = json!(poll_interval_ms);
         let task_bytes = serde_json::to_vec(&fixture.task).unwrap();
         std::fs::write(fixture.root.join("task.json"), &task_bytes).unwrap();
         std::fs::write(fixture.root.join("watch_gap"), "complete").unwrap();
 
-        // Positive test gives sufficient budget (--timeout 4) to honor the 1500ms interval.
-        // Near-identical negative test gives a short budget (--timeout 1) differing only
-        // in budget duration; since 1s < 1500ms, delay >= remaining, so the CLI must not poll early.
-        let timeout_str = if short_budget { "1" } else { "4" };
+        // Positive test gives sufficient budget (--timeout 6) to honor the 3000ms interval.
+        // Near-identical negative test gives a short budget (--timeout 2) differing only
+        // in budget duration; since 2s < 3000ms, delay >= remaining, so the CLI must not poll early.
+        let timeout_str = if short_budget { "2" } else { "6" };
         let output = if http {
             let (mut server, endpoint) = fixture.http();
             let output = run_cli(&[
@@ -4870,11 +4896,16 @@ mod plain_http {
             !output.status.success(),
             "legacy-only must not read a modern endpoint"
         );
-        assert!(
-            output.stdout.is_empty(),
-            "no catalog: {}",
-            stdout_str(&output)
-        );
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["schema"], "fastmcp.cli.error/v2", "{document}");
+        assert_eq!(document["command"], "inspect", "{document}");
+        assert_eq!(document["success"], false, "{document}");
+        for key in ["server", "tools", "resources", "prompts"] {
+            assert!(
+                document.get(key).is_none(),
+                "no catalog ({key}): {document}"
+            );
+        }
         assert!(
             stderr_str(&output).contains("requires a configured legacy SSE GET target"),
             "{}",

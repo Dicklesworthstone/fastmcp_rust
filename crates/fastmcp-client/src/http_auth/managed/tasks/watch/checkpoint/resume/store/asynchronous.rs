@@ -438,7 +438,7 @@ mod tests {
     fn worker_persists_reopens_and_conditionally_removes_without_poll_thread_protection() {
         run(|cx| async move {
             let guard = ProcessGenerationGuard::install().unwrap();
-            let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+            let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
             let directory = Directory::new();
             let vault = Vault::default();
             let current = binding("one");
@@ -485,7 +485,7 @@ mod tests {
     fn shutdown_refusal_returns_exact_owner_binding_and_unexecuted_input() {
         run(|cx| async move {
             let guard = ProcessGenerationGuard::install().unwrap();
-            let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+            let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
             let directory = Directory::new();
             let vault = Vault::default();
             let current = binding("one");
@@ -511,11 +511,12 @@ mod tests {
         runtime.block_on(async {
             let cx = Cx::current().unwrap();
             let guard = ProcessGenerationGuard::install().unwrap();
-            let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+            let token = guard.token();
+            let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
             let directory = Directory::new();
             let vault = Vault::default();
             let result = AsyncTaskResumeStore::open(
-                &cx, &lane, guard.token(), directory.handle(), "tasks".to_owned(), 65536,
+                &cx, &lane, token, directory.handle(), "tasks".to_owned(), 65536,
                 vault.clone(), binding("one"), TaskResumeStoreLimits::default(),
             );
             assert!(matches!(result, Err(CredentialIoError::BlockingPoolUnavailable)));

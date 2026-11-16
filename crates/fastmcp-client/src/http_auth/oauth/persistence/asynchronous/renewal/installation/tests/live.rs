@@ -332,7 +332,7 @@ async fn renew(
         .to_string();
         json_reply(&mut tls, &body).await;
     };
-    let ((), outcome) = native::pair(server, renewal.run(cx)).await;
+    let ((), outcome) = Box::pin(native::pair(server, renewal.run(cx))).await;
     outcome.unwrap();
     assert_eq!(fixture.revision(), tombstone + 1);
     assert_eq!(renewal.stage(), OAuthRefreshRenewalStage::Complete);

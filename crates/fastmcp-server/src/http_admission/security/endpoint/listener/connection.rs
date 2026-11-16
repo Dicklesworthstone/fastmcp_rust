@@ -1500,16 +1500,21 @@ mod tests {
     }
 
     fn secured_peer_request(slot: usize, sse: bool) -> Vec<u8> {
+        let mut meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        if sse {
+            meta["progressToken"] = serde_json::json!(format!("secured-peer-progress-{slot}"));
+        }
         let body = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0", "id": slot + 710, "method": "tools/call",
             "params": {
                 "name": "secured_peer_probe", "arguments": {"slot": slot, "stream": sse},
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": fastmcp_protocol::FINAL_PROTOCOL_VERSION,
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                },
+                "_meta": meta,
             },
-        })).unwrap();
+        }))
+        .unwrap();
         let accept = if sse {
             "text/event-stream"
         } else {

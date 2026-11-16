@@ -29,7 +29,7 @@ fn insert(cx: &Cx, current: &TaskResumeBinding, id: &str) -> TaskResumeInsert {
 fn callbacks_acknowledge_insert_and_conditional_change_but_refuse_stale_cleanup() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let current = binding("one");
@@ -138,7 +138,7 @@ async fn controlled_store(
 fn abandoned_callback_and_cancelled_observer_retain_one_unreplayed_write() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let gate = Arc::new(Gate::default());
@@ -193,7 +193,7 @@ fn abandoned_callback_and_cancelled_observer_retain_one_unreplayed_write() {
 fn protection_failure_returns_the_owner_and_preserves_the_prior_checkpoint() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let fail = Arc::new(AtomicBool::new(false));
@@ -227,7 +227,7 @@ fn protection_failure_returns_the_owner_and_preserves_the_prior_checkpoint() {
 fn asynchronous_page_cursors_survive_reads_but_not_a_committed_mutation() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let current = binding("one");

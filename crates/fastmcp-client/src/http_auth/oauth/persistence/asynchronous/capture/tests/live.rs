@@ -152,7 +152,8 @@ impl Peer {
                 browser(authorization)
             },
         );
-        let ((), result) = native::pair(self.token("authorization_code", body), login).await;
+        let ((), result) =
+            Box::pin(native::pair(self.token("authorization_code", body), login)).await;
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         quiet(&self.issuer);
         result.unwrap()

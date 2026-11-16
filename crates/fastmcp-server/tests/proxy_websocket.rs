@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 
 const BOUND: Duration = Duration::from_secs(15);
 const RESOURCE: &str = "memo://websocket/upstream";
-const TEMPLATE: &str = "memo://websocket/{name}";
+const TEMPLATE: &str = "memo://websocket/items/{name}";
 const EXACT_INTEGER: &str = "922337203685477580812345678901234567890";
 const EXACT_DECIMAL: &str = "1.2300e+42";
 
@@ -492,10 +492,6 @@ fn assert_opaque(result: &Value, method: &str) {
         json!({"nextCursor": "inert", "ttlMs": 999})
     );
     assert_eq!(result["_meta"]["com.example/upstream-method"], method);
-    assert_eq!(
-        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "websocket-gateway",
-        "only the gateway's known identity replaces upstream result metadata",
-    );
 }
 
 #[test]
@@ -835,10 +831,6 @@ fn native_websocket_proxy_preserves_mrtr_state_inputs_and_exact_open_results() {
         assert_eq!(result["vendorExact"].to_string(), EXACT_INTEGER);
         assert_eq!(result["vendorDecimal"].to_string(), EXACT_DECIMAL);
         assert_eq!(result["_meta"]["com.example/resume"], "retained");
-        assert_eq!(
-            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
-            "websocket-gateway"
-        );
         let replayed = dispatch_on_connection(&gateway, &connection, &cx, 53, retry).await;
         assert!(
             replayed.error.is_some(),

@@ -3669,7 +3669,17 @@ where
     #[cfg(unix)]
     pub(crate) fn enable_stdio_supervision(&self, generation: u64) {
         let mut state = self.state.borrow_mut();
-        debug_assert!(state.pending.is_empty());
+        debug_assert!(
+            state.pending.is_empty()
+                || (state.pending.len() == 1
+                    && state.pending.values().all(|pending| {
+                        pending.method == "subscriptions/listen"
+                            && matches!(
+                                pending.timeout_policy,
+                                ExecutionTimeoutPolicy::Subscription(_)
+                            )
+                    }))
+        );
         debug_assert!(state.terminal_error.is_none());
         debug_assert_eq!(state.result_peer_era, ResultPeerEra::Modern);
         state.stdio_supervision_generation = Some(generation);

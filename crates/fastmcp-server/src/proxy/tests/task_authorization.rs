@@ -217,6 +217,10 @@ fn issue_bound(
         .unwrap().unwrap().task.base().task_id.clone()
 }
 
+fn task_meta() -> serde_json::Value {
+    serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap()
+}
+
 #[test]
 fn proxy_task_carriers_require_exact_binding_and_cannot_be_rebound() {
     let route = raw_route();
@@ -226,20 +230,21 @@ fn proxy_task_carriers_require_exact_binding_and_cannot_be_rebound() {
     let carrier = route.relay.encode_task_carrier(reservation, route.creation.clone()).unwrap();
     let handle = route.relay.admit_carried_task(&ctx, &carrier)
         .unwrap().unwrap().task.base().task_id.clone();
-    assert!(block_on(route.relay.dispatch_get(&ctx, serde_json::json!({"taskId": handle}))).is_err(),
+    let meta = task_meta();
+    assert!(block_on(route.relay.dispatch_get(&ctx, serde_json::json!({"_meta": meta, "taskId": handle}))).is_err(),
         "an internal carrier is not a router-authorized Task handle");
     assert!(route.calls.lock().unwrap().is_empty());
     let original_registration = Arc::new(());
     route.relay.admit_carried_task_for_operation(
         &ctx, &carrier, FinalTaskOperation::for_tool("weather", &original_registration).unwrap(),
     ).unwrap().unwrap();
-    assert!(block_on(route.relay.dispatch_get(&ctx, serde_json::json!({"taskId": handle}))).is_ok());
+    assert!(block_on(route.relay.dispatch_get(&ctx, serde_json::json!({"_meta": meta, "taskId": handle}))).is_ok());
     let replacement_registration = Arc::new(());
     assert!(route.relay.admit_carried_task_for_operation(
         &ctx, &carrier, FinalTaskOperation::for_tool("weather", &replacement_registration).unwrap(),
     ).is_err(), "a same-name replacement cannot acquire an issued carrier");
     drop(original_registration);
-    assert!(block_on(route.relay.dispatch_get(&ctx, serde_json::json!({"taskId": handle}))).is_err());
+    assert!(block_on(route.relay.dispatch_get(&ctx, serde_json::json!({"_meta": meta, "taskId": handle}))).is_err());
     assert_eq!(route.calls.lock().unwrap().as_slice(), ["tasks/get"]);
 }
 
@@ -275,16 +280,17 @@ fn proxy_task_mixed_selection_denial_opens_no_upstream_and_registration_cannot_r
     assert!(first.calls.lock().unwrap().is_empty());
     assert!(second.calls.lock().unwrap().is_empty());
 
+    let meta = task_meta();
     let disabled = ctx.clone();
     assert!(disabled.disable_tool("allowed"));
-    assert!(block_on(first.relay.dispatch_get(&disabled, serde_json::json!({"taskId": allowed}))).is_err());
+    assert!(block_on(first.relay.dispatch_get(&disabled, serde_json::json!({"_meta": meta, "taskId": allowed}))).is_err());
     let fresh = relay_test_context(Cx::for_testing(), 7321);
     let original = first.relay.tasks.lock().unwrap().tasks[&allowed].original_operation.clone().unwrap();
     drop(first_registration);
     let replacement_registration = Arc::new(());
     let replacement = FinalTaskOperation::for_tool("allowed", &replacement_registration).unwrap();
     assert_ne!(original, replacement);
-    assert!(block_on(first.relay.dispatch_get(&fresh, serde_json::json!({"taskId": allowed}))).is_err());
+    assert!(block_on(first.relay.dispatch_get(&fresh, serde_json::json!({"_meta": meta, "taskId": allowed}))).is_err());
     assert!(first.calls.lock().unwrap().is_empty());
 }
 
@@ -357,9 +363,10 @@ fn proxy_task_missing_policy_blocks_management_and_reconciliation_without_upstre
     let handle = issue_bound(&route, &ctx, FinalTaskOperation::for_tool("weather", &registration).unwrap());
     route.relay.tasks.lock().unwrap().access_authorizers.clear();
     let before = route.client.final_task_registry_snapshot_for_test().unwrap();
-    assert!(block_on(route.relay.dispatch_get(&ctx, serde_json::json!({"taskId": handle}))).is_err());
-    assert!(block_on(route.relay.dispatch_update(&ctx, serde_json::json!({"taskId": handle, "inputResponses": {}}))).is_err());
-    assert!(block_on(route.relay.dispatch_cancel(&ctx, serde_json::json!({"taskId": handle}))).is_err());
+    let meta = task_meta();
+    assert!(block_on(route.relay.dispatch_get(&ctx, serde_json::json!({"_meta": meta, "taskId": handle}))).is_err());
+    assert!(block_on(route.relay.dispatch_update(&ctx, serde_json::json!({"_meta": meta, "taskId": handle, "inputResponses": {}}))).is_err());
+    assert!(block_on(route.relay.dispatch_cancel(&ctx, serde_json::json!({"_meta": meta, "taskId": handle}))).is_err());
     assert!(block_on(route.relay.open_listener_async(&ctx, relay_test_filter(vec![handle.clone()]))).is_err());
     assert!(block_on(route.relay.reconcile_task(
         &ctx, super::super::proxy_task_owner(&ctx).unwrap(), &handle,

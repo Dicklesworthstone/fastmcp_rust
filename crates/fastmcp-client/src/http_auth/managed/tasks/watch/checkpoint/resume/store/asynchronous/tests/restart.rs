@@ -7,7 +7,7 @@ use crate::http_auth::managed::tasks::watch::checkpoint::resume::client::restart
 fn reopened_store_stages_all_pages_before_later_mutations() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let current = binding("one");
@@ -79,7 +79,7 @@ fn reopened_store_stages_all_pages_before_later_mutations() {
 fn failed_staging_returns_unchanged_owner_and_never_exposes_a_prefix() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let vault = Vault::default();
         let current = binding("one");
@@ -135,7 +135,7 @@ fn failed_staging_returns_unchanged_owner_and_never_exposes_a_prefix() {
 fn cancelled_staging_wait_retains_the_same_one_use_completion_and_charge() {
     run(|cx| async move {
         let guard = ProcessGenerationGuard::install().unwrap();
-        let lane = CredentialIoLane::new(&guard, CredentialIoLimits::default()).unwrap();
+        let lane = CredentialIoLane::new(guard, CredentialIoLimits::default()).unwrap();
         let directory = Directory::new();
         let current = binding("one");
         let store = open(&cx, &lane, &directory, Vault::default(), current.clone()).await;

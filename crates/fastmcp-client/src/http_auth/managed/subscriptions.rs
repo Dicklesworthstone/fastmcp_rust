@@ -985,7 +985,9 @@ mod tests {
     fn subscription_requests_above_64_kib_keep_exact_configured_bounds() {
         let mut meta =
             serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
-        meta["com.example/context"] = json!("x".repeat(128 * 1024));
+        for index in 0..8 {
+            meta[format!("com.example/context-{index}")] = json!("x".repeat(12 * 1024));
+        }
         let params = json!({"_meta":meta,"notifications":{"toolsListChanged":true}});
         let make_request = || {
             CoreRequest::decode(ProtocolEra::Modern2026, "subscriptions/listen", Some(&params))

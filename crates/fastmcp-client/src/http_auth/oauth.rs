@@ -123,10 +123,15 @@ impl std::error::Error for OAuthError {}
 /// lists as valid) needs the root policy; every other endpoint keeps the safe
 /// non-root, no-trailing-slash default.
 pub(crate) fn endpoint_resource_policy(resource: &CanonicalHttpUrl) -> CanonicalResourceIdPolicy {
-    if resource.path() == "/" {
+    let base = if resource.path() == "/" {
         CanonicalResourceIdPolicy::root_endpoint()
     } else {
         CanonicalResourceIdPolicy::DEFAULT
+    };
+    if resource.query().is_some() {
+        base.with_resource_significant_query()
+    } else {
+        base
     }
 }
 

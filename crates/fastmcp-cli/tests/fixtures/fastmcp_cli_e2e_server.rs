@@ -1,5 +1,6 @@
 //! Compiled framework-level server fixture for CLI interoperability tests.
 
+#![recursion_limit = "256"]
 #![allow(clippy::needless_pass_by_value)]
 
 use fastmcp_rust::{auto::ServerBuilder, prelude::*};

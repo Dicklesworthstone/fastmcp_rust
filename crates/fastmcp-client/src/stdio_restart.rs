@@ -1288,7 +1288,7 @@ while IFS= read -r request; do
     case "$request" in
         *'"method":"tools/list"'*)
             printf '%s\n' list >> "$SUPERVISION_LOG"
-            printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[]}}\n' "$request_id"
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}\n' "$request_id"
             ;;
         *'"method":"subscriptions/listen"'*)
             printf '%s\n' listen >> "$SUPERVISION_LOG"
@@ -1355,10 +1355,11 @@ done
         fn new() -> Self {
             let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
             let identifier = fastmcp_core::draw_security_identifier().unwrap();
-            let nonce = identifier.as_bytes()[..8]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
+            let mut nonce = String::with_capacity(16);
+            for byte in &identifier.as_bytes()[..8] {
+                use std::fmt::Write as _;
+                let _ = write!(nonce, "{byte:02x}");
+            }
             let directory = std::env::temp_dir().join(format!(
                 "fastmcp-stdio-restart-{}-{sequence}-{nonce}",
                 std::process::id(),

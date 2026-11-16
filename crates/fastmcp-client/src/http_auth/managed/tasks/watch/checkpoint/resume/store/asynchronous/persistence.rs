@@ -71,7 +71,7 @@ pub type TaskResumePersistenceFuture =
     Pin<Box<dyn Future<Output = Result<(), TaskResumePersistenceError>> + Send + 'static>>;
 
 enum Phase<P> {
-    Ready(AsyncTaskResumeStore<P>),
+    Ready(Box<AsyncTaskResumeStore<P>>),
     Pending(CredentialSlotTask<TaskResumeCompletion<P, ()>>),
     Closing(CredentialSlotTask<()>),
     Closed,
@@ -133,7 +133,7 @@ impl<P: TaskResumeProtector + 'static> TaskResumePersistence<P> {
         Self {
             state: Arc::new(Mutex::new(State {
                 current,
-                phase: Phase::Ready(store),
+                phase: Phase::Ready(Box::new(store)),
             })),
         }
     }
@@ -209,7 +209,7 @@ impl<P: TaskResumeProtector + 'static> TaskResumePersistence<P> {
                 // This exact command did not run when custody was returned.
                 // The enclosing watch still owns its pending control change.
                 if let Some((store, _, _)) = retained {
-                    state.phase = Phase::Ready(store);
+                    state.phase = Phase::Ready(Box::new(store));
                 }
                 return Err(TaskResumePersistenceError::Io(cause));
             }
@@ -278,7 +278,7 @@ impl<P: TaskResumeProtector + 'static> TaskResumePersistence<P> {
 
 fn take_ready<P>(state: &mut State<P>) -> Result<AsyncTaskResumeStore<P>, TaskResumePersistenceError> {
     match std::mem::replace(&mut state.phase, Phase::Unavailable) {
-        Phase::Ready(store) => Ok(store),
+        Phase::Ready(store) => Ok(*store),
         other => {
             let error = match &other {
                 Phase::Pending(_) => TaskResumePersistenceError::OperationPending,
@@ -313,7 +313,7 @@ async fn finish<P>(state: &mut State<P>, cx: &Cx) -> Result<(), TaskResumePersis
     match result {
         Ok(completion) => {
             let (owner, outcome) = completion.into_parts();
-            state.phase = Phase::Ready(owner);
+            state.phase = Phase::Ready(Box::new(owner));
             outcome.map_err(TaskResumePersistenceError::Store)
         }
         Err(error) => {

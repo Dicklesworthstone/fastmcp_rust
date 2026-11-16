@@ -4199,12 +4199,20 @@ mod tests {
             Option<std::task::Waker>,
         )>,
         requested: Mutex<Option<SubscriptionFilter>>,
+        latest_task: Option<Arc<Mutex<fastmcp_protocol::Task>>>,
         dropped: std::sync::atomic::AtomicBool,
     }
 
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     impl OrdinaryProxyTasksListenerControl {
         fn push(&self, event: ProxyFinalTaskListenerEvent) {
+            if !self.dropped.load(std::sync::atomic::Ordering::Acquire)
+                && let ProxyFinalTaskListenerEvent::Notification(ref notification) = event
+                && let Some(latest_task) = &self.latest_task
+            {
+                *latest_task.lock().expect("latest upstream task") =
+                    notification.params.task.clone();
+            }
             let wake = {
                 let mut pending = self.pending.lock().expect("listener event queue");
                 pending.0.push_back(event);
@@ -4303,6 +4311,7 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         updates: Arc<Mutex<Vec<serde_json::Value>>>,
         task: CreateTaskResult,
+        latest_task: Arc<Mutex<fastmcp_protocol::Task>>,
         listener_controls: Option<OrdinaryProxyTasksListenerControls>,
         catalog_control: Option<Arc<Mutex<OrdinaryProxyCatalogListenerControl>>>,
         relay_tasks: bool,
@@ -4310,7 +4319,44 @@ mod tests {
     }
 
     #[cfg(all(feature = "proxy", feature = "tasks"))]
+    struct OrdinaryProxyTasksAsyncRequest;
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    impl crate::proxy::ProxyAsyncRequest for OrdinaryProxyTasksAsyncRequest {
+        fn client_implementation(&self) -> Implementation {
+            Implementation::try_new("ordinary-proxy-tasks-test", "1.0")
+                .expect("the fixed test implementation is valid")
+        }
+
+        fn execute<'a>(
+            self: Box<Self>,
+            ctx: &'a McpContext,
+            _request: fastmcp_protocol::CoreRequest,
+            _on_progress: &'a mut (
+                        dyn FnMut(fastmcp_protocol::FinalProgressNotificationParams) + Send
+                    ),
+        ) -> crate::handler::BoxFuture<'a, McpResult<CoreResult>> {
+            Box::pin(async move {
+                ctx.checkpoint()?;
+                Err(fastmcp_core::McpError::internal_error(
+                    "ordinary Tasks proxy test must retain the final result algebra",
+                ))
+            })
+        }
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     impl crate::proxy::ProxyBackend for OrdinaryProxyTasksBackend {
+        fn async_protocol_era(&self) -> Option<ProtocolEra> {
+            Some(ProtocolEra::Modern2026)
+        }
+
+        fn prepare_async_request(
+            &mut self,
+        ) -> McpResult<Option<Box<dyn crate::proxy::ProxyAsyncRequest>>> {
+            Ok(Some(Box::new(OrdinaryProxyTasksAsyncRequest)))
+        }
+
         fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
             Ok(Vec::new())
         }
@@ -4447,6 +4493,26 @@ mod tests {
             Ok(FinalToolCallOutcome::InputRequired(result))
         }
 
+        fn get_final_task(
+            &mut self,
+            task_id: fastmcp_protocol::FinalTaskId,
+        ) -> McpResult<fastmcp_protocol::FinalGetTaskResult> {
+            assert_eq!(
+                task_id.as_str(),
+                self.task.task.base().task_id.as_str(),
+                "the relay queries the retained upstream task id"
+            );
+            Ok(fastmcp_protocol::FinalGetTaskResult {
+                task: self
+                    .latest_task
+                    .lock()
+                    .expect("latest upstream task")
+                    .clone(),
+                meta: None,
+                additional: std::collections::BTreeMap::new(),
+            })
+        }
+
         fn update_final_task(
             &mut self,
             task: &fastmcp_protocol::Task,
@@ -4480,7 +4546,10 @@ mod tests {
                 .expect("ordinary proxy task call log is not poisoned")
                 .push("subscriptions/listen".to_owned());
             let control = self.listener_controls.as_ref().map(|listeners| {
-                let control = Arc::new(OrdinaryProxyTasksListenerControl::default());
+                let control = Arc::new(OrdinaryProxyTasksListenerControl {
+                    latest_task: Some(Arc::clone(&self.latest_task)),
+                    ..OrdinaryProxyTasksListenerControl::default()
+                });
                 *control.requested.lock().expect("Tasks listener filter") =
                     Some(notifications.clone());
                 listeners
@@ -4491,7 +4560,10 @@ mod tests {
             });
             Ok(Box::new(OrdinaryProxyTasksListener {
                 accepted: Some(if self.narrow_task_acknowledgement {
-                    SubscriptionFilter::default()
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    }
                 } else {
                     notifications
                 }),
@@ -6309,6 +6381,59 @@ mod tests {
             calls: Arc<Mutex<Vec<fastmcp_client::CompletionParams>>>,
         }
 
+        impl crate::proxy::ProxyAsyncRequest for CompletionProxyBackend {
+            fn client_implementation(&self) -> Implementation {
+                Implementation::try_new("completion-test-proxy", "1.0")
+                    .expect("the fixed test implementation is valid")
+            }
+
+            fn execute<'a>(
+                mut self: Box<Self>,
+                ctx: &'a McpContext,
+                request: fastmcp_protocol::CoreRequest,
+                _on_progress: &'a mut (
+                            dyn FnMut(fastmcp_protocol::FinalProgressNotificationParams) + Send
+                        ),
+            ) -> crate::handler::BoxFuture<'a, McpResult<CoreResult>> {
+                use crate::proxy::ProxyBackend as _;
+                Box::pin(async move {
+                    ctx.checkpoint()?;
+                    let params = match request {
+                        fastmcp_protocol::CoreRequest::Legacy(
+                            fastmcp_protocol::LegacyCoreRequest::Completion(params),
+                        ) => fastmcp_client::CompletionParams {
+                            reference: match params.reference {
+                                fastmcp_protocol::LegacyCompletionReference::Prompt { name } => {
+                                    fastmcp_client::CompletionReference::Prompt { name }
+                                }
+                                fastmcp_protocol::LegacyCompletionReference::Resource { uri } => {
+                                    fastmcp_client::CompletionReference::Resource { uri }
+                                }
+                            },
+                            argument: fastmcp_client::CompletionArgument {
+                                name: params.argument.name,
+                                value: params.argument.value,
+                            },
+                            context: None,
+                        },
+                        fastmcp_protocol::CoreRequest::Final(
+                            fastmcp_protocol::FinalCoreRequest::Completion(params),
+                        ) => fastmcp_client::CompletionParams {
+                            reference: params.reference,
+                            argument: params.argument,
+                            context: params.context,
+                        },
+                        _ => {
+                            return Err(fastmcp_core::McpError::invalid_request(
+                                "completion proxy test backend received unexpected request",
+                            ));
+                        }
+                    };
+                    self.complete_result(params)
+                })
+            }
+        }
+
         struct LocalFinalCompletionPrompt;
 
         impl crate::PromptHandler for LocalFinalCompletionPrompt {
@@ -6806,7 +6931,7 @@ mod tests {
             relay_tasks: bool,
             narrow_task_acknowledgement: bool,
         ) -> ProxyClient {
-            let task = serde_json::from_value(serde_json::json!({
+            let task: CreateTaskResult = serde_json::from_value(serde_json::json!({
                 "resultType": "task",
                 "taskId": "ordinary-proxy-task-71",
                 "status": "input_required",
@@ -6816,11 +6941,13 @@ mod tests {
                 "inputRequests": {},
             }))
             .expect("the ordinary proxy Task fixture is exact");
+            let latest_task = Arc::new(Mutex::new(task.task.clone()));
             let client = bound_proxy_client(
                 OrdinaryProxyTasksBackend {
                     calls,
                     updates,
                     task,
+                    latest_task,
                     listener_controls,
                     catalog_control,
                     relay_tasks,
@@ -6863,6 +6990,7 @@ mod tests {
             Final,
         }
 
+        #[derive(Clone)]
         struct RecordingDualEraProxyBackend {
             route: DualEraProxyRoute,
             calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
@@ -6877,7 +7005,64 @@ mod tests {
             }
         }
 
+        impl crate::proxy::ProxyAsyncRequest for RecordingDualEraProxyBackend {
+            fn client_implementation(&self) -> Implementation {
+                Implementation::try_new("dual-era-test-proxy", "1.0")
+                    .expect("the fixed test implementation is valid")
+            }
+
+            fn execute<'a>(
+                mut self: Box<Self>,
+                ctx: &'a McpContext,
+                request: fastmcp_protocol::CoreRequest,
+                _on_progress: &'a mut (
+                            dyn FnMut(fastmcp_protocol::FinalProgressNotificationParams) + Send
+                        ),
+            ) -> crate::handler::BoxFuture<'a, McpResult<CoreResult>> {
+                use crate::proxy::ProxyBackend as _;
+                Box::pin(async move {
+                    ctx.checkpoint()?;
+                    let (name, arguments) = match request {
+                        fastmcp_protocol::CoreRequest::Legacy(
+                            fastmcp_protocol::LegacyCoreRequest::ToolsCall(params),
+                        ) => (
+                            params.name,
+                            params.arguments.unwrap_or_else(|| serde_json::json!({})),
+                        ),
+                        fastmcp_protocol::CoreRequest::Final(
+                            fastmcp_protocol::FinalCoreRequest::ToolsCall(params),
+                        ) => (
+                            params.name,
+                            params
+                                .arguments
+                                .into_value()
+                                .unwrap_or_else(|| serde_json::json!({})),
+                        ),
+                        _ => {
+                            return Err(fastmcp_core::McpError::invalid_request(
+                                "dual-era proxy test backend received unexpected request",
+                            ));
+                        }
+                    };
+                    self.call_tool_result(&name, arguments)
+                })
+            }
+        }
+
         impl crate::proxy::ProxyBackend for RecordingDualEraProxyBackend {
+            fn async_protocol_era(&self) -> Option<ProtocolEra> {
+                Some(match self.route {
+                    DualEraProxyRoute::Legacy => ProtocolEra::Legacy2024,
+                    DualEraProxyRoute::Final => ProtocolEra::Modern2026,
+                })
+            }
+
+            fn prepare_async_request(
+                &mut self,
+            ) -> McpResult<Option<Box<dyn crate::proxy::ProxyAsyncRequest>>> {
+                Ok(Some(Box::new(self.clone())))
+            }
+
             fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
                 Ok(Vec::new())
             }
@@ -7340,23 +7525,34 @@ mod tests {
 
             let mut input_required_parameters = task_parameters.clone();
             input_required_parameters["arguments"] = serde_json::json!({});
-            let listened = dispatch_modern(
+            let listen_inbound = crate::InboundRequestContext::with_modern_connection(
+                cx.clone(),
                 705,
+                crate::InboundRequestTransport::Memory,
+                &connection,
+            );
+            let listened = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                server.protocol_policy,
+                &listen_inbound,
                 JsonRpcRequest::new(
                     "subscriptions/listen",
                     Some(serde_json::json!({
-                        "notifications": {"taskIds": []},
+                        "notifications": {"taskIds": [downstream_id]},
                         "_meta": task_parameters["_meta"].clone(),
                     })),
                     705_i64,
                 ),
-            );
-            assert_eq!(
-                listened
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.get("resultType")),
-                Some(&serde_json::json!("complete"))
+                None,
+                None,
+                None,
+                None,
+                fastmcp_core::McpRequestCancellation::new(),
+                None,
+                Arc::clone(&notification_sender),
+            ));
+            assert!(
+                listened.is_none(),
+                "admitted public listener terminates via notifications/cancelled: {listened:?}"
             );
             let emitted_before_rejection = emitted_notifications
                 .lock()
@@ -7364,8 +7560,8 @@ mod tests {
                 .clone();
             assert_eq!(
                 emitted_before_rejection.len(),
-                1,
-                "the public listener emits its acknowledgement before terminal completion"
+                2,
+                "the public listener emits its acknowledgement and terminal cancellation"
             );
             assert_eq!(
                 emitted_before_rejection
@@ -7373,6 +7569,13 @@ mod tests {
                     .map(|notification| notification.method.as_str()),
                 Some("notifications/subscriptions/acknowledged"),
                 "the captured local notification is the listener acknowledgement"
+            );
+            assert_eq!(
+                emitted_before_rejection
+                    .get(1)
+                    .map(|notification| notification.method.as_str()),
+                Some("notifications/cancelled"),
+                "the second local notification is the correlated server termination control"
             );
             let calls_before_rejection = calls
                 .lock()
@@ -7762,8 +7965,8 @@ mod tests {
         fn public_mixed_subscription_combines_local_tasks_with_proxy_catalog_and_checks_owner() {
             use crate::tasks::FinalTaskStore;
             for foreign_owner in [false, true] {
-                let ((), report) = asupersync::lab::run_async_under_lab(
-                    0x63_17,
+                let ((), report) = asupersync::lab::run_async_under_lab_with_config(
+                    asupersync::lab::LabConfig::new(0x63_17).with_auto_advance(),
                     move |cx| async move {
                         let catalog =
                             Arc::new(Mutex::new(OrdinaryProxyCatalogListenerControl::default()));
@@ -7922,8 +8125,8 @@ mod tests {
         fn public_mixed_proxy_subscription_cancel_or_drop_preserves_overlapping_task_listener() {
             use std::sync::atomic::Ordering;
             for cancel_first in [false, true] {
-                let ((), report) = asupersync::lab::run_async_under_lab(
-                    0x63_18,
+                let ((), report) = asupersync::lab::run_async_under_lab_with_config(
+                    asupersync::lab::LabConfig::new(0x63_18).with_auto_advance(),
                     move |cx| async move {
                         let catalog =
                             Arc::new(Mutex::new(OrdinaryProxyCatalogListenerControl::default()));

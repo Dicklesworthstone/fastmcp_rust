@@ -4770,8 +4770,13 @@ impl ResourceTlsTrust {
         let der = certificate.as_der();
         if resource.scheme() != "https"
             || resource.has_userinfo()
-            || resource.query().is_some()
             || resource.fragment().is_some()
+            || fastmcp_core::CanonicalResourceId::parse_for_endpoint(
+                resource.as_str(),
+                &resource,
+                crate::http_auth::oauth::endpoint_resource_policy(&resource),
+            )
+            .is_err()
             || der.is_empty()
             || der.len() > 16 * 1024
         {
@@ -5707,21 +5712,54 @@ impl LegacyHttpRequest {
             fastmcp_protocol::methods::NOTIFICATIONS_CANCELLED,
             Some(params),
         ));
-        let send = self.outbound.send(cx, &control);
-        let mut send = std::pin::pin!(asupersync::time::timeout_at(
-            cx.now()
+        let io_cx = if cx.has_io() || !cx.capabilities().io || cx.checkpoint().is_err() {
+            cx
+        } else {
+            &self.request_cx
+        };
+        let clock_cx = if cx.timer_driver().is_some() {
+            cx.clone()
+        } else {
+            self.deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .response
+                .cx
+                .clone()
+        };
+        let mut sleep = Sleep::new(
+            clock_cx
+                .now()
                 .saturating_add_nanos(LEGACY_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS),
-            send,
-        ));
+        );
+        let mut send = std::pin::pin!(self.outbound.send(io_cx, &control));
         let result = poll_fn(|task_cx| {
-            let _caller = Cx::set_current(Some(cx.clone()));
-            send.as_mut().poll(task_cx)
+            if cx.checkpoint().is_err() {
+                return Poll::Ready(Ok(Err(LegacySseOutboundSendError::not_submitted(
+                    LegacySseHttpClientError::Cancelled,
+                ))));
+            }
+            let poll_send = {
+                let _caller = Cx::set_current(Some(io_cx.clone()));
+                send.as_mut().poll(task_cx)
+            };
+            if let Poll::Ready(output) = poll_send {
+                return Poll::Ready(Ok(output));
+            }
+            let timed_out = {
+                let _clock = Cx::set_current(Some(clock_cx.clone()));
+                Pin::new(&mut sleep).poll(task_cx).is_ready()
+            };
+            if timed_out {
+                return Poll::Ready(Err(()));
+            }
+            Poll::Pending
         })
         .await;
         match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(ClientHttpConnectionError::Legacy(error.error)),
-            Err(_) => Err(ClientHttpConnectionError::Legacy(
+            Err(()) => Err(ClientHttpConnectionError::Legacy(
                 LegacySseHttpClientError::Executor(ModernHttpExecutorError::Transport(
                     ClientError::DeadlineExceeded,
                 )),
@@ -15168,7 +15206,7 @@ mod tests {
                 Err(_) => {
                     self.observations.locked.fetch_add(1, Ordering::SeqCst);
                 }
-            };
+            }
         }
     }
 

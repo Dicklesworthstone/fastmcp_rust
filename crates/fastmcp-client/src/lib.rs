@@ -45872,7 +45872,7 @@ exec sleep 2
             client.set_final_result_cache_enabled(false);
             match client.connection_mut() {
                 ClientHttpConnection::Modern(inner) => {
-                    inner.set_outbound_trace_context(None).unwrap()
+                    inner.set_outbound_trace_context(None).unwrap();
                 }
                 #[cfg(feature = "legacy-2024-11-05")]
                 ClientHttpConnection::LegacySse(_) => panic!("fixture must select modern HTTP"),

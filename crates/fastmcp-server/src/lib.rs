@@ -15882,7 +15882,7 @@ async fn serve_http_connection(
                 legacy_dispatch_mode,
                 LiveHttpLegacyDispatchMode::CallerOwnedAsync
             ) {
-                let response = dispatch_http_request_async(
+                let response = Box::pin(dispatch_http_request_async(
                     cx,
                     &endpoint,
                     &legacy_sessions,
@@ -15890,7 +15890,7 @@ async fn serve_http_connection(
                     request,
                     legacy_admission,
                     legacy_dispatch_mode,
-                )
+                ))
                 .await;
                 let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
                 return;
@@ -15938,7 +15938,7 @@ async fn serve_http_connection(
             let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
             return;
         }
-        let response = dispatch_http_request_async(
+        let response = Box::pin(dispatch_http_request_async(
             cx,
             &endpoint,
             &legacy_sessions,
@@ -15946,7 +15946,7 @@ async fn serve_http_connection(
             request,
             legacy_admission,
             LiveHttpLegacyDispatchMode::Blocking,
-        )
+        ))
         .await;
         let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
         return;
@@ -18911,7 +18911,11 @@ impl Server {
                 .remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
             set_task_subscription_ids(&mut params.notifications, admitted)
                 .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?;
-            if has_task_events {
+            if has_task_events
+                || !catalog_filter_requests_events(&core_accepted_subscription_filter(
+                    &params.notifications,
+                ))
+            {
                 relay_listener = Some(listener);
             }
             // Keep independent core subscriptions active after an empty Task
@@ -19084,11 +19088,13 @@ impl Server {
                         if lease.publish(notification).is_err() {
                             return lease.terminate(request_ctx.cx(), &request_cancellation).await;
                         }
+                        continue;
                     }
                     Ok(proxy::ProxyMixedSubscriptionEvent::Task(notification)) => {
                         if lease.publish_task(notification).is_err() {
                             return lease.terminate(request_ctx.cx(), &request_cancellation).await;
                         }
+                        continue;
                     }
                     Ok(proxy::ProxyMixedSubscriptionEvent::Terminal) => {
                         return lease.terminate(request_ctx.cx(), &request_cancellation).await;
@@ -19114,6 +19120,7 @@ impl Server {
                         if lease.publish_task(notification).is_err() {
                             return lease.terminate(request_ctx.cx(), &request_cancellation).await;
                         }
+                        continue;
                     }
                     Ok(ProxyFinalTaskListenerEvent::Terminal) => {
                         return lease.terminate(request_ctx.cx(), &request_cancellation).await;
@@ -19148,6 +19155,7 @@ impl Server {
                         if lease.publish(notification).is_err() {
                             return lease.terminate(request_ctx.cx(), &request_cancellation).await;
                         }
+                        continue;
                     }
                     Ok(ProxyCatalogListenerEvent::Terminal) => {
                         return lease.terminate(request_ctx.cx(), &request_cancellation).await;
