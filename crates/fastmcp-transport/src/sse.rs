@@ -27,10 +27,11 @@
 //!
 //! # Size limits
 //!
-//! SSE wire lines are limited to 64 KiB. Because a message data line also
-//! contains the `data: ` prefix and newline delimiter, JSON-RPC message data
-//! is limited to 65,529 bytes. Both [`SseWriter`] and [`SseReader`] enforce
-//! that same effective message ceiling before codec admission.
+//! JSON-RPC message data is limited to 8 MiB. A wire line may additionally
+//! carry the `data: ` prefix and a CRLF delimiter (8 bytes). The reader bounds
+//! both raw and replacement-decoded lines and bounds the assembled payload
+//! before codec admission. One leading UTF-8 BOM is ignored; malformed UTF-8
+//! is decoded with U+FFFD replacement, as required for event streams.
 //!
 //! # Example
 //!
@@ -189,6 +190,47 @@ const MAX_SSE_LINE_SIZE: usize = MAX_SSE_MESSAGE_SIZE + SSE_DATA_LINE_CRLF_OVERH
 
 /// Bytes this writer adds around one serialized data line: `data: ` plus LF.
 const SSE_DATA_LINE_WIRE_OVERHEAD: usize = b"data: \n".len();
+
+/// Decode one complete SSE line without allocating an over-limit replacement.
+///
+/// Line framing retains UTF-8 prefixes across reads. CR and LF cannot occur
+/// inside a valid multibyte scalar, so replacement at a complete line boundary
+/// has the same result as streaming UTF-8 decoding. Valid text stays borrowed.
+fn decode_sse_line(raw: &[u8], limit_bytes: usize) -> Option<std::borrow::Cow<'_, str>> {
+    if raw.len() > limit_bytes {
+        return None;
+    }
+    if let Ok(line) = std::str::from_utf8(raw) {
+        return Some(std::borrow::Cow::Borrowed(line));
+    }
+
+    // Preflight the exact replacement length before from_utf8_lossy allocates.
+    // Each invalid subsequence emits one three-byte U+FFFD. An incomplete
+    // terminal subsequence also emits exactly one replacement.
+    let mut remaining = raw;
+    let mut decoded_bytes = 0usize;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                decoded_bytes = decoded_bytes.saturating_add(valid.len());
+                remaining = &[];
+            }
+            Err(error) => {
+                decoded_bytes = decoded_bytes
+                    .saturating_add(error.valid_up_to())
+                    .saturating_add('\u{FFFD}'.len_utf8());
+                let consumed = error.error_len().map_or(remaining.len(), |length| {
+                    error.valid_up_to() + length
+                });
+                remaining = &remaining[consumed..];
+            }
+        }
+        if decoded_bytes > limit_bytes {
+            return None;
+        }
+    }
+    Some(String::from_utf8_lossy(raw))
+}
 
 /// Explicit bounds for a modern request-scoped SSE response body.
 ///
@@ -440,14 +482,13 @@ impl ModernSseDecoder {
             }
         }
         let raw_len = raw.len();
-        let line = String::from_utf8_lossy(&raw);
-        if line.len() > self.limits.line_bytes {
+        let Some(line) = decode_sse_line(&raw, self.limits.line_bytes) else {
             return Err(ModernSsePushError::Parse(self.poison(
                 ModernSseParseError::LineTooLong {
                     limit_bytes: self.limits.line_bytes,
                 },
             )));
-        }
+        };
         self.process_line(&line, raw_len, consume)
     }
 
@@ -938,6 +979,8 @@ pub struct SseReader<R> {
     /// A CR terminates a line immediately; one following LF belongs to the
     /// same delimiter and is discarded at the start of the next read.
     discard_lf_after_cr: bool,
+    /// Only the first line may begin with the stream's optional UTF-8 BOM.
+    bom_window_open: bool,
     /// Last valid SSE event ID, persisted across event blocks.
     last_event_id: Option<String>,
     /// Last valid reconnection delay, persisted across event blocks.
@@ -958,6 +1001,7 @@ impl<R: Read> SseReader<R> {
             max_line_size: MAX_SSE_LINE_SIZE,
             terminal: false,
             discard_lf_after_cr: false,
+            bom_window_open: true,
             last_event_id: None,
             reconnection_time: None,
         }
@@ -1065,8 +1109,10 @@ impl<R: Read> SseReader<R> {
 
         let mut event_type: Option<SseEventType> = None;
         let mut unknown_event = false;
-        let mut data_lines: Vec<String> = Vec::new();
-        let mut total_data_size: usize = 0;
+        // One bounded buffer avoids a String allocation for every data line
+        // and a second full payload allocation when dispatching the event.
+        let mut data = String::new();
+        let mut has_data = false;
         let mut consumed_input = false;
         loop {
             self.line_buffer.clear();
@@ -1097,21 +1143,33 @@ impl<R: Read> SseReader<R> {
                 return Err(error);
             }
 
-            let line = std::str::from_utf8(&self.line_buffer).map_err(|error| {
+            let delimiter_bytes = bytes_read.saturating_sub(self.line_buffer.len());
+            let mut raw = self.line_buffer.as_slice();
+            if self.bom_window_open {
+                self.bom_window_open = false;
+                raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
+            }
+            let Some(line) = decode_sse_line(
+                raw,
+                self.max_line_size.saturating_sub(delimiter_bytes),
+            ) else {
                 self.terminal = true;
-                TransportError::Io(std::io::Error::new(
+                return Err(TransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Invalid UTF-8 in SSE line: {error}"),
-                ))
-            })?;
+                    format!(
+                        "SSE line exceeds maximum size of {} bytes",
+                        self.max_line_size
+                    ),
+                )));
+            };
+            let line = line.as_ref();
 
             // Empty line = end of event
             if line.is_empty() {
                 // SSE dispatches only when at least one data field was seen.
                 // An empty `data` field still counts and dispatches an event
                 // with an empty payload; event/id/retry-only blocks do not.
-                if !data_lines.is_empty() && !unknown_event {
-                    let data = data_lines.join("\n");
+                if has_data && !unknown_event {
                     return Ok(Some(SseEvent {
                         event_type: event_type.unwrap_or(SseEventType::Message),
                         data,
@@ -1124,8 +1182,8 @@ impl<R: Read> SseReader<R> {
                 // block. ID and retry state deliberately persist separately.
                 event_type = None;
                 unknown_event = false;
-                data_lines.clear();
-                total_data_size = 0;
+                data.clear();
+                has_data = false;
                 continue;
             }
 
@@ -1154,11 +1212,12 @@ impl<R: Read> SseReader<R> {
                 }
                 "data" => {
                     // Check accumulated data size to prevent memory exhaustion.
-                    let separator_size = usize::from(!data_lines.is_empty());
-                    total_data_size = total_data_size
+                    let separator_size = usize::from(has_data);
+                    let next_size = data
+                        .len()
                         .saturating_add(separator_size)
                         .saturating_add(value.len());
-                    if total_data_size > MAX_SSE_MESSAGE_SIZE {
+                    if next_size > MAX_SSE_MESSAGE_SIZE {
                         self.terminal = true;
                         return Err(TransportError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1168,7 +1227,11 @@ impl<R: Read> SseReader<R> {
                             ),
                         )));
                     }
-                    data_lines.push(value.to_string());
+                    if has_data {
+                        data.push('\n');
+                    }
+                    data.push_str(value);
+                    has_data = true;
                 }
                 "id" => {
                     // U+0000 makes this field a no-op; it does not clear the
@@ -1870,6 +1933,50 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
 // Tests
 // =============================================================================
 
+#[cfg(test)]
+mod decoding_tests {
+    use super::*;
+
+    #[test]
+    fn sse_line_replacement_checks_decoded_bytes_before_allocation() {
+        assert!(matches!(
+            decode_sse_line(b"valid", 5),
+            Some(std::borrow::Cow::Borrowed("valid"))
+        ));
+        for (raw, expected) in [
+            (&b"\xFF\xFF"[..], "\u{FFFD}\u{FFFD}"),
+            (&b"\xE2\x82"[..], "\u{FFFD}"),
+            (&b"a\xF0\x9Fz"[..], "a\u{FFFD}z"),
+            (&b"\xED\xA0\x80"[..], "\u{FFFD}\u{FFFD}\u{FFFD}"),
+        ] {
+            assert_eq!(
+                decode_sse_line(raw, expected.len()).as_deref(),
+                Some(expected)
+            );
+            assert!(decode_sse_line(raw, expected.len() - 1).is_none());
+        }
+    }
+
+    #[test]
+    fn modern_sse_replacement_remains_chunk_invariant_and_bounded() {
+        let wire = b"\xEF\xBB\xBFdata: a\xF0\x9Fz\r\n\r\n";
+        for split in 0..=wire.len() {
+            let mut decoder = ModernSseDecoder::new(ModernSseLimits::new(64, 64, 8).unwrap());
+            let mut events = decoder.push(&wire[..split]).unwrap();
+            events.extend(decoder.push(&wire[split..]).unwrap());
+            assert_eq!(events, vec!["a\u{FFFD}z".to_owned()], "split {split}");
+            assert!(!decoder.finish().unwrap().discarded_pending_event);
+        }
+
+        let mut decoder = ModernSseDecoder::new(ModernSseLimits::new(8, 64, 8).unwrap());
+        assert_eq!(
+            decoder.push(b"data: \xFF\n\n"),
+            Err(ModernSseParseError::LineTooLong { limit_bytes: 8 })
+        );
+        assert_eq!(decoder.push(b"data: ok\n\n"), Err(ModernSseParseError::Poisoned));
+    }
+}
+
 #[cfg(all(test, feature = "legacy-2024-11-05"))]
 mod tests {
     use super::*;
@@ -2147,6 +2254,95 @@ id\ndata: third\n\n";
 
         assert_eq!(event.event_type, SseEventType::Message);
         assert_eq!(event.data, "méthod");
+    }
+
+    #[test]
+    fn legacy_sse_reader_strips_only_the_stream_leading_bom() {
+        let wire = b"\xEF\xBB\xBFevent: endpoint\r\ndata: /messages\r\n\r\n\
+\xEF\xBB\xBFdata: ignored\ndata: \xEF\xBB\xBFpayload\n\n";
+        let mut reader = SseReader::new(ByteAtATime {
+            inner: Cursor::new(wire.to_vec()),
+        });
+        let cx = Cx::for_testing();
+
+        let endpoint = reader.read_event(&cx).unwrap().unwrap();
+        assert_eq!(endpoint.event_type, SseEventType::Endpoint);
+        assert_eq!(endpoint.data, "/messages");
+        let message = reader.read_event(&cx).unwrap().unwrap();
+        assert_eq!(message.event_type, SseEventType::Message);
+        assert_eq!(message.data, "\u{FEFF}payload");
+    }
+
+    #[test]
+    fn legacy_sse_reader_does_not_reopen_bom_window_after_an_empty_line() {
+        for wire in [
+            &b"\n\xEF\xBB\xBFdata: ignored\ndata: visible\n\n"[..],
+            &b"\xEF\xBB\xBF\xEF\xBB\xBFdata: ignored\ndata: visible\n\n"[..],
+        ] {
+            let mut reader = SseReader::new(ByteAtATime {
+                inner: Cursor::new(wire.to_vec()),
+            });
+            let event = reader.read_event(&Cx::for_testing()).unwrap().unwrap();
+            assert_eq!(event.data, "visible");
+        }
+    }
+
+    #[test]
+    fn legacy_sse_replacement_preserves_json_admission_and_following_events() {
+        let wire = b"data: {\"jsonrpc\":\"2.0\",\"method\":\"bad\xFFname\",\"id\":1}\n\n\
+data: {\"jsonrpc\":\"2.0\",\"method\":\xFF,\"id\":2}\n\n\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":3}\n\n";
+        let mut reader = SseReader::new(ByteAtATime {
+            inner: Cursor::new(wire.to_vec()),
+        });
+        let cx = Cx::for_testing();
+
+        let JsonRpcMessage::Request(first) = reader.read_message(&cx).unwrap().unwrap() else {
+            panic!("expected request");
+        };
+        assert_eq!(first.method, "bad\u{FFFD}name");
+        assert!(matches!(reader.read_message(&cx), Err(TransportError::Codec(_))));
+        assert!(!reader.terminal);
+        let JsonRpcMessage::Request(next) = reader.read_message(&cx).unwrap().unwrap() else {
+            panic!("expected request");
+        };
+        assert_eq!(next.method, "ping");
+    }
+
+    #[test]
+    fn legacy_sse_replacement_expansion_obeys_line_limit_and_latches_refusal() {
+        let cx = Cx::for_testing();
+        for (limit, admitted) in [(10, true), (9, false)] {
+            let mut reader = SseReader::new(Cursor::new(b"data: \xFF\n\n".to_vec()));
+            reader.max_line_size = limit;
+            if admitted {
+                assert_eq!(reader.read_event(&cx).unwrap().unwrap().data, "\u{FFFD}");
+            } else {
+                assert!(matches!(
+                    reader.read_event(&cx),
+                    Err(TransportError::Io(error))
+                        if error.kind() == std::io::ErrorKind::InvalidData
+                ));
+                assert!(matches!(reader.read_event(&cx), Err(TransportError::Closed)));
+            }
+        }
+
+        let mut reader = SseReader::new(Cursor::new(
+            b"id: known\n\nid: \xFF\xFF\ndata: x\n\n".to_vec(),
+        ));
+        reader.max_line_size = 10;
+        assert!(matches!(reader.read_event(&cx), Err(TransportError::Io(_))));
+        assert_eq!(reader.last_event_id(), Some("known"));
+        assert!(reader.terminal);
+    }
+
+    #[test]
+    fn legacy_sse_reader_preserves_many_empty_data_fields_in_one_buffer() {
+        let mut wire = "data\n".repeat(4096);
+        wire.push_str("data: tail\n\n");
+        let mut reader = SseReader::new(Cursor::new(wire.into_bytes()));
+        let event = reader.read_event(&Cx::for_testing()).unwrap().unwrap();
+        assert_eq!(event.data, format!("{}tail", "\n".repeat(4096)));
     }
 
     #[test]
