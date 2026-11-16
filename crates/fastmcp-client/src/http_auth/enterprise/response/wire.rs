@@ -111,9 +111,16 @@ pub(super) fn admit(
         if body.max_age.is_some() {
             return Err(Error::InvalidResponse);
         }
-        let basic_denial = response.status == 401 && error == "invalid_client"
-            && used_basic && admits_one_basic_challenge(response.headers);
-        if response.status != 400 && !basic_denial {
+        let failed_basic_authentication = error == "invalid_client" && used_basic;
+        let basic_denial = response.status == 401
+            && failed_basic_authentication
+            && admits_one_basic_challenge(response.headers);
+        // Only the external OIDC code-token subflow admits the conflicting
+        // OIDC/400 and OAuth/401 rules. Later exchanges retain OAuth's
+        // method-specific 401 plus matching challenge for failed HTTP Basic.
+        let bad_request_denial = response.status == 400
+            && (!failed_basic_authentication || stage == EnterpriseTokenResponseStage::OidcCode);
+        if !bad_request_denial && !basic_denial {
             return Err(Error::UnexpectedStatus);
         }
         let code = match error {
@@ -323,17 +330,63 @@ mod tests {
         ] {
             let mut headers = head();
             headers.push(("WWW-Authenticate".into(), challenge.into()));
-            for basic in [false, true] {
-                let result = admit(&EnterpriseTokenResponse {
-                    status: 401, headers: &headers, body,
-                }, EnterpriseTokenResponseStage::OidcCode, basic, 3600);
-                assert_eq!(matches!(result, Ok((AdmittedBody::Denied(_), _))), accepted && basic, "{challenge}");
+            for stage in [
+                EnterpriseTokenResponseStage::OidcCode,
+                EnterpriseTokenResponseStage::IdJag,
+                EnterpriseTokenResponseStage::AccessToken,
+            ] {
+                for basic in [false, true] {
+                    let result = admit(&EnterpriseTokenResponse {
+                        status: 401, headers: &headers, body,
+                    }, stage, basic, 3600);
+                    assert_eq!(
+                        matches!(result, Ok((AdmittedBody::Denied(_), _))),
+                        accepted && basic,
+                        "{stage:?}: {challenge}",
+                    );
+                }
             }
         }
         let headers = head();
         assert!(matches!(admit(&EnterpriseTokenResponse {
             status: 400, headers: &headers, body,
         }, EnterpriseTokenResponseStage::OidcCode, true, 3600), Ok((AdmittedBody::Denied(_), _))));
+    }
+
+    #[test]
+    fn enterprise_other_oauth_denials_keep_bad_request_transport() {
+        let headers = head();
+        for stage in [
+            EnterpriseTokenResponseStage::OidcCode,
+            EnterpriseTokenResponseStage::IdJag,
+            EnterpriseTokenResponseStage::AccessToken,
+        ] {
+            for basic in [false, true] {
+                for (error, code) in [
+                    ("invalid_grant", EnterpriseOAuthErrorCode::InvalidGrant),
+                    ("invalid_scope", EnterpriseOAuthErrorCode::InvalidScope),
+                    ("access_denied", EnterpriseOAuthErrorCode::AccessDenied),
+                ] {
+                    let body = format!(r#"{{"error":"{error}"}}"#);
+                    let result = admit(
+                        &EnterpriseTokenResponse {
+                            status: 400,
+                            headers: &headers,
+                            body: body.as_bytes(),
+                        },
+                        stage,
+                        basic,
+                        3600,
+                    );
+                    let Ok((AdmittedBody::Denied(denial), _)) = result else {
+                        panic!("expected ordinary OAuth denial for {stage:?}: {error}");
+                    };
+                    assert_eq!(denial.code(), code);
+                    assert_eq!(denial.status(), 400);
+                    assert!(!denial.matched_basic_challenge());
+                }
+            }
+        }
     }
 
     #[test]

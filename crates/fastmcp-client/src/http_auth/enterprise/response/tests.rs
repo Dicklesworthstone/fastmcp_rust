@@ -24,13 +24,25 @@ fn headers() -> Vec<(String, String)> {
     ]
 }
 fn profile(requested: &[&str]) -> EnterpriseProfile {
+    profile_with_authentication(
+        requested,
+        EnterpriseClientAuthentication::ClientSecretBasic,
+        EnterpriseClientAuthentication::ClientSecretPost,
+    )
+}
+
+fn profile_with_authentication(
+    requested: &[&str],
+    idp_authentication: EnterpriseClientAuthentication,
+    resource_as_authentication: EnterpriseClientAuthentication,
+) -> EnterpriseProfile {
     let url = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
     let cfg = EnterpriseProfileConfiguration {
         idp: EnterpriseRegistrationConfiguration {
             issuer: "https://idp.example".into(),
             token_endpoint: "https://idp.example/token".into(),
             client_id: "native-idp".into(),
-            authentication: EnterpriseClientAuthentication::ClientSecretBasic,
+            authentication: idp_authentication,
             generation: 11,
             scope_allowance: vec!["openid".into(), "read".into(), "write".into()],
         },
@@ -38,7 +50,7 @@ fn profile(requested: &[&str]) -> EnterpriseProfile {
             issuer: "https://as.example".into(),
             token_endpoint: "https://as.example/token".into(),
             client_id: "native-resource".into(),
-            authentication: EnterpriseClientAuthentication::ClientSecretPost,
+            authentication: resource_as_authentication,
             generation: 12,
             scope_allowance: vec!["read".into(), "write".into()],
         },
@@ -72,7 +84,7 @@ fn profile(requested: &[&str]) -> EnterpriseProfile {
             "jwks_uri":"https://idp.example/oidc-keys",
             "grant_types_supported":["authorization_code",TOKEN_EXCHANGE_GRANT],
             "response_types_supported":["code"], "code_challenge_methods_supported":["S256"],
-            "token_endpoint_auth_methods_supported":["client_secret_basic"],
+            "token_endpoint_auth_methods_supported":[idp_authentication.as_str()],
             "identity_chaining_requested_token_types_supported":[ID_JAG_TOKEN_TYPE],
             "id_token_signing_alg_values_supported":["RS256"],
             "scopes_supported":["openid","read","write"]
@@ -81,7 +93,7 @@ fn profile(requested: &[&str]) -> EnterpriseProfile {
             "issuer":"https://as.example", "token_endpoint":"https://as.example/token",
             "authorization_grant_profiles_supported":[ID_JAG_GRANT_PROFILE],
             "grant_types_supported":[JWT_BEARER_GRANT],
-            "token_endpoint_auth_methods_supported":["client_secret_post"]
+            "token_endpoint_auth_methods_supported":[resource_as_authentication.as_str()]
         }),
         json!({
             "authorization_grant_profiles_supported":[ID_JAG_GRANT_PROFILE],
@@ -90,12 +102,12 @@ fn profile(requested: &[&str]) -> EnterpriseProfile {
         json!({
             "issuer":"https://idp.example", "token_endpoint":"https://idp.example/token",
             "client_id":"native-idp", "grant_types":["authorization_code",TOKEN_EXCHANGE_GRANT],
-            "token_endpoint_auth_method":"client_secret_basic"
+            "token_endpoint_auth_method":idp_authentication.as_str()
         }),
         json!({
             "issuer":"https://as.example", "token_endpoint":"https://as.example/token",
             "client_id":"native-resource", "grant_types":[JWT_BEARER_GRANT],
-            "token_endpoint_auth_method":"client_secret_post"
+            "token_endpoint_auth_method":resource_as_authentication.as_str()
         }),
     ].map(|value| serde_json::to_vec(&value).unwrap());
     EnterpriseProfile::from_documents(cfg, &docs[0], &docs[1], &docs[2], &docs[3], &docs[4]).unwrap()
@@ -300,6 +312,124 @@ fn enterprise_response_expiry_is_earliest_and_final_admission_refuses_clock_rewi
     late["expires_in"] = json!(300);
     assert!(matches!(jag(&profile, &keys, &late, now() + Duration::from_secs(240)),
         Err(EnterpriseResponseError::InvalidLifetime)));
+}
+
+#[test]
+fn enterprise_oidc_basic_400_exception_does_not_admit_id_jag_denials() {
+    let selected = profile(&["read"]);
+    let (oidc_keys, jag_keys) = keys();
+    let body = br#"{"error":"invalid_client"}"#;
+    for (status, challenged, oidc_allowed, jag_allowed) in [
+        (400, false, true, false),
+        (400, true, true, false),
+        (401, false, false, false),
+        (401, true, true, true),
+    ] {
+        let mut fields = headers();
+        if challenged {
+            fields.push(("WWW-Authenticate".into(), r#"Basic realm="issuer""#.into()));
+        }
+        let oidc = selected.admit_oidc_code_response(
+            EnterpriseTokenResponse { status, headers: &fields, body },
+            &oidc_keys,
+            "oidc-flow-nonce",
+            TenantExpectation::SingleTenant,
+            None,
+            EnterpriseResponsePolicy::default(),
+            now(),
+        );
+        assert_enterprise_client_denial(oidc, status, oidc_allowed);
+        let exchanged = selected.admit_id_jag_response(
+            EnterpriseTokenResponse { status, headers: &fields, body },
+            &jag_keys,
+            TenantExpectation::SingleTenant,
+            ResourceTenantExpectation::SingleTenant,
+            EnterpriseResponsePolicy::default(),
+            now(),
+        );
+        assert_enterprise_client_denial(exchanged, status, jag_allowed);
+    }
+}
+
+#[test]
+fn enterprise_final_client_denials_follow_the_selected_registration() {
+    use EnterpriseClientAuthentication::{ClientSecretBasic, ClientSecretPost};
+
+    let (_, jag_keys) = keys();
+    let body = br#"{"error":"invalid_client"}"#;
+    for (authentication, status, challenged, allowed) in [
+        (ClientSecretBasic, 400, false, false),
+        (ClientSecretBasic, 400, true, false),
+        (ClientSecretBasic, 401, false, false),
+        (ClientSecretBasic, 401, true, true),
+        (ClientSecretPost, 400, false, true),
+        (ClientSecretPost, 400, true, true),
+        (ClientSecretPost, 401, false, false),
+        (ClientSecretPost, 401, true, false),
+    ] {
+        // Acquire a genuine signed ID-JAG through the public profile path so
+        // the final stage must retain the selected resource-AS method.
+        let selected = profile_with_authentication(
+            &["read"],
+            ClientSecretBasic,
+            authentication,
+        );
+        let admitted = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
+        let mut fields = headers();
+        if challenged {
+            fields.push(("WWW-Authenticate".into(), r#"Basic realm="issuer""#.into()));
+        }
+        let result = admitted.admit_access_token_response(
+            EnterpriseTokenResponse { status, headers: &fields, body },
+            now(),
+        );
+        assert_enterprise_client_denial(result, status, allowed);
+    }
+}
+
+#[test]
+fn enterprise_form_authenticated_id_jag_denials_keep_oauth_400_semantics() {
+    use EnterpriseClientAuthentication::ClientSecretPost;
+
+    let selected = profile_with_authentication(
+        &["read"],
+        ClientSecretPost,
+        ClientSecretPost,
+    );
+    let (_, jag_keys) = keys();
+    let mut fields = headers();
+    fields.push(("WWW-Authenticate".into(), r#"Basic realm="issuer""#.into()));
+    let body = br#"{"error":"invalid_client"}"#;
+    for (status, allowed) in [(400, true), (401, false), (403, false), (500, false)] {
+        let result = selected.admit_id_jag_response(
+            EnterpriseTokenResponse { status, headers: &fields, body },
+            &jag_keys,
+            TenantExpectation::SingleTenant,
+            ResourceTenantExpectation::SingleTenant,
+            EnterpriseResponsePolicy::default(),
+            now(),
+        );
+        assert_enterprise_client_denial(result, status, allowed);
+    }
+}
+
+fn assert_enterprise_client_denial<T>(
+    result: Result<EnterpriseResponseOutcome<T>, EnterpriseResponseError>,
+    status: u16,
+    allowed: bool,
+) {
+    match result {
+        Ok(EnterpriseResponseOutcome::Denied { denial, .. }) => {
+            assert!(allowed, "unexpected typed denial at status {status}");
+            assert_eq!(denial.code(), EnterpriseOAuthErrorCode::InvalidClient);
+            assert_eq!(denial.status(), status);
+            assert_eq!(denial.matched_basic_challenge(), status == 401);
+        }
+        Err(EnterpriseResponseError::UnexpectedStatus) => {
+            assert!(!allowed, "expected typed denial at status {status}");
+        }
+        _ => panic!("unexpected enterprise response outcome at status {status}"),
+    }
 }
 
 #[test]
