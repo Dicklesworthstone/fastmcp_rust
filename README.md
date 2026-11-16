@@ -1373,6 +1373,29 @@ own token acquisition and refresh. Credentials require HTTPS and a modern or
 auto protocol policy. Core-only builds omit Tasks from help and explain
 the required feature when a Tasks command is attempted.
 
+### Observing a Task returned by a tool
+
+With `tasks` enabled, a Tasks-aware tool call returns
+`FinalToolCallOutcome::Task(created)` when the server accepts asynchronous
+work. For HTTP, `HttpClient::call_tool_final_outcome_with_cancellation` checks
+that the peer supports Tasks before dispatch and returns the complete, Task,
+or input-required outcome from exactly one tool call. It does not invoke
+installed input callbacks. Unix stdio offers the corresponding
+`call_tool_final_outcome_with_cx` method.
+
+Use `FinalTaskHandle::from_created(&created)` to retain that Task on the same
+client without sending an extra `tasks/get` or repeating the tool call.
+The creation receipt remains yours, including its metadata and unknown
+envelope members; the handle retains the exact Task result.
+
+The handle's `wait`, `wait_with_stdio`, `wait_with_memory`, and
+`wait_with_websocket` methods respect the accepted Task's initial
+`pollIntervalMs` before their first read. They stop at terminal state,
+input-required, local cancellation, expiry, or the configured finite bounds.
+Waiting does not answer input or cancel remote work. Keep using the original
+client and authenticated identity. This in-process handoff does not persist a
+Task or establish permission to use it through another client.
+
 ### Subscription-assisted Task driving (current source tree, optional)
 
 With `tasks` enabled, a retained `FinalTaskHandle` can become a

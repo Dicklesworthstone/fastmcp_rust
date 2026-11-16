@@ -409,6 +409,54 @@ impl FinalTaskDriver {
 }
 
 impl FinalTaskHandle {
+    /// Retains a tool call's accepted Task without sending another request.
+    ///
+    /// This is the creation-to-observation handoff for
+    /// [`crate::FinalToolCallOutcome::Task`]. Use the same originating client and
+    /// authenticated identity for subsequent operations. No request is sent,
+    /// request ID allocated, callback invoked, or creating call repeated.
+    /// Unlike attaching by ID, the first wait observes the creation response's
+    /// `pollIntervalMs` before its first authoritative read.
+    ///
+    /// Borrowing preserves the caller's creation receipt, including its envelope
+    /// metadata and unknown members. The handle clones only its Task, retaining
+    /// the exact completed-result source. Publicly constructed or modified Task
+    /// values must still pass wire-shape and status/payload consistency checks.
+    /// Transport admission remains responsible for the received message limits;
+    /// this local handoff does not impose a smaller result-size ceiling.
+    ///
+    /// Expired snapshots remain available: terminal data has already been
+    /// delivered, while waiting and input submission enforce live retention.
+    /// This handoff is not authentication, cross-client binding, persistence,
+    /// or proof of durable recovery.
+    pub fn from_created(result: &fastmcp_protocol::CreateTaskResult) -> McpResult<Self> {
+        use fastmcp_protocol::tasks_extension::TaskStatus;
+
+        let expected = match &result.task {
+            FinalTask::Working(_) => TaskStatus::Working,
+            FinalTask::InputRequired { .. } => TaskStatus::InputRequired,
+            FinalTask::Completed { .. } => TaskStatus::Completed,
+            FinalTask::Failed { .. } => TaskStatus::Failed,
+            FinalTask::Cancelled(_) => TaskStatus::Cancelled,
+        };
+        if result.task.base().status != expected {
+            return Err(McpError::invalid_request(
+                "Final Task status does not match its payload",
+            ));
+        }
+        let invalid = |_| McpError::invalid_request("Invalid final Task creation snapshot");
+        // Validate only the Task; open envelope siblings remain with the caller
+        // and are not copied into observation state. Do not use Value here:
+        // completed-result source must keep its numeric and member spellings.
+        let encoded = serde_json::to_vec(&result.task).map_err(invalid)?;
+        let _: FinalTask = serde_json::from_slice(&encoded).map_err(invalid)?;
+        admit_identity(&result.task, &result.task)?;
+        timestamp_nanos(&result.task.base().last_updated_at)
+            .map_err(|_| McpError::invalid_request("Invalid final Task update timestamp"))?;
+        next_delay(&result.task, FinalTaskWaitPolicy::default())?;
+        Ok(Self::new(result.task.clone()))
+    }
+
     /// Transfers this handle into a reusable automatic input workflow.
     /// Existing `wait`, `poll` and manual input methods remain observation or
     /// explicit submission operations; only driving this new owner invokes
@@ -1415,6 +1463,63 @@ fn task_watch_comparison_error(error: HttpClientError) -> McpError {
     match error {
         HttpClientError::CoreResult(error) => error,
         _ => McpError::internal_error("Final Task snapshot comparison failed"),
+    }
+}
+
+impl HttpClient {
+    /// Calls one Tasks-capable tool without automatically following input requests.
+    ///
+    /// The retained modern discovery must admit the official Tasks result
+    /// before a request is sent. The call preserves complete, Task, and
+    /// input-required outcomes, including exact completed Task result source.
+    /// It invokes no installed input callbacks and never repeats the tool call.
+    /// Use [`FinalTaskHandle::from_created`] to observe an accepted Task through
+    /// this same client without an eager extra read.
+    pub async fn call_tool_final_outcome_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<crate::FinalToolCallOutcome, HttpClientError> {
+        use crate::FinalToolCallOutcome;
+        use fastmcp_protocol::{CoreResult, FinalCoreResult};
+
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let discovery = self.server_discovery().ok_or_else(|| {
+            HttpClientError::CoreResult(McpError::invalid_params(
+                "Modern Tasks requires the retained final server/discover response",
+            ))
+        })?;
+        crate::admit_final_tasks_result_discriminator(
+            &discovery,
+            crate::OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        )
+        .map_err(HttpClientError::CoreResult)?;
+        match self
+            .request_final_core_with_cancellation(
+                cx,
+                cancellation,
+                "tools/call",
+                serde_json::json!({"name": name, "arguments": arguments}),
+            )
+            .await?
+        {
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                Ok(FinalToolCallOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+                Ok(FinalToolCallOutcome::Task(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                Ok(FinalToolCallOutcome::InputRequired(result))
+            }
+            _ => Err(HttpClientError::CoreResult(
+                crate::unexpected_convenience_result("tools/call"),
+            )),
+        }
     }
 }
 

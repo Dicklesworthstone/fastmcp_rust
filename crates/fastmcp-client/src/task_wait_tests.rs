@@ -107,6 +107,137 @@ mod memory {
         (client, handle, peer)
     }
 
+
+    async fn just_created(
+        cx: &Cx,
+        mut initial: Value,
+    ) -> (MemoryClient, fastmcp_protocol::CreateTaskResult, MemoryTransport) {
+        let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
+        peer.send_async(cx, &serde_json::from_value(discovery()).unwrap())
+            .await
+            .unwrap();
+        let mut client = MemoryClient::builder(ClientInfo {
+            name: "created-task-memory-client".to_owned(),
+            version: "1".to_owned(),
+        })
+        .with_tasks()
+        .connect(cx, transport)
+        .await
+        .unwrap();
+        receive(cx, &mut peer, "server/discover", Some(1)).await;
+        initial["resultType"] = json!("task");
+        initial["_meta"] = json!({"creation-note": "retained"});
+        initial["x-creation"] = json!({"opaque": [1, true, "unchanged"]});
+        peer.send_async(
+            cx,
+            &JsonRpcMessage::Response(fastmcp_protocol::JsonRpcResponse::success(
+                fastmcp_protocol::RequestId::Number(2),
+                initial,
+            )),
+        )
+        .await
+        .unwrap();
+        let crate::FinalToolCallOutcome::Task(created) = client
+            .call_tool_final_outcome(
+                cx,
+                &McpRequestCancellation::new(),
+                "start-work",
+                json!({"value": 7}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the negotiated creating call must retain its Task result");
+        };
+        let request = receive(cx, &mut peer, "tools/call", Some(2)).await;
+        let parameters = request.params.unwrap();
+        assert_eq!(parameters["name"], "start-work");
+        assert_eq!(parameters["arguments"], json!({"value": 7}));
+        assert_eq!(
+            parameters["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                [fastmcp_protocol::TASKS_EXTENSION],
+            json!({}),
+        );
+        (client, created, peer)
+    }
+
+    #[test]
+    fn public_memory_created_task_wait_preserves_receipt_and_initial_poll_floor() {
+        run_memory(|cx| async move {
+            let (mut client, created, mut peer) =
+                just_created(&cx, task("working", Some(80))).await;
+            let received_at = Instant::now();
+            let receipt = serde_json::to_vec(&created).unwrap();
+            let mut handle = FinalTaskHandle::from_created(&created).unwrap();
+            let mut server = cx
+                .spawn(move |peer_cx| async move {
+                    let get = receive(&peer_cx, &mut peer, "tasks/get", Some(3)).await;
+                    assert_eq!(get.params.unwrap()["taskId"], "wait-task");
+                    assert!(
+                        received_at.elapsed() >= Duration::from_millis(80),
+                        "creation adoption must not perform an early attachment read",
+                    );
+                    reply_task(&peer_cx, &mut peer, 3, task("completed", None)).await;
+                    receive(&peer_cx, &mut peer, "tools/list", Some(4)).await;
+                    reply_tools(&peer_cx, &mut peer, 4).await;
+                    peer
+                })
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            assert_eq!(
+                handle
+                    .wait_with_memory(&cx, &mut client, &cancellation, policy(2000, 2, 1))
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::Completed,
+            );
+            assert!(matches!(handle.task(), FinalTask::Completed { .. }));
+            assert_eq!(serde_json::to_vec(&created).unwrap(), receipt);
+            assert_eq!(
+                created.additional["x-creation"],
+                json!({"opaque": [1, true, "unchanged"]}),
+            );
+            assert!(matches!(
+                client.list_tools(&cx, &cancellation, None).await.unwrap(),
+                CoreResult::Final(FinalCoreResult::ToolsList { .. }),
+            ));
+            let _peer = server.join(&cx).await.unwrap();
+            assert!(client.take_cancellation_events().is_empty());
+            assert!(cx.checkpoint().is_ok());
+            client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn public_memory_created_task_wait_never_shortens_initial_floor_to_fit_budget() {
+        run_memory(|cx| async move {
+            let (mut client, created, mut peer) =
+                just_created(&cx, task("working", Some(500))).await;
+            let receipt = serde_json::to_vec(&created).unwrap();
+            let mut handle = FinalTaskHandle::from_created(&created).unwrap();
+            let snapshot = serde_json::to_vec(handle.task()).unwrap();
+            let cancellation = McpRequestCancellation::new();
+            assert_eq!(
+                handle
+                    .wait_with_memory(&cx, &mut client, &cancellation, policy(40, 2, 1))
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::DeadlineElapsed,
+            );
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), snapshot);
+            assert_eq!(serde_json::to_vec(&created).unwrap(), receipt);
+            assert!(
+                client.take_cancellation_events().is_empty(),
+                "no Task read or creating call was dispatched or cancelled",
+            );
+            // ID 3 and the next method prove adoption and the expired wait
+            // neither allocated a read nor repeated the creating call.
+            assert_core_usable(&cx, &mut client, &mut peer, 3).await;
+            assert!(!cancellation.is_cancel_requested());
+            client.close(&cx).unwrap();
+        });
+    }
+
     fn answers() -> FinalTaskInputResponses {
         serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap()
     }
@@ -1732,6 +1863,368 @@ fn public_http_task_watch_acknowledgements_use_exact_set_subsets() {
                 } else {
                     assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
                 }
+                assert!(cx.checkpoint().is_ok());
+                client.list_tools(&cx, None).await.unwrap();
+            });
+        peer.join().unwrap();
+    }
+}
+
+fn creation_receipt(mut task: Value) -> fastmcp_protocol::CreateTaskResult {
+    task["resultType"] = json!("task");
+    task["_meta"] = json!({"creation-receipt": {"generation": 9}});
+    task["x-creation-envelope"] = json!({"opaque": [false, 7, "kept"]});
+    serde_json::from_str(&task.to_string()).unwrap()
+}
+
+#[test]
+fn created_task_handle_retains_every_status_without_consuming_creation_receipt() {
+    for status in ["working", "input_required", "completed", "failed", "cancelled"] {
+        let mut initial = task(status, Some(25));
+        initial["createdAt"] = json!("2026-07-28T08:00:00-04:00");
+        let created = creation_receipt(initial);
+        let receipt = serde_json::to_vec(&created).unwrap();
+        let snapshot = serde_json::to_vec(&created.task).unwrap();
+        let handle = FinalTaskHandle::from_created(&created).unwrap();
+        assert_eq!(handle.task_id(), &FinalTaskId::parse("wait-task").unwrap());
+        assert_eq!(
+            handle.task().base().created_at.as_str(),
+            "2026-07-28T08:00:00-04:00",
+            "adoption must preserve the admitted creation spelling",
+        );
+        assert_eq!(serde_json::to_vec(handle.task()).unwrap(), snapshot);
+        assert_eq!(serde_json::to_vec(&created).unwrap(), receipt);
+        assert_eq!(
+            created.additional["x-creation-envelope"],
+            json!({"opaque": [false, 7, "kept"]}),
+        );
+        assert_eq!(
+            serde_json::to_value(created.meta.as_ref().unwrap()).unwrap(),
+            json!({"creation-receipt": {"generation": 9}}),
+        );
+    }
+}
+
+#[test]
+fn created_task_handle_preserves_exact_completed_result_source() {
+    const RESULT: &str = r#"{"z-first":1.20e+4,"content":[{"type":"text","text":"finished"}],"wide":123456789012345678901234567890,"a-last":{"opaque":true}}"#;
+    let wire = format!(
+        r#"{{"resultType":"task","taskId":"wait-task","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:01Z","ttlMs":null,"result":{RESULT},"_meta":{{"receipt":"original"}},"x-creation-envelope":{{"kept":true}}}}"#,
+    );
+    let created: fastmcp_protocol::CreateTaskResult = serde_json::from_str(&wire).unwrap();
+    let receipt = serde_json::to_string(&created).unwrap();
+    let handle = FinalTaskHandle::from_created(&created).unwrap();
+    let retained = serde_json::to_string(handle.task()).unwrap();
+    assert!(
+        retained.contains(RESULT),
+        "Task adoption must not rebuild nested result numbers or member order",
+    );
+    let handle = handle.into_driver(FinalTaskDrivePolicy::default()).into_handle();
+    assert_eq!(serde_json::to_string(handle.task()).unwrap(), retained);
+    assert_eq!(serde_json::to_string(&created).unwrap(), receipt);
+}
+
+#[test]
+fn created_task_handle_rejects_locally_mutated_status_and_payload() {
+    use fastmcp_protocol::tasks_extension::TaskStatus;
+
+    for status in ["working", "input_required", "completed", "failed", "cancelled"] {
+        let mut created = creation_receipt(task(status, None));
+        assert!(FinalTaskHandle::from_created(&created).is_ok());
+        let base = match &mut created.task {
+            FinalTask::Working(base) | FinalTask::Cancelled(base) => base,
+            FinalTask::InputRequired { base, .. }
+            | FinalTask::Completed { base, .. }
+            | FinalTask::Failed { base, .. } => base,
+        };
+        base.status = if status == "working" {
+            TaskStatus::Cancelled
+        } else {
+            TaskStatus::Working
+        };
+        let before = serde_json::to_vec(&created.task).unwrap();
+        assert!(FinalTaskHandle::from_created(&created).is_err());
+        assert_eq!(serde_json::to_vec(&created.task).unwrap(), before);
+    }
+
+    let mut completed = creation_receipt(task("completed", None));
+    let FinalTask::Completed { result, .. } = &mut completed.task else {
+        unreachable!();
+    };
+    result.additional.insert("content".to_owned(), json!([]));
+    assert!(
+        FinalTaskHandle::from_created(&completed).is_err(),
+        "a public-field mutation cannot smuggle a colliding completed payload",
+    );
+
+    let mut failed = creation_receipt(task("failed", None));
+    let FinalTask::Failed { error, .. } = &mut failed.task else {
+        unreachable!();
+    };
+    error.additional.insert("code".to_owned(), json!(0));
+    assert!(FinalTaskHandle::from_created(&failed).is_err());
+
+    let mut input = creation_receipt(task("input_required", None));
+    let FinalTask::InputRequired { input_requests, .. } = &mut input.task else {
+        unreachable!();
+    };
+    let descriptor = input_requests["roots"].clone();
+    for index in 0..128 {
+        input_requests.insert(format!("extra-{index}"), descriptor.clone());
+    }
+    assert_eq!(input_requests.len(), 129);
+    assert!(
+        FinalTaskHandle::from_created(&input).is_err(),
+        "typed local input cannot bypass the Task input-ledger bound",
+    );
+}
+
+#[test]
+fn created_task_handle_preserves_expired_data_and_waits_without_reads() {
+    struct NoReads;
+    impl TaskWaitTransport for NoReads {
+        type Error = McpError;
+        fn read_task(
+            &mut self,
+            _: &Cx,
+            _: &McpRequestCancellation,
+            _: FinalTaskId,
+        ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
+            std::future::poll_fn(|_| panic!("expired or terminal Tasks must not be polled"))
+        }
+    }
+
+    for (status, expected) in [
+        ("working", FinalTaskWaitOutcome::TaskExpired),
+        ("input_required", FinalTaskWaitOutcome::TaskExpired),
+        ("completed", FinalTaskWaitOutcome::Completed),
+        ("failed", FinalTaskWaitOutcome::Failed),
+        ("cancelled", FinalTaskWaitOutcome::Cancelled),
+    ] {
+        let mut initial = task(status, Some(25));
+        initial["createdAt"] = json!("1970-01-01T00:00:00Z");
+        initial["ttlMs"] = json!(1);
+        let created = creation_receipt(initial);
+        let receipt = serde_json::to_vec(&created).unwrap();
+        let mut handle = FinalTaskHandle::from_created(&created).unwrap();
+        let snapshot = serde_json::to_vec(handle.task()).unwrap();
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        let mut transport = NoReads;
+        let observed = {
+            let mut wait = std::pin::pin!(wait_for_task(
+                &mut handle,
+                &cx,
+                &mut transport,
+                &cancellation,
+                policy(1000, 2, 1),
+            ));
+            let waker = std::task::Waker::noop();
+            let mut context = std::task::Context::from_waker(waker);
+            wait.as_mut().poll(&mut context)
+        };
+        assert!(matches!(observed, Poll::Ready(Ok(outcome)) if outcome == expected));
+        assert_eq!(serde_json::to_vec(handle.task()).unwrap(), snapshot);
+        assert_eq!(serde_json::to_vec(&created).unwrap(), receipt);
+    }
+}
+
+#[test]
+fn public_http_task_creating_call_preserves_typed_outcomes_without_replay() {
+    for expected in ["complete", "task", "input_required"] {
+        let result = match expected {
+            "complete" => json!({
+                "resultType": "complete",
+                "content": [{"type": "text", "text": "synchronous"}],
+                "x-call": {"retained": true},
+            }),
+            "task" => {
+                let mut result = task("working", Some(80));
+                result["resultType"] = json!("task");
+                result["_meta"] = json!({"receipt": "creation"});
+                result["x-call"] = json!({"retained": true});
+                result
+            }
+            "input_required" => json!({
+                "resultType": "input_required",
+                "inputRequests": {"roots": {"method": "roots/list"}},
+                "requestState": "one-use",
+            }),
+            _ => unreachable!(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            let mut discover = accept(&listener);
+            let request = read(&mut discover);
+            assert_eq!(request["method"], "server/discover");
+            assert_eq!(request["id"], 1);
+            write(&mut discover, &discovery()).unwrap();
+            drop(discover);
+
+            let mut call = accept(&listener);
+            let request = read(&mut call);
+            assert_eq!(request["method"], "tools/call");
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["params"]["name"], "start-work");
+            assert_eq!(request["params"]["arguments"], json!({"value": 7}));
+            assert_eq!(
+                request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                    ["extensions"][fastmcp_protocol::TASKS_EXTENSION],
+                json!({}),
+            );
+            write(
+                &mut call,
+                &json!({"jsonrpc": "2.0", "id": 2, "result": result}),
+            )
+            .unwrap();
+            drop(call);
+
+            let mut sibling = accept(&listener);
+            let request = read(&mut sibling);
+            assert_eq!(
+                request["method"], "tools/list",
+                "typed Task outcomes must not trigger a retry, callback, or attachment read",
+            );
+            assert_eq!(request["id"], 3);
+            write(
+                &mut sibling,
+                &json!({"jsonrpc": "2.0", "id": 3, "result": {
+                    "resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private"
+                }}),
+            )
+            .unwrap();
+        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut client = HttpClient::connect(
+                    &cx,
+                    plan(&target),
+                    ClientInfo {
+                        name: "task-creating-http-client".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities {
+                        roots: Some(fastmcp_protocol::RootsCapability::default()),
+                        ..ClientCapabilities::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let outcome = client
+                    .call_tool_final_outcome_with_cancellation(
+                        &cx,
+                        &cancellation,
+                        "start-work",
+                        json!({"value": 7}),
+                    )
+                    .await
+                    .unwrap();
+                match (expected, outcome) {
+                    ("complete", crate::FinalToolCallOutcome::Complete(result)) => {
+                        assert!(!result.payload.is_error);
+                    }
+                    ("task", crate::FinalToolCallOutcome::Task(created)) => {
+                        assert_eq!(created.task.base().task_id.as_str(), "wait-task");
+                        assert_eq!(created.additional["x-call"], json!({"retained": true}));
+                        let receipt = serde_json::to_vec(&created).unwrap();
+                        let handle = FinalTaskHandle::from_created(&created).unwrap();
+                        assert!(matches!(handle.task(), FinalTask::Working(_)));
+                        assert_eq!(serde_json::to_vec(&created).unwrap(), receipt);
+                    }
+                    ("input_required", crate::FinalToolCallOutcome::InputRequired(_)) => {}
+                    _ => panic!("the Task-capable HTTP call changed the peer's outcome"),
+                }
+                assert!(cx.checkpoint().is_ok());
+                assert!(!cancellation.is_cancel_requested());
+                client.list_tools(&cx, None).await.unwrap();
+            });
+        peer.join().unwrap();
+    }
+}
+
+#[test]
+fn public_http_task_creating_call_refuses_absent_negotiation_and_precancellation_without_ids() {
+    for cancelled in [false, true] {
+        let mut advertised = discovery();
+        if !cancelled {
+            advertised["result"]["capabilities"]
+                .as_object_mut()
+                .unwrap()
+                .remove("extensions");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            let mut discover = accept(&listener);
+            let request = read(&mut discover);
+            assert_eq!(request["method"], "server/discover");
+            assert_eq!(request["id"], 1);
+            write(&mut discover, &advertised).unwrap();
+            drop(discover);
+
+            let mut sibling = accept(&listener);
+            let request = read(&mut sibling);
+            assert_eq!(
+                request["method"], "tools/list",
+                "a refused Task-creating call must not publish tool effects",
+            );
+            assert_eq!(request["id"], 2, "refusal must precede ID allocation");
+            write(
+                &mut sibling,
+                &json!({"jsonrpc": "2.0", "id": 2, "result": {
+                    "resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private"
+                }}),
+            )
+            .unwrap();
+        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut client = HttpClient::connect(
+                    &cx,
+                    plan(&target),
+                    ClientInfo {
+                        name: "task-refusal-http-client".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                )
+                .await
+                .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                if cancelled {
+                    cancellation.cancel();
+                }
+                let result = client
+                    .call_tool_final_outcome_with_cancellation(
+                        &cx,
+                        &cancellation,
+                        "start-work",
+                        json!({}),
+                    )
+                    .await;
+                let Err(HttpClientError::CoreResult(error)) = result else {
+                    panic!("Task negotiation and local cancellation must refuse before transport");
+                };
+                assert_eq!(
+                    error.code,
+                    if cancelled {
+                        fastmcp_core::McpErrorCode::RequestCancelled
+                    } else {
+                        fastmcp_core::McpErrorCode::InvalidParams
+                    },
+                );
                 assert!(cx.checkpoint().is_ok());
                 client.list_tools(&cx, None).await.unwrap();
             });
