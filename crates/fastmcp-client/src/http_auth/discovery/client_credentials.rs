@@ -2080,7 +2080,7 @@ mod tests {
     fn machine_discovery_uses_the_mcp_payload_budget_without_widening_token_limits() {
         let request = declared_discovery();
         let mut response: Value = serde_json::from_slice(&discovery_reply(json!({}))).unwrap();
-        response["result"]["instructions"] = json!("x".repeat(2 * 1024 * 1024));
+        response["result"]["com.example/document"] = json!("x".repeat(2 * 1024 * 1024));
         let bytes = serde_json::to_vec(&response).unwrap();
         assert!(bytes.len() > MAX_TOKEN_BYTES);
         assert!(admit_resource(&request, &RequestId::Number(7), &bytes).is_ok());

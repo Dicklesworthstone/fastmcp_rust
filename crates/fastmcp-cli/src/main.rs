@@ -7806,10 +7806,13 @@ async fn run_yielding_stdio_task(
     client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
         remaining, remaining,
     )?)?;
-    let task = client
+    let task_result = client
         .get_task_final_with_cx(cx, &cancellation, task_id.clone())
-        .await?
-        .task;
+        .await;
+    if task_result.is_err() {
+        budget.remaining()?;
+    }
+    let task = task_result?.task;
     let mut last_poll = std::time::Instant::now();
     match action {
         TaskAction::Get { .. } => output.write_event(cx, "snapshot", &task),
@@ -7885,10 +7888,13 @@ async fn run_yielding_stdio_task(
                             client.set_request_timeout_policy(
                                 fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?,
                             )?;
-                            let task = client
+                            let task_result = client
                                 .get_task_final_with_cx(cx, &cancellation, task_id.clone())
-                                .await?
-                                .task;
+                                .await;
+                            if task_result.is_err() {
+                                budget.remaining()?;
+                            }
+                            let task = task_result?.task;
                             last_poll = std::time::Instant::now();
                             budget.remaining()?;
                             let reconnect_acknowledged = reconnect_ack_pending && !reconnect;
@@ -7996,9 +8002,12 @@ fn watch_stdio_task(
                 client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
                     remaining, remaining,
                 )?)?;
-                let task = client
-                    .get_task_final_with_cancellation(cx, cancellation, task_id.clone())?
-                    .task;
+                let task_result =
+                    client.get_task_final_with_cancellation(cx, cancellation, task_id.clone());
+                if task_result.is_err() {
+                    budget.remaining()?;
+                }
+                let task = task_result?.task;
                 last_poll = std::time::Instant::now();
                 budget.remaining()?;
                 let reconnect_acknowledged = reconnect_ack_pending && !reconnect;

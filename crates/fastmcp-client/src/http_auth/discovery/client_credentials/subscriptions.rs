@@ -511,7 +511,9 @@ mod tests {
     fn large_core_subscription_metadata_keeps_the_exact_request_bound() {
         let defaults = ClientCredentialsCoreSubscriptionLimits::default();
         let mut meta = serde_json::to_value(metadata()).unwrap();
-        meta["com.example/document"] = json!("x".repeat(2 * 1024 * 1024));
+        for index in 0..80 {
+            meta[format!("com.example/document-{index}")] = json!("x".repeat(16 * 1024 - 2));
+        }
         let prepare_with = |limits| {
             prepare_subscription(
                 &resource(),
@@ -531,8 +533,8 @@ mod tests {
         assert!(bytes > 1024 * 1024);
         let wire: Value = serde_json::from_slice(accepted.listen_wire.body()).unwrap();
         assert_eq!(
-            wire["params"]["_meta"]["com.example/document"],
-            meta["com.example/document"],
+            wire["params"]["_meta"]["com.example/document-0"],
+            meta["com.example/document-0"],
         );
         let limits = |request_bytes| {
             ClientCredentialsCoreSubscriptionLimits::new(
@@ -926,9 +928,9 @@ mod tests {
                 "params": {
                     "_meta": {
                         (FINAL_SUBSCRIPTION_ID_META_KEY): SUBSCRIPTION_ID,
-                        "com.example/document": "x".repeat(2 * 1024 * 1024),
                     },
                     "uri": "file:///tmp/watched",
+                    "com.example/document": "x".repeat(2 * 1024 * 1024),
                 },
             });
             let payload = serde_json::to_string_pretty(&update).unwrap();

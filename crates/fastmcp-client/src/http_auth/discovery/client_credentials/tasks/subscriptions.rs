@@ -537,7 +537,9 @@ mod tests {
     fn machine_task_subscription_large_metadata_preserves_explicit_request_limits() {
         let defaults = ClientCredentialsSubscriptionLimits::default();
         let mut meta = metadata();
-        meta["com.example/document"] = json!("x".repeat(2 * 1024 * 1024));
+        for index in 0..80 {
+            meta[format!("com.example/document-{index}")] = json!("x".repeat(16 * 1024 - 2));
+        }
         let prepare_with = |limits| {
             prepare_subscription(
                 "https://mcp.example/mcp",
@@ -556,7 +558,10 @@ mod tests {
             .max(accepted.listen_wire.body().len());
         assert!(bytes > 1024 * 1024);
         let wire: Value = serde_json::from_slice(accepted.listen_wire.body()).unwrap();
-        assert_eq!(wire["params"]["_meta"]["com.example/document"], meta["com.example/document"]);
+        assert_eq!(
+            wire["params"]["_meta"]["com.example/document-0"],
+            meta["com.example/document-0"]
+        );
         let limits = |request_bytes| {
             ClientCredentialsSubscriptionLimits::new(
                 request_bytes,

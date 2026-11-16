@@ -4086,7 +4086,7 @@ os.close(fd)
     fn cli_02_b_stdio_watch_timeout_is_not_task_completion() {
         let fixture = TaskFixture::new(false);
         let started = Instant::now();
-        let output = fixture.stdio("watch", &["--json", "--timeout", "1"]);
+        let output = fixture.stdio("watch", &["--json", "--timeout", "2"]);
         assert!(!output.status.success());
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(
@@ -5611,7 +5611,9 @@ else:
                 stderr_str(&output)
             );
             assert!(!stderr_str(&output).contains("could not establish"));
-            assert_eq!(documents(&output).len(), 1);
+            let error_document: Value =
+                serde_json::from_str(&stdout_str(&output)).expect("one CLI error JSON document");
+            assert_eq!(error_document["schema"], "fastmcp.cli.error/v2");
         }
     }
 }

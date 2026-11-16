@@ -337,7 +337,7 @@ fn typed_machine_discovery_keeps_large_payloads_inside_the_callers_frame_bound()
         run_machine(post, |cx, peer, client| async move {
             let mut document: Value =
                 serde_json::from_str(&discovery_document(json!({}))).unwrap();
-            document["instructions"] = json!("x".repeat(2 * 1024 * 1024));
+            document["com.example/document"] = json!("x".repeat(2 * 1024 * 1024));
             let document = document.to_string();
             for index in 0..3 {
                 let id = 1 + 2 * index as i64;
