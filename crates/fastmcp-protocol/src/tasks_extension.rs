@@ -626,7 +626,13 @@ impl FinalTaskCallToolResult {
             if key == TASK_MISSING_RESULT_TYPE_DIAGNOSTIC {
                 continue;
             }
-            if members.insert(key.clone(), value.clone()).is_some() {
+            // Omitted defaults and optional fields still belong to the typed
+            // payload. An additional member must not override that state or
+            // introduce an enclosing result discriminator into this object.
+            if ["content", "isError", "structuredContent", "_meta", "resultType"]
+                .contains(&key.as_str())
+                || members.insert(key.clone(), value.clone()).is_some()
+            {
                 return Err(TaskWireError::Invalid("result"));
             }
         }
@@ -662,8 +668,17 @@ impl Serialize for FinalTaskCallToolResult {
     {
         let canonical = self.canonical_value().map_err(serde::ser::Error::custom)?;
         if let Some(exact_wire) = &self.exact_wire {
-            if serde_json::from_str::<Value>(exact_wire)
+            // Compare the two typed snapshots. A peer may spell an omitted
+            // default explicitly (for example, isError:false); that is not a
+            // public-field mutation and must not discard its exact source.
+            if Self::decode_exact_wire(exact_wire)
                 .ok()
+                .filter(|original| {
+                    !original
+                        .additional
+                        .contains_key(TASK_MISSING_RESULT_TYPE_DIAGNOSTIC)
+                })
+                .and_then(|original| original.canonical_value().ok())
                 .as_ref()
                 .is_some_and(|exact| json_values_equal_ignoring_object_order(exact, &canonical))
             {
@@ -1853,6 +1868,99 @@ mod tests {
             "\"content\":[],\"_meta\":{\"io.modelcontextprotocol/related-task\":{\"taskId\":\"task-1\"}}",
         );
         assert!(serde_json::from_str::<GetTaskResult>(&with_legacy_related_task).is_err());
+    }
+
+    #[test]
+    fn completed_task_exact_result_survives_explicit_default_members() {
+        const RESULT: &str = r#"{"z-first":1.20e+4,"isError":false,"content":[{"type":"text","text":"quoted \u0022 value"}],"escaped\/key":9007199254740993,"structuredContent":null,"_meta":{"x-result":true},"a-last":{"kept":1}}"#;
+        let body = format!(
+            r#""taskId":"task-1","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{RESULT}"#,
+        );
+        let standalone_wire = format!("{{{body}}}");
+        let task: Task = serde_json::from_str(&standalone_wire).expect("completed Task");
+        assert_eq!(
+            serde_json::to_string(&task).expect("standalone Task emission"),
+            standalone_wire,
+            "explicit defaults must not discard nested escapes, number spelling, or member order",
+        );
+        for discriminator in ["task", "complete"] {
+            let wire = format!(r#"{{"resultType":"{discriminator}",{body}}}"#);
+            let emitted = if discriminator == "task" {
+                let created: CreateTaskResult =
+                    serde_json::from_str(&wire).expect("completed creation receipt");
+                assert!(matches!(
+                    &created.task,
+                    Task::Completed { result, .. } if !result.result.is_error
+                ));
+                serde_json::to_string(&created).expect("creation receipt emission")
+            } else {
+                let get: GetTaskResult = serde_json::from_str(&wire).expect("completed read receipt");
+                serde_json::to_string(&get).expect("read receipt emission")
+            };
+            assert_eq!(emitted, wire, "both Task envelopes retain the exact result");
+        }
+    }
+
+    #[test]
+    fn completed_task_exact_result_never_replays_mutated_typed_defaults() {
+        const WIRE: &str =
+            r#"{"content":[],"isError":false,"escaped\/key":1.20e+4,"structuredContent":null}"#;
+        let mut result: FinalTaskCallToolResult =
+            serde_json::from_str(WIRE).expect("completed result");
+        result.result.is_error = true;
+        let changed = serde_json::to_string(&result).expect("mutated error result");
+        let value: Value = serde_json::from_str(&changed).expect("mutated result value");
+        assert_eq!(value["isError"], Value::Bool(true));
+        assert!(
+            !changed.contains(r"escaped\/key"),
+            "a changed typed payload must select canonical fallback instead of old peer source",
+        );
+
+        result.result.is_error = false;
+        assert_eq!(
+            serde_json::to_string(&result).expect("restored admitted result"),
+            WIRE,
+            "restoring the original typed snapshot may retain its exact source",
+        );
+        result.result.structured_content = None;
+        let changed = serde_json::to_string(&result).expect("removed structured result");
+        let value: Value = serde_json::from_str(&changed).expect("changed result value");
+        assert!(
+            value.get("structuredContent").is_none(),
+            "a present null and an omitted optional member remain distinct",
+        );
+        assert_ne!(changed, WIRE);
+    }
+
+    #[test]
+    fn completed_task_result_additional_members_cannot_override_omitted_known_fields() {
+        for (key, value) in [
+            ("content", serde_json::json!([])),
+            ("isError", serde_json::json!(true)),
+            ("structuredContent", serde_json::json!({"injected": true})),
+            ("_meta", serde_json::json!({"x-injected": true})),
+            ("resultType", serde_json::json!("complete")),
+        ] {
+            let mut result: FinalTaskCallToolResult =
+                serde_json::from_str(r#"{"content":[],"isError":false}"#)
+                    .expect("result with omitted optional fields");
+            result.additional.insert(key.to_owned(), value);
+            assert!(
+                serde_json::to_string(&result).is_err(),
+                "{key} is reserved even when the typed serializer omits its default",
+            );
+        }
+
+        // A local compatibility diagnostic is never part of the emitted
+        // protocol payload, even when typed canonical comparison succeeds.
+        let result: FinalTaskCallToolResult = serde_json::from_str(
+            r#"{"content":[],"isError":false,"\u0000fastmcp/tasks/missing-result-type":true}"#,
+        )
+        .expect("result carrying a non-wire diagnostic");
+        let emitted: Value =
+            serde_json::from_str(&serde_json::to_string(&result).expect("canonical emission"))
+                .expect("emitted result");
+        assert!(emitted.get(TASK_MISSING_RESULT_TYPE_DIAGNOSTIC).is_none());
     }
 
     #[test]
