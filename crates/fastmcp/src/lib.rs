@@ -10104,6 +10104,66 @@ pub mod legacy_2024 {
         ServerBuilder::new(name, version)
     }
 
+    /// A complete exact-2024 catalog traversal with its typed pages intact.
+    ///
+    /// Opaque cursors and the existing legacy result vocabulary are retained
+    /// without projecting into modern result types. Failure publishes no partial
+    /// collection. This preserves the fields represented by the legacy catalog
+    /// types; it does not add retention of unknown catalog result members.
+    #[derive(Debug)]
+    pub struct CollectedCatalog {
+        method: &'static str,
+        pages: Vec<LegacyCoreResult>,
+        item_count: usize,
+    }
+
+    impl CollectedCatalog {
+        #[cfg(unix)]
+        fn from_inner(catalog: fastmcp_client::CollectedCatalog) -> McpResult<Self> {
+            let method = catalog.method();
+            let item_count = catalog.item_count();
+            let pages = catalog
+                .into_pages()
+                .into_iter()
+                .map(|page| match page {
+                    fastmcp_protocol::CoreResult::Legacy(result) => Ok(result),
+                    fastmcp_protocol::CoreResult::Final(_) => Err(McpError::internal_error(
+                        format!("Legacy catalog received a non-legacy {method} result"),
+                    )),
+                })
+                .collect::<McpResult<Vec<_>>>()?;
+            Ok(Self {
+                method,
+                pages,
+                item_count,
+            })
+        }
+
+        /// Returns the catalog method used for every page.
+        #[must_use]
+        pub const fn method(&self) -> &'static str {
+            self.method
+        }
+
+        /// Borrows the exact-2024 typed pages in traversal order.
+        #[must_use]
+        pub fn pages(&self) -> &[LegacyCoreResult] {
+            &self.pages
+        }
+
+        /// Consumes the collection without flattening its pages.
+        #[must_use]
+        pub fn into_pages(self) -> Vec<LegacyCoreResult> {
+            self.pages
+        }
+
+        /// Returns the number of catalog entries across all pages.
+        #[must_use]
+        pub const fn item_count(&self) -> usize {
+            self.item_count
+        }
+    }
+
     /// A sealed exact-2024 stdio client.
     ///
     /// The root client now defaults to bounded `Auto` selection. This wrapper
@@ -10261,6 +10321,332 @@ pub mod legacy_2024 {
             cancellation: &McpRequestCancellation,
         ) -> McpResult<()> {
             self.inner.ping_with_cancellation(cx, cancellation)
+        }
+
+        /// Pings the exact-2024 peer while yielding the caller's Unix runtime.
+        ///
+        /// The acknowledgement is decoded as an exact legacy result. Caller
+        /// cancellation and dropped-future ownership match [Self::call_tool_with_cx].
+        /// A cancellation observed before publication consumes no request ID
+        /// and sends no application frame.
+        #[cfg(unix)]
+        pub async fn ping_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+            match self
+                .inner
+                .request_legacy_core_with_cx(cx, LegacyCoreRequest::Ping)
+                .await?
+            {
+                LegacyCoreResult::Ping(_) => Ok(()),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected ping result",
+                )),
+            }
+        }
+
+        /// Lists one exact-2024 tools page on the caller's Unix runtime.
+        ///
+        /// The caller supplies the opaque cursor and tag filters. No cursor is
+        /// followed and legacy pages remain uncached. Request-local cancellation
+        /// and dropping a published future retire only this request; queued
+        /// cancellation is serviced on the next client drive, send, or close.
+        /// Deferred initialization retains its connection-level cancellation
+        /// rules. Pipe writes remain bounded synchronous operations.
+        #[cfg(unix)]
+        pub async fn list_tools_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListToolsParams,
+        ) -> McpResult<ListToolsResult> {
+            match self.inner.list_tools_with_cx(cx, cancellation, params).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy tools/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact-2024 resource page with the cooperative execution
+        /// and cancellation behavior of [Self::list_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_resources_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourcesParams,
+        ) -> McpResult<ListResourcesResult> {
+            match self
+                .inner
+                .list_resources_with_cx(cx, cancellation, params)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy resources/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact-2024 resource-template page with the cooperative
+        /// execution and cancellation behavior of [Self::list_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_resource_templates_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourceTemplatesParams,
+        ) -> McpResult<ListResourceTemplatesResult> {
+            match self
+                .inner
+                .list_resource_templates_with_cx(cx, cancellation, params)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(
+                    result,
+                )) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy resources/templates/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact-2024 prompt page with the cooperative execution
+        /// and cancellation behavior of [Self::list_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_prompts_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListPromptsParams,
+        ) -> McpResult<ListPromptsResult> {
+            match self.inner.list_prompts_with_cx(cx, cancellation, params).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy prompts/list result",
+                )),
+            }
+        }
+
+        /// Collects every exact-2024 tools page on the caller's Unix runtime.
+        ///
+        /// One absolute budget covers deferred initialization and all pages.
+        /// Page, entry, byte, and cursor limits are cumulative. Opaque cursors,
+        /// including empty and repeated values, are passed back unchanged under
+        /// those bounds. An initial cursor is rejected. Failure returns no
+        /// partial catalog; cancellation and future-drop behavior match
+        /// [Self::list_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_all_tools_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListToolsParams,
+        ) -> McpResult<CollectedCatalog> {
+            CollectedCatalog::from_inner(
+                self.inner
+                    .list_all_tools_with_cx(cx, cancellation, params)
+                    .await?,
+            )
+        }
+
+        /// Collects resource pages with the bounds and cancellation behavior
+        /// of [Self::list_all_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_all_resources_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourcesParams,
+        ) -> McpResult<CollectedCatalog> {
+            CollectedCatalog::from_inner(
+                self.inner
+                    .list_all_resources_with_cx(cx, cancellation, params)
+                    .await?,
+            )
+        }
+
+        /// Collects resource-template pages with the bounds and cancellation
+        /// behavior of [Self::list_all_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_all_resource_templates_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourceTemplatesParams,
+        ) -> McpResult<CollectedCatalog> {
+            CollectedCatalog::from_inner(
+                self.inner
+                    .list_all_resource_templates_with_cx(cx, cancellation, params)
+                    .await?,
+            )
+        }
+
+        /// Collects prompt pages with the bounds and cancellation behavior
+        /// of [Self::list_all_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_all_prompts_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListPromptsParams,
+        ) -> McpResult<CollectedCatalog> {
+            CollectedCatalog::from_inner(
+                self.inner
+                    .list_all_prompts_with_cx(cx, cancellation, params)
+                    .await?,
+            )
+        }
+
+        /// Reads one resource while yielding the caller's Unix runtime.
+        ///
+        /// Returns the exact legacy result, including its represented metadata
+        /// and open content members. Request-local cancellation, deferred
+        /// initialization, and future-drop behavior match [Self::list_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn read_resource_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> McpResult<ReadResourceResult> {
+            match self
+                .inner
+                .request_core_with_cx(cx, cancellation, "resources/read", json!({"uri": uri}))
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy resources/read result",
+                )),
+            }
+        }
+
+        /// Gets one prompt with the exact result and cooperative execution
+        /// behavior of [Self::read_resource_with_cx].
+        #[cfg(unix)]
+        pub async fn get_prompt_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<GetPromptResult> {
+            match self
+                .inner
+                .request_core_with_cx(
+                    cx,
+                    cancellation,
+                    "prompts/get",
+                    json!({"name": name, "arguments": arguments}),
+                )
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy prompts/get result",
+                )),
+            }
+        }
+
+        /// Completes one exact-2024 argument while yielding the caller's Unix
+        /// runtime. Legacy request metadata is preserved without adding modern
+        /// completion context or protocol metadata.
+        #[cfg(unix)]
+        pub async fn complete_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: LegacyCompletionParams,
+        ) -> McpResult<LegacyCompletionResult> {
+            let parameters = serde_json::to_value(params).map_err(|_| {
+                McpError::invalid_params("Legacy completion parameters could not be encoded")
+            })?;
+            match self
+                .inner
+                .request_core_with_cx(cx, cancellation, "completion/complete", parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::Completion(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy completion/complete result",
+                )),
+            }
+        }
+
+        /// Sets the exact-2024 peer's logging level on the caller's Unix runtime.
+        ///
+        /// The peer's acknowledgement is decoded as an exact legacy result.
+        /// Caller cancellation and dropped-future ownership match
+        /// [Self::call_tool_with_cx]; no modern logging metadata is introduced.
+        #[cfg(unix)]
+        pub async fn set_log_level_with_cx(&mut self, cx: &Cx, level: LogLevel) -> McpResult<()> {
+            match self
+                .inner
+                .request_legacy_core_with_cx(
+                    cx,
+                    LegacyCoreRequest::SetLogLevel(SetLogLevelParams { level }),
+                )
+                .await?
+            {
+                LegacyCoreResult::SetLogLevel(_) => Ok(()),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected logging/setLevel result",
+                )),
+            }
+        }
+
+        /// Starts an exact-2024 resource subscription while yielding the caller's
+        /// Unix runtime. Read retained updates with [Self::take_server_notifications].
+        #[cfg(unix)]
+        pub async fn subscribe_resource_with_cx(&mut self, cx: &Cx, uri: &str) -> McpResult<()> {
+            match self
+                .inner
+                .request_legacy_core_with_cx(
+                    cx,
+                    LegacyCoreRequest::ResourcesSubscribe(SubscribeResourceParams {
+                        uri: uri.to_owned(),
+                    }),
+                )
+                .await?
+            {
+                LegacyCoreResult::ResourcesSubscribe(_) => Ok(()),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected resources/subscribe result",
+                )),
+            }
+        }
+
+        /// Ends an exact-2024 resource subscription with the cooperative
+        /// execution and ownership behavior of [Self::subscribe_resource_with_cx].
+        #[cfg(unix)]
+        pub async fn unsubscribe_resource_with_cx(&mut self, cx: &Cx, uri: &str) -> McpResult<()> {
+            match self
+                .inner
+                .request_legacy_core_with_cx(
+                    cx,
+                    LegacyCoreRequest::ResourcesUnsubscribe(UnsubscribeResourceParams {
+                        uri: uri.to_owned(),
+                    }),
+                )
+                .await?
+            {
+                LegacyCoreResult::ResourcesUnsubscribe(_) => Ok(()),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected resources/unsubscribe result",
+                )),
+            }
         }
 
         /// Lists exact-2024 tools.

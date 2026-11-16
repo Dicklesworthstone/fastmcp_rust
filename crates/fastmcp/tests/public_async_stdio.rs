@@ -924,6 +924,543 @@ while IFS= read -r unexpected; do exit 98; done
         });
     }
 
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    mod legacy_operations {
+        use super::{DiscoveryRelease, require_send, run};
+        use fastmcp_rust::{Cx, JsonValue, McpErrorCode, McpResult, json, legacy_2024 as legacy};
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        const INITIALIZE: &str = r#"
+next_id=1
+read_request() {
+    IFS= read -r request || exit 70
+    id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\)[,}].*/\1/p')
+    [ "$id" = "$next_id" ] || exit 71
+    next_id=$((next_id + 1))
+    case "$request" in *'io.modelcontextprotocol/'*|*'"resultType":'*) exit 72 ;; esac
+}
+read_request
+case "$request" in *'"method":"initialize"'*) ;; *) exit 73 ;; esac
+case "$request" in *'"protocolVersion":"2024-11-05"'*) ;; *) exit 74 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{"subscribe":true},"prompts":{},"logging":{}},"serverInfo":{"name":"async-legacy-peer","version":"1.0"}}}\n' "$id"
+IFS= read -r initialized || exit 75
+case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 76 ;; esac
+"#;
+
+        async fn connect(cx: &Cx, script: &str, release: &str) -> legacy::Client {
+            legacy::ClientBuilder::new()
+                .auto_initialize(false)
+                .max_retries(0)
+                .request_timeout_policy(
+                    legacy::RequestTimeoutPolicy::new(
+                        Duration::from_secs(5),
+                        Duration::from_secs(5),
+                    )
+                    .unwrap(),
+                )
+                .connect_stdio_with_cx(
+                    cx,
+                    "sh",
+                    &["-c", script, "public-async-legacy-operations", release],
+                )
+                .await
+                .unwrap()
+        }
+
+        async fn page(
+            client: &mut legacy::Client,
+            cx: &Cx,
+            cancellation: &legacy::McpRequestCancellation,
+            method: &str,
+            params: JsonValue,
+        ) -> McpResult<JsonValue> {
+            let result = match method {
+                "tools/list" => serde_json::to_value(
+                    client
+                        .list_tools_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .await?,
+                ),
+                "resources/list" => serde_json::to_value(
+                    client
+                        .list_resources_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .await?,
+                ),
+                "resources/templates/list" => serde_json::to_value(
+                    client
+                        .list_resource_templates_with_cx(
+                            cx,
+                            cancellation,
+                            serde_json::from_value(params).unwrap(),
+                        )
+                        .await?,
+                ),
+                "prompts/list" => serde_json::to_value(
+                    client
+                        .list_prompts_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .await?,
+                ),
+                _ => unreachable!(),
+            };
+            Ok(result.unwrap())
+        }
+
+        async fn collect(
+            client: &mut legacy::Client,
+            cx: &Cx,
+            cancellation: &legacy::McpRequestCancellation,
+            method: &str,
+            params: JsonValue,
+        ) -> McpResult<legacy::CollectedCatalog> {
+            match method {
+                "tools/list" => {
+                    client
+                        .list_all_tools_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .await
+                }
+                "resources/list" => {
+                    client
+                        .list_all_resources_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .await
+                }
+                "resources/templates/list" => {
+                    client
+                        .list_all_resource_templates_with_cx(
+                            cx,
+                            cancellation,
+                            serde_json::from_value(params).unwrap(),
+                        )
+                        .await
+                }
+                "prompts/list" => {
+                    client
+                        .list_all_prompts_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        fn page_value(page: &legacy::LegacyCoreResult) -> JsonValue {
+            match page {
+                legacy::LegacyCoreResult::ToolsList(result) => serde_json::to_value(result),
+                legacy::LegacyCoreResult::ResourcesList(result) => serde_json::to_value(result),
+                legacy::LegacyCoreResult::ResourceTemplatesList(result) => {
+                    serde_json::to_value(result)
+                }
+                legacy::LegacyCoreResult::PromptsList(result) => serde_json::to_value(result),
+                _ => panic!("catalogs must retain only their own legacy result family"),
+            }
+            .unwrap()
+        }
+
+        #[test]
+        fn legacy_async_catalog_pages_and_collections_preserve_typed_cursors() {
+            run(|cx| async move {
+                const CURSOR: &str = " opaque /+=? token ";
+                let catalogs = [
+                    ("tools/list", "tools", json!({"name": "echo", "inputSchema": {"type": "object"}})),
+                    ("resources/list", "resources", json!({"name": "source", "uri": "test://source"})),
+                    ("resources/templates/list", "resourceTemplates", json!({"name": "source", "uriTemplate": "test://source/{name}"})),
+                    ("prompts/list", "prompts", json!({"name": "greet"})),
+                ];
+                let mut script = INITIALIZE.to_owned();
+                for (method, field, item) in &catalogs {
+                    // One caller-controlled page followed by one complete traversal.
+                    for index in 0..5 {
+                        script.push_str(&format!(
+                            "read_request\n\
+                             case \"$request\" in *'\"method\":\"{method}\"'*) ;; *) exit 80 ;; esac\n\
+                             case \"$request\" in *'\"includeTags\":[\"visible\"]'*) ;; *) exit 81 ;; esac\n\
+                             case \"$request\" in *'\"excludeTags\":[\"hidden\"]'*) ;; *) exit 82 ;; esac\n"
+                        ));
+                        script.push_str(match index {
+                            0 => "case \"$request\" in *'\"cursor\":\"one page\"'*) ;; *) exit 83 ;; esac\n",
+                            1 => "case \"$request\" in *'\"cursor\":'*) exit 84 ;; esac\n",
+                            2 => "case \"$request\" in *'\"cursor\":\"\"'*) ;; *) exit 85 ;; esac\n",
+                            _ => "case \"$request\" in *'\"cursor\":\" opaque /+=? token \"'*) ;; *) exit 86 ;; esac\n",
+                        });
+                        let mut result = json!({});
+                        result[*field] = if index == 2 { json!([]) } else { json!([item]) };
+                        if index < 4 {
+                            result["nextCursor"] = json!(if index == 1 { "" } else { CURSOR });
+                        }
+                        script.push_str(&format!(
+                            "printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{result}}}\\n' \"$id\"\n"
+                        ));
+                    }
+                }
+                script.push_str("while IFS= read -r unexpected; do exit 87; done\n");
+                let mut client = connect(&cx, &script, "").await;
+                let cancellation = legacy::McpRequestCancellation::new();
+                let cancelled = legacy::McpRequestCancellation::new();
+                cancelled.cancel();
+                for (method, field, item) in catalogs {
+                    let params = json!({"includeTags": ["visible"], "excludeTags": ["hidden"]});
+                    let mut single_params = params.clone();
+                    single_params["cursor"] = json!("one page");
+                    let error = require_send(page(
+                        &mut client, &cx, &cancelled, method, single_params.clone(),
+                    ))
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    let first = require_send(page(
+                        &mut client, &cx, &cancellation, method, single_params,
+                    ))
+                    .await
+                    .unwrap();
+                    assert_eq!(first[field], json!([item]));
+                    assert_eq!(first["nextCursor"], json!(CURSOR));
+
+                    let mut invalid_start = params.clone();
+                    invalid_start["cursor"] = json!("");
+                    let error = require_send(collect(
+                        &mut client, &cx, &cancellation, method, invalid_start,
+                    ))
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                    let error = require_send(collect(
+                        &mut client, &cx, &cancelled, method, params.clone(),
+                    ))
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    let catalog = require_send(collect(
+                        &mut client, &cx, &cancellation, method, params,
+                    ))
+                    .await
+                    .unwrap();
+                    assert_eq!(catalog.method(), method);
+                    assert_eq!(catalog.item_count(), 3);
+                    let pages: &[legacy::LegacyCoreResult] = catalog.pages();
+                    assert_eq!(pages.len(), 4);
+                    for (index, page) in pages.iter().enumerate() {
+                        assert_eq!(page.method(), method);
+                        let value = page_value(page);
+                        assert_eq!(value[field].as_array().unwrap().len(), usize::from(index != 1));
+                        assert!(value.get("resultType").is_none());
+                        let expected = match index {
+                            0 => Some(json!("")),
+                            1 | 2 => Some(json!(CURSOR)),
+                            _ => None,
+                        };
+                        assert_eq!(value.get("nextCursor"), expected.as_ref());
+                    }
+                    let owned: Vec<legacy::LegacyCoreResult> = catalog.into_pages();
+                    assert_eq!(owned.len(), 4);
+                }
+                require_send(client.close_with_cx(&cx)).await.unwrap();
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+
+        #[test]
+        fn legacy_async_content_and_controls_yield_and_preserve_wire() {
+            run(|cx| async move {
+                let release = DiscoveryRelease::new();
+                let script = [INITIALIZE, r#"
+read_request
+case "$request" in *'"method":"ping"'*) ;; *) exit 80 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+read_request
+case "$request" in *'"method":"logging/setLevel"'*) ;; *) exit 81 ;; esac
+case "$request" in *'"level":"info"'*) ;; *) exit 82 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+read_request
+case "$request" in *'"method":"resources/subscribe"'*) ;; *) exit 83 ;; esac
+case "$request" in *'"uri":"test://async/value"'*) ;; *) exit 84 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+read_request
+case "$request" in *'"method":"resources/read"'*) ;; *) exit 85 ;; esac
+case "$request" in *'"uri":"test://async/value"'*) ;; *) exit 86 ;; esac
+turn=0
+while [ ! -s "$1" ]; do
+    turn=$((turn + 1))
+    [ "$turn" -le 3000 ] || exit 87
+    sleep 0.001
+done
+printf '{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"test://async/value"}}\n'
+printf '{"jsonrpc":"2.0","id":%s,"result":{"contents":[{"uri":"test://async/value","text":"resource value","mimeType":"text/plain","vendor":7}],"_meta":{"source":"legacy"},"vendorResult":"resource"}}\n' "$id"
+read_request
+case "$request" in *'"method":"prompts/get"'*) ;; *) exit 88 ;; esac
+case "$request" in *'"arguments":{"name":"Ada"}'*) ;; *) exit 89 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"description":"legacy prompt","messages":[{"role":"user","content":{"type":"text","text":"Hello Ada","vendor":8}}],"_meta":{"source":"legacy"},"vendorResult":"prompt"}}\n' "$id"
+read_request
+case "$request" in *'"method":"completion/complete"'*) ;; *) exit 90 ;; esac
+case "$request" in *'"progressToken":"legacy-complete"'*) ;; *) exit 91 ;; esac
+case "$request" in *'"context":'*) exit 92 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"completion":{"values":["Ada"],"total":1,"hasMore":false},"_meta":{"source":"legacy","order":2}}}\n' "$id"
+read_request
+case "$request" in *'"method":"tools/call"'*) ;; *) exit 93 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"tool value","vendor":9}],"_meta":{"source":"legacy"},"vendorResult":"tool"}}\n' "$id"
+read_request
+case "$request" in *'"method":"resources/unsubscribe"'*) ;; *) exit 94 ;; esac
+case "$request" in *'"uri":"test://async/value"'*) ;; *) exit 95 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+while IFS= read -r unexpected; do exit 96; done
+"#].concat();
+                let mut client = connect(&cx, &script, release.path()).await;
+                let cancellation = legacy::McpRequestCancellation::new();
+                let cancelled = legacy::McpRequestCancellation::new();
+                cancelled.cancel();
+                let cancelled_cx = Cx::for_request();
+                cancelled_cx.set_cancel_requested(true);
+                assert_eq!(
+                    require_send(client.ping_with_cx(&cancelled_cx))
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled,
+                );
+                assert_eq!(
+                    require_send(client.set_log_level_with_cx(&cancelled_cx, legacy::LogLevel::Info))
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled,
+                );
+                assert_eq!(
+                    require_send(client.subscribe_resource_with_cx(&cancelled_cx, "test://async/value"))
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled,
+                );
+                assert_eq!(
+                    require_send(client.unsubscribe_resource_with_cx(&cancelled_cx, "test://async/value"))
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled,
+                );
+                assert_eq!(
+                    require_send(client.read_resource_with_cx(&cx, &cancelled, "test://async/value"))
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled,
+                );
+                require_send(client.ping_with_cx(&cx)).await.unwrap();
+                require_send(client.set_log_level_with_cx(&cx, legacy::LogLevel::Info))
+                    .await
+                    .unwrap();
+                require_send(client.subscribe_resource_with_cx(&cx, "test://async/value"))
+                    .await
+                    .unwrap();
+
+                let mut reading = Box::pin(require_send(client.read_resource_with_cx(
+                    &cx, &cancellation, "test://async/value",
+                )));
+                let yielded = std::future::poll_fn(|task_cx| {
+                    Poll::Ready(reading.as_mut().poll(task_cx).is_pending())
+                })
+                .await;
+                assert!(yielded, "resource reads must yield before the peer replies");
+                release.release();
+                let resource = serde_json::to_value(reading.await.unwrap()).unwrap();
+                assert_eq!(resource["contents"][0]["text"], "resource value");
+                assert_eq!(resource["contents"][0]["vendor"], 7);
+                assert_eq!(resource["_meta"]["source"], "legacy");
+                assert_eq!(resource["vendorResult"], "resource");
+                assert!(resource.get("resultType").is_none());
+
+                let prompt = require_send(client.get_prompt_with_cx(
+                    &cx,
+                    &cancellation,
+                    "greet",
+                    HashMap::from([("name".to_owned(), "Ada".to_owned())]),
+                ))
+                .await
+                .unwrap();
+                let prompt = serde_json::to_value(prompt).unwrap();
+                assert_eq!(prompt["messages"][0]["content"]["text"], "Hello Ada");
+                assert_eq!(prompt["messages"][0]["content"]["vendor"], 8);
+                assert_eq!(prompt["_meta"]["source"], "legacy");
+                assert_eq!(prompt["vendorResult"], "prompt");
+
+                let completed = require_send(client.complete_with_cx(
+                    &cx,
+                    &cancellation,
+                    serde_json::from_value(json!({
+                        "ref": {"type": "ref/prompt", "name": "greet"},
+                        "argument": {"name": "name", "value": "A"},
+                        "_meta": {"progressToken": "legacy-complete"},
+                    }))
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(completed.completion.values, ["Ada"]);
+                assert_eq!(completed.meta.as_ref().unwrap().get("source"), Some(&json!("legacy")));
+                let tool = require_send(client.call_tool_with_cx(&cx, "echo", json!({"value": "tool"})))
+                    .await
+                    .unwrap();
+                let tool = serde_json::to_value(tool).unwrap();
+                assert_eq!(tool["content"][0]["text"], "tool value");
+                assert_eq!(tool["content"][0]["vendor"], 9);
+                assert_eq!(tool["vendorResult"], "tool");
+                require_send(client.unsubscribe_resource_with_cx(&cx, "test://async/value"))
+                    .await
+                    .unwrap();
+                let notifications = client.take_server_notifications().unwrap();
+                assert_eq!(notifications.len(), 1);
+                assert!(matches!(
+                    &notifications[0],
+                    legacy::ServerNotification::ResourceUpdated(update)
+                        if update.uri == "test://async/value"
+                ));
+                require_send(client.close_with_cx(&cx)).await.unwrap();
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+
+        #[test]
+        fn legacy_async_catalog_error_returns_no_partial_collection_and_allows_reuse() {
+            run(|cx| async move {
+                let script = [INITIALIZE, r#"
+read_request
+case "$request" in *'"method":"tools/list"'*) ;; *) exit 80 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"partial","inputSchema":{"type":"object"}}],"nextCursor":"continuation"}}\n' "$id"
+read_request
+case "$request" in *'"cursor":"continuation"'*) ;; *) exit 81 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"continuation refused","data":{"page":2}}}\n' "$id"
+read_request
+case "$request" in *'"method":"ping"'*) ;; *) exit 82 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+read_request
+case "$request" in *'"method":"prompts/list"'*) ;; *) exit 83 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"prompts":[{"name":"healthy"}]}}\n' "$id"
+while IFS= read -r unexpected; do exit 84; done
+"#].concat();
+                let mut client = connect(&cx, &script, "").await;
+                let cancellation = legacy::McpRequestCancellation::new();
+                let error = require_send(client.list_all_tools_with_cx(
+                    &cx, &cancellation, legacy::ListToolsParams::default(),
+                ))
+                .await
+                .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.message, "continuation refused");
+                assert_eq!(error.data, Some(json!({"page": 2})));
+                require_send(client.ping_with_cx(&cx)).await.unwrap();
+                let recovered = require_send(client.list_all_prompts_with_cx(
+                    &cx, &cancellation, legacy::ListPromptsParams::default(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(recovered.item_count(), 1);
+                assert_eq!(recovered.pages().len(), 1);
+                assert_eq!(page_value(&recovered.pages()[0])["prompts"][0]["name"], "healthy");
+                require_send(client.close_with_cx(&cx)).await.unwrap();
+            });
+        }
+
+        #[test]
+        fn legacy_async_read_cancellation_retires_only_the_active_request() {
+            run(|cx| async move {
+                let script = [INITIALIZE, r#"
+read_request
+case "$request" in *'"method":"resources/read"'*) ;; *) exit 80 ;; esac
+original_id=$id
+IFS= read -r cancelled || exit 81
+case "$cancelled" in *'"method":"notifications/cancelled"'*) ;; *) exit 82 ;; esac
+case "$cancelled" in *'"requestId":2'*|*'"requestId":2}'*) ;; *) exit 83 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"contents":[]}}\n' "$original_id"
+read_request
+case "$request" in *'"method":"ping"'*) ;; *) exit 84 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+while IFS= read -r unexpected; do exit 85; done
+"#].concat();
+                let mut client = connect(&cx, &script, "").await;
+                require_send(client.ensure_initialized_with_cx(&cx)).await.unwrap();
+                assert!(client.is_initialized());
+                let cancellation = legacy::McpRequestCancellation::new();
+                let mut reading = Box::pin(require_send(client.read_resource_with_cx(
+                    &cx, &cancellation, "test://async/pending",
+                )));
+                let yielded = std::future::poll_fn(|task_cx| {
+                    Poll::Ready(reading.as_mut().poll(task_cx).is_pending())
+                })
+                .await;
+                assert!(yielded, "the peer holds the request until cancellation");
+                cancellation.cancel();
+                assert_eq!(reading.await.unwrap_err().code, McpErrorCode::RequestCancelled);
+                require_send(client.ping_with_cx(&cx)).await.unwrap();
+                assert!(cx.checkpoint().is_ok());
+                require_send(client.close_with_cx(&cx)).await.unwrap();
+            });
+        }
+
+        #[test]
+        fn legacy_async_results_reject_one_field_modern_contamination() {
+            run(|cx| async move {
+                for (method, valid) in [
+                    ("tools/list", json!({"tools": []})),
+                    ("resources/read", json!({"contents": []})),
+                    ("completion/complete", json!({"completion": {"values": []}})),
+                    ("resources/subscribe", json!({})),
+                    ("ping", json!({})),
+                ] {
+                    for contaminated in [false, true] {
+                        let mut result = valid.clone();
+                        if contaminated {
+                            result["resultType"] = json!("complete");
+                        }
+                        let script = format!(
+                            "{INITIALIZE}\n\
+                             read_request\n\
+                             case \"$request\" in *'\"method\":\"{method}\"'*) ;; *) exit 80 ;; esac\n\
+                             printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{result}}}\\n' \"$id\"\n\
+                             while IFS= read -r unexpected; do exit 81; done\n"
+                        );
+                        let mut client = connect(&cx, &script, "").await;
+                        let cancellation = legacy::McpRequestCancellation::new();
+                        let observed = match method {
+                            "tools/list" => client
+                                .list_tools_with_cx(&cx, &cancellation, legacy::ListToolsParams::default())
+                                .await
+                                .map(|_| ()),
+                            "resources/read" => client
+                                .read_resource_with_cx(&cx, &cancellation, "test://source")
+                                .await
+                                .map(|_| ()),
+                            "completion/complete" => client
+                                .complete_with_cx(
+                                    &cx,
+                                    &cancellation,
+                                    serde_json::from_value(json!({
+                                        "ref": {"type": "ref/prompt", "name": "greet"},
+                                        "argument": {"name": "name", "value": "A"},
+                                    }))
+                                    .unwrap(),
+                                )
+                                .await
+                                .map(|_| ()),
+                            "resources/subscribe" => client
+                                .subscribe_resource_with_cx(&cx, "test://source")
+                                .await,
+                            "ping" => client.ping_with_cx(&cx).await,
+                            _ => unreachable!(),
+                        };
+                        if contaminated {
+                            assert_eq!(observed.unwrap_err().code, McpErrorCode::InvalidRequest);
+                            assert!(client.ping_with_cx(&cx).await.is_err());
+                        } else {
+                            observed.unwrap();
+                        }
+                        require_send(client.close_with_cx(&cx)).await.unwrap();
+                        assert!(cx.checkpoint().is_ok());
+                    }
+                }
+            });
+        }
+    }
+
     async fn collect(
         client: &mut modern::Client,
         cx: &Cx,
