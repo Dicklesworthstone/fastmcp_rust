@@ -136,14 +136,14 @@ different things:
   **more than an adapter profile**, which is worth stating precisely because
   the cheap-sounding estimate is wrong. The HTTPS requirement is not one check
   in the conformance adapter: a census of `crates/fastmcp-client/src`, with
-  `cfg(test)` modules excluded, finds **30 production HTTPS enforcement points
-  across 23 files**: 28 independent `scheme() != "https"` or
+  `cfg(test)` modules excluded, finds **31 production HTTPS enforcement points
+  across 24 files**: 29 independent `scheme() != "https"` or
   `starts_with("https://")` refusals in `http_auth.rs`, `device/wire.rs`,
   `challenge.rs`,
   `private_key_jwt.rs`, `metadata_document.rs`, `dpop.rs`,
   `dpop/native/core/stream/task_subscription/watch/checkpoint.rs`, `driver.rs`,
   `redirect.rs`, `enterprise/identity.rs`, `enterprise/identity/sector.rs`,
-  `enterprise/oidc.rs`,
+  `enterprise/keys.rs`, `enterprise/oidc.rs`,
   `enterprise/policy.rs`, `http_client.rs`, `managed/client.rs`, `resume.rs`,
   `oauth.rs`, `revocation.rs`, `recovery.rs`, `repair.rs`, `http_executor.rs`
   and `parameter_headers.rs`, plus the two central helpers `validate_https`
@@ -165,7 +165,7 @@ different things:
   direction that matters: RFC 8252 §7.3 permits loopback `http` for the
   *client's own redirect URI*, which is not what blocks us, while OAuth 2.1
   requires `https` for the authorization server's own endpoints — exactly the
-  URLs these 23 enforcement points refuse. The pinned suite serves its
+  URLs these 31 enforcement points refuse. The pinned suite serves its
   authorization server
   over plain `http` as a harness convenience, not because the spec allows it.
   So permitting it would be a real relaxation beyond the spec, not a reviewed
@@ -1452,6 +1452,10 @@ response admission and local identity resolution separate:
   servers and both preregistered clients. It checks their exact issuers,
   endpoints, grant declarations and confidential-client methods. OIDC and
   ID-JAG signing authority are configured separately.
+- `keys::EnterpriseKeySource` fetches both configured JWKS endpoints through
+  credential-free guarded HTTPS under the caller's context. It returns
+  separate OIDC and ID-JAG key owners together, bound to the frozen profile
+  and their independent key generations.
 - `oidc::OidcCodeFlowConfiguration` admits the strict web/code/query/S256
   registration and the original IdP permission to request `openid`. It generates
   independent state, nonce and verifier values under the caller's capability
@@ -1493,8 +1497,27 @@ observe the code/verifier and must erase its buffers. Confidential client
 authentication and HTTP dispatch are separate; local byte digests do not
 establish launch or transport provenance.
 
-With an already-admitted profile, independently imported ID-JAG keys, and a
-response obtained from the selected trusted endpoint:
+For native signing-key acquisition, construct `keys::EnterpriseKeySource` with
+the admitted profile, a `GuardedHttpFetcher`, and a nonzero fetch-policy
+generation. Configure at most 64 KiB per response and a fetch deadline no
+greater than 30 seconds. Reuse or clone the source so overlapping calls share
+its single acquisition slot.
+
+Calling `fetch(cx).await` makes separate GETs for the configured OIDC and ID-JAG
+sources, even when the operator explicitly selects the same URL for both
+purposes. The entire pair shares one original deadline and the caller's
+authority. Redirects, malformed documents, mismatched transport provenance or
+failure of either fetch prevent publication of the pair. Cancellation and
+abandonment retain the acquisition slot until guarded child operations settle.
+
+The returned `EnterpriseVerificationKeySet` exposes `profile()`, `oidc()` and
+`id_jag()` for the existing signed-response consumers. Its observations retain
+the exact endpoints, document digests, key generations and guarded TLS
+provenance. Refresh is explicit; key identifiers in peer tokens cannot initiate
+network requests.
+
+With an already-admitted profile, purpose-bound ID-JAG keys, and a response
+obtained from the selected trusted endpoint:
 
 ```rust
 use std::time::SystemTime;
