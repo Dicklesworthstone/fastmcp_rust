@@ -6381,59 +6381,6 @@ mod tests {
             calls: Arc<Mutex<Vec<fastmcp_client::CompletionParams>>>,
         }
 
-        impl crate::proxy::ProxyAsyncRequest for CompletionProxyBackend {
-            fn client_implementation(&self) -> Implementation {
-                Implementation::try_new("completion-test-proxy", "1.0")
-                    .expect("the fixed test implementation is valid")
-            }
-
-            fn execute<'a>(
-                mut self: Box<Self>,
-                ctx: &'a McpContext,
-                request: fastmcp_protocol::CoreRequest,
-                _on_progress: &'a mut (
-                            dyn FnMut(fastmcp_protocol::FinalProgressNotificationParams) + Send
-                        ),
-            ) -> crate::handler::BoxFuture<'a, McpResult<CoreResult>> {
-                use crate::proxy::ProxyBackend as _;
-                Box::pin(async move {
-                    ctx.checkpoint()?;
-                    let params = match request {
-                        fastmcp_protocol::CoreRequest::Legacy(
-                            fastmcp_protocol::LegacyCoreRequest::Completion(params),
-                        ) => fastmcp_client::CompletionParams {
-                            reference: match params.reference {
-                                fastmcp_protocol::LegacyCompletionReference::Prompt { name } => {
-                                    fastmcp_client::CompletionReference::Prompt { name }
-                                }
-                                fastmcp_protocol::LegacyCompletionReference::Resource { uri } => {
-                                    fastmcp_client::CompletionReference::Resource { uri }
-                                }
-                            },
-                            argument: fastmcp_client::CompletionArgument {
-                                name: params.argument.name,
-                                value: params.argument.value,
-                            },
-                            context: None,
-                        },
-                        fastmcp_protocol::CoreRequest::Final(
-                            fastmcp_protocol::FinalCoreRequest::Completion(params),
-                        ) => fastmcp_client::CompletionParams {
-                            reference: params.reference,
-                            argument: params.argument,
-                            context: params.context,
-                        },
-                        _ => {
-                            return Err(fastmcp_core::McpError::invalid_request(
-                                "completion proxy test backend received unexpected request",
-                            ));
-                        }
-                    };
-                    self.complete_result(params)
-                })
-            }
-        }
-
         struct LocalFinalCompletionPrompt;
 
         impl crate::PromptHandler for LocalFinalCompletionPrompt {
