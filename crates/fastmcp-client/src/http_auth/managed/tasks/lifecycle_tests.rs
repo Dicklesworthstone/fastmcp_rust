@@ -741,4 +741,166 @@ fn native_oauth_reviewed_task_calls_keep_headers_through_public_continuation_and
     }
 }
 
+#[test]
+fn native_oauth_large_task_results_keep_explicit_limits_and_sibling_access() {
+    use crate::http_auth::oauth::OAuthError;
+
+    for sse in [false, true] {
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                asupersync::time::timeout_at(
+                    cx.now().saturating_add_nanos(60_000_000_000),
+                    async {
+                        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let issuer = format!("https://{}", listener.local_addr().unwrap());
+                        let url = |text: &str| CanonicalHttpUrl::parse(text).unwrap();
+                        let resource = url(&format!("{issuer}/mcp?tenant=one"));
+                        let config = OAuthClientConfiguration::from_trusted_endpoints(
+                            issuer.clone(),
+                            url(&format!("{issuer}/authorize")),
+                            url(&format!("{issuer}/token")),
+                            resource.clone(),
+                            "native-client",
+                            vec![],
+                        )
+                        .unwrap()
+                        .with_extra_root_certificate(Certificate::from_pem(ROOT).unwrap().remove(0))
+                        .unwrap()
+                        .with_resource_root_certificate(Certificate::from_pem(ROOT).unwrap().remove(0))
+                        .unwrap();
+                        let acceptor = TlsAcceptorBuilder::new(
+                            CertificateChain::from_pem(LEAF).unwrap(),
+                            PrivateKey::from_pem(KEY).unwrap(),
+                        )
+                        .alpn_protocols(vec![b"http/1.1".to_vec()])
+                        .build()
+                        .unwrap();
+                        let text = "large-task-result".repeat(70_000);
+                        let result = json!({
+                            "resultType": "complete", "taskId": "task-one", "status": "completed",
+                            "createdAt": "2026-09-16T00:00:00Z", "lastUpdatedAt": "2026-09-16T00:00:00Z",
+                            "ttlMs": 60000, "result": {"content": [{"type": "text", "text": text}]}
+                        });
+                        let reply = |id| json!({"jsonrpc": "2.0", "id": id, "result": result});
+                        let application = async {
+                            let callback_issuer = issuer.clone();
+                            let session = ManagedOAuthSession::authorize(
+                                &cx,
+                                OAuthClient::new(config),
+                                OAuthSessionPolicy::default(),
+                                move |authorization| {
+                                    let fields = form_fields(authorization.query().unwrap());
+                                    assert_eq!(fields["code_challenge_method"], "S256");
+                                    let redirect = fields["redirect_uri"].clone();
+                                    let state = fields["state"].clone();
+                                    async move {
+                                        let (address, path) = redirect.strip_prefix("http://").unwrap()
+                                            .split_once('/').unwrap();
+                                        let (address, path) = (address.to_owned(), path.to_owned());
+                                        let mut callback = asupersync::net::TcpStream::connect(address.clone())
+                                            .await.map_err(|_| OAuthError::BrowserLaunchFailed)?;
+                                        let request = format!(
+                                            "GET /{path}?code=fixture-code&state={}&iss={} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n",
+                                            form_component(&state), form_component(&callback_issuer),
+                                        );
+                                        callback.write_all(request.as_bytes()).await
+                                            .map_err(|_| OAuthError::BrowserLaunchFailed)?;
+                                        Ok(())
+                                    }
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            // Default admission, an exact-sized override, a
+                            // one-byte-smaller refusal, then an unaffected sibling.
+                            for (index, bounded) in [None, Some(false), Some(true), None]
+                                .into_iter().enumerate()
+                            {
+                                let discovery = 1 + 2 * index as i64;
+                                let size = serde_json::to_vec(&reply(discovery + 1)).unwrap().len();
+                                assert!(size > 1024 * 1024);
+                                let limits = if let Some(too_small) = bounded {
+                                    ManagedTasksLimits::new(
+                                        8192, size - usize::from(too_small), 8, Duration::from_secs(20),
+                                    ).unwrap()
+                                } else {
+                                    ManagedTasksLimits::default()
+                                };
+                                let client = ManagedTasksClient::new(
+                                    session.clone(), FinalRequestMeta::new(ClientCapabilities::default()), limits,
+                                ).unwrap();
+                                let mut call = client.request(&cx, sequential_ids(discovery),
+                                    operation(TASK_GET)).await.unwrap();
+                                let observed = call.next_event(&cx).await;
+                                if bounded == Some(true) {
+                                    assert!(observed.is_err(), "one-byte-over frame must be refused");
+                                    assert!(matches!(call.next_event(&cx).await, Err(ManagedTasksError::Closed)));
+                                } else {
+                                    let Some(ManagedTaskEvent::Snapshot(snapshot)) = observed.unwrap() else {
+                                        panic!("large completed Task must remain observable");
+                                    };
+                                    assert_eq!(serde_json::to_value(snapshot).unwrap(), result);
+                                    assert!(call.next_event(&cx).await.unwrap().is_none());
+                                }
+                                assert!(!session.inner.closed.is_cancel_requested());
+                                assert!(cx.checkpoint().is_ok());
+                            }
+                        };
+                        let server = async {
+                            let (socket, _) = listener.accept().await.unwrap();
+                            let mut socket = acceptor.accept(socket).await.unwrap();
+                            let form = read_token_form(&mut socket).await;
+                            assert_eq!(form["grant_type"], "authorization_code");
+                            assert_eq!(form["resource"], resource.as_str());
+                            json_reply(&mut socket, &json!({
+                                "access_token": "reviewed-task-token", "token_type": "Bearer", "expires_in": 120
+                            })).await;
+                            drop(socket);
+                            for index in 0..4 {
+                                let discovery = 1 + 2 * index;
+                                let (socket, _) = listener.accept().await.unwrap();
+                                let mut socket = acceptor.accept(socket).await.unwrap();
+                                reviewed_discovery(&mut socket, discovery).await;
+                                drop(socket);
+                                let (socket, _) = listener.accept().await.unwrap();
+                                let mut socket = acceptor.accept(socket).await.unwrap();
+                                let (fields, body) = read_request(&mut socket).await;
+                                assert_eq!(body["id"], discovery + 1);
+                                assert_eq!(body["method"], TASK_GET);
+                                assert_eq!(header(&fields, "authorization"), Some("Bearer reviewed-task-token"));
+                                assert!(admit(&fields, &body, header(&fields, "mcp-name")));
+                                let payload = reply(discovery + 1).to_string();
+                                let wire = if sse {
+                                    let data = format!("data: {payload}\r\n\r\n");
+                                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{data}\r\n0\r\n\r\n", data.len())
+                                } else {
+                                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len())
+                                };
+                                let sent = socket.write_all(wire.as_bytes()).await;
+                                if index == 2 {
+                                    // The bounded client may close as soon as
+                                    // it sees Content-Length or the excess byte.
+                                    let _ = sent;
+                                    let _ = socket.flush().await;
+                                } else {
+                                    sent.unwrap();
+                                    socket.flush().await.unwrap();
+                                }
+                            }
+                        };
+                        pair(application, server).await;
+                        assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending(),
+                            "a payload refusal must not replay the Task request or reauthorize");
+                    },
+                )
+                .await
+                .expect("bounded large Task HTTPS fixture");
+            });
+    }
+}
+
 mod driver_events;

@@ -55,6 +55,11 @@ pub mod tasks;
 #[cfg(test)]
 mod revocation_tests;
 
+// LIMIT-01's ordinary MCP message budget, shared by authenticated Tasks and
+// subscription APIs. OAuth token/discovery-document limits remain separate:
+// those security documents do not carry MCP tool results or Task snapshots.
+pub(super) const MAX_MANAGED_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Bounds shared renewal and response-head admission. Response bodies retain
 /// the native executor's separate idle/absolute limits after handoff, further
 /// constrained by the original access token's expiry and caller budget.
