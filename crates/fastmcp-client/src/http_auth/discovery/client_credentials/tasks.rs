@@ -42,6 +42,8 @@ use super::{
     CLIENT_CREDENTIALS_EXTENSION, ClientCredentialsClient, ClientCredentialsError,
     ClientCredentialsSnapshot, active, admit_resource, authorize, discovery_deadline,
 };
+use super::rpc::mcp_sse_limits;
+use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 use crate::http_auth::managed::tasks::validate_task_input_shapes;
 pub use crate::http_auth::managed::tasks::{
     ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError,
@@ -50,7 +52,6 @@ use crate::http_executor::{
     ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseStream,
     ModernHttpSseResponseStream,
 };
-use crate::sse::SseLimits;
 
 /// Bounds discovery plus one operation, including acquisition and caller pauses.
 /// Native HTTP/SSE limits still apply and may be tighter. Records include the
@@ -66,8 +67,8 @@ pub struct ClientCredentialsTasksLimits {
 impl Default for ClientCredentialsTasksLimits {
     fn default() -> Self {
         Self {
-            request_bytes: 64 * 1024,
-            frame_bytes: 64 * 1024,
+            request_bytes: MAX_MANAGED_MCP_MESSAGE_BYTES,
+            frame_bytes: MAX_MANAGED_MCP_MESSAGE_BYTES,
             records: 64,
             timeout: Duration::from_secs(120),
         }
@@ -81,8 +82,8 @@ impl ClientCredentialsTasksLimits {
         records: usize,
         timeout: Duration,
     ) -> Result<Self, ClientCredentialsTasksError> {
-        if !(1..=1024 * 1024).contains(&request_bytes)
-            || !(1..=1024 * 1024).contains(&frame_bytes)
+        if !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&request_bytes)
+            || !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&frame_bytes)
             || !(1..=1024).contains(&records)
             || timeout.is_zero()
             || timeout > Duration::from_mins(15)
@@ -396,7 +397,7 @@ impl ClientCredentialsTaskCall {
             // Streamable HTTP lets a server answer any request, not only a tool
             // call, with an SSE stream that ends in the correlated result.
             ModernHttpResponseKind::Sse => {
-                let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
+                let framing = mcp_sse_limits(limits.frame_bytes)
                     .ok_or(ManagedTasksError::InvalidLimits)?;
                 Body::Sse(
                     response
@@ -934,6 +935,186 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn machine_tasks_message_limits_match_ordinary_mcp() {
+        let defaults = ClientCredentialsTasksLimits::default();
+        let core = crate::http_auth::rpc::ManagedCoreLimits::default();
+        assert_eq!(defaults.request_bytes, core.request_bytes());
+        assert_eq!(defaults.frame_bytes, core.frame_bytes());
+        assert!(
+            ClientCredentialsTasksLimits::new(
+                defaults.request_bytes,
+                defaults.frame_bytes,
+                defaults.records,
+                defaults.timeout,
+            )
+            .is_ok()
+        );
+        for (request, frame) in [
+            (0, defaults.frame_bytes),
+            (defaults.request_bytes, 0),
+            (defaults.request_bytes + 1, defaults.frame_bytes),
+            (defaults.request_bytes, defaults.frame_bytes + 1),
+        ] {
+            assert!(matches!(
+                ClientCredentialsTasksLimits::new(
+                    request,
+                    frame,
+                    defaults.records,
+                    defaults.timeout,
+                ),
+                Err(ClientCredentialsTasksError::Protocol(ManagedTasksError::InvalidLimits))
+            ));
+        }
+    }
+
+    #[test]
+    fn machine_large_task_arguments_keep_the_exact_encoded_request_bound() {
+        let arguments = json!({"document": "x".repeat(2 * 1024 * 1024)});
+        let prepare_call = |limits| {
+            prepare(
+                "https://resource.example/mcp",
+                &metadata(),
+                &RequestId::Number(2),
+                ManagedTaskRequest::CallTool {
+                    name: "echo".to_owned(),
+                    arguments: Some(arguments.clone()),
+                },
+                limits,
+            )
+        };
+        let defaults = ClientCredentialsTasksLimits::default();
+        let accepted = prepare_call(defaults).unwrap();
+        let encoded = accepted.wire.body().len();
+        assert!(encoded > 1024 * 1024);
+        let wire: Value = serde_json::from_slice(accepted.wire.body()).unwrap();
+        assert_eq!(wire["params"]["arguments"], arguments);
+        let limits = |request_bytes| {
+            ClientCredentialsTasksLimits::new(
+                request_bytes,
+                defaults.frame_bytes,
+                defaults.records,
+                defaults.timeout,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            prepare_call(limits(encoded)).unwrap().wire.body(),
+            accepted.wire.body(),
+        );
+        assert!(matches!(
+            prepare_call(limits(encoded - 1)),
+            Err(ManagedTasksError::RequestTooLarge)
+        ));
+    }
+
+    #[test]
+    fn machine_large_completed_task_json_and_sse_keep_the_exact_payload_bound() {
+        use crate::sse::BoundedSseParser;
+
+        let result = json!({
+            "resultType": "complete", "taskId": "owned-task", "status": "completed",
+            "createdAt": "2026-09-17T00:00:00Z", "lastUpdatedAt": "2026-09-17T00:00:00Z",
+            "ttlMs": 60000,
+            "result": {"content": [{"type": "text", "text": "x".repeat(2 * 1024 * 1024)}]},
+        });
+        let payload = envelope(result.clone());
+        assert!(payload.len() > 1024 * 1024);
+        for (maximum, prefix) in [
+            (ClientCredentialsTasksLimits::default().frame_bytes, ""),
+            (payload.len(), ""),
+            (payload.len(), "\u{feff}"),
+        ] {
+            let framing = mcp_sse_limits(maximum).unwrap();
+            let mut parser = BoundedSseParser::new(framing);
+            let framed = format!(
+                "{prefix}data: {}\r\n\r\n",
+                std::str::from_utf8(&payload).unwrap(),
+            );
+            let mut frames = Vec::new();
+            for chunk in framed.as_bytes().chunks(4093) {
+                parser
+                    .push_with(chunk, |frame| {
+                        frames.push(frame);
+                        Ok::<(), ()>(())
+                    })
+                    .unwrap();
+            }
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].as_bytes(), payload);
+            for source in [payload.as_slice(), frames[0].as_bytes()] {
+                let ManagedTaskEvent::Snapshot(snapshot) = decode_result(
+                    &Decoder::Get(id()),
+                    source,
+                    &RequestId::Number(2),
+                    maximum,
+                )
+                .unwrap() else {
+                    panic!("completed Task snapshot must remain observable");
+                };
+                assert_eq!(serde_json::to_value(snapshot).unwrap(), result);
+                assert!(matches!(
+                    decode_result(
+                        &Decoder::Get(id()),
+                        source,
+                        &RequestId::Number(2),
+                        payload.len() - 1,
+                    ),
+                    Err(ManagedTasksError::InvalidResponse)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn machine_task_sse_multiline_framing_does_not_spend_the_json_budget() {
+        use crate::sse::BoundedSseParser;
+
+        let response = json!({"jsonrpc": "2.0", "id": 2, "result": {
+            "resultType": "complete", "taskId": "owned-task", "status": "completed",
+            "createdAt": "2026-09-17T00:00:00Z", "lastUpdatedAt": "2026-09-17T00:00:00Z",
+            "ttlMs": 60000, "result": {"content": [{"type": "text", "text": "complete"}]},
+        }});
+        let payload = serde_json::to_string_pretty(&response).unwrap();
+        let mut framed = payload
+            .lines()
+            .map(|line| format!("data: {line}\r\n"))
+            .collect::<String>();
+        framed.push_str("\r\n");
+        assert!(framed.len() > payload.len() + 64);
+        let mut parser = BoundedSseParser::new(mcp_sse_limits(payload.len()).unwrap());
+        let mut frames = Vec::new();
+        parser
+            .push_with(framed.as_bytes(), |frame| {
+                frames.push(frame);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert_eq!(frames, vec![payload.clone()]);
+        assert!(
+            decode_record(
+                &Decoder::Get(id()),
+                payload.as_bytes(),
+                &RequestId::Number(2),
+                payload.len(),
+                None,
+                &mut None,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            decode_record(
+                &Decoder::Get(id()),
+                payload.as_bytes(),
+                &RequestId::Number(2),
+                payload.len() - 1,
+                None,
+                &mut None,
+            ),
+            Err(ManagedTasksError::InvalidResponse)
+        ));
+    }
+
     #[test]
     fn both_extensions_are_explicit_and_other_profiles_cannot_be_smuggled_in() {
         let meta = metadata();

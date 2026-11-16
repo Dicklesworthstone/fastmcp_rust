@@ -184,7 +184,7 @@ impl ClientCredentialsTasksClient {
         let filter = state.filter()?;
         let limits = ClientCredentialsSubscriptionLimits::new(
             self.limits.request_bytes.min(MAX_SELECTION_BYTES),
-            self.limits.frame_bytes.min(MAX_SELECTION_BYTES),
+            self.limits.frame_bytes,
             policy.maximum_records,
             policy.timeout,
         )?;

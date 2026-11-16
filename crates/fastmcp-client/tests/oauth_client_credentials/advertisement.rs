@@ -332,6 +332,111 @@ fn typed_machine_tool_resource_and_prompt_streams_work_without_auth_advertisemen
 }
 
 #[test]
+fn typed_machine_discovery_keeps_large_payloads_inside_the_callers_frame_bound() {
+    for post in [false, true] {
+        run_machine(post, |cx, peer, client| async move {
+            let mut document: Value =
+                serde_json::from_str(&discovery_document(json!({}))).unwrap();
+            document["instructions"] = json!("x".repeat(2 * 1024 * 1024));
+            let document = document.to_string();
+            for index in 0..3 {
+                let id = 1 + 2 * index as i64;
+                let bytes = terminal(id, &document).len();
+                assert!(bytes > 1024 * 1024);
+                let accepted = index != 2;
+                let limits = if index == 0 {
+                    ManagedCoreLimits::default()
+                } else {
+                    ManagedCoreLimits::new(
+                        4096,
+                        bytes - usize::from(!accepted),
+                        8 * 1024 * 1024,
+                        4,
+                        Duration::from_secs(10),
+                    )
+                    .unwrap()
+                };
+                let server = async {
+                    peer.discovery(id, TOKEN, &document).await;
+                    if accepted {
+                        json_reply(
+                            &mut peer.rpc(id + 1, "tools/call", TOKEN).await,
+                            &terminal(id + 1, CALL),
+                        )
+                        .await;
+                    }
+                };
+                let application = async {
+                    let result = client
+                        .request_core(
+                            &cx,
+                            core("tools/call"),
+                            RequestId::Number(id),
+                            RequestId::Number(id + 1),
+                            limits,
+                        )
+                        .await;
+                    if !accepted {
+                        assert!(matches!(
+                            result,
+                            Err(ClientCredentialsCoreError::Authentication(Error::Transport))
+                        ));
+                        return;
+                    }
+                    let mut call = result.unwrap();
+                    assert_eq!(call.credential_generation(), 1);
+                    let Some(ManagedCoreEvent::Result(result)) =
+                        call.next_event(&cx).await.unwrap()
+                    else {
+                        panic!("admitted discovery must allow the typed tool result");
+                    };
+                    assert!(matches!(
+                        result.as_ref(),
+                        CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                    ));
+                    assert!(call.next_event(&cx).await.unwrap().is_none());
+                };
+                pair(server, application).await;
+                assert_eq!(
+                    peer.rpcs.load(Ordering::SeqCst),
+                    if accepted { 2 * (index + 1) } else { 5 },
+                    "oversized discovery must prevent the application POST"
+                );
+                peer.quiet();
+                assert!(cx.checkpoint().is_ok());
+            }
+            // A discovery bound belongs to its call. Refusing one response
+            // neither renews the credential nor prevents a fresh sibling call.
+            let ((), sibling) = pair(
+                operation(&peer, 7, json!({}), "tools/call", CALL),
+                client.request_core(
+                    &cx,
+                    core("tools/call"),
+                    RequestId::Number(7),
+                    RequestId::Number(8),
+                    ManagedCoreLimits::new(4096, 4096, 8192, 4, Duration::from_secs(10))
+                        .unwrap(),
+                ),
+            )
+            .await;
+            let mut sibling = sibling.unwrap();
+            assert_eq!(sibling.credential_generation(), 1);
+            assert!(matches!(
+                sibling.next_event(&cx).await.unwrap(),
+                Some(ManagedCoreEvent::Result(_))
+            ));
+            assert!(sibling.next_event(&cx).await.unwrap().is_none());
+            assert_eq!(peer.rpcs.load(Ordering::SeqCst), 7);
+            assert_eq!(peer.gets.load(Ordering::SeqCst), 2);
+            assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+            assert_eq!(client.credential(&cx).await.unwrap().generation(), 1);
+            peer.quiet();
+            client.close();
+        });
+    }
+}
+
+#[test]
 fn partial_machine_continuations_keep_exact_answers_without_server_auth_advertisements() {
     for post in [false, true] {
         run_machine(post, |cx, peer, client| async move {

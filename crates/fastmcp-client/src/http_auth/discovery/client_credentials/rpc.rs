@@ -29,6 +29,7 @@ use super::{
     ClientCredentialsClient, ClientCredentialsError, ClientCredentialsResponse,
     ClientCredentialsSnapshot, active, discovery_deadline, prepare,
 };
+use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 use crate::http_auth::rpc::{CoreDecoder, ManagedCoreError};
 use crate::http_executor::{
     ModernHttpResponseKind, ModernHttpResponseStream, ModernHttpSseResponseStream,
@@ -38,6 +39,22 @@ use crate::sse::SseLimits;
 // Match the Tasks machine-client API: share the already-public event and limit
 // vocabulary instead of defining a parallel set of protocol/result types.
 pub use crate::http_auth::rpc::{ManagedCoreEvent, ManagedCoreLimits};
+
+// Bound JSON payloads independently from SSE syntax. A maximal payload needs
+// room for the data prefix, CRLF and an optional leading BOM; multiline data
+// also spends bounded framing bytes without reducing the JSON message budget.
+// Every consumer still enforces its exact decoded JSON-RPC byte limit.
+pub(super) fn mcp_sse_limits(frame_bytes: usize) -> Option<SseLimits> {
+    if !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&frame_bytes) {
+        return None;
+    }
+    SseLimits::with_data_lines(
+        frame_bytes.checked_add(16)?,
+        frame_bytes.checked_add(1024 * 1024)?,
+        64,
+        4096,
+    )
+}
 
 /// Sanitized authentication or core-protocol failure. Peer error messages,
 /// malformed input, credential values and result payloads are not retained.
@@ -125,12 +142,13 @@ impl ClientCredentialsClient {
             &self.inner.closed,
             cancellation,
             None,
-            self.execute_core_with_cancellation(
+            self.execute_core_with_cancellation_and_discovery_limit(
                 cx,
                 cancellation,
                 request,
                 discovery_id,
                 request_id,
+                limits.frame_bytes(),
             ),
         ))
         .await?;
@@ -227,8 +245,7 @@ impl ClientCredentialsCoreCall {
         let body = match response.metadata().kind() {
             ModernHttpResponseKind::Json => Body::Json(response),
             ModernHttpResponseKind::Sse => {
-                let frame = limits.frame_bytes();
-                let framing = SseLimits::new(frame + 16, frame + 64, 64)
+                let framing = mcp_sse_limits(limits.frame_bytes())
                     .ok_or(ManagedCoreError::InvalidLimits)?;
                 Body::Sse(
                     response

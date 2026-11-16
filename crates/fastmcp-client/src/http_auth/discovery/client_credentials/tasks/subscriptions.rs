@@ -37,7 +37,8 @@ use crate::http_executor::{
     ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
     ModernHttpSubscriptionListener,
 };
-use crate::sse::SseLimits;
+use super::super::rpc::mcp_sse_limits;
+use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 
 /// Bounds the complete acquisition/discovery/listen operation and later reads.
 /// Native transport bounds and the machine client's configured timeout still
@@ -53,8 +54,8 @@ pub struct ClientCredentialsSubscriptionLimits {
 impl Default for ClientCredentialsSubscriptionLimits {
     fn default() -> Self {
         Self {
-            request_bytes: 64 * 1024,
-            frame_bytes: 64 * 1024,
+            request_bytes: MAX_MANAGED_MCP_MESSAGE_BYTES,
+            frame_bytes: MAX_MANAGED_MCP_MESSAGE_BYTES,
             records: 1024,
             timeout: Duration::from_mins(15),
         }
@@ -68,8 +69,8 @@ impl ClientCredentialsSubscriptionLimits {
         records: usize,
         timeout: Duration,
     ) -> Result<Self, ClientCredentialsTasksError> {
-        if !(1..=64 * 1024).contains(&request_bytes)
-            || !(1..=64 * 1024).contains(&frame_bytes)
+        if !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&request_bytes)
+            || !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&frame_bytes)
             || !(2..=4096).contains(&records)
             || timeout.is_zero()
             || timeout > Duration::from_secs(3600)
@@ -240,11 +241,12 @@ impl ClientCredentialsTasksClient {
                 if response.metadata().kind() != ModernHttpResponseKind::Sse {
                     return Err(ManagedTasksError::InvalidResponse.into());
                 }
-                let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
+                let framing = mcp_sse_limits(limits.frame_bytes)
                     .ok_or(ManagedTasksError::InvalidLimits)?;
                 let listener = response
                     .into_final_subscriptions_listener(request_id.clone(), prepared.filter, framing)
-                    .map_err(subscription_error)?;
+                    .map_err(subscription_error)?
+                    .with_maximum_jsonrpc_bytes(limits.frame_bytes);
                 Ok(ClientCredentialsTaskSubscription {
                     listener: Some(Box::new(listener)),
                     snapshot,
@@ -499,6 +501,82 @@ mod tests {
     }
 
     #[test]
+    fn machine_task_subscription_message_limits_match_ordinary_mcp() {
+        let defaults = ClientCredentialsSubscriptionLimits::default();
+        let core = crate::http_auth::rpc::ManagedCoreLimits::default();
+        assert_eq!(defaults.request_bytes, core.request_bytes());
+        assert_eq!(defaults.frame_bytes, core.frame_bytes());
+        assert!(
+            ClientCredentialsSubscriptionLimits::new(
+                defaults.request_bytes,
+                defaults.frame_bytes,
+                defaults.records,
+                defaults.timeout,
+            )
+            .is_ok()
+        );
+        for (request, frame) in [
+            (0, defaults.frame_bytes),
+            (defaults.request_bytes, 0),
+            (defaults.request_bytes + 1, defaults.frame_bytes),
+            (defaults.request_bytes, defaults.frame_bytes + 1),
+        ] {
+            assert!(matches!(
+                ClientCredentialsSubscriptionLimits::new(
+                    request,
+                    frame,
+                    defaults.records,
+                    defaults.timeout,
+                ),
+                Err(ClientCredentialsTasksError::Protocol(ManagedTasksError::InvalidLimits))
+            ));
+        }
+    }
+
+    #[test]
+    fn machine_task_subscription_large_metadata_preserves_explicit_request_limits() {
+        let defaults = ClientCredentialsSubscriptionLimits::default();
+        let mut meta = metadata();
+        meta["com.example/document"] = json!("x".repeat(2 * 1024 * 1024));
+        let prepare_with = |limits| {
+            prepare_subscription(
+                "https://mcp.example/mcp",
+                &meta,
+                &RequestId::Number(1),
+                &RequestId::Number(2),
+                filter(json!({"taskIds": ["one"]})),
+                limits,
+            )
+        };
+        let accepted = prepare_with(defaults).unwrap();
+        let bytes = accepted
+            .discovery_wire
+            .body()
+            .len()
+            .max(accepted.listen_wire.body().len());
+        assert!(bytes > 1024 * 1024);
+        let wire: Value = serde_json::from_slice(accepted.listen_wire.body()).unwrap();
+        assert_eq!(wire["params"]["_meta"]["com.example/document"], meta["com.example/document"]);
+        let limits = |request_bytes| {
+            ClientCredentialsSubscriptionLimits::new(
+                request_bytes,
+                defaults.frame_bytes,
+                defaults.records,
+                defaults.timeout,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            prepare_with(limits(bytes)).unwrap().listen_wire.body(),
+            accepted.listen_wire.body(),
+        );
+        assert!(matches!(
+            prepare_with(limits(bytes - 1)),
+            Err(ManagedTasksError::RequestTooLarge)
+        ));
+    }
+
+    #[test]
     fn subscription_stamps_both_extensions_and_preserves_the_exact_selection() {
         for ids in [json!([]), json!(["one", "one", " two "])] {
             let selection = json!({"taskIds":ids, "toolsListChanged":true, "resourceSubscriptions":["file:///watched"]});
@@ -661,7 +739,7 @@ mod tests {
         assert!(ClientCredentialsSubscriptionLimits::new(1, 1, 2, second).is_ok());
         for (bytes, frame, records, time) in [
             (0, 1, 2, second),
-            (1, 65537, 2, second),
+            (1, MAX_MANAGED_MCP_MESSAGE_BYTES + 1, 2, second),
             (1, 1, 1, second),
             (1, 1, 4097, second),
             (1, 1, 2, Duration::ZERO),

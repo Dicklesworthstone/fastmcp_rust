@@ -31,7 +31,8 @@ use crate::http_executor::{
     ModernHttpRequest, ModernHttpResponseKind, ModernHttpSubscriptionListenError,
     ModernHttpSubscriptionListener,
 };
-use crate::sse::SseLimits;
+use super::rpc::mcp_sse_limits;
+use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 
 // Re-export the existing event vocabulary rather than inventing a second
 // representation of protocol acknowledgments, notifications and terminal data.
@@ -89,8 +90,8 @@ pub struct ClientCredentialsCoreSubscriptionLimits {
 impl Default for ClientCredentialsCoreSubscriptionLimits {
     fn default() -> Self {
         Self {
-            request_bytes: 64 * 1024,
-            frame_bytes: 64 * 1024,
+            request_bytes: MAX_MANAGED_MCP_MESSAGE_BYTES,
+            frame_bytes: MAX_MANAGED_MCP_MESSAGE_BYTES,
             records: 1024,
             timeout: Duration::from_mins(15),
         }
@@ -104,8 +105,8 @@ impl ClientCredentialsCoreSubscriptionLimits {
         records: usize,
         timeout: Duration,
     ) -> Result<Self, ClientCredentialsCoreSubscriptionError> {
-        if !(1..=64 * 1024).contains(&request_bytes)
-            || !(1..=64 * 1024).contains(&frame_bytes)
+        if !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&request_bytes)
+            || !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&frame_bytes)
             || !(2..=4096).contains(&records)
             || timeout.is_zero()
             || timeout > Duration::from_secs(3600)
@@ -233,11 +234,12 @@ impl ClientCredentialsClient {
                 {
                     return Err(ClientCredentialsCoreSubscriptionError::InvalidResponse);
                 }
-                let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
+                let framing = mcp_sse_limits(limits.frame_bytes)
                     .ok_or(ClientCredentialsCoreSubscriptionError::InvalidLimits)?;
                 let listener = response
                     .into_final_subscriptions_listener(request_id.clone(), prepared.filter, framing)
-                    .map_err(subscription_error)?;
+                    .map_err(subscription_error)?
+                    .with_maximum_jsonrpc_bytes(limits.frame_bytes);
                 Ok(ClientCredentialsCoreSubscription {
                     listener: Some(Box::new(listener)),
                     snapshot,
@@ -506,6 +508,52 @@ mod tests {
     }
 
     #[test]
+    fn large_core_subscription_metadata_keeps_the_exact_request_bound() {
+        let defaults = ClientCredentialsCoreSubscriptionLimits::default();
+        let mut meta = serde_json::to_value(metadata()).unwrap();
+        meta["com.example/document"] = json!("x".repeat(2 * 1024 * 1024));
+        let prepare_with = |limits| {
+            prepare_subscription(
+                &resource(),
+                serde_json::from_value(meta.clone()).unwrap(),
+                &RequestId::Number(6),
+                &RequestId::Number(7),
+                filter(),
+                limits,
+            )
+        };
+        let accepted = prepare_with(defaults).unwrap();
+        let bytes = accepted
+            .discovery_wire
+            .body()
+            .len()
+            .max(accepted.listen_wire.body().len());
+        assert!(bytes > 1024 * 1024);
+        let wire: Value = serde_json::from_slice(accepted.listen_wire.body()).unwrap();
+        assert_eq!(
+            wire["params"]["_meta"]["com.example/document"],
+            meta["com.example/document"],
+        );
+        let limits = |request_bytes| {
+            ClientCredentialsCoreSubscriptionLimits::new(
+                request_bytes,
+                defaults.frame_bytes,
+                defaults.records,
+                defaults.timeout,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            prepare_with(limits(bytes)).unwrap().listen_wire.body(),
+            accepted.listen_wire.body(),
+        );
+        assert!(matches!(
+            prepare_with(limits(bytes - 1)),
+            Err(ClientCredentialsCoreSubscriptionError::RequestTooLarge)
+        ));
+    }
+
+    #[test]
     fn defaults_are_valid_bounded_limits() {
         let limits = ClientCredentialsCoreSubscriptionLimits::default();
         assert!(
@@ -517,8 +565,9 @@ mod tests {
             )
             .is_ok()
         );
-        assert_eq!(limits.request_bytes(), 64 * 1024);
-        assert_eq!(limits.frame_bytes(), 64 * 1024);
+        let core = crate::http_auth::rpc::ManagedCoreLimits::default();
+        assert_eq!(limits.request_bytes(), core.request_bytes());
+        assert_eq!(limits.frame_bytes(), core.frame_bytes());
         assert_eq!(limits.records(), 1024);
         assert_eq!(limits.timeout(), Duration::from_mins(15));
     }
@@ -527,9 +576,9 @@ mod tests {
     fn limit_construction_rejects_unbounded_or_unusable_values() {
         for (request, frame, records, timeout) in [
             (0, 1024, 2, Duration::from_secs(1)),
-            (65_537, 1024, 2, Duration::from_secs(1)),
+            (MAX_MANAGED_MCP_MESSAGE_BYTES + 1, 1024, 2, Duration::from_secs(1)),
             (1024, 0, 2, Duration::from_secs(1)),
-            (1024, 65_537, 2, Duration::from_secs(1)),
+            (1024, MAX_MANAGED_MCP_MESSAGE_BYTES + 1, 2, Duration::from_secs(1)),
             (1024, 1024, 0, Duration::from_secs(1)),
             (1024, 1024, 1, Duration::from_secs(1)),
             (1024, 1024, 4097, Duration::from_secs(1)),
@@ -543,8 +592,8 @@ mod tests {
         }
         assert!(
             ClientCredentialsCoreSubscriptionLimits::new(
-                65_536,
-                65_536,
+                MAX_MANAGED_MCP_MESSAGE_BYTES,
+                MAX_MANAGED_MCP_MESSAGE_BYTES,
                 4096,
                 Duration::from_secs(3600),
             )
@@ -829,10 +878,11 @@ mod tests {
             .execute_with_cancellation(cx, &cancellation, &wire)
             .await
             .unwrap();
-        let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64).unwrap();
+        let framing = mcp_sse_limits(limits.frame_bytes).unwrap();
         let listener = response
             .into_final_subscriptions_listener(RequestId::Number(7), prepared.filter, framing)
-            .unwrap();
+            .unwrap()
+            .with_maximum_jsonrpc_bytes(limits.frame_bytes);
         let owner = McpRequestCancellation::new();
         let expires_at = Instant::now() + Duration::from_secs(60);
         let bearer = crate::http_auth::BoundBearerCredential::bind_with_expiry(
@@ -864,6 +914,82 @@ mod tests {
             },
             peer,
         )
+    }
+
+    #[test]
+    fn native_core_large_multiline_update_keeps_the_exact_json_bound() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let update = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": {
+                    "_meta": {
+                        (FINAL_SUBSCRIPTION_ID_META_KEY): SUBSCRIPTION_ID,
+                        "com.example/document": "x".repeat(2 * 1024 * 1024),
+                    },
+                    "uri": "file:///tmp/watched",
+                },
+            });
+            let payload = serde_json::to_string_pretty(&update).unwrap();
+            let mut framed = payload
+                .lines()
+                .map(|line| format!("data: {line}\r\n"))
+                .collect::<String>();
+            framed.push_str("\r\n");
+            assert!(payload.len() > 1024 * 1024);
+            assert!(framed.len() > payload.len() + 64);
+            let defaults = ClientCredentialsCoreSubscriptionLimits::default();
+            for (maximum, accepted) in [
+                (defaults.frame_bytes, true),
+                (payload.len(), true),
+                (payload.len() - 1, false),
+            ] {
+                let limits = ClientCredentialsCoreSubscriptionLimits::new(
+                    defaults.request_bytes,
+                    maximum,
+                    defaults.records,
+                    defaults.timeout,
+                )
+                .unwrap();
+                let body = format!("\u{feff}{}{framed}{TERMINAL}", ack(SUBSCRIPTION_ID));
+                let (mut subscription, peer) =
+                    native_subscription(&cx, body, false, limits).await;
+                assert!(matches!(
+                    subscription.next_event(&cx).await.unwrap(),
+                    Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+                ));
+                let event = subscription.next_event(&cx).await;
+                if accepted {
+                    assert!(matches!(
+                        event.unwrap(),
+                        Some(ModernHttpSubscriptionListenEvent::Notification(_))
+                    ));
+                    assert!(matches!(
+                        subscription.next_event(&cx).await.unwrap(),
+                        Some(ModernHttpSubscriptionListenEvent::Terminal { .. })
+                    ));
+                    assert_eq!(subscription.records_delivered(), 3);
+                } else {
+                    assert!(matches!(
+                        event,
+                        Err(ClientCredentialsCoreSubscriptionError::InvalidResponse)
+                    ));
+                    assert_eq!(subscription.records_delivered(), 1);
+                }
+                assert!(subscription.is_closed());
+                if accepted {
+                    assert!(subscription.next_event(&cx).await.unwrap().is_none());
+                } else {
+                    assert!(matches!(
+                        subscription.next_event(&cx).await,
+                        Err(ClientCredentialsCoreSubscriptionError::Closed)
+                    ));
+                }
+                assert!(cx.checkpoint().is_ok());
+                peer.join().unwrap();
+            }
+        });
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::http_auth::BoundBearerCredential;
+use crate::http_auth::discovery::client_credentials::tasks::ClientCredentialsTasksLimits;
 use crate::http_auth::discovery::client_credentials::tasks::subscriptions::watch::ManagedTaskSnapshotCause;
 use crate::http_auth::discovery::client_credentials::{CLIENT_CREDENTIALS_EXTENSION, ServiceToken};
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -501,6 +502,163 @@ fn tls_multiple_tasks_use_one_credential_and_ignore_late_terminals() {
 #[test]
 fn tls_abandoned_watch_read_releases_socket() {
     isolated("tls_abandoned_watch_read_releases_socket", Case::Abandon);
+}
+
+#[derive(Clone, Copy)]
+enum CompletionFrameBound {
+    Default,
+    Exact,
+    OneByteUnder,
+}
+
+fn completed_task(id: &str, text: &str) -> serde_json::Value {
+    let mut completed = task(id, "completed");
+    completed["result"] = json!({"content":[{"type":"text","text":text}]});
+    completed
+}
+
+fn run_large_completion(bound: CompletionFrameBound) {
+    runtime().block_on(async {
+        let cx = Cx::current().unwrap();
+        let scenario = async {
+            let peer = Peer::new().await;
+            let mut client = peer.client();
+            Arc::get_mut(&mut client.client.inner).unwrap().timeout = Duration::from_secs(15);
+            let notified_text = "n".repeat(2 * 1024 * 1024);
+            let fresh_text = "r".repeat(notified_text.len());
+            let mut notice = completed_task("one", &notified_text);
+            notice["_meta"] = json!({(FINAL_SUBSCRIPTION_ID_META_KEY):"large-watch:1"});
+            let notification =
+                json!({"jsonrpc":"2.0","method":"notifications/tasks","params":notice});
+            let notification_bytes = serde_json::to_vec(&notification).unwrap().len();
+            assert!(notification_bytes > 1024 * 1024);
+            if !matches!(bound, CompletionFrameBound::Default) {
+                let frame_bytes = notification_bytes
+                    - usize::from(matches!(bound, CompletionFrameBound::OneByteUnder));
+                client.limits = ClientCredentialsTasksLimits::new(
+                    64 * 1024,
+                    frame_bytes,
+                    64,
+                    Duration::from_secs(15),
+                )
+                .unwrap();
+            }
+            let watch_policy =
+                ClientCredentialsTaskWatchPolicy::new(Duration::from_secs(15), 4, 8).unwrap();
+            let reject = matches!(bound, CompletionFrameBound::OneByteUnder);
+            let server = async {
+                let (mut stream, listen_id) = peer.listen(json!(["one"]), false).await;
+                assert_eq!(listen_id, json!("large-watch:1"));
+                peer.get("one", "working").await;
+                event(&mut stream, notification).await;
+                if !reject {
+                    peer.discover().await;
+                    let (mut socket, request) = peer.rpc("tasks/get").await;
+                    assert_eq!(request["params"]["taskId"], "one");
+                    let mut result = completed_task("one", &fresh_text);
+                    result["resultType"] = json!("complete");
+                    let response =
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                    assert!(
+                        serde_json::to_vec(&response).unwrap().len() < notification_bytes,
+                        "the fresh result must fit the same exact frame budget"
+                    );
+                    reply(&mut socket, response).await;
+                }
+                closed(&mut stream).await;
+                if reject {
+                    peer.get("sibling", "cancelled").await;
+                }
+                peer.quiet();
+            };
+            let application = async {
+                let mut watch = Box::pin(client.watch_tasks(
+                    &cx,
+                    vec![TaskId::parse("one").unwrap()],
+                    "large-watch".to_owned(),
+                    watch_policy,
+                ))
+                .await
+                .unwrap();
+                let initial = watch.next_snapshot(&cx).await.unwrap().unwrap();
+                assert_eq!(initial.cause, ManagedTaskSnapshotCause::Initial);
+                assert!(matches!(initial.task.as_ref(), Task::Working(_)));
+                if reject {
+                    assert!(matches!(
+                        watch.next_snapshot(&cx).await,
+                        Err(ClientCredentialsTaskWatchError::Task(
+                            ClientCredentialsTasksError::Protocol(ManagedTasksError::InvalidResponse)
+                        ))
+                    ));
+                    assert!(matches!(
+                        watch.next_snapshot(&cx).await,
+                        Err(ClientCredentialsTaskWatchError::Closed)
+                    ));
+                    // The failed subscription owns its stream, not its sibling's
+                    // credential or permission to make a fresh independent read.
+                    let mut sibling = Box::pin(client.request(
+                        &cx,
+                        RequestId::String("healthy-discover".to_owned()),
+                        RequestId::String("healthy-get".to_owned()),
+                        ManagedTaskRequest::Get(TaskId::parse("sibling").unwrap()),
+                    ))
+                    .await
+                    .unwrap();
+                    let Some(ManagedTaskEvent::Snapshot(snapshot)) =
+                        sibling.next_event(&cx).await.unwrap()
+                    else {
+                        panic!("the sibling must receive its own terminal snapshot");
+                    };
+                    assert!(matches!(snapshot.task, Task::Cancelled(_)));
+                    assert!(sibling.next_event(&cx).await.unwrap().is_none());
+                    return;
+                }
+                let snapshot = watch.next_snapshot(&cx).await.unwrap().unwrap();
+                assert_eq!(snapshot.cause, ManagedTaskSnapshotCause::ChangeNotification);
+                assert!(matches!(snapshot.task.as_ref(), Task::Completed { .. }));
+                let published = serde_json::to_value(snapshot.task.as_ref()).unwrap();
+                assert_eq!(
+                    published["result"]["content"][0]["text"].as_str(),
+                    Some(fresh_text.as_str()),
+                    "a large notification triggers a fresh read; its payload is never a snapshot"
+                );
+                assert_eq!(watch.remaining_tasks(), 0);
+                assert!(watch.next_snapshot(&cx).await.unwrap().is_none());
+            };
+            Box::pin(pair(server, application)).await;
+            assert_eq!(peer.updates.load(Ordering::SeqCst), 0);
+        };
+        asupersync::time::timeout_at(
+            cx.now().saturating_add_nanos(20_000_000_000),
+            Box::pin(scenario),
+        )
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
+fn tls_default_watch_delivers_large_completion_from_a_fresh_read() {
+    isolated_run(
+        "tls_default_watch_delivers_large_completion_from_a_fresh_read",
+        || run_large_completion(CompletionFrameBound::Default),
+    );
+}
+
+#[test]
+fn tls_watch_accepts_the_exact_large_notification_frame_limit() {
+    isolated_run(
+        "tls_watch_accepts_the_exact_large_notification_frame_limit",
+        || run_large_completion(CompletionFrameBound::Exact),
+    );
+}
+
+#[test]
+fn tls_watch_rejects_one_byte_over_the_explicit_frame_limit_locally() {
+    isolated_run(
+        "tls_watch_rejects_one_byte_over_the_explicit_frame_limit_locally",
+        || run_large_completion(CompletionFrameBound::OneByteUnder),
+    );
 }
 
 mod cancellation;

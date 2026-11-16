@@ -60,6 +60,7 @@ use super::{
     validate_optional_array, within,
 };
 use crate::http_auth::BoundBearerCredential;
+use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 use crate::http_executor::{
     ModernHttpExecutor, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseMetadata,
     ModernHttpResponseStream, ModernHttpSseResponseStream, ResourceTlsTrust,
@@ -72,7 +73,7 @@ const MAX_TOKEN_BYTES: usize = 64 * 1024;
 const MAX_TOKEN_RESPONSE_BYTES: usize = SecurityDocumentKind::TokenResponse.byte_limit();
 const MAX_SECRET_BYTES: usize = 4096;
 const MAX_SECRET_GRANT_BYTES: usize = 64 * 1024;
-const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = MAX_MANAGED_MCP_MESSAGE_BYTES;
 const MAX_ACQUISITIONS: usize = 64;
 
 /// A host-selected client-password method, fixed before issuer discovery.
@@ -657,6 +658,31 @@ impl ClientCredentialsClient {
         discovery_id: RequestId,
         request_id: RequestId,
     ) -> Result<ClientCredentialsResponse, ClientCredentialsError> {
+        Box::pin(self.execute_core_with_cancellation_and_discovery_limit(
+            cx,
+            cancellation,
+            request,
+            discovery_id,
+            request_id,
+            MAX_MANAGED_MCP_MESSAGE_BYTES,
+        ))
+        .await
+    }
+
+    // Typed callers carry their frame bound through negotiation as well as the
+    // eventual response. The raw API uses the ordinary MCP message maximum.
+    async fn execute_core_with_cancellation_and_discovery_limit(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        discovery_id: RequestId,
+        request_id: RequestId,
+        maximum_discovery_bytes: usize,
+    ) -> Result<ClientCredentialsResponse, ClientCredentialsError> {
+        if !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&maximum_discovery_bytes) {
+            return Err(ClientCredentialsError::InvalidRequest);
+        }
         if discovery_id.correlates_with(&request_id) {
             return Err(ClientCredentialsError::InvalidRequest);
         }
@@ -710,7 +736,11 @@ impl ClientCredentialsClient {
                     Some(&snapshot),
                     async {
                         response
-                            .read_to_end_with_cancellation(cx, cancellation, MAX_TOKEN_BYTES)
+                            .read_to_end_with_cancellation(
+                                cx,
+                                cancellation,
+                                maximum_discovery_bytes,
+                            )
                             .await
                             .map_err(|_| ClientCredentialsError::Transport)
                     },
@@ -1090,7 +1120,7 @@ fn admit_resource(
     {
         return Err(ClientCredentialsError::Negotiation);
     }
-    let result = decoded_result(request, id, bytes, MAX_TOKEN_BYTES)
+    let result = decoded_result(request, id, bytes, MAX_MANAGED_MCP_MESSAGE_BYTES)
         .map_err(|_| ClientCredentialsError::Negotiation)?;
     let CoreResult::Final(FinalCoreResult::Discover(discovery)) = &result else {
         return Err(ClientCredentialsError::Negotiation);
@@ -2047,6 +2077,22 @@ mod tests {
     }
 
     #[test]
+    fn machine_discovery_uses_the_mcp_payload_budget_without_widening_token_limits() {
+        let request = declared_discovery();
+        let mut response: Value = serde_json::from_slice(&discovery_reply(json!({}))).unwrap();
+        response["result"]["instructions"] = json!("x".repeat(2 * 1024 * 1024));
+        let bytes = serde_json::to_vec(&response).unwrap();
+        assert!(bytes.len() > MAX_TOKEN_BYTES);
+        assert!(admit_resource(&request, &RequestId::Number(7), &bytes).is_ok());
+        assert!(admit_resource(&request, &RequestId::Number(8), &bytes).is_err());
+        // Only MCP discovery receives the MCP budget. Secret grant and token
+        // bounds remain independent and must not inherit the larger constant.
+        assert_eq!(MAX_TOKEN_BYTES, 64 * 1024);
+        assert_eq!(MAX_SECRET_GRANT_BYTES, 64 * 1024);
+        assert_eq!(MAX_TOKEN_RESPONSE_BYTES, SecurityDocumentKind::TokenResponse.byte_limit());
+    }
+
+    #[test]
     fn optional_advertisement_does_not_bypass_version_correlation_or_document_bounds() {
         let request = declared_discovery();
         let valid = discovery_reply(json!({}));
@@ -2068,7 +2114,7 @@ mod tests {
             serde_json::to_vec(&json!([serde_json::from_slice::<Value>(&valid).unwrap()])).unwrap();
         assert!(admit_resource(&request, &RequestId::Number(7), &array).is_err());
         let mut oversized = valid;
-        oversized.resize(MAX_TOKEN_BYTES + 1, b' ');
+        oversized.resize(MAX_MANAGED_MCP_MESSAGE_BYTES + 1, b' ');
         assert!(admit_resource(&request, &RequestId::Number(7), &oversized).is_err());
     }
 

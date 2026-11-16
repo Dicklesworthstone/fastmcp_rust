@@ -14,7 +14,7 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{CoreRequest, FinalInputResponses, RequestId};
 
 use super::super::super::{
-    ClientCredentialsError, ClientCredentialsSnapshot, MAX_TOKEN_BYTES, active, admit_resource,
+    ClientCredentialsError, ClientCredentialsSnapshot, active, admit_resource,
     authorize, check_token, prepare,
 };
 use super::{
@@ -572,7 +572,7 @@ async fn discover(
             return Err(ClientCredentialsError::Negotiation.into());
         }
         let bytes = response
-            .read_to_end_with_cancellation(cx, cancellation, MAX_TOKEN_BYTES.min(frame_bytes))
+            .read_to_end_with_cancellation(cx, cancellation, frame_bytes)
             .await
             .map_err(terminal_http_error)?;
         admit_resource(&request, id, &bytes)?;
