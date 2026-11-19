@@ -36,10 +36,21 @@ description = "Compile-time proof that the published facade is sufficient for th
 resolver = "3"
 
 [features]
-# OFF by default, and the default build must stay green. Checking with this
-# feature on MUST FAIL: that failure is the only evidence this crate can detect
-# a closure defect at all, and an instrument that has never failed is not known
-# to work. src/lib.rs says what each negative proves.
+# Keeping `default = ["readme-default"]` preserves the README consumer's default
+# posture for a bare `cargo check`, while `--no-default-features` isolates the
+# ModernOnly profile and `--no-default-features --features proxy` isolates the
+# cross-profile configuration that previously hid `ProgressParams`.
+default = ["readme-default"]
+readme-default = ["fastmcp-rust/legacy-2024-11-05", "fastmcp-rust/tasks"]
+apps = ["fastmcp-rust/apps"]
+proxy = ["fastmcp-rust/proxy"]
+websocket = ["fastmcp-rust/websocket-experimental"]
+auth-server = ["fastmcp-rust/builtin-auth-server"]
+
+# OFF by default, and every positive profile build must stay green. Checking
+# with this feature on MUST FAIL: that failure is the only evidence this crate
+# can detect a closure defect at all, and an instrument that has never failed is
+# not known to work. src/lib.rs says what each profile-specific negative proves.
 planted-negative = []
 
 # The two shipped JWT resource verifiers, reached the way a consumer must reach
@@ -52,4 +63,4 @@ planted-negative = []
 jwt-provider-reachable = ["fastmcp-rust/jwt-resource-auth"]
 
 [dependencies]
-fastmcp-rust = { path = "../crates/fastmcp" }
+fastmcp-rust = { path = "../crates/fastmcp", default-features = false }

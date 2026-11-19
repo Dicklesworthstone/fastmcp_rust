@@ -43,28 +43,39 @@
 //!    states in its own header that it cannot prove, because Cargo gives it
 //!    the facade's dependencies. Its import list, mirrored where it is
 //!    falsifiable.
-//! 6. A planted negative behind an off-by-default feature, so this crate is
-//!    known to be able to go red. Two halves that are not interchangeable: the
-//!    extern-prelude half (a leading `::`, the defect verbatim) and the
-//!    list-membership half (a name the facade deliberately withholds). Only
-//!    the second would turn red if a future edit dropped a name from
-//!    `__private::server`.
+//! 6. Per-profile facade closure coverage (`bd-m692s`):
+//!    - ModernOnly (`--no-default-features`): handler macros, `modern::ServerBuilder`,
+//!      `modern::Server::run_stdio_with_cx`, and unconditional facade types with
+//!      `legacy-2024-11-05` and `tasks` off.
+//!    - `apps`: real `impl McpAppsWireHostEffects` overriding `progress` and
+//!      `cancelled`, plus `initialize` override shape and `PeerError` propagation.
+//!    - `proxy` (including `--no-default-features --features proxy`, isolating
+//!      `proxy` without `legacy-2024-11-05`): constructing a non-empty
+//!      `ProxyLegacyPeerNotifications` including `ProgressParams` and
+//!      `ProgressMarker`.
+//!    - `websocket`: binding `modern::Server::bind_websocket`,
+//!      `BoundWebSocketServer`, `WebSocketClient`, `WebSocketListener`,
+//!      `AsyncWsClientTransport`, `AsyncWsServerTransport`, and
+//!      `WebSocketUpgradeAdmission`.
+//!    - `auth-server`: real `impl OidcJwksReadBackVerifier` using
+//!      `fastmcp_rust::jose::JwksEndpointReadBack`, plus
+//!      `OidcSigningKeyExpiry::new` and external RS256 signer vocabulary.
+//! 7. A planted negative behind an off-by-default feature (`planted-negative`),
+//!    both globally and per profile, so every profile is known to be able to go
+//!    red against a name the facade deliberately withholds under that gate.
 //!
 //! NO-CLAIM. This is a verification surface and earns no capability credit. It
-//! gates one property -- that `fastmcp-rust` alone suffices for the APIs it
-//! publishes, with the runtime the README instructs a consumer to add treated
-//! as consumer-owned rather than as a gap, for the reason recorded at
-//! `serve_documented` -- under ONE feature configuration, the dependency's defaults
-//! (`legacy-2024-11-05` and `tasks`). It says nothing about the `apps`,
-//! `proxy`, `websocket-experimental`, `builtin-auth-server` or
-//! `--no-default-features` facade profiles, whose closure is unmeasured by any
-//! consumer-shaped target; extending to those means adding passthrough
-//! features here and a per-profile invocation, not more code. It also says
-//! nothing about runtime behaviour: resolving a path is not exercising it.
+//! gates one property per profile -- that `fastmcp-rust` alone suffices for the
+//! APIs it publishes under that feature set, with the runtime the README
+//! instructs a consumer to add treated as consumer-owned rather than as a gap,
+//! for the reason recorded at `serve_documented`. It says nothing about runtime
+//! behaviour or MCP conformance: resolving a path is not exercising it.
 
 #![forbid(unsafe_code)]
 
-use fastmcp_rust::{auto::ServerBuilder, prelude::*};
+#[cfg(feature = "readme-default")]
+use fastmcp_rust::auto::ServerBuilder;
+use fastmcp_rust::prelude::*;
 
 // ---------------------------------------------------------------------------
 // 1. The three handler macros, in the exact async shapes that were broken.
@@ -102,12 +113,24 @@ async fn notes() -> String {
 /// Never called. Type-checking it is the whole point: the three generated
 /// handler types must satisfy the facade's own `ToolHandler`, `PromptHandler`
 /// and `ResourceHandler` bounds through paths a consumer can name.
+#[cfg(feature = "readme-default")]
 pub fn build_server() -> fastmcp_rust::auto::Server {
     ServerBuilder::new("consumer-closure-probe", "0.13.0")
         .tool(Echo)
         .prompt(ReviewPrompt)
         .resource(NotesResource)
         .instructions("Consumer-closure probe; not a shipped server.")
+        .build()
+}
+
+/// ModernOnly counterpart, compiled unconditionally — including under
+/// `--no-default-features` where `legacy-2024-11-05` and `tasks` are both off.
+pub fn build_modern_server() -> fastmcp_rust::modern::Server {
+    fastmcp_rust::modern::ServerBuilder::new("consumer-closure-probe-modern", "0.13.0")
+        .tool(Echo)
+        .prompt(ReviewPrompt)
+        .resource(NotesResource)
+        .instructions("ModernOnly consumer-closure probe; not a shipped server.")
         .build()
 }
 
@@ -133,8 +156,15 @@ pub fn build_server() -> fastmcp_rust::auto::Server {
 /// down, which is the documented contract. This function does that and nothing
 /// else; `run_stdio_with_cx` returns `!`, which coerces here exactly as it
 /// does in the README's own `main`.
+#[cfg(feature = "readme-default")]
 pub async fn serve_documented(cx: &Cx) {
     build_server().run_stdio_with_cx(cx).await
+}
+
+/// ModernOnly stdio entry point, compiled unconditionally including under
+/// `--no-default-features`.
+pub async fn serve_modern_documented(cx: &Cx) {
+    build_modern_server().run_stdio_with_cx(cx).await
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +176,7 @@ pub async fn serve_documented(cx: &Cx) {
 /// makes the binding type-check; it is also why this is a stronger check than
 /// an import, since a sealed witness with no public constructor would fail
 /// here and pass a mere `use`.
+#[cfg(feature = "readme-default")]
 pub fn task_store_return_positions() {
     use fastmcp_rust::{
         FinalTaskAcceptedInputClaim, FinalTaskId, FinalTaskInitialWorkClaim,
@@ -375,6 +406,190 @@ pub fn jwt_resource_providers_install_through_the_facade() {
     installs_as_a_token_verifier::<ManagedJwtResourceVerifier>();
 }
 
+// ---------------------------------------------------------------------------
+// 6b. Per-profile facade closure coverage (`bd-m692s`).
+// ---------------------------------------------------------------------------
+
+/// POSITIVE (`apps`) — real `impl McpAppsWireHostEffects` OVERRIDING `progress`
+/// and `cancelled` through the facade alone.
+///
+/// Mirrors `crates/fastmcp/tests/public_reexport_closure.rs:367-426` in a
+/// single-dependency consumer where `fastmcp-protocol` is absent from the
+/// extern prelude. Importing the trait alone is insufficient: the defect fixed
+/// in `fe6bbdab` was that overriding these defaulted methods was unwritable
+/// without naming six types in `fastmcp_rust::mcp_apps_bridge`.
+#[cfg(feature = "apps")]
+#[allow(clippy::unused_async_trait_impl, clippy::no_effect_underscore_binding)]
+pub fn apps_embedder_hooks_override_through_the_facade() {
+    use fastmcp_rust::mcp_apps_bridge::{
+        McpAppsCancelledControlParams, McpAppsJsonRpcError, McpAppsJsonRpcRequestId,
+        McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
+        McpAppsProgressControlParams,
+    };
+    use fastmcp_rust::{Cx, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostEffects};
+
+    struct ProbeAppsEffects;
+
+    impl McpAppsWireHostEffects for ProbeAppsEffects {
+        async fn progress(
+            &mut self,
+            _request_id: &McpAppsJsonRpcRequestId,
+            _params: &McpAppsProgressControlParams,
+        ) -> Result<(), McpAppsHostError> {
+            Ok(())
+        }
+
+        fn cancelled(
+            &mut self,
+            _cx: &Cx,
+            _request_id: &McpAppsJsonRpcRequestId,
+            _params: &McpAppsCancelledControlParams,
+        ) -> Result<(), McpAppsHostError> {
+            Ok(())
+        }
+    }
+
+    fn initialize_override_shape(
+        _params: &McpAppsPinnedInitializeParams,
+        prepared: McpAppsPinnedInitializeResult,
+    ) -> McpAppsPinnedInitializeResult {
+        prepared
+    }
+    let _shape: fn(
+        &McpAppsPinnedInitializeParams,
+        McpAppsPinnedInitializeResult,
+    ) -> McpAppsPinnedInitializeResult = initialize_override_shape;
+
+    fn effects_impl_is_accepted<E: McpAppsWireHostEffects>() {}
+    effects_impl_is_accepted::<ProbeAppsEffects>();
+
+    let _peer_error = |outcome: McpAppsHostRequestOutcome| -> Option<McpAppsJsonRpcError> {
+        match outcome {
+            McpAppsHostRequestOutcome::PeerError(err) => Some(err),
+            _ => None,
+        }
+    };
+}
+
+/// POSITIVE (`proxy`, including `--no-default-features --features proxy`) —
+/// CONSTRUCTS a `ProxyLegacyPeerNotifications` from its three public fields,
+/// including a concrete `ProgressParams` element.
+///
+/// Covers both `2d5bd730` (`ProxyLegacyPeerNotifications` return-position
+/// constructibility) and the cross-profile `9cf3a4ca` defect (`ProgressParams`
+/// previously gated on `legacy-2024-11-05` while demanded by `proxy`-gated
+/// `ProxyBackend::take_legacy_peer_notifications`). Under
+/// `--no-default-features --features proxy`, `legacy-2024-11-05` is OFF, so
+/// this function compiles only because the facade exports `ProgressParams`
+/// under `proxy` itself.
+#[cfg(feature = "proxy")]
+pub fn proxy_legacy_peer_notifications_and_progress_params_through_the_facade()
+-> fastmcp_rust::ProxyLegacyPeerNotifications {
+    use fastmcp_rust::{
+        LoggingLevel, ProgressMarker, ProgressParams, ProxyBackend, ProxyLegacyPeerNotifications,
+    };
+
+    fn backend_trait_is_nameable<B: ProxyBackend>() {}
+    let _ = backend_trait_is_nameable::<fastmcp_rust::ProxyClient>;
+
+    ProxyLegacyPeerNotifications {
+        updated_uris: vec!["probe://resource".to_owned()],
+        log_messages: vec![(LoggingLevel::Warning, fastmcp_rust::json!({"msg": "probe"}))],
+        progress: vec![ProgressParams {
+            progress_marker: ProgressMarker::from("probe-progress"),
+            progress: 0.5,
+            total: Some(1.0),
+            message: Some("in-flight".to_owned()),
+        }],
+    }
+}
+
+/// POSITIVE (`websocket`) — binds the experimental WebSocket listener,
+/// transport, and policy-pinned `modern::Server::bind_websocket` surface
+/// through the facade alone.
+#[cfg(feature = "websocket")]
+pub async fn websocket_server_and_client_closure_through_the_facade(
+    cx: &Cx,
+) -> McpResult<fastmcp_rust::BoundWebSocketServer> {
+    use fastmcp_rust::transport::websocket::WebSocketListener as TransportWebSocketListener;
+    use fastmcp_rust::{
+        AsyncWsClientTransport, AsyncWsServerTransport, WebSocketClient, WebSocketListener,
+        WebSocketNonquiescentShutdown, WebSocketResponse, WebSocketServerShutdown,
+        WebSocketUpgradeAdmission,
+    };
+
+    let _: Option<WebSocketListener> = None;
+    let _: Option<TransportWebSocketListener> = None;
+    let _: Option<WebSocketUpgradeAdmission> = None;
+    let _: Option<WebSocketResponse> = None;
+    let _: Option<WebSocketServerShutdown> = None;
+    let _: Option<WebSocketNonquiescentShutdown> = None;
+    let _: Option<AsyncWsClientTransport<()>> = None;
+    let _: Option<AsyncWsServerTransport<()>> = None;
+    let _: Option<WebSocketClient<()>> = None;
+
+    build_modern_server().bind_websocket(cx, "127.0.0.1:0").await
+}
+
+/// POSITIVE (`auth-server`) — real `impl OidcJwksReadBackVerifier` using
+/// `fastmcp_rust::jose::JwksEndpointReadBack`, plus `OidcSigningKeyExpiry::new`
+/// and external RS256 signer vocabulary through the facade alone.
+#[cfg(feature = "auth-server")]
+#[allow(clippy::no_effect_underscore_binding)]
+pub fn auth_server_oidc_readback_verifier_and_jose_closure() {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use fastmcp_rust::jose::{
+        CanonicalRs256PublicJwks, ExternalRs256SignDisposition, ExternalRs256Signer,
+        ExternalRs256SignerBackend, ExternalRs256SigningRequest, JwksEndpointReadBack,
+        JwsSigningError,
+    };
+    use fastmcp_rust::server::oidc::{
+        OidcError, OidcJwksReadBackVerifier, OidcSigningActivationStatus,
+        OidcSigningActivationStoreRecord, OidcSigningKeyExpiry,
+    };
+
+    struct ProbeReadBackVerifier;
+
+    impl OidcJwksReadBackVerifier for ProbeReadBackVerifier {
+        fn read_back<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _endpoints: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<JwksEndpointReadBack>, OidcError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct ProbeExternalSignerBackend;
+
+    impl ExternalRs256SignerBackend for ProbeExternalSignerBackend {
+        fn sign<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _request: ExternalRs256SigningRequest,
+        ) -> Pin<Box<dyn Future<Output = ExternalRs256SignDisposition> + Send + 'a>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn verifier_is_accepted<V: OidcJwksReadBackVerifier>() {}
+    verifier_is_accepted::<ProbeReadBackVerifier>();
+
+    fn signer_backend_is_accepted<B: ExternalRs256SignerBackend>() {}
+    signer_backend_is_accepted::<ProbeExternalSignerBackend>();
+
+    let _expiry_ctor: fn(i64, Vec<u8>) -> Result<OidcSigningKeyExpiry, OidcError> =
+        OidcSigningKeyExpiry::new;
+    let _: Option<ExternalRs256Signer> = None;
+    let _: Option<CanonicalRs256PublicJwks> = None;
+    let _: Option<JwsSigningError> = None;
+    let _: Option<OidcSigningActivationStatus> = None;
+    let _: Option<OidcSigningActivationStoreRecord> = None;
+}
+
 /// NEGATIVE 1 — the EXTERN PRELUDE half. Differs from the positive above in
 /// exactly one dimension: a leading `::`. That is the defect verbatim; the
 /// prompt and resource expansions emitted
@@ -401,6 +616,47 @@ pub fn negative_leading_colon_names_an_unlinked_crate() {
 #[cfg(feature = "planted-negative")]
 pub fn negative_withheld_name_is_not_in_the_private_server_list() {
     let _: Option<fastmcp_rust::__private::server::ServerBuilder> = None;
+}
+
+/// NEGATIVE (ModernOnly, `--no-default-features`) — verifies that disabling
+/// `readme-default` genuinely withholds `auto::ServerBuilder` (`legacy-2024-11-05`)
+/// and `FinalTaskAcceptedInputClaim` (`tasks`) from the consumer surface.
+#[cfg(all(not(feature = "readme-default"), feature = "planted-negative"))]
+pub fn negative_modern_only_withholds_auto_and_tasks() {
+    let _: Option<fastmcp_rust::auto::ServerBuilder> = None;
+    let _: Option<fastmcp_rust::FinalTaskAcceptedInputClaim> = None;
+}
+
+/// NEGATIVE (`apps`) — verifies that `mcp_apps_bridge` types remain withheld
+/// from the curated `__private::protocol` list under the `apps` profile.
+#[cfg(all(feature = "apps", feature = "planted-negative"))]
+pub fn negative_apps_withheld_from_private_protocol_list() {
+    let _: Option<fastmcp_rust::__private::protocol::McpAppsJsonRpcRequestId> = None;
+}
+
+/// NEGATIVE (`proxy`) — verifies that the sealed witness
+/// `PreparedIncrementalHttpListen` remains withheld under the `proxy` profile
+/// per `crates/fastmcp/src/lib.rs:1039-1042`.
+#[cfg(all(feature = "proxy", feature = "planted-negative"))]
+pub fn negative_proxy_withheld_sealed_witness() {
+    let _: Option<fastmcp_rust::PreparedIncrementalHttpListen> = None;
+}
+
+/// NEGATIVE (`websocket`) — verifies that raw `AsyncWsClientTransport` remains
+/// withheld from the policy-pinned `modern` namespace per
+/// `crates/fastmcp/src/lib.rs:3080-3082`.
+#[cfg(all(feature = "websocket", feature = "planted-negative"))]
+pub fn negative_websocket_withheld_from_modern_namespace() {
+    let _: Option<fastmcp_rust::modern::AsyncWsClientTransport<()>> = None;
+}
+
+/// NEGATIVE (`auth-server`) — verifies that crate-private `OidcHttpRoutes` and
+/// forbidden local-signing `jose::EncodingKey` remain withheld under
+/// `builtin-auth-server`.
+#[cfg(all(feature = "auth-server", feature = "planted-negative"))]
+pub fn negative_auth_server_withheld_internal_routes_and_local_signing_key() {
+    let _: Option<fastmcp_rust::server::oauth::OidcHttpRoutes> = None;
+    let _: Option<fastmcp_rust::jose::EncodingKey> = None;
 }
 
 // ---------------------------------------------------------------------------
