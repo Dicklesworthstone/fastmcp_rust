@@ -933,6 +933,370 @@ mod websocket {
             .unwrap();
     }
 
+    #[derive(Default)]
+    struct TaskCallControl {
+        cancel_on_result: std::sync::Mutex<Option<McpRequestCancellation>>,
+        write_limit: std::sync::Mutex<Option<usize>>,
+        written: std::sync::atomic::AtomicUsize,
+        wakeups: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::task::Wake for TaskCallControl {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wakeups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.wakeups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct TaskCallIo {
+        inner: VirtualTcpStream,
+        control: std::sync::Arc<TaskCallControl>,
+    }
+
+    impl asupersync::io::AsyncRead for TaskCallIo {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &mut asupersync::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let before = buffer.filled().len();
+            let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, buffer);
+            if matches!(result, Poll::Ready(Ok(())))
+                && buffer.filled()[before..].ends_with(b"}}")
+                && let Some(cancellation) = this.control.cancel_on_result.lock().unwrap().take()
+            {
+                cancellation.cancel();
+            }
+            result
+        }
+    }
+
+    impl asupersync::io::AsyncWrite for TaskCallIo {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let mut limit = this.control.write_limit.lock().unwrap();
+            if *limit == Some(0) {
+                // No peer or timer wake: the independent cancellation token
+                // must wake a call parked inside its native frame send.
+                return Poll::Pending;
+            }
+            let count = limit.map_or(bytes.len(), |remaining| bytes.len().min(remaining));
+            let result = std::pin::Pin::new(&mut this.inner).poll_write(cx, &bytes[..count]);
+            if let Poll::Ready(Ok(written)) = result {
+                this.control
+                    .written
+                    .fetch_add(written, std::sync::atomic::Ordering::SeqCst);
+                if let Some(remaining) = limit.as_mut() {
+                    *remaining -= written;
+                }
+            }
+            result
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    async fn connect_task_call(
+        cx: &Cx,
+        advertised: bool,
+        callbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (
+        WebSocketClient<TaskCallIo>,
+        VirtualTcpStream,
+        std::sync::Arc<TaskCallControl>,
+    ) {
+        let (client_io, mut peer) = VirtualTcpStream::pair(
+            "127.0.0.1:45211".parse().unwrap(),
+            "127.0.0.1:45212".parse().unwrap(),
+        );
+        let mut advertised_discovery: serde_json::Value =
+            serde_json::from_str(&discovery()).unwrap();
+        let extensions = if advertised {
+            std::collections::BTreeMap::from([(
+                fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                json!({}),
+            )])
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        advertised_discovery["result"]["capabilities"] = serde_json::to_value(
+            ServerDiscoverCapabilities::from_registry(
+                &ServerBehaviorRegistry::from_behaviors([
+                    ServerBehavior::ToolsList,
+                    ServerBehavior::ToolsCall,
+                ]),
+                extensions,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        frame(&mut peer, &advertised_discovery.to_string()).await;
+        let control = std::sync::Arc::new(TaskCallControl::default());
+        let handlers =
+            crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                callbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] }) })
+            });
+        let client = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+            .reverse_request_handlers(handlers)
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
+            )
+            .connect_websocket_with_cx(
+                cx,
+                AsyncWsClientTransport::from_upgraded(TaskCallIo {
+                    inner: client_io,
+                    control: std::sync::Arc::clone(&control),
+                }),
+            )
+            .await
+            .unwrap();
+        (client, peer, control)
+    }
+
+    async fn finish_task_call(
+        cx: &Cx,
+        client: &mut WebSocketClient<TaskCallIo>,
+        mut peer: VirtualTcpStream,
+        called: bool,
+        cancelled: bool,
+    ) {
+        let next_id = if called { 3 } else { 2 };
+        assert_eq!(
+            client.next_id, next_id,
+            "no automatic retry, callback, or attachment read"
+        );
+        frame(&mut peer, &format!(r#"{{"jsonrpc":"2.0","id":{next_id},"result":{{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}}}"#)).await;
+        client.list_tools(cx, None).await.unwrap();
+        client.close(cx).await.unwrap();
+        let mut peer = AsyncWsServerTransport::from_upgraded(peer);
+        receive(cx, &mut peer, "server/discover", Some(1)).await;
+        if called {
+            let call = receive(cx, &mut peer, "tools/call", Some(2)).await;
+            let params = call.params.unwrap();
+            assert_eq!(params["name"], "create-work");
+            assert_eq!(params["arguments"], json!({"value":7}));
+            assert_eq!(
+                params["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                    [fastmcp_protocol::TASKS_EXTENSION],
+                json!({})
+            );
+        }
+        if cancelled {
+            let cancellation = receive(cx, &mut peer, "notifications/cancelled", None).await;
+            assert_eq!(cancellation.params.unwrap()["requestId"], 2);
+        }
+        receive(cx, &mut peer, "tools/list", Some(next_id as i64)).await;
+        assert!(matches!(peer.recv(cx).await, Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn websocket_task_call_cancellation_preserves_outcome_families_and_task_receipt() {
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            for family in ["complete", "task", "input_required"] {
+                for cancel_on_result in [false, true] {
+                    let callbacks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let (mut client, mut peer, control) = connect_task_call(
+                        &cx, true, std::sync::Arc::clone(&callbacks),
+                    ).await;
+                    let cancellation = McpRequestCancellation::new();
+                    if cancel_on_result {
+                        *control.cancel_on_result.lock().unwrap() = Some(cancellation.clone());
+                    }
+                    let body = match family {
+                        "complete" => r#"{"resultType":"complete","content":[],"callExtra":true}"#.to_owned(),
+                        "task" => format!(r#"{{"resultType":"task","_meta":{{"receipt":"kept"}},"creationExtra":true,{}"#,
+                            &task("completed", None, 2)[1..]),
+                        "input_required" => r#"{"resultType":"input_required","requestState":"one-use","inputRequests":{"roots":{"method":"roots/list"}}}"#.to_owned(),
+                        _ => unreachable!(),
+                    };
+                    frame(&mut peer, &format!(r#"{{"jsonrpc":"2.0","id":2,"result":{body}}}"#)).await;
+                    let result = client.call_tool_final_outcome_with_cancellation(
+                        &cx, &cancellation, "create-work", json!({"value":7}),
+                    ).await;
+                    assert_eq!(cancellation.is_cancel_requested(), cancel_on_result,
+                        "the actual native read must elect the requested cancellation");
+                    if cancel_on_result && family != "task" {
+                        assert_eq!(result.unwrap_err().code, fastmcp_core::McpErrorCode::RequestCancelled);
+                    } else {
+                        match (family, result.unwrap()) {
+                            ("complete", crate::FinalToolCallOutcome::Complete(result)) => {
+                                assert_eq!(serde_json::to_value(result).unwrap()["callExtra"], true);
+                            }
+                            ("task", crate::FinalToolCallOutcome::Task(created)) => {
+                                assert_completed(&created.task);
+                                assert_eq!(created.additional["creationExtra"], true);
+                                assert_eq!(serde_json::to_value(&created).unwrap()["_meta"]["receipt"], "kept");
+                                let handle = FinalTaskHandle::from_created(&created).unwrap();
+                                assert_completed(handle.task());
+                            }
+                            ("input_required", crate::FinalToolCallOutcome::InputRequired(input)) => {
+                                assert_eq!(serde_json::to_value(input).unwrap()["requestState"], "one-use");
+                            }
+                            _ => panic!("a Task-capable call changed the peer's result family"),
+                        }
+                    }
+                    assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+                    finish_task_call(&cx, &mut client, peer, true, false).await;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn websocket_task_call_cancellation_preflight_has_no_wire_effect() {
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for cancelled in [false, true] {
+                    let callbacks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let (mut client, peer, control) =
+                        connect_task_call(&cx, cancelled, std::sync::Arc::clone(&callbacks)).await;
+                    let before = control.written.load(std::sync::atomic::Ordering::SeqCst);
+                    let cancellation = McpRequestCancellation::new();
+                    if cancelled {
+                        cancellation.cancel();
+                    }
+                    let error = client
+                        .call_tool_final_outcome_with_cancellation(
+                            &cx,
+                            &cancellation,
+                            "create-work",
+                            json!({"value":7}),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        error.code,
+                        if cancelled {
+                            fastmcp_core::McpErrorCode::RequestCancelled
+                        } else {
+                            fastmcp_core::McpErrorCode::InvalidParams
+                        }
+                    );
+                    assert_eq!(
+                        control.written.load(std::sync::atomic::Ordering::SeqCst),
+                        before
+                    );
+                    assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+                    finish_task_call(&cx, &mut client, peer, false, false).await;
+                }
+            });
+    }
+
+    #[test]
+    fn websocket_task_call_cancellation_stops_quiet_response_and_preserves_sibling() {
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let callbacks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let (mut client, peer, control) = connect_task_call(&cx, true, callbacks).await;
+                let cancellation = McpRequestCancellation::new();
+                let mut call = Box::pin(client.call_tool_final_outcome_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    "create-work",
+                    json!({"value":7}),
+                ));
+                let waker = std::task::Waker::from(std::sync::Arc::clone(&control));
+                let mut task_cx = std::task::Context::from_waker(&waker);
+                assert!(call.as_mut().poll(&mut task_cx).is_pending());
+                let wakeups = control.wakeups.load(std::sync::atomic::Ordering::SeqCst);
+                cancellation.cancel();
+                assert!(
+                    control.wakeups.load(std::sync::atomic::Ordering::SeqCst) > wakeups,
+                    "cancellation must wake a quiet response wait without another peer frame"
+                );
+                assert_eq!(
+                    call.await.unwrap_err().code,
+                    fastmcp_core::McpErrorCode::RequestCancelled
+                );
+                finish_task_call(&cx, &mut client, peer, true, true).await;
+            });
+    }
+
+    #[test]
+    fn websocket_task_call_cancellation_stops_uncommitted_or_partial_send() {
+        RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for prefix in [0, 3] {
+                    let callbacks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let (mut client, peer, control) = connect_task_call(&cx, true, callbacks).await;
+                    let before = control.written.load(std::sync::atomic::Ordering::SeqCst);
+                    *control.write_limit.lock().unwrap() = Some(prefix);
+                    let cancellation = McpRequestCancellation::new();
+                    let mut call = Box::pin(client.call_tool_final_outcome_with_cancellation(
+                        &cx,
+                        &cancellation,
+                        "create-work",
+                        json!({"value":7}),
+                    ));
+                    let waker = std::task::Waker::from(std::sync::Arc::clone(&control));
+                    let mut task_cx = std::task::Context::from_waker(&waker);
+                    assert!(call.as_mut().poll(&mut task_cx).is_pending());
+                    assert_eq!(
+                        control.written.load(std::sync::atomic::Ordering::SeqCst),
+                        before + prefix
+                    );
+                    let wakeups = control.wakeups.load(std::sync::atomic::Ordering::SeqCst);
+                    cancellation.cancel();
+                    assert!(
+                        control.wakeups.load(std::sync::atomic::Ordering::SeqCst) > wakeups,
+                        "cancellation must wake a backpressured send without a writable peer"
+                    );
+                    assert_eq!(
+                        call.await.unwrap_err().code,
+                        fastmcp_core::McpErrorCode::RequestCancelled
+                    );
+                    *control.write_limit.lock().unwrap() = None;
+                    assert!(
+                        client.list_tools(&cx, None).await.is_err(),
+                        "an abandoned frame must not be followed by another request"
+                    );
+                    assert!(client.closed);
+                    assert_eq!(
+                        control.written.load(std::sync::atomic::Ordering::SeqCst),
+                        before + prefix,
+                        "cleanup must not flush an uncertain frame suffix or a Close frame"
+                    );
+                    let mut peer = AsyncWsServerTransport::from_upgraded(peer);
+                    receive(&cx, &mut peer, "server/discover", Some(1)).await;
+                    assert!(peer.recv(&cx).await.is_err());
+                }
+            });
+    }
+
     #[test]
     fn public_websocket_task_watch_driver_resolves_inputs_and_delivers_early_completion() {
         use std::sync::{

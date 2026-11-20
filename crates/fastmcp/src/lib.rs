@@ -4714,6 +4714,28 @@ pub mod modern {
                 .await
         }
 
+        /// Calls a Tasks-capable tool under a caller-owned cancellation token.
+        ///
+        /// Complete, Task, and input-required results remain distinct. The
+        /// operation does not invoke input handlers or poll a created Task.
+        /// An already admitted Task receipt survives simultaneous cancellation;
+        /// adopt it with [`FinalTaskHandle::from_created`] without another call.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalToolCallOutcome>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_final_outcome_with_cancellation(cx, cancellation, name, arguments)
+                .await
+        }
+
         /// Calls one Tasks-capable tool while stamping the caller's progress token.
         #[cfg(feature = "tasks")]
         pub async fn call_tool_outcome_with_progress_marker(

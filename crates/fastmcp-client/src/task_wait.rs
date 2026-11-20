@@ -1563,6 +1563,38 @@ impl<IO> WebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    /// Calls one Tasks-capable tool under an independent cancellation token.
+    ///
+    /// The negotiated Tasks profile is required before sending. Complete,
+    /// Task, and input-required outcomes retain their original result family;
+    /// this operation does not invoke input handlers, poll a created Task, or
+    /// repeat a call after an uncertain send. A Task receipt can be adopted
+    /// with [`FinalTaskHandle::from_created`] without another network request.
+    ///
+    /// Cancellation also interrupts a backpressured frame send or quiet
+    /// response wait. Dropping the in-flight request leaves cleanup with the
+    /// existing WebSocket dispatcher. Once a valid Task result has been
+    /// admitted, its receipt wins a simultaneous cancellation so the caller
+    /// does not lose the identifier of accepted work. Other outcomes remain
+    /// cancellation-first. This never remotely cancels the created Task.
+    pub async fn call_tool_final_outcome_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<crate::FinalToolCallOutcome> {
+        let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+        let cx = &caller;
+        guard_websocket_task_operation_with_result(
+            cx,
+            cancellation,
+            self.call_tool_final_outcome(cx, name, arguments),
+            |outcome| matches!(outcome, crate::FinalToolCallOutcome::Task(_)),
+        )
+        .await
+    }
+
     /// Attaches an existing Task through one negotiated, cancellable read.
     ///
     /// Attachment does not create, replay, persist or automatically resume any
@@ -1589,6 +1621,21 @@ async fn guard_websocket_task_operation<T>(
     cx: &Cx,
     cancellation: &McpRequestCancellation,
     operation: impl Future<Output = McpResult<T>>,
+) -> McpResult<T> {
+    guard_websocket_task_operation_with_result(cx, cancellation, operation, |_| false).await
+}
+
+// An admitted Task creation receipt identifies durable work accepted by the
+// peer. It must not be discarded when cancellation arrives in the same poll
+// that admits the response. The ordinary get/update/cancel operations keep
+// their existing cancellation-first policy; only the creating call supplies
+// this exception.
+#[cfg(feature = "websocket-experimental")]
+async fn guard_websocket_task_operation_with_result<T>(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    operation: impl Future<Output = McpResult<T>>,
+    preserve_admitted: impl Fn(&T) -> bool,
 ) -> McpResult<T> {
     let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
     let cx = &caller;
@@ -1624,6 +1671,11 @@ async fn guard_websocket_task_operation<T>(
                 )));
             }
             let result = operation.as_mut().poll(task_cx);
+            if let Poll::Ready(Ok(value)) = &result {
+                if preserve_admitted(value) {
+                    return result;
+                }
+            }
             if let Err(error) = checkpoint_task_operation(cx, cancellation) {
                 return Poll::Ready(Err(error));
             }
