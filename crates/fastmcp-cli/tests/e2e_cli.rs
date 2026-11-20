@@ -5657,3 +5657,311 @@ fn call_wait_without_bounded_platform_output_fails_before_connecting() {
     assert!(stderr_str(&output).contains("requires Unix bounded Task receipt output"));
     assert!(!stderr_str(&output).contains("could not establish"));
 }
+
+/// Exercise bounded pagination through the public binary, including exact
+/// opaque cursors and a failure after a previously accepted page. The peer is
+/// deliberately independent of the Rust client's pagination implementation.
+#[cfg(unix)]
+mod inspect_pagination {
+    use super::*;
+    use serde_json::Value;
+
+    const PEER: &str = r#"
+import http.server
+import json
+import sys
+
+mode, era, transport, log_path, ready_path = sys.argv[1:]
+pages = {}
+families = {
+    "tools/list": "tools",
+    "resources/list": "resources",
+    "resources/templates/list": "resourceTemplates",
+    "prompts/list": "prompts",
+}
+
+def respond(request):
+    with open(log_path, "a", encoding="utf-8") as log:
+        log.write(json.dumps(request, ensure_ascii=False) + "\n")
+    if "id" not in request:
+        return None
+    method = request["method"]
+    if method in ("server/discover", "initialize"):
+        capabilities = {"tools": {}, "resources": {}, "prompts": {}}
+        identity = {"name": "paginated-peer", "version": "1"}
+        if era == "legacy":
+            assert method == "initialize"
+            result = {"protocolVersion": "2024-11-05", "capabilities": capabilities,
+                      "serverInfo": identity}
+        else:
+            assert method == "server/discover"
+            result = {"resultType": "complete", "supportedVersions": ["2026-07-28"],
+                      "capabilities": capabilities, "ttlMs": 60000, "cacheScope": "private",
+                      "_meta": {"io.modelcontextprotocol/serverInfo": identity}}
+    else:
+        assert method in families, "inspection must only read the four catalogs"
+        page = pages.get(method, 0)
+        pages[method] = page + 1
+        params = request.get("params", {})
+        if page == 0:
+            assert "cursor" not in params, "first page must omit the cursor"
+        else:
+            assert params.get("cursor") == "", "empty opaque cursor must be echoed exactly"
+        if mode == "invalid_second" and method == "tools/list" and page == 1:
+            return {"jsonrpc": "2.0", "id": request["id"],
+                    "error": {"code": -32602, "message": "rejected continuation"}}
+        count = 130 if mode == "item_limit" and method == "tools/list" else 1
+        members = []
+        for offset in range(count):
+            number = page * count + offset
+            name = "item-" + str(number)
+            if method == "tools/list":
+                item = {"name": name, "inputSchema": {"type": "object"}}
+            elif method == "resources/list":
+                item = {"name": name, "uri": "test://catalog/" + str(number)}
+            elif method == "resources/templates/list":
+                item = {"name": name, "uriTemplate": "test://catalog/" + str(number) + "/{key}"}
+            else:
+                item = {"name": name, "arguments": []}
+            if era == "modern" and mode != "item_limit":
+                item["_meta"] = {"com.example/page": page, "com.example/label": "公開 café"}
+            members.append(item)
+        result = {families[method]: members}
+        if era == "modern":
+            result.update({"resultType": "complete", "ttlMs": 60000, "cacheScope": "private"})
+        if page < 2:
+            result["nextCursor"] = ""
+    return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+
+if transport == "stdio":
+    for line in sys.stdin:
+        response = respond(json.loads(line))
+        if response is not None:
+            print(json.dumps(response, ensure_ascii=False), flush=True)
+else:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def do_POST(self):
+            assert self.path == "/mcp"
+            length = int(self.headers["Content-Length"])
+            assert 0 < length <= 65536
+            response = respond(json.loads(self.rfile.read(length)))
+            payload = json.dumps(response, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+            self.close_connection = True
+        def log_message(self, *args):
+            pass
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    with open(ready_path, "w", encoding="utf-8") as ready:
+        ready.write("http://127.0.0.1:" + str(server.server_port) + "/mcp")
+    server.serve_forever()
+"#;
+
+    const SAVED_REPORT: &[u8] = b"previous complete inspection\n";
+
+    fn inspect(
+        mode: &str,
+        http: bool,
+        legacy: bool,
+        maximum_pages: Option<&str>,
+        save_report: bool,
+    ) -> (Output, Vec<Value>, Option<Vec<u8>>) {
+        let root = TestTempDir::new("inspect-pagination");
+        let script = root.join("peer.py");
+        let log = root.join("requests.jsonl");
+        let ready = root.join("ready");
+        let report = root.join("inspection.json");
+        std::fs::write(&script, PEER).unwrap();
+        let peer_arguments = [
+            mode,
+            if legacy { "legacy" } else { "modern" },
+            if http { "http" } else { "stdio" },
+            log.to_str().unwrap(),
+            ready.to_str().unwrap(),
+        ];
+        let mut command = Command::new(get_binary_path());
+        command.args([
+            "inspect",
+            "--format",
+            "json",
+            "--protocol-policy",
+            if legacy { "legacy-only" } else { "modern-only" },
+        ]);
+        if let Some(maximum) = maximum_pages {
+            command.args(["--max-pages", maximum]);
+        }
+        if save_report {
+            std::fs::write(&report, SAVED_REPORT).unwrap();
+            command.arg("--output").arg(&report);
+        }
+        let mut peer = if http {
+            let mut peer_command = Command::new("python3");
+            peer_command
+                .arg(&script)
+                .args(peer_arguments)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(root.join("peer.stderr")).unwrap());
+            let peer = ProcessGroupGuard::spawn(&mut peer_command);
+            let started = Instant::now();
+            let endpoint = loop {
+                if let Ok(endpoint) = std::fs::read_to_string(&ready)
+                    && endpoint.starts_with("http://")
+                    && endpoint.ends_with("/mcp")
+                {
+                    break endpoint;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "HTTP pagination peer did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            command.args(["--http-url", &endpoint]);
+            Some(peer)
+        } else {
+            command.arg("python3").arg(&script).args(peer_arguments);
+            None
+        };
+        let output = run_with_deadline(command, Duration::from_secs(15))
+            .expect("bounded paginated inspection");
+        if let Some(peer) = peer.as_mut() {
+            peer.kill_and_reap().expect("HTTP pagination peer cleanup");
+        }
+        let requests = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|request: &Value| request.get("id").is_some())
+            .collect();
+        let saved = save_report.then(|| std::fs::read(report).unwrap());
+        (output, requests, saved)
+    }
+
+    fn assert_pages(output: &Output, requests: &[Value], pages: usize, legacy: bool) {
+        assert!(output.status.success(), "{}", stderr_str(output));
+        let report = inspect_json_stdout(output);
+        assert_eq!(
+            report["schema"],
+            if legacy {
+                "fastmcp.cli.inspect/v1"
+            } else {
+                "fastmcp.cli.inspect/v2"
+            },
+        );
+        assert_eq!(report["truncated"], pages < 3);
+        assert_eq!(requests.len(), 1 + 4 * pages);
+        assert_eq!(
+            requests[0]["method"],
+            if legacy {
+                "initialize"
+            } else {
+                "server/discover"
+            },
+        );
+        for (index, (method, field)) in [
+            ("tools/list", "tools"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resource_templates"),
+            ("prompts/list", "prompts"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let items = report[field].as_array().unwrap();
+            assert_eq!(items.len(), pages, "{field}");
+            for (page, item) in items.iter().enumerate() {
+                assert_eq!(item["name"], format!("item-{page}"));
+                let request = &requests[1 + index * pages + page];
+                assert_eq!(request["method"], method);
+                if page == 0 {
+                    assert!(request["params"].get("cursor").is_none());
+                } else {
+                    assert_eq!(request["params"]["cursor"], "");
+                }
+                if !legacy {
+                    assert_eq!(item["_meta"]["com.example/page"], page);
+                    assert_eq!(item["_meta"]["com.example/label"], "公開 café");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cli_inspect_pagination_stdio_follows_opaque_cursors_and_retains_metadata() {
+        let (output, requests, _) = inspect("normal", false, false, Some("3"), false);
+        assert_pages(&output, &requests, 3, false);
+    }
+
+    #[test]
+    fn cli_inspect_pagination_http_follows_opaque_cursors_and_retains_metadata() {
+        let (output, requests, _) = inspect("normal", true, false, Some("3"), false);
+        assert_pages(&output, &requests, 3, false);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn cli_inspect_pagination_legacy_stdio_retains_selected_era() {
+        let (output, requests, _) = inspect("normal", false, true, Some("3"), false);
+        assert_pages(&output, &requests, 3, true);
+    }
+
+    #[test]
+    fn cli_inspect_pagination_default_and_explicit_limit_report_partial_catalogs() {
+        for http in [false, true] {
+            for (maximum, pages) in [(None, 1), (Some("2"), 2)] {
+                let (output, requests, _) = inspect("normal", http, false, maximum, false);
+                assert_pages(&output, &requests, pages, false);
+            }
+        }
+    }
+
+    #[test]
+    fn cli_inspect_pagination_item_budget_is_shared_between_pages() {
+        for http in [false, true] {
+            let (output, requests, _) = inspect("item_limit", http, false, Some("3"), false);
+            assert!(output.status.success(), "{}", stderr_str(&output));
+            let report = inspect_json_stdout(&output);
+            assert_eq!(report["tools"].as_array().unwrap().len(), 256);
+            assert_eq!(report["tools"][255]["name"], "item-255");
+            assert_eq!(report["truncated"], true);
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == "tools/list")
+                    .count(),
+                2,
+                "do not fetch a third tools page after the aggregate item limit",
+            );
+            assert_eq!(requests.len(), 1 + 2 + 3 * 3);
+        }
+    }
+
+    #[test]
+    fn cli_inspect_pagination_later_error_emits_no_catalog_or_output_file_change() {
+        for http in [false, true] {
+            let (output, requests, saved) = inspect("invalid_second", http, false, Some("3"), true);
+            assert!(!output.status.success());
+            assert_eq!(saved.as_deref(), Some(SAVED_REPORT));
+            let error = inspect_json_stdout(&output);
+            assert_eq!(error["schema"], "fastmcp.cli.error/v2");
+            assert_eq!(error["success"], false);
+            for field in ["tools", "resources", "resource_templates", "prompts"] {
+                assert!(error.get(field).is_none(), "no partial {field} on failure");
+            }
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request["method"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["server/discover", "tools/list", "tools/list"],
+            );
+            assert_eq!(requests[2]["params"]["cursor"], "");
+        }
+    }
+}

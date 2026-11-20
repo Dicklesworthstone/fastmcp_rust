@@ -669,6 +669,11 @@ enum Commands {
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
+        /// Maximum pages per catalog (1-100). Item and byte limits still apply;
+        /// omitted pages or entries are reported as truncated.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+        max_pages: u32,
+
         /// Protocol-policy selection for the client connection.
         #[arg(long, value_enum, default_value_t = CliProtocolPolicy::default())]
         protocol_policy: CliProtocolPolicy,
@@ -1437,6 +1442,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             args,
             format,
             output,
+            max_pages,
             protocol_policy,
         } => match server.as_deref() {
             Some(server) => {
@@ -1447,6 +1453,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                     format,
                     output.as_deref(),
                     protocol_policy,
+                    max_pages,
                 ))
                 .await
             }
@@ -1466,6 +1473,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                     output.as_deref(),
                     protocol_policy,
                     bearer_token_file.as_deref(),
+                    max_pages,
                 ))
                 .await
             }
@@ -8340,6 +8348,7 @@ async fn cmd_inspect(
     format: InspectFormat,
     output: Option<&std::path::Path>,
     protocol_policy: CliProtocolPolicy,
+    max_pages: u32,
 ) -> McpResult<()> {
     validate_cli_protocol_policy(protocol_policy)?;
     let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -8358,50 +8367,14 @@ async fn cmd_inspect(
             InspectIdentity::from_discovery(client.server_info(), client.server_discovery());
         let capabilities = stdio_inspect_capabilities(&client)?;
 
-        // Acquire one typed page per category. MCP's list requests have no item
-        // limit, so the transport may still receive one bounded protocol message,
-        // but inspect retains and bounds that page locally and never follows a
-        // peer cursor into the client's larger auto-pagination budget.
-        let mut acquisition_truncated = false;
-        let tools = if capabilities.advertises("tools") {
-            let (items, truncated) = inspect_tools_result(
-                stdio_inspect_core_request(cx, &mut client, "tools/list").await?,
-            )?;
-            acquisition_truncated |= truncated;
-            items
-        } else {
-            InspectTools::default()
-        };
-
-        let resources = if capabilities.advertises("resources") {
-            let (items, truncated) = inspect_resources_result(
-                stdio_inspect_core_request(cx, &mut client, "resources/list").await?,
-            )?;
-            acquisition_truncated |= truncated;
-            items
-        } else {
-            InspectResources::default()
-        };
-
-        let resource_templates = if capabilities.advertises("resources") {
-            let (items, truncated) = inspect_resource_templates_result(
-                stdio_inspect_core_request(cx, &mut client, "resources/templates/list").await?,
-            )?;
-            acquisition_truncated |= truncated;
-            items
-        } else {
-            InspectResourceTemplates::default()
-        };
-
-        let prompts = if capabilities.advertises("prompts") {
-            let (items, truncated) = inspect_prompts_result(
-                stdio_inspect_core_request(cx, &mut client, "prompts/list").await?,
-            )?;
-            acquisition_truncated |= truncated;
-            items
-        } else {
-            InspectPrompts::default()
-        };
+        let (acquisition_truncated, tools, resources, resource_templates, prompts) =
+            inspect_catalogs(
+                cx,
+                &mut InspectClient::Stdio(&mut client),
+                &capabilities,
+                max_pages,
+            )
+            .await?;
 
         Ok((
             server_info,
@@ -8818,6 +8791,7 @@ async fn cmd_inspect_http(
     output: Option<&std::path::Path>,
     protocol_policy: CliProtocolPolicy,
     bearer_token_file: Option<&Path>,
+    max_pages: u32,
 ) -> McpResult<()> {
     validate_cli_protocol_policy(protocol_policy)?;
     let mut client = Box::pin(
@@ -8840,7 +8814,13 @@ async fn cmd_inspect_http(
         InspectIdentity::from_discovery(client.server_info(), client.server_discovery().as_ref());
     let capabilities = http_inspect_capabilities(&client)?;
     let (acquisition_truncated, tools, resources, resource_templates, prompts) =
-        http_inspect_catalogs(cx, &mut client, &capabilities).await?;
+        inspect_catalogs(
+            cx,
+            &mut InspectClient::Http(&mut client),
+            &capabilities,
+            max_pages,
+        )
+        .await?;
 
     write_inspect_report(
         server_info.as_ref(),
@@ -8887,10 +8867,11 @@ fn http_inspect_capabilities(
 }
 
 #[allow(clippy::type_complexity)]
-async fn http_inspect_catalogs(
+async fn inspect_catalogs(
     cx: &Cx,
-    client: &mut fastmcp_client::HttpClient,
+    client: &mut InspectClient<'_>,
     capabilities: &InspectCapabilities,
+    max_pages: u32,
 ) -> McpResult<(
     bool,
     InspectTools,
@@ -8901,25 +8882,35 @@ async fn http_inspect_catalogs(
     let mut acquisition_truncated = false;
     let tools = if capabilities.advertises("tools") {
         let (items, truncated) =
-            inspect_tools_result(http_inspect_core_request(cx, client, "tools/list").await?)?;
+            inspect_catalog_pages(cx, client, "tools/list", max_pages, inspect_tools_page).await?;
         acquisition_truncated |= truncated;
         items
     } else {
         InspectTools::default()
     };
     let resources = if capabilities.advertises("resources") {
-        let (items, truncated) = inspect_resources_result(
-            http_inspect_core_request(cx, client, "resources/list").await?,
-        )?;
+        let (items, truncated) = inspect_catalog_pages(
+            cx,
+            client,
+            "resources/list",
+            max_pages,
+            inspect_resources_page,
+        )
+        .await?;
         acquisition_truncated |= truncated;
         items
     } else {
         InspectResources::default()
     };
     let resource_templates = if capabilities.advertises("resources") {
-        let (items, truncated) = inspect_resource_templates_result(
-            http_inspect_core_request(cx, client, "resources/templates/list").await?,
-        )?;
+        let (items, truncated) = inspect_catalog_pages(
+            cx,
+            client,
+            "resources/templates/list",
+            max_pages,
+            inspect_resource_templates_page,
+        )
+        .await?;
         acquisition_truncated |= truncated;
         items
     } else {
@@ -8927,7 +8918,8 @@ async fn http_inspect_catalogs(
     };
     let prompts = if capabilities.advertises("prompts") {
         let (items, truncated) =
-            inspect_prompts_result(http_inspect_core_request(cx, client, "prompts/list").await?)?;
+            inspect_catalog_pages(cx, client, "prompts/list", max_pages, inspect_prompts_page)
+                .await?;
         acquisition_truncated |= truncated;
         items
     } else {
@@ -8942,27 +8934,146 @@ async fn http_inspect_catalogs(
     ))
 }
 
-async fn http_inspect_core_request(
+/// Both transports retain their selected-era decoder and caller-owned request
+/// lifetime. A repeated opaque cursor must reach the peer rather than replaying
+/// a cached nonterminal page, so this dedicated inspect client bypasses reuse.
+enum InspectClient<'a> {
+    Stdio(&'a mut Client),
+    Http(&'a mut fastmcp_client::HttpClient),
+}
+
+impl InspectClient<'_> {
+    async fn page(
+        &mut self,
+        cx: &Cx,
+        method: &'static str,
+        cursor: Option<&str>,
+    ) -> McpResult<fastmcp_client::CoreResult> {
+        cx.checkpoint()
+            .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+        let parameters = cursor.map_or_else(
+            || serde_json::json!({}),
+            |cursor| serde_json::json!({"cursor": cursor}),
+        );
+        match self {
+            Self::Stdio(client) => {
+                let cancellation = fastmcp_core::McpRequestCancellation::new();
+                #[cfg(unix)]
+                {
+                    client
+                        .request_core_with_cx(cx, &cancellation, method, parameters)
+                        .await
+                }
+                #[cfg(not(unix))]
+                {
+                    client.request_core_with_cancellation(
+                        cx,
+                        &cancellation,
+                        method,
+                        parameters,
+                        |_| {},
+                    )
+                }
+            }
+            Self::Http(client) => {
+                client.clear_final_result_cache();
+                Box::pin(client.request_final_core(cx, method, parameters))
+                    .await
+                    .map_err(|error| {
+                        fastmcp_core::McpError::internal_error(format!(
+                            "inspect HTTP {method} request failed: {error}"
+                        ))
+                    })
+            }
+        }
+    }
+}
+
+type InspectPage<Legacy, Final> = (InspectCatalog<Legacy, Final>, Option<String>);
+
+/// CLI inspection retains a much smaller prefix than the library's automatic
+/// collectors (whose minimum bounds are 1,000 pages and 100,000 items). Keep the
+/// existing diagnostic limits across all pages without changing opaque-cursor
+/// semantics: empty and repeated cursors continue until an explicit local bound.
+async fn inspect_catalog_pages<Legacy: Serialize, Final: Serialize>(
     cx: &Cx,
-    client: &mut fastmcp_client::HttpClient,
+    client: &mut InspectClient<'_>,
     method: &'static str,
-) -> McpResult<fastmcp_client::CoreResult> {
-    client
-        .request_final_core(cx, method, serde_json::json!({}))
-        .await
-        .map_err(|error| {
-            fastmcp_core::McpError::internal_error(format!(
-                "inspect HTTP {method} request failed: {error}"
-            ))
-        })
+    max_pages: u32,
+    decode: fn(fastmcp_client::CoreResult) -> McpResult<InspectPage<Legacy, Final>>,
+) -> McpResult<(InspectCatalog<Legacy, Final>, bool)> {
+    if !(1..=100).contains(&max_pages) {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "inspect --max-pages must be between 1 and 100",
+        ));
+    }
+    let mut budget = InspectItemBudget::default();
+    let mut catalog = None;
+    let mut cursor = None::<String>;
+    for page_index in 0..max_pages {
+        let (page, next_cursor) = decode(client.page(cx, method, cursor.as_deref()).await?)?;
+        let (page, local_truncated) = budget.retain_catalog(page, method)?;
+        append_inspect_catalog(&mut catalog, page, method)?;
+        let peer_has_more = next_cursor.is_some();
+        if local_truncated || !peer_has_more || page_index + 1 == max_pages || budget.is_full() {
+            return Ok((
+                catalog.ok_or_else(|| unexpected_inspect_result(method))?,
+                local_truncated || peer_has_more,
+            ));
+        }
+        // Match the existing client collection cursor ceiling without logging
+        // the peer's cursor. Its spelling, including an empty string, is opaque.
+        if next_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > 4 * 1024)
+        {
+            return Err(fastmcp_core::McpError::invalid_request(
+                "inspect received a pagination cursor exceeding 4 KiB",
+            ));
+        }
+        cursor = next_cursor;
+    }
+    Err(unexpected_inspect_result(method))
+}
+
+fn append_inspect_catalog<Legacy, Final>(
+    catalog: &mut Option<InspectCatalog<Legacy, Final>>,
+    page: InspectCatalog<Legacy, Final>,
+    method: &str,
+) -> McpResult<()> {
+    match (catalog.as_mut(), page) {
+        (Some(InspectCatalog::Legacy(items)), InspectCatalog::Legacy(page)) => items.extend(page),
+        (Some(InspectCatalog::Final(items)), InspectCatalog::Final(page)) => items.extend(page),
+        (Some(_), _) => return Err(unexpected_inspect_result(method)),
+        (None, page) => *catalog = Some(page),
+    }
+    Ok(())
+}
+
+fn bounded_inspect_page<Legacy: Serialize, Final: Serialize>(
+    page: InspectPage<Legacy, Final>,
+    method: &str,
+) -> McpResult<(InspectCatalog<Legacy, Final>, bool)> {
+    let (catalog, next_cursor) = page;
+    match catalog {
+        InspectCatalog::Legacy(items) => bound_inspect_items(items, next_cursor.is_some(), method)
+            .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated)),
+        InspectCatalog::Final(items) => bound_inspect_items(items, next_cursor.is_some(), method)
+            .map(|(items, truncated)| (InspectCatalog::Final(items), truncated)),
+    }
 }
 
 fn inspect_tools_result(result: fastmcp_client::CoreResult) -> McpResult<(InspectTools, bool)> {
+    bounded_inspect_page(inspect_tools_page(result)?, "tools/list")
+}
+
+fn inspect_tools_page(
+    result: fastmcp_client::CoreResult,
+) -> McpResult<InspectPage<fastmcp_protocol::Tool, fastmcp_protocol::FinalTool>> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::ToolsList(result)) => {
-            bound_inspect_items(result.tools, result.next_cursor.is_some(), "tools/list")
-                .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated))
+            Ok((InspectCatalog::Legacy(result.tools), result.next_cursor))
         }
         fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ToolsList {
             result,
@@ -8971,8 +9082,7 @@ fn inspect_tools_result(result: fastmcp_client::CoreResult) -> McpResult<(Inspec
             let fastmcp_protocol::FinalListToolsResult {
                 tools, next_cursor, ..
             } = result.payload;
-            bound_inspect_items(tools, next_cursor.is_some(), "tools/list")
-                .map(|(items, truncated)| (InspectCatalog::Final(items), truncated))
+            Ok((InspectCatalog::Final(tools), next_cursor))
         }
         _ => Err(unexpected_inspect_result("tools/list")),
     }
@@ -8981,16 +9091,17 @@ fn inspect_tools_result(result: fastmcp_client::CoreResult) -> McpResult<(Inspec
 fn inspect_resources_result(
     result: fastmcp_client::CoreResult,
 ) -> McpResult<(InspectResources, bool)> {
+    bounded_inspect_page(inspect_resources_page(result)?, "resources/list")
+}
+
+fn inspect_resources_page(
+    result: fastmcp_client::CoreResult,
+) -> McpResult<InspectPage<fastmcp_protocol::Resource, fastmcp_protocol::FinalResource>> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::ResourcesList(
             result,
-        )) => bound_inspect_items(
-            result.resources,
-            result.next_cursor.is_some(),
-            "resources/list",
-        )
-        .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated)),
+        )) => Ok((InspectCatalog::Legacy(result.resources), result.next_cursor)),
         fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ResourcesList {
             result,
             ..
@@ -9000,26 +9111,25 @@ fn inspect_resources_result(
                 next_cursor,
                 ..
             } = result.payload;
-            bound_inspect_items(resources, next_cursor.is_some(), "resources/list")
-                .map(|(items, truncated)| (InspectCatalog::Final(items), truncated))
+            Ok((InspectCatalog::Final(resources), next_cursor))
         }
         _ => Err(unexpected_inspect_result("resources/list")),
     }
 }
 
-fn inspect_resource_templates_result(
+fn inspect_resource_templates_page(
     result: fastmcp_client::CoreResult,
-) -> McpResult<(InspectResourceTemplates, bool)> {
+) -> McpResult<
+    InspectPage<fastmcp_protocol::ResourceTemplate, fastmcp_protocol::FinalResourceTemplate>,
+> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(
             fastmcp_client::LegacyCoreResult::ResourceTemplatesList(result),
-        ) => bound_inspect_items(
-            result.resource_templates,
-            result.next_cursor.is_some(),
-            "resources/templates/list",
-        )
-        .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated)),
+        ) => Ok((
+            InspectCatalog::Legacy(result.resource_templates),
+            result.next_cursor,
+        )),
         fastmcp_client::CoreResult::Final(
             fastmcp_client::FinalCoreResult::ResourceTemplatesList { result, .. },
         ) => {
@@ -9028,24 +9138,24 @@ fn inspect_resource_templates_result(
                 next_cursor,
                 ..
             } = result.payload;
-            bound_inspect_items(
-                resource_templates,
-                next_cursor.is_some(),
-                "resources/templates/list",
-            )
-            .map(|(items, truncated)| (InspectCatalog::Final(items), truncated))
+            Ok((InspectCatalog::Final(resource_templates), next_cursor))
         }
         _ => Err(unexpected_inspect_result("resources/templates/list")),
     }
 }
 
 fn inspect_prompts_result(result: fastmcp_client::CoreResult) -> McpResult<(InspectPrompts, bool)> {
+    bounded_inspect_page(inspect_prompts_page(result)?, "prompts/list")
+}
+
+fn inspect_prompts_page(
+    result: fastmcp_client::CoreResult,
+) -> McpResult<InspectPage<fastmcp_protocol::Prompt, fastmcp_protocol::FinalPrompt>> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::PromptsList(
             result,
-        )) => bound_inspect_items(result.prompts, result.next_cursor.is_some(), "prompts/list")
-            .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated)),
+        )) => Ok((InspectCatalog::Legacy(result.prompts), result.next_cursor)),
         fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::PromptsList {
             result,
             ..
@@ -9055,8 +9165,7 @@ fn inspect_prompts_result(result: fastmcp_client::CoreResult) -> McpResult<(Insp
                 next_cursor,
                 ..
             } = result.payload;
-            bound_inspect_items(prompts, next_cursor.is_some(), "prompts/list")
-                .map(|(items, truncated)| (InspectCatalog::Final(items), truncated))
+            Ok((InspectCatalog::Final(prompts), next_cursor))
         }
         _ => Err(unexpected_inspect_result("prompts/list")),
     }
@@ -9077,35 +9186,75 @@ fn bound_inspect_items<T: Serialize>(
     peer_has_more: bool,
     source: &str,
 ) -> McpResult<(Vec<T>, bool)> {
-    let total_items = items.len();
-    let mut rendered_bytes = 2usize;
-    let mut bounded = Vec::with_capacity(total_items.min(CLI_OUTPUT_MAX_ITEMS));
+    let (items, local_truncated) = InspectItemBudget::default().retain(items, source)?;
+    Ok((items, local_truncated || peer_has_more))
+}
 
-    for item in items {
-        if bounded.len() == CLI_OUTPUT_MAX_ITEMS {
-            break;
-        }
-        let item_bytes = serde_json::to_vec(&item).map_err(|error| {
-            fastmcp_core::McpError::internal_error(format!(
-                "inspect could not size typed {source} data: {error}"
-            ))
-        })?;
-        let separator_bytes = usize::from(!bounded.is_empty());
-        let Some(next_bytes) = rendered_bytes
-            .checked_add(separator_bytes)
-            .and_then(|bytes| bytes.checked_add(item_bytes.len()))
-        else {
-            break;
-        };
-        if next_bytes > INSPECT_CATEGORY_MAX_BYTES {
-            break;
-        }
-        rendered_bytes = next_bytes;
-        bounded.push(item);
+/// One category's retained-item budget, shared by every page. Count commas
+/// between pages as well as within them; modern metadata is sized before any
+/// terminal projection can discard it.
+struct InspectItemBudget {
+    items: usize,
+    bytes: usize,
+}
+
+impl Default for InspectItemBudget {
+    fn default() -> Self {
+        Self { items: 0, bytes: 2 }
+    }
+}
+
+impl InspectItemBudget {
+    fn is_full(&self) -> bool {
+        self.items == CLI_OUTPUT_MAX_ITEMS || self.bytes == INSPECT_CATEGORY_MAX_BYTES
     }
 
-    let truncated = peer_has_more || bounded.len() < total_items;
-    Ok((bounded, truncated))
+    fn retain_catalog<Legacy: Serialize, Final: Serialize>(
+        &mut self,
+        catalog: InspectCatalog<Legacy, Final>,
+        source: &str,
+    ) -> McpResult<(InspectCatalog<Legacy, Final>, bool)> {
+        match catalog {
+            InspectCatalog::Legacy(items) => self
+                .retain(items, source)
+                .map(|(items, truncated)| (InspectCatalog::Legacy(items), truncated)),
+            InspectCatalog::Final(items) => self
+                .retain(items, source)
+                .map(|(items, truncated)| (InspectCatalog::Final(items), truncated)),
+        }
+    }
+
+    fn retain<T: Serialize>(&mut self, items: Vec<T>, source: &str) -> McpResult<(Vec<T>, bool)> {
+        let total_items = items.len();
+        let remaining_items = CLI_OUTPUT_MAX_ITEMS.saturating_sub(self.items);
+        let mut bounded = Vec::with_capacity(total_items.min(remaining_items));
+        for item in items {
+            if self.items == CLI_OUTPUT_MAX_ITEMS {
+                break;
+            }
+            let item_bytes = serde_json::to_vec(&item).map_err(|error| {
+                fastmcp_core::McpError::internal_error(format!(
+                    "inspect could not size typed {source} data: {error}"
+                ))
+            })?;
+            let separator_bytes = usize::from(self.items != 0);
+            let Some(next_bytes) = self
+                .bytes
+                .checked_add(separator_bytes)
+                .and_then(|bytes| bytes.checked_add(item_bytes.len()))
+            else {
+                break;
+            };
+            if next_bytes > INSPECT_CATEGORY_MAX_BYTES {
+                break;
+            }
+            self.bytes = next_bytes;
+            self.items += 1;
+            bounded.push(item);
+        }
+        let truncated = bounded.len() < total_items;
+        Ok((bounded, truncated))
+    }
 }
 
 fn inspect_icon_from_final(
@@ -15391,7 +15540,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                         }).unwrap();
                         let args = vec!["-c".to_owned(), script];
                         let outcome = if inspect {
-                            Box::pin(cmd_inspect(&cx, "sh", &args, InspectFormat::Json, None, policy)).await
+                            Box::pin(cmd_inspect(&cx, "sh", &args, InspectFormat::Json, None, policy, 1)).await
                         } else {
                             Box::pin(cmd_test(
                                 &cx,
@@ -16343,6 +16492,29 @@ IFS= read -r end
                     assert!(output.is_none());
                 }
                 _ => unreachable!("Expected Inspect command"),
+            }
+        }
+
+        #[test]
+        fn inspect_max_pages_cli_bounds() {
+            let cli = Cli::try_parse_from(["fastmcp", "inspect", "./server"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Inspect { max_pages: 1, .. }
+            ));
+            for (value, expected) in [("1", 1), ("100", 100)] {
+                let cli =
+                    Cli::try_parse_from(["fastmcp", "inspect", "--max-pages", value, "./server"])
+                        .unwrap();
+                assert!(
+                    matches!(cli.command, Commands::Inspect { max_pages, .. } if max_pages == expected)
+                );
+            }
+            for value in ["0", "101", "-1"] {
+                assert!(
+                    Cli::try_parse_from(["fastmcp", "inspect", "--max-pages", value, "./server",])
+                        .is_err()
+                );
             }
         }
 
@@ -19674,6 +19846,81 @@ IFS= read -r end
                 .expect("oversized item is omitted without losing the process");
             assert!(items.is_empty());
             assert!(truncated);
+        }
+
+        #[test]
+        fn inspect_pagination_accumulates_under_shared_limits() {
+            let mut bytes = InspectItemBudget::default();
+            let first = "x".repeat(INSPECT_CATEGORY_MAX_BYTES - 8);
+            let (page, truncated) = bytes.retain(vec![first.clone()], "tools/list").unwrap();
+            assert_eq!(page, vec![first.clone()]);
+            assert!(!truncated);
+            let (page, truncated) = bytes.retain(vec!["a".to_owned()], "tools/list").unwrap();
+            assert_eq!(page, vec!["a"]);
+            assert!(!truncated);
+            assert_eq!(
+                serde_json::to_vec(&vec![first, "a".to_owned()])
+                    .unwrap()
+                    .len(),
+                INSPECT_CATEGORY_MAX_BYTES,
+                "the comma between pages must count toward the aggregate bound",
+            );
+            assert!(bytes.is_full());
+            let (page, truncated) = bytes.retain(vec![""], "tools/list").unwrap();
+            assert!(page.is_empty());
+            assert!(truncated);
+
+            let mut items = InspectItemBudget::default();
+            let (first, truncated) = items
+                .retain(vec![0; CLI_OUTPUT_MAX_ITEMS - 1], "tools/list")
+                .unwrap();
+            assert_eq!(first.len(), CLI_OUTPUT_MAX_ITEMS - 1);
+            assert!(!truncated);
+            let (second, truncated) = items.retain(vec![1, 2], "tools/list").unwrap();
+            assert_eq!(second, vec![1]);
+            assert!(truncated);
+            assert!(items.is_full());
+        }
+
+        #[test]
+        fn inspect_pagination_rejects_mixed_era_without_losing_retained_items() {
+            let mut catalog = Some(InspectCatalog::<u32, u32>::Final(vec![1]));
+            append_inspect_catalog(&mut catalog, InspectCatalog::Final(vec![2]), "tools/list")
+                .unwrap();
+            assert!(
+                append_inspect_catalog(&mut catalog, InspectCatalog::Legacy(vec![3]), "tools/list")
+                    .is_err()
+            );
+            assert!(matches!(catalog, Some(InspectCatalog::Final(items)) if items == vec![1, 2]));
+        }
+
+        #[test]
+        fn inspect_pagination_preserves_opaque_cursor_presence() {
+            let parameters = serde_json::json!({
+                "_meta": fastmcp_protocol::FinalRequestMeta::new(fastmcp_protocol::ClientCapabilities::default()),
+            });
+            let request = fastmcp_protocol::CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                "tools/list",
+                Some(&parameters),
+            )
+            .unwrap();
+            for cursor in [None, Some(""), Some("repeated")] {
+                let mut wire = serde_json::json!({
+                    "resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private",
+                });
+                if let Some(cursor) = cursor {
+                    wire["nextCursor"] = serde_json::json!(cursor);
+                }
+                let (page, observed) = inspect_tools_page(
+                    request
+                        .decode_result(&serde_json::to_string(&wire).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(page.len(), 0);
+                assert_eq!(observed.as_deref(), cursor);
+            }
         }
 
         #[test]
