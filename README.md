@@ -2565,6 +2565,51 @@ and its receive turns retain the native client's bounded synchronous slices.
 After dropping installed routes and other handles, consume the last handle
 with `close_with_cx` to await observable subprocess cleanup.
 
+### Typed extension gateways to WebSocket upstreams
+
+Enable `extension-authoring`, `proxy`, and `websocket-experimental`. The caller
+supplies an owned `AsyncWsClientTransport`, acquired with `connect`, `connect_wss`,
+or its own Upgrade/TLS setup. Reusing the typed echo declaration above:
+
+```rust
+let upstream = modern::ClientBuilder::new()
+    .connect_extension_websocket_upstream_with_cx(
+        cx,
+        transport,
+        EchoExtension.register(make_builder()?)?.build()?,
+        &Settings {},
+    )
+    .await?;
+let registration = make_builder()?
+    .typed_websocket_proxy_request::<Message, Message, _>(
+        "com.example/echo",
+        "echo-params-v1",
+        "echo-result-v1",
+        upstream.clone(),
+    )?
+    .build()?;
+```
+
+Install `registration` on the gateway as above. Both legs independently
+negotiate the complete contract; schema identities and effective settings must
+match. The adapter validates typed payloads and creates fresh upstream IDs and
+metadata. Cloned handles share one connection and admit at most 64 running or
+waiting operations on the caller's runtime.
+
+Awaited cancellation settles native request retirement before connection reuse.
+Dropped requests retain cleanup ownership for the next operation or close.
+After serving finishes, call `upstream.close(cx).await?`; retain the handle to
+retry an acquisition failure. Idle cleanup accepts a cancelled caller; busy
+cleanup requires the caller's timer and has a finite acquisition bound.
+
+Standalone client notifications use
+`typed_websocket_proxy_notification::<Notification, _, _>` with an explicit
+authorization policy and the same complete declaration. They receive fresh
+activation proof, allocate no request ID, and are never retried automatically.
+This adapter supports finite request/results and standalone client notifications;
+request-owned server notifications, Tasks, and subscription relays remain outside
+its supported contract.
+
 ## In-process test clients
 
 Enable the facade's `testing` feature to use `testing::TestClient` with a

@@ -9941,10 +9941,61 @@ where
     where
         IO: Send + 'static,
     {
+        self.request_final_extension_with_optional_cancellation(
+            cx,
+            None,
+            extension_id,
+            method,
+            parameters,
+        )
+        .await
+    }
+
+    /// Sends one admitted extension request with request-local cancellation.
+    ///
+    /// A pre-cancelled token allocates no ID and writes no frame. Cancellation
+    /// after publication uses the native client's bounded retirement path;
+    /// the caller's context and unrelated requests remain usable. A failed
+    /// cancellation write remains a transport failure rather than being
+    /// disguised as a successful cancellation.
+    pub async fn request_final_extension_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<serde_json::Value>
+    where
+        IO: Send + 'static,
+    {
+        self.request_final_extension_with_optional_cancellation(
+            cx,
+            Some(cancellation),
+            extension_id,
+            method,
+            parameters,
+        )
+        .await
+    }
+
+    async fn request_final_extension_with_optional_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<serde_json::Value>
+    where
+        IO: Send + 'static,
+    {
         let admission = self
             .session
             .admit_final_extension_method(extension_id, method)?;
-        if cx.checkpoint().is_err() {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
             return Err(McpError::request_cancelled());
         }
         let parameters = self.with_modern_request_metadata(parameters)?;
@@ -9953,7 +10004,7 @@ where
             .request_admitted_with_raw_result(
                 cx,
                 JsonRpcRequest::new(method, Some(parameters), request_id),
-                None,
+                cancellation,
             )
             .await?;
         if let Some(error) = received.response.error {
@@ -43591,6 +43642,148 @@ exec sleep 2
                 .await
                 .expect("close reusable extension client");
             assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
+    fn clt_ext_websocket_request_cancellation_retires_only_its_own_id() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+                let (client_io, server_io) = async_websocket_pair();
+                let cancellation = McpRequestCancellation::new();
+                let after_publication = cancellation.clone();
+                let mut peer = cx
+                    .spawn(move |peer_cx| async move {
+                        let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                        let JsonRpcMessage::Request(discover) =
+                            server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("discovery request expected");
+                        };
+                        assert_eq!(discover.id, Some(RequestId::Number(1)));
+                        let source = modern_raw_extension_discovery_response(
+                            "cancelled-extension-peer",
+                            Some(serde_json::json!({"mode": "raw"})),
+                        );
+                        let discovery: serde_json::Value = serde_json::from_str(&source).unwrap();
+                        server
+                            .send(
+                                &peer_cx,
+                                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    discover.id.unwrap(),
+                                    discovery["result"].clone(),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                        let JsonRpcMessage::Request(request) = server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("extension request expected");
+                        };
+                        assert_eq!(request.id, Some(RequestId::Number(2)));
+                        assert_eq!(request.method, "example/echo");
+                        after_publication.cancel();
+                        let JsonRpcMessage::Request(cancelled) =
+                            server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("native cancellation notification expected");
+                        };
+                        assert_eq!(cancelled.id, None);
+                        assert_eq!(cancelled.method, "notifications/cancelled");
+                        assert_eq!(cancelled.params.unwrap()["requestId"], 2);
+                        server
+                            .send(
+                                &peer_cx,
+                                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    RequestId::Number(2),
+                                    serde_json::json!({"echoed": {"input": "late"}}),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                        let JsonRpcMessage::Request(reused) = server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("independent extension request expected");
+                        };
+                        assert_eq!(reused.id, Some(RequestId::Number(3)));
+                        assert_eq!(reused.method, "example/echo");
+                        server
+                            .send(
+                                &peer_cx,
+                                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    reused.id.unwrap(),
+                                    serde_json::json!({"echoed": {"input": "live"}}),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            server.recv(&peer_cx).await,
+                            Err(TransportError::Closed)
+                        ));
+                    })
+                    .unwrap();
+                let (id, registry, discovery) = raw_extension_configuration(
+                    ExtensionDirection::ClientToServer,
+                    fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+                );
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                    .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                    .unwrap()
+                    .connect_websocket_with_cx(
+                        &cx,
+                        AsyncWsClientTransport::from_upgraded(client_io),
+                    )
+                    .await
+                    .unwrap();
+                let already_cancelled = McpRequestCancellation::new();
+                already_cancelled.cancel();
+                let error = client
+                    .request_final_extension_with_cancellation(
+                        &cx,
+                        &already_cancelled,
+                        &id,
+                        "example/echo",
+                        serde_json::json!({"input": "never-published"}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert_eq!(client.next_id, 2, "pre-cancellation consumes no request ID");
+                let error = client
+                    .request_final_extension_with_cancellation(
+                        &cx,
+                        &cancellation,
+                        &id,
+                        "example/echo",
+                        serde_json::json!({"input": "cancel-after-send"}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert!(cx.checkpoint().is_ok());
+                assert!(client.transient_request.is_none());
+                let live = McpRequestCancellation::new();
+                let result = client
+                    .request_final_extension_with_cancellation(
+                        &cx,
+                        &live,
+                        &id,
+                        "example/echo",
+                        serde_json::json!({"input": "live"}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["echoed"]["input"], "live");
+                assert!(!live.is_cancel_requested());
+                client.close(&cx).await.unwrap();
+                peer.join(&cx).await.unwrap();
+            })
+            .await
+            .expect("cancellation and same-connection reuse are bounded");
         });
     }
 
