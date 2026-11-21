@@ -618,6 +618,72 @@ impl Harness {
     }
 }
 
+/// Shares the named in-memory providers with the HTTP composition tests. Every
+/// owner still comes from the production MAC/store/restore reservation path;
+/// this fixture does not construct a reserved owner or a durability attestation.
+pub(in crate::http_auth::enterprise) struct ExchangeReplayFixture(Harness);
+
+impl ExchangeReplayFixture {
+    pub(in crate::http_auth::enterprise) fn new(cx: &Cx) -> Self {
+        Self(Harness::new(cx))
+    }
+
+    pub(in crate::http_auth::enterprise) async fn reserve(
+        &self,
+        cx: &Cx,
+        profile: &EnterpriseProfile,
+        assertion: EnterpriseIdentityAssertion,
+        now: SystemTime,
+    ) -> Result<ReservedIdentityAssertion, IdentityAssertionReplayError> {
+        self.0
+            .replay
+            .reserve(cx, profile, assertion, flow(10), now, deadline(cx))
+            .await
+    }
+
+    pub(in crate::http_auth::enterprise) async fn quarantine(&self, cx: &Cx) {
+        let abandoned = self
+            .0
+            .restore
+            .prepare_write(cx, [0xe9; 32], deadline(cx))
+            .await
+            .unwrap();
+        drop(abandoned);
+        assert!(self.0.restore.is_quarantined());
+    }
+
+    pub(in crate::http_auth::enterprise) fn reserved_aliases(&self) -> usize {
+        self.0.journal.lock().unwrap().aliases.len()
+    }
+}
+
+#[test]
+fn reserved_exchange_guard_keeps_profile_monotonic_lifetime_and_restore_binding() {
+    run(|cx, _| {
+        let selected = profile(30, 11, 21);
+        let fixture = ExchangeReplayFixture::new(cx);
+        let started = Instant::now();
+        let reserved = ready(fixture.reserve(cx, &selected, assertion(&selected), now())).unwrap();
+        let (identity, guard) = reserved.into_exchange(&selected).unwrap();
+        assert_eq!(identity.identity().issuer(), selected.idp_issuer());
+        assert!(guard.identity_deadline() >= started + Duration::from_secs(240));
+        assert!(guard.identity_deadline() <= Instant::now() + Duration::from_secs(240));
+        assert!(guard.check().is_ok());
+        ready(fixture.quarantine(cx));
+        assert_eq!(guard.check(), Err(IdentityAssertionReplayError::RestoreUnavailable));
+        assert_eq!(fixture.reserved_aliases(), 2);
+
+        let fixture = ExchangeReplayFixture::new(cx);
+        let reserved = ready(fixture.reserve(cx, &selected, assertion(&selected), now())).unwrap();
+        let different_policy = profile(31, 11, 21);
+        assert!(matches!(
+            reserved.into_exchange(&different_policy),
+            Err(IdentityAssertionReplayError::InvalidAssertion)
+        ));
+        assert_eq!(fixture.reserved_aliases(), 2);
+    });
+}
+
 #[test]
 fn verified_assertion_reserves_every_alias_then_completes_the_independent_intent() {
     run(|cx, _| {

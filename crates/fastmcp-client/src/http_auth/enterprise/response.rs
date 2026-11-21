@@ -3,8 +3,9 @@
 //! Bounded response admission and an explicit guarded HTTPS exchange driver.
 //!
 //! The driver binds each protected assertion to its original profile before
-//! serialization, keeps the two grant forms distinct, and consumes inputs on
-//! every outcome. It does not activate EMA or issue browser-flow, credential-
+//! serialization, requires durable assertion reservation, keeps the two grant
+//! forms distinct, and consumes inputs on every outcome. It does not activate
+//! EMA or issue browser-flow, credential-
 //! custody, subject-mapping or deployment receipts. Those trust boundaries are
 //! additional requirements for the complete enterprise profile. Embeddings run
 //! synchronous signature admission on their caller-owned bounded CPU lane.
@@ -36,6 +37,9 @@ use fastmcp_transport::{
 use super::policy::{
     EnterpriseClientAuthentication, EnterpriseProfile, ID_JAG_TOKEN_TYPE, IdJagGrantedScopeSet,
     JWT_BEARER_GRANT, TOKEN_EXCHANGE_GRANT,
+};
+use super::replay::{
+    IdentityAssertionExchangeGuard, IdentityAssertionReplayError, ReservedIdentityAssertion,
 };
 use super::verification::disclosure::{IdJagDisclosureFacts, IdJagDisclosurePolicy};
 use super::verification::{
@@ -681,6 +685,7 @@ pub enum EnterpriseExchangeError {
     TransportFailed,
     RedirectRefused,
     EvidenceMismatch,
+    ReservationRejected,
     EncodingFailed,
     ResponseRejected(EnterpriseResponseError),
     CredentialBindingFailed,
@@ -712,6 +717,9 @@ impl fmt::Display for EnterpriseExchangeError {
             }
             Self::EvidenceMismatch => {
                 formatter.write_str("enterprise token exchange peer provenance did not match")
+            }
+            Self::ReservationRejected => {
+                formatter.write_str("enterprise assertion reservation is no longer usable")
             }
             Self::EncodingFailed => {
                 formatter.write_str("enterprise token exchange form encoding failed")
@@ -752,10 +760,37 @@ impl fmt::Debug for EnterpriseExchangeObservation {
     }
 }
 
+/// Exclusive ID-JAG returned by the guarded first-stage exchange after durable
+/// identity-assertion reservation. A locally parsed response cannot construct
+/// this owner. It has no Clone, raw-token getter, retry or unwrapping method.
+/// Dropping it never releases the identity assertion's durable replay aliases.
+pub struct EnterpriseExchangedIdJag {
+    response: EnterpriseIdJagResponse,
+    reservation: IdentityAssertionExchangeGuard,
+    expires_at_monotonic: Instant,
+}
+
+impl EnterpriseExchangedIdJag {
+    /// Borrows signed facts and admitted grant metadata without extracting the
+    /// protected assertion or bypassing second-stage ownership.
+    pub fn response(&self) -> &EnterpriseIdJagResponse {
+        &self.response
+    }
+
+    pub fn granted_scopes(&self) -> &[String] {
+        self.response.granted_scopes()
+    }
+
+    pub fn effective_expires_at(&self) -> SystemTime {
+        self.response.effective_expires_at()
+    }
+}
+
 /// Admitted final enterprise access-token grant paired with its sealed
 /// resource-bound bearer conversion.
 pub struct EnterpriseBoundAccessToken {
     response: EnterpriseAccessTokenResponse,
+    reservation: IdentityAssertionExchangeGuard,
     received_at: SystemTime,
     expires_at_monotonic: Instant,
 }
@@ -775,6 +810,7 @@ impl EnterpriseBoundAccessToken {
         now_monotonic: Instant,
         received_at_wall: SystemTime,
     ) -> Result<BoundBearerCredential, EnterpriseExchangeError> {
+        self.reservation.check().map_err(map_reservation_error)?;
         if received_at_wall < self.received_at || Instant::now() >= self.expires_at_monotonic {
             return Err(EnterpriseExchangeError::CredentialBindingFailed);
         }
@@ -824,8 +860,8 @@ struct ExchangeDriverInner {
 
 /// Sealed guarded-HTTPS driver executing the two-stage Enterprise-Managed
 /// Authorization token exchange:
-/// 1. RFC 8693 (`token-exchange`) at the IdP token endpoint (`EnterpriseIdentityAssertion` -> `EnterpriseIdJagResponse`)
-/// 2. RFC 7523 (`jwt-bearer`) at the Resource AS token endpoint (`EnterpriseIdJagResponse` -> `EnterpriseBoundAccessToken`)
+/// 1. RFC 8693 (`token-exchange`) at the IdP token endpoint (`ReservedIdentityAssertion` -> `EnterpriseExchangedIdJag`)
+/// 2. RFC 7523 (`jwt-bearer`) at the Resource AS token endpoint (`EnterpriseExchangedIdJag` -> `EnterpriseBoundAccessToken`)
 ///
 /// Enforces single-flight execution, bounded deadlines, zero HTTP redirects,
 /// strict peer provenance verification, exact per-role client authentication
@@ -835,8 +871,9 @@ struct ExchangeDriverInner {
 ///
 /// This is a low-level transport component, not complete EMA activation. Raw
 /// secrets supplied here do not attest a confidential credential provider, and
-/// locally verified assertions do not attest browser acquisition or durable
-/// replay protection. Callers must separately establish those authorities.
+/// the required reservation's local flow identifiers do not attest browser
+/// acquisition. Store durability, credential custody, browser custody and
+/// deployment qualification remain independent trust boundaries.
 #[derive(Clone)]
 pub struct EnterpriseExchangeDriver {
     inner: Arc<ExchangeDriverInner>,
@@ -878,18 +915,19 @@ impl EnterpriseExchangeDriver {
         &self.inner.profile
     }
 
-    /// Stage 1 (RFC 8693): exchanges a verified OIDC identity assertion at the
-    /// IdP token endpoint for a signed ID-JAG assertion.
+    /// Stage 1 (RFC 8693): consumes a durably reserved OIDC identity assertion
+    /// at the IdP token endpoint for an exclusively owned signed ID-JAG.
     ///
     /// `received_at` is the trusted wall-clock sample at call entry. Elapsed
     /// monotonic time advances it before response admission. The exact original
     /// profile, verification keys, tenancy and live input lifetime are checked
-    /// before a confidential form is constructed or posted.
+    /// before a confidential form is constructed or posted. No outcome releases
+    /// the durable replay reservation, including a local refusal or a denial.
     #[allow(clippy::too_many_arguments)]
     pub async fn exchange_identity_for_id_jag(
         &self,
         cx: &Cx,
-        assertion: EnterpriseIdentityAssertion,
+        reserved: ReservedIdentityAssertion,
         idp_client_secret: &EnterpriseClientSecret,
         id_jag_keys: &IdJagVerificationKeys,
         idp_tenant: TenantExpectation<'_>,
@@ -897,13 +935,17 @@ impl EnterpriseExchangeDriver {
         received_at: SystemTime,
     ) -> Result<
         (
-            EnterpriseResponseOutcome<EnterpriseIdJagResponse>,
+            EnterpriseResponseOutcome<EnterpriseExchangedIdJag>,
             EnterpriseExchangeObservation,
         ),
         EnterpriseExchangeError,
     > {
+        let clock = ExchangeClock::new(received_at);
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let profile = &self.inner.profile;
+        let (assertion, reservation) = reserved
+            .into_exchange(profile)
+            .map_err(map_reservation_error)?;
         if assertion.profile != *profile
             || assertion.policy != self.inner.response_policy
             || id_jag_keys.issuer() != profile.idp_issuer()
@@ -917,9 +959,12 @@ impl EnterpriseExchangeDriver {
                 EnterpriseResponseError::PolicyBindingMismatch,
             ));
         }
-        let clock = ExchangeClock::new(received_at);
-        let input_deadline =
-            clock.input_deadline(assertion.received_at, assertion.identity.expires_at())?;
+        let input_deadline = clock
+            .input_deadline(assertion.received_at, assertion.identity.expires_at())?
+            .min(reservation.identity_deadline());
+        if Instant::now() >= input_deadline {
+            return Err(EnterpriseExchangeError::TimedOut);
+        }
         let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
         let scope_wire = profile.requested_scopes().as_wire_value();
         let mut fields: Vec<(&str, &str)> = vec![
@@ -946,6 +991,7 @@ impl EnterpriseExchangeDriver {
                 &request,
                 input_deadline,
                 Arc::clone(&permit),
+                &reservation,
             )
             .await?;
         let observation = EnterpriseExchangeObservation {
@@ -966,11 +1012,34 @@ impl EnterpriseExchangeDriver {
                 clock.wall_now()?,
             )
             .map_err(EnterpriseExchangeError::ResponseRejected)?;
+        reservation.check().map_err(map_reservation_error)?;
+        let outcome = match outcome {
+            EnterpriseResponseOutcome::Success { value, cache } => {
+                let expires_at_monotonic = clock.deadline(value.effective_expires_at)?;
+                if Instant::now() >= expires_at_monotonic {
+                    return Err(EnterpriseExchangeError::TimedOut);
+                }
+                EnterpriseResponseOutcome::Success {
+                    value: EnterpriseExchangedIdJag {
+                        response: value,
+                        reservation,
+                        expires_at_monotonic,
+                    },
+                    cache,
+                }
+            }
+            EnterpriseResponseOutcome::Denied { denial, cache } => {
+                EnterpriseResponseOutcome::Denied { denial, cache }
+            }
+            EnterpriseResponseOutcome::StepUpRequired { requirement, cache } => {
+                EnterpriseResponseOutcome::StepUpRequired { requirement, cache }
+            }
+        };
         Ok((outcome, observation))
     }
 
-    /// Stage 2 (RFC 7523): exchanges a verified ID-JAG assertion at the Resource
-    /// AS token endpoint for a resource-bound final MCP access token.
+    /// Stage 2 (RFC 7523): consumes the first-stage exchange's sealed ID-JAG
+    /// owner at the Resource AS for a resource-bound final MCP access token.
     ///
     /// The closed JWT-bearer form carries only grant_type, assertion and the
     /// registered authentication representation. Its scope/resource authority
@@ -979,7 +1048,7 @@ impl EnterpriseExchangeDriver {
     pub async fn exchange_id_jag_for_access_token(
         &self,
         cx: &Cx,
-        id_jag: EnterpriseIdJagResponse,
+        exchanged: EnterpriseExchangedIdJag,
         resource_as_client_secret: &EnterpriseClientSecret,
         received_at: SystemTime,
     ) -> Result<
@@ -989,16 +1058,26 @@ impl EnterpriseExchangeDriver {
         ),
         EnterpriseExchangeError,
     > {
+        let clock = ExchangeClock::new(received_at);
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let profile = &self.inner.profile;
+        let EnterpriseExchangedIdJag {
+            response: id_jag,
+            reservation,
+            expires_at_monotonic,
+        } = exchanged;
+        reservation.check().map_err(map_reservation_error)?;
         if id_jag.profile != *profile || id_jag.policy != self.inner.response_policy {
             return Err(EnterpriseExchangeError::ResponseRejected(
                 EnterpriseResponseError::PolicyBindingMismatch,
             ));
         }
-        let clock = ExchangeClock::new(received_at);
-        let input_deadline =
-            clock.input_deadline(id_jag.received_at, id_jag.effective_expires_at)?;
+        let input_deadline = clock
+            .input_deadline(id_jag.received_at, id_jag.effective_expires_at)?
+            .min(expires_at_monotonic);
+        if Instant::now() >= input_deadline {
+            return Err(EnterpriseExchangeError::TimedOut);
+        }
         let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
         let mut fields: Vec<(&str, &str)> = vec![
             ("grant_type", JWT_BEARER_GRANT),
@@ -1017,6 +1096,7 @@ impl EnterpriseExchangeDriver {
                 &request,
                 input_deadline,
                 Arc::clone(&permit),
+                &reservation,
             )
             .await?;
         let observation = EnterpriseExchangeObservation {
@@ -1034,12 +1114,17 @@ impl EnterpriseExchangeDriver {
                 received_at,
             )
             .map_err(EnterpriseExchangeError::ResponseRejected)?;
+        reservation.check().map_err(map_reservation_error)?;
         let mapped = match outcome {
             EnterpriseResponseOutcome::Success { value, cache } => {
                 let expires_at_monotonic = clock.deadline(value.expires_at)?;
+                if Instant::now() >= expires_at_monotonic {
+                    return Err(EnterpriseExchangeError::TimedOut);
+                }
                 EnterpriseResponseOutcome::Success {
                     value: EnterpriseBoundAccessToken {
                         response: value,
+                        reservation,
                         received_at: clock.wall,
                         expires_at_monotonic,
                     },
@@ -1063,6 +1148,7 @@ impl EnterpriseExchangeDriver {
         request: &GuardedHttpRequest,
         input_deadline: Instant,
         permit: Arc<ExchangePermit>,
+        reservation: &IdentityAssertionExchangeGuard,
     ) -> Result<GuardedHttpFetchResponse, EnterpriseExchangeError> {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let response = CallerContextFuture::new(&admitted, async {
@@ -1087,6 +1173,7 @@ impl EnterpriseExchangeDriver {
                     .await
             });
             poll_fn(|task| {
+                reservation.check().map_err(map_reservation_error)?;
                 exchange_checkpoint(&admitted, deadline, started, timeout)?;
                 if cancelled.as_mut().poll(task).is_ready() {
                     return Poll::Ready(Err(EnterpriseExchangeError::Cancelled));
@@ -1096,6 +1183,7 @@ impl EnterpriseExchangeDriver {
                     return Poll::Ready(Err(EnterpriseExchangeError::TimedOut));
                 }
                 let res = call.as_mut().poll(task);
+                reservation.check().map_err(map_reservation_error)?;
                 exchange_checkpoint(&admitted, deadline, started, timeout)?;
                 res
             })
@@ -1261,6 +1349,15 @@ fn map_exchange_fetch_error(error: GuardedHttpFetchError) -> EnterpriseExchangeE
         GuardedHttpFetchError::Cancelled => EnterpriseExchangeError::Cancelled,
         GuardedHttpFetchError::DeadlineExceeded => EnterpriseExchangeError::TimedOut,
         _ => EnterpriseExchangeError::TransportFailed,
+    }
+}
+
+fn map_reservation_error(error: IdentityAssertionReplayError) -> EnterpriseExchangeError {
+    match error {
+        IdentityAssertionReplayError::InvalidAssertion => EnterpriseExchangeError::ResponseRejected(
+            EnterpriseResponseError::PolicyBindingMismatch,
+        ),
+        _ => EnterpriseExchangeError::ReservationRejected,
     }
 }
 

@@ -12,10 +12,12 @@
 //! base and must prove atomicity, persistence, ring acknowledgement, and receipt
 //! verification separately. Flow evidence is local correlation, not the missing
 //! sealed browser/acquisition receipt. Reserving an assertion does not activate
-//! EMA, expose its compact bytes, or authorize HTTP dispatch.
+//! EMA or expose its compact bytes. The guarded exchange driver consumes this
+//! owner as one prerequisite to dispatch; it does not promote the reservation
+//! into browser, confidential-provider or deployment authority.
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -23,7 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use asupersync::channel::oneshot;
@@ -399,6 +401,7 @@ impl IdentityAssertionReplay {
         now: SystemTime,
         deadline: Time,
     ) -> Result<ReservedIdentityAssertion, IdentityAssertionReplayError> {
+        let started = Instant::now();
         self.process
             .verify()
             .map_err(|_| IdentityAssertionReplayError::ProcessChanged)?;
@@ -417,12 +420,15 @@ impl IdentityAssertionReplay {
         let evidence = evidence(profile, assertion.identity(), flow, now)?;
         // A slow provider cannot return a reservation after the assertion's
         // remaining signed lifetime. Cap the entire caller-owned operation.
-        let remaining = assertion
+        let assertion_remaining = assertion
             .identity()
             .expires_at()
             .duration_since(now)
-            .map_err(|_| IdentityAssertionReplayError::InvalidLifetime)?
-            .min(MAX_ASSERTION_RESERVATION_DURATION);
+            .map_err(|_| IdentityAssertionReplayError::InvalidLifetime)?;
+        let expires_at_monotonic = started
+            .checked_add(assertion_remaining)
+            .ok_or(IdentityAssertionReplayError::InvalidLifetime)?;
+        let remaining = assertion_remaining.min(MAX_ASSERTION_RESERVATION_DURATION);
         let expires = cx
             .now()
             .as_nanos()
@@ -494,6 +500,9 @@ impl IdentityAssertionReplay {
             if completed.commit_digest() != expected_commit {
                 return Err(IdentityAssertionReplayError::InvalidReceipt);
             }
+            if Instant::now() >= expires_at_monotonic {
+                return Err(IdentityAssertionReplayError::InvalidLifetime);
+            }
             match decision {
                 IdentityAssertionReservationDecision::AlreadyReserved => {
                     Err(IdentityAssertionReplayError::AlreadyReserved)
@@ -505,6 +514,9 @@ impl IdentityAssertionReplay {
                     completed,
                     store_identity: self.store_identity.clone(),
                     ring_acknowledgement_digest: self.ring_acknowledgement_digest,
+                    process: self.process,
+                    restore: self.restore.clone(),
+                    expires_at_monotonic,
                 }),
             }
         })
@@ -513,7 +525,8 @@ impl IdentityAssertionReplay {
 }
 
 /// Exclusive protected assertion with a completed durable reservation.
-/// No Clone, Debug, Serialize, raw-token getter, release, or HTTP conversion exists.
+/// No Clone, Debug, Serialize, raw-token getter or release exists. The guarded
+/// exchange driver consumes this owner and retains its live restore guard.
 /// Dropping this owner destroys local assertion custody and retains the tombstone.
 pub struct ReservedIdentityAssertion {
     store_identity: IdentityAssertionStoreIdentity,
@@ -522,6 +535,9 @@ pub struct ReservedIdentityAssertion {
     aliases: PersistentReplayAliasSet,
     completed: CompletedRestoreWrite,
     ring_acknowledgement_digest: Sha256Digest,
+    process: ProcessBoundToken,
+    restore: RegisteredRestoreStore,
+    expires_at_monotonic: Instant,
 }
 impl ReservedIdentityAssertion {
     pub const fn store_identity(&self) -> &IdentityAssertionStoreIdentity {
@@ -547,6 +563,51 @@ impl ReservedIdentityAssertion {
     }
     pub fn commit_digest(&self) -> [u8; 32] {
         self.completed.commit_digest()
+    }
+
+    /// Only the exchange implementation can extract protected assertion bytes.
+    /// The original durable aliases remain reserved after every outcome.
+    pub(super) fn into_exchange(
+        self,
+        profile: &EnterpriseProfile,
+    ) -> Result<
+        (EnterpriseIdentityAssertion, IdentityAssertionExchangeGuard),
+        IdentityAssertionReplayError,
+    > {
+        let guard = IdentityAssertionExchangeGuard {
+            process: self.process,
+            restore: self.restore,
+            identity_expires_at_monotonic: self.expires_at_monotonic,
+        };
+        guard.check()?;
+        if self.evidence.profile_digest != profile_digest(profile)? {
+            return Err(IdentityAssertionReplayError::InvalidAssertion);
+        }
+        Ok((self.assertion, guard))
+    }
+}
+
+/// Retains the exact reservation's process and shared restore quarantine across
+/// both HTTP exchanges. It is not a fresh external epoch attestation.
+pub(super) struct IdentityAssertionExchangeGuard {
+    process: ProcessBoundToken,
+    restore: RegisteredRestoreStore,
+    identity_expires_at_monotonic: Instant,
+}
+
+impl IdentityAssertionExchangeGuard {
+    pub(super) fn identity_deadline(&self) -> Instant {
+        self.identity_expires_at_monotonic
+    }
+
+    pub(super) fn check(&self) -> Result<(), IdentityAssertionReplayError> {
+        self.process
+            .verify()
+            .map_err(|_| IdentityAssertionReplayError::ProcessChanged)?;
+        if self.restore.is_quarantined() {
+            return Err(IdentityAssertionReplayError::RestoreUnavailable);
+        }
+        Ok(())
     }
 }
 

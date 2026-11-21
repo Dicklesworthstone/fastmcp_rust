@@ -11,11 +11,12 @@
 //! remain deployment trust boundaries, with no built-in durability attestation.
 //! Explicit sector-document review and purpose-separated signing-key acquisition
 //! use bounded credential-free guarded HTTPS GETs under the caller's context.
-//! These components do not activate the MCP extension, launch a browser,
-//! dispatch credential-bearing HTTP or install an MCP credential. Durable browser-flow custody,
-//! confidential credential providers and independently attested deployment/
-//! identity authority remain separate work. A local byte digest or subject
-//! lookup is not a launch, dispatch or authorization receipt.
+//! The guarded two-stage token driver consumes a completed assertion reservation
+//! and returns an exclusively owned, resource-bound bearer credential. This
+//! low-level dispatch component does not activate the MCP extension or launch a
+//! browser. Durable browser-flow custody, confidential credential providers and
+//! independently attested deployment/identity authority remain separate work.
+//! A local byte digest or subject lookup is not a launch or authorization receipt.
 
 pub mod identity;
 pub mod keys;

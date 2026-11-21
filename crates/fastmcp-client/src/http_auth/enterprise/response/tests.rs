@@ -7,6 +7,7 @@ use crate::http_auth::enterprise::policy::{
     ID_JAG_TOKEN_TYPE, IdJagCryptoConfiguration, JWT_BEARER_GRANT, RequestedEnterpriseScopeSet,
     TOKEN_EXCHANGE_GRANT,
 };
+use crate::http_auth::enterprise::replay::tests::ExchangeReplayFixture;
 use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
 use serde_json::{Value, json};
 
@@ -758,6 +759,7 @@ struct ScriptedExchangePoster {
         std::collections::VecDeque<Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>,
     >,
     recorded: std::sync::Mutex<Vec<RecordedPost>>,
+    quarantine_before_reply: Option<Arc<ExchangeReplayFixture>>,
 }
 
 impl ScriptedExchangePoster {
@@ -765,6 +767,7 @@ impl ScriptedExchangePoster {
         Arc::new(Self {
             responses: std::sync::Mutex::new(responses.into()),
             recorded: std::sync::Mutex::new(Vec::new()),
+            quarantine_before_reply: None,
         })
     }
 
@@ -776,7 +779,7 @@ impl ScriptedExchangePoster {
 impl ExchangePoster for ScriptedExchangePoster {
     fn post<'a>(
         &'a self,
-        _cx: &'a Cx,
+        cx: &'a Cx,
         url: &'a GuardedHttpsUrl,
         request: &'a GuardedHttpRequest,
         _lifetime: Arc<dyn Send + Sync>,
@@ -799,7 +802,12 @@ impl ExchangePoster for ScriptedExchangePoster {
             .unwrap()
             .pop_front()
             .expect("scripted exchange response");
-        Box::pin(async move { next })
+        Box::pin(async move {
+            if let Some(fixture) = &self.quarantine_before_reply {
+                fixture.quarantine(cx).await;
+            }
+            next
+        })
     }
 }
 
@@ -935,10 +943,15 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     // stages end to end and verify exact resource-bound Bearer credential.
     run_exchange_async(async {
         let cx = Cx::current().expect("runtime cx");
+        let replay = ExchangeReplayFixture::new(&cx);
+        let reserved = replay
+            .reserve(&cx, &selected, identity_assertion, now())
+            .await
+            .unwrap();
         let (jag_outcome, jag_obs) = driver
             .exchange_identity_for_id_jag(
                 &cx,
-                identity_assertion,
+                reserved,
                 &idp_secret,
                 &jag_keys,
                 TenantExpectation::SingleTenant,
@@ -1057,10 +1070,15 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     );
     run_exchange_async(async {
         let cx = Cx::current().unwrap();
+        let replay = ExchangeReplayFixture::new(&cx);
+        let reserved = replay
+            .reserve(&cx, &selected, assertion_for_redirect, now())
+            .await
+            .unwrap();
         let err = match redirect_driver
             .exchange_identity_for_id_jag(
                 &cx,
-                assertion_for_redirect,
+                reserved,
                 &idp_secret,
                 &jag_keys,
                 TenantExpectation::SingleTenant,
@@ -1101,10 +1119,15 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     );
     run_exchange_async(async {
         let cx = Cx::current().unwrap();
+        let replay = ExchangeReplayFixture::new(&cx);
+        let reserved = replay
+            .reserve(&cx, &selected, assertion_for_host, now())
+            .await
+            .unwrap();
         let err = match wrong_host_driver
             .exchange_identity_for_id_jag(
                 &cx,
-                assertion_for_host,
+                reserved,
                 &idp_secret,
                 &jag_keys,
                 TenantExpectation::SingleTenant,
@@ -1146,6 +1169,49 @@ fn identity_for_exchange(selected: &EnterpriseProfile) -> EnterpriseIdentityAsse
     )
 }
 
+async fn reserved_for_exchange(cx: &Cx, selected: &EnterpriseProfile) -> ReservedIdentityAssertion {
+    ExchangeReplayFixture::new(cx)
+        .reserve(cx, selected, identity_for_exchange(selected), now())
+        .await
+        .unwrap()
+}
+
+/// Runs the production reservation and first-stage driver with the explicitly
+/// scripted HTTP seam; never constructs a stage-two owner directly.
+async fn exchanged_for_test(
+    cx: &Cx,
+    selected: &EnterpriseProfile,
+) -> (EnterpriseExchangedIdJag, ExchangeReplayFixture) {
+    let replay = ExchangeReplayFixture::new(cx);
+    let reserved = replay
+        .reserve(cx, selected, identity_for_exchange(selected), now())
+        .await
+        .unwrap();
+    let fetcher = test_fetcher();
+    let poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+        "idp.example",
+        fetcher.root_identity(),
+        serde_json::to_vec(&jag_body()).unwrap(),
+    ))]);
+    let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+    let (_, jag_keys) = keys();
+    let secret = EnterpriseClientSecret::try_new("fixture-idp-secret").unwrap();
+    let (outcome, _) = driver
+        .exchange_identity_for_id_jag(
+            cx,
+            reserved,
+            &secret,
+            &jag_keys,
+            TenantExpectation::SingleTenant,
+            ResourceTenantExpectation::SingleTenant,
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(poster.take_recorded().len(), 1);
+    (success(outcome), replay)
+}
+
 #[test]
 fn enterprise_exchange_preflight_binds_profile_keys_and_tenancy_before_post() {
     let selected = profile(&["read"]);
@@ -1168,7 +1234,7 @@ fn enterprise_exchange_preflight_binds_profile_keys_and_tenancy_before_post() {
         let result = driver
             .exchange_identity_for_id_jag(
                 &cx,
-                identity_for_exchange(&selected),
+                reserved_for_exchange(&cx, &selected).await,
                 &secret,
                 &jag_keys,
                 TenantExpectation::SingleTenant,
@@ -1190,7 +1256,7 @@ fn enterprise_exchange_preflight_binds_profile_keys_and_tenancy_before_post() {
         let result = driver
             .exchange_identity_for_id_jag(
                 &cx,
-                identity_for_exchange(&selected),
+                reserved_for_exchange(&cx, &selected).await,
                 &secret,
                 &wrong_keys,
                 TenantExpectation::SingleTenant,
@@ -1202,7 +1268,7 @@ fn enterprise_exchange_preflight_binds_profile_keys_and_tenancy_before_post() {
         let result = driver
             .exchange_identity_for_id_jag(
                 &cx,
-                identity_for_exchange(&selected),
+                reserved_for_exchange(&cx, &selected).await,
                 &secret,
                 &jag_keys,
                 TenantExpectation::Exact("different-tenant"),
@@ -1222,9 +1288,9 @@ fn enterprise_exchange_preflight_binds_profile_keys_and_tenancy_before_post() {
         );
         let poster = ScriptedExchangePoster::new(vec![]);
         let (driver, _) = driver_with_poster(changed, Arc::clone(&poster));
-        let original = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
+        let (original, _) = exchanged_for_test(&cx, &selected).await;
         let result = driver
-            .exchange_id_jag_for_access_token(&cx, original, &secret, now())
+            .exchange_id_jag_for_access_token(&cx, original, &secret, now() + Duration::from_secs(1))
             .await;
         assert!(matches!(result, Err(error) if error == denied));
         assert!(poster.take_recorded().is_empty());
@@ -1249,7 +1315,7 @@ fn enterprise_exchange_preflight_checks_input_lifetime_and_singleflight_before_p
             let result = driver
                 .exchange_identity_for_id_jag(
                     &cx,
-                    identity_for_exchange(&selected),
+                    reserved_for_exchange(&cx, &selected).await,
                     &secret,
                     &jag_keys,
                     TenantExpectation::SingleTenant,
@@ -1259,11 +1325,13 @@ fn enterprise_exchange_preflight_checks_input_lifetime_and_singleflight_before_p
                 .await;
             assert!(matches!(result, Err(error) if error == invalid_lifetime));
         }
-        for time in [
-            now() - Duration::from_secs(1),
-            now() + Duration::from_secs(60),
-        ] {
-            let original = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
+        for expired in [false, true] {
+            let (original, _) = exchanged_for_test(&cx, &selected).await;
+            let time = if expired {
+                original.effective_expires_at()
+            } else {
+                now() - Duration::from_secs(1)
+            };
             let result = driver
                 .exchange_id_jag_for_access_token(&cx, original, &secret, time)
                 .await;
@@ -1273,7 +1341,7 @@ fn enterprise_exchange_preflight_checks_input_lifetime_and_singleflight_before_p
         let result = driver
             .exchange_identity_for_id_jag(
                 &cx,
-                identity_for_exchange(&selected),
+                reserved_for_exchange(&cx, &selected).await,
                 &secret,
                 &jag_keys,
                 TenantExpectation::SingleTenant,
@@ -1297,7 +1365,6 @@ fn enterprise_exchange_preflight_checks_input_lifetime_and_singleflight_before_p
 #[test]
 fn enterprise_exchange_bearer_conversion_cannot_restart_or_backdate_lifetime() {
     let selected = profile(&["read"]);
-    let (_, jag_keys) = keys();
     let secret = EnterpriseClientSecret::try_new("as-secret").unwrap();
     let fetcher = test_fetcher();
     let poster = ScriptedExchangePoster::new(vec![
@@ -1315,21 +1382,22 @@ fn enterprise_exchange_bearer_conversion_cannot_restart_or_backdate_lifetime() {
     let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
     run_exchange_async(async {
         let cx = Cx::current().unwrap();
-        let original = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
+        let (original, _) = exchanged_for_test(&cx, &selected).await;
+        let stage_two_at = now() + Duration::from_secs(1);
         let (outcome, _) = driver
-            .exchange_id_jag_for_access_token(&cx, original, &secret, now())
+            .exchange_id_jag_for_access_token(&cx, original, &secret, stage_two_at)
             .await
             .unwrap();
         let token = success(outcome);
         let original_deadline = token.expires_at_monotonic;
         let credential = token
-            .into_bound_bearer_credential(Instant::now() + Duration::from_hours(1), now())
+            .into_bound_bearer_credential(Instant::now() + Duration::from_hours(1), stage_two_at)
             .unwrap();
         assert_eq!(credential.expires_at(), Some(original_deadline));
 
-        let original = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
+        let (original, _) = exchanged_for_test(&cx, &selected).await;
         let (outcome, _) = driver
-            .exchange_id_jag_for_access_token(&cx, original, &secret, now())
+            .exchange_id_jag_for_access_token(&cx, original, &secret, stage_two_at)
             .await
             .unwrap();
         assert!(matches!(
@@ -1338,5 +1406,178 @@ fn enterprise_exchange_bearer_conversion_cannot_restart_or_backdate_lifetime() {
             Err(EnterpriseExchangeError::CredentialBindingFailed)
         ));
         assert_eq!(poster.take_recorded().len(), 2);
+    });
+}
+
+#[test]
+fn enterprise_exchange_terminal_or_unknown_post_never_reopens_reserved_identity() {
+    let selected = profile(&["read"]);
+    let (_, jag_keys) = keys();
+    let secret = EnterpriseClientSecret::try_new("fixture-idp-secret").unwrap();
+    let fetcher = test_fetcher();
+    let mut denial = ok_exchange_response(
+        "idp.example",
+        fetcher.root_identity(),
+        serde_json::to_vec(&json!({ "error": "invalid_grant" })).unwrap(),
+    );
+    denial.status = 400;
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        for (response, denied) in [
+            (Ok(denial), true),
+            (Err(GuardedHttpFetchError::DeadlineExceeded), false),
+        ] {
+            let replay = ExchangeReplayFixture::new(&cx);
+            let reserved = replay
+                .reserve(&cx, &selected, identity_for_exchange(&selected), now())
+                .await
+                .unwrap();
+            let poster = ScriptedExchangePoster::new(vec![response]);
+            let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+            let result = driver
+                .exchange_identity_for_id_jag(
+                    &cx,
+                    reserved,
+                    &secret,
+                    &jag_keys,
+                    TenantExpectation::SingleTenant,
+                    ResourceTenantExpectation::SingleTenant,
+                    now(),
+                )
+                .await;
+            if denied {
+                assert!(matches!(
+                    result,
+                    Ok((EnterpriseResponseOutcome::Denied { .. }, _))
+                ));
+            } else {
+                assert!(matches!(result, Err(EnterpriseExchangeError::TimedOut)));
+            }
+            assert_eq!(poster.take_recorded().len(), 1);
+            assert_eq!(replay.reserved_aliases(), 2);
+            assert!(matches!(
+                replay
+                    .reserve(&cx, &selected, identity_for_exchange(&selected), now())
+                    .await,
+                Err(IdentityAssertionReplayError::AlreadyReserved)
+            ));
+            assert_eq!(replay.reserved_aliases(), 2);
+        }
+    });
+}
+
+#[test]
+fn enterprise_exchange_restore_quarantine_fences_each_disclosure_and_credential_release() {
+    let selected = profile(&["read"]);
+    let (_, jag_keys) = keys();
+    let secret = EnterpriseClientSecret::try_new("confidential-canary").unwrap();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let replay = ExchangeReplayFixture::new(&cx);
+        let reserved = replay
+            .reserve(&cx, &selected, identity_for_exchange(&selected), now())
+            .await
+            .unwrap();
+        replay.quarantine(&cx).await;
+        let poster = ScriptedExchangePoster::new(vec![]);
+        let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+        assert!(matches!(
+            driver
+                .exchange_identity_for_id_jag(
+                    &cx,
+                    reserved,
+                    &secret,
+                    &jag_keys,
+                    TenantExpectation::SingleTenant,
+                    ResourceTenantExpectation::SingleTenant,
+                    now(),
+                )
+                .await,
+            Err(EnterpriseExchangeError::ReservationRejected)
+        ));
+        assert!(poster.take_recorded().is_empty());
+        assert_eq!(replay.reserved_aliases(), 2);
+
+        let (exchanged, replay) = exchanged_for_test(&cx, &selected).await;
+        replay.quarantine(&cx).await;
+        assert!(matches!(
+            driver
+                .exchange_id_jag_for_access_token(
+                    &cx,
+                    exchanged,
+                    &secret,
+                    now() + Duration::from_secs(1),
+                )
+                .await,
+            Err(EnterpriseExchangeError::ReservationRejected)
+        ));
+        assert!(poster.take_recorded().is_empty());
+        assert_eq!(replay.reserved_aliases(), 2);
+
+        let (exchanged, replay) = exchanged_for_test(&cx, &selected).await;
+        let fetcher = test_fetcher();
+        let poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+            "as.example",
+            fetcher.root_identity(),
+            serde_json::to_vec(&access_body()).unwrap(),
+        ))]);
+        let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+        let (outcome, _) = driver
+            .exchange_id_jag_for_access_token(
+                &cx,
+                exchanged,
+                &secret,
+                now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let bound = success(outcome);
+        replay.quarantine(&cx).await;
+        assert!(matches!(
+            bound.into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(1)),
+            Err(EnterpriseExchangeError::ReservationRejected)
+        ));
+        assert_eq!(poster.take_recorded().len(), 1);
+        assert_eq!(replay.reserved_aliases(), 2);
+    });
+}
+
+#[test]
+fn enterprise_exchange_restore_quarantine_during_post_discards_the_reply() {
+    let selected = profile(&["read"]);
+    let (_, jag_keys) = keys();
+    let secret = EnterpriseClientSecret::try_new("fixture-idp-secret").unwrap();
+    let fetcher = test_fetcher();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let replay = Arc::new(ExchangeReplayFixture::new(&cx));
+        let reserved = replay
+            .reserve(&cx, &selected, identity_for_exchange(&selected), now())
+            .await
+            .unwrap();
+        let mut poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+            "idp.example",
+            fetcher.root_identity(),
+            serde_json::to_vec(&jag_body()).unwrap(),
+        ))]);
+        Arc::get_mut(&mut poster).unwrap().quarantine_before_reply = Some(Arc::clone(&replay));
+        let (driver, _) = driver_with_poster(selected, Arc::clone(&poster));
+        assert!(matches!(
+            driver
+                .exchange_identity_for_id_jag(
+                    &cx,
+                    reserved,
+                    &secret,
+                    &jag_keys,
+                    TenantExpectation::SingleTenant,
+                    ResourceTenantExpectation::SingleTenant,
+                    now(),
+                )
+                .await,
+            Err(EnterpriseExchangeError::ReservationRejected)
+        ));
+        assert_eq!(poster.take_recorded().len(), 1);
+        assert_eq!(replay.reserved_aliases(), 2);
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
     });
 }
