@@ -604,7 +604,7 @@ impl FinalTaskHandle {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        wait_for_task(self, cx, client, cancellation, policy).await
+        Box::pin(wait_for_task(self, cx, client, cancellation, policy)).await
     }
 
     /// Reconciles this handle through one yielding Unix stdio `tasks/get`.
