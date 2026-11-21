@@ -501,7 +501,7 @@ fn block_until_cancelled_logged(ctx: &McpContext, request_id: i64) -> McpResult<
             record_event(&events, request_id, "cancelled", start);
             break;
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(1));
     }
 
     record_event(&events, request_id, "finish", start);
@@ -2112,7 +2112,7 @@ mod router_tests {
             .expect("cancel-started recv failed");
         let cancellation_deadline = Instant::now() + Duration::from_secs(5);
         while !cx.is_cancel_requested() && Instant::now() < cancellation_deadline {
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
         assert!(
             cx.is_cancel_requested(),
@@ -2204,7 +2204,7 @@ mod router_tests {
                     "active requests did not register in time"
                 );
             }
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
 
         server.cancel_active_requests(CancelKind::User, true);
@@ -2291,7 +2291,7 @@ mod router_tests {
                     "active requests did not register in time"
                 );
             }
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
 
         server.cancel_active_requests(CancelKind::User, true);
@@ -8702,7 +8702,7 @@ mod helper_function_tests {
                         while !started_for_receive.load(Ordering::Acquire)
                             && Instant::now() < deadline
                         {
-                            std::thread::yield_now();
+                            std::thread::sleep(Duration::from_millis(1));
                         }
                         if started_for_receive.load(Ordering::Acquire) {
                             Ok(JsonRpcMessage::Request(
@@ -8727,7 +8727,7 @@ mod helper_function_tests {
                         while !completed_for_receive.load(Ordering::Acquire)
                             && Instant::now() < deadline
                         {
-                            std::thread::yield_now();
+                            std::thread::sleep(Duration::from_millis(1));
                         }
                         if completed_for_receive.load(Ordering::Acquire) {
                             Err(fastmcp_transport::TransportError::Closed)
