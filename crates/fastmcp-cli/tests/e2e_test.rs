@@ -1278,6 +1278,7 @@ fn serve_legacy_http_inspect_bundle(
     deadline: Instant,
     modern_probe_status: Option<u16>,
     advertised_message_target: String,
+    test_liveness: bool,
 ) {
     if let Some(status) = modern_probe_status {
         let mut modern =
@@ -1310,20 +1311,29 @@ fn serve_legacy_http_inspect_bundle(
     );
 
     for (expected_method, response) in [
-        (
+        Some((
             "initialize",
             Some(
                 r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"legacy-h1-inspect","version":"1.0.0"}}}"#,
             ),
-        ),
-        ("notifications/initialized", None),
-        (
+        )),
+        Some(("notifications/initialized", None)),
+        test_liveness.then_some((
+            "ping",
+            Some(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#),
+        )),
+        Some((
             "tools/list",
-            Some(
-                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"legacy-h1-tool","description":"legacy H1 catalog","inputSchema":{"type":"object"}}]}}"#,
-            ),
-        ),
-    ] {
+            Some(if test_liveness {
+                r#"{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"legacy-h1-tool","inputSchema":{"type":"object"}}]}}"#
+            } else {
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"legacy-h1-tool","description":"legacy H1 catalog","inputSchema":{"type":"object"}}]}}"#
+            }),
+        )),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let mut message = accept_h1_fixture_connection(
             &listener,
             deadline,
@@ -3363,6 +3373,297 @@ fn e2e_cli_inspect_modern_discovery_planted_negative_rejects_malformed_server_in
 }
 
 #[test]
+fn e2e_cli_test_http_modern_uses_discovery_and_only_advertised_catalogs() {
+    for catalogs in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let fixture = spawn_loopback_fixture("HTTP connectivity probes", move |deadline| {
+            let discovery = serde_json::json!({
+                "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                "capabilities": if catalogs {
+                    serde_json::json!({"tools": {}, "resources": {}, "prompts": {}})
+                } else {
+                    serde_json::json!({})
+                },
+                "ttlMs": 60_000, "cacheScope": "private",
+            });
+            let mut replies = vec![
+                ("server/discover", discovery.clone()),
+                ("server/discover", discovery),
+            ];
+            if catalogs {
+                replies.extend([
+                    ("tools/list", serde_json::json!({
+                        "resultType": "complete", "tools": [{
+                            "name": "probe-tool", "inputSchema": {"type": "object"}
+                        }], "nextCursor": "more-tools", "ttlMs": 60_000, "cacheScope": "private",
+                    })),
+                    ("resources/list", serde_json::json!({
+                        "resultType": "complete", "resources": [{
+                            "uri": "test://probe", "name": "probe-resource"
+                        }], "ttlMs": 60_000, "cacheScope": "private",
+                    })),
+                    ("prompts/list", serde_json::json!({
+                        "resultType": "complete", "prompts": [{"name": "probe-prompt"}],
+                        "ttlMs": 60_000, "cacheScope": "private",
+                    })),
+                ]);
+            }
+            for (index, (method, result)) in replies.into_iter().enumerate() {
+                let mut stream =
+                    accept_h1_fixture_connection(&listener, deadline, "HTTP test probe");
+                let (head, request) = read_h1_json_request(&mut stream, deadline);
+                assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
+                assert_eq!(request["method"], method);
+                assert_eq!(request["id"], index + 1);
+                assert_eq!(
+                    request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                    "2026-07-28"
+                );
+                write_h1_json_response(
+                    &mut stream,
+                    deadline,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": result,
+                    })
+                    .to_string(),
+                );
+            }
+        });
+        let output = run_cli(&[
+            "test",
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "modern-only",
+            "--json",
+        ]);
+        wait_for_loopback_fixture(fixture, "HTTP connectivity probes");
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "fastmcp.cli.test/v1");
+        assert_eq!(report["success"], true);
+        assert_eq!(
+            report["tests"][0]["details"],
+            "protocol 2026-07-28 over HTTP"
+        );
+        assert_eq!(report["tests"][1]["name"], "ping");
+        assert_eq!(report["tests"].as_array().unwrap().len(), 5);
+        for index in 2..5 {
+            assert_eq!(report["tests"][index]["success"], true);
+            assert_eq!(
+                report["tests"][index]["skipped"].as_bool().unwrap_or(false),
+                !catalogs
+            );
+        }
+        if catalogs {
+            assert_eq!(
+                report["tests"][2]["details"],
+                "1 tools in the bounded first page; more were omitted"
+            );
+            assert_eq!(report["tests"][3]["details"], "1 resources");
+            assert_eq!(report["tests"][4]["details"], "1 prompts");
+        }
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_test_http_legacy_only_and_authorized_auto_fallback() {
+    for (policy, modern_status) in [("legacy-only", None), ("auto", Some(404))] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let modern = format!("http://{address}/mcp");
+        let sse = format!("http://{address}/legacy-sse");
+        let messages = format!("http://{address}/legacy-message");
+        let target = messages.clone();
+        let fixture = spawn_loopback_fixture("legacy HTTP test", move |deadline| {
+            serve_legacy_http_inspect_bundle(listener, deadline, modern_status, target, true);
+        });
+        let output = run_cli(&[
+            "test",
+            "--http-url",
+            &modern,
+            "--legacy-sse-url",
+            &sse,
+            "--legacy-message-url",
+            &messages,
+            "--protocol-policy",
+            policy,
+            "--json",
+        ]);
+        wait_for_loopback_fixture(fixture, "legacy HTTP test");
+        assert!(output.status.success(), "{policy}: {}", stderr_str(&output));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["success"], true);
+        assert_eq!(
+            report["tests"][0]["details"],
+            "protocol 2024-11-05 over HTTP"
+        );
+        assert_eq!(report["tests"][1]["success"], true);
+        assert_eq!(report["tests"][2]["details"], "1 tools");
+        assert_eq!(report["tests"][3]["skipped"], true);
+        assert_eq!(report["tests"][4]["skipped"], true);
+    }
+}
+
+#[test]
+fn e2e_cli_test_http_rejects_invalid_plans_and_plaintext_credentials_before_contact() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let observer = spawn_forbidden_http_contact_observer(
+        listener,
+        Arc::clone(&contacts),
+        "HTTP test preflight",
+    );
+    for output in [
+        run_cli(&[
+            "test",
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "auto",
+            "--json",
+        ]),
+        run_cli(&[
+            "test",
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "modern-only",
+            "--bearer-token-file",
+            "unopened-token.txt",
+            "--json",
+        ]),
+        run_cli(&["test", "--protocol-policy", "modern-only", "--json"]),
+    ] {
+        assert!(!output.status.success());
+        let _: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("preflight failures must retain machine-readable output");
+    }
+    stop_forbidden_http_contact_observer(observer, "HTTP test preflight");
+    assert_eq!(contacts.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_test_http_auto_reports_bounded_peer_failure_without_downgrade() {
+    let modern_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let modern = format!("http://{}/mcp", modern_listener.local_addr().unwrap());
+    let legacy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let legacy_address = legacy_listener.local_addr().unwrap();
+    let sse = format!("http://{legacy_address}/sse");
+    let messages = format!("http://{legacy_address}/messages");
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let observer = spawn_forbidden_http_contact_observer(
+        legacy_listener,
+        Arc::clone(&contacts),
+        "HTTP test forbidden fallback",
+    );
+    let fixture = spawn_loopback_fixture("HTTP test peer failure", move |deadline| {
+        for method in ["server/discover", "server/discover", "tools/list"] {
+            let mut stream =
+                accept_h1_fixture_connection(&modern_listener, deadline, "HTTP test error probe");
+            let (_, request) = read_h1_json_request(&mut stream, deadline);
+            assert_eq!(request["method"], method);
+            let response = if method == "tools/list" {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"], "error": {
+                        "code": -32603,
+                        "message": format!("catalog failed\u{1b}[31m{}", "x".repeat(10_000)),
+                        "data": {"secret": "never-print-this-peer-payload", "timeoutSource": "idle"},
+                    },
+                })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"], "result": {
+                        "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}}, "ttlMs": 0, "cacheScope": "private",
+                    },
+                })
+            };
+            write_h1_json_response(&mut stream, deadline, &response.to_string());
+        }
+    });
+    let output = run_cli(&[
+        "test",
+        "--http-url",
+        &modern,
+        "--legacy-sse-url",
+        &sse,
+        "--legacy-message-url",
+        &messages,
+        "--protocol-policy",
+        "auto",
+        "--json",
+    ]);
+    wait_for_loopback_fixture(fixture, "HTTP test peer failure");
+    stop_forbidden_http_contact_observer(observer, "HTTP test forbidden fallback");
+    assert_eq!(contacts.load(Ordering::SeqCst), 0);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["success"], false);
+    assert_eq!(report["tests"][0]["success"], true);
+    assert_eq!(report["tests"][1]["success"], true);
+    assert_eq!(report["tests"][2]["name"], "list_tools");
+    assert_eq!(report["tests"][2]["success"], false);
+    assert!(report["tests"][2]["timeout_source"].is_null());
+    assert!(
+        report["tests"][2]["error"]
+            .as_str()
+            .unwrap()
+            .contains("catalog failed")
+    );
+    assert!(!stdout_str(&output).contains("never-print-this-peer-payload"));
+    assert!(!stdout_str(&output).contains('\u{1b}'));
+    assert!(output.stdout.len() < 16 * 1024);
+    assert_eq!(report["truncated"], true);
+}
+
+#[test]
+fn e2e_cli_test_http_timeout_reports_source_and_retires_the_exchange() {
+    for (idle, absolute, source) in [("1", "3", "idle"), ("3", "1", "absolute")] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let fixture = spawn_loopback_fixture_with_deadline(
+            "silent HTTP test discovery",
+            Duration::from_secs(8),
+            move |deadline| {
+                let mut stream =
+                    accept_h1_fixture_connection(&listener, deadline, "silent HTTP test");
+                let (_, request) = read_h1_json_request(&mut stream, deadline);
+                assert_eq!(request["method"], "server/discover");
+                expect_h1_fixture_reset(
+                    &mut stream,
+                    deadline,
+                    "expired HTTP test must retire its socket",
+                );
+            },
+        );
+        let output = run_cli(&[
+            "test",
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "modern-only",
+            "--idle-timeout",
+            idle,
+            "--absolute-timeout",
+            absolute,
+            "--json",
+        ]);
+        wait_for_loopback_fixture(fixture, "silent HTTP test discovery");
+        assert!(!output.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["success"], false);
+        assert_eq!(report["tests"][0]["name"], "initialize");
+        assert_eq!(report["tests"][0]["timeout_source"], source);
+        assert_eq!(report["tests"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
 fn e2e_cli_inspect_http_bundle_modern_only_uses_live_modern_h1_and_negotiated_status_renderer() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP inspect fixture");
     let address = listener
@@ -3578,7 +3879,7 @@ fn e2e_cli_inspect_http_bundle_auto_uses_authorized_legacy_fallback() {
     let legacy_message_url = format!("http://{address}/legacy-message");
     let fixture_message_url = legacy_message_url.clone();
     let fixture = spawn_loopback_fixture("Auto legacy HTTP fixture", move |deadline| {
-        serve_legacy_http_inspect_bundle(listener, deadline, Some(404), fixture_message_url);
+        serve_legacy_http_inspect_bundle(listener, deadline, Some(404), fixture_message_url, false);
     });
 
     let output = inspect_http_bundle("auto", &modern_url, &legacy_sse_url, &legacy_message_url);
@@ -3664,7 +3965,7 @@ fn e2e_cli_inspect_http_bundle_legacy_only_skips_modern_contact() {
     let legacy_message_url = format!("http://{address}/legacy-message");
     let fixture_message_url = legacy_message_url.clone();
     let fixture = spawn_loopback_fixture("LegacyOnly HTTP fixture", move |deadline| {
-        serve_legacy_http_inspect_bundle(listener, deadline, None, fixture_message_url);
+        serve_legacy_http_inspect_bundle(listener, deadline, None, fixture_message_url, false);
     });
 
     let output = inspect_http_bundle(

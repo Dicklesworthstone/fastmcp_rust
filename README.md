@@ -1264,6 +1264,59 @@ best-effort safety net. The group anchor protects its numeric PGID while it is
 live and closes an owner-death channel when the host exits, but this is not
 portable process-tree containment or a substitute for Windows Job Objects.
 
+### Test HTTP connectivity (current source tree)
+
+A CLI built from the current source can test an HTTP server's negotiation,
+liveness, and advertised tools, resources, and prompts without starting a
+subprocess.
+
+```bash
+# Modern MCP endpoint
+fastmcp test \
+  --protocol-policy modern-only \
+  --http-url https://mcp.example/mcp \
+  --json
+
+# Auto: supply the modern endpoint and both explicit legacy endpoints
+fastmcp test \
+  --protocol-policy auto \
+  --http-url https://mcp.example/mcp \
+  --legacy-sse-url https://mcp.example/sse \
+  --legacy-message-url https://mcp.example/messages \
+  --json
+
+# Exact MCP 2024-11-05 over SSE and message POST
+fastmcp test \
+  --protocol-policy legacy-only \
+  --legacy-sse-url https://mcp.example/sse \
+  --legacy-message-url https://mcp.example/messages \
+  --verbose
+```
+
+From a source checkout, replace `fastmcp` with `cargo run -p fastmcp-cli --`.
+Auto and legacy-only require the `legacy-2024-11-05` feature. Auto requires all
+three endpoints and falls back only when negotiation permits it; an application
+failure after modern selection does not trigger a downgrade. The legacy SSE
+and message endpoints must share an origin. Omit the subprocess command when
+supplying HTTP endpoints.
+
+For bearer authentication, add `--bearer-token-file ./mcp-token.txt` to the modern
+command. The file must be a regular file containing at most 16 KiB, and the
+modern endpoint must use HTTPS. Authenticated requests never fall back to
+legacy. Add `--idle-timeout 10 --absolute-timeout 30` for shorter probe deadlines.
+The defaults are 30 seconds idle and 120 seconds absolute; accepted ranges are
+1–300 and 1–900 seconds respectively. For HTTP, the absolute limit also bounds
+the complete connection handshake and each probe, including connection setup.
+These limits do not impose one deadline on the entire command.
+
+Modern liveness uses `server/discover`; legacy liveness uses `ping`. Catalog
+probes fetch one bounded page for each advertised capability, mark unadvertised
+capabilities as skipped, and report when more entries were omitted. `--json`
+emits bounded, sanitized `fastmcp.cli.test/v1` results with the negotiated
+protocol, probe outcomes, and local idle/absolute timeout sources. Failures
+before testing begins use `fastmcp.cli.error/v2`. Failed tests return a nonzero
+exit status; use `--verbose` for detailed text output.
+
 **Requirements:**
 - Rust nightly-2026-08-25 (see `rust-toolchain.toml`) for Edition 2024. The last FND-01 evidence snapshot still records `nightly-2026-07-11` until that harness is re-attested.
 
