@@ -2,7 +2,7 @@
 # `scripts/run_official_conformance.sh --baseline <this file>`, which forwards
 # it to the suite's own `--expected-failures`.
 #
-# Measured 2026-10-12 at 1c2dc896 on worker hz3 with
+# Measured 2026-11-20 at 65d2247d on local arm64 Darwin (macOS) with
 # `@modelcontextprotocol/conformance@0.2.0-alpha.10`,
 # `--spec-version 2026-07-28 --suite all`:
 #
@@ -17,6 +17,20 @@
 #   99a3b4e8  2026-10-05   40 scenarios, 115 checks, 110 SUCCESS,  0 FAILURE
 #   e2a0ac5c  2026-10-12   40 scenarios, 115 checks, 110 SUCCESS,  0 FAILURE
 #   1c2dc896  2026-10-12   40 scenarios, 115 checks, 112 SUCCESS,  0 FAILURE
+#   65d2247d  2026-11-20   40 scenarios, 115 checks, 112 SUCCESS,  0 FAILURE
+#
+# 65d2247d re-measures both server mode and client mode across >1,000 commits
+# after 1c2dc896 (including v0.13.0 and asupersync =0.6.2) on pinned
+# nightly-2026-08-25 (rustc 1.100.0-nightly (e7769602a 2026-08-24)), bound to:
+# conformance_server blob a2d1f906889039b7d5935464b2fa934adc585630 (sha256
+# c3b4385de40dc4d09b8bc13c9d7fb358ca26ec835e556cf88df45f8f2deb37ec), suite rc 0;
+# client mode reproduced 2b6c519e (32 scenarios, 155 checks: 55 SUCCESS,
+# 46 FAILURE, 2 SKIPPED, 1 WARNING, 51 INFO; suite rc 1) with conformance_client
+# blob fcf1296f971c60ce778bfd63dc5cdd7dcd610b22 (sha256
+# 066a512dc2a2d92d28838b24802fff0dc21f32a509707b5c34fe6199170934ca).
+# The `--baseline` defect below remains open because `server: []` is
+# owner-reserved and SHOULD-level warnings still trigger non-zero `--baseline`
+# exits.
 #
 # The 2026-10-04 row carries a date and no revision, and 98 commits touching
 # 388 lines of server-mode source landed after it. 99a3b4e8 re-measures it and
