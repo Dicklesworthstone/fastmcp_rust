@@ -555,7 +555,7 @@ pub async fn websocket_server_and_client_closure_through_the_facade(
     let _: Option<WebSocketNonquiescentShutdown> = None;
     let _: Option<AsyncWsClientTransport<()>> = None;
     let _: Option<AsyncWsServerTransport<()>> = None;
-    let _: Option<WebSocketClient<()>> = None;
+    let _: Option<WebSocketClient<std::io::Cursor<Vec<u8>>>> = None;
 
     build_modern_server()
         .bind_websocket(cx, "127.0.0.1:0")
