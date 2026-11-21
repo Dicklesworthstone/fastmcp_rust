@@ -608,13 +608,11 @@ impl TestClient {
     ) -> McpResult<Vec<LegacyContent>> {
         self.ensure_initialized()?;
         let (content, is_error) = if self.is_modern() {
-            let raw = self.send_modern_request(
-                "tools/call",
-                serde_json::json!({
-                    "name": name,
-                    "arguments": arguments,
-                }),
-            )?;
+            let mut params = serde_json::json!({ "name": name });
+            if !arguments.is_null() {
+                params["arguments"] = arguments;
+            }
+            let raw = self.send_modern_request("tools/call", params)?;
             let is_error = raw
                 .get("isError")
                 .and_then(serde_json::Value::as_bool)
@@ -1034,6 +1032,8 @@ impl std::fmt::Debug for TestClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TestClient")
             .field("client_info", &self.client_info)
+            .field("protocol_mode", &self.protocol_mode)
+            .field("negotiated_mode", &self.negotiated_mode)
             .field("initialized", &self.initialized)
             .field("server_info", &self.server_info)
             .finish_non_exhaustive()
@@ -1801,5 +1801,82 @@ mod tests {
             assert!(client.negotiated_mode().is_none());
             assert!(client.protocol_version().is_none());
         }
+    }
+
+    #[test]
+    fn test_client_modern_null_arguments_omits_field_while_scalar_is_rejected() {
+        let (client_transport, mut server_transport) = create_memory_transport_pair();
+        let server_cx = Cx::for_testing();
+        let discovery = serde_json::json!({
+            "protocolVersion": MODERN_PROTOCOL_VERSION,
+            "serverInfo": { "name": "modern-null-arg-peer", "version": "1.0.0" },
+            "capabilities": {
+                "behaviors": {
+                    "tools": { "list": {}, "call": {} }
+                }
+            }
+        });
+        server_transport
+            .send(
+                &server_cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    RequestId::Number(1),
+                    discovery,
+                )),
+            )
+            .unwrap();
+        server_transport
+            .send(
+                &server_cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    RequestId::Number(2),
+                    serde_json::json!({
+                        "resultType": "complete",
+                        "content": [{ "type": "text", "text": "pong" }]
+                    }),
+                )),
+            )
+            .unwrap();
+        server_transport
+            .send(
+                &server_cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::error(
+                    Some(RequestId::Number(3)),
+                    McpError::invalid_params("arguments must be an object").into(),
+                )),
+            )
+            .unwrap();
+
+        let mut client = TestClient::new_modern(client_transport, Cx::for_testing());
+        let debug = format!("{client:?}");
+        assert!(debug.contains("protocol_mode: Modern2026"));
+
+        // Positive: Value::Null omits `"arguments"` on the modern wire request.
+        let content = client
+            .call_tool("ping", serde_json::Value::Null)
+            .expect("0-arg modern tool call with Value::Null must succeed");
+        assert_eq!(content.len(), 1);
+        let _discover = server_transport.recv(&server_cx).unwrap();
+        let JsonRpcMessage::Request(null_call) = server_transport.recv(&server_cx).unwrap() else {
+            panic!("expected tools/call request");
+        };
+        let null_params = null_call.params.expect("tools/call params");
+        assert_eq!(null_params["name"], "ping");
+        assert!(
+            null_params.get("arguments").is_none(),
+            "Value::Null must omit arguments rather than sending arguments: null"
+        );
+
+        // Near-identical planted negative (RH-5): non-null scalar arguments are still forwarded
+        // and rejected rather than silently dropped.
+        let err = client
+            .call_tool("ping", serde_json::json!(42))
+            .expect_err("scalar arguments must still be forwarded and rejected");
+        assert_eq!(err.code, fastmcp_core::McpErrorCode::InvalidParams);
+        let JsonRpcMessage::Request(scalar_call) = server_transport.recv(&server_cx).unwrap()
+        else {
+            panic!("expected second tools/call request");
+        };
+        assert_eq!(scalar_call.params.unwrap()["arguments"], 42);
     }
 }

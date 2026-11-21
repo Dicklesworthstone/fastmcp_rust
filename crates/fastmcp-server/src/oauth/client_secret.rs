@@ -51,10 +51,13 @@ impl std::fmt::Debug for ClientSecretVerifier {
 impl ClientSecretVerifier {
     pub(super) fn create(secret: &ClientSecret) -> Result<Self, OAuthError> {
         admit_secret(secret.as_bytes())?;
+        let cx = Cx::current();
+        // Reject cancelled/expired callers before consuming OS entropy.
+        check_wait(cx.as_ref(), Instant::now())?;
         // Entropy failure happens before any job or client-store mutation.
         let salt = draw_oauth_client_secret_salt().map_err(|_| unavailable())?;
         let secret = Zeroizing::new(secret.as_bytes().to_vec());
-        executor().execute(Cx::current(), move || {
+        executor().execute(cx, move || {
             // Argon2 0.6's explicit-salt API encodes the PHC salt from these
             // exact core-owned bytes; it never invokes an ambient RNG.
             let phc = algorithm()?
@@ -229,12 +232,23 @@ impl KdfExecutor {
                 }
                 Err(oneshot::TryRecvError::Closed) => return Err(unavailable()),
                 Err(oneshot::TryRecvError::Empty) => {
-                    let remaining = MAX_WAIT.saturating_sub(started.elapsed());
+                    let remaining = remaining_wait(cx.as_ref(), started);
                     let _ = task.0.wait_timeout(WAIT_SLICE.min(remaining));
                 }
             }
         }
     }
+}
+
+fn remaining_wait(cx: Option<&Cx>, started: Instant) -> Duration {
+    let mut remaining = MAX_WAIT.saturating_sub(started.elapsed());
+    if let Some(cx) = cx
+        && let Some(deadline) = cx.budget().deadline
+    {
+        let budget_nanos = deadline.as_nanos().saturating_sub(cx.now().as_nanos());
+        remaining = remaining.min(Duration::from_nanos(budget_nanos));
+    }
+    remaining
 }
 
 fn check_wait(cx: Option<&Cx>, started: Instant) -> Result<(), OAuthError> {
@@ -423,5 +437,37 @@ mod tests {
             assert!(Instant::now() < limit, "running KDF reservation leaked");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn create_rejects_cancelled_cx_before_dispatch_and_remaining_wait_clamps_tight_deadline() {
+        let secret = ClientSecret::new("cancelled-secret".to_owned());
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        let result = fastmcp_core::runtime::with_caller_context(&cancelled, || {
+            ClientSecretVerifier::create(&secret)
+        });
+        assert!(
+            matches!(result, Err(OAuthError::TemporarilyUnavailable(_))),
+            "cancelled Cx must fail closed before KDF execution"
+        );
+
+        let tight = Cx::for_testing_with_budget(
+            asupersync::types::Budget::INFINITE
+                .with_deadline(asupersync::types::Time::from_millis(2)),
+        );
+        let started = Instant::now();
+        // Positive: tight 2ms deadline clamps below WAIT_SLICE (10ms).
+        let clamped = remaining_wait(Some(&tight), started);
+        assert!(
+            clamped <= Duration::from_millis(2),
+            "tight Cx deadline must clamp wait slice, got {clamped:?}"
+        );
+        // Near-identical negative (RH-5): unconstrained Cx retains MAX_WAIT budget (> WAIT_SLICE).
+        let unbounded = Cx::for_testing();
+        assert!(
+            remaining_wait(Some(&unbounded), started) > WAIT_SLICE,
+            "unbounded Cx must not prematurely clamp below WAIT_SLICE"
+        );
     }
 }

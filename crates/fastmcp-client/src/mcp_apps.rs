@@ -674,6 +674,9 @@ impl TokenSink for ViewHtmlAuditSink {
     type Handle = ();
 
     fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<Self::Handle> {
+        if self.error.get().is_some() {
+            return TokenSinkResult::Continue;
+        }
         let next_count = self.token_count.get().saturating_add(1);
         self.token_count.set(next_count);
         if next_count > MAX_MCP_APPS_VIEW_HTML_TOKENS {
@@ -711,18 +714,34 @@ impl TokenSink for ViewHtmlAuditSink {
                                     }
                                 }
                             }
-                        } else if tag_name == "script" && !tag.self_closing {
+                        } else if tag_name == "script" {
+                            // In WHATWG HTML5 (outside foreign SVG/MathML), rawtext/rcdata/script
+                            // start tags are never self-closing: a trailing `/` is ignored and the
+                            // browser still enters the raw state until a matching end tag or EOF.
                             self.open_raw_tag.set(Some("script"));
                             return TokenSinkResult::RawData(states::RawKind::ScriptData);
-                        } else if tag_name == "style" && !tag.self_closing {
-                            self.open_raw_tag.set(Some("style"));
+                        } else if let Some(raw_tag) = match tag_name {
+                            "style" => Some("style"),
+                            "iframe" => Some("iframe"),
+                            "noembed" => Some("noembed"),
+                            "noframes" => Some("noframes"),
+                            "xmp" => Some("xmp"),
+                            _ => None,
+                        } {
+                            self.open_raw_tag.set(Some(raw_tag));
                             return TokenSinkResult::RawData(states::RawKind::Rawtext);
-                        } else if tag_name == "textarea" && !tag.self_closing {
-                            self.open_raw_tag.set(Some("textarea"));
+                        } else if let Some(rcdata_tag) = match tag_name {
+                            "textarea" => Some("textarea"),
+                            "title" => Some("title"),
+                            _ => None,
+                        } {
+                            self.open_raw_tag.set(Some(rcdata_tag));
                             return TokenSinkResult::RawData(states::RawKind::Rcdata);
-                        } else if tag_name == "title" && !tag.self_closing {
-                            self.open_raw_tag.set(Some("title"));
-                            return TokenSinkResult::RawData(states::RawKind::Rcdata);
+                        } else if tag_name == "plaintext" {
+                            // WHATWG HTML5 `<plaintext>` consumes all remaining input until EOF
+                            // with no closing tag, so it is always unclosed/truncated syntax.
+                            self.open_raw_tag.set(Some("plaintext"));
+                            self.fail(McpAppsViewHtmlError::TruncatedSyntax);
                         }
                     }
                     TagKind::EndTag => {
@@ -737,6 +756,8 @@ impl TokenSink for ViewHtmlAuditSink {
         TokenSinkResult::Continue
     }
 }
+
+const VIEW_HTML_TOKENIZE_CHUNK_BYTES: usize = 16 * 1024;
 
 /// Validates an MCP Apps View HTML document with the WHATWG HTML5 tokenizer
 /// (`html5ever`) before an embedder mounts it into a sandboxed webview/iframe.
@@ -753,8 +774,19 @@ pub fn validate_mcp_apps_view_html(html: &str) -> Result<(), McpAppsViewHtmlErro
 
     let tokenizer = Tokenizer::new(ViewHtmlAuditSink::new(), TokenizerOpts::default());
     let input = BufferQueue::default();
-    input.push_back(StrTendril::from_slice(html));
-    let _ = tokenizer.feed(&input);
+    let mut offset = 0;
+    while offset < html.len() {
+        let mut end = (offset + VIEW_HTML_TOKENIZE_CHUNK_BYTES).min(html.len());
+        while end < html.len() && !html.is_char_boundary(end) {
+            end -= 1;
+        }
+        input.push_back(StrTendril::from_slice(&html[offset..end]));
+        let _ = tokenizer.feed(&input);
+        if let Some(error) = tokenizer.sink.error.get() {
+            return Err(error);
+        }
+        offset = end;
+    }
     tokenizer.end();
 
     if let Some(error) = tokenizer.sink.error.get() {
@@ -13300,13 +13332,23 @@ exec sleep 10
 
     #[test]
     fn html5ever_view_html_admission_positive_and_planted_negatives() {
-        let valid_html = "<!doctype html><html><head><meta charset=\"utf-8\"></head>\
-            <body><main>view</main><script>const less = 3 < 4;</script></body></html>";
+        let valid_html = "<!doctype html><html><head><meta charset=\"utf-8\">\
+            <title>View</title><style>.a > .b {}</style></head>\
+            <body><main>view</main><textarea><base href=\"https://inert.example/\"></textarea>\
+            <iframe src=\"https://maps.example\">fallback</iframe>\
+            <script>const less = 3 < 4;</script></body></html>";
 
         // Positive: exact MCP Apps HTML MIME type + valid HTML5 body passes.
         let admitted = admit_mcp_apps_view_html(Some(MCP_APPS_HTML_MIME_TYPE), valid_html)
             .expect("valid MCP Apps View HTML must be admitted");
         assert_eq!(admitted, valid_html);
+
+        // Positive: a valid >16 KiB document with `<script>` straddling the chunk boundary passes.
+        let boundary_pad = "a".repeat(VIEW_HTML_TOKENIZE_CHUNK_BYTES - 3);
+        let chunk_straddling =
+            format!("<main>{boundary_pad}</main><script>const x = 1 < 2;</script>");
+        validate_mcp_apps_view_html(&chunk_straddling)
+            .expect("chunk-straddling valid View HTML5 document must pass");
 
         // Near-identical planted negatives (RH-5):
         assert!(matches!(
@@ -13346,13 +13388,26 @@ exec sleep 10
             ),
             Err(McpAppsViewHtmlError::ForbiddenMetaHttpEquiv)
         );
+        for truncated in [
+            "<main><!-- unterminated comment",
+            "<style>body { color: red;",
+            "<script/>alert(1)",
+            "<style/>body {}",
+            "<textarea/>unclosed",
+            "<title/>unclosed",
+            "<iframe>unclosed",
+            "<plaintext>rest",
+        ] {
+            assert_eq!(
+                validate_mcp_apps_view_html(truncated),
+                Err(McpAppsViewHtmlError::TruncatedSyntax),
+                "expected TruncatedSyntax for {truncated:?}"
+            );
+        }
+        let token_bomb = "<a>".repeat(MAX_MCP_APPS_VIEW_HTML_TOKENS + 1);
         assert_eq!(
-            validate_mcp_apps_view_html("<main><!-- unterminated comment"),
-            Err(McpAppsViewHtmlError::TruncatedSyntax)
-        );
-        assert_eq!(
-            validate_mcp_apps_view_html("<style>body { color: red;"),
-            Err(McpAppsViewHtmlError::TruncatedSyntax)
+            validate_mcp_apps_view_html(&token_bomb),
+            Err(McpAppsViewHtmlError::ExceedsTokenLimit)
         );
         let oversized = "x".repeat(MAX_MCP_APPS_VIEW_HTML_BYTES + 1);
         assert_eq!(

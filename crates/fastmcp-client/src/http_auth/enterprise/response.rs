@@ -1005,7 +1005,9 @@ impl EnterpriseExchangeDriver {
         {
             return Err(EnterpriseExchangeError::TimedOut);
         }
-        if let EnterpriseResponseOutcome::Success(assertion) = &outcome
+        if let EnterpriseResponseOutcome::Success {
+            value: assertion, ..
+        } = &outcome
             && assertion.identity().expires_at() <= clock.wall_now()?
         {
             return Err(EnterpriseExchangeError::TimedOut);
@@ -1484,7 +1486,9 @@ fn verify_exchange_provenance(
 
 fn encode_form_component(value: &str) -> SecretString {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(value.len());
+    // Pre-size for worst-case percent-encoding so secret bytes never leave
+    // unzeroized copies in an abandoned heap buffer after a reallocation.
+    let mut encoded = String::with_capacity(value.len().saturating_mul(3));
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
@@ -1528,18 +1532,31 @@ pub(super) fn build_confidential_token_request<'a>(
         }
     };
 
-    let mut body_text = String::new();
+    let mut encoded_fields = Vec::with_capacity(fields.len());
+    let mut total_len = 0usize;
     for (index, (name, value)) in fields.iter().enumerate() {
+        let encoded_name = encode_form_component(name);
+        let encoded_value = encode_form_component(value);
+        let sep = usize::from(index != 0);
+        total_len = total_len
+            .saturating_add(sep)
+            .saturating_add(encoded_name.as_str().len())
+            .saturating_add(1)
+            .saturating_add(encoded_value.as_str().len());
+        if total_len > MAX_ENTERPRISE_EXCHANGE_FORM_BYTES {
+            return Err(EnterpriseExchangeError::EncodingFailed);
+        }
+        encoded_fields.push((encoded_name, encoded_value));
+    }
+    // Exact capacity prevents reallocating secret-bearing form bytes.
+    let mut body_text = String::with_capacity(total_len);
+    for (index, (encoded_name, encoded_value)) in encoded_fields.iter().enumerate() {
         if index != 0 {
             body_text.push('&');
         }
-        body_text.push_str(encode_form_component(name).as_str());
+        body_text.push_str(encoded_name.as_str());
         body_text.push('=');
-        body_text.push_str(encode_form_component(value).as_str());
-        if body_text.len() > MAX_ENTERPRISE_EXCHANGE_FORM_BYTES {
-            drop(SecretString::from_string(body_text));
-            return Err(EnterpriseExchangeError::EncodingFailed);
-        }
+        body_text.push_str(encoded_value.as_str());
     }
     let body_secret = SecretString::from_string(body_text);
     let mut request = GuardedHttpRequest::new(

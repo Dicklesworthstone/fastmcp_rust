@@ -23,6 +23,7 @@
 //! - Operating the negotiated official Tasks extension with bounded watches
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::env;
@@ -14571,6 +14572,7 @@ mod portable_install {
     use std::io::{self, Read, Write};
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use fastmcp_core::{McpError, McpResult};
@@ -14581,6 +14583,40 @@ mod portable_install {
         prepare_json_config, sanitize_config_path, sanitize_peer_text, usable_parent,
         validate_atomic_destination_name, write_cli_warning, write_install_stdout,
     };
+
+    static SIBLING_NONCE_SEQ: AtomicU64 = AtomicU64::new(0);
+    const MAX_SIBLING_STEM_BYTES: usize = 64;
+
+    fn next_sibling_nonce() -> String {
+        let seq = SIBLING_NONCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "{}-{seq}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        )
+    }
+
+    /// Builds a bounded sibling path in `parent` guaranteed to stay well below
+    /// POSIX `NAME_MAX` (255 bytes) even when `file_name` itself is near the
+    /// limit, and strictly unique across concurrent callers in this process.
+    fn sibling_path(
+        parent: &Path,
+        prefix: &str,
+        file_name: &std::ffi::OsStr,
+        nonce: &str,
+    ) -> PathBuf {
+        let stem = file_name.to_string_lossy();
+        let mut end = stem.len().min(MAX_SIBLING_STEM_BYTES);
+        while end > 0 && !stem.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut name = std::ffi::OsString::from(prefix);
+        name.push(&stem[..end]);
+        name.push(format!(".{nonce}"));
+        parent.join(name)
+    }
 
     /// What a successful publication did beyond writing the new content.
     #[derive(Debug, Default)]
@@ -14785,23 +14821,15 @@ mod portable_install {
                     "Refusing to write {context} at {display}: destination changed to a non-regular file"
                 )));
             }
-            metadata.permissions().mode() & 0o7777
+            metadata.permissions().mode() & 0o777
         } else {
             0o600
         };
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        );
-        let mut stage_name = std::ffi::OsString::from(".fastmcp-stage.");
-        stage_name.push(file_name);
-        stage_name.push(format!(".{nonce}"));
-        let stage = parent.join(stage_name);
+        let nonce = next_sibling_nonce();
+        let stage = sibling_path(parent, ".fastmcp-stage.", file_name, &nonce);
         if let Err(error) = write_staged(&stage, mode, contents) {
-            let _ = fs::remove_file(&stage);
+            // `write_staged` cleans up only when it actually created `&stage`;
+            // never unlink a pre-existing path on `AlreadyExists`.
             return Err(io_error("stage the output file", &error));
         }
         match read_bounded_with_context(path, max_bytes, context) {
@@ -14828,17 +14856,26 @@ mod portable_install {
     }
 
     /// Writes `contents` to a freshly created (never pre-existing) file with
-    /// exactly `mode`, then makes it durable.
+    /// exactly `mode`, then makes it durable. Unlinks `path` on error only if
+    /// this call actually created it (never on `AlreadyExists`).
     fn write_staged(path: &Path, mode: u32, contents: &[u8]) -> io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(mode)
             .open(path)?;
-        // The creation mode is filtered by the umask; set the exact bits.
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
-        file.write_all(contents)?;
-        file.sync_all()
+        let result = (|| -> io::Result<()> {
+            // The creation mode is filtered by the umask; set the exact bits.
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+            file.write_all(contents)?;
+            file.sync_all()
+        })();
+        if let Err(error) = result {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Atomically replaces `path` with `contents`, given the exact bytes the
@@ -14887,23 +14924,18 @@ mod portable_install {
             return Err(refuse_changed());
         }
 
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        );
-        let sibling = |prefix: &str| {
-            let mut name = std::ffi::OsString::from(prefix);
-            name.push(file_name);
-            name.push(format!(".{nonce}"));
-            parent.join(name)
-        };
+        let nonce = next_sibling_nonce();
+        let sibling = |prefix: &str| sibling_path(parent, prefix, file_name, &nonce);
 
         let mut publication = Publication::default();
         let mode = if original.is_some() {
-            let metadata = fs::metadata(path).map_err(|error| io_error("inspect", &error))?;
+            let metadata =
+                fs::symlink_metadata(path).map_err(|error| io_error("inspect", &error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(McpError::invalid_params(format!(
+                    "Refusing to write installation config at {display}: destination changed to a non-regular file"
+                )));
+            }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Ok(file) = File::open(path) {
                 publication.dropped_extended_attributes =
@@ -14912,7 +14944,7 @@ mod portable_install {
             let backup = sibling(".fastmcp-backup.");
             fs::hard_link(path, &backup).map_err(|error| io_error("link a backup", &error))?;
             publication.backup = Some(backup);
-            metadata.permissions().mode() & 0o7777
+            metadata.permissions().mode() & 0o777
         } else {
             0o600
         };
@@ -14920,30 +14952,32 @@ mod portable_install {
         let stage = sibling(".fastmcp-stage.");
         // Until the rename succeeds nothing was published, so a failure also
         // removes this call's backup link; the original file is untouched.
-        let abandon = |publication: &Publication| {
-            let _ = fs::remove_file(&stage);
+        let abandon = |publication: &Publication, remove_stage: bool| {
+            if remove_stage {
+                let _ = fs::remove_file(&stage);
+            }
             if let Some(backup) = &publication.backup {
                 let _ = fs::remove_file(backup);
             }
         };
         if let Err(error) = write_staged(&stage, mode, contents) {
-            abandon(&publication);
+            abandon(&publication, false);
             return Err(io_error("stage the new config", &error));
         }
         after_stage();
         match read_bounded(path, CONFIG_INPUT_MAX_BYTES) {
             Ok(current) if current.as_deref() == original => {}
             Ok(_) => {
-                abandon(&publication);
+                abandon(&publication, true);
                 return Err(refuse_changed());
             }
             Err(error) => {
-                abandon(&publication);
+                abandon(&publication, true);
                 return Err(error);
             }
         }
         if let Err(error) = fs::rename(&stage, path) {
-            abandon(&publication);
+            abandon(&publication, true);
             return Err(io_error("publish the new config", &error));
         }
         File::open(parent)
@@ -15194,6 +15228,42 @@ mod portable_install {
                 .expect_err("oversized");
             assert_eq!(oversized_err.code, McpErrorCode::InvalidParams);
             assert!(!oversized_target.exists());
+
+            fs::remove_dir_all(&directory).expect("remove scratch directory");
+        }
+
+        #[test]
+        fn replace_file_handles_long_filenames_distinct_nonces_and_non_destructive_write_staged() {
+            let directory = scratch("replace-file-hardening");
+            // Positive: a 220-byte file name (which previously exceeded NAME_MAX
+            // once prefixed with `.fastmcp-stage.` + nonce) publishes cleanly.
+            let long_name = format!("{}.json", "a".repeat(215));
+            let long_path = directory.join(&long_name);
+            let outcome = replace_file(&long_path, b"{\"long\":true}\n", "inspect output", 1024)
+                .expect("long filename must publish without ENAMETOOLONG");
+            assert!(matches!(outcome, AtomicReplaceOutcome::Committed));
+            assert_eq!(
+                fs::read(&long_path).expect("read long"),
+                b"{\"long\":true}\n"
+            );
+
+            // Monotonic nonces remain strictly distinct even on immediate back-to-back calls.
+            let first_nonce = next_sibling_nonce();
+            let second_nonce = next_sibling_nonce();
+            assert_ne!(first_nonce, second_nonce);
+
+            // Planted negative (RH-5): `write_staged` on a pre-existing file returns
+            // AlreadyExists WITHOUT deleting or mutating the pre-existing file.
+            let pre_existing = directory.join("existing-stage");
+            fs::write(&pre_existing, b"keep-me").expect("seed pre-existing");
+            let err = write_staged(&pre_existing, 0o600, b"overwrite")
+                .expect_err("create_new must reject pre-existing path");
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(
+                fs::read(&pre_existing).expect("pre-existing preserved"),
+                b"keep-me",
+                "AlreadyExists failure must never unlink or mutate a pre-existing file"
+            );
 
             fs::remove_dir_all(&directory).expect("remove scratch directory");
         }
