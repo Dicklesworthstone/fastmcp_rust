@@ -238,12 +238,12 @@ impl TestClient {
             .map(serde_json::from_value)
             .transpose()
             .map_err(|error| {
-                McpError::internal_error(format!("Failed to deserialize modern serverInfo: {error}"))
+                McpError::internal_error(format!(
+                    "Failed to deserialize modern serverInfo: {error}"
+                ))
             })?
             .ok_or_else(|| {
-                McpError::internal_error(
-                    "Modern server/discover response missing _meta serverInfo",
-                )
+                McpError::internal_error("Modern server/discover response missing _meta serverInfo")
             })?;
         let capabilities: ServerCapabilities = raw
             .get("capabilities")
@@ -275,7 +275,8 @@ impl TestClient {
     }
 
     fn modern_request_meta(&self) -> serde_json::Value {
-        let caps = serde_json::to_value(&self.capabilities).unwrap_or_else(|_| serde_json::json!({}));
+        let caps =
+            serde_json::to_value(&self.capabilities).unwrap_or_else(|_| serde_json::json!({}));
         serde_json::json!({
             FINAL_PROTOCOL_VERSION_META_KEY: FINAL_PROTOCOL_VERSION,
             FINAL_CLIENT_CAPABILITIES_META_KEY: caps,
@@ -283,7 +284,10 @@ impl TestClient {
     }
 
     const fn is_modern(&self) -> bool {
-        matches!(self.negotiated_mode, Some(TestClientProtocolMode::Modern2026))
+        matches!(
+            self.negotiated_mode,
+            Some(TestClientProtocolMode::Modern2026)
+        )
     }
 
     fn send_modern_request(
@@ -293,7 +297,10 @@ impl TestClient {
     ) -> McpResult<serde_json::Value> {
         let meta = self.modern_request_meta();
         if let Some(obj) = params.as_object_mut() {
-            match obj.get_mut("_meta").and_then(serde_json::Value::as_object_mut) {
+            match obj
+                .get_mut("_meta")
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 Some(existing) => {
                     if let Some(meta_obj) = meta.as_object() {
                         for (k, v) in meta_obj {
@@ -366,7 +373,7 @@ impl TestClient {
         arguments: serde_json::Value,
     ) -> McpResult<Vec<LegacyContent>> {
         self.ensure_initialized()?;
-        let result: CallToolResult = if self.is_modern() {
+        let (content, is_error) = if self.is_modern() {
             let raw = self.send_modern_request(
                 "tools/call",
                 serde_json::json!({
@@ -389,19 +396,19 @@ impl TestClient {
                     ))
                 })?
                 .unwrap_or_default();
-            CallToolResult { content, is_error }
+            (content, is_error)
         } else {
             let params = CallToolParams {
                 name: name.to_string(),
                 arguments: Some(arguments),
                 meta: None,
             };
-            self.send_request("tools/call", params)?
+            let result: CallToolResult = self.send_request("tools/call", params)?;
+            (result.content, result.is_error)
         };
 
-        if result.is_error {
-            let error_msg = result
-                .content
+        if is_error {
+            let error_msg = content
                 .first()
                 .and_then(|c| match c {
                     LegacyContent::Text { text, .. } => Some(text.clone()),
@@ -411,7 +418,7 @@ impl TestClient {
             return Err(McpError::tool_error(error_msg));
         }
 
-        Ok(result.content)
+        Ok(content)
     }
 
     /// Lists available resources.
@@ -470,10 +477,8 @@ impl TestClient {
     pub fn read_resource(&mut self, uri: &str) -> McpResult<Vec<LegacyResourceContent>> {
         self.ensure_initialized()?;
         if self.is_modern() {
-            let raw = self.send_modern_request(
-                "resources/read",
-                serde_json::json!({ "uri": uri }),
-            )?;
+            let raw =
+                self.send_modern_request("resources/read", serde_json::json!({ "uri": uri }))?;
             let contents = raw.get("contents").cloned().ok_or_else(|| {
                 McpError::internal_error("Modern resources/read missing contents array")
             })?;
@@ -964,7 +969,11 @@ mod tests {
                 }
             }
 
-            fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            fn call(
+                &self,
+                _ctx: &McpContext,
+                arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
                 let msg = arguments
                     .get("message")
                     .and_then(serde_json::Value::as_str)
@@ -1003,7 +1012,11 @@ mod tests {
                 Prompt {
                     name: "greet".to_owned(),
                     description: Some("Greets user".to_owned()),
-                    arguments: Vec::new(),
+                    arguments: vec![fastmcp_protocol::PromptArgument {
+                        name: "who".to_owned(),
+                        description: Some("Target name".to_owned()),
+                        required: false,
+                    }],
                     icon: None,
                     version: None,
                     tags: Vec::new(),
@@ -1044,9 +1057,11 @@ mod tests {
                 });
             });
 
-            let mut client = TestClient::new(client_transport, Cx::for_testing())
-                .with_protocol_mode(mode);
-            let init = client.initialize().expect("modern server/discover succeeds");
+            let mut client =
+                TestClient::new(client_transport, Cx::for_testing()).with_protocol_mode(mode);
+            let init = client
+                .initialize()
+                .expect("modern server/discover succeeds");
             assert_eq!(init.protocol_version, FINAL_PROTOCOL_VERSION);
             assert_eq!(init.server_info.name, "modern-test-server");
             assert_eq!(client.protocol_version(), Some(FINAL_PROTOCOL_VERSION));
@@ -1069,13 +1084,22 @@ mod tests {
 
             let resources = client.list_resources().expect("modern resources/list");
             assert_eq!(resources.len(), 1);
-            let contents = client.read_resource("test://info").expect("modern resources/read");
-            assert_eq!(contents[0].text.as_deref(), Some("hello-resource"));
+            let contents = client
+                .read_resource("test://info")
+                .expect("modern resources/read");
+            assert!(matches!(
+                contents.first(),
+                Some(fastmcp_protocol::LegacyResourceContent::Text { text, .. })
+                    if text == "hello-resource"
+            ));
 
             let prompts = client.list_prompts().expect("modern prompts/list");
             assert_eq!(prompts.len(), 1);
             let messages = client
-                .get_prompt("greet", HashMap::from([("who".to_owned(), "mcp".to_owned())]))
+                .get_prompt(
+                    "greet",
+                    HashMap::from([("who".to_owned(), "mcp".to_owned())]),
+                )
                 .expect("modern prompts/get");
             assert!(matches!(
                 &messages[0].content,
