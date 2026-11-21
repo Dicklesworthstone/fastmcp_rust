@@ -10,8 +10,12 @@
 //! symlinks, and reads bytes only from the already-opened file handle.
 //! Those handle-relative no-follow semantics are qualified on Linux and
 //! macOS. Public [`FilesystemProvider::build`] constructs a handler there
-//! and routes listing/read I/O through the caller-owned asupersync blocking
-//! pool when one is installed. Other targets remain fail-closed.
+//! and routes asynchronous listing/read I/O through the caller-owned asupersync
+//! blocking pool. Missing or refused pool admission never runs I/O inline.
+//! Cancellation retains the worker until its closure and captures retire, and
+//! no result is returned after the request ends. A running filesystem syscall
+//! cannot be preempted; this is not a filesystem termination or durability
+//! guarantee. Other targets remain fail-closed.
 //!
 //! # Example
 //!
@@ -42,7 +46,8 @@ use cap_std::fs::{Dir, File, OpenOptions};
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult, Outcome};
 use fastmcp_protocol::{
-    FinalReadResourceResult, FinalResourceTemplate, Resource, ResourceContent, ResourceTemplate,
+    CompleteResult, FinalReadResourceResult, FinalResourceTemplate, Resource, ResourceContent,
+    ResourceTemplate,
 };
 
 use crate::handler::{BoxFuture, FinalMethodOutcome, ResourceHandler, UriParams};
@@ -626,7 +631,9 @@ impl FilesystemProvider {
     ///
     /// Linux and macOS acquire a handle-relative directory capability and
     /// return a handler. Listing and reads run on the caller-owned asupersync
-    /// blocking pool when one is installed. Other targets remain fail-closed.
+    /// blocking pool. Async reads require caller-owned I/O, spawn and timer
+    /// capabilities; missing or refused pool admission fails without inline I/O.
+    /// Other targets remain fail-closed.
     ///
     /// # Errors
     ///
@@ -1266,17 +1273,120 @@ impl FilesystemResourceHandler {
     }
 }
 
-async fn run_filesystem_blocking<T, F>(ctx: &McpContext, work: F) -> McpOutcome<T>
+async fn run_filesystem_blocking<T, F>(
+    ctx: &McpContext,
+    request_cx: &Cx,
+    work: F,
+) -> McpOutcome<T>
 where
     T: Send + 'static,
     F: FnOnce(&McpContext) -> McpResult<T> + Send + 'static,
 {
-    let worker_ctx = ctx.clone();
-    // Awaited blocking-pool offload for synchronous std::fs I/O, not runtime re-entry.
-    match asupersync::runtime::spawn_blocking(move || work(&worker_ctx)).await {
-        Ok(value) => Outcome::Ok(value),
-        Err(error) => Outcome::Err(error),
-    }
+    use fastmcp_core::runtime::{CallerContextFuture, with_caller_context};
+
+    // The explicit request owns runtime identity and drivers. Neither it nor
+    // a later polling host may widen the original request's capabilities.
+    let caller = with_caller_context(ctx.cx(), || {
+        with_caller_context(request_cx, || {
+            Cx::current().expect("filesystem caller context is installed")
+        })
+    });
+    let context = ctx.clone().with_request_cx(caller.clone());
+    CallerContextFuture::new(&caller, async {
+        if ctx.ensure_live().is_err() || context.ensure_live().is_err() {
+            return Outcome::Err(McpError::request_cancelled());
+        }
+        let admitted = Cx::current().expect("filesystem caller context is installed");
+        if !filesystem_blocking_authority(&admitted) {
+            return Outcome::Err(filesystem_blocking_unavailable());
+        }
+        let Some(permit) = crate::try_reserve_blocking_dispatch() else {
+            return Outcome::Err(filesystem_blocking_unavailable());
+        };
+        let worker_context = context.clone();
+        let mut worker = match admitted.spawn_blocking_drained(move |worker_cx| {
+            let _permit = permit;
+            let _lane = fastmcp_core::runtime::enter_blocking_lane();
+            let worker_context = worker_context.with_request_cx(worker_cx.clone());
+            with_caller_context(&worker_cx, || {
+                worker_context
+                    .ensure_live()
+                    .map_err(|_| McpError::request_cancelled())?;
+                let result = work(&worker_context);
+                worker_context
+                    .ensure_live()
+                    .map_err(|_| McpError::request_cancelled())?;
+                result
+            })
+        }) {
+            Ok(worker) => worker,
+            Err(_) => return Outcome::Err(filesystem_blocking_unavailable()),
+        };
+        let joined = loop {
+            if ctx.ensure_live().is_err() || context.ensure_live().is_err() {
+                let reason = if context.deadline_expired() || ctx.deadline_expired() {
+                    asupersync::CancelReason::deadline()
+                } else {
+                    admitted
+                        .cancel_reason()
+                        .unwrap_or_else(|| {
+                            asupersync::CancelReason::user("filesystem request ended")
+                        })
+                };
+                worker.abort_with_reason(reason);
+                // A cancelled request does not terminate an in-progress
+                // syscall. Keep the region's worker and permit charged until
+                // actual retirement, then discard even a successful result.
+                let _ = worker.join().await;
+                return Outcome::Err(McpError::request_cancelled());
+            }
+            let current = Cx::current().expect("filesystem caller context is installed");
+            if !filesystem_blocking_authority(&current) {
+                worker.abort_with_reason(asupersync::CancelReason::user(
+                    "filesystem caller authority changed",
+                ));
+                let _ = worker.join().await;
+                return Outcome::Err(filesystem_blocking_unavailable());
+            }
+            // Periodic observation also covers a closed request lease or a
+            // tightened shared deadline with no socket or worker wakeup.
+            if let Ok(joined) = asupersync::time::timeout(
+                current.now(),
+                std::time::Duration::from_millis(20),
+                worker.join(),
+            )
+            .await
+            {
+                break joined;
+            }
+        };
+        if ctx.ensure_live().is_err() || context.ensure_live().is_err() {
+            return Outcome::Err(McpError::request_cancelled());
+        }
+        let current = Cx::current().expect("filesystem caller context is installed");
+        if !filesystem_blocking_authority(&current) {
+            return Outcome::Err(filesystem_blocking_unavailable());
+        }
+        match joined {
+            Ok(Ok(value)) => Outcome::Ok(value),
+            Ok(Err(error)) => Outcome::Err(error),
+            Err(_) => Outcome::Err(filesystem_blocking_unavailable()),
+        }
+    })
+    .await
+}
+
+fn filesystem_blocking_authority(cx: &Cx) -> bool {
+    let capabilities = cx.capabilities();
+    capabilities.io
+        && capabilities.spawn
+        && capabilities.time
+        && cx.timer_driver().is_some()
+        && cx.blocking_pool_handle().is_some()
+}
+
+fn filesystem_blocking_unavailable() -> McpError {
+    McpError::internal_error("Filesystem resource requires admitted caller-owned blocking I/O")
 }
 
 impl ResourceHandler for FilesystemResourceHandler {
@@ -1336,7 +1446,9 @@ impl ResourceHandler for FilesystemResourceHandler {
     ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
         let handler = self.clone();
         Box::pin(
-            async move { run_filesystem_blocking(ctx, move |child| handler.read(child)).await },
+            async move {
+                run_filesystem_blocking(ctx, ctx.cx(), move |child| handler.read(child)).await
+            },
         )
     }
 
@@ -1350,7 +1462,7 @@ impl ResourceHandler for FilesystemResourceHandler {
         let uri = uri.to_owned();
         let params = params.clone();
         Box::pin(async move {
-            run_filesystem_blocking(ctx, move |child| {
+            run_filesystem_blocking(ctx, ctx.cx(), move |child| {
                 handler.read_with_uri(child, &uri, &params)
             })
             .await
@@ -1360,7 +1472,7 @@ impl ResourceHandler for FilesystemResourceHandler {
     fn read_async_with_uri_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
-        _request_cx: &'a Cx,
+        request_cx: &'a Cx,
         uri: &'a str,
         params: &'a UriParams,
     ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
@@ -1368,8 +1480,71 @@ impl ResourceHandler for FilesystemResourceHandler {
         let uri = uri.to_owned();
         let params = params.clone();
         Box::pin(async move {
-            run_filesystem_blocking(ctx, move |child| {
+            run_filesystem_blocking(ctx, request_cx, move |child| {
                 handler.read_with_uri(child, &uri, &params)
+            })
+            .await
+        })
+    }
+
+    fn read_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        let handler = self.clone();
+        Box::pin(async move {
+            run_filesystem_blocking(ctx, ctx.cx(), move |child| handler.read_final(child)).await
+        })
+    }
+
+    fn read_final_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        self.read_final_async_with_uri_in_request(ctx, ctx.cx(), uri, params)
+    }
+
+    fn read_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        let handler = self.clone();
+        Box::pin(async move {
+            run_filesystem_blocking(ctx, ctx.cx(), move |child| {
+                handler.read_final_outcome(child)
+            })
+            .await
+        })
+    }
+
+    fn read_final_outcome_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        self.read_final_outcome_async_with_uri_in_request(ctx, ctx.cx(), uri, params)
+    }
+
+    fn read_final_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        let handler = self.clone();
+        let uri = uri.to_owned();
+        let params = params.clone();
+        Box::pin(async move {
+            run_filesystem_blocking(ctx, request_cx, move |child| {
+                if params.is_empty() {
+                    handler.read_final(child)
+                } else {
+                    handler.read_final_with_uri(child, &uri, &params)
+                }
             })
             .await
         })
@@ -1378,7 +1553,7 @@ impl ResourceHandler for FilesystemResourceHandler {
     fn read_final_outcome_async_with_uri_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
-        _request_cx: &'a Cx,
+        request_cx: &'a Cx,
         uri: &'a str,
         params: &'a UriParams,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
@@ -1386,7 +1561,7 @@ impl ResourceHandler for FilesystemResourceHandler {
         let uri = uri.to_owned();
         let params = params.clone();
         Box::pin(async move {
-            run_filesystem_blocking(ctx, move |child| {
+            run_filesystem_blocking(ctx, request_cx, move |child| {
                 handler.read_final_outcome_with_uri(child, &uri, &params)
             })
             .await
@@ -1773,9 +1948,14 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::future::{Future, poll_fn};
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::task::Poll;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use fastmcp_core::McpErrorCode;
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -2259,29 +2439,367 @@ mod tests {
         }
     }
 
+    fn filesystem_runtime(pool: bool) -> asupersync::runtime::Runtime {
+        let builder = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap());
+        let builder = if pool {
+            builder.blocking_threads(1, 2)
+        } else {
+            builder.blocking_threads(0, 0)
+        };
+        builder.build().unwrap()
+    }
+
+    fn filesystem_error<T>(outcome: McpOutcome<T>, expected: McpErrorCode) {
+        match outcome {
+            Outcome::Err(error) => assert_eq!(error.code, expected),
+            _ => panic!("filesystem read must return the expected typed refusal"),
+        }
+    }
+
+    // Continue polling the actual operation while observing a worker barrier.
+    // Every wait is finite, and an early return fails instead of masquerading
+    // as completion of a still-owned blocking operation.
+    async fn filesystem_pending_until<F: Future>(
+        cx: &Cx,
+        mut operation: Pin<&mut F>,
+        mut observed: impl FnMut() -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut tick = Box::pin(asupersync::time::Sleep::new(
+            cx.now().saturating_add_nanos(1_000_000),
+        ));
+        poll_fn(|task| {
+            assert!(
+                operation.as_mut().poll(task).is_pending(),
+                "filesystem call returned before its worker retired",
+            );
+            if observed() {
+                return Poll::Ready(());
+            }
+            assert!(Instant::now() < deadline, "filesystem worker barrier timed out");
+            if tick.as_mut().poll(task).is_ready() {
+                tick = Box::pin(asupersync::time::Sleep::new(
+                    cx.now().saturating_add_nanos(1_000_000),
+                ));
+                let _ = tick.as_mut().poll(task);
+            }
+            Poll::Pending
+        })
+        .await;
+    }
+
+    struct FilesystemDropSignal(Arc<AtomicBool>);
+
+    impl Drop for FilesystemDropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn test_handler_read_async_with_uri() {
         let root = TestDir::new("handler-async");
         write_text(&root.join("notes.md"), "async content");
-
         let handler = FilesystemProvider::new(root.path())
             .with_patterns(&["*.md"])
-            .build_for_test()
-            .expect("valid filesystem provider");
-        let ctx = McpContext::new(asupersync::Cx::for_testing(), 9);
-
+            .build()
+            .expect("public filesystem provider");
         let mut params = HashMap::new();
         params.insert("path".to_string(), "notes.md".to_string());
-        let outcome =
-            fastmcp_core::block_on(handler.read_async_with_uri(&ctx, "file:///notes.md", &params));
-        match outcome {
-            Outcome::Ok(content) => {
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].text.as_deref(), Some("async content"));
+
+        filesystem_runtime(true).block_on(async {
+            let cx = Cx::current().unwrap();
+            let ctx = McpContext::new(cx.clone(), 9);
+            let Outcome::Ok(content) = handler
+                .read_async_with_uri(&ctx, "file:///notes.md", &params)
+                .await
+            else {
+                panic!("caller-owned pool must complete the public resource read");
+            };
+            assert_eq!(content.len(), 1);
+            assert_eq!(content[0].text.as_deref(), Some("async content"));
+            let Outcome::Ok(FinalMethodOutcome::Complete(result)) = handler
+                .read_final_outcome_async_with_uri_in_request(
+                    &ctx, &cx, "file:///notes.md", &params,
+                )
+                .await
+            else {
+                panic!("final resource read must preserve its complete result");
+            };
+            let payload = serde_json::to_value(result.payload).unwrap();
+            assert_eq!(payload["contents"][0]["text"], "async content");
+            let Outcome::Ok(listing) = handler.read_async(&ctx).await else {
+                panic!("caller-owned pool must complete directory listing");
+            };
+            let entries: serde_json::Value =
+                serde_json::from_str(listing[0].text.as_deref().unwrap()).unwrap();
+            assert_eq!(entries[0]["uri"], "file:///notes.md");
+
+            // An empty parameter map means a listing on every final async
+            // surface, including the complete-only URI compatibility path.
+            let empty = UriParams::new();
+            let Outcome::Ok(complete) = handler
+                .read_final_async_with_uri(&ctx, "file:///", &empty)
+                .await
+            else {
+                panic!("complete-only URI read must preserve empty-params listing");
+            };
+            let complete = serde_json::to_value(complete.payload).unwrap();
+            let Outcome::Ok(in_request) = handler
+                .read_final_async_with_uri_in_request(&ctx, &cx, "file:///", &empty)
+                .await
+            else {
+                panic!("explicit request must preserve complete-only URI listing");
+            };
+            let in_request = serde_json::to_value(in_request.payload).unwrap();
+            let Outcome::Ok(FinalMethodOutcome::Complete(outcome)) = handler
+                .read_final_outcome_async_with_uri_in_request(&ctx, &cx, "file:///", &empty)
+                .await
+            else {
+                panic!("final outcome URI read must preserve empty-params listing");
+            };
+            let outcome = serde_json::to_value(outcome.payload).unwrap();
+            assert_eq!(complete, in_request);
+            assert_eq!(complete, outcome);
+            let final_entries: serde_json::Value =
+                serde_json::from_str(complete["contents"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(final_entries, entries);
+
+            let poller = std::thread::current().id();
+            let parent_task = cx.task_id();
+            let worker_handler = handler.clone();
+            let worker_params = params.clone();
+            let outcome = run_filesystem_blocking(&ctx, &cx, move |worker| {
+                assert_ne!(std::thread::current().id(), poller);
+                assert_ne!(worker.task_id(), parent_task);
+                assert_eq!(worker.request_id(), 9);
+                assert_eq!(Cx::current().unwrap().task_id(), worker.task_id());
+                worker_handler.read_with_uri(worker, "file:///notes.md", &worker_params)
+            })
+            .await;
+            assert!(matches!(outcome, Outcome::Ok(_)));
+            assert!(ctx.ensure_live().is_ok());
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn filesystem_async_missing_pool_refuses_every_public_read_surface() {
+        let root = TestDir::new("async-no-pool");
+        write_text(&root.join("notes.md"), "must not read inline");
+        let handler = FilesystemProvider::new(root.path()).build().unwrap();
+        let params = HashMap::from([("path".to_owned(), "notes.md".to_owned())]);
+        filesystem_runtime(false).block_on(async {
+            let cx = Cx::current().unwrap();
+            assert!(cx.blocking_pool_handle().is_none());
+            let ctx = McpContext::new(cx.clone(), 13);
+            let unavailable = McpErrorCode::InternalError;
+            filesystem_error(handler.read_async(&ctx).await, unavailable);
+            filesystem_error(
+                handler.read_async_with_uri(&ctx, "file:///notes.md", &params).await,
+                unavailable,
+            );
+            filesystem_error(handler.read_final_async(&ctx).await, unavailable);
+            filesystem_error(
+                handler.read_final_async_with_uri(&ctx, "file:///notes.md", &params).await,
+                unavailable,
+            );
+            filesystem_error(handler.read_final_outcome_async(&ctx).await, unavailable);
+            filesystem_error(
+                handler.read_final_outcome_async_with_uri(&ctx, "file:///notes.md", &params).await,
+                unavailable,
+            );
+            filesystem_error(
+                handler.read_async_with_uri_in_request(&ctx, &cx, "file:///notes.md", &params).await,
+                unavailable,
+            );
+            filesystem_error(
+                handler.read_final_async_with_uri_in_request(&ctx, &cx, "file:///notes.md", &params).await,
+                unavailable,
+            );
+            filesystem_error(
+                handler.read_final_outcome_async_with_uri_in_request(&ctx, &cx, "file:///notes.md", &params).await,
+                unavailable,
+            );
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            filesystem_error(
+                run_filesystem_blocking(&ctx, &cx, move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await,
+                unavailable,
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            // The explicitly synchronous API remains available to a caller
+            // that owns its blocking execution; this change adds no runtime.
+            assert!(handler.read_with_uri(&ctx, "file:///notes.md", &params).is_ok());
+        });
+
+        filesystem_runtime(true).block_on(async {
+            let cx = Cx::current().unwrap();
+            let ctx = McpContext::new(cx.clone(), 14);
+            let explicit = cx.with_blocking_pool_handle(None);
+            filesystem_error(
+                handler.read_async_with_uri_in_request(&ctx, &explicit, "file:///notes.md", &params).await,
+                McpErrorCode::InternalError,
+            );
+            filesystem_error(
+                handler.read_final_outcome_async_with_uri_in_request(
+                    &ctx, &explicit, "file:///notes.md", &params,
+                ).await,
+                McpErrorCode::InternalError,
+            );
+            assert!(ctx.ensure_live().is_ok(), "a wider ambient pool grants no authority");
+        });
+    }
+
+    #[test]
+    fn filesystem_async_stopped_pool_never_invokes_work_inline() {
+        let pool = asupersync::runtime::BlockingPool::new(0, 1);
+        pool.shutdown();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        filesystem_runtime(false).block_on(async {
+            let cx = Cx::current().unwrap().with_blocking_pool_handle(Some(pool.handle()));
+            let ctx = McpContext::new(cx.clone(), 15);
+            filesystem_error(
+                run_filesystem_blocking(&ctx, &cx, move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }).await,
+                McpErrorCode::InternalError,
+            );
+            assert!(ctx.ensure_live().is_ok());
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(pool.shutdown_and_wait(Duration::from_secs(5)));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn filesystem_async_explicit_cancel_and_deadline_cannot_use_a_live_parent() {
+        let root = TestDir::new("async-explicit-cancellation");
+        write_text(&root.join("notes.md"), "must not read after request ends");
+        let handler = FilesystemProvider::new(root.path()).build().unwrap();
+        let params = HashMap::from([("path".to_owned(), "notes.md".to_owned())]);
+        let runtime = filesystem_runtime(true);
+        let expired = runtime.request_cx_with_budget(
+            asupersync::types::Budget::INFINITE.with_deadline(asupersync::types::Time::ZERO),
+        );
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        runtime.block_on(async {
+            let parent = Cx::current().unwrap();
+            let ctx = McpContext::new(parent.clone(), 16);
+            for explicit in [&cancelled, &expired] {
+                filesystem_error(
+                    handler.read_async_with_uri_in_request(&ctx, explicit, "file:///notes.md", &params).await,
+                    McpErrorCode::RequestCancelled,
+                );
+                filesystem_error(
+                    handler.read_final_outcome_async_with_uri_in_request(
+                        &ctx, explicit, "file:///notes.md", &params,
+                    ).await,
+                    McpErrorCode::RequestCancelled,
+                );
             }
-            other => panic!("unexpected async outcome: {other:?}"),
-        }
+            assert!(parent.checkpoint().is_ok());
+            assert!(ctx.ensure_live().is_ok());
+        });
+    }
+
+    #[test]
+    fn filesystem_async_cancelled_queued_work_retains_captures_until_pool_retirement() {
+        let pool = asupersync::runtime::BlockingPool::new(0, 1);
+        let (entered, entering) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let occupying = pool.spawn(move || {
+            entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        filesystem_runtime(false).block_on(async {
+            let cx = Cx::current().unwrap().with_blocking_pool_handle(Some(pool.handle()));
+            let ctx = McpContext::new(cx.clone(), 17);
+            let sibling = McpContext::new(cx.clone(), 18);
+            let observed = Arc::clone(&calls);
+            let capture = FilesystemDropSignal(Arc::clone(&dropped));
+            let mut call = Box::pin(run_filesystem_blocking(&ctx, &cx, move |_| {
+                let _capture = capture;
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }));
+            filesystem_pending_until(&cx, call.as_mut(), || pool.pending_count() == 1).await;
+            ctx.request_cancellation().cancel();
+            let cancelled_at = Instant::now();
+            filesystem_pending_until(&cx, call.as_mut(), || {
+                cancelled_at.elapsed() >= Duration::from_millis(50)
+            }).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(!dropped.load(Ordering::SeqCst));
+            assert!(sibling.ensure_live().is_ok());
+            release.send(()).unwrap();
+            filesystem_error(call.await, McpErrorCode::RequestCancelled);
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(cx.checkpoint().is_ok());
+        });
+        assert!(occupying.wait_timeout(Duration::from_secs(5)));
+        assert!(pool.shutdown_and_wait(Duration::from_secs(5)));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn filesystem_async_running_cancellation_joins_worker_and_discards_late_read() {
+        let root = TestDir::new("async-running-cancellation");
+        let path = root.join("late.txt");
+        write_text(&path, "late file contents");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let read = Arc::new(AtomicUsize::new(0));
+        filesystem_runtime(true).block_on(async {
+            let cx = Cx::current().unwrap();
+            let ctx = McpContext::new(cx.clone(), 19);
+            let sibling = McpContext::new(cx.clone(), 20);
+            let (entered, entering) = std::sync::mpsc::sync_channel(1);
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            let payload = FilesystemDropSignal(Arc::clone(&dropped));
+            let observed = Arc::clone(&read);
+            let mut call = Box::pin(run_filesystem_blocking(&ctx, &cx, move |worker| {
+                entered.send(worker.cx().clone()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+                // Model a syscall that already entered before cancellation:
+                // it cannot be preempted and still returns valid file bytes.
+                let text = std::fs::read_to_string(path).unwrap();
+                assert_eq!(text, "late file contents");
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok((text, payload))
+            }));
+            let mut worker = None;
+            filesystem_pending_until(&cx, call.as_mut(), || {
+                if let Ok(entered) = entering.try_recv() {
+                    worker = Some(entered);
+                }
+                worker.is_some()
+            }).await;
+            ctx.request_cancellation().cancel();
+            filesystem_pending_until(&cx, call.as_mut(), || {
+                worker.as_ref().unwrap().is_cancel_requested()
+            }).await;
+            assert_eq!(read.load(Ordering::SeqCst), 0);
+            assert!(!dropped.load(Ordering::SeqCst));
+            assert!(sibling.ensure_live().is_ok());
+            release.send(()).unwrap();
+            filesystem_error(call.await, McpErrorCode::RequestCancelled);
+            assert_eq!(read.load(Ordering::SeqCst), 1);
+            assert!(dropped.load(Ordering::SeqCst), "late bytes are discarded before completion");
+            assert!(cx.checkpoint().is_ok());
+        });
     }
 
     #[test]
