@@ -14109,7 +14109,13 @@ where
         return false;
     }
 
-    if cx.checkpoint().is_err() {
+    if listener_shutdown.is_requested()
+        || cx.checkpoint().is_err()
+        || cx
+            .budget()
+            .deadline
+            .is_some_and(|deadline| cx.now() >= deadline)
+    {
         let _ = send_h1_response(
             cx,
             listener_shutdown,
@@ -14127,21 +14133,72 @@ where
         let _ = send_h1_response(cx, listener_shutdown, framed, response).await;
         return true;
     }
+    // Credential verification is memory/CPU-hard. Admit the synchronous route
+    // before cloning any request state, and never allow spawn_blocking's
+    // no-pool fallback to run it on the reactor. The drained child retains its
+    // dispatch reservation and request custody until the closure retires.
+    let Some(dispatch_permit) = try_reserve_blocking_dispatch() else {
+        let _ = send_h1_response(
+            cx,
+            listener_shutdown,
+            framed,
+            HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
+        )
+        .await;
+        return true;
+    };
     let routes = routes.clone();
     let request = request.clone();
     let raw_path = raw_path.to_owned();
     let raw_query = raw_query.to_owned();
-    let response = match cx.spawn_blocking(move |route_cx| {
+    let response = match cx.spawn_blocking_drained(move |route_cx| {
+        let _dispatch_permit = dispatch_permit;
+        let _lane = fastmcp_core::runtime::enter_blocking_lane();
         if route_cx.checkpoint().is_err() {
             return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
         }
-        dispatch_oauth_h1_request(&routes, &request, &raw_path, &raw_query)
+        fastmcp_core::runtime::with_caller_context(&route_cx, || {
+            dispatch_oauth_h1_request(&routes, &request, &raw_path, &raw_query)
+        })
     }) {
-        Ok(mut dispatch) => match dispatch.join(cx).await {
-            Ok(response) => response,
-            Err(_) => HttpResponse::internal_error(),
-        },
-        Err(_) => HttpResponse::internal_error(),
+        Ok(mut dispatch) => {
+            let joined = loop {
+                let expired = cx
+                    .budget()
+                    .deadline
+                    .is_some_and(|deadline| cx.now() >= deadline);
+                if listener_shutdown.is_requested() || cx.checkpoint().is_err() || expired {
+                    // Local listener/connection cancellation is not automatically
+                    // inherited by the separately admitted blocking child. Close
+                    // its claim gate and publish cancellation to its own Cx, but
+                    // retain both the handle and connection until real retirement.
+                    let reason = if expired {
+                        asupersync::CancelReason::deadline()
+                    } else {
+                        cx.cancel_reason()
+                            .unwrap_or_else(asupersync::CancelReason::shutdown)
+                    };
+                    dispatch.abort_with_reason(reason);
+                    break dispatch.join().await;
+                }
+                // A borrowed drained join can be dropped and resumed without
+                // discarding the result or abandoning the pool's captures.
+                if let Ok(result) =
+                    asupersync::time::timeout(cx.now(), HTTP_ACCEPT_CANCEL_POLL, dispatch.join())
+                        .await
+                {
+                    break result;
+                }
+            };
+            match joined {
+                Ok(response) => response,
+                Err(asupersync::runtime::JoinError::Cancelled(_)) => {
+                    HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+                }
+                Err(_) => HttpResponse::internal_error(),
+            }
+        }
+        Err(_) => HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
     };
     let _ = send_h1_response(cx, listener_shutdown, framed, response).await;
     true
@@ -51214,6 +51271,203 @@ mod lib_unit_tests {
             );
             assert!(routes.server().validate_access_token(access).is_none());
         }
+    }
+
+    #[test]
+    fn live_http_oauth_listener_cancel_reaches_child_and_joins_retirement() {
+        #[derive(Default)]
+        struct CancelAwareConsent {
+            entered: AtomicBool,
+            cancelled: AtomicBool,
+            release: AtomicBool,
+            retired: AtomicBool,
+        }
+
+        impl oauth::AuthorizationApprovalBackend for CancelAwareConsent {
+            fn generation(&self) -> oauth::AuthorizationApprovalGeneration {
+                oauth::AuthorizationApprovalGeneration::from_bytes([0x43; 32])
+            }
+
+            fn approve(
+                &self,
+                _request: &oauth::AuthorizationApprovalRequest,
+            ) -> oauth::AuthorizationApprovalDisposition {
+                let cx = Cx::current().expect("native OAuth must install its admitted child Cx");
+                self.entered.store(true, Ordering::Release);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while cx.checkpoint().is_ok() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                self.cancelled
+                    .store(cx.is_cancel_requested(), Ordering::Release);
+                // Cancellation acknowledgement alone is not retirement. Keep
+                // the closure alive until the real socket owner observes that
+                // its connection permit is still retained.
+                while !self.release.load(Ordering::Acquire) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                self.retired.store(true, Ordering::Release);
+                oauth::AuthorizationApprovalDisposition::Cancelled
+            }
+        }
+
+        let consent = Arc::new(CancelAwareConsent::default());
+        let oauth = Arc::new(
+            oauth::OAuthServer::try_with_approval_backend(
+                oauth::OAuthServerConfig::default(),
+                consent.clone(),
+            )
+            .unwrap(),
+        );
+        oauth
+            .register_client(
+                oauth::OAuthClient::builder("cancel-client")
+                    .redirect_uri("https://client.example.test/callback")
+                    .scope("mcp")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let routes = OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth").unwrap();
+        run_live_http_test(move |cx| async move {
+            let bound = Server::new("oauth-cancellation-retirement", "1.0.0")
+                .oauth_http_routes(routes)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("OAuth cancellation bind failed: {error}"))?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let operator = bound.operator_handle();
+            let client_operator = operator.clone();
+            let client_consent = Arc::clone(&consent);
+            let caller_cx = cx.clone();
+            let mut client = cx.spawn(move |client_cx| async move {
+                let result = async {
+                    let mut stream = AsyncTcpStream::connect(address)
+                        .await.map_err(|error| error.to_string())?;
+                    let request = b"GET /oauth/authorize?response_type=code&client_id=cancel-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=mcp&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n";
+                    stream.write_all(request).await.map_err(|error| error.to_string())?;
+                    stream.flush().await.map_err(|error| error.to_string())?;
+                    wait_for_live_http_flag(&client_cx, &client_consent.entered, "OAuth consent entry").await?;
+                    // This deliberately cancels only the listener Cx, rather
+                    // than closing the whole runtime region around the child.
+                    caller_cx.cancel_with(CancelKind::User, Some("cancel OAuth listener"));
+                    wait_for_live_http_flag(&client_cx, &client_consent.cancelled, "OAuth child cancellation").await?;
+                    if client_consent.retired.load(Ordering::Acquire) {
+                        return Err("consent retired before the test released its gate".to_owned());
+                    }
+                    let snapshot = OperatorSnapshot::capture(&client_operator)
+                        .map_err(|error| error.to_string())?;
+                    if snapshot.connections().active != 1 || snapshot.counters().released != 0 {
+                        return Err("OAuth connection released before closure retirement".to_owned());
+                    }
+                    client_consent.release.store(true, Ordering::Release);
+                    let mut response = Vec::new();
+                    read_live_http_to_end(&mut stream, &mut response, "cancelled OAuth socket").await?;
+                    if !response.is_empty() {
+                        return Err("cancelled OAuth listener published a late response".to_owned());
+                    }
+                    Ok(())
+                }.await;
+                client_consent.release.store(true, Ordering::Release);
+                caller_cx.cancel_with(CancelKind::User, Some("OAuth cancellation checked"));
+                result
+            }).map_err(|error| format!("OAuth cancellation client spawn failed: {error}"))?;
+            let serve = bound.serve(&cx).await;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| error.to_string())??;
+            require_quiescent_http_shutdown(
+                serve.map_err(|error| error.to_string())?,
+                "OAuth cancellation retirement",
+            )
+            .await?;
+            if !consent.retired.load(Ordering::Acquire) {
+                return Err("listener claimed quiescence before consent retired".to_owned());
+            }
+            let snapshot =
+                OperatorSnapshot::capture(&operator).map_err(|error| error.to_string())?;
+            if snapshot.connections().in_use() != 0
+                || snapshot.counters().accepted != snapshot.counters().released
+            {
+                return Err("cancelled OAuth connection did not conserve its permit".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_oauth_without_blocking_pool_rejects_work_and_preserves_code() {
+        // Build the synchronous issuer fixture before entering the reactor.
+        let (routes, code_form, basic) = native_oauth_basic_fixture();
+        let retry_routes = routes.clone();
+        let retry_form = code_form.clone();
+        let retry_basic = basic.clone();
+        let metadata_path = routes.metadata_path().to_owned();
+        run_live_http_test_with_blocking_capacity(
+            move |cx| async move {
+                let bound = Server::new("oauth-without-blocking-pool", "1.0.0")
+                    .oauth_http_routes(routes)
+                    .build()
+                    .bind_http(&cx, "127.0.0.1:0")
+                    .await
+                    .map_err(|error| format!("OAuth listener failed: {error}"))?;
+                let address = bound
+                    .local_addr()
+                    .map_err(|error| format!("OAuth address failed: {error}"))?;
+                let caller_cx = cx.clone();
+                let mut client = cx
+                    .spawn(move |_client_cx| async move {
+                        let result = async {
+                            let request = format!(
+                                "POST /oauth/token HTTP/1.1\r\nHost: loopback\r\nAuthorization: {basic}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{code_form}",
+                                code_form.len(),
+                            );
+                            let rejected = live_http_exchange(address, request.into_bytes()).await?;
+                            if !rejected.starts_with(b"HTTP/1.1 503") {
+                                return Err("OAuth work ran without a blocking pool".to_owned());
+                            }
+                            // Immutable discovery still works on the same live
+                            // listener after refusing the expensive route.
+                            let metadata = live_http_exchange(
+                                address,
+                                format!(
+                                    "GET {metadata_path} HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
+                                )
+                                .into_bytes(),
+                            )
+                            .await?;
+                            if !metadata.starts_with(b"HTTP/1.1 200") {
+                                return Err("OAuth discovery requires a blocking pool".to_owned());
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        caller_cx.cancel_with(CancelKind::User, Some("OAuth admission checked"));
+                        result
+                    })
+                    .map_err(|error| format!("OAuth client spawn failed: {error}"))?;
+                let serve = bound.serve(&cx).await;
+                client
+                    .join(&cx)
+                    .await
+                    .map_err(|error| format!("OAuth client failed: {error:?}"))??;
+                require_quiescent_http_shutdown(
+                    serve.map_err(|error| format!("OAuth server failed: {error}"))?,
+                    "OAuth missing blocking pool",
+                )
+                .await
+            },
+            0,
+        );
+        // Refusal happened before dispatch: the exact authorization code is
+        // still redeemable when a synchronous caller supplies execution.
+        let request = native_oauth_form_request("/oauth/token", &retry_form, Some(&retry_basic));
+        assert_eq!(
+            dispatch_oauth_h1_request(&retry_routes, &request, "/oauth/token", "").status,
+            HttpStatus::OK,
+        );
     }
 
     #[test]

@@ -2268,10 +2268,12 @@ pub use context::{
 pub use crypto::{
     CryptoInputTooLongError, EPHEMERAL_KEY_MATERIAL_BYTES, EphemeralKeyMaterial,
     HMAC_SHA256_KEY_BYTES, HMAC_SHA256_TAG_BYTES, HmacSha256Key, HmacSha256Tag,
-    HmacVerificationError, NONCE_DOMAIN_MATERIAL_BYTES, NonceDomainMaterial, RandomDrawError,
+    HmacVerificationError, NONCE_DOMAIN_MATERIAL_BYTES, NonceDomainMaterial,
+    OAUTH_CLIENT_SECRET_SALT_BYTES, OAuthClientSecretSalt, RandomDrawError,
     SECURITY_IDENTIFIER_BYTES, SHA256_DIGEST_BYTES, SecurityIdentifier, Sha256Digest,
     WEBSOCKET_MASK_BYTES, WebSocketMask, draw_ephemeral_key_material, draw_hmac_sha256_key,
-    draw_nonce_domain_material, draw_security_identifier, draw_websocket_mask, sha256_bounded,
+    draw_nonce_domain_material, draw_oauth_client_secret_salt, draw_security_identifier,
+    draw_websocket_mask, sha256_bounded,
 };
 pub use duration::{ParseDurationError, parse_duration};
 pub use error::{

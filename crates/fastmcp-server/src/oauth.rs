@@ -69,11 +69,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "builtin-auth-server")]
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
-#[cfg(feature = "builtin-auth-server")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use fastmcp_core::{
@@ -89,11 +85,16 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::auth::{AuthRequest, TokenVerifier};
 #[cfg(feature = "builtin-auth-server")]
+mod client_secret;
+#[cfg(feature = "builtin-auth-server")]
 use crate::oidc::OidcProvider;
+#[cfg(feature = "builtin-auth-server")]
+use client_secret::ClientSecretVerifier;
 
 const PKCE_CODE_VERIFIER_MIN_BYTES: usize = 43;
 const PKCE_CODE_VERIFIER_MAX_BYTES: usize = 128;
 const OAUTH_OPAQUE_CREDENTIAL_BYTES: usize = 43;
+#[cfg(not(feature = "builtin-auth-server"))]
 const CLIENT_SECRET_VERIFIER_DOMAIN: &[u8] = b"fastmcp:oauth:client-secret:v1\0";
 const AUTHORIZATION_CODE_DIGEST_DOMAIN: &[u8] = b"fastmcp:oauth:authorization-code:v1\0";
 const ACCESS_TOKEN_DIGEST_DOMAIN: &[u8] = b"fastmcp:oauth:access-token:v1\0";
@@ -106,52 +107,19 @@ const CLIENT_CREDENTIALS_GRANT_ID_DOMAIN: &[u8] = b"fastmcp:oauth:machine-grant-
 const CLIENT_ASSERTION_REPLAY_DOMAIN: &[u8] = b"fastmcp:oauth:client-assertion-replay:v1\0";
 const OAUTH_SESSION_OWNER_DOMAIN: &[u8] = b"fastmcp:oauth:session-owner:v1\0";
 const OAUTH_REGISTRATION_EPOCH_BYTES: usize = 32;
+#[cfg(not(feature = "builtin-auth-server"))]
 const CLIENT_SECRET_SALT_BYTES: usize = 32;
+#[cfg(not(feature = "builtin-auth-server"))]
 const MAX_CLIENT_SECRET_VERIFIER_INPUT_BYTES: usize = CLIENT_SECRET_VERIFIER_DOMAIN.len()
     + CLIENT_SECRET_SALT_BYTES
     + MAX_OAUTH_CLIENT_CREDENTIAL_BYTES;
 const MAX_OPAQUE_CREDENTIAL_DIGEST_INPUT_BYTES: usize =
     AUTHORIZATION_CODE_DIGEST_DOMAIN.len() + OAUTH_OPAQUE_CREDENTIAL_BYTES;
 const MAX_GRANT_ID_DERIVATION_INPUT_BYTES: usize = AUTHORIZATION_GRANT_ID_DOMAIN.len() + 64;
+#[cfg(not(feature = "builtin-auth-server"))]
 const DUMMY_CLIENT_SECRET_SALT: [u8; CLIENT_SECRET_SALT_BYTES] = [0x5a; CLIENT_SECRET_SALT_BYTES];
 #[cfg(not(feature = "builtin-auth-server"))]
 const DUMMY_CLIENT_SECRET_DIGEST: Sha256Digest = Sha256Digest::from_bytes([0xa5; 32]);
-
-/// Minimum memory cost (KiB) admitted for Argon2id client-secret verification (8 MiB).
-#[cfg(feature = "builtin-auth-server")]
-pub const MIN_ARGON2_MEMORY_KIB: u32 = 8 * 1_024;
-/// Default OWASP interactive memory cost (KiB) for Argon2id client-secret verification (19 MiB).
-#[cfg(feature = "builtin-auth-server")]
-pub const DEFAULT_ARGON2_MEMORY_KIB: u32 = 19_456;
-/// Maximum memory cost (KiB) admitted for Argon2id client-secret verification (64 MiB).
-#[cfg(feature = "builtin-auth-server")]
-pub const MAX_ARGON2_MEMORY_KIB: u32 = 64 * 1_024;
-/// Minimum time cost (iterations) admitted for Argon2id client-secret verification.
-#[cfg(feature = "builtin-auth-server")]
-pub const MIN_ARGON2_TIME_COST: u32 = 1;
-/// Default OWASP interactive time cost (iterations) for Argon2id client-secret verification.
-#[cfg(feature = "builtin-auth-server")]
-pub const DEFAULT_ARGON2_TIME_COST: u32 = 2;
-/// Maximum time cost (iterations) admitted for Argon2id client-secret verification.
-#[cfg(feature = "builtin-auth-server")]
-pub const MAX_ARGON2_TIME_COST: u32 = 8;
-/// Minimum parallelism lanes admitted for Argon2id client-secret verification.
-#[cfg(feature = "builtin-auth-server")]
-pub const MIN_ARGON2_PARALLELISM: u32 = 1;
-/// Default parallelism lanes for Argon2id client-secret verification.
-#[cfg(feature = "builtin-auth-server")]
-pub const DEFAULT_ARGON2_PARALLELISM: u32 = 1;
-/// Maximum parallelism lanes admitted for Argon2id client-secret verification.
-#[cfg(feature = "builtin-auth-server")]
-pub const MAX_ARGON2_PARALLELISM: u32 = 4;
-/// Hard process-wide cap on concurrent Argon2id derivations so burst invalid
-/// credentials cannot exhaust server RAM (8 * 19 MiB ~= 152 MiB peak).
-#[cfg(feature = "builtin-auth-server")]
-const MAX_CONCURRENT_ARGON2_VERIFICATIONS: usize = 8;
-#[cfg(feature = "builtin-auth-server")]
-const ARGON2_DERIVED_KEY_BYTES: usize = 32;
-#[cfg(feature = "builtin-auth-server")]
-static ACTIVE_ARGON2_VERIFICATIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Maximum UTF-8 byte length of the configured OAuth issuer URL.
 pub const MAX_OAUTH_ISSUER_BYTES: usize = 2_048;
@@ -1960,114 +1928,11 @@ impl std::fmt::Debug for ClientSecret {
     }
 }
 
-/// Bounded Argon2id parameter profile for `builtin-auth-server` client-secret verification.
+/// Bounded salted verifier for the development-only, non-issuer profile.
 ///
-/// Enforces explicit memory, iteration, and lane floors/ceilings so neither weak
-/// parameters nor DoS-scale memory allocations can be configured.
-#[cfg(feature = "builtin-auth-server")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Argon2ClientSecretParams {
-    memory_kib: u32,
-    time_cost: u32,
-    parallelism: u32,
-}
-
-#[cfg(feature = "builtin-auth-server")]
-impl Default for Argon2ClientSecretParams {
-    fn default() -> Self {
-        Self {
-            memory_kib: DEFAULT_ARGON2_MEMORY_KIB,
-            time_cost: DEFAULT_ARGON2_TIME_COST,
-            parallelism: DEFAULT_ARGON2_PARALLELISM,
-        }
-    }
-}
-
-#[cfg(feature = "builtin-auth-server")]
-impl Argon2ClientSecretParams {
-    /// Validates and constructs bounded Argon2id parameters.
-    pub fn try_new(memory_kib: u32, time_cost: u32, parallelism: u32) -> Result<Self, OAuthError> {
-        if !(MIN_ARGON2_MEMORY_KIB..=MAX_ARGON2_MEMORY_KIB).contains(&memory_kib)
-            || !(MIN_ARGON2_TIME_COST..=MAX_ARGON2_TIME_COST).contains(&time_cost)
-            || !(MIN_ARGON2_PARALLELISM..=MAX_ARGON2_PARALLELISM).contains(&parallelism)
-        {
-            return Err(OAuthError::ServerError(
-                "Argon2id client-secret parameters are outside admitted bounds".to_string(),
-            ));
-        }
-        // Validate against argon2's own invariants (e.g., m_cost >= 8 * p_cost).
-        let _ = argon2::Params::new(
-            memory_kib,
-            time_cost,
-            parallelism,
-            Some(ARGON2_DERIVED_KEY_BYTES),
-        )
-        .map_err(|_| {
-            OAuthError::ServerError("Argon2id client-secret parameters were refused".to_string())
-        })?;
-        Ok(Self {
-            memory_kib,
-            time_cost,
-            parallelism,
-        })
-    }
-
-    /// Configured memory cost in KiB.
-    #[must_use]
-    pub const fn memory_kib(self) -> u32 {
-        self.memory_kib
-    }
-
-    /// Configured iteration count.
-    #[must_use]
-    pub const fn time_cost(self) -> u32 {
-        self.time_cost
-    }
-
-    /// Configured parallelism lane count.
-    #[must_use]
-    pub const fn parallelism(self) -> u32 {
-        self.parallelism
-    }
-}
-
-#[cfg(feature = "builtin-auth-server")]
-struct Argon2ConcurrencyGuard;
-
-#[cfg(feature = "builtin-auth-server")]
-impl Argon2ConcurrencyGuard {
-    fn try_acquire() -> Option<Self> {
-        ACTIVE_ARGON2_VERIFICATIONS
-            .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
-                (current < MAX_CONCURRENT_ARGON2_VERIFICATIONS).then_some(current + 1)
-            })
-            .ok()
-            .map(|_| Self)
-    }
-}
-
-#[cfg(feature = "builtin-auth-server")]
-impl Drop for Argon2ConcurrencyGuard {
-    fn drop(&mut self) {
-        ACTIVE_ARGON2_VERIFICATIONS.fetch_sub(1, AtomicOrdering::AcqRel);
-    }
-}
-
-/// Client-secret verifier retained for confidential OAuth clients.
-///
-/// With `builtin-auth-server` enabled, secrets are hashed and verified using
-/// bounded Argon2id (`argon2 = "=0.6.0"`, v0x13) with a 32-byte OS-random salt,
-/// zeroized output buffer, bounded process-wide concurrency, and constant-time
-/// digest comparison. Without `builtin-auth-server`, the in-memory development
-/// path retains the bounded salted SHA-256 fallback without pulling `argon2`.
-#[cfg(feature = "builtin-auth-server")]
-#[derive(Clone)]
-struct ClientSecretVerifier {
-    salt: [u8; CLIENT_SECRET_SALT_BYTES],
-    params: Argon2ClientSecretParams,
-    digest: Zeroizing<[u8; ARGON2_DERIVED_KEY_BYTES]>,
-}
-
+/// It removes plaintext retention and provides fixed-width comparison, but it
+/// is not the AUTH-06 Argon2id verifier. Enabling `builtin-auth-server`
+/// replaces this implementation with the admitted memory-hard KDF above.
 #[cfg(not(feature = "builtin-auth-server"))]
 #[derive(Clone)]
 struct ClientSecretVerifier {
@@ -2075,57 +1940,6 @@ struct ClientSecretVerifier {
     digest: Sha256Digest,
 }
 
-#[cfg(feature = "builtin-auth-server")]
-impl ClientSecretVerifier {
-    fn create(secret: &ClientSecret) -> Result<Self, OAuthError> {
-        Self::create_with_params(secret.as_bytes(), Argon2ClientSecretParams::default())
-    }
-
-    fn create_with_params(
-        secret: &[u8],
-        params: Argon2ClientSecretParams,
-    ) -> Result<Self, OAuthError> {
-        let salt = draw_security_identifier()
-            .map_err(|error| OAuthError::ServerError(error.to_string()))?;
-        Self::create_with_salt_and_params(secret, *salt.as_bytes(), params)
-    }
-
-    fn create_with_salt_and_params(
-        secret: &[u8],
-        salt: [u8; CLIENT_SECRET_SALT_BYTES],
-        params: Argon2ClientSecretParams,
-    ) -> Result<Self, OAuthError> {
-        let digest = client_secret_argon2id_digest(&salt, secret, params)?;
-        Ok(Self {
-            salt,
-            params,
-            digest,
-        })
-    }
-
-    fn dummy() -> &'static Self {
-        static DUMMY: OnceLock<ClientSecretVerifier> = OnceLock::new();
-        DUMMY.get_or_init(|| {
-            let params = Argon2ClientSecretParams::default();
-            let digest = client_secret_argon2id_digest(
-                &DUMMY_CLIENT_SECRET_SALT,
-                b"fastmcp-oauth-dummy-client-secret-sentinel",
-                params,
-            )
-            .expect("static Argon2id dummy verifier parameters are valid");
-            Self {
-                salt: DUMMY_CLIENT_SECRET_SALT,
-                params,
-                digest,
-            }
-        })
-    }
-
-    fn verify(&self, provided: &[u8]) -> bool {
-        client_secret_argon2id_digest(&self.salt, provided, self.params)
-            .is_ok_and(|provided_digest| constant_time_digest_eq(&self.digest, &provided_digest))
-    }
-}
 
 #[cfg(not(feature = "builtin-auth-server"))]
 impl ClientSecretVerifier {
@@ -2151,13 +1965,14 @@ impl ClientSecretVerifier {
         &DUMMY
     }
 
-    fn verify(&self, provided: &[u8]) -> bool {
-        client_secret_digest(&self.salt, provided).is_ok_and(|provided_digest| {
+    fn verify(&self, provided: &[u8]) -> Result<bool, OAuthError> {
+        client_secret_digest(&self.salt, provided).map(|provided_digest| {
             constant_time_digest_eq(self.digest.as_bytes(), provided_digest.as_bytes())
         })
     }
 }
 
+#[cfg(not(feature = "builtin-auth-server"))]
 impl std::fmt::Debug for ClientSecretVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClientSecretVerifier([redacted])")
@@ -2232,25 +2047,90 @@ impl RegisteredOAuthClient {
         self.metadata.validate_scopes(scopes)
     }
 
-    fn authenticate(&self, provided: Option<&str>, method: TokenEndpointAuthMethod) -> bool {
+    fn authentication_snapshot(&self) -> ClientAuthenticationSnapshot {
+        ClientAuthenticationSnapshot {
+            client_id: self.metadata.client_id.clone(),
+            client_type: self.metadata.client_type,
+            method: self.metadata.token_endpoint_auth_method,
+            secret_verifier: self.secret_verifier.clone(),
+            registration_epoch: self.registration_epoch,
+        }
+    }
+}
+
+/// The bounded registration fields needed for off-lock credential work.
+/// No grant, token or store guard is retained while a KDF job runs.
+struct ClientAuthenticationSnapshot {
+    client_id: String,
+    client_type: ClientType,
+    method: TokenEndpointAuthMethod,
+    secret_verifier: Option<ClientSecretVerifier>,
+    registration_epoch: OAuthRegistrationEpoch,
+}
+
+impl ClientAuthenticationSnapshot {
+    fn authenticate(
+        self,
+        provided: Option<&str>,
+        method: TokenEndpointAuthMethod,
+    ) -> Result<AuthenticatedOAuthClient, OAuthError> {
         // Complete the same verifier work for a wrong method as a wrong
         // secret. Both failures use the same public invalid_client response.
         let credentials_match = match (self.secret_verifier.as_ref(), provided) {
-            (Some(verifier), Some(secret)) => verifier.verify(secret.as_bytes()),
+            (Some(verifier), Some(secret)) => verifier.verify(secret.as_bytes())?,
             (Some(verifier), None) => {
-                std::hint::black_box(verifier.verify(std::hint::black_box(&[])));
+                std::hint::black_box(verifier.verify(std::hint::black_box(&[]))?);
                 false
             }
             (None, None) => {
-                perform_dummy_client_secret_verification(&[]);
-                self.metadata.client_type == ClientType::Public
+                perform_dummy_client_secret_verification(&[])?;
+                self.client_type == ClientType::Public
             }
             (None, Some(secret)) => {
-                perform_dummy_client_secret_verification(secret.as_bytes());
+                perform_dummy_client_secret_verification(secret.as_bytes())?;
                 false
             }
         };
-        credentials_match && self.metadata.token_endpoint_auth_method == method
+        if !credentials_match || self.method != method {
+            return Err(OAuthError::InvalidClient(
+                OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
+            ));
+        }
+        checkpoint_oauth_operation()?;
+        Ok(AuthenticatedOAuthClient {
+            client_id: self.client_id,
+            client_type: self.client_type,
+            method: self.method,
+            registration_epoch: self.registration_epoch,
+        })
+    }
+}
+
+/// Credential verification is not a store authorization: its exact
+/// registration must still exist under the guard that reads or commits state.
+struct AuthenticatedOAuthClient {
+    client_id: String,
+    client_type: ClientType,
+    method: TokenEndpointAuthMethod,
+    registration_epoch: OAuthRegistrationEpoch,
+}
+
+impl AuthenticatedOAuthClient {
+    fn validate_current(
+        &self,
+        state: &OAuthServerState,
+    ) -> Result<OAuthRegistrationEpoch, OAuthError> {
+        checkpoint_oauth_operation()?;
+        if !state.clients.get(&self.client_id).is_some_and(|client| {
+            client.registration_epoch == self.registration_epoch
+                && client.metadata.client_type == self.client_type
+                && client.metadata.token_endpoint_auth_method == self.method
+        }) {
+            return Err(OAuthError::InvalidClient(
+                OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
+            ));
+        }
+        Ok(self.registration_epoch)
     }
 }
 
@@ -4394,10 +4274,12 @@ impl OAuthServer {
         &self,
     ) -> Result<(std::sync::RwLockWriteGuard<'_, OAuthServerState>, Instant), OAuthError> {
         self.config.validate()?;
+        checkpoint_oauth_operation()?;
         let mut state = self
             .state
             .write()
             .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
+        checkpoint_oauth_operation()?;
         // Capture time only after acquiring the write lock. A caller may have
         // waited arbitrarily long behind another mutation.
         let now = Instant::now();
@@ -4405,11 +4287,31 @@ impl OAuthServer {
         Ok((state, now))
     }
 
-    /// Acquires the mutation gate only after authenticating the client while
-    /// holding the same write lock that will commit the transition. Failed
-    /// client authentication must not perform opportunistic expiry cleanup:
-    /// an otherwise denied request is not allowed to mutate retained OAuth
-    /// state before it is rejected.
+    /// Copies only bounded authentication fields before expensive verifier work.
+    /// The returned receipt must be revalidated under the eventual store guard.
+    fn authenticate_client_without_state_lock(
+        &self,
+        client_id: &str,
+        client_secret: Option<&str>,
+        method: TokenEndpointAuthMethod,
+    ) -> Result<AuthenticatedOAuthClient, OAuthError> {
+        checkpoint_oauth_operation()?;
+        let snapshot = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OAuthError::ServerError("failed to acquire read lock".to_string()))?;
+            state
+                .clients
+                .get(client_id)
+                .map(RegisteredOAuthClient::authentication_snapshot)
+        };
+        authenticate_client_snapshot_or_dummy(snapshot, client_secret, method)
+    }
+
+    /// Verifies credentials without a store lock, then checks the exact
+    /// registration again under the lock that commits the transition. Failed
+    /// authentication or a stale receipt cannot perform expiry cleanup.
     fn state_for_authenticated_mutation(
         &self,
         client_id: &str,
@@ -4424,15 +4326,9 @@ impl OAuthServer {
         OAuthError,
     > {
         self.config.validate()?;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
-        let registration_epoch =
-            authenticate_client_or_dummy(&state, client_id, client_secret, method)?;
-        let now = Instant::now();
-        state.cleanup_expired_at(now);
-        Ok((state, now, registration_epoch))
+        let authenticated =
+            self.authenticate_client_without_state_lock(client_id, client_secret, method)?;
+        self.state_for_authenticated_receipt(&authenticated, |_| true)
     }
 
     /// Authenticates the client before expiry cleanup can occur. Resource
@@ -4453,9 +4349,43 @@ impl OAuthServer {
         OAuthError,
     >
     where
-        F: FnOnce(&OAuthServerState) -> bool,
+        F: Fn(&OAuthServerState) -> bool,
     {
         self.config.validate()?;
+        checkpoint_oauth_operation()?;
+        let snapshot = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OAuthError::ServerError("failed to acquire read lock".to_string()))?;
+            if !resource_matches(&state) {
+                return Err(invalid_grant_error());
+            }
+            state
+                .clients
+                .get(client_id)
+                .map(RegisteredOAuthClient::authentication_snapshot)
+        };
+        let authenticated = authenticate_client_snapshot_or_dummy(snapshot, client_secret, method)?;
+        self.state_for_authenticated_receipt(&authenticated, resource_matches)
+    }
+
+    fn state_for_authenticated_receipt<F>(
+        &self,
+        authenticated: &AuthenticatedOAuthClient,
+        resource_matches: F,
+    ) -> Result<
+        (
+            std::sync::RwLockWriteGuard<'_, OAuthServerState>,
+            Instant,
+            OAuthRegistrationEpoch,
+        ),
+        OAuthError,
+    >
+    where
+        F: FnOnce(&OAuthServerState) -> bool,
+    {
+        checkpoint_oauth_operation()?;
         let mut state = self
             .state
             .write()
@@ -4463,8 +4393,7 @@ impl OAuthServer {
         if !resource_matches(&state) {
             return Err(invalid_grant_error());
         }
-        let registration_epoch =
-            authenticate_client_or_dummy(&state, client_id, client_secret, method)?;
+        let registration_epoch = authenticated.validate_current(&state)?;
         let now = Instant::now();
         state.cleanup_expired_at(now);
         Ok((state, now, registration_epoch))
@@ -4475,6 +4404,10 @@ impl OAuthServer {
     // -------------------------------------------------------------------------
 
     /// Registers a new OAuth client.
+    ///
+    /// With `builtin-auth-server`, confidential secrets use bounded Argon2id
+    /// work on a dedicated blocking pool. This synchronous API waits for that
+    /// work; async embedders must call it from an admitted blocking lane.
     ///
     /// # Errors
     ///
@@ -4523,6 +4456,7 @@ impl OAuthServer {
             return Err(capacity_error("registered clients"));
         }
 
+        checkpoint_oauth_operation()?;
         state.clients.insert(client_id, client);
         Ok(())
     }
@@ -4640,6 +4574,7 @@ impl OAuthServer {
             ));
         }
 
+        checkpoint_oauth_operation()?;
         state.clients.remove(client_id);
         state
             .authorization_codes
@@ -5013,6 +4948,7 @@ impl OAuthServer {
                 state: request.state.clone(),
                 registration_epoch: approved_registration_epoch,
             };
+            checkpoint_oauth_operation()?;
             state.authorization_codes.insert(code_digest, code);
         }
 
@@ -5309,10 +5245,18 @@ impl OAuthServer {
         }
         scopes.sort_unstable();
 
-        // Authentication, registration identity, machine policy and commit
-        // share one lock. In particular, a denied resource/scope/method request
-        // may not even clean up unrelated expired state. Generate the candidate
-        // only after every authorization and capacity decision succeeds.
+        // Credential work retains only a bounded registration snapshot. The
+        // exact registration, machine policy and commit still share one lock.
+        // Denied requests cannot clean up unrelated expired state.
+        let authenticated = if assertion.is_none() {
+            Some(self.authenticate_client_without_state_lock(
+                &request.client_id,
+                request.client_secret.as_deref(),
+                request.client_authentication_method,
+            )?)
+        } else {
+            None
+        };
         let mut state = self
             .state
             .write()
@@ -5327,12 +5271,11 @@ impl OAuthServer {
             assertion.validate_current(&state)?;
             assertion.registration_epoch
         } else {
-            authenticate_client_or_dummy(
-                &state,
-                &request.client_id,
-                request.client_secret.as_deref(),
-                request.client_authentication_method,
-            )?
+            authenticated
+                .ok_or_else(|| OAuthError::InvalidClient(
+                    OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
+                ))?
+                .validate_current(&state)?
         };
         let client = state.clients.get(&request.client_id).ok_or_else(|| {
             OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string())
@@ -5420,8 +5363,10 @@ impl OAuthServer {
                 family_expires_at: expires_at,
                 introspection_epoch: clock.introspection_epoch(expires_at)?,
             };
+            checkpoint_oauth_operation()?;
             if let Some(assertion) = assertion {
                 let now_unix_seconds = assertion.validate_current(&state)?;
+                checkpoint_oauth_operation()?;
                 state.commit_client_assertion(assertion, now_unix_seconds);
             }
             state.cleanup_expired_at(issued_at);
@@ -5582,6 +5527,7 @@ impl OAuthServer {
             return Err(invalid_grant_error());
         }
         ensure_fresh_token_pair(&state, &prepared)?;
+        checkpoint_oauth_operation()?;
         let (response, access, refresh) = prepared.into_response_and_records();
 
         state
@@ -5661,6 +5607,7 @@ impl OAuthServer {
             )?;
         if let Some(revoked) = state.revoked_tokens.get(&refresh_digest).cloned() {
             if revoked.client_id == request.client_id {
+                checkpoint_oauth_operation()?;
                 state.revoke_grant_family(revoked.grant_id, &request.client_id, &self.config, now);
             }
             return Err(invalid_grant_error());
@@ -5724,6 +5671,7 @@ impl OAuthServer {
         )?;
         ensure_fresh_token_pair(&state, &prepared)?;
         let replacement_refresh_expiry = prepared.refresh_metadata.expires_at;
+        checkpoint_oauth_operation()?;
         let (response, access, refresh) = prepared.into_response_and_records();
 
         let consumed = state
@@ -5940,6 +5888,7 @@ impl OAuthServer {
         let (mut state, now, _) =
             self.state_for_authenticated_mutation(client_id, client_secret, method)?;
 
+        checkpoint_oauth_operation()?;
         state.revoke_presented_token(admitted_token, client_id, &self.config, now);
         Ok(())
     }
@@ -5965,6 +5914,7 @@ impl OAuthServer {
         })?;
         let now_unix_seconds = verified.validate_current(&state)?;
         let now = Instant::now();
+        checkpoint_oauth_operation()?;
         state.commit_client_assertion(&verified, now_unix_seconds);
         state.cleanup_expired_at(now);
         state.revoke_presented_token(admitted_token, &verified.client_id, &self.config, now);
@@ -5996,9 +5946,10 @@ impl OAuthServer {
     /// expired, revoked or refresh tokens, including prior registrations and
     /// grant families invalidated by refresh-token reuse.
     ///
-    /// Authentication, resource permission, token-owner registration and all
-    /// liveness checks share one nonblocking authoritative read guard. A busy
-    /// or unavailable store returns an error, never a cached success. This
+    /// Credential verification runs outside the store lock. The verified
+    /// registration, resource permission, token-owner registration and all
+    /// liveness checks then share one nonblocking authoritative read guard. A
+    /// busy or unavailable store returns an error, never a cached success. This
     /// operation does not clean up, consume, rotate or revoke token state.
     /// The resource-evidence profile additionally observes the issuer's
     /// nonblocking wall-clock fence; rollback makes that profile unavailable.
@@ -6025,14 +5976,22 @@ impl OAuthServer {
         if !self.config.allow_development_token_introspection {
             return Err(authentication_failed());
         }
+        checkpoint_oauth_operation()?;
+        let snapshot = {
+            let state = self.state.try_read().map_err(|_| {
+                OAuthError::TemporarilyUnavailable("OAuth issuer state is unavailable".to_string())
+            })?;
+            state
+                .clients
+                .get(client_id)
+                .map(RegisteredOAuthClient::authentication_snapshot)
+        };
+        let authenticated = authenticate_client_snapshot_or_dummy(snapshot, client_secret, method)?;
         let state = self.state.try_read().map_err(|_| {
             OAuthError::TemporarilyUnavailable("OAuth issuer state is unavailable".to_string())
         })?;
-        let caller_epoch = authenticate_client_or_dummy(&state, client_id, client_secret, method)?;
-        let caller = state
-            .clients
-            .get(client_id)
-            .ok_or_else(authentication_failed)?;
+        let caller_epoch = authenticated.validate_current(&state)?;
+        let caller = state.clients.get(client_id).ok_or_else(authentication_failed)?;
         if caller.registration_epoch != caller_epoch
             || caller.metadata.client_type != ClientType::Confidential
             || method != TokenEndpointAuthMethod::ClientSecretBasic
@@ -6106,6 +6065,7 @@ impl OAuthServer {
                 (Some(base64url_encode(owner.as_bytes())), Some(epoch))
             }
         };
+        checkpoint_oauth_operation()?;
         Ok(DevelopmentAccessTokenIntrospection {
             active: true,
             scope: (!stored.scopes.is_empty()).then(|| stored.scopes.join(" ")),
@@ -6565,34 +6525,42 @@ fn validate_client_authentication_admission(
     Ok(())
 }
 
-fn authenticate_client_or_dummy(
-    state: &OAuthServerState,
-    client_id: &str,
+fn authenticate_client_snapshot_or_dummy(
+    snapshot: Option<ClientAuthenticationSnapshot>,
     client_secret: Option<&str>,
     method: TokenEndpointAuthMethod,
-) -> Result<OAuthRegistrationEpoch, OAuthError> {
-    let client = state.clients.get(client_id);
-    let authenticated = client.map_or_else(
-        || {
-            let provided = client_secret.unwrap_or_default();
-            perform_dummy_client_secret_verification(provided.as_bytes());
-            false
-        },
-        |client| client.authenticate(client_secret, method),
-    );
-    if !authenticated {
-        return Err(OAuthError::InvalidClient(
-            OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
-        ));
+) -> Result<AuthenticatedOAuthClient, OAuthError> {
+    checkpoint_oauth_operation()?;
+    if let Some(snapshot) = snapshot {
+        return snapshot.authenticate(client_secret, method);
     }
-    client
-        .map(|client| client.registration_epoch)
-        .ok_or_else(|| OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string()))
+    perform_dummy_client_secret_verification(client_secret.unwrap_or_default().as_bytes())?;
+    Err(OAuthError::InvalidClient(
+        OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
+    ))
 }
 
-fn perform_dummy_client_secret_verification(provided: &[u8]) {
-    let verified = ClientSecretVerifier::dummy().verify(std::hint::black_box(provided));
+/// Synchronous embedders may have no runtime context. Native request drivers
+/// install their caller context, whose deadline/cancellation must win before
+/// a credential result authorizes a store mutation.
+fn checkpoint_oauth_operation() -> Result<(), OAuthError> {
+    if asupersync::Cx::current().is_some_and(|cx| {
+        cx.budget()
+            .deadline
+            .is_some_and(|deadline| cx.now() >= deadline)
+            || cx.checkpoint().is_err()
+    }) {
+        return Err(OAuthError::TemporarilyUnavailable(
+            "OAuth operation is no longer available".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn perform_dummy_client_secret_verification(provided: &[u8]) -> Result<(), OAuthError> {
+    let verified = ClientSecretVerifier::dummy().verify(std::hint::black_box(provided))?;
     std::hint::black_box(verified);
+    Ok(())
 }
 
 fn validate_opaque_credential(value: &str, error: &'static str) -> Result<(), OAuthError> {
@@ -6665,50 +6633,6 @@ fn derive_grant_id(
     Ok(OAuthGrantId::from_bytes(digest.into_bytes()))
 }
 
-#[cfg(feature = "builtin-auth-server")]
-fn client_secret_argon2id_digest(
-    salt: &[u8; CLIENT_SECRET_SALT_BYTES],
-    secret: &[u8],
-    params: Argon2ClientSecretParams,
-) -> Result<Zeroizing<[u8; ARGON2_DERIVED_KEY_BYTES]>, OAuthError> {
-    if secret.len() > MAX_OAUTH_CLIENT_CREDENTIAL_BYTES {
-        return Err(OAuthError::InvalidClient(
-            OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
-        ));
-    }
-    let _permit = Argon2ConcurrencyGuard::try_acquire().ok_or_else(|| {
-        OAuthError::ServerError(
-            "Argon2id client-secret verification capacity exhausted".to_string(),
-        )
-    })?;
-    let mut framed = Zeroizing::new(Vec::with_capacity(
-        CLIENT_SECRET_VERIFIER_DOMAIN.len() + secret.len(),
-    ));
-    framed.extend_from_slice(CLIENT_SECRET_VERIFIER_DOMAIN);
-    framed.extend_from_slice(secret);
-    if framed.len() + salt.len() > MAX_CLIENT_SECRET_VERIFIER_INPUT_BYTES {
-        return Err(OAuthError::InvalidClient(
-            OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
-        ));
-    }
-    let argon2_params = argon2::Params::new(
-        params.memory_kib(),
-        params.time_cost(),
-        params.parallelism(),
-        Some(ARGON2_DERIVED_KEY_BYTES),
-    )
-    .map_err(|_| OAuthError::ServerError("Argon2id parameter construction failed".to_string()))?;
-    let hasher = argon2::Argon2::new(
-        argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13,
-        argon2_params,
-    );
-    let mut out = Zeroizing::new([0u8; ARGON2_DERIVED_KEY_BYTES]);
-    hasher
-        .hash_password_into(&framed, salt, out.as_mut())
-        .map_err(|_| OAuthError::ServerError("Argon2id key derivation failed".to_string()))?;
-    Ok(out)
-}
 
 #[cfg(not(feature = "builtin-auth-server"))]
 fn client_secret_digest(
@@ -9280,6 +9204,230 @@ mod tests {
     }
 
     #[test]
+    fn authentication_snapshot_cannot_cross_client_reregistration_or_clean_state() {
+        let server = OAuthServer::with_defaults();
+        let registration = |secret| {
+            OAuthClient::builder("snapshot-client")
+                .secret(secret)
+                .redirect_uri("http://127.0.0.1/callback")
+                .build()
+                .unwrap()
+        };
+        server.register_client(registration("old-secret")).unwrap();
+        let snapshot = {
+            let state = server.state.read().unwrap();
+            state.clients["snapshot-client"].authentication_snapshot()
+        };
+        // Owning the expensive-work input must not retain even a read guard.
+        drop(
+            server
+                .state
+                .try_write()
+                .expect("snapshot releases store lock"),
+        );
+        server.unregister_client("snapshot-client").unwrap();
+        server.register_client(registration("new-secret")).unwrap();
+        let token = server.issue_tokens("snapshot-client", &[], None).unwrap();
+        let canary = insert_expired_authorization_code_cleanup_canary(&server, "snapshot-client");
+        let before = server.stats();
+
+        // The original real verifier can still finish successfully after the
+        // replacement registration exists. That result carries no authority
+        // over the replacement's tokens, including read-only introspection.
+        let stale = authenticate_client_snapshot_or_dummy(
+            Some(snapshot),
+            Some("old-secret"),
+            TokenEndpointAuthMethod::ClientSecretBasic,
+        )
+        .unwrap();
+        assert!(matches!(
+            stale.validate_current(&server.state.read().unwrap()),
+            Err(OAuthError::InvalidClient(_))
+        ));
+        assert!(matches!(
+            server.state_for_authenticated_receipt(&stale, |_| true),
+            Err(OAuthError::InvalidClient(_))
+        ));
+        assert_oauth_stats_unchanged(&before, &server.stats());
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .authorization_codes
+                .contains_key(&canary)
+        );
+        assert!(server.validate_access_token(&token.access_token).is_some());
+
+        let current = server
+            .authenticate_client_without_state_lock(
+                "snapshot-client",
+                Some("new-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
+            .unwrap();
+        assert!(
+            current
+                .validate_current(&server.state.read().unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn authentication_resource_predicate_is_rechecked_before_cleanup() {
+        let server = OAuthServer::with_defaults();
+        server
+            .register_client(bounded_test_client("resource-client"))
+            .unwrap();
+        let canary = insert_expired_authorization_code_cleanup_canary(&server, "resource-client");
+        let before = server.stats();
+        let checks = AtomicUsize::new(0);
+        assert!(matches!(
+            server.state_for_authenticated_resource_checked_mutation(
+                "resource-client",
+                None,
+                TokenEndpointAuthMethod::None,
+                |_| checks.fetch_add(1, Ordering::SeqCst) == 0,
+            ),
+            Err(OAuthError::InvalidGrant(_))
+        ));
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_oauth_stats_unchanged(&before, &server.stats());
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .authorization_codes
+                .contains_key(&canary)
+        );
+    }
+
+    #[test]
+    fn authentication_cancelled_receipt_cannot_clean_or_revoke_state() {
+        let server = OAuthServer::with_defaults();
+        server
+            .register_client(bounded_test_client("cancelled-client"))
+            .unwrap();
+        let token = server.issue_tokens("cancelled-client", &[], None).unwrap();
+        let authenticated = server
+            .authenticate_client_without_state_lock(
+                "cancelled-client",
+                None,
+                TokenEndpointAuthMethod::None,
+            )
+            .unwrap();
+        let canary = insert_expired_authorization_code_cleanup_canary(&server, "cancelled-client");
+        let before = server.stats();
+        let cx = asupersync::Cx::for_testing();
+        cx.set_cancel_requested(true);
+        fastmcp_core::runtime::with_caller_context(&cx, || {
+            assert!(matches!(
+                server.state_for_authenticated_receipt(&authenticated, |_| true),
+                Err(OAuthError::TemporarilyUnavailable(_))
+            ));
+            assert!(matches!(
+                server.revoke(
+                    &token.access_token,
+                    "cancelled-client",
+                    None,
+                    TokenEndpointAuthMethod::None,
+                ),
+                Err(OAuthError::TemporarilyUnavailable(_))
+            ));
+        });
+        assert_oauth_stats_unchanged(&before, &server.stats());
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .authorization_codes
+                .contains_key(&canary)
+        );
+        assert!(server.validate_access_token(&token.access_token).is_some());
+    }
+
+    #[test]
+    fn authentication_cancellation_after_random_draw_preserves_code_and_refresh() {
+        let server = server_with_counting_approval(Arc::new(CountingApprovalBackend::new(
+            ApprovalTestMode::Exact,
+        )));
+        server
+            .register_client(
+                OAuthClient::builder("cancel-before-commit")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (code, _) = server
+            .authorize(&approved_resource_request("cancel-before-commit"))
+            .unwrap();
+        let request =
+            resource_code_exchange_request("cancel-before-commit", &code, TEST_MCP_RESOURCE);
+        let before = server.stats();
+        let cx = asupersync::Cx::for_testing();
+        let draws = std::cell::Cell::new(0);
+        let result = fastmcp_core::runtime::with_caller_context(&cx, || {
+            server.token_authorization_code_with_draw(&request, || {
+                let value = draw_security_identifier();
+                draws.set(draws.get() + 1);
+                if draws.get() == 2 {
+                    cx.set_cancel_requested(true);
+                }
+                value
+            })
+        });
+        assert!(matches!(result, Err(OAuthError::TemporarilyUnavailable(_))));
+        assert_eq!(draws.get(), 2);
+        assert_oauth_stats_unchanged(&before, &server.stats());
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .authorization_codes
+                .contains_key(&authorization_code_digest(&code),)
+        );
+
+        let issued = server
+            .token(&request)
+            .expect("unconsumed code remains usable");
+        let refresh = issued.refresh_token.unwrap();
+        let request = bounded_refresh_request("cancel-before-commit", &refresh);
+        let before = server.stats();
+        let cx = asupersync::Cx::for_testing();
+        let draws = std::cell::Cell::new(0);
+        let result = fastmcp_core::runtime::with_caller_context(&cx, || {
+            server.token_refresh_token_with_draw(&request, || {
+                let value = draw_security_identifier();
+                draws.set(draws.get() + 1);
+                if draws.get() == 2 {
+                    cx.set_cancel_requested(true);
+                }
+                value
+            })
+        });
+        assert!(matches!(result, Err(OAuthError::TemporarilyUnavailable(_))));
+        assert_eq!(draws.get(), 2);
+        assert_oauth_stats_unchanged(&before, &server.stats());
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .refresh_tokens
+                .contains_key(&refresh_token_digest(&refresh),)
+        );
+        assert!(
+            server.token(&request).is_ok(),
+            "unrotated refresh remains usable"
+        );
+    }
+
+    #[test]
     fn authorization_approval_backend_is_called_once_and_receives_only_redacted_facts() {
         const CLIENT_SECRET: &str = "approval-client-secret-canary";
         const CODE_CANARY: &str = "approval-code-canary";
@@ -10842,84 +10990,10 @@ mod tests {
             .secret_verifier
             .as_ref()
             .expect("stored verifier");
-        assert!(verifier.verify(SECRET.as_bytes()));
-        assert!(!verifier.verify(b"wrong-secret"));
+        assert!(verifier.verify(SECRET.as_bytes()).unwrap());
+        assert!(!verifier.verify(b"wrong-secret").unwrap());
         assert!(!format!("{verifier:?}").contains(SECRET));
         assert_eq!(registered.metadata.client_type, ClientType::Confidential);
-    }
-
-    #[cfg(feature = "builtin-auth-server")]
-    #[test]
-    fn argon2id_client_secret_verifier_positive_and_planted_negatives() {
-        let params = Argon2ClientSecretParams::try_new(
-            MIN_ARGON2_MEMORY_KIB,
-            MIN_ARGON2_TIME_COST,
-            MIN_ARGON2_PARALLELISM,
-        )
-        .expect("minimum admitted Argon2id params are accepted");
-        assert_eq!(params.memory_kib(), MIN_ARGON2_MEMORY_KIB);
-        assert_eq!(params.time_cost(), MIN_ARGON2_TIME_COST);
-        assert_eq!(params.parallelism(), MIN_ARGON2_PARALLELISM);
-
-        // Positive: real Argon2id derivation matches the exact secret and uses
-        // distinct digests under distinct salts.
-        let salt_a = [0x11; CLIENT_SECRET_SALT_BYTES];
-        let salt_b = [0x22; CLIENT_SECRET_SALT_BYTES];
-        let secret = b"argon2id-confidential-client-secret-01";
-        let verifier_a = ClientSecretVerifier::create_with_salt_and_params(secret, salt_a, params)
-            .expect("create Argon2id verifier A");
-        let verifier_b = ClientSecretVerifier::create_with_salt_and_params(secret, salt_b, params)
-            .expect("create Argon2id verifier B");
-        assert_ne!(
-            verifier_a.digest.as_slice(),
-            verifier_b.digest.as_slice(),
-            "different salts must yield different Argon2id digests"
-        );
-        assert!(verifier_a.verify(secret));
-
-        // Near-identical planted negatives (RH-5):
-        // 1) 1-byte secret flip must fail verification.
-        assert!(!verifier_a.verify(b"argon2id-confidential-client-secret-02"));
-        // 2) Oversized secret (> MAX_OAUTH_CLIENT_CREDENTIAL_BYTES) fails closed before KDF.
-        let oversized = vec![b'x'; MAX_OAUTH_CLIENT_CREDENTIAL_BYTES + 1];
-        assert!(!verifier_a.verify(&oversized));
-        assert!(
-            ClientSecretVerifier::create_with_salt_and_params(&oversized, salt_a, params).is_err()
-        );
-        // 3) Out-of-bounds memory/time/parallelism params are refused (anti-DoS & anti-weakening).
-        assert!(Argon2ClientSecretParams::try_new(MIN_ARGON2_MEMORY_KIB - 1, 1, 1).is_err());
-        assert!(Argon2ClientSecretParams::try_new(MAX_ARGON2_MEMORY_KIB + 1, 1, 1).is_err());
-        assert!(Argon2ClientSecretParams::try_new(MIN_ARGON2_MEMORY_KIB, 0, 1).is_err());
-        assert!(
-            Argon2ClientSecretParams::try_new(MIN_ARGON2_MEMORY_KIB, MAX_ARGON2_TIME_COST + 1, 1)
-                .is_err()
-        );
-        assert!(
-            Argon2ClientSecretParams::try_new(MIN_ARGON2_MEMORY_KIB, 1, MAX_ARGON2_PARALLELISM + 1)
-                .is_err()
-        );
-
-        // 4) Concurrency ceiling fails closed without panicking and restores permits on drop.
-        let mut guards = Vec::new();
-        while let Some(guard) = Argon2ConcurrencyGuard::try_acquire() {
-            guards.push(guard);
-            if guards.len() > MAX_CONCURRENT_ARGON2_VERIFICATIONS {
-                panic!("concurrency guard exceeded cap");
-            }
-        }
-        assert!(
-            Argon2ConcurrencyGuard::try_acquire().is_none(),
-            "cap must reject excess concurrent derivations"
-        );
-        assert!(
-            !verifier_a.verify(secret),
-            "verification must fail closed when concurrency cap is saturated"
-        );
-        drop(guards);
-        assert!(
-            verifier_a.verify(secret),
-            "releasing concurrency guards restores normal Argon2id verification"
-        );
     }
 
     #[test]
