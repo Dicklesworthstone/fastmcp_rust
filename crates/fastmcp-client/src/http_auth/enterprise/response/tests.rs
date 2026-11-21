@@ -725,3 +725,363 @@ fn disclosure_review_expiry_cannot_cross_initial_or_final_response_admission() {
         ));
     }
 }
+
+// ============================================================================
+// EnterpriseExchangeDriver tests (AUTHX-01..03, positive + RH-5 negatives)
+// ============================================================================
+
+pub(super) trait ExchangePoster: Send + Sync {
+    fn post<'a>(
+        &'a self,
+        cx: &'a Cx,
+        url: &'a GuardedHttpsUrl,
+        request: &'a GuardedHttpRequest,
+        lifetime: Arc<dyn Send + Sync>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
+struct RecordedPost {
+    url: String,
+    content_type: String,
+    has_authorization: bool,
+    body: String,
+}
+
+struct ScriptedExchangePoster {
+    responses: std::sync::Mutex<
+        std::collections::VecDeque<Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>,
+    >,
+    recorded: std::sync::Mutex<Vec<RecordedPost>>,
+}
+
+impl ScriptedExchangePoster {
+    fn new(
+        responses: Vec<Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            responses: std::sync::Mutex::new(responses.into()),
+            recorded: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn take_recorded(&self) -> Vec<RecordedPost> {
+        std::mem::take(&mut *self.recorded.lock().unwrap())
+    }
+}
+
+impl ExchangePoster for ScriptedExchangePoster {
+    fn post<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        url: &'a GuardedHttpsUrl,
+        request: &'a GuardedHttpRequest,
+        _lifetime: Arc<dyn Send + Sync>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.recorded.lock().unwrap().push(RecordedPost {
+            url: url.as_str().to_owned(),
+            content_type: request.content_type().to_owned(),
+            has_authorization: request.has_authorization(),
+            body: String::from_utf8(request.body().to_vec()).expect("utf-8 form body"),
+        });
+        let next = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted exchange response");
+        Box::pin(async move { next })
+    }
+}
+
+fn test_fetcher() -> GuardedHttpFetcher {
+    let policy = fastmcp_transport::GuardedHttpFetchPolicy::new(
+        Duration::from_secs(5),
+        MAX_ENTERPRISE_EXCHANGE_RESPONSE_BYTES,
+        "test-root-rev-1",
+    )
+    .expect("valid guarded fetch policy");
+    GuardedHttpFetcher::with_webpki_roots(policy).expect("webpki guarded fetcher")
+}
+
+fn ok_exchange_response(
+    host: &str,
+    root_identity: &str,
+    body: Vec<u8>,
+) -> GuardedHttpFetchResponse {
+    GuardedHttpFetchResponse {
+        status: 200,
+        headers: headers(),
+        body,
+        redirect: None,
+        provenance: GuardedHttpPeerProvenance {
+            host: host.to_owned(),
+            selected_address: std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 10)),
+                443,
+            ),
+            root_policy_revision: root_identity.to_owned(),
+            alpn: Some(b"http/1.1".to_vec()),
+            tls_protocol: Some("TLSv1.3".to_owned()),
+            server_certificate_sha256: [0x22; 32],
+        },
+    }
+}
+
+fn driver_with_poster(
+    selected: EnterpriseProfile,
+    poster: Arc<ScriptedExchangePoster>,
+) -> (EnterpriseExchangeDriver, String) {
+    let fetcher = test_fetcher();
+    let root_id = fetcher.root_identity().to_owned();
+    let driver =
+        EnterpriseExchangeDriver::new(selected, fetcher, EnterpriseResponsePolicy::default())
+            .expect("valid enterprise exchange driver");
+    let inner = ExchangeDriverInner {
+        profile: driver.inner.profile.clone(),
+        idp_token_url: driver.inner.idp_token_url.clone(),
+        resource_as_token_url: driver.inner.resource_as_token_url.clone(),
+        fetcher: driver.inner.fetcher.clone(),
+        response_policy: driver.inner.response_policy,
+        busy: Arc::new(AtomicBool::new(false)),
+        test_post: Some(poster),
+    };
+    (
+        EnterpriseExchangeDriver {
+            inner: Arc::new(inner),
+        },
+        root_id,
+    )
+}
+
+fn run_exchange_async<T>(f: impl Future<Output = T>) -> T {
+    let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+        .build()
+        .expect("enterprise exchange test runtime");
+    rt.block_on(f)
+}
+
+#[test]
+fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives() {
+    let selected = profile(&["read"]);
+    let (oidc_keys, jag_keys) = keys();
+    let oidc_body = serde_json::to_vec(&json!({
+        "access_token": "oidc-temp-access-token-01",
+        "token_type": "Bearer",
+        "scope": "openid",
+        "id_token": fixtures()["oidc"]["valid"].as_str().unwrap(),
+    }))
+    .unwrap();
+    let headers_val = headers();
+    let identity_assertion = success(
+        selected
+            .admit_oidc_code_response(
+                EnterpriseTokenResponse {
+                    status: 200,
+                    headers: &headers_val,
+                    body: &oidc_body,
+                },
+                &oidc_keys,
+                "nonce-valid",
+                TenantExpectation::SingleTenant,
+                None,
+                EnterpriseResponsePolicy::default(),
+                now(),
+            )
+            .expect("admit OIDC identity assertion"),
+    );
+
+    let jag_body = serde_json::to_vec(&json!({
+        "issued_token_type": ID_JAG_TOKEN_TYPE,
+        "access_token": fixtures()["id_jag"]["valid"].as_str().unwrap(),
+        "token_type": "N_A",
+        "scope": "read",
+        "expires_in": 300,
+    }))
+    .unwrap();
+    let access_body_bytes = serde_json::to_vec(&json!({
+        "access_token": "enterprise-final-bearer-token-2026",
+        "token_type": "Bearer",
+        "scope": "read",
+        "resource": "https://mcp.example/mcp",
+        "expires_in": 600,
+    }))
+    .unwrap();
+
+    let fetcher = test_fetcher();
+    let root_id = fetcher.root_identity().to_owned();
+    let poster = ScriptedExchangePoster::new(vec![
+        Ok(ok_exchange_response("idp.example", &root_id, jag_body.clone())),
+        Ok(ok_exchange_response("as.example", &root_id, access_body_bytes)),
+    ]);
+    let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+    let idp_secret = EnterpriseClientSecret::try_new("idp-secret-val").unwrap();
+    let as_secret = EnterpriseClientSecret::try_new("as-secret-val").unwrap();
+    assert!(!format!("{idp_secret:?}").contains("idp-secret-val"));
+
+    // Positive: execute both RFC 8693 (Basic auth) and RFC 7523 (Post auth)
+    // stages end to end and verify exact resource-bound Bearer credential.
+    run_exchange_async(async {
+        let cx = Cx::current().expect("runtime cx");
+        let (jag_outcome, jag_obs) = driver
+            .exchange_identity_for_id_jag(
+                &cx,
+                identity_assertion,
+                &idp_secret,
+                &jag_keys,
+                TenantExpectation::SingleTenant,
+                ResourceTenantExpectation::SingleTenant,
+                now(),
+            )
+            .await
+            .expect("stage 1 RFC 8693 exchange succeeds");
+        assert_eq!(jag_obs.endpoint(), "https://idp.example/token");
+        let id_jag = success(jag_outcome);
+        assert_eq!(id_jag.granted_scopes(), ["read"]);
+
+        let (token_outcome, token_obs) = driver
+            .exchange_id_jag_for_access_token(&cx, id_jag, &as_secret, now() + Duration::from_secs(1))
+            .await
+            .expect("stage 2 RFC 7523 exchange succeeds");
+        assert_eq!(token_obs.endpoint(), "https://as.example/token");
+        let bound_token = success(token_outcome);
+        assert_eq!(bound_token.response().resource(), "https://mcp.example/mcp");
+        assert_eq!(bound_token.response().granted_scopes(), ["read"]);
+
+        let credential = bound_token
+            .into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(1))
+            .expect("bind final enterprise access token to HTTPS resource");
+        let target = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
+        let other = CanonicalHttpUrl::parse("https://other.example/mcp").unwrap();
+        assert_eq!(
+            credential.authorization_for_target(&target).as_deref(),
+            Some("Bearer enterprise-final-bearer-token-2026")
+        );
+        assert!(
+            credential.authorization_for_target(&other).is_none(),
+            "bound credential must never attach to a different HTTPS origin"
+        );
+    });
+
+    let recorded = poster.take_recorded();
+    assert_eq!(recorded.len(), 2);
+    // Stage 1: IdP uses ClientSecretBasic -> Authorization header present, NO client_secret in body.
+    assert_eq!(recorded[0].url, "https://idp.example/token");
+    assert_eq!(recorded[0].content_type, "application/x-www-form-urlencoded");
+    assert!(recorded[0].has_authorization);
+    assert!(recorded[0].body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange"));
+    assert!(!recorded[0].body.contains("client_secret="));
+    // Stage 2: Resource AS uses ClientSecretPost -> NO Authorization header, client_id & client_secret in body.
+    assert_eq!(recorded[1].url, "https://as.example/token");
+    assert!(!recorded[1].has_authorization);
+    assert!(recorded[1].body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"));
+    assert!(recorded[1].body.contains("client_id=native-resource"));
+    assert!(recorded[1].body.contains("client_secret=as-secret-val"));
+
+    // Planted negatives (RH-5):
+    // 1. Invalid client secret refused.
+    assert_eq!(
+        EnterpriseClientSecret::try_new("").unwrap_err(),
+        EnterpriseExchangeError::InvalidConfiguration
+    );
+    assert_eq!(
+        EnterpriseClientSecret::try_new("bad\nsecret").unwrap_err(),
+        EnterpriseExchangeError::InvalidConfiguration
+    );
+
+    // 2. HTTP redirect refused without following.
+    let mut redirect_resp = ok_exchange_response("idp.example", &root_id, jag_body.clone());
+    redirect_resp.status = 302;
+    redirect_resp.redirect = Some(fastmcp_transport::GuardedHttpRedirect {
+        status: 302,
+        location: "https://evil.example/token".to_owned(),
+    });
+    let redirect_poster = ScriptedExchangePoster::new(vec![Ok(redirect_resp)]);
+    let (redirect_driver, _) = driver_with_poster(selected.clone(), redirect_poster);
+    let assertion_for_redirect = success(
+        selected
+            .admit_oidc_code_response(
+                EnterpriseTokenResponse {
+                    status: 200,
+                    headers: &headers_val,
+                    body: &oidc_body,
+                },
+                &oidc_keys,
+                "nonce-valid",
+                TenantExpectation::SingleTenant,
+                None,
+                EnterpriseResponsePolicy::default(),
+                now(),
+            )
+            .unwrap(),
+    );
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let err = redirect_driver
+            .exchange_identity_for_id_jag(
+                &cx,
+                assertion_for_redirect,
+                &idp_secret,
+                &jag_keys,
+                TenantExpectation::SingleTenant,
+                ResourceTenantExpectation::SingleTenant,
+                now(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, EnterpriseExchangeError::RedirectRefused);
+    });
+
+    // 3. Peer provenance host mismatch refused (EvidenceMismatch).
+    let wrong_host_poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+        "attacker.example",
+        &root_id,
+        jag_body,
+    ))]);
+    let (wrong_host_driver, _) = driver_with_poster(selected.clone(), wrong_host_poster);
+    let assertion_for_host = success(
+        selected
+            .admit_oidc_code_response(
+                EnterpriseTokenResponse {
+                    status: 200,
+                    headers: &headers_val,
+                    body: &oidc_body,
+                },
+                &oidc_keys,
+                "nonce-valid",
+                TenantExpectation::SingleTenant,
+                None,
+                EnterpriseResponsePolicy::default(),
+                now(),
+            )
+            .unwrap(),
+    );
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let err = wrong_host_driver
+            .exchange_identity_for_id_jag(
+                &cx,
+                assertion_for_host,
+                &idp_secret,
+                &jag_keys,
+                TenantExpectation::SingleTenant,
+                ResourceTenantExpectation::SingleTenant,
+                now(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, EnterpriseExchangeError::EvidenceMismatch);
+    });
+}

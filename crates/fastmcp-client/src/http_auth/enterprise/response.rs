@@ -11,12 +11,30 @@ mod tests;
 mod wire;
 
 use std::fmt;
-use std::time::{Duration, SystemTime};
+use std::future::{Future, poll_fn};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
+use std::time::{Duration, Instant, SystemTime};
 
+use asupersync::Cx;
+use asupersync::channel::oneshot;
+use asupersync::http::h1::Request as H1Request;
 use asupersync::security::SecretString;
-use fastmcp_core::AccessToken;
+use asupersync::time::Sleep;
+use asupersync::types::Time;
+use fastmcp_core::runtime::CallerContextFuture;
+use fastmcp_core::{AccessToken, CanonicalHttpUrl};
+use fastmcp_transport::{
+    GuardedHttpFetchError, GuardedHttpFetchResponse, GuardedHttpFetcher, GuardedHttpPeerProvenance,
+    GuardedHttpRequest, GuardedHttpsUrl,
+};
 
-use super::policy::{EnterpriseClientAuthentication, EnterpriseProfile, IdJagGrantedScopeSet};
+use super::policy::{
+    EnterpriseClientAuthentication, EnterpriseProfile, ID_JAG_TOKEN_TYPE, IdJagGrantedScopeSet,
+    JWT_BEARER_GRANT, TOKEN_EXCHANGE_GRANT,
+};
+use crate::http_auth::BoundBearerCredential;
 use super::verification::disclosure::{IdJagDisclosureFacts, IdJagDisclosurePolicy};
 use super::verification::{
     IdJagExpectations, IdJagVerificationKeys, JwtTimePolicy, OidcIdTokenExpectations,
@@ -595,4 +613,615 @@ fn bounded_expiry(
         return Err(EnterpriseResponseError::InvalidLifetime);
     }
     Ok(expires_at)
+}
+
+// ============================================================================
+// Sealed RFC 8693 + RFC 7523 Guarded HTTPS Exchange Driver (AUTHX-01..03)
+// ============================================================================
+
+const SUBJECT_TOKEN_TYPE_ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
+const MAX_ENTERPRISE_CLIENT_SECRET_BYTES: usize = 4_096;
+const MAX_ENTERPRISE_EXCHANGE_FORM_BYTES: usize = 32 * 1_024;
+const MAX_ENTERPRISE_EXCHANGE_RESPONSE_BYTES: usize = 64 * 1_024;
+
+/// Bounded confidential client secret for one enterprise role (IdP or Resource AS).
+///
+/// Never echoes secret bytes in `Debug` or `Display` and zeroizes on drop.
+pub struct EnterpriseClientSecret {
+    value: SecretString,
+}
+
+impl EnterpriseClientSecret {
+    /// Validates and wraps a bounded non-empty confidential client secret.
+    pub fn try_new(value: impl Into<String>) -> Result<Self, EnterpriseExchangeError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_ENTERPRISE_CLIENT_SECRET_BYTES
+            || value.bytes().any(|b| b < 0x20 || b == 0x7f)
+        {
+            return Err(EnterpriseExchangeError::InvalidConfiguration);
+        }
+        Ok(Self {
+            value: SecretString::from_string(value),
+        })
+    }
+
+    fn as_str(&self) -> &str {
+        self.value.as_str()
+    }
+}
+
+impl fmt::Debug for EnterpriseClientSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EnterpriseClientSecret([redacted])")
+    }
+}
+
+/// Redacted failure surface for guarded enterprise token exchanges.
+///
+/// Never carries tokens, secrets, headers, endpoints, or peer response bodies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnterpriseExchangeError {
+    InvalidConfiguration,
+    InvalidEndpoint,
+    InvalidPolicy,
+    RuntimeUnavailable,
+    ExchangeInProgress,
+    Cancelled,
+    TimedOut,
+    TransportFailed,
+    RedirectRefused,
+    EvidenceMismatch,
+    EncodingFailed,
+    ResponseRejected(EnterpriseResponseError),
+    CredentialBindingFailed,
+}
+
+impl fmt::Display for EnterpriseExchangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfiguration => {
+                formatter.write_str("invalid enterprise exchange configuration")
+            }
+            Self::InvalidEndpoint => formatter.write_str("invalid enterprise token endpoint"),
+            Self::InvalidPolicy => formatter.write_str("invalid enterprise exchange fetch policy"),
+            Self::RuntimeUnavailable => formatter.write_str(
+                "enterprise token exchange requires caller I/O, time, spawn and timer authority",
+            ),
+            Self::ExchangeInProgress => {
+                formatter.write_str("enterprise token exchange is already in progress")
+            }
+            Self::Cancelled => formatter.write_str("enterprise token exchange was cancelled"),
+            Self::TimedOut => formatter.write_str("enterprise token exchange exceeded its deadline"),
+            Self::TransportFailed => {
+                formatter.write_str("enterprise guarded HTTPS token exchange failed")
+            }
+            Self::RedirectRefused => {
+                formatter.write_str("enterprise token exchange refused HTTP redirect")
+            }
+            Self::EvidenceMismatch => {
+                formatter.write_str("enterprise token exchange peer provenance did not match")
+            }
+            Self::EncodingFailed => {
+                formatter.write_str("enterprise token exchange form encoding failed")
+            }
+            Self::ResponseRejected(error) => error.fmt(formatter),
+            Self::CredentialBindingFailed => {
+                formatter.write_str("enterprise access token could not be bound to HTTPS resource")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EnterpriseExchangeError {}
+
+/// Transport provenance recorded for one enterprise token-endpoint POST.
+pub struct EnterpriseExchangeObservation {
+    endpoint: String,
+    provenance: GuardedHttpPeerProvenance,
+}
+
+impl EnterpriseExchangeObservation {
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    #[must_use]
+    pub fn provenance(&self) -> &GuardedHttpPeerProvenance {
+        &self.provenance
+    }
+}
+
+impl fmt::Debug for EnterpriseExchangeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnterpriseExchangeObservation")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Admitted final enterprise access-token grant paired with its sealed
+/// resource-bound bearer conversion.
+pub struct EnterpriseBoundAccessToken {
+    response: EnterpriseAccessTokenResponse,
+}
+
+impl EnterpriseBoundAccessToken {
+    /// Inspects the admitted scope/resource/expiry metadata without exposing token bytes.
+    #[must_use]
+    pub fn response(&self) -> &EnterpriseAccessTokenResponse {
+        &self.response
+    }
+
+    /// Consumes this grant and binds it strictly to its exact HTTPS MCP resource
+    /// with a monotonic deadline derived from `expires_at - received_at_wall`.
+    pub fn into_bound_bearer_credential(
+        self,
+        now_monotonic: Instant,
+        received_at_wall: SystemTime,
+    ) -> Result<BoundBearerCredential, EnterpriseExchangeError> {
+        let ttl = self
+            .response
+            .expires_at
+            .duration_since(received_at_wall)
+            .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)?;
+        if ttl.is_zero() {
+            return Err(EnterpriseExchangeError::CredentialBindingFailed);
+        }
+        let deadline = now_monotonic
+            .checked_add(ttl)
+            .ok_or(EnterpriseExchangeError::CredentialBindingFailed)?;
+        let resource = CanonicalHttpUrl::parse(self.response.resource())
+            .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)?;
+        BoundBearerCredential::bind_with_expiry(
+            resource,
+            self.response._access_token.as_str(),
+            deadline,
+        )
+        .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)
+    }
+}
+
+impl fmt::Debug for EnterpriseBoundAccessToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnterpriseBoundAccessToken")
+            .field("resource", &self.response.resource())
+            .field("granted_scopes", &self.response.granted_scopes())
+            .finish_non_exhaustive()
+    }
+}
+
+struct ExchangeDriverInner {
+    profile: EnterpriseProfile,
+    idp_token_url: GuardedHttpsUrl,
+    resource_as_token_url: GuardedHttpsUrl,
+    fetcher: GuardedHttpFetcher,
+    response_policy: EnterpriseResponsePolicy,
+    busy: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_post: Option<Arc<dyn tests::ExchangePoster>>,
+}
+
+/// Sealed guarded-HTTPS driver executing the two-stage Enterprise-Managed
+/// Authorization token exchange:
+/// 1. RFC 8693 (`token-exchange`) at the IdP token endpoint (`EnterpriseIdentityAssertion` -> `EnterpriseIdJagResponse`)
+/// 2. RFC 7523 (`jwt-bearer`) at the Resource AS token endpoint (`EnterpriseIdJagResponse` -> `EnterpriseBoundAccessToken`)
+///
+/// Enforces single-flight execution, bounded deadlines, zero HTTP redirects,
+/// strict peer provenance verification, exact per-role client authentication
+/// (`client_secret_basic` vs `client_secret_post`), real RS256 ID-JAG signature
+/// verification, and scope/resource/expiry clamping without exposing compact
+/// assertions externally.
+#[derive(Clone)]
+pub struct EnterpriseExchangeDriver {
+    inner: Arc<ExchangeDriverInner>,
+}
+
+impl EnterpriseExchangeDriver {
+    /// Freezes one admitted [`EnterpriseProfile`], [`GuardedHttpFetcher`], and
+    /// [`EnterpriseResponsePolicy`]. Performs no network I/O.
+    pub fn new(
+        profile: EnterpriseProfile,
+        fetcher: GuardedHttpFetcher,
+        response_policy: EnterpriseResponsePolicy,
+    ) -> Result<Self, EnterpriseExchangeError> {
+        if fetcher.policy().response_body_bytes() > MAX_ENTERPRISE_EXCHANGE_RESPONSE_BYTES
+            || fetcher.policy().deadline() > Duration::from_secs(30)
+        {
+            return Err(EnterpriseExchangeError::InvalidPolicy);
+        }
+        let idp_token_url = GuardedHttpsUrl::parse(profile.idp_token_endpoint())
+            .map_err(|_| EnterpriseExchangeError::InvalidEndpoint)?;
+        let resource_as_token_url = GuardedHttpsUrl::parse(profile.resource_as_token_endpoint())
+            .map_err(|_| EnterpriseExchangeError::InvalidEndpoint)?;
+        Ok(Self {
+            inner: Arc::new(ExchangeDriverInner {
+                profile,
+                idp_token_url,
+                resource_as_token_url,
+                fetcher,
+                response_policy,
+                busy: Arc::new(AtomicBool::new(false)),
+                #[cfg(test)]
+                test_post: None,
+            }),
+        })
+    }
+
+    #[must_use]
+    pub fn profile(&self) -> &EnterpriseProfile {
+        &self.inner.profile
+    }
+
+    /// Stage 1 (RFC 8693): exchanges a verified OIDC identity assertion at the
+    /// IdP token endpoint for a signed ID-JAG assertion.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn exchange_identity_for_id_jag(
+        &self,
+        cx: &Cx,
+        assertion: EnterpriseIdentityAssertion,
+        idp_client_secret: &EnterpriseClientSecret,
+        id_jag_keys: &IdJagVerificationKeys,
+        idp_tenant: TenantExpectation<'_>,
+        resource_tenant: ResourceTenantExpectation<'_>,
+        received_at: SystemTime,
+    ) -> Result<
+        (
+            EnterpriseResponseOutcome<EnterpriseIdJagResponse>,
+            EnterpriseExchangeObservation,
+        ),
+        EnterpriseExchangeError,
+    > {
+        let profile = &self.inner.profile;
+        let scope_wire = profile.requested_scopes().as_wire_value();
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("grant_type", TOKEN_EXCHANGE_GRANT),
+            ("requested_token_type", ID_JAG_TOKEN_TYPE),
+            ("audience", profile.resource_as_issuer()),
+            ("resource", profile.resource().as_str()),
+            ("subject_token", assertion._assertion.as_str()),
+            ("subject_token_type", SUBJECT_TOKEN_TYPE_ID_TOKEN),
+        ];
+        if let Some(scope) = scope_wire.as_deref() {
+            fields.push(("scope", scope));
+        }
+        let request = build_confidential_token_request(
+            profile.idp_authentication(),
+            profile.idp_client_id(),
+            idp_client_secret.as_str(),
+            &mut fields,
+        )?;
+        let response = self
+            .dispatch_post(cx, &self.inner.idp_token_url, &request)
+            .await?;
+        let observation = EnterpriseExchangeObservation {
+            endpoint: profile.idp_token_endpoint().to_owned(),
+            provenance: response.provenance,
+        };
+        let outcome = profile
+            .admit_id_jag_response(
+                EnterpriseTokenResponse {
+                    status: response.status,
+                    headers: &response.headers,
+                    body: &response.body,
+                },
+                id_jag_keys,
+                idp_tenant,
+                resource_tenant,
+                self.inner.response_policy,
+                received_at,
+            )
+            .map_err(EnterpriseExchangeError::ResponseRejected)?;
+        Ok((outcome, observation))
+    }
+
+    /// Stage 2 (RFC 7523): exchanges a verified ID-JAG assertion at the Resource
+    /// AS token endpoint for a resource-bound final MCP access token.
+    pub async fn exchange_id_jag_for_access_token(
+        &self,
+        cx: &Cx,
+        id_jag: EnterpriseIdJagResponse,
+        resource_as_client_secret: &EnterpriseClientSecret,
+        received_at: SystemTime,
+    ) -> Result<
+        (
+            EnterpriseResponseOutcome<EnterpriseBoundAccessToken>,
+            EnterpriseExchangeObservation,
+        ),
+        EnterpriseExchangeError,
+    > {
+        let profile = &self.inner.profile;
+        let scope_wire = (!id_jag.granted_scopes().is_empty())
+            .then(|| id_jag.granted_scopes().join(" "));
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("grant_type", JWT_BEARER_GRANT),
+            ("assertion", id_jag._assertion.as_str()),
+            ("resource", profile.resource().as_str()),
+        ];
+        if let Some(scope) = scope_wire.as_deref() {
+            fields.push(("scope", scope));
+        }
+        let request = build_confidential_token_request(
+            profile.resource_as_authentication(),
+            profile.resource_as_client_id(),
+            resource_as_client_secret.as_str(),
+            &mut fields,
+        )?;
+        let response = self
+            .dispatch_post(cx, &self.inner.resource_as_token_url, &request)
+            .await?;
+        let observation = EnterpriseExchangeObservation {
+            endpoint: profile.resource_as_token_endpoint().to_owned(),
+            provenance: response.provenance,
+        };
+        let outcome = id_jag
+            .admit_access_token_response(
+                EnterpriseTokenResponse {
+                    status: response.status,
+                    headers: &response.headers,
+                    body: &response.body,
+                },
+                received_at,
+            )
+            .map_err(EnterpriseExchangeError::ResponseRejected)?;
+        let mapped = match outcome {
+            EnterpriseResponseOutcome::Success { value, cache } => {
+                EnterpriseResponseOutcome::Success {
+                    value: EnterpriseBoundAccessToken { response: value },
+                    cache,
+                }
+            }
+            EnterpriseResponseOutcome::Denied { denial, cache } => {
+                EnterpriseResponseOutcome::Denied { denial, cache }
+            }
+            EnterpriseResponseOutcome::StepUpRequired { requirement, cache } => {
+                EnterpriseResponseOutcome::StepUpRequired { requirement, cache }
+            }
+        };
+        Ok((mapped, observation))
+    }
+
+    async fn dispatch_post(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+        request: &GuardedHttpRequest,
+    ) -> Result<GuardedHttpFetchResponse, EnterpriseExchangeError> {
+        let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
+        let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
+        let response = CallerContextFuture::new(&admitted, async {
+            let timeout = self.inner.fetcher.policy().deadline();
+            let started = Instant::now();
+            let nanos = u64::try_from(timeout.as_nanos())
+                .map_err(|_| EnterpriseExchangeError::InvalidPolicy)?;
+            let deadline = admitted.now().saturating_add_nanos(nanos);
+            let deadline = admitted
+                .budget()
+                .deadline
+                .map_or(deadline, |limit| limit.min(deadline));
+            let mut timer = std::pin::pin!(Sleep::new(deadline));
+            let (_sender, mut receiver) = oneshot::channel::<()>();
+            let mut cancelled = std::pin::pin!(receiver.recv(&admitted));
+            let mut call = std::pin::pin!(async {
+                self.send_post(&admitted, url, request, permit.clone())
+                    .await
+            });
+            poll_fn(|task| {
+                exchange_checkpoint(&admitted, deadline, started, timeout)?;
+                if cancelled.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(EnterpriseExchangeError::Cancelled));
+                }
+                if timer.as_mut().poll(task).is_ready() {
+                    exchange_checkpoint(&admitted, deadline, started, timeout)?;
+                    return Poll::Ready(Err(EnterpriseExchangeError::TimedOut));
+                }
+                let res = call.as_mut().poll(task);
+                exchange_checkpoint(&admitted, deadline, started, timeout)?;
+                res
+            })
+            .await
+        })
+        .await?;
+
+        if response.redirect.is_some() {
+            return Err(EnterpriseExchangeError::RedirectRefused);
+        }
+        if response.body.len() > self.inner.fetcher.policy().response_body_bytes()
+            || response.body.len() > MAX_ENTERPRISE_EXCHANGE_RESPONSE_BYTES
+        {
+            return Err(EnterpriseExchangeError::ResponseRejected(
+                EnterpriseResponseError::InvalidResponse,
+            ));
+        }
+        verify_exchange_provenance(&response.provenance, url, &self.inner.fetcher)?;
+        Ok(response)
+    }
+
+    async fn send_post(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+        request: &GuardedHttpRequest,
+        lifetime: Arc<dyn Send + Sync>,
+    ) -> Result<GuardedHttpFetchResponse, EnterpriseExchangeError> {
+        #[cfg(test)]
+        if let Some(poster) = &self.inner.test_post {
+            return poster
+                .post(cx, url, request, lifetime)
+                .await
+                .map_err(map_exchange_fetch_error);
+        }
+        Box::pin(
+            self.inner
+                .fetcher
+                .post_with_lifetime(cx, url, request, lifetime),
+        )
+        .await
+        .map_err(map_exchange_fetch_error)
+    }
+}
+
+impl fmt::Debug for EnterpriseExchangeDriver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnterpriseExchangeDriver")
+            .finish_non_exhaustive()
+    }
+}
+
+struct ExchangePermit(Arc<AtomicBool>);
+
+impl ExchangePermit {
+    fn acquire(busy: Arc<AtomicBool>) -> Result<Self, EnterpriseExchangeError> {
+        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| EnterpriseExchangeError::ExchangeInProgress)?;
+        Ok(Self(busy))
+    }
+}
+
+impl Drop for ExchangePermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn admit_exchange_caller() -> Result<Cx, EnterpriseExchangeError> {
+    let current = Cx::current().ok_or(EnterpriseExchangeError::RuntimeUnavailable)?;
+    if current.checkpoint().is_err() {
+        return Err(EnterpriseExchangeError::Cancelled);
+    }
+    let caps = current.capabilities();
+    if !caps.io || !caps.time || !caps.spawn || current.timer_driver().is_none() {
+        return Err(EnterpriseExchangeError::RuntimeUnavailable);
+    }
+    if current
+        .budget()
+        .deadline
+        .is_some_and(|limit| current.now() >= limit)
+    {
+        return Err(EnterpriseExchangeError::TimedOut);
+    }
+    Ok(current)
+}
+
+fn exchange_checkpoint(
+    admitted: &Cx,
+    deadline: Time,
+    started: Instant,
+    timeout: Duration,
+) -> Result<(), EnterpriseExchangeError> {
+    let current = admit_exchange_caller()?;
+    let held = admitted.capabilities();
+    let active = current.capabilities();
+    if (held.entropy && !active.entropy) || (held.remote && !active.remote) {
+        return Err(EnterpriseExchangeError::RuntimeUnavailable);
+    }
+    if current.now() >= deadline || started.elapsed() >= timeout {
+        return Err(EnterpriseExchangeError::TimedOut);
+    }
+    Ok(())
+}
+
+fn map_exchange_fetch_error(error: GuardedHttpFetchError) -> EnterpriseExchangeError {
+    match error {
+        GuardedHttpFetchError::Cancelled => EnterpriseExchangeError::Cancelled,
+        GuardedHttpFetchError::DeadlineExceeded => EnterpriseExchangeError::TimedOut,
+        _ => EnterpriseExchangeError::TransportFailed,
+    }
+}
+
+fn verify_exchange_provenance(
+    peer: &GuardedHttpPeerProvenance,
+    url: &GuardedHttpsUrl,
+    fetcher: &GuardedHttpFetcher,
+) -> Result<(), EnterpriseExchangeError> {
+    if peer.host != url.host()
+        || peer.selected_address.port() != url.port()
+        || peer.root_policy_revision != fetcher.root_identity()
+        || peer.alpn.as_deref().is_some_and(|alpn| alpn != b"http/1.1")
+        || peer.tls_protocol.as_deref().is_some_and(|protocol| {
+            protocol.is_empty()
+                || protocol.len() > 64
+                || !protocol.is_ascii()
+                || protocol.chars().any(char::is_control)
+        })
+    {
+        return Err(EnterpriseExchangeError::EvidenceMismatch);
+    }
+    Ok(())
+}
+
+fn encode_form_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            b' ' => encoded.push('+'),
+            _ => {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 15)]));
+            }
+        }
+    }
+    encoded
+}
+
+fn build_confidential_token_request(
+    auth: EnterpriseClientAuthentication,
+    client_id: &str,
+    client_secret: &str,
+    fields: &mut Vec<(&str, &str)>,
+) -> Result<GuardedHttpRequest, EnterpriseExchangeError> {
+    let basic_header = match auth {
+        EnterpriseClientAuthentication::ClientSecretBasic => {
+            let encoded_id = encode_form_component(client_id);
+            let encoded_secret = SecretString::from_string(encode_form_component(client_secret));
+            let header = H1Request::post("/")
+                .basic_auth(encoded_id, Some(encoded_secret.as_str()))
+                .build()
+                .headers
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value)
+                .ok_or(EnterpriseExchangeError::EncodingFailed)?;
+            Some(SecretString::from_string(header))
+        }
+        EnterpriseClientAuthentication::ClientSecretPost => {
+            fields.push(("client_id", client_id));
+            fields.push(("client_secret", client_secret));
+            None
+        }
+    };
+
+    let mut body_text = String::new();
+    for (index, (name, value)) in fields.iter().enumerate() {
+        if index != 0 {
+            body_text.push('&');
+        }
+        body_text.push_str(&encode_form_component(name));
+        body_text.push('=');
+        body_text.push_str(&encode_form_component(value));
+        if body_text.len() > MAX_ENTERPRISE_EXCHANGE_FORM_BYTES {
+            drop(SecretString::from_string(body_text));
+            return Err(EnterpriseExchangeError::EncodingFailed);
+        }
+    }
+    let body_secret = SecretString::from_string(body_text);
+    let mut request = GuardedHttpRequest::new(
+        "application/x-www-form-urlencoded",
+        body_secret.as_str().as_bytes().to_vec(),
+    )
+    .map_err(|_| EnterpriseExchangeError::EncodingFailed)?;
+    if let Some(header) = basic_header {
+        request = request
+            .with_authorization(header.as_str())
+            .map_err(|_| EnterpriseExchangeError::EncodingFailed)?;
+    }
+    Ok(request)
 }
