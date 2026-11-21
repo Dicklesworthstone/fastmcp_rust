@@ -16234,9 +16234,7 @@ async fn serve_native_http_diagnostic(
     if !diagnostic && !admission.health_only() {
         return Some(admission);
     }
-    let Some(_health_permit) = admission.into_health(&endpoint.health_control_active) else {
-        return None;
-    };
+    let _health_permit = admission.into_health(&endpoint.health_control_active)?;
     let response = if !diagnostic {
         HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
     } else if request.uri.contains('?') {
