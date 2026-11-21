@@ -98,7 +98,10 @@ fn typed_http_proxy_client_notifications_revalidate_each_leg_and_rebuild_proof()
         assert!(
             builder()
                 .typed_http_proxy_request::<ScaleRequest, ScaleResponse>(
-                    METHOD, "scale-params-v1", "scale-result-v1", upstream.clone(),
+                    METHOD,
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
                 )
                 .unwrap()
                 .build()
@@ -129,13 +132,15 @@ fn typed_http_proxy_client_notifications_revalidate_each_leg_and_rebuild_proof()
             let address = address(endpoint);
             let valid = notification(7, false);
             let unauthenticated = notification_http_exchange(address, valid.clone(), false)
-                .await.unwrap();
+                .await
+                .unwrap();
             assert!(unauthenticated.starts_with(b"HTTP/1.1 401"));
             assert_eq!(authorized.load(Ordering::SeqCst), 0);
             assert_eq!(observations.authorized.load(Ordering::SeqCst), 0);
 
             let accepted = notification_http_exchange(address, valid.clone(), true)
-                .await.unwrap();
+                .await
+                .unwrap();
             assert!(accepted.starts_with(b"HTTP/1.1 202"));
             assert!(
                 accepted.ends_with(b"\r\n\r\n"),
@@ -145,7 +150,10 @@ fn typed_http_proxy_client_notifications_revalidate_each_leg_and_rebuild_proof()
             assert_eq!(observations.total.load(Ordering::SeqCst), 21);
 
             let mut missing = valid.clone();
-            missing["params"]["_meta"].as_object_mut().unwrap().remove(ACTIVATION);
+            missing["params"]["_meta"]
+                .as_object_mut()
+                .unwrap()
+                .remove(ACTIVATION);
             let mut incompatible = valid.clone();
             incompatible["params"]["_meta"][ACTIVATION]["version"] = json!(2);
             let mut malformed = valid.clone();
@@ -155,33 +163,44 @@ fn typed_http_proxy_client_notifications_revalidate_each_leg_and_rebuild_proof()
             let mut request_shaped = valid.clone();
             request_shaped["id"] = json!(41);
             for rejected in [missing, incompatible, malformed, unexpected, request_shaped] {
-                let response = notification_http_exchange(address, rejected, true).await.unwrap();
+                let response = notification_http_exchange(address, rejected, true)
+                    .await
+                    .unwrap();
                 assert!(response.starts_with(b"HTTP/1.1 400"));
                 assert_eq!(observations.authorized.load(Ordering::SeqCst), 1);
                 assert_eq!(observations.started.load(Ordering::SeqCst), 1);
             }
             let denied = notification_http_exchange(address, notification(17, false), true)
-                .await.unwrap();
+                .await
+                .unwrap();
             assert!(denied.starts_with(b"HTTP/1.1 403"));
             assert_eq!(observations.authorized.load(Ordering::SeqCst), 1);
-            let upstream_denied = notification_http_exchange(address, notification(13, false), true)
-                .await.unwrap();
+            let upstream_denied =
+                notification_http_exchange(address, notification(13, false), true)
+                    .await
+                    .unwrap();
             assert!(upstream_denied.starts_with(b"HTTP/1.1 400"));
             assert_eq!(observations.authorized.load(Ordering::SeqCst), 2);
             assert_eq!(observations.started.load(Ordering::SeqCst), 1);
 
             let mut fresh = notification(11, false);
             fresh["params"]["_meta"]["com.example/downstream-only"] = json!("do-not-forward");
-            fresh["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2025-11-25");
+            fresh["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+                json!("2025-11-25");
             fresh["params"]["_meta"]["io.modelcontextprotocol/clientInfo"] =
                 json!({"name": "spoofed-downstream", "version": "0"});
-            let accepted = notification_http_exchange(address, fresh, true).await.unwrap();
+            let accepted = notification_http_exchange(address, fresh, true)
+                .await
+                .unwrap();
             assert!(accepted.starts_with(b"HTTP/1.1 202"));
             assert_eq!(observations.total.load(Ordering::SeqCst), 54);
         })
         .await;
         assert_eq!(declaration_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(declaration_observations.authorized.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            declaration_observations.authorized.load(Ordering::SeqCst),
+            0
+        );
         assert_eq!(declaration_observations.started.load(Ordering::SeqCst), 0);
     });
     assert_eq!(retained.completed.load(Ordering::SeqCst), 2);
@@ -189,7 +208,10 @@ fn typed_http_proxy_client_notifications_revalidate_each_leg_and_rebuild_proof()
     let received = retained_wire.lock().unwrap();
     assert_eq!(received.len(), 2);
     for request in received.iter() {
-        assert!(request.id.is_none(), "notifications never allocate a response waiter");
+        assert!(
+            request.id.is_none(),
+            "notifications never allocate a response waiter"
+        );
         assert_eq!(
             request.params.as_ref().unwrap()["_meta"],
             json!({(ACTIVATION): {"version": 1}})
@@ -208,7 +230,8 @@ fn typed_http_proxy_client_notification_drop_releases_both_legs_and_keeps_reques
         .unwrap();
     run_http_test(server, move |cx, endpoint| async move {
         let upstream = connect_upstream(
-            &cx, endpoint,
+            &cx,
+            endpoint,
             duplex_registration(
                 Arc::new(AtomicUsize::new(0)),
                 Arc::new(NotificationObservations::default()),
@@ -225,18 +248,23 @@ fn typed_http_proxy_client_notification_drop_releases_both_legs_and_keeps_reques
                 .await
                 .unwrap();
             let mut held = Box::pin(notification_http_exchange(
-                address(endpoint), notification(7, true), false,
+                address(endpoint),
+                notification(7, true),
+                false,
             ));
             while observations.started.load(Ordering::SeqCst) == 0 {
                 assert!(
                     std::future::poll_fn(|task| Poll::Ready(held.as_mut().poll(task)))
-                        .await.is_pending()
+                        .await
+                        .is_pending()
                 );
                 asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
             assert_eq!(
-                client.request_final_extension(&cx, &id, METHOD, json!({"value": 11}))
-                    .await.unwrap(),
+                client
+                    .request_final_extension(&cx, &id, METHOD, json!({"value": 11}))
+                    .await
+                    .unwrap(),
                 json!({"value": 33})
             );
             assert_eq!(observations.abandoned.load(Ordering::SeqCst), 0);
@@ -249,19 +277,21 @@ fn typed_http_proxy_client_notification_drop_releases_both_legs_and_keeps_reques
             .await
             .expect("dropping the caller's POST closes both owned HTTP legs");
             assert_eq!(
-                observations.started.load(Ordering::SeqCst), 1,
+                observations.started.load(Ordering::SeqCst),
+                1,
                 "no automatic replay"
             );
             assert_eq!(observations.completed.load(Ordering::SeqCst), 0);
             assert!(cx.checkpoint().is_ok());
-            client.notify_final_extension(
-                &cx, &id, NOTIFICATION, json!({"value": 11, "hold": false}),
-            )
-            .await
-            .expect("a new independent notification succeeds after the abandoned POST");
+            client
+                .notify_final_extension(&cx, &id, NOTIFICATION, json!({"value": 11, "hold": false}))
+                .await
+                .expect("a new independent notification succeeds after the abandoned POST");
             assert_eq!(
-                client.request_final_extension(&cx, &id, METHOD, json!({"value": 17}))
-                    .await.unwrap(),
+                client
+                    .request_final_extension(&cx, &id, METHOD, json!({"value": 17}))
+                    .await
+                    .unwrap(),
                 json!({"value": 51})
             );
         })
@@ -279,8 +309,14 @@ fn settings_builder(
     resolved: Arc<AtomicUsize>,
 ) -> ExtensionBuilder<ClientSettings, ServerSettings, Settings> {
     ExtensionBuilder::new(
-        EXTENSION, 1, "typed-math-client-v1", "typed-math-server-v1",
-        ServerSettings { version: 1, multiplier },
+        EXTENSION,
+        1,
+        "typed-math-client-v1",
+        "typed-math-server-v1",
+        ServerSettings {
+            version: 1,
+            multiplier,
+        },
         move |client: ClientSettings, server: ServerSettings| {
             if client.version != server.version {
                 return Err(McpError::invalid_params("incompatible math version"));
@@ -304,7 +340,9 @@ fn typed_http_proxy_client_notifications_refuse_settings_mismatch_and_fresh_reso
         let resolved = Arc::new(AtomicUsize::new(3));
         let declaration = settings_builder(3, Arc::clone(&resolved))
             .typed_notification_sync(
-                NOTIFICATION, "scaled-notification-v1", ACTIVATION,
+                NOTIFICATION,
+                "scaled-notification-v1",
+                ACTIVATION,
                 |_: &ScaleNotification| Ok(()),
                 |_: ExtensionNotificationContext<'_, Settings>, _: ScaleNotification| Ok(()),
             )
@@ -323,38 +361,38 @@ fn typed_http_proxy_client_notifications_refuse_settings_mismatch_and_fresh_reso
             .extension(changed)
             .unwrap();
         with_http_server(&cx, changed, |endpoint| async {
-            let refused = notification_http_exchange(
-                address(endpoint), notification(7, false), false,
-            )
-            .await
-            .unwrap();
+            let refused =
+                notification_http_exchange(address(endpoint), notification(7, false), false)
+                    .await
+                    .unwrap();
             assert!(refused.starts_with(b"HTTP/1.1 400"));
             assert_eq!(observations.authorized.load(Ordering::SeqCst), 0);
         })
         .await;
 
-        let registration = forward_notification(
-            builder(), upstream, Arc::new(AtomicUsize::new(0)),
-        )
-        .build()
-        .unwrap();
+        let registration = forward_notification(builder(), upstream, Arc::new(AtomicUsize::new(0)))
+            .build()
+            .unwrap();
         let gateway = modern::ServerBuilder::new("stable-notification-settings", "1.0")
             .extension(registration)
             .unwrap();
         with_http_server(&cx, gateway, |endpoint| async {
             let address = address(endpoint);
             let accepted = notification_http_exchange(address, notification(7, false), false)
-                .await.unwrap();
+                .await
+                .unwrap();
             assert!(accepted.starts_with(b"HTTP/1.1 202"));
             resolved.store(5, Ordering::SeqCst);
             let refused = notification_http_exchange(address, notification(11, false), false)
-                .await.unwrap();
+                .await
+                .unwrap();
             assert!(refused.starts_with(b"HTTP/1.1 400"));
             assert_eq!(observations.authorized.load(Ordering::SeqCst), 1);
             assert_eq!(observations.completed.load(Ordering::SeqCst), 1);
             resolved.store(3, Ordering::SeqCst);
             let accepted = notification_http_exchange(address, notification(11, false), false)
-                .await.unwrap();
+                .await
+                .unwrap();
             assert!(accepted.starts_with(b"HTTP/1.1 202"));
         })
         .await;
@@ -366,7 +404,9 @@ fn typed_http_proxy_client_notifications_refuse_settings_mismatch_and_fresh_reso
 fn forged_notification_registration(calls: Arc<AtomicUsize>) -> ExtensionRegistration {
     builder()
         .typed_notification_sync(
-            NOTIFICATION, "forged-notification-v1", ACTIVATION,
+            NOTIFICATION,
+            "forged-notification-v1",
+            ACTIVATION,
             |_: &ForgedRequest| Ok(()),
             move |_: ExtensionNotificationContext<'_, Settings>, _: ForgedRequest| {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -387,13 +427,18 @@ fn typed_http_proxy_client_notifications_reject_synthesized_metadata_before_peer
         .unwrap();
     run_http_test(server, move |cx, endpoint| async move {
         let upstream = connect_upstream(
-            &cx, endpoint, forged_notification_registration(Arc::new(AtomicUsize::new(0))),
+            &cx,
+            endpoint,
+            forged_notification_registration(Arc::new(AtomicUsize::new(0))),
         )
         .await;
         let registration = builder()
             .typed_http_proxy_notification(
-                NOTIFICATION, "forged-notification-v1", ACTIVATION,
-                |_: &ForgedRequest| Ok(()), upstream,
+                NOTIFICATION,
+                "forged-notification-v1",
+                ACTIVATION,
+                |_: &ForgedRequest| Ok(()),
+                upstream,
             )
             .unwrap()
             .build()

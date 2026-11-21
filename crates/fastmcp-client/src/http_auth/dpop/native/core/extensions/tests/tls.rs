@@ -16,8 +16,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use crate::http_auth::dpop::DpopSession;
-use crate::http_auth::dpop::native::{DpopHttpError, DpopHttpPolicy};
 use crate::http_auth::dpop::native::core::DpopCoreError;
+use crate::http_auth::dpop::native::{DpopHttpError, DpopHttpPolicy};
 
 const ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo\nApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS\nBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI\nrmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY\nvQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW\nX/aCEJ5+hA==\n-----END CERTIFICATE-----\n";
 const LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49\nAwEHA0IABPPKylLna9VpWAlpshHBhSsQHNOv3BaEGX4HSBhHiBVel0ce+qfHF15O\n0T63Zlp7TtxlMdEY+rPpgioSFDQVadijYzBhMAwGA1UdEwEB/wQCMAAwLAYDVR0R\nBCUwI4IJbG9jYWxob3N0hwR/AAABhxAAAAAAAAAAAAAAAAAAAAABMBMGA1UdJQQM\nMAoGCCsGAQUFBwMBMA4GA1UdDwEB/wQEAwIHgDAKBggqhkjOPQQDAgNIADBFAiEA\n6qrAr2qp/t6K62T9Et2mUU/zfd4kJb+ekyoAim1yTFcCICb6SdVY2fg15/SXf0vE\nIvYelqtTk8FQInCEcIxvfF3m\n-----END CERTIFICATE-----\n";
@@ -124,8 +124,7 @@ fn operation(discovery: i64) -> DpopExtensionOperation {
 
 fn limits(notifications: usize) -> DpopStreamLimits {
     DpopStreamLimits::new(
-        ManagedCoreLimits::new(8192, 8192, 32768, notifications, Duration::from_secs(60))
-            .unwrap(),
+        ManagedCoreLimits::new(8192, 8192, 32768, notifications, Duration::from_secs(60)).unwrap(),
         Duration::from_secs(10),
     )
     .unwrap()
@@ -143,8 +142,11 @@ fn discovery() -> Value {
 }
 
 fn frame(id: &RequestId, source: &str) -> Vec<u8> {
-    format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{source}}}",
-        serde_json::to_string(id).unwrap()).into_bytes()
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{source}}}",
+        serde_json::to_string(id).unwrap()
+    )
+    .into_bytes()
 }
 
 fn progress(token: Value, value: &str) -> Vec<u8> {
@@ -226,9 +228,14 @@ fn inspect(
     assert_eq!(header(head, "authorization"), "DPoP extension-access");
     assert_eq!(header(head, "mcp-method"), method);
     assert_eq!(header(head, "mcp-protocol-version"), "2026-07-28");
-    assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
-    assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
-        json!({EXTENSION:{"format":"echo-v1"},OTHER_EXTENSION:{"format":"echo-v1"}}));
+    assert_eq!(
+        body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+        "2026-07-28"
+    );
+    assert_eq!(
+        body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+        json!({EXTENSION:{"format":"echo-v1"},OTHER_EXTENSION:{"format":"echo-v1"}})
+    );
     let proof = claims(header(head, "dpop"));
     assert_eq!(proof["htm"], "POST");
     assert_eq!(proof["htu"], target.split('?').next().unwrap());
@@ -238,16 +245,26 @@ fn inspect(
     } else {
         assert_eq!(proof["nonce"], "extension-next");
     }
-    assert!(proofs.insert(proof["jti"].as_str().unwrap().to_owned()), "every POST signs a fresh proof");
+    assert!(
+        proofs.insert(proof["jti"].as_str().unwrap().to_owned()),
+        "every POST signs a fresh proof"
+    );
     assert!(!head.contains("body-only-canary"));
-    assert!(!head.lines().any(|line| line.to_ascii_lowercase().starts_with("mcp-name:")));
+    assert!(
+        !head
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("mcp-name:"))
+    );
     if method == "server/discover" {
         assert_eq!(header(head, "accept"), "application/json");
         assert!(body["params"].get("private").is_none());
         assert!(body["params"]["_meta"].get("progressToken").is_none());
         assert!(body["params"]["_meta"].get("com.example/note").is_none());
     } else {
-        assert_eq!(header(head, "accept"), "application/json, text/event-stream");
+        assert_eq!(
+            header(head, "accept"),
+            "application/json, text/event-stream"
+        );
         assert_eq!(body["params"]["private"], "body-only-canary");
         assert_eq!(body["params"]["_meta"]["progressToken"], "owned");
         assert_eq!(body["params"]["_meta"]["com.example/note"], "retained");
@@ -289,8 +306,12 @@ fn assert_result(result: DpopExtensionResult, id: &RequestId) {
 }
 
 fn no_extra(listener: &TcpListener) {
-    assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending(),
-        "no retry, remote cancellation, refresh, or other hidden connection");
+    assert!(
+        listener
+            .poll_accept(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "no retry, remote cancellation, refresh, or other hidden connection"
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -330,8 +351,15 @@ enum Case {
 
 impl Case {
     fn ends_at_discovery(self) -> bool {
-        matches!(self, Self::NoOffer | Self::InactiveOffer | Self::UnknownOffer
-            | Self::IncompatibleOffer | Self::UnsupportedVersion | Self::DiscoveryWrongId)
+        matches!(
+            self,
+            Self::NoOffer
+                | Self::InactiveOffer
+                | Self::UnknownOffer
+                | Self::IncompatibleOffer
+                | Self::UnsupportedVersion
+                | Self::DiscoveryWrongId
+        )
     }
 
     fn has_progress(self) -> bool {
@@ -361,10 +389,20 @@ async fn exercise(case: Case) {
         )
         .unwrap()
     } else {
-        limits(if matches!(case, Case::NotificationLimit) { 1 } else { 8 })
+        limits(if matches!(case, Case::NotificationLimit) {
+            1
+        } else {
+            8
+        })
     };
     let application = client.request_final_extension_with_events(
-        &cx, &cancellation, &credential, &configuration, metadata(), operation(1), selected,
+        &cx,
+        &cancellation,
+        &credential,
+        &configuration,
+        metadata(),
+        operation(1),
+        selected,
         |notification| {
             assert!(matches!(notification, ServerNotification::Progress(_)));
             calls += 1;
@@ -383,10 +421,23 @@ async fn exercise(case: Case) {
         let (socket, _) = listener.accept().await.unwrap();
         let mut socket = acceptor.accept(socket).await.unwrap();
         let (head, body) = read(&mut socket).await;
-        inspect(&head, &body, &target, "server/discover", &RequestId::Number(1), &mut proofs);
+        inspect(
+            &head,
+            &body,
+            &target,
+            "server/discover",
+            &RequestId::Number(1),
+            &mut proofs,
+        );
         let mut offer = discovery();
-        if matches!(case, Case::NoOffer | Case::InactiveOffer | Case::UnknownOffer) {
-            offer["capabilities"]["extensions"].as_object_mut().unwrap().remove(EXTENSION);
+        if matches!(
+            case,
+            Case::NoOffer | Case::InactiveOffer | Case::UnknownOffer
+        ) {
+            offer["capabilities"]["extensions"]
+                .as_object_mut()
+                .unwrap()
+                .remove(EXTENSION);
         }
         if matches!(case, Case::UnknownOffer) {
             offer["capabilities"]["extensions"]["com.example/unregistered"] =
@@ -433,14 +484,34 @@ async fn exercise(case: Case) {
             observed.cancelled().await;
             if matches!(case, Case::Stop | Case::Panic | Case::Cancel | Case::Revoke) {
                 // Leave the stream open until the application releases it.
-            } else if matches!(case, Case::NotificationLimit | Case::BadProgress | Case::ForeignProgress) {
-                let token = if matches!(case, Case::ForeignProgress) { json!(1) } else { json!("owned") };
-                event(&mut socket, &progress(token, if matches!(case, Case::BadProgress) { "1" } else { "2" })).await;
+            } else if matches!(
+                case,
+                Case::NotificationLimit | Case::BadProgress | Case::ForeignProgress
+            ) {
+                let token = if matches!(case, Case::ForeignProgress) {
+                    json!(1)
+                } else {
+                    json!("owned")
+                };
+                event(
+                    &mut socket,
+                    &progress(
+                        token,
+                        if matches!(case, Case::BadProgress) {
+                            "1"
+                        } else {
+                            "2"
+                        },
+                    ),
+                )
+                .await;
             } else if matches!(case, Case::ReverseRequest | Case::UnknownNotification) {
                 let record = if matches!(case, Case::ReverseRequest) {
-                    br#"{"jsonrpc":"2.0","id":"reverse","method":"example/reverse","params":{}}"#.as_slice()
+                    br#"{"jsonrpc":"2.0","id":"reverse","method":"example/reverse","params":{}}"#
+                        .as_slice()
                 } else {
-                    br#"{"jsonrpc":"2.0","method":"example/unregistered-notification","params":{}}"#.as_slice()
+                    br#"{"jsonrpc":"2.0","method":"example/unregistered-notification","params":{}}"#
+                        .as_slice()
                 };
                 event(&mut socket, record).await;
             } else if matches!(case, Case::BodyLimit) {
@@ -459,13 +530,23 @@ async fn exercise(case: Case) {
                     } else {
                         let source = match case {
                             Case::ForeignResult => json!({"resultType":OTHER_RESULT}).to_string(),
-                            Case::UnknownResult => json!({"resultType":"com.example/unregistered-result"}).to_string(),
+                            Case::UnknownResult => {
+                                json!({"resultType":"com.example/unregistered-result"}).to_string()
+                            }
                             Case::MissingDiscriminator => json!({"value":7}).to_string(),
-                            Case::InvalidDiscriminator => json!({"resultType":null,"value":7}).to_string(),
-                            Case::InvalidResultMeta => json!({"resultType":RESULT,"_meta":[]}).to_string(),
+                            Case::InvalidDiscriminator => {
+                                json!({"resultType":null,"value":7}).to_string()
+                            }
+                            Case::InvalidResultMeta => {
+                                json!({"resultType":RESULT,"_meta":[]}).to_string()
+                            }
                             _ => SOURCE.to_owned(),
                         };
-                        let id = if matches!(case, Case::ForeignId) { RequestId::Number(2) } else { operation_id };
+                        let id = if matches!(case, Case::ForeignId) {
+                            RequestId::Number(2)
+                        } else {
+                            operation_id
+                        };
                         frame(&id, &source)
                     };
                     tail.extend_from_slice(&event_chunk(&payload));
@@ -486,8 +567,10 @@ async fn exercise(case: Case) {
             }
         }
         let mut byte = [0];
-        assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0),
-            "rejected stream must release its owned socket without a terminal");
+        assert!(
+            !matches!(socket.read(&mut byte).await, Ok(count) if count > 0),
+            "rejected stream must release its owned socket without a terminal"
+        );
     };
     let (outcome, ()) = pair(application, peer).await;
     if matches!(case, Case::Json | Case::Sse) {
@@ -501,45 +584,101 @@ async fn exercise(case: Case) {
         assert_eq!(result.raw_result_source(), r#"{"value":7}"#);
         assert_eq!(result.into_result(), json!({"value":7}));
     } else {
-        let error = outcome.err().expect("planted failure must not publish a result");
+        let error = outcome
+            .err()
+            .expect("planted failure must not publish a result");
         assert!(!format!("{error:?} {error}").contains("canary"));
         let expected = match (&case, &error) {
-            (Case::ForeignId | Case::DiscoveryWrongId,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseIdMismatch)))
-            | (Case::ForeignResult | Case::UnknownResult | Case::InvalidDiscriminator | Case::InvalidResultMeta,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResult)))
-            | (Case::DuplicateMember | Case::DuplicateTerminal | Case::IncompleteTail,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)))
-            | (Case::MissingTerminal,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::MissingTerminal)))
-            | (Case::RemoteError,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::Remote { .. })))
-            | (Case::NoOffer | Case::InactiveOffer | Case::UnknownOffer | Case::IncompatibleOffer | Case::UnsupportedVersion,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::UnsupportedRequest)))
-            | (Case::NonceChallenge,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::HttpStatus { status: 401 })))
+            (
+                Case::ForeignId | Case::DiscoveryWrongId,
+                DpopStreamError::Core(DpopCoreError::Protocol(
+                    ManagedCoreError::ResponseIdMismatch,
+                )),
+            )
+            | (
+                Case::ForeignResult
+                | Case::UnknownResult
+                | Case::InvalidDiscriminator
+                | Case::InvalidResultMeta,
+                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResult)),
+            )
+            | (
+                Case::DuplicateMember | Case::DuplicateTerminal | Case::IncompleteTail,
+                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)),
+            )
+            | (
+                Case::MissingTerminal,
+                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::MissingTerminal)),
+            )
+            | (
+                Case::RemoteError,
+                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::Remote { .. })),
+            )
+            | (
+                Case::NoOffer
+                | Case::InactiveOffer
+                | Case::UnknownOffer
+                | Case::IncompatibleOffer
+                | Case::UnsupportedVersion,
+                DpopStreamError::Core(DpopCoreError::Protocol(
+                    ManagedCoreError::UnsupportedRequest,
+                )),
+            )
+            | (
+                Case::NonceChallenge,
+                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::HttpStatus {
+                    status: 401,
+                })),
+            )
             | (Case::Stop, DpopStreamError::ObserverStopped)
             | (Case::Panic, DpopStreamError::ObserverPanicked)
-            | (Case::Cancel, DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled)))
-            | (Case::Revoke, DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(_))))
-            | (Case::NotificationLimit,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::NotificationLimit)))
-            | (Case::BadProgress | Case::ForeignProgress,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidProgress)))
-            | (Case::ReverseRequest | Case::UnknownNotification,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::UnexpectedNotification)))
-            | (Case::BodyLimit, DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::BodyTooLarge)))
-            | (Case::FrameLimit,
-                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit))) => true,
+            | (
+                Case::Cancel,
+                DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled)),
+            )
+            | (
+                Case::Revoke,
+                DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(_))),
+            )
+            | (
+                Case::NotificationLimit,
+                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::NotificationLimit)),
+            )
+            | (
+                Case::BadProgress | Case::ForeignProgress,
+                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidProgress)),
+            )
+            | (
+                Case::ReverseRequest | Case::UnknownNotification,
+                DpopStreamError::Core(DpopCoreError::Protocol(
+                    ManagedCoreError::UnexpectedNotification,
+                )),
+            )
+            | (
+                Case::BodyLimit,
+                DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::BodyTooLarge)),
+            )
+            | (
+                Case::FrameLimit,
+                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit)),
+            ) => true,
             _ => false,
         };
         assert!(expected, "unexpected disposition for {case:?}: {error:?}");
     }
     assert_eq!(calls, usize::from(case.has_progress()));
     assert_eq!(proofs.len(), if case.ends_at_discovery() { 1 } else { 2 });
-    assert_eq!(factories.load(Ordering::SeqCst),
-        usize::from(!matches!(case, Case::UnsupportedVersion | Case::DiscoveryWrongId)));
-    assert_eq!(client.session.resource_nonce, Some(DpopNonce::new("extension-next").unwrap()));
+    assert_eq!(
+        factories.load(Ordering::SeqCst),
+        usize::from(!matches!(
+            case,
+            Case::UnsupportedVersion | Case::DiscoveryWrongId
+        ))
+    );
+    assert_eq!(
+        client.session.resource_nonce,
+        Some(DpopNonce::new("extension-next").unwrap())
+    );
     assert!(client.session.token_nonce.is_none());
     no_extra(&listener);
     assert!(cx.checkpoint().is_ok());
@@ -552,11 +691,21 @@ async fn exercise(case: Case) {
     // resolver and proof. Earlier transport refusal cannot poison this client.
     let follow_cancel = McpRequestCancellation::new();
     let application = client.request_final_extension(
-        &cx, &follow_cancel, &credential, &configuration, metadata(), operation(3), limits(0),
+        &cx,
+        &follow_cancel,
+        &credential,
+        &configuration,
+        metadata(),
+        operation(3),
+        limits(0),
     );
     let peer = async {
         for (id, method, source) in [
-            (RequestId::Number(3), "server/discover", discovery().to_string()),
+            (
+                RequestId::Number(3),
+                "server/discover",
+                discovery().to_string(),
+            ),
             (RequestId::String("4".to_owned()), METHOD, SOURCE.to_owned()),
         ] {
             let (socket, _) = listener.accept().await.unwrap();
@@ -569,8 +718,13 @@ async fn exercise(case: Case) {
     let (result, ()) = pair(application, peer).await;
     assert_result(result.unwrap(), &RequestId::String("4".to_owned()));
     assert_eq!(proofs.len(), if case.ends_at_discovery() { 3 } else { 4 });
-    assert_eq!(factories.load(Ordering::SeqCst),
-        1 + usize::from(!matches!(case, Case::UnsupportedVersion | Case::DiscoveryWrongId)));
+    assert_eq!(
+        factories.load(Ordering::SeqCst),
+        1 + usize::from(!matches!(
+            case,
+            Case::UnsupportedVersion | Case::DiscoveryWrongId
+        ))
+    );
     assert!(!follow_cancel.is_cancel_requested());
     no_extra(&listener);
 }
@@ -584,32 +738,60 @@ fn public_extension_json_and_sse_keep_source_and_fresh_dpop_authority() {
 
 #[test]
 fn extension_discovery_cannot_dispatch_absent_incompatible_or_foreign_capability() {
-    for case in [Case::NoOffer, Case::InactiveOffer, Case::UnknownOffer,
-        Case::IncompatibleOffer, Case::UnsupportedVersion, Case::DiscoveryWrongId] {
+    for case in [
+        Case::NoOffer,
+        Case::InactiveOffer,
+        Case::UnknownOffer,
+        Case::IncompatibleOffer,
+        Case::UnsupportedVersion,
+        Case::DiscoveryWrongId,
+    ] {
         run(exercise(case));
     }
 }
 
 #[test]
 fn extension_streams_reject_unowned_results_ids_and_unclean_completion() {
-    for case in [Case::ForeignId, Case::ForeignResult, Case::UnknownResult,
-        Case::InvalidDiscriminator, Case::InvalidResultMeta, Case::DuplicateMember,
-        Case::DuplicateTerminal, Case::IncompleteTail, Case::MissingTerminal, Case::RemoteError] {
+    for case in [
+        Case::ForeignId,
+        Case::ForeignResult,
+        Case::UnknownResult,
+        Case::InvalidDiscriminator,
+        Case::InvalidResultMeta,
+        Case::DuplicateMember,
+        Case::DuplicateTerminal,
+        Case::IncompleteTail,
+        Case::MissingTerminal,
+        Case::RemoteError,
+    ] {
         run(exercise(case));
     }
 }
 
 #[test]
 fn extension_streams_enforce_progress_and_independent_response_bounds() {
-    for case in [Case::NotificationLimit, Case::BadProgress, Case::ForeignProgress,
-        Case::ReverseRequest, Case::UnknownNotification, Case::BodyLimit, Case::FrameLimit] {
+    for case in [
+        Case::NotificationLimit,
+        Case::BadProgress,
+        Case::ForeignProgress,
+        Case::ReverseRequest,
+        Case::UnknownNotification,
+        Case::BodyLimit,
+        Case::FrameLimit,
+    ] {
         run(exercise(case));
     }
 }
 
 #[test]
 fn stopped_extension_streams_release_sockets_and_keep_explicit_followup_usable() {
-    for case in [Case::NonceChallenge, Case::Stop, Case::Panic, Case::Cancel, Case::Revoke] {
+    for case in [
+        Case::NonceChallenge,
+        Case::Stop,
+        Case::Panic,
+        Case::Cancel,
+        Case::Revoke,
+    ] {
         run(exercise(case));
     }
 }
@@ -633,10 +815,19 @@ fn extension_preflight_rejects_unowned_or_invalid_operations_without_a_connectio
         Revoked,
     }
     for rejection in [
-        Rejection::Owner, Rejection::Direction, Rejection::Disabled, Rejection::Method,
-        Rejection::Metadata, Rejection::Capabilities, Rejection::ClientInfo,
-        Rejection::Progress, Rejection::Version, Rejection::BaseCapabilities,
-        Rejection::RequestLimit, Rejection::Cancelled, Rejection::Revoked,
+        Rejection::Owner,
+        Rejection::Direction,
+        Rejection::Disabled,
+        Rejection::Method,
+        Rejection::Metadata,
+        Rejection::Capabilities,
+        Rejection::ClientInfo,
+        Rejection::Progress,
+        Rejection::Version,
+        Rejection::BaseCapabilities,
+        Rejection::RequestLimit,
+        Rejection::Cancelled,
+        Rejection::Revoked,
     ] {
         run(async {
             let cx = Cx::current().unwrap();
@@ -655,7 +846,8 @@ fn extension_preflight_rejects_unowned_or_invalid_operations_without_a_connectio
             let mut params = parameters();
             match rejection {
                 Rejection::Metadata => {
-                    params["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2024-11-05");
+                    params["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+                        json!("2024-11-05");
                 }
                 Rejection::Capabilities => {
                     params["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
@@ -668,8 +860,10 @@ fn extension_preflight_rejects_unowned_or_invalid_operations_without_a_connectio
                 Rejection::Progress => params["_meta"]["progressToken"] = json!({"invalid":1}),
                 Rejection::Version => metadata.protocol_version = "2024-11-05".to_owned(),
                 Rejection::BaseCapabilities => {
-                    metadata.client_capabilities.extensions =
-                        Some(BTreeMap::from([("com.example/forged".to_owned(), json!({}))]));
+                    metadata.client_capabilities.extensions = Some(BTreeMap::from([(
+                        "com.example/forged".to_owned(),
+                        json!({}),
+                    )]));
                 }
                 Rejection::RequestLimit => params["oversized"] = json!("x".repeat(2048)),
                 _ => {}
@@ -678,7 +872,8 @@ fn extension_preflight_rejects_unowned_or_invalid_operations_without_a_connectio
                 DpopStreamLimits::new(
                     ManagedCoreLimits::new(1024, 8192, 32768, 8, Duration::from_secs(60)).unwrap(),
                     Duration::from_secs(10),
-                ).unwrap()
+                )
+                .unwrap()
             } else {
                 limits(8)
             };
@@ -693,8 +888,13 @@ fn extension_preflight_rejects_unowned_or_invalid_operations_without_a_connectio
                 METHOD
             };
             let operation = DpopExtensionOperation::new(
-                RequestId::Number(1), RequestId::String("2".to_owned()), owner, method, params,
-            ).unwrap();
+                RequestId::Number(1),
+                RequestId::String("2".to_owned()),
+                owner,
+                method,
+                params,
+            )
+            .unwrap();
             let cancellation = McpRequestCancellation::new();
             if matches!(rejection, Rejection::Cancelled) {
                 cancellation.cancel();
@@ -702,25 +902,62 @@ fn extension_preflight_rejects_unowned_or_invalid_operations_without_a_connectio
             if matches!(rejection, Rejection::Revoked) {
                 credential.revoke();
             }
-            let error = client.request_final_extension(
-                &cx, &cancellation, &credential, &configuration, metadata, operation, selected,
-            ).await.err().expect("local refusal cannot succeed");
+            let error = client
+                .request_final_extension(
+                    &cx,
+                    &cancellation,
+                    &credential,
+                    &configuration,
+                    metadata,
+                    operation,
+                    selected,
+                )
+                .await
+                .err()
+                .expect("local refusal cannot succeed");
             let expected = match (rejection, &error) {
-                (Rejection::Owner | Rejection::Direction | Rejection::Disabled
-                    | Rejection::Method | Rejection::BaseCapabilities,
-                    DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::UnsupportedRequest)))
-                | (Rejection::Metadata | Rejection::Capabilities | Rejection::ClientInfo
-                    | Rejection::Progress | Rejection::Version,
-                    DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidRequest)))
-                | (Rejection::RequestLimit,
-                    DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::RequestTooLarge)))
-                | (Rejection::Cancelled,
-                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled)))
-                | (Rejection::Revoked,
-                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(_)))) => true,
+                (
+                    Rejection::Owner
+                    | Rejection::Direction
+                    | Rejection::Disabled
+                    | Rejection::Method
+                    | Rejection::BaseCapabilities,
+                    DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::UnsupportedRequest,
+                    )),
+                )
+                | (
+                    Rejection::Metadata
+                    | Rejection::Capabilities
+                    | Rejection::ClientInfo
+                    | Rejection::Progress
+                    | Rejection::Version,
+                    DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::InvalidRequest,
+                    )),
+                )
+                | (
+                    Rejection::RequestLimit,
+                    DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::RequestTooLarge,
+                    )),
+                )
+                | (
+                    Rejection::Cancelled,
+                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled)),
+                )
+                | (
+                    Rejection::Revoked,
+                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(
+                        _,
+                    ))),
+                ) => true,
                 _ => false,
             };
-            assert!(expected, "unexpected local disposition for {rejection:?}: {error:?}");
+            assert!(
+                expected,
+                "unexpected local disposition for {rejection:?}: {error:?}"
+            );
             assert_eq!(factories.load(Ordering::SeqCst), 0);
             assert!(client.session.resource_nonce.is_none());
             no_extra(&listener);
@@ -743,15 +980,21 @@ fn discovery_and_extension_share_the_exact_aggregate_payload_budget() {
             let total = discovery_frame.len() + result_frame.len() - usize::from(short);
             let maximum_frame = discovery_frame.len().max(result_frame.len());
             let selected = DpopStreamLimits::new(
-                ManagedCoreLimits::new(
-                    8192, maximum_frame, total, 0, Duration::from_secs(60),
-                ).unwrap(),
+                ManagedCoreLimits::new(8192, maximum_frame, total, 0, Duration::from_secs(60))
+                    .unwrap(),
                 Duration::from_secs(10),
-            ).unwrap();
+            )
+            .unwrap();
             let cancellation = McpRequestCancellation::new();
             let mut proofs = BTreeSet::new();
             let application = client.request_final_extension(
-                &cx, &cancellation, &credential, &configuration, metadata(), operation(1), selected,
+                &cx,
+                &cancellation,
+                &credential,
+                &configuration,
+                metadata(),
+                operation(1),
+                selected,
             );
             let peer = async {
                 for (id, method, payload) in [
@@ -767,8 +1010,12 @@ fn discovery_and_extension_share_the_exact_aggregate_payload_budget() {
             };
             let (outcome, ()) = pair(application, peer).await;
             if short {
-                assert!(matches!(outcome,
-                    Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit)))));
+                assert!(matches!(
+                    outcome,
+                    Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::ResponseByteLimit
+                    )))
+                ));
             } else {
                 assert_result(outcome.unwrap(), &RequestId::String("2".to_owned()));
             }
@@ -793,7 +1040,13 @@ fn dropping_an_extension_stream_releases_the_socket_without_remote_cancellation(
         let mut calls = 0;
         let application = async {
             let mut call = Box::pin(client.request_final_extension_with_events(
-                &cx, &cancellation, &credential, &configuration, metadata(), operation(1), limits(8),
+                &cx,
+                &cancellation,
+                &credential,
+                &configuration,
+                metadata(),
+                operation(1),
+                limits(8),
                 |_| {
                     calls += 1;
                     observed.cancel();
@@ -802,26 +1055,51 @@ fn dropping_an_extension_stream_releases_the_socket_without_remote_cancellation(
             ));
             poll_fn(|task| {
                 assert!(call.as_mut().poll(task).is_pending());
-                if observed.is_cancel_requested() { Poll::Ready(()) } else { Poll::Pending }
-            }).await;
+                if observed.is_cancel_requested() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
             drop(call);
         };
         let peer = async {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = acceptor.accept(socket).await.unwrap();
             let (head, body) = read(&mut socket).await;
-            inspect(&head, &body, &target, "server/discover", &RequestId::Number(1), &mut proofs);
-            json_reply(&mut socket, &frame(&RequestId::Number(1), &discovery().to_string())).await;
+            inspect(
+                &head,
+                &body,
+                &target,
+                "server/discover",
+                &RequestId::Number(1),
+                &mut proofs,
+            );
+            json_reply(
+                &mut socket,
+                &frame(&RequestId::Number(1), &discovery().to_string()),
+            )
+            .await;
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = acceptor.accept(socket).await.unwrap();
             let (head, body) = read(&mut socket).await;
-            inspect(&head, &body, &target, METHOD, &RequestId::String("2".to_owned()), &mut proofs);
+            inspect(
+                &head,
+                &body,
+                &target,
+                METHOD,
+                &RequestId::String("2".to_owned()),
+                &mut proofs,
+            );
             socket.write_all(SSE_HEAD).await.unwrap();
             event(&mut socket, &progress(json!("owned"), "1")).await;
             observed.cancelled().await;
             let mut byte = [0];
-            assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0),
-                "dropping the public future must retire the open response");
+            assert!(
+                !matches!(socket.read(&mut byte).await, Ok(count) if count > 0),
+                "dropping the public future must retire the open response"
+            );
         };
         pair(application, peer).await;
         assert_eq!(calls, 1);
@@ -844,7 +1122,8 @@ fn discovery_and_progress_cannot_refund_the_original_extension_deadline() {
         .blocking_threads(0, 0)
         .with_reactor(create_reactor().unwrap())
         .with_timer_driver(timer.clone())
-        .build().unwrap();
+        .build()
+        .unwrap();
     runtime.block_on(async {
         let cx = Cx::current().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -858,11 +1137,21 @@ fn discovery_and_progress_cannot_refund_the_original_extension_deadline() {
         let selected = DpopStreamLimits::new(
             ManagedCoreLimits::new(8192, 8192, 32768, 8, Duration::from_secs(10)).unwrap(),
             Duration::from_secs(10),
-        ).unwrap();
+        )
+        .unwrap();
         let application = async {
             let mut call = Box::pin(client.request_final_extension_with_events(
-                &cx, &cancellation, &credential, &configuration, metadata(), operation(1), selected,
-                |_| { observed.cancel(); true },
+                &cx,
+                &cancellation,
+                &credential,
+                &configuration,
+                metadata(),
+                operation(1),
+                selected,
+                |_| {
+                    observed.cancel();
+                    true
+                },
             ));
             let mut reached_wait = std::pin::pin!(reached.cancelled());
             poll_fn(|task| {
@@ -870,26 +1159,49 @@ fn discovery_and_progress_cannot_refund_the_original_extension_deadline() {
                 if reached_wait.as_mut().poll(task).is_ready() {
                     // The original ten-second budget, not a restarted budget
                     // at discovery or at the progress frame, must win now.
-                    assert!(matches!(result, Poll::Ready(Err(DpopStreamError::Core(
-                        DpopCoreError::Transport(DpopHttpError::TimedOut))))));
+                    assert!(matches!(
+                        result,
+                        Poll::Ready(Err(DpopStreamError::Core(DpopCoreError::Transport(
+                            DpopHttpError::TimedOut
+                        ))))
+                    ));
                     Poll::Ready(())
                 } else {
                     assert!(result.is_pending());
                     Poll::Pending
                 }
-            }).await;
+            })
+            .await;
         };
         let peer = async {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = acceptor.accept(socket).await.unwrap();
             let (head, body) = read(&mut socket).await;
-            inspect(&head, &body, &target, "server/discover", &RequestId::Number(1), &mut proofs);
+            inspect(
+                &head,
+                &body,
+                &target,
+                "server/discover",
+                &RequestId::Number(1),
+                &mut proofs,
+            );
             clock.advance(6_000_000_000);
-            json_reply(&mut socket, &frame(&RequestId::Number(1), &discovery().to_string())).await;
+            json_reply(
+                &mut socket,
+                &frame(&RequestId::Number(1), &discovery().to_string()),
+            )
+            .await;
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = acceptor.accept(socket).await.unwrap();
             let (head, body) = read(&mut socket).await;
-            inspect(&head, &body, &target, METHOD, &RequestId::String("2".to_owned()), &mut proofs);
+            inspect(
+                &head,
+                &body,
+                &target,
+                METHOD,
+                &RequestId::String("2".to_owned()),
+                &mut proofs,
+            );
             socket.write_all(SSE_HEAD).await.unwrap();
             event(&mut socket, &progress(json!("owned"), "1")).await;
             observed.cancelled().await;
@@ -912,9 +1224,19 @@ fn discovery_and_progress_cannot_refund_the_original_extension_deadline() {
 #[test]
 fn resolver_cancellation_revocation_and_panics_cannot_dispatch_the_extension() {
     #[derive(Clone, Copy)]
-    enum Stop { Cancel, Revoke, Panic, CancelAndPanic }
+    enum Stop {
+        Cancel,
+        Revoke,
+        Panic,
+        CancelAndPanic,
+    }
 
-    for stop in [Stop::Cancel, Stop::Revoke, Stop::Panic, Stop::CancelAndPanic] {
+    for stop in [
+        Stop::Cancel,
+        Stop::Revoke,
+        Stop::Panic,
+        Stop::CancelAndPanic,
+    ] {
         run(async {
             let cx = Cx::current().unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -934,9 +1256,14 @@ fn resolver_cancellation_revocation_and_panics_cannot_dispatch_the_extension() {
             registry.register(other).unwrap();
             let settings = ClientExtensionDiscovery {
                 extensions: BTreeMap::from([
-                    (extension_id(), ExtensionSettings::new(json!({"format":"echo-v1"})).unwrap()),
-                    (ExtensionId::parse(OTHER_EXTENSION).unwrap(),
-                        ExtensionSettings::new(json!({"format":"echo-v1"})).unwrap()),
+                    (
+                        extension_id(),
+                        ExtensionSettings::new(json!({"format":"echo-v1"})).unwrap(),
+                    ),
+                    (
+                        ExtensionId::parse(OTHER_EXTENSION).unwrap(),
+                        ExtensionSettings::new(json!({"format":"echo-v1"})).unwrap(),
+                    ),
                 ]),
             };
             let configuration = DpopExtensionConfiguration::new(registry, settings, move || {
@@ -947,31 +1274,63 @@ fn resolver_cancellation_revocation_and_panics_cannot_dispatch_the_extension() {
                 if matches!(stop, Stop::Revoke) {
                     owner_revocation.revoke();
                 }
-                assert!(!matches!(stop, Stop::Panic | Stop::CancelAndPanic),
-                    "resolver-private-canary");
+                assert!(
+                    !matches!(stop, Stop::Panic | Stop::CancelAndPanic),
+                    "resolver-private-canary"
+                );
                 compatible
-            }).unwrap();
+            })
+            .unwrap();
             let mut proofs = BTreeSet::new();
             let application = client.request_final_extension(
-                &cx, &cancellation, &credential, &configuration, metadata(), operation(1), limits(8),
+                &cx,
+                &cancellation,
+                &credential,
+                &configuration,
+                metadata(),
+                operation(1),
+                limits(8),
             );
             let peer = async {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut socket = acceptor.accept(socket).await.unwrap();
                 let (head, body) = read(&mut socket).await;
-                inspect(&head, &body, &target, "server/discover", &RequestId::Number(1), &mut proofs);
-                json_reply(&mut socket, &frame(&RequestId::Number(1), &discovery().to_string())).await;
+                inspect(
+                    &head,
+                    &body,
+                    &target,
+                    "server/discover",
+                    &RequestId::Number(1),
+                    &mut proofs,
+                );
+                json_reply(
+                    &mut socket,
+                    &frame(&RequestId::Number(1), &discovery().to_string()),
+                )
+                .await;
             };
             let (outcome, ()) = pair(application, peer).await;
-            let error = outcome.err().expect("resolver interruption cannot grant execution authority");
+            let error = outcome
+                .err()
+                .expect("resolver interruption cannot grant execution authority");
             assert!(!format!("{error:?} {error}").contains("canary"));
             match stop {
-                Stop::Cancel | Stop::CancelAndPanic => assert!(matches!(error,
-                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled)))),
-                Stop::Revoke => assert!(matches!(error,
-                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(_))))),
-                Stop::Panic => assert!(matches!(error,
-                    DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::UnsupportedRequest)))),
+                Stop::Cancel | Stop::CancelAndPanic => assert!(matches!(
+                    error,
+                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled))
+                )),
+                Stop::Revoke => assert!(matches!(
+                    error,
+                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(
+                        _
+                    )))
+                )),
+                Stop::Panic => assert!(matches!(
+                    error,
+                    DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::UnsupportedRequest
+                    ))
+                )),
             }
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(proofs.len(), 1);

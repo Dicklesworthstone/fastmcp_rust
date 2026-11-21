@@ -3024,7 +3024,10 @@ fn assert_http_operation_timeout(resume: Option<(&str, &str)>) {
             assert_eq!(request["method"], "tools/call");
             if resuming {
                 assert_eq!(request["params"]["requestState"], "timeout-resume");
-                assert_eq!(request["params"]["inputResponses"], serde_json::json!({"roots": {"roots": []}}));
+                assert_eq!(
+                    request["params"]["inputResponses"],
+                    serde_json::json!({"roots": {"roots": []}})
+                );
             }
             observed.fetch_add(1, Ordering::SeqCst);
             expect_h1_fixture_reset(&mut stream, deadline, "timed out HTTP stream must close");
@@ -3056,7 +3059,12 @@ fn assert_http_operation_timeout(resume: Option<(&str, &str)>) {
         "1",
     ]);
     if let Some((result_path, responses_path)) = resume {
-        command.args(["--resume-result-file", result_path, "--input-responses-file", responses_path]);
+        command.args([
+            "--resume-result-file",
+            result_path,
+            "--input-responses-file",
+            responses_path,
+        ]);
     }
     let output = run_with_deadline(command, Duration::from_secs(6)).unwrap_or_else(|expired| {
         panic!(

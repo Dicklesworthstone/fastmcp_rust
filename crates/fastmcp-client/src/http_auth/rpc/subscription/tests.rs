@@ -295,10 +295,23 @@ fn cancellation_requires_both_exact_owning_ids_and_retains_byte_bounds() {
     for bad in [
         notification(json!(8), "notifications/cancelled", json!({"requestId":7})),
         notification(json!(7), "notifications/cancelled", json!({"requestId":8})),
-        notification(json!("7"), "notifications/cancelled", json!({"requestId":7})),
-        notification(json!(7), "notifications/cancelled", json!({"requestId":"7"})),
-        br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#.to_vec(),
-        notification(Value::Null, "notifications/cancelled", json!({"requestId":7})),
+        notification(
+            json!("7"),
+            "notifications/cancelled",
+            json!({"requestId":7}),
+        ),
+        notification(
+            json!(7),
+            "notifications/cancelled",
+            json!({"requestId":"7"}),
+        ),
+        br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#
+            .to_vec(),
+        notification(
+            Value::Null,
+            "notifications/cancelled",
+            json!({"requestId":7}),
+        ),
     ] {
         let mut state = decoder(json!({}));
         state.admit(&ack(json!(7), json!({}))).unwrap();
@@ -311,7 +324,10 @@ fn cancellation_requires_both_exact_owning_ids_and_retains_byte_bounds() {
     state.admit(&ack(json!(7), json!({}))).unwrap();
     state.limits.total_bytes = state.bytes + good.len() - 1;
     let before = snapshot(&state);
-    assert!(matches!(state.admit(&good), Err(ManagedCoreError::ResponseByteLimit)));
+    assert!(matches!(
+        state.admit(&good),
+        Err(ManagedCoreError::ResponseByteLimit)
+    ));
     assert_eq!(snapshot(&state), before);
     state.limits.total_bytes += 1;
     assert!(state.admit(&good).is_ok());

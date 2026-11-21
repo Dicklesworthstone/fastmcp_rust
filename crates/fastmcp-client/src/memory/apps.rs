@@ -14,14 +14,13 @@ use serde_json::Value;
 use super::{
     MemoryClient, MemoryClientBuilder, MemoryRequestEvent, SEND_ADMISSION_TIMEOUT, checkpoint,
 };
+use crate::McpAppsClientSettings;
 use crate::mcp_apps::{
     McpAppsActivationProof, McpAppsBridgeTransport, McpAppsHost, McpAppsHostConfiguration,
-    McpAppsHostError, McpAppsHostPolicy, McpAppsServerInputClient,
-    McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
-    McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
-    dispatch_apps_server_input, project_reused_core_result,
+    McpAppsHostError, McpAppsHostPolicy, McpAppsServerInputClient, McpAppsWireBridgeTransport,
+    McpAppsWireHost, McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
+    McpAppsWireHostPolicy, dispatch_apps_server_input, project_reused_core_result,
 };
-use crate::McpAppsClientSettings;
 
 /// Forwards one negotiated Apps View through an existing memory client.
 ///
@@ -52,18 +51,14 @@ impl MemoryClient {
     /// Reports live bilateral Apps activation on this exact connection.
     #[must_use]
     pub fn mcp_apps_active(&self) -> bool {
-        !self.closed
-            && self.executor.terminal_error().is_none()
-            && self.session.mcp_apps_active()
+        !self.closed && self.executor.terminal_error().is_none() && self.session.mcp_apps_active()
     }
 
     fn apps_activation_proof(&self) -> Result<McpAppsActivationProof, McpAppsHostError> {
         if !self.mcp_apps_active() {
             return Err(McpAppsHostError::NotNegotiated);
         }
-        McpAppsActivationProof::from_activation_receipt(
-            self.session.mcp_apps_activation_receipt(),
-        )
+        McpAppsActivationProof::from_activation_receipt(self.session.mcp_apps_activation_receipt())
     }
 
     /// Starts a typed Apps Host with explicit embedder forwarding and consent.
@@ -148,7 +143,9 @@ impl MemoryClient {
     ) -> McpResult<CoreResult> {
         crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
         if !self.mcp_apps_active() {
-            return Err(McpError::invalid_request("Apps memory connection is inactive"));
+            return Err(McpError::invalid_request(
+                "Apps memory connection is inactive",
+            ));
         }
         // Keep single-request execution here. The Apps Host, rather than the
         // client's installed general MRTR handlers, owns this View's consent.
@@ -183,11 +180,7 @@ impl MemoryClient {
 }
 
 impl McpAppsServerInputClient for MemoryClient {
-    fn prepare_apps_server_input(
-        &self,
-        cx: &Cx,
-        parameters: Value,
-    ) -> McpResult<(Instant, Value)> {
+    fn prepare_apps_server_input(&self, cx: &Cx, parameters: Value) -> McpResult<(Instant, Value)> {
         if !self.mcp_apps_active() {
             return Err(McpError::invalid_request(
                 "MCP Apps reused methods require the current bilateral activation receipt",
@@ -212,17 +205,12 @@ impl McpAppsServerInputClient for MemoryClient {
             #[cfg(feature = "tasks")]
             self.admit_apps_tasks()?;
             #[cfg(not(feature = "tasks"))]
-            return Err(McpError::invalid_params("Apps Tasks support is not enabled"));
+            return Err(McpError::invalid_params(
+                "Apps Tasks support is not enabled",
+            ));
         }
-        self.request_apps_core_prepared(
-            cx,
-            cancellation,
-            deadline,
-            method,
-            parameters,
-            allow_tasks,
-        )
-        .await
+        self.request_apps_core_prepared(cx, cancellation, deadline, method, parameters, allow_tasks)
+            .await
     }
 
     #[cfg(feature = "tasks")]
@@ -232,11 +220,9 @@ impl McpAppsServerInputClient for MemoryClient {
                 "Apps Tasks requires explicit memory Tasks opt-in and negotiation",
             ));
         }
-        crate::mcp_apps::admit_apps_task_discovery(
-            self.session.server_discovery().ok_or_else(|| {
-                McpError::invalid_request("Apps server Tasks require current discovery")
-            })?,
-        )
+        crate::mcp_apps::admit_apps_task_discovery(self.session.server_discovery().ok_or_else(
+            || McpError::invalid_request("Apps server Tasks require current discovery"),
+        )?)
     }
 
     #[cfg(feature = "tasks")]
@@ -263,7 +249,8 @@ impl McpAppsServerInputClient for MemoryClient {
         responses: crate::FinalTaskInputResponses,
     ) -> McpResult<()> {
         crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
-        self.update_task_final(cx, cancellation, task, responses).await?;
+        self.update_task_final(cx, cancellation, task, responses)
+            .await?;
         crate::check_mrtr_operation(cx, Some(cancellation), deadline)
     }
 }
@@ -317,14 +304,8 @@ impl McpAppsWireHostPolicy for McpAppsMemoryClientWirePolicy<'_> {
         method: McpAppsRoutedMethod,
         parameters: Option<Value>,
     ) -> Result<Value, McpAppsHostError> {
-        self.dispatch_reused_request_with_effects(
-            cx,
-            cancellation,
-            method,
-            parameters,
-            &mut (),
-        )
-        .await
+        self.dispatch_reused_request_with_effects(cx, cancellation, method, parameters, &mut ())
+            .await
     }
 
     async fn dispatch_reused_request_with_effects<E: McpAppsWireHostEffects>(
@@ -341,7 +322,12 @@ impl McpAppsWireHostPolicy for McpAppsMemoryClientWirePolicy<'_> {
             McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
         ) {
             return dispatch_apps_server_input(
-                self.client, cx, cancellation, method, parameters, effects,
+                self.client,
+                cx,
+                cancellation,
+                method,
+                parameters,
+                effects,
             )
             .await;
         }
@@ -351,10 +337,9 @@ impl McpAppsWireHostPolicy for McpAppsMemoryClientWirePolicy<'_> {
             McpAppsRoutedMethod::PromptsList => "prompts/list",
             _ => return Err(McpError::invalid_params("Unsupported Apps reused method").into()),
         };
-        let (deadline, parameters) = self.client.prepare_apps_server_input(
-            cx,
-            parameters.unwrap_or_else(|| serde_json::json!({})),
-        )?;
+        let (deadline, parameters) = self
+            .client
+            .prepare_apps_server_input(cx, parameters.unwrap_or_else(|| serde_json::json!({})))?;
         let result = crate::wait_for_mrtr_operation(
             cx,
             Some(cancellation),
@@ -391,17 +376,17 @@ mod tests {
     use fastmcp_protocol::{
         ClientCapabilities, ClientInfo, FinalCoreResult, JsonRpcMessage, JsonRpcRequest,
         JsonRpcResponse, MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeImplementation,
-        McpAppsBridgeLifecycle, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext,
-        RequestId, SamplingCapability,
+        McpAppsBridgeLifecycle, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext, RequestId,
+        SamplingCapability,
     };
     use fastmcp_transport::memory::{MemoryTransport, create_memory_transport_pair_with_capacity};
     use serde_json::json;
 
     use super::*;
+    use crate::ReverseRequestHandlers;
     use crate::mcp_apps::{
         McpAppsCatalogBinding, McpAppsInMemoryWireViewTransport, mcp_apps_in_memory_wire_pair,
     };
-    use crate::ReverseRequestHandlers;
 
     const APPS: &str = fastmcp_protocol::extensions::OFFICIAL_MCP_APPS_EXTENSION_ID;
     const CAPS: &str = crate::FINAL_CLIENT_CAPABILITIES_META_KEY;
@@ -495,9 +480,13 @@ mod tests {
         method: &str,
         params: Value,
     ) {
-        view.send_to_host(cx, json!({
-            "jsonrpc": "2.0", "id": id, "method": method, "params": params,
-        }).to_string())
+        view.send_to_host(
+            cx,
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+            })
+            .to_string(),
+        )
         .await
         .unwrap();
     }
@@ -511,16 +500,26 @@ mod tests {
         view: &mut McpAppsInMemoryWireViewTransport,
         cx: &Cx,
     ) {
-        enqueue(view, cx, "initialize", "ui/initialize", json!({
-            "appInfo": {"name": "view", "version": "1"}, "appCapabilities": {},
-            "protocolVersion": MCP_APPS_HOST_VIEW_PROTOCOL_VERSION,
-        }))
+        enqueue(
+            view,
+            cx,
+            "initialize",
+            "ui/initialize",
+            json!({
+                "appInfo": {"name": "view", "version": "1"}, "appCapabilities": {},
+                "protocolVersion": MCP_APPS_HOST_VIEW_PROTOCOL_VERSION,
+            }),
+        )
         .await;
         host.process_next(cx).await.unwrap();
         assert!(view_response(view, cx).await.get("result").is_some());
-        view.send_to_host(cx, json!({
-            "jsonrpc": "2.0", "method": "ui/notifications/initialized",
-        }).to_string())
+        view.send_to_host(
+            cx,
+            json!({
+                "jsonrpc": "2.0", "method": "ui/notifications/initialized",
+            })
+            .to_string(),
+        )
         .await
         .unwrap();
         host.process_next(cx).await.unwrap();
@@ -543,10 +542,14 @@ mod tests {
     }
 
     async fn cancel_view(view: &mut McpAppsInMemoryWireViewTransport, cx: &Cx, id: &str) {
-        view.send_to_host(cx, json!({
-            "jsonrpc": "2.0", "method": "notifications/cancelled",
-            "params": {"requestId": id},
-        }).to_string())
+        view.send_to_host(
+            cx,
+            json!({
+                "jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"requestId": id},
+            })
+            .to_string(),
+        )
         .await
         .unwrap();
     }
@@ -595,7 +598,10 @@ mod tests {
         calls: Arc<Mutex<Vec<Value>>>,
     }
 
-    #[allow(clippy::unused_async_trait_impl, reason = "public async Host consent callback")]
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "public async Host consent callback"
+    )]
     impl McpAppsWireHostEffects for InputEffects {
         async fn resolve_server_input(
             &mut self,
@@ -606,10 +612,18 @@ mod tests {
             required: &fastmcp_protocol::InputRequiredResult,
         ) -> Result<fastmcp_protocol::FinalInputResponses, McpAppsHostError> {
             checkpoint(cx, cancellation)?;
-            assert!(matches!(method, McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead));
-            self.calls.lock().unwrap().push(json!({"params": params, "state": required.request_state()}));
+            assert!(matches!(
+                method,
+                McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
+            ));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(json!({"params": params, "state": required.request_state()}));
             if !self.allowed {
-                return Err(McpError::invalid_request("This View did not grant input consent").into());
+                return Err(
+                    McpError::invalid_request("This View did not grant input consent").into(),
+                );
             }
             Ok(serde_json::from_value(input_response()).unwrap())
         }
@@ -619,27 +633,49 @@ mod tests {
     fn memory_apps_requires_bilateral_receipt_and_keeps_incompatible_peer_core_usable() {
         run(|cx| async move {
             for (mime, extensions, active) in [
-                (fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE, json!({(APPS): {}}), true),
+                (
+                    fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                    json!({(APPS): {}}),
+                    true,
+                ),
                 (fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE, json!({}), false),
                 ("application/json", json!({(APPS): {}}), false),
-                (fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE, json!({(APPS): {"unexpected": true}}), false),
+                (
+                    fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                    json!({(APPS): {"unexpected": true}}),
+                    false,
+                ),
             ] {
-                let (mut client, mut peer, discovery) = connect(
-                    &cx, builder().mcp_apps(settings(mime)), extensions, 1,
-                ).await;
-                assert_eq!(discovery.params.unwrap()["_meta"][CAPS]["extensions"][APPS],
-                    json!({"mimeTypes": [mime]}));
+                let (mut client, mut peer, discovery) =
+                    connect(&cx, builder().mcp_apps(settings(mime)), extensions, 1).await;
+                assert_eq!(
+                    discovery.params.unwrap()["_meta"][CAPS]["extensions"][APPS],
+                    json!({"mimeTypes": [mime]})
+                );
                 assert_eq!(client.mcp_apps_active(), active);
                 let (transport, _view) = mcp_apps_in_memory_wire_pair(1);
-                assert_eq!(client.mcp_apps_wire_host(&cx, transport, configuration()).is_ok(), active);
+                assert_eq!(
+                    client
+                        .mcp_apps_wire_host(&cx, transport, configuration())
+                        .is_ok(),
+                    active
+                );
                 respond(&mut peer, &cx, 2, tools()).await;
                 assert!(matches!(
-                    client.list_tools(&cx, &McpRequestCancellation::new(), None).await.unwrap(),
+                    client
+                        .list_tools(&cx, &McpRequestCancellation::new(), None)
+                        .await
+                        .unwrap(),
                     CoreResult::Final(FinalCoreResult::ToolsList { .. }),
                 ));
                 let ordinary = next_request(&mut peer, &cx).await;
                 assert_eq!(ordinary.id, Some(RequestId::Number(2)));
-                assert_eq!(ordinary.params.unwrap()["_meta"][CAPS]["extensions"].get(APPS).is_some(), active);
+                assert_eq!(
+                    ordinary.params.unwrap()["_meta"][CAPS]["extensions"]
+                        .get(APPS)
+                        .is_some(),
+                    active
+                );
                 client.close(&cx).unwrap();
                 assert!(!client.mcp_apps_active());
                 let (transport, _view) = mcp_apps_in_memory_wire_pair(1);
@@ -650,14 +686,28 @@ mod tests {
             }
             let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
             let raw = ClientCapabilities {
-                extensions: Some(BTreeMap::from([(APPS.to_owned(), json!({
-                    "mimeTypes": [fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE],
-                }))])),
+                extensions: Some(BTreeMap::from([(
+                    APPS.to_owned(),
+                    json!({
+                        "mimeTypes": [fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE],
+                    }),
+                )])),
                 ..ClientCapabilities::default()
             };
-            assert!(MemoryClient::builder(ClientInfo { name: "raw".into(), version: "1".into() })
-                .capabilities(raw).connect(&cx, transport).await.is_err());
-            assert!(peer.recv_async(&cx).await.is_err(), "raw advertisement cannot publish discovery or mint authority");
+            assert!(
+                MemoryClient::builder(ClientInfo {
+                    name: "raw".into(),
+                    version: "1".into()
+                })
+                .capabilities(raw)
+                .connect(&cx, transport)
+                .await
+                .is_err()
+            );
+            assert!(
+                peer.recv_async(&cx).await.is_err(),
+                "raw advertisement cannot publish discovery or mint authority"
+            );
         });
     }
 
@@ -665,28 +715,56 @@ mod tests {
     fn memory_apps_generic_registry_owns_settings_and_cannot_fall_back_to_dedicated_html() {
         run(|cx| async move {
             for (generic_mime, dedicated_mime, active) in [
-                (fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE, "application/json", true),
-                ("application/json", fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE, false),
+                (
+                    fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                    "application/json",
+                    true,
+                ),
+                (
+                    "application/json",
+                    fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                    false,
+                ),
             ] {
                 let mut descriptors = ExtensionDescriptorRegistry::new();
                 let id = register_official_mcp_apps_extension(&mut descriptors).unwrap();
-                let configured = builder().mcp_apps(settings(dedicated_mime)).extension_registry(
-                    descriptors,
-                    ClientExtensionDiscovery {
-                        extensions: BTreeMap::from([(id, settings(generic_mime).to_extension_settings())]),
-                    },
-                    official_mcp_apps_negotiation_resolver,
-                ).unwrap();
-                let (mut client, mut peer, discovery) = connect(&cx, configured, json!({(APPS): {}}), 1).await;
-                assert_eq!(discovery.params.unwrap()["_meta"][CAPS]["extensions"][APPS],
-                    json!({"mimeTypes": [generic_mime]}));
+                let configured = builder()
+                    .mcp_apps(settings(dedicated_mime))
+                    .extension_registry(
+                        descriptors,
+                        ClientExtensionDiscovery {
+                            extensions: BTreeMap::from([(
+                                id,
+                                settings(generic_mime).to_extension_settings(),
+                            )]),
+                        },
+                        official_mcp_apps_negotiation_resolver,
+                    )
+                    .unwrap();
+                let (mut client, mut peer, discovery) =
+                    connect(&cx, configured, json!({(APPS): {}}), 1).await;
+                assert_eq!(
+                    discovery.params.unwrap()["_meta"][CAPS]["extensions"][APPS],
+                    json!({"mimeTypes": [generic_mime]})
+                );
                 assert_eq!(client.mcp_apps_active(), active);
                 let (transport, _view) = mcp_apps_in_memory_wire_pair(1);
-                assert_eq!(client.mcp_apps_wire_host(&cx, transport, configuration()).is_ok(), active);
+                assert_eq!(
+                    client
+                        .mcp_apps_wire_host(&cx, transport, configuration())
+                        .is_ok(),
+                    active
+                );
                 respond(&mut peer, &cx, 2, tools()).await;
-                client.list_tools(&cx, &McpRequestCancellation::new(), None).await.unwrap();
-                assert_eq!(next_request(&mut peer, &cx).await.params.unwrap()["_meta"][CAPS]["extensions"][APPS],
-                    json!({"mimeTypes": [generic_mime]}));
+                client
+                    .list_tools(&cx, &McpRequestCancellation::new(), None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    next_request(&mut peer, &cx).await.params.unwrap()["_meta"][CAPS]["extensions"]
+                        [APPS],
+                    json!({"mimeTypes": [generic_mime]})
+                );
                 client.close(&cx).unwrap();
             }
         });
@@ -697,12 +775,21 @@ mod tests {
         run(|cx| async move {
             let (mut client, mut peer, _) = connect(&cx, builder(), json!({(APPS): {}}), 2).await;
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-            let mut host = client.mcp_apps_wire_host(&cx, transport, configuration()).unwrap();
-            host.bind_server_catalogs(McpAppsCatalogBinding {
-                view_id: "view".into(), resource_uri: "ui://view".into(),
-                origin: "https://view.example".into(), principal_id: "owner".into(),
-                server_id: "memory-peer".into(), revision: "one".into(),
-            }, true).unwrap();
+            let mut host = client
+                .mcp_apps_wire_host(&cx, transport, configuration())
+                .unwrap();
+            host.bind_server_catalogs(
+                McpAppsCatalogBinding {
+                    view_id: "view".into(),
+                    resource_uri: "ui://view".into(),
+                    origin: "https://view.example".into(),
+                    principal_id: "owner".into(),
+                    server_id: "memory-peer".into(),
+                    revision: "one".into(),
+                },
+                true,
+            )
+            .unwrap();
             activate(&mut host, &mut view, &cx).await;
             for (offset, (method, params, payload)) in [
                 ("tools/call", json!({"name": "ordinary"}), json!({"content": [{"type": "text", "text": "ordinary"}]})),
@@ -742,7 +829,10 @@ mod tests {
             }
             drop(host);
             client.close(&cx).unwrap();
-            assert!(peer.recv_async(&cx).await.is_err(), "no Apps envelope or extra core request");
+            assert!(
+                peer.recv_async(&cx).await.is_err(),
+                "no Apps envelope or extra core request"
+            );
         });
     }
 
@@ -814,32 +904,60 @@ mod tests {
                 let handlers = ReverseRequestHandlers::new().with_modern_sampling_create_message(
                     move |_, _, _| {
                         observed.fetch_add(1, Ordering::AcqRel);
-                        Box::pin(async { Err(McpError::internal_error("connection consent cannot authorize this View")) })
+                        Box::pin(async {
+                            Err(McpError::internal_error(
+                                "connection consent cannot authorize this View",
+                            ))
+                        })
                     },
                 );
                 let (mut client, mut peer, _) = connect(
-                    &cx, builder().reverse_request_handlers(handlers), json!({(APPS): {}}), 4,
-                ).await;
+                    &cx,
+                    builder().reverse_request_handlers(handlers),
+                    json!({(APPS): {}}),
+                    4,
+                )
+                .await;
                 let calls = Arc::new(Mutex::new(Vec::new()));
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-                let mut host = client.mcp_apps_wire_host(&cx, transport, configuration()).unwrap()
-                    .with_effects(InputEffects { allowed, calls: Arc::clone(&calls) });
+                let mut host = client
+                    .mcp_apps_wire_host(&cx, transport, configuration())
+                    .unwrap()
+                    .with_effects(InputEffects {
+                        allowed,
+                        calls: Arc::clone(&calls),
+                    });
                 activate(&mut host, &mut view, &cx).await;
                 respond(&mut peer, &cx, 2, callable_tools(&["interactive"])).await;
                 respond(&mut peer, &cx, 3, input_required("private-server-state")).await;
                 if allowed {
                     respond(&mut peer, &cx, 4, complete("Host approved")).await;
                 }
-                let original = json!({"name": "interactive", "arguments": {"value": "résumé 東京"}});
-                let response = request(&mut host, &mut view, &cx, "view-input", "tools/call", original.clone()).await;
+                let original =
+                    json!({"name": "interactive", "arguments": {"value": "résumé 東京"}});
+                let response = request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "view-input",
+                    "tools/call",
+                    original.clone(),
+                )
+                .await;
                 assert_eq!(response.get("result").is_some(), allowed);
                 assert_eq!(response.get("error").is_some(), !allowed);
                 assert!(!response.to_string().contains("private-server-state"));
-                assert_eq!(calls.lock().unwrap().as_slice(), &[json!({
-                    "params": original, "state": "private-server-state",
-                })]);
+                assert_eq!(
+                    calls.lock().unwrap().as_slice(),
+                    &[json!({
+                        "params": original, "state": "private-server-state",
+                    })]
+                );
                 assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
-                assert_eq!(next_request(&mut peer, &cx).await.id, Some(RequestId::Number(3)));
+                assert_eq!(
+                    next_request(&mut peer, &cx).await.id,
+                    Some(RequestId::Number(3))
+                );
                 if allowed {
                     let continuation = next_request(&mut peer, &cx).await;
                     assert_eq!(continuation.id, Some(RequestId::Number(4)));
@@ -852,17 +970,53 @@ mod tests {
                 // Replacing effects removes the earlier Host approval too.
                 let mut host = host.with_effects(());
                 let refused_id = if allowed { 6 } else { 5 };
-                respond(&mut peer, &cx, refused_id - 1, callable_tools(&["interactive"])).await;
-                respond(&mut peer, &cx, refused_id, input_required("default-refuses")).await;
-                assert!(request(&mut host, &mut view, &cx, "view-input", "tools/call", original)
-                    .await.get("error").is_some());
+                respond(
+                    &mut peer,
+                    &cx,
+                    refused_id - 1,
+                    callable_tools(&["interactive"]),
+                )
+                .await;
+                respond(
+                    &mut peer,
+                    &cx,
+                    refused_id,
+                    input_required("default-refuses"),
+                )
+                .await;
+                assert!(
+                    request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "view-input",
+                        "tools/call",
+                        original
+                    )
+                    .await
+                    .get("error")
+                    .is_some()
+                );
                 assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
-                assert_eq!(next_request(&mut peer, &cx).await.id, Some(RequestId::Number(refused_id)));
+                assert_eq!(
+                    next_request(&mut peer, &cx).await.id,
+                    Some(RequestId::Number(refused_id))
+                );
                 let healthy_id = refused_id + 2;
                 respond(&mut peer, &cx, healthy_id - 1, callable_tools(&["healthy"])).await;
                 respond(&mut peer, &cx, healthy_id, complete("healthy")).await;
-                assert_eq!(request(&mut host, &mut view, &cx, "healthy", "tools/call", json!({"name": "healthy"}))
-                    .await["result"]["content"][0]["text"], "healthy");
+                assert_eq!(
+                    request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "healthy",
+                        "tools/call",
+                        json!({"name": "healthy"})
+                    )
+                    .await["result"]["content"][0]["text"],
+                    "healthy"
+                );
                 assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                 let healthy = next_request(&mut peer, &cx).await;
                 assert_eq!(healthy.id, Some(RequestId::Number(healthy_id)));
@@ -870,7 +1024,10 @@ mod tests {
                 assert_eq!(connection_calls.load(Ordering::Acquire), 0);
                 drop(host);
                 client.close(&cx).unwrap();
-                assert!(peer.recv_async(&cx).await.is_err(), "refusal never queues an unauthorized continuation");
+                assert!(
+                    peer.recv_async(&cx).await.is_err(),
+                    "refusal never queues an unauthorized continuation"
+                );
             }
         });
     }
@@ -1131,7 +1288,8 @@ mod tests {
                     value["inputRequests"] = input_required("unused")["inputRequests"].clone();
                 }
                 "completed" => {
-                    value["result"] = json!({"content": [{"type": "text", "text": "Task completed"}]});
+                    value["result"] =
+                        json!({"content": [{"type": "text", "text": "Task completed"}]});
                 }
                 _ => {}
             }
@@ -1144,7 +1302,10 @@ mod tests {
             snapshots: Arc<AtomicUsize>,
         }
 
-        #[allow(clippy::unused_async_trait_impl, reason = "public async Host consent callbacks")]
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "public async Host consent callbacks"
+        )]
         impl McpAppsWireHostEffects for TaskEffects {
             async fn server_task_policy(
                 &mut self,
@@ -1157,7 +1318,9 @@ mod tests {
                     return Ok(None);
                 }
                 Ok(Some(McpAppsServerTaskPolicy::new(
-                    Duration::from_millis(1), 8, 64 * 1024,
+                    Duration::from_millis(1),
+                    8,
+                    64 * 1024,
                 )?))
             }
 
@@ -1183,7 +1346,9 @@ mod tests {
                 params: &Value,
                 required: &fastmcp_protocol::InputRequiredResult,
             ) -> Result<fastmcp_protocol::FinalInputResponses, McpAppsHostError> {
-                self.input.resolve_server_input(cx, cancellation, method, params, required).await
+                self.input
+                    .resolve_server_input(cx, cancellation, method, params, required)
+                    .await
             }
         }
 
@@ -1191,17 +1356,26 @@ mod tests {
         fn memory_apps_composes_mrtr_task_input_update_and_private_terminal_projection() {
             run(|cx| async move {
                 let (mut client, mut peer, _) = connect(
-                    &cx, builder().with_tasks(), json!({(APPS): {}, (TASKS): {}}), 8,
-                ).await;
+                    &cx,
+                    builder().with_tasks(),
+                    json!({(APPS): {}, (TASKS): {}}),
+                    8,
+                )
+                .await;
                 let calls = Arc::new(Mutex::new(Vec::new()));
                 let snapshots = Arc::new(AtomicUsize::new(0));
                 let effects = TaskEffects {
                     creation: true,
-                    input: InputEffects { allowed: true, calls: Arc::clone(&calls) },
+                    input: InputEffects {
+                        allowed: true,
+                        calls: Arc::clone(&calls),
+                    },
                     snapshots: Arc::clone(&snapshots),
                 };
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-                let mut host = client.mcp_apps_wire_host(&cx, transport, configuration()).unwrap()
+                let mut host = client
+                    .mcp_apps_wire_host(&cx, transport, configuration())
+                    .unwrap()
                     .with_effects(effects);
                 activate(&mut host, &mut view, &cx).await;
                 for (id, result) in [
@@ -1215,24 +1389,54 @@ mod tests {
                     respond(&mut peer, &cx, id, result).await;
                 }
                 let original = json!({"name": "job", "arguments": {"value": 7}});
-                let response = request(&mut host, &mut view, &cx, "view-task", "tools/call", original.clone()).await;
-                assert_eq!(response["result"],
-                    json!({"content": [{"type": "text", "text": "Task completed"}]}));
+                let response = request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "view-task",
+                    "tools/call",
+                    original.clone(),
+                )
+                .await;
+                assert_eq!(
+                    response["result"],
+                    json!({"content": [{"type": "text", "text": "Task completed"}]})
+                );
                 for private in [
-                    "private-server-task", "before-task-private-state", "inputResponses", "Host-private",
+                    "private-server-task",
+                    "before-task-private-state",
+                    "inputResponses",
+                    "Host-private",
                 ] {
                     assert!(!response.to_string().contains(private));
                 }
-                assert_eq!(calls.lock().unwrap().len(), 2, "one ordinary MRTR round and one Task input round");
-                assert!(calls.lock().unwrap().iter().all(|call| call["params"] == original));
+                assert_eq!(
+                    calls.lock().unwrap().len(),
+                    2,
+                    "one ordinary MRTR round and one Task input round"
+                );
+                assert!(
+                    calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|call| call["params"] == original)
+                );
                 assert!(snapshots.load(Ordering::Acquire) > 0);
                 let catalog = next_request(&mut peer, &cx).await;
                 assert_eq!(catalog.id, Some(RequestId::Number(2)));
                 assert_eq!(catalog.method, "tools/list");
-                assert!(catalog.params.unwrap()["_meta"][CAPS]["extensions"].get(TASKS).is_none());
+                assert!(
+                    catalog.params.unwrap()["_meta"][CAPS]["extensions"]
+                        .get(TASKS)
+                        .is_none()
+                );
                 for (id, method) in [
-                    (3, "tools/call"), (4, "tools/call"), (5, "tasks/get"),
-                    (6, "tasks/update"), (7, "tasks/get"),
+                    (3, "tools/call"),
+                    (4, "tools/call"),
+                    (5, "tasks/get"),
+                    (6, "tasks/update"),
+                    (7, "tasks/get"),
                 ] {
                     let forwarded = next_request(&mut peer, &cx).await;
                     assert_eq!(forwarded.id, Some(RequestId::Number(id)));
@@ -1255,16 +1459,33 @@ mod tests {
                 let mut host = host.with_effects(());
                 respond(&mut peer, &cx, 8, callable_tools(&["job"])).await;
                 respond(&mut peer, &cx, 9, complete("ordinary")).await;
-                assert_eq!(request(&mut host, &mut view, &cx, "view-task", "tools/call", original)
-                    .await["result"]["content"][0]["text"], "ordinary");
+                assert_eq!(
+                    request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "view-task",
+                        "tools/call",
+                        original
+                    )
+                    .await["result"]["content"][0]["text"],
+                    "ordinary"
+                );
                 assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                 let ordinary = next_request(&mut peer, &cx).await;
                 assert_eq!(ordinary.id, Some(RequestId::Number(9)));
-                assert!(ordinary.params.unwrap()["_meta"][CAPS]["extensions"].get(TASKS).is_none(),
-                    "new effects ownership cannot retain prior Task creation consent");
+                assert!(
+                    ordinary.params.unwrap()["_meta"][CAPS]["extensions"]
+                        .get(TASKS)
+                        .is_none(),
+                    "new effects ownership cannot retain prior Task creation consent"
+                );
                 drop(host);
                 client.close(&cx).unwrap();
-                assert!(peer.recv_async(&cx).await.is_err(), "observation never implies remote Task cancellation");
+                assert!(
+                    peer.recv_async(&cx).await.is_err(),
+                    "observation never implies remote Task cancellation"
+                );
             });
         }
 
@@ -1272,46 +1493,82 @@ mod tests {
         fn memory_apps_tasks_require_both_client_opt_in_and_per_view_creation_consent() {
             run(|cx| async move {
                 for (configured, creation) in [(false, true), (true, false)] {
-                    let selected = if configured { builder().with_tasks() } else { builder() };
-                    let (mut client, mut peer, _) = connect(
-                        &cx, selected, json!({(APPS): {}, (TASKS): {}}), 4,
-                    ).await;
+                    let selected = if configured {
+                        builder().with_tasks()
+                    } else {
+                        builder()
+                    };
+                    let (mut client, mut peer, _) =
+                        connect(&cx, selected, json!({(APPS): {}, (TASKS): {}}), 4).await;
                     let calls = Arc::new(Mutex::new(Vec::new()));
                     let snapshots = Arc::new(AtomicUsize::new(0));
                     let effects = TaskEffects {
                         creation,
-                        input: InputEffects { allowed: true, calls: Arc::clone(&calls) },
+                        input: InputEffects {
+                            allowed: true,
+                            calls: Arc::clone(&calls),
+                        },
                         snapshots: Arc::clone(&snapshots),
                     };
                     let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-                    let mut host = client.mcp_apps_wire_host(&cx, transport, configuration()).unwrap()
+                    let mut host = client
+                        .mcp_apps_wire_host(&cx, transport, configuration())
+                        .unwrap()
                         .with_effects(effects);
                     activate(&mut host, &mut view, &cx).await;
                     respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
                     if configured {
                         respond(&mut peer, &cx, 3, snapshot("working", true)).await;
                     }
-                    assert!(request(&mut host, &mut view, &cx, "refused-task", "tools/call", json!({"name": "job"}))
-                        .await.get("error").is_some());
+                    assert!(
+                        request(
+                            &mut host,
+                            &mut view,
+                            &cx,
+                            "refused-task",
+                            "tools/call",
+                            json!({"name": "job"})
+                        )
+                        .await
+                        .get("error")
+                        .is_some()
+                    );
                     assert_eq!(snapshots.load(Ordering::Acquire), 0);
                     assert!(calls.lock().unwrap().is_empty());
                     assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                     let healthy_id = if configured {
                         let unapproved = next_request(&mut peer, &cx).await;
                         assert_eq!(unapproved.id, Some(RequestId::Number(3)));
-                        assert!(unapproved.params.unwrap()["_meta"][CAPS]["extensions"].get(TASKS).is_none());
+                        assert!(
+                            unapproved.params.unwrap()["_meta"][CAPS]["extensions"]
+                                .get(TASKS)
+                                .is_none()
+                        );
                         5
                     } else {
                         4
                     };
                     respond(&mut peer, &cx, healthy_id - 1, callable_tools(&["healthy"])).await;
                     respond(&mut peer, &cx, healthy_id, complete("healthy")).await;
-                    assert_eq!(request(&mut host, &mut view, &cx, "healthy", "tools/call", json!({"name": "healthy"}))
-                        .await["result"]["content"][0]["text"], "healthy");
+                    assert_eq!(
+                        request(
+                            &mut host,
+                            &mut view,
+                            &cx,
+                            "healthy",
+                            "tools/call",
+                            json!({"name": "healthy"})
+                        )
+                        .await["result"]["content"][0]["text"],
+                        "healthy"
+                    );
                     assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                     let healthy = next_request(&mut peer, &cx).await;
                     assert_eq!(healthy.id, Some(RequestId::Number(healthy_id)));
-                    assert_eq!(healthy.method, "tools/call", "no unapproved Task lifecycle request");
+                    assert_eq!(
+                        healthy.method, "tools/call",
+                        "no unapproved Task lifecycle request"
+                    );
                     drop(host);
                     client.close(&cx).unwrap();
                     assert!(peer.recv_async(&cx).await.is_err());

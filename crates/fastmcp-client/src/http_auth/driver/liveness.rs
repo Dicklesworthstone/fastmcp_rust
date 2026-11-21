@@ -95,8 +95,18 @@ fn deferred_launch_wakes_the_latest_task_before_any_network_or_timer_activity() 
                 }
             },
         ));
-        assert!(execution.as_mut().poll(&mut Context::from_waker(&old_waker)).is_pending());
-        assert!(execution.as_mut().poll(&mut Context::from_waker(&latest_waker)).is_pending());
+        assert!(
+            execution
+                .as_mut()
+                .poll(&mut Context::from_waker(&old_waker))
+                .is_pending()
+        );
+        assert!(
+            execution
+                .as_mut()
+                .poll(&mut Context::from_waker(&latest_waker))
+                .is_pending()
+        );
         assert_eq!(old.0.load(Ordering::SeqCst), 0);
         assert_eq!(latest.0.load(Ordering::SeqCst), 0);
         assert_eq!(driver_calls.load(Ordering::SeqCst), 0);
@@ -114,11 +124,18 @@ fn deferred_launch_wakes_the_latest_task_before_any_network_or_timer_activity() 
         assert_eq!(timer.process_timers(), 0);
         // Only poll after observing an actual wake, not a lucky manual repoll.
         latest.0.store(0, Ordering::SeqCst);
-        assert!(execution.as_mut().poll(&mut Context::from_waker(&latest_waker)).is_pending());
+        assert!(
+            execution
+                .as_mut()
+                .poll(&mut Context::from_waker(&latest_waker))
+                .is_pending()
+        );
         assert_eq!(driver_calls.load(Ordering::SeqCst), 1);
         assert!(latest.0.load(Ordering::SeqCst) > 0);
         assert!(matches!(
-            execution.as_mut().poll(&mut Context::from_waker(&latest_waker)),
+            execution
+                .as_mut()
+                .poll(&mut Context::from_waker(&latest_waker)),
             Poll::Ready(Ok(42))
         ));
         drop(execution);
@@ -158,7 +175,12 @@ fn publication_before_registration_is_observed_without_losing_the_url() {
                 }
             },
         ));
-        assert!(execution.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            execution
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         assert!(wakes.0.load(Ordering::SeqCst) > 0);
         assert!(matches!(
             execution.as_mut().poll(&mut Context::from_waker(&waker)),
@@ -194,7 +216,12 @@ fn abandonment_releases_launch_waker_and_a_late_publish_cannot_restart_work() {
                 ready(Ok(()))
             },
         ));
-        assert!(execution.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            execution
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         let launcher = retained.lock().unwrap().take().unwrap();
         let slot = Arc::clone(&launcher.slot);
         assert!(slot.lock().unwrap().waiter.is_some());
@@ -226,14 +253,20 @@ impl Wake for ReentrantWake {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        assert!(self.slot.try_lock().is_ok(), "wake ran under launch-slot lock");
+        assert!(
+            self.slot.try_lock().is_ok(),
+            "wake ran under launch-slot lock"
+        );
         self.wakes.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 impl Drop for ReentrantWake {
     fn drop(&mut self) {
-        assert!(self.slot.try_lock().is_ok(), "waker drop ran under launch-slot lock");
+        assert!(
+            self.slot.try_lock().is_ok(),
+            "waker drop ran under launch-slot lock"
+        );
         self.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -254,7 +287,11 @@ fn wake_replacement_consumption_and_retirement_never_invoke_user_code_under_lock
         drop(waker); // The slot owns the only remaining reference.
         match disposition {
             0 => {
-                AuthorizationLauncher { slot: Arc::clone(&slot) }.submit(url()).unwrap();
+                AuthorizationLauncher {
+                    slot: Arc::clone(&slot),
+                }
+                .submit(url())
+                .unwrap();
                 assert_eq!(scope.take_url().unwrap(), Some(url()));
                 assert_eq!(wakes.load(Ordering::SeqCst), 1);
             }
@@ -361,7 +398,9 @@ fn operation_and_browser_factories_and_polls_observe_the_effective_caller_ceilin
                 for _ in 0..4 {
                     let _ambient = Cx::set_current(Some(ambient.clone()));
                     let depth = Cx::restriction_depth();
-                    let polled = execution.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+                    let polled = execution
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
                     assert_eq!(row(&Cx::current().unwrap()), ambient_bits);
                     assert_eq!(Cx::restriction_depth(), depth);
                     if let Poll::Ready(outcome) = polled {
@@ -374,7 +413,9 @@ fn operation_and_browser_factories_and_polls_observe_the_effective_caller_ceilin
                 if expected & TIME == 0 {
                     assert!(matches!(
                         result,
-                        Err(AuthorizationDriverError::Driver(OAuthError::RuntimeTimerUnavailable))
+                        Err(AuthorizationDriverError::Driver(
+                            OAuthError::RuntimeTimerUnavailable
+                        ))
                     ));
                     assert_eq!(factories.load(Ordering::SeqCst), 0);
                     assert_eq!(browser_polls.load(Ordering::SeqCst), 0);
@@ -406,7 +447,10 @@ fn a_pending_driver_uses_each_new_ceiling_and_denied_time_retires_both_futures()
                 let _owned = operation_owned;
                 launcher.launch(url()).await?;
                 poll_fn(|_| {
-                    assert_eq!(usize::from(row(&Cx::current().unwrap())), expected.load(Ordering::SeqCst));
+                    assert_eq!(
+                        usize::from(row(&Cx::current().unwrap())),
+                        expected.load(Ordering::SeqCst)
+                    );
                     operation_polls.fetch_add(1, Ordering::SeqCst);
                     Poll::<Result<(), OAuthError>>::Pending
                 })
@@ -415,7 +459,10 @@ fn a_pending_driver_uses_each_new_ceiling_and_denied_time_retires_both_futures()
             |_| async {
                 let _owned = driver_owned;
                 poll_fn(|_| {
-                    assert_eq!(usize::from(row(&Cx::current().unwrap())), expected.load(Ordering::SeqCst));
+                    assert_eq!(
+                        usize::from(row(&Cx::current().unwrap())),
+                        expected.load(Ordering::SeqCst)
+                    );
                     driver_polls.fetch_add(1, Ordering::SeqCst);
                     Poll::<Result<(), OAuthError>>::Pending
                 })
@@ -425,15 +472,24 @@ fn a_pending_driver_uses_each_new_ceiling_and_denied_time_retires_both_futures()
         for bits in [ALL & !8, ALL & !4] {
             expected.store(usize::from(bits), Ordering::SeqCst);
             let _ambient = Cx::set_current(Some(held(&Cx::for_testing(), bits)));
-            assert!(execution.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                execution
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             assert_eq!(row(&Cx::current().unwrap()), bits);
         }
         assert_eq!(operation_polls.load(Ordering::SeqCst), 2);
         assert_eq!(driver_polls.load(Ordering::SeqCst), 1);
         let _ambient = Cx::set_current(Some(held(&Cx::for_testing(), ALL & !TIME)));
         assert!(matches!(
-            execution.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::RuntimeTimerUnavailable)))
+            execution
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(AuthorizationDriverError::Driver(
+                OAuthError::RuntimeTimerUnavailable
+            )))
         ));
         drop(execution);
         assert_eq!(operation_polls.load(Ordering::SeqCst), 2);
@@ -458,11 +514,14 @@ fn deadline_and_cancellation_retire_a_deferred_launcher_without_starting_a_brows
                     *retained.lock().unwrap() = Some(launcher);
                     std::future::pending::<Result<(), OAuthError>>()
                 },
-                |_| -> Ready<Result<(), OAuthError>> {
-                    panic!("no URL has been published")
-                },
+                |_| -> Ready<Result<(), OAuthError>> { panic!("no URL has been published") },
             ));
-            assert!(execution.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            assert!(
+                execution
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
             assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
             if cancelled {
                 cx.set_cancel_requested(true);
@@ -473,8 +532,14 @@ fn deadline_and_cancellation_retire_a_deferred_launcher_without_starting_a_brows
             assert!(wakes.0.load(Ordering::SeqCst) > 0);
             let result = execution.as_mut().poll(&mut Context::from_waker(&waker));
             match (cancelled, result) {
-                (true, Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::Cancelled))))
-                | (false, Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::TimedOut)))) => {}
+                (
+                    true,
+                    Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::Cancelled))),
+                )
+                | (
+                    false,
+                    Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::TimedOut))),
+                ) => {}
                 _ => panic!("original lifetime failure must remain authoritative"),
             }
             drop(execution);

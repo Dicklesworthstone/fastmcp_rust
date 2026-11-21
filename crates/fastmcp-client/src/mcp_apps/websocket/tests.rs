@@ -12,17 +12,16 @@ use asupersync::test_utils::run_test;
 use fastmcp_protocol::{
     ClientCapabilities, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
     MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeDirection, McpAppsBridgeError,
-    McpAppsBridgeImplementation, McpAppsBridgeLifecycle,
-    McpAppsControlDisposition, McpAppsJsonRpcRequestId, McpAppsPinnedHostCapabilities,
-    McpAppsPinnedHostContext, RequestId, SamplingCapability,
+    McpAppsBridgeImplementation, McpAppsBridgeLifecycle, McpAppsControlDisposition,
+    McpAppsJsonRpcRequestId, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext, RequestId,
+    SamplingCapability,
 };
 use fastmcp_transport::websocket::AsyncWsServerTransport;
 use serde_json::{Value, json};
 
 use super::super::{
     McpAppsCatalogBinding, McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport,
-    McpAppsWireHost,
-    McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
+    McpAppsWireHost, McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
     mcp_apps_in_memory_wire_pair,
 };
 use super::{Cx, McpAppsHostError, McpAppsRoutedMethod, McpRequestCancellation, WebSocketClient};
@@ -76,12 +75,7 @@ async fn next_request(peer: &mut Peer, cx: &Cx) -> JsonRpcRequest {
     request
 }
 
-async fn connect<IO>(
-    cx: &Cx,
-    stream: IO,
-    peer: &mut Peer,
-    options: Options,
-) -> WebSocketClient<IO>
+async fn connect<IO>(cx: &Cx, stream: IO, peer: &mut Peer, options: Options) -> WebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
@@ -274,7 +268,10 @@ impl InputEffects {
     }
 }
 
-#[allow(clippy::unused_async_trait_impl, reason = "public async consent callback")]
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "public async consent callback"
+)]
 impl McpAppsWireHostEffects for InputEffects {
     async fn resolve_server_input(
         &mut self,
@@ -286,7 +283,10 @@ impl McpAppsWireHostEffects for InputEffects {
     ) -> Result<fastmcp_protocol::FinalInputResponses, McpAppsHostError> {
         super::super::wire_policy_checkpoint(cx, cancellation)?;
         assert_eq!(method, McpAppsRoutedMethod::ToolsCall);
-        self.calls.lock().unwrap().push(json!({"params": params, "state": required.request_state()}));
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!({"params": params, "state": required.request_state()}));
         Ok(serde_json::from_value(self.responses.clone()).unwrap())
     }
 }
@@ -300,26 +300,55 @@ fn public_websocket_apps_forwards_reused_methods_with_fresh_core_ids() {
         let mut client = connect(&cx, stream, &mut peer, Options::default()).await;
         assert!(client.mcp_apps_active());
         let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-        let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap();
+        let mut host = client
+            .mcp_apps_wire_host(transport, configuration())
+            .unwrap();
         host.bind_server_catalogs(
             McpAppsCatalogBinding {
-                view_id: "view".into(), resource_uri: "ui://view".into(),
-                origin: "https://view.example".into(), principal_id: "owner".into(),
-                server_id: "peer".into(), revision: "one".into(),
+                view_id: "view".into(),
+                resource_uri: "ui://view".into(),
+                origin: "https://view.example".into(),
+                principal_id: "owner".into(),
+                server_id: "peer".into(),
+                revision: "one".into(),
             },
             true,
-        ).unwrap();
+        )
+        .unwrap();
         activate(&mut host, &mut view, &cx).await;
         for (index, (method, params, payload)) in [
-            ("tools/call", json!({"name": "ordinary"}), json!({"content": [{"type": "text", "text": "ordinary"}]})),
-            ("resources/read", json!({"uri": "test://entry"}), json!({
-                "contents": [{"uri": "test://entry", "text": "resource"}],
-                "ttlMs": 0, "cacheScope": "private"
-            })),
-            ("resources/list", json!({}), json!({"resources": [], "ttlMs": 0, "cacheScope": "private"})),
-            ("resources/templates/list", json!({}), json!({"resourceTemplates": [], "ttlMs": 0, "cacheScope": "private"})),
-            ("prompts/list", json!({}), json!({"prompts": [], "ttlMs": 0, "cacheScope": "private"})),
-        ].into_iter().enumerate() {
+            (
+                "tools/call",
+                json!({"name": "ordinary"}),
+                json!({"content": [{"type": "text", "text": "ordinary"}]}),
+            ),
+            (
+                "resources/read",
+                json!({"uri": "test://entry"}),
+                json!({
+                    "contents": [{"uri": "test://entry", "text": "resource"}],
+                    "ttlMs": 0, "cacheScope": "private"
+                }),
+            ),
+            (
+                "resources/list",
+                json!({}),
+                json!({"resources": [], "ttlMs": 0, "cacheScope": "private"}),
+            ),
+            (
+                "resources/templates/list",
+                json!({}),
+                json!({"resourceTemplates": [], "ttlMs": 0, "cacheScope": "private"}),
+            ),
+            (
+                "prompts/list",
+                json!({}),
+                json!({"prompts": [], "ttlMs": 0, "cacheScope": "private"}),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let id = i64::try_from(index).unwrap() + 3;
             if method == "tools/call" {
                 respond(&mut peer, &cx, 2, callable_tools(&["ordinary"])).await;
@@ -327,7 +356,15 @@ fn public_websocket_apps_forwards_reused_methods_with_fresh_core_ids() {
             let mut result = payload.clone();
             result["resultType"] = json!("complete");
             respond(&mut peer, &cx, id, result).await;
-            let response = request(&mut host, &mut view, &cx, "same-view-id", method, params.clone()).await;
+            let response = request(
+                &mut host,
+                &mut view,
+                &cx,
+                "same-view-id",
+                method,
+                params.clone(),
+            )
+            .await;
             if method == "resources/read" {
                 assert_eq!(response["result"]["contents"], payload["contents"]);
                 assert!(response["result"].get("resultType").is_none());
@@ -343,7 +380,10 @@ fn public_websocket_apps_forwards_reused_methods_with_fresh_core_ids() {
             assert_eq!(forwarded.id, Some(RequestId::Number(id)));
             assert_eq!(forwarded.method, method);
             let forwarded = forwarded.params.unwrap();
-            assert_eq!(forwarded["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+            assert_eq!(
+                forwarded["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                "2026-07-28"
+            );
             assert!(!forwarded.to_string().contains("same-view-id"));
             for (key, value) in params.as_object().unwrap() {
                 assert_eq!(&forwarded[key], value);
@@ -351,7 +391,10 @@ fn public_websocket_apps_forwards_reused_methods_with_fresh_core_ids() {
         }
         drop(host);
         client.close(&cx).await.unwrap();
-        assert!(peer.recv(&cx).await.is_err(), "no Apps frame or extra core RPC");
+        assert!(
+            peer.recv(&cx).await.is_err(),
+            "no Apps frame or extra core RPC"
+        );
     });
 }
 
@@ -424,9 +467,17 @@ fn public_websocket_apps_requires_live_bilateral_activation() {
         for (client_apps, server_apps) in [(false, true), (true, false)] {
             let (stream, server) = streams();
             let mut peer = Peer::from_upgraded(server);
-            let mut client = connect(&cx, stream, &mut peer, Options {
-                client_apps, server_apps, ..Options::default()
-            }).await;
+            let mut client = connect(
+                &cx,
+                stream,
+                &mut peer,
+                Options {
+                    client_apps,
+                    server_apps,
+                    ..Options::default()
+                },
+            )
+            .await;
             assert!(!client.mcp_apps_active());
             let (transport, _view) = mcp_apps_in_memory_wire_pair(1);
             assert!(matches!(
@@ -434,7 +485,10 @@ fn public_websocket_apps_requires_live_bilateral_activation() {
                 Err(McpAppsHostError::NotNegotiated)
             ));
             client.close(&cx).await.unwrap();
-            assert!(peer.recv(&cx).await.is_err(), "refusal must precede any RPC");
+            assert!(
+                peer.recv(&cx).await.is_err(),
+                "refusal must precede any RPC"
+            );
         }
         let (stream, server) = streams();
         let mut peer = Peer::from_upgraded(server);
@@ -456,16 +510,26 @@ fn public_websocket_apps_refuses_exact_legacy_before_view_dispatch() {
         let cx = Cx::current().unwrap();
         let (stream, server) = streams();
         let mut peer = Peer::from_upgraded(server);
-        respond(&mut peer, &cx, 1, json!({
-            "protocolVersion": "2024-11-05", "capabilities": {},
-            "serverInfo": {"name": "legacy", "version": "1"}
-        })).await;
+        respond(
+            &mut peer,
+            &cx,
+            1,
+            json!({
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "serverInfo": {"name": "legacy", "version": "1"}
+            }),
+        )
+        .await;
         let mut client = ClientBuilder::new()
             .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly))
             .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(stream))
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(next_request(&mut peer, &cx).await.method, "initialize");
-        assert_eq!(next_request(&mut peer, &cx).await.method, "notifications/initialized");
+        assert_eq!(
+            next_request(&mut peer, &cx).await.method,
+            "notifications/initialized"
+        );
         let (transport, _view) = mcp_apps_in_memory_wire_pair(1);
         assert!(matches!(
             client.mcp_apps_wire_host(transport, configuration()),
@@ -483,27 +547,48 @@ fn public_websocket_apps_mrtr_requires_this_views_capability_and_exact_input_rou
         for case in ["approved", "foreign-key", "missing-capability"] {
             let (stream, server) = streams();
             let mut peer = Peer::from_upgraded(server);
-            let mut client = connect(&cx, stream, &mut peer, Options {
-                sampling: case != "missing-capability", ..Options::default()
-            }).await;
+            let mut client = connect(
+                &cx,
+                stream,
+                &mut peer,
+                Options {
+                    sampling: case != "missing-capability",
+                    ..Options::default()
+                },
+            )
+            .await;
             let mut effects = InputEffects::new();
             if case == "foreign-key" {
                 effects.responses = json!({"other-round": input_response()["sample"]});
             }
             let calls = Arc::clone(&effects.calls);
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-            let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap().with_effects(effects);
+            let mut host = client
+                .mcp_apps_wire_host(transport, configuration())
+                .unwrap()
+                .with_effects(effects);
             activate(&mut host, &mut view, &cx).await;
             respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
             respond(&mut peer, &cx, 3, input_required("private-round")).await;
             if case == "approved" {
                 respond(&mut peer, &cx, 4, complete("continued")).await;
             }
-            let response = request(&mut host, &mut view, &cx, "view-round", "tools/call", json!({
-                "name": "job", "arguments": {"value": 7}
-            })).await;
+            let response = request(
+                &mut host,
+                &mut view,
+                &cx,
+                "view-round",
+                "tools/call",
+                json!({
+                    "name": "job", "arguments": {"value": 7}
+                }),
+            )
+            .await;
             assert_eq!(response.get("result").is_some(), case == "approved");
-            assert_eq!(calls.lock().unwrap().len(), usize::from(case != "missing-capability"));
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                usize::from(case != "missing-capability")
+            );
             assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
             let first = next_request(&mut peer, &cx).await;
             assert_eq!(first.id, Some(RequestId::Number(3)));
@@ -519,7 +604,15 @@ fn public_websocket_apps_mrtr_requires_this_views_capability_and_exact_input_rou
             let healthy_id = if case == "approved" { 6 } else { 5 };
             respond(&mut peer, &cx, healthy_id - 1, callable_tools(&["healthy"])).await;
             respond(&mut peer, &cx, healthy_id, complete("healthy")).await;
-            let healthy = request(&mut host, &mut view, &cx, "view-round", "tools/call", json!({"name": "healthy"})).await;
+            let healthy = request(
+                &mut host,
+                &mut view,
+                &cx,
+                "view-round",
+                "tools/call",
+                json!({"name": "healthy"}),
+            )
+            .await;
             assert_eq!(healthy["result"]["content"][0]["text"], "healthy");
             assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
             let healthy = next_request(&mut peer, &cx).await;
@@ -549,18 +642,28 @@ async fn cancellation_probe(abandon_drive: bool) {
     // An absent-ID control is inert and cannot manufacture upstream cleanup.
     view.send_to_host(
         &cx,
-        json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {}})
-            .to_string(),
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {}}).to_string(),
     )
     .await
     .unwrap();
     host.process_next(&cx).await.unwrap();
     {
         let mut receive = Box::pin(peer.recv(&cx));
-        assert!(poll_fn(|task| Poll::Ready(receive.as_mut().poll(task))).await.is_pending());
+        assert!(
+            poll_fn(|task| Poll::Ready(receive.as_mut().poll(task)))
+                .await
+                .is_pending()
+        );
     }
 
-    enqueue(&mut view, &cx, "owned-view-id", "tools/call", json!({"name": "slow"})).await;
+    enqueue(
+        &mut view,
+        &cx,
+        "owned-view-id",
+        "tools/call",
+        json!({"name": "slow"}),
+    )
+    .await;
     let mut drive = Box::pin(host.process_next(&cx));
     let catalog = request_while_pending(&mut drive, &mut peer, &cx).await;
     assert_eq!(catalog.id, Some(RequestId::Number(2)));
@@ -573,12 +676,16 @@ async fn cancellation_probe(abandon_drive: bool) {
     if abandon_drive {
         drop(drive);
         assert_eq!(
-            host.admission.admit_control(
-                McpAppsBridgeDirection::ViewToHost,
-                McpAppsRoutedMethod::Cancelled,
-                Some(&json!({"requestId": "owned-view-id"})),
-            ).unwrap(),
-            McpAppsControlDisposition::Bound(McpAppsJsonRpcRequestId::String("owned-view-id".into())),
+            host.admission
+                .admit_control(
+                    McpAppsBridgeDirection::ViewToHost,
+                    McpAppsRoutedMethod::Cancelled,
+                    Some(&json!({"requestId": "owned-view-id"})),
+                )
+                .unwrap(),
+            McpAppsControlDisposition::Bound(McpAppsJsonRpcRequestId::String(
+                "owned-view-id".into()
+            )),
             "dropping a drive alone must not release View correlation",
         );
         cancel_view(&mut view, &cx, "owned-view-id").await;
@@ -608,8 +715,14 @@ async fn cancellation_probe(abandon_drive: bool) {
     respond(&mut peer, &cx, 4, callable_tools(&["healthy"])).await;
     respond(&mut peer, &cx, 5, complete("healthy successor")).await;
     let healthy = request(
-        &mut host, &mut view, &cx, "owned-view-id", "tools/call", json!({"name": "healthy"}),
-    ).await;
+        &mut host,
+        &mut view,
+        &cx,
+        "owned-view-id",
+        "tools/call",
+        json!({"name": "healthy"}),
+    )
+    .await;
     assert_eq!(healthy["result"]["content"][0]["text"], "healthy successor");
     assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
     let successor = next_request(&mut peer, &cx).await;
@@ -620,7 +733,10 @@ async fn cancellation_probe(abandon_drive: bool) {
     drop(host);
     assert!(client.retired_requests.is_empty());
     client.close(&cx).await.unwrap();
-    assert!(peer.recv(&cx).await.is_err(), "exactly one cancellation and no replay");
+    assert!(
+        peer.recv(&cx).await.is_err(),
+        "exactly one cancellation and no replay"
+    );
 }
 
 #[test]
@@ -706,13 +822,25 @@ fn public_websocket_apps_cleanup_commits_view_cancel_before_stalled_native_retir
             for drop_cleanup in [false, true] {
                 let (stream, server) = streams();
                 let gate = Arc::new(WriteGate::default());
-                let stream = GatedIo { inner: stream, gate: Arc::clone(&gate) };
+                let stream = GatedIo {
+                    inner: stream,
+                    gate: Arc::clone(&gate),
+                };
                 let mut peer = Peer::from_upgraded(server);
                 let mut client = connect(&cx, stream, &mut peer, Options::default()).await;
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-                let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap();
+                let mut host = client
+                    .mcp_apps_wire_host(transport, configuration())
+                    .unwrap();
                 activate(&mut host, &mut view, &cx).await;
-                enqueue(&mut view, &cx, "cancel-before-await", "tools/call", json!({"name": "slow"})).await;
+                enqueue(
+                    &mut view,
+                    &cx,
+                    "cancel-before-await",
+                    "tools/call",
+                    json!({"name": "slow"}),
+                )
+                .await;
                 let mut drive = Box::pin(host.process_next(&cx));
                 let catalog = request_while_pending(&mut drive, &mut peer, &cx).await;
                 assert_eq!(catalog.id, Some(RequestId::Number(2)));
@@ -731,7 +859,8 @@ fn public_websocket_apps_cleanup_commits_view_cancel_before_stalled_native_retir
                     } else {
                         Poll::Pending
                     }
-                }).await;
+                })
+                .await;
 
                 if drop_cleanup {
                     drop(drive);
@@ -748,27 +877,44 @@ fn public_websocket_apps_cleanup_commits_view_cancel_before_stalled_native_retir
                     assert!(host.policy.client.closed);
                     assert!(!gate.dropped.load(Ordering::Acquire));
                     let error = asupersync::time::timeout(
-                        cx.now(), Duration::from_secs(1), host.process_next(&cx),
-                    ).await.unwrap().unwrap_err();
+                        cx.now(),
+                        Duration::from_secs(1),
+                        host.process_next(&cx),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap_err();
                     assert!(matches!(error, McpAppsHostError::Core(_)));
                 } else {
                     assert!(
                         asupersync::time::timeout(cx.now(), Duration::from_secs(1), drive)
-                            .await.unwrap().is_err(),
+                            .await
+                            .unwrap()
+                            .is_err(),
                         "the native cancellation write has its own finite deadline",
                     );
                 }
                 assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
-                assert!(gate.dropped.load(Ordering::Acquire), "both native halves are retired");
+                assert!(
+                    gate.dropped.load(Ordering::Acquire),
+                    "both native halves are retired"
+                );
                 assert!(!host.policy.client.mcp_apps_active());
                 assert_eq!(host.policy.client.next_id, 4);
                 assert_eq!(host.policy.client.retired_requests.len(), 1);
                 let polls = gate.polls.load(Ordering::Acquire);
                 assert!(host.process_next(&cx).await.is_err());
-                assert_eq!(gate.polls.load(Ordering::Acquire), polls, "no second cancellation or Close");
+                assert_eq!(
+                    gate.polls.load(Ordering::Acquire),
+                    polls,
+                    "no second cancellation or Close"
+                );
                 drop(host);
                 assert!(client.closed);
-                assert!(peer.recv(&cx).await.is_err(), "no complete cancellation or successor frame");
+                assert!(
+                    peer.recv(&cx).await.is_err(),
+                    "no complete cancellation or successor frame"
+                );
             }
         }
     });
@@ -788,8 +934,12 @@ mod tasks {
             "ttlMs": null, "pollIntervalMs": 1, "statusMessage": "Host-private status"
         });
         match status {
-            "input_required" => value["inputRequests"] = input_required("unused")["inputRequests"].clone(),
-            "completed" => value["result"] = json!({"content": [{"type": "text", "text": "Task completed"}]}),
+            "input_required" => {
+                value["inputRequests"] = input_required("unused")["inputRequests"].clone()
+            }
+            "completed" => {
+                value["result"] = json!({"content": [{"type": "text", "text": "Task completed"}]})
+            }
             _ => {}
         }
         value
@@ -815,7 +965,10 @@ mod tasks {
         }
     }
 
-    #[allow(clippy::unused_async_trait_impl, reason = "public async consent callbacks")]
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "public async consent callbacks"
+    )]
     impl McpAppsWireHostEffects for TaskEffects {
         async fn server_task_policy(
             &mut self,
@@ -832,7 +985,9 @@ mod tasks {
             }
             super::super::super::wire_policy_checkpoint(cx, cancellation)?;
             Ok(Some(McpAppsServerTaskPolicy::new(
-                Duration::from_millis(10), 8, 64 * 1024,
+                Duration::from_millis(10),
+                8,
+                64 * 1024,
             )?))
         }
 
@@ -848,7 +1003,10 @@ mod tasks {
             snapshots.push(json!({
                 "params": params, "taskId": task.base().task_id, "status": task.base().status
             }));
-            if self.revoke_after.is_some_and(|limit| snapshots.len() > limit) {
+            if self
+                .revoke_after
+                .is_some_and(|limit| snapshots.len() > limit)
+            {
                 return Err(super::super::super::wire_policy_denied());
             }
             Ok(())
@@ -862,7 +1020,9 @@ mod tasks {
             params: &Value,
             required: &fastmcp_protocol::InputRequiredResult,
         ) -> Result<fastmcp_protocol::FinalInputResponses, McpAppsHostError> {
-            self.input.resolve_server_input(cx, cancellation, method, params, required).await
+            self.input
+                .resolve_server_input(cx, cancellation, method, params, required)
+                .await
         }
     }
 
@@ -872,14 +1032,24 @@ mod tasks {
             let cx = Cx::current().unwrap();
             let (stream, server) = streams();
             let mut peer = Peer::from_upgraded(server);
-            let mut client = connect(&cx, stream, &mut peer, Options {
-                tasks: true, ..Options::default()
-            }).await;
+            let mut client = connect(
+                &cx,
+                stream,
+                &mut peer,
+                Options {
+                    tasks: true,
+                    ..Options::default()
+                },
+            )
+            .await;
             let effects = TaskEffects::new();
             let calls = Arc::clone(&effects.input.calls);
             let snapshots = Arc::clone(&effects.snapshots);
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-            let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap().with_effects(effects);
+            let mut host = client
+                .mcp_apps_wire_host(transport, configuration())
+                .unwrap()
+                .with_effects(effects);
             activate(&mut host, &mut view, &cx).await;
             for (id, result) in [
                 (2, callable_tools(&["job"])),
@@ -892,32 +1062,63 @@ mod tasks {
                 respond(&mut peer, &cx, id, result).await;
             }
             let original = json!({"name": "job", "arguments": {"value": 7}});
-            let response = request(&mut host, &mut view, &cx, "view-task", "tools/call", original.clone()).await;
-            assert_eq!(response["result"], json!({"content": [{"type": "text", "text": "Task completed"}]}));
+            let response = request(
+                &mut host,
+                &mut view,
+                &cx,
+                "view-task",
+                "tools/call",
+                original.clone(),
+            )
+            .await;
+            assert_eq!(
+                response["result"],
+                json!({"content": [{"type": "text", "text": "Task completed"}]})
+            );
             let encoded = response.to_string();
-            for private in ["private-server-task", "before-task-private-state", "inputResponses", "Host-private"] {
-                assert!(!encoded.contains(private), "Host-owned task state cannot cross the View bridge");
+            for private in [
+                "private-server-task",
+                "before-task-private-state",
+                "inputResponses",
+                "Host-private",
+            ] {
+                assert!(
+                    !encoded.contains(private),
+                    "Host-owned task state cannot cross the View bridge"
+                );
             }
             let calls = calls.lock().unwrap();
             assert_eq!(calls.len(), 2, "one MRTR round and one Task input round");
             assert!(calls.iter().all(|call| call["params"] == original));
             drop(calls);
-            assert!(snapshots.lock().unwrap().iter().any(|entry| entry["status"] == "completed"));
+            assert!(
+                snapshots
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["status"] == "completed")
+            );
             let catalog = next_request(&mut peer, &cx).await;
             assert_eq!(catalog.id, Some(RequestId::Number(2)));
             assert_eq!(catalog.method, "tools/list");
             assert!(catalog.params.unwrap()["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
                 .get(fastmcp_protocol::TASKS_EXTENSION).is_none());
             for (id, method) in [
-                (3, "tools/call"), (4, "tools/call"), (5, "tasks/get"),
-                (6, "tasks/update"), (7, "tasks/get"),
+                (3, "tools/call"),
+                (4, "tools/call"),
+                (5, "tasks/get"),
+                (6, "tasks/update"),
+                (7, "tasks/get"),
             ] {
                 let request = next_request(&mut peer, &cx).await;
                 assert_eq!(request.id, Some(RequestId::Number(id)));
                 assert_eq!(request.method, method);
                 let params = request.params.unwrap();
-                assert!(params["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
-                    .get(fastmcp_protocol::TASKS_EXTENSION).is_some());
+                assert!(
+                    params["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                        .get(fastmcp_protocol::TASKS_EXTENSION)
+                        .is_some()
+                );
                 assert!(!params.to_string().contains("view-task"));
                 if id == 4 {
                     assert_eq!(params["requestState"], "before-task-private-state");
@@ -933,7 +1134,15 @@ mod tasks {
             }
             respond(&mut peer, &cx, 8, callable_tools(&["ordinary"])).await;
             respond(&mut peer, &cx, 9, complete("ordinary")).await;
-            let ordinary = request(&mut host, &mut view, &cx, "view-task", "tools/call", json!({"name": "ordinary"})).await;
+            let ordinary = request(
+                &mut host,
+                &mut view,
+                &cx,
+                "view-task",
+                "tools/call",
+                json!({"name": "ordinary"}),
+            )
+            .await;
             assert_eq!(ordinary["result"]["content"][0]["text"], "ordinary");
             assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
             let ordinary = next_request(&mut peer, &cx).await;
@@ -945,7 +1154,19 @@ mod tasks {
             let mut host = host.with_effects(());
             respond(&mut peer, &cx, 10, callable_tools(&["job"])).await;
             respond(&mut peer, &cx, 11, complete("new consent owner")).await;
-            assert!(request(&mut host, &mut view, &cx, "view-task", "tools/call", original).await.get("result").is_some());
+            assert!(
+                request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "view-task",
+                    "tools/call",
+                    original
+                )
+                .await
+                .get("result")
+                .is_some()
+            );
             assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
             let replaced = next_request(&mut peer, &cx).await;
             assert_eq!(replaced.id, Some(RequestId::Number(11)));
@@ -962,28 +1183,44 @@ mod tasks {
         run_test(|| async {
             let cx = Cx::current().unwrap();
             for case in [
-                "not-advertised", "not-approved", "foreign-task", "changed-creation",
-                "input-round", "missing-sampling", "revoked-consent", "input-reuse",
+                "not-advertised",
+                "not-approved",
+                "foreign-task",
+                "changed-creation",
+                "input-round",
+                "missing-sampling",
+                "revoked-consent",
+                "input-reuse",
             ] {
                 let (stream, server) = streams();
                 let mut peer = Peer::from_upgraded(server);
-                let mut client = connect(&cx, stream, &mut peer, Options {
-                    tasks: case != "not-advertised",
-                    sampling: case != "missing-sampling",
-                    ..Options::default()
-                }).await;
+                let mut client = connect(
+                    &cx,
+                    stream,
+                    &mut peer,
+                    Options {
+                        tasks: case != "not-advertised",
+                        sampling: case != "missing-sampling",
+                        ..Options::default()
+                    },
+                )
+                .await;
                 let mut effects = TaskEffects::new();
-                if case == "not-approved" { effects.creation = false; }
-                if case == "revoked-consent" { effects.revoke_after = Some(1); }
+                if case == "not-approved" {
+                    effects.creation = false;
+                }
+                if case == "revoked-consent" {
+                    effects.revoke_after = Some(1);
+                }
                 if case == "input-round" {
                     effects.input.responses = json!({"other-round": input_response()["sample"]});
                 }
                 let calls = Arc::clone(&effects.input.calls);
                 let (results, methods): (Vec<Value>, Vec<&str>) = match case {
                     "not-advertised" => (vec![], vec![]),
-                    "not-approved" | "revoked-consent" => (
-                        vec![task_snapshot("working", true)], vec!["tools/call"],
-                    ),
+                    "not-approved" | "revoked-consent" => {
+                        (vec![task_snapshot("working", true)], vec!["tools/call"])
+                    }
                     "foreign-task" | "changed-creation" => {
                         let mut terminal = task_snapshot("completed", false);
                         if case == "foreign-task" {
@@ -991,29 +1228,52 @@ mod tasks {
                         } else {
                             terminal["createdAt"] = json!("2026-07-28T11:00:00.000Z");
                         }
-                        (vec![task_snapshot("working", true), terminal], vec!["tools/call", "tasks/get"])
+                        (
+                            vec![task_snapshot("working", true), terminal],
+                            vec!["tools/call", "tasks/get"],
+                        )
                     }
                     "input-reuse" => {
                         let mut reused = task_snapshot("input_required", false);
                         reused["inputRequests"]["sample"]["params"]["maxTokens"] = json!(64);
                         (
-                            vec![task_snapshot("input_required", true), json!({"resultType": "complete"}), reused],
+                            vec![
+                                task_snapshot("input_required", true),
+                                json!({"resultType": "complete"}),
+                                reused,
+                            ],
                             vec!["tools/call", "tasks/update", "tasks/get"],
                         )
                     }
-                    _ => (vec![task_snapshot("input_required", true)], vec!["tools/call"]),
+                    _ => (
+                        vec![task_snapshot("input_required", true)],
+                        vec!["tools/call"],
+                    ),
                 };
                 respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
                 for (offset, result) in results.into_iter().enumerate() {
                     respond(&mut peer, &cx, i64::try_from(offset).unwrap() + 3, result).await;
                 }
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-                let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap().with_effects(effects);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, configuration())
+                    .unwrap()
+                    .with_effects(effects);
                 activate(&mut host, &mut view, &cx).await;
-                enqueue(&mut view, &cx, "refused", "tools/call", json!({"name": "job"})).await;
+                enqueue(
+                    &mut view,
+                    &cx,
+                    "refused",
+                    "tools/call",
+                    json!({"name": "job"}),
+                )
+                .await;
                 let disposition = host.process_next(&cx).await;
                 assert_eq!(disposition.is_err(), case == "foreign-task", "{case}");
-                assert!(view_response(&mut view, &cx).await.get("error").is_some(), "{case}");
+                assert!(
+                    view_response(&mut view, &cx).await.get("error").is_some(),
+                    "{case}"
+                );
                 assert_eq!(
                     calls.lock().unwrap().len(),
                     usize::from(matches!(case, "input-round" | "input-reuse")),
@@ -1024,28 +1284,53 @@ mod tasks {
                 assert_eq!(catalog.method, "tools/list");
                 for (offset, method) in methods.iter().enumerate() {
                     let request = next_request(&mut peer, &cx).await;
-                    assert_eq!(request.id, Some(RequestId::Number(i64::try_from(offset).unwrap() + 3)));
+                    assert_eq!(
+                        request.id,
+                        Some(RequestId::Number(i64::try_from(offset).unwrap() + 3))
+                    );
                     assert_eq!(request.method.as_str(), *method);
                     if case == "not-approved" {
-                        assert!(request.params.unwrap()["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
-                            .get(fastmcp_protocol::TASKS_EXTENSION).is_none());
+                        assert!(
+                            request.params.unwrap()["_meta"]
+                                [crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                                .get(fastmcp_protocol::TASKS_EXTENSION)
+                                .is_none()
+                        );
                     }
                 }
                 if case == "foreign-task" {
                     assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
                     drop(host);
                     assert!(!client.mcp_apps_active());
-                    assert!(peer.recv(&cx).await.is_err(), "foreign identity fences the connection");
+                    assert!(
+                        peer.recv(&cx).await.is_err(),
+                        "foreign identity fences the connection"
+                    );
                     continue;
                 }
                 let next_id = i64::try_from(methods.len()).unwrap() + 4;
                 respond(&mut peer, &cx, next_id - 1, callable_tools(&["healthy"])).await;
                 respond(&mut peer, &cx, next_id, complete("healthy")).await;
-                assert!(request(&mut host, &mut view, &cx, "refused", "tools/call", json!({"name": "healthy"})).await.get("result").is_some());
+                assert!(
+                    request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "refused",
+                        "tools/call",
+                        json!({"name": "healthy"})
+                    )
+                    .await
+                    .get("result")
+                    .is_some()
+                );
                 assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                 let healthy = next_request(&mut peer, &cx).await;
                 assert_eq!(healthy.id, Some(RequestId::Number(next_id)));
-                assert_eq!(healthy.method, "tools/call", "no unauthorized Task update, read, cancel or replay");
+                assert_eq!(
+                    healthy.method, "tools/call",
+                    "no unauthorized Task update, read, cancel or replay"
+                );
                 let params = healthy.params.unwrap();
                 assert_eq!(params["name"], "healthy");
                 assert!(params.get("taskId").is_none());
@@ -1064,25 +1349,59 @@ mod tasks {
             for method in ["tasks/get", "tasks/update"] {
                 let (stream, server) = streams();
                 let mut peer = Peer::from_upgraded(server);
-                let mut client = connect(&cx, stream, &mut peer, Options {
-                    tasks: true,
-                    timeout: RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(1)).unwrap(),
-                    ..Options::default()
-                }).await;
+                let mut client = connect(
+                    &cx,
+                    stream,
+                    &mut peer,
+                    Options {
+                        tasks: true,
+                        timeout: RequestTimeoutPolicy::new(
+                            Duration::from_secs(2),
+                            Duration::from_secs(1),
+                        )
+                        .unwrap(),
+                        ..Options::default()
+                    },
+                )
+                .await;
                 let mut effects = TaskEffects::new();
                 // Spend part of the one Apps operation budget before its
                 // tool RPC. A new per-RPC budget must not replace it.
                 effects.delay = Duration::from_millis(700);
-                let initial = if method == "tasks/get" { "working" } else { "input_required" };
+                let initial = if method == "tasks/get" {
+                    "working"
+                } else {
+                    "input_required"
+                };
                 respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
                 respond(&mut peer, &cx, 3, task_snapshot(initial, true)).await;
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-                let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap().with_effects(effects);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, configuration())
+                    .unwrap()
+                    .with_effects(effects);
                 activate(&mut host, &mut view, &cx).await;
-                enqueue(&mut view, &cx, "bounded-task", "tools/call", json!({"name": "job"})).await;
+                enqueue(
+                    &mut view,
+                    &cx,
+                    "bounded-task",
+                    "tools/call",
+                    json!({"name": "job"}),
+                )
+                .await;
                 let mut drive = Box::pin(host.process_next(&cx));
-                assert_eq!(request_while_pending(&mut drive, &mut peer, &cx).await.method, "tools/list");
-                assert_eq!(request_while_pending(&mut drive, &mut peer, &cx).await.method, "tools/call");
+                assert_eq!(
+                    request_while_pending(&mut drive, &mut peer, &cx)
+                        .await
+                        .method,
+                    "tools/list"
+                );
+                assert_eq!(
+                    request_while_pending(&mut drive, &mut peer, &cx)
+                        .await
+                        .method,
+                    "tools/call"
+                );
                 let held = request_while_pending(&mut drive, &mut peer, &cx).await;
                 assert_eq!(held.method, method);
                 assert_eq!(held.id, Some(RequestId::Number(4)));
@@ -1091,7 +1410,8 @@ mod tasks {
                 // Its own RPC timeout is 1 s; the original operation has only
                 // about 300 ms left and must settle within this shorter bound.
                 asupersync::time::timeout(cx.now(), Duration::from_millis(500), drive)
-                    .await.expect("original Apps deadline owns the held Task RPC")
+                    .await
+                    .expect("original Apps deadline owns the held Task RPC")
                     .unwrap();
                 assert!(view_response(&mut view, &cx).await.get("error").is_some());
                 let control = next_request(&mut peer, &cx).await;
@@ -1099,18 +1419,35 @@ mod tasks {
                 assert_eq!(control.params.unwrap()["requestId"], 4);
                 assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
 
-                respond(&mut peer, &cx, 4, if method == "tasks/get" {
-                    task_snapshot("completed", false)
-                } else {
-                    json!({"resultType": "complete"})
-                }).await;
+                respond(
+                    &mut peer,
+                    &cx,
+                    4,
+                    if method == "tasks/get" {
+                        task_snapshot("completed", false)
+                    } else {
+                        json!({"resultType": "complete"})
+                    },
+                )
+                .await;
                 respond(&mut peer, &cx, 5, callable_tools(&["healthy"])).await;
                 respond(&mut peer, &cx, 6, complete("after deadline")).await;
-                let response = request(&mut host, &mut view, &cx, "bounded-task", "tools/call", json!({"name": "healthy"})).await;
+                let response = request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "bounded-task",
+                    "tools/call",
+                    json!({"name": "healthy"}),
+                )
+                .await;
                 assert_eq!(response["result"]["content"][0]["text"], "after deadline");
                 assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                 let healthy = next_request(&mut peer, &cx).await;
-                assert_eq!(healthy.method, "tools/call", "observation cancellation never cancels the remote Task");
+                assert_eq!(
+                    healthy.method, "tools/call",
+                    "observation cancellation never cancels the remote Task"
+                );
                 assert_eq!(healthy.id, Some(RequestId::Number(6)));
                 drop(host);
                 client.close(&cx).await.unwrap();
@@ -1128,42 +1465,74 @@ fn public_websocket_apps_catalog_deadline_bounds_an_uncommitted_native_send() {
             for prefix in [0, 1] {
                 let (stream, server) = streams();
                 let gate = Arc::new(WriteGate::default());
-                let stream = GatedIo { inner: stream, gate: Arc::clone(&gate) };
+                let stream = GatedIo {
+                    inner: stream,
+                    gate: Arc::clone(&gate),
+                };
                 let mut peer = Peer::from_upgraded(server);
-                let mut client = connect(&cx, stream, &mut peer, Options {
-                    timeout: RequestTimeoutPolicy::new(
-                        Duration::from_secs(2), Duration::from_millis(50),
-                    ).unwrap(),
-                    ..Options::default()
-                }).await;
+                let mut client = connect(
+                    &cx,
+                    stream,
+                    &mut peer,
+                    Options {
+                        timeout: RequestTimeoutPolicy::new(
+                            Duration::from_secs(2),
+                            Duration::from_millis(50),
+                        )
+                        .unwrap(),
+                        ..Options::default()
+                    },
+                )
+                .await;
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-                let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap();
+                let mut host = client
+                    .mcp_apps_wire_host(transport, configuration())
+                    .unwrap();
                 host.bind_server_catalogs(
                     McpAppsCatalogBinding {
-                        view_id: "bounded-view".into(), resource_uri: "ui://bounded".into(),
-                        origin: "https://view.example".into(), principal_id: "owner".into(),
-                        server_id: "peer".into(), revision: "one".into(),
+                        view_id: "bounded-view".into(),
+                        resource_uri: "ui://bounded".into(),
+                        origin: "https://view.example".into(),
+                        principal_id: "owner".into(),
+                        server_id: "peer".into(),
+                        revision: "one".into(),
                     },
                     true,
-                ).unwrap();
+                )
+                .unwrap();
                 activate(&mut host, &mut view, &cx).await;
                 gate.remaining.store(prefix, Ordering::Release);
                 gate.blocked.store(true, Ordering::Release);
                 enqueue(&mut view, &cx, "bounded-list", method, json!({})).await;
                 let error = asupersync::time::timeout(
-                    cx.now(), Duration::from_secs(1), host.process_next(&cx),
-                ).await.expect("the short client budget must bound allocation and send")
-                    .unwrap_err();
+                    cx.now(),
+                    Duration::from_secs(1),
+                    host.process_next(&cx),
+                )
+                .await
+                .expect("the short client budget must bound allocation and send")
+                .unwrap_err();
                 assert!(matches!(error, McpAppsHostError::Core(_)));
-                assert!(gate.entered.load(Ordering::Acquire), "the admitted list reached native send");
-                assert!(gate.dropped.load(Ordering::Acquire), "the incomplete send retires both halves");
+                assert!(
+                    gate.entered.load(Ordering::Acquire),
+                    "the admitted list reached native send"
+                );
+                assert!(
+                    gate.dropped.load(Ordering::Acquire),
+                    "the incomplete send retires both halves"
+                );
                 assert!(view_response(&mut view, &cx).await.get("error").is_some());
                 assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
                 assert_eq!(host.policy.client.next_id, 3);
-                assert!(host.policy.client.retired_requests.is_empty(),
-                    "an incomplete request cannot authorize a cancellation frame");
+                assert!(
+                    host.policy.client.retired_requests.is_empty(),
+                    "an incomplete request cannot authorize a cancellation frame"
+                );
                 drop(host);
-                assert!(peer.recv(&cx).await.is_err(), "no completed list, cancellation or successor RPC");
+                assert!(
+                    peer.recv(&cx).await.is_err(),
+                    "no completed list, cancellation or successor RPC"
+                );
             }
         }
     });

@@ -268,15 +268,15 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Wake, Waker};
     use std::time::Duration;
 
+    use crate::McpErrorCode;
     use asupersync::runtime::{Runtime, RuntimeBuilder};
     use asupersync::time::{TimerDriverHandle, VirtualClock};
     use asupersync::{Budget, Time};
-    use crate::McpErrorCode;
 
     fn environment() -> (Runtime, Arc<VirtualClock>, TimerDriverHandle, McpContext) {
         let clock = Arc::new(VirtualClock::new());
@@ -366,7 +366,10 @@ mod tests {
     }
 
     fn dropped(seen: &[Arc<Seen>]) {
-        assert!(seen.iter().all(|seen| seen.drops.load(Ordering::SeqCst) == 1));
+        assert!(
+            seen.iter()
+                .all(|seen| seen.drops.load(Ordering::SeqCst) == 1)
+        );
     }
 
     fn poll<F: Future + ?Sized>(future: Pin<&mut F>, waker: &Waker) -> Poll<F::Output> {
@@ -395,9 +398,8 @@ mod tests {
     #[test]
     fn first_success_refills_failed_slots_without_repolling_silent_siblings() {
         let (runtime, _, timer, ctx) = environment();
-        let (seen, futures) = branches(&[
-            (true, true), (false, false), (true, false), (true, false),
-        ]);
+        let (seen, futures) =
+            branches(&[(true, true), (false, false), (true, false), (true, false)]);
         let mut selection = Box::pin(ctx.first_ok_bounded(2, futures));
         assert!(poll(selection.as_mut(), Waker::noop()).is_pending());
         assert_eq!(counts(&seen), vec![1, 1, 0, 0]);
@@ -416,8 +418,12 @@ mod tests {
     fn bounded_quorum_retains_completion_order_and_can_exceed_concurrency() {
         let (runtime, _, timer, ctx) = environment();
         let (seen, futures) = branches(&[
-            (false, false), (true, false), (true, true),
-            (true, false), (true, false), (true, false),
+            (false, false),
+            (true, false),
+            (true, true),
+            (true, false),
+            (true, false),
+            (true, false),
         ]);
         let mut selection = Box::pin(ctx.quorum_bounded(2, 3, futures));
         for expected in [
@@ -444,7 +450,11 @@ mod tests {
     fn impossible_quorum_does_not_wait_for_silent_work_or_poll_later_ready_losers() {
         let (runtime, _, timer, ctx) = environment();
         let (seen, futures) = branches(&[
-            (false, false), (true, false), (true, true), (true, true), (true, false),
+            (false, false),
+            (true, false),
+            (true, true),
+            (true, true),
+            (true, false),
         ]);
         let mut selection = Box::pin(ctx.quorum_bounded(4, 4, futures));
         let result = done(poll(selection.as_mut(), Waker::noop())).unwrap();
@@ -496,9 +506,9 @@ mod tests {
         assert_eq!(counts(&seen), vec![0, 0]);
         dropped(&seen);
         drop(zero);
-        for (concurrency, required, count) in [
-            (0, 0, 1), (65, 1, 1), (1, 2, 1), (1, 0, 4097), (1, 1, 1),
-        ] {
+        for (concurrency, required, count) in
+            [(0, 0, 1), (65, 1, 1), (1, 2, 1), (1, 0, 4097), (1, 1, 1)]
+        {
             let (seen, futures) = branches(&vec![(true, false); count]);
             let mut selection = Box::pin(ctx.quorum_bounded(concurrency, required, futures));
             assert!(done(poll(selection.as_mut(), Waker::noop())).is_err());
@@ -685,17 +695,22 @@ mod tests {
             let (runtime, _, timer, ctx) = environment();
             let cancellation = ctx.request_cancellation();
             let (seen, mut futures) = branches(&[(true, false)]);
-            futures.insert(0, Box::pin(async move {
-                cancellation.cancel();
-                Ok(99)
-            }));
+            futures.insert(
+                0,
+                Box::pin(async move {
+                    cancellation.cancel();
+                    Ok(99)
+                }),
+            );
             let mut selection: BoxFuture<'_, McpResult<()>> = if quorum {
                 Box::pin(async { ctx.quorum_bounded(2, 1, futures).await.map(|_| ()) })
             } else {
                 Box::pin(async { ctx.first_ok_bounded(2, futures).await.map(|_| ()) })
             };
             assert_eq!(
-                done(poll(selection.as_mut(), Waker::noop())).unwrap_err().code,
+                done(poll(selection.as_mut(), Waker::noop()))
+                    .unwrap_err()
+                    .code,
                 McpErrorCode::RequestCancelled
             );
             assert_eq!(counts(&seen), vec![0]);
@@ -720,9 +735,8 @@ mod tests {
             }
             {
                 let _caller = Cx::set_current(Some(ctx.cx().clone()));
-                let _restriction = Cx::push_restriction(
-                    CapSet::<true, false, true, true, true>::MASK,
-                );
+                let _restriction =
+                    Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
                 assert!(done(poll(selection.as_mut(), Waker::noop())).is_err());
                 assert!(!Cx::current().unwrap().capabilities().time);
             }

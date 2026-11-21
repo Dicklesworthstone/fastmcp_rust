@@ -18,12 +18,12 @@ use fastmcp_client::http_auth::discovery::client_credentials::rpc::catalog::{
 use fastmcp_client::http_auth::discovery::client_credentials::rpc::{
     ClientCredentialsCoreCall, ClientCredentialsCoreError,
 };
-use fastmcp_client::http_auth::discovery::client_credentials::{
-    ClientCredentialsClient, ClientCredentialsError,
-};
 use fastmcp_client::http_auth::discovery::client_credentials::subscriptions::{
     ClientCredentialsCoreSubscription, ClientCredentialsCoreSubscriptionError,
     ClientCredentialsCoreSubscriptionLimits, ModernHttpSubscriptionListenEvent,
+};
+use fastmcp_client::http_auth::discovery::client_credentials::{
+    ClientCredentialsClient, ClientCredentialsError,
 };
 use fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionEvent;
 use fastmcp_client::http_auth::rpc::catalog::ManagedCatalogError;
@@ -35,14 +35,14 @@ use fastmcp_protocol::{
 };
 use serde_json::json;
 
+use super::super::subscriptions::{
+    ManagedOAuthResourceSelector, ManagedOAuthResourceUpdates, ResourceUpdateStream,
+    resource_filter,
+};
 use super::super::{
     BoxFuture, CoreBackend, Forwarder, ManagedOAuthPrompt, ManagedOAuthResource, ManagedOAuthTool,
     UNEXPECTED_RESULT, allocate_request_id, build_prompts, build_resources, build_tools, check_cx,
     core_request, forward_notification, upstream_error,
-};
-use super::super::subscriptions::{
-    ManagedOAuthResourceSelector, ManagedOAuthResourceUpdates, ResourceUpdateStream,
-    resource_filter,
 };
 use super::{ManagedOAuthResourceTemplate, build_templates};
 use interaction::{InteractiveMachineResponse, MachineInputs, interaction_error};
@@ -484,9 +484,9 @@ fn machine_subscription_event(
         ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter } => {
             Ok(ManagedSubscriptionEvent::Acknowledged { accepted_filter })
         }
-        ModernHttpSubscriptionListenEvent::Notification(notification) => {
-            Ok(ManagedSubscriptionEvent::Notification(Box::new(notification)))
-        }
+        ModernHttpSubscriptionListenEvent::Notification(notification) => Ok(
+            ManagedSubscriptionEvent::Notification(Box::new(notification)),
+        ),
         ModernHttpSubscriptionListenEvent::Terminal {
             subscription_id,
             result,

@@ -91,7 +91,11 @@ impl ExtensionSettingsCompatibilityResolver for ProxySettingsResolver {
         // Notifications perform a new compatibility decision for every POST.
         // Even a stateful application resolver cannot change the settings that
         // the proxy compares with the independently admitted downstream leg.
-        if self.effective.get().is_some_and(|expected| expected != &effective) {
+        if self
+            .effective
+            .get()
+            .is_some_and(|expected| expected != &effective)
+        {
             return Err(rejected());
         }
         Ok(effective)
@@ -131,7 +135,10 @@ impl ExtensionRegistration {
         ClientSettings: Serialize + Sync + ?Sized,
     {
         if builder.selected_protocol_plan().policy() != ProtocolPolicy::ModernOnly
-            || builder.selected_protocol_plan().modern_post_target().is_none()
+            || builder
+                .selected_protocol_plan()
+                .modern_post_target()
+                .is_none()
         {
             return Err(McpError::invalid_params(
                 "HTTP extension proxy requires a modern-only HTTP client plan",
@@ -155,18 +162,21 @@ impl ExtensionRegistration {
         // Each negotiation owns a fresh resolver. Only immutable callback
         // configuration is shared. The effective settings are sealed before
         // the connected upstream becomes available for forwarding.
-        let builder = builder.extension_registry(descriptors, discovery, move || {
-            ProxySettingsResolver {
+        let builder =
+            builder.extension_registry(descriptors, discovery, move || ProxySettingsResolver {
                 descriptor: resolver_protocol.clone(),
                 resolve: Arc::clone(&resolve),
                 effective: Arc::clone(&resolver_effective),
-            }
-        })?;
+            })?;
         // No application callback from the declaration survives into forwarding.
         drop(self.handlers);
         let connected = Box::pin(builder.connect_http_client_with_cx(cx)).await;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-        if cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline) {
+        if cx
+            .budget()
+            .deadline
+            .is_some_and(|deadline| cx.now() >= deadline)
+        {
             return Err(McpError::request_cancelled());
         }
         let client = connected
@@ -273,11 +283,15 @@ where
         Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
         Notification: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
     {
-        let declaration = self.descriptor.request_notification.as_ref().ok_or_else(|| {
-            McpError::invalid_params(
-                "HTTP notification proxy requires a typed notification declaration",
-            )
-        })?;
+        let declaration = self
+            .descriptor
+            .request_notification
+            .as_ref()
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "HTTP notification proxy requires a typed notification declaration",
+                )
+            })?;
         if upstream.descriptor.request_notification.as_ref() != Some(declaration) {
             return Err(McpError::invalid_params(
                 "HTTP notification proxy requires matching notification declarations",
@@ -394,18 +408,18 @@ where
         Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
     {
         if upstream.descriptor.id != self.descriptor.id
-            || !upstream.descriptor.methods.iter().any(|entry| entry.name == method)
+            || !upstream
+                .descriptor
+                .methods
+                .iter()
+                .any(|entry| entry.name == method)
         {
             return Err(McpError::invalid_params(
                 "HTTP upstream does not own this extension method",
             ));
         }
         let (method, parameter_schema, result_schema, total) = self
-            .prepare_method::<Request, Response>(
-                method,
-                parameter_schema_id,
-                result_schema_id,
-            )?;
+            .prepare_method::<Request, Response>(method, parameter_schema_id, result_schema_id)?;
         let index = self.pending.len();
         let effective_schema = Arc::clone(&self.effective_schema.admitted);
         retain_schema_identity(
@@ -493,9 +507,9 @@ where
         negotiated: &NegotiatedExtension,
         authorized: AuthorizedNotificationPayload,
     ) -> McpResult<Value> {
-        let (notification, _settings) = self.binding.prepare::<Notification, Settings>(
-            context, negotiated, authorized,
-        )?;
+        let (notification, _settings) = self
+            .binding
+            .prepare::<Notification, Settings>(context, negotiated, authorized)?;
         if negotiated.effective_settings().settings()
             != self.upstream.negotiated.effective_settings().settings()
         {
@@ -527,15 +541,21 @@ where
     async fn forward(&self, context: &McpContext, parameters: Value) -> McpResult<Value> {
         ensure_live(context)?;
         let _permit = HttpProxyNotificationPermit::reserve(&self.upstream.pending_notifications)?;
-        let method = self.binding.descriptor.notification.as_ref().ok_or_else(|| {
-            McpError::internal_error("typed notification descriptor is unavailable")
-        })?;
+        let method = self
+            .binding
+            .descriptor
+            .notification
+            .as_ref()
+            .ok_or_else(|| {
+                McpError::internal_error("typed notification descriptor is unavailable")
+            })?;
         // Clone the immutable modern transport, not a request or its authority.
         // A short lock is never retained over network or cancellation awaits.
         let client = {
-            let client = self.upstream.client.lock().map_err(|_| {
-                McpError::internal_error("HTTP extension upstream is unavailable")
-            })?;
+            let client =
+                self.upstream.client.lock().map_err(|_| {
+                    McpError::internal_error("HTTP extension upstream is unavailable")
+                })?;
             #[allow(unreachable_patterns)]
             match client.connection() {
                 ClientHttpConnection::Modern(client) => client.clone(),
@@ -557,7 +577,9 @@ where
                 .await;
             ensure_live(context)?;
             acknowledged.map_err(|_| {
-                McpError::invalid_request("HTTP extension upstream notification was not acknowledged")
+                McpError::invalid_request(
+                    "HTTP extension upstream notification was not acknowledged",
+                )
             })?;
             Ok(Value::Null)
         })
@@ -631,7 +653,9 @@ impl HttpProxyNotification {
         })?;
         object.remove("_meta");
         self.schema.validate(&parameters).map_err(|_| {
-            McpError::invalid_request("HTTP upstream notification does not satisfy its typed schema")
+            McpError::invalid_request(
+                "HTTP upstream notification does not satisfy its typed schema",
+            )
         })?;
         let parameters = (self.codec)(parameters)?;
         ensure_live(context)?;
@@ -663,9 +687,8 @@ fn reencode_notification<Notification: DeserializeOwned + Serialize>(
     .map_err(|_| {
         McpError::invalid_request("Re-encoded HTTP notification exceeds its wire bounds")
     })?;
-    serde_json::from_slice(&source).map_err(|_| {
-        McpError::invalid_request("Re-encoded HTTP notification is not valid JSON")
-    })
+    serde_json::from_slice(&source)
+        .map_err(|_| McpError::invalid_request("Re-encoded HTTP notification is not valid JSON"))
 }
 
 impl<Request, Response, Settings> TypedHttpProxyHandler<Request, Response, Settings>
@@ -680,8 +703,9 @@ where
         negotiated: &NegotiatedExtension,
         parameters: Value,
     ) -> McpResult<Value> {
-        let (request, _settings) =
-            self.binding.decode::<Request, Settings>(context, negotiated, parameters)?;
+        let (request, _settings) = self
+            .binding
+            .decode::<Request, Settings>(context, negotiated, parameters)?;
         if negotiated.effective_settings().settings()
             != self.upstream.negotiated.effective_settings().settings()
         {
@@ -701,9 +725,12 @@ where
                 "typed proxy request serialization cannot supply framework metadata",
             ));
         }
-        self.binding.parameter_schema.validate(&parameters).map_err(|_| {
-            McpError::invalid_params("serialized proxy request does not satisfy its schema")
-        })?;
+        self.binding
+            .parameter_schema
+            .validate(&parameters)
+            .map_err(|_| {
+                McpError::invalid_params("serialized proxy request does not satisfy its schema")
+            })?;
         ensure_live(context)?;
         Ok(parameters)
     }
@@ -714,17 +741,17 @@ where
         // The lock covers only synchronous admission and allocation. Every
         // execution is owned, so no client lock is held across network awaits.
         let execution = {
-            let client = self.upstream.client.lock().map_err(|_| {
-                McpError::internal_error("HTTP extension upstream is unavailable")
-            })?;
-            client
-                .execute_final_extension(
-                    context.cx(),
-                    &self.binding.descriptor.id,
-                    &method.name,
-                    parameters,
-                    response_limits(),
-                )
+            let client =
+                self.upstream.client.lock().map_err(|_| {
+                    McpError::internal_error("HTTP extension upstream is unavailable")
+                })?;
+            client.execute_final_extension(
+                context.cx(),
+                &self.binding.descriptor.id,
+                &method.name,
+                parameters,
+                response_limits(),
+            )
         };
         ensure_live(context)?;
         let execution = execution.map_err(|_| {
@@ -748,7 +775,9 @@ where
             match event {
                 Some(ModernHttpExtensionEvent::Terminal(mut result)) => {
                     let object = result.as_object_mut().ok_or_else(|| {
-                        McpError::invalid_request("HTTP extension upstream result must be an object")
+                        McpError::invalid_request(
+                            "HTTP extension upstream result must be an object",
+                        )
                     })?;
                     // Upstream protocol metadata is not gateway identity or
                     // downstream authority. Only typed application data crosses.
@@ -759,7 +788,9 @@ where
                         )
                     })?;
                     let response: Response = serde_json::from_value(result).map_err(|_| {
-                        McpError::invalid_request("HTTP extension upstream typed result was rejected")
+                        McpError::invalid_request(
+                            "HTTP extension upstream typed result was rejected",
+                        )
                     })?;
                     let result = self.binding.encode(context, &response)?;
                     if result.get("_meta").is_some() {
@@ -769,8 +800,10 @@ where
                     }
                     return Ok(result);
                 }
-                Some(ModernHttpExtensionEvent::Progress(_)
-                    | ModernHttpExtensionEvent::Notification(_)) => {}
+                Some(
+                    ModernHttpExtensionEvent::Progress(_)
+                    | ModernHttpExtensionEvent::Notification(_),
+                ) => {}
                 Some(ModernHttpExtensionEvent::ExtensionNotification {
                     notification,
                     raw_params,
@@ -927,26 +960,24 @@ mod tests {
             "_meta": {"com.example/upstream-owner": "must-not-cross"}
         });
         let source = serde_json::to_string(&parameters).unwrap();
-        let notification = JsonRpcRequest::notification(
-            "com.example/notice",
-            Some(parameters.clone()),
-        );
-        relay.relay(&context, notification.clone(), Some(&source)).unwrap();
+        let notification =
+            JsonRpcRequest::notification("com.example/notice", Some(parameters.clone()));
+        relay
+            .relay(&context, notification.clone(), Some(&source))
+            .unwrap();
         assert_eq!(*values.lock().unwrap(), vec![json!({"value": 7})]);
 
-        let wrong_method = JsonRpcRequest::notification(
-            "com.example/another-notice",
-            Some(parameters.clone()),
-        );
+        let wrong_method =
+            JsonRpcRequest::notification("com.example/another-notice", Some(parameters.clone()));
         assert!(relay.relay(&context, wrong_method, Some(&source)).is_err());
-        let wrong_role = JsonRpcRequest::new(
-            "com.example/notice",
-            Some(parameters),
-            41_i64,
-        );
+        let wrong_role = JsonRpcRequest::new("com.example/notice", Some(parameters), 41_i64);
         assert!(relay.relay(&context, wrong_role, Some(&source)).is_err());
         let different_source = serde_json::to_string(&json!({"value": 8})).unwrap();
-        assert!(relay.relay(&context, notification, Some(&different_source)).is_err());
+        assert!(
+            relay
+                .relay(&context, notification, Some(&different_source))
+                .is_err()
+        );
         for parameters in [
             json!({"value": "wrong-type"}),
             json!({
@@ -957,10 +988,7 @@ mod tests {
             }),
         ] {
             let source = serde_json::to_string(&parameters).unwrap();
-            let notification = JsonRpcRequest::notification(
-                "com.example/notice",
-                Some(parameters),
-            );
+            let notification = JsonRpcRequest::notification("com.example/notice", Some(parameters));
             assert!(relay.relay(&context, notification, Some(&source)).is_err());
         }
         assert_eq!(

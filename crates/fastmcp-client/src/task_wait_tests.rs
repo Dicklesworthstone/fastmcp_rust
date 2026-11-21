@@ -1679,8 +1679,7 @@ fn task_wait_policy_and_missing_timer_fail_before_transport_activity() {
         assert!(FinalTaskWaitPolicy::new(timeout, polls, fallback).is_err());
     }
     assert!(
-        FinalTaskWaitPolicy::new(Duration::from_hours(24), 4096, Duration::from_mins(5),)
-            .is_ok()
+        FinalTaskWaitPolicy::new(Duration::from_hours(24), 4096, Duration::from_mins(5),).is_ok()
     );
 
     struct NoReads;
@@ -1692,7 +1691,9 @@ fn task_wait_policy_and_missing_timer_fail_before_transport_activity() {
             _: &McpRequestCancellation,
             _: FinalTaskId,
         ) -> impl std::future::Future<Output = McpResult<FinalTask>> {
-            std::future::poll_fn(|_| panic!("unavailable timer must refuse before a transport read"))
+            std::future::poll_fn(|_| {
+                panic!("unavailable timer must refuse before a transport read")
+            })
         }
     }
     let cx = Cx::for_request();

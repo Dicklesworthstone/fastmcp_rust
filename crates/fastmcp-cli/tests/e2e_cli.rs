@@ -1485,7 +1485,10 @@ fn e2e_cli_inspect_modern_only_refuses_legacy_only_shipped_echo_server() {
         stdout_str(&refused)
     );
     let refused_json = inspect_json_stdout(&refused);
-    assert_eq!(refused_json["schema"], "fastmcp.cli.error/v2", "{refused_json}");
+    assert_eq!(
+        refused_json["schema"], "fastmcp.cli.error/v2",
+        "{refused_json}"
+    );
     assert_eq!(refused_json["command"], "inspect", "{refused_json}");
     assert_eq!(refused_json["success"], false, "{refused_json}");
     for key in ["server", "tools", "resources", "prompts"] {
@@ -5287,7 +5290,6 @@ done
     }
 }
 
-
 // Exercise call --wait through the public binary: creation and observation must
 // share the connection's request-ID allocator and exactly one tool dispatch.
 #[cfg(all(unix, feature = "tasks"))]
@@ -5492,16 +5494,29 @@ else:
     fn assert_exchange(events: &[Value], expected: &[&str]) {
         let methods = events
             .iter()
-            .map(|event| event["request"]["method"].as_str().unwrap_or("notification"))
+            .map(|event| {
+                event["request"]["method"]
+                    .as_str()
+                    .unwrap_or("notification")
+            })
             .collect::<Vec<_>>();
-        assert_eq!(methods, expected, "no callbacks, mutation, replay, or reconnect");
+        assert_eq!(
+            methods, expected,
+            "no callbacks, mutation, replay, or reconnect"
+        );
         let pid = &events[0]["pid"];
         let mut previous_id = None;
         for event in events {
-            assert_eq!(&event["pid"], pid, "one live peer owns creation and polling");
+            assert_eq!(
+                &event["pid"], pid,
+                "one live peer owns creation and polling"
+            );
             let id = event["request"]["id"].as_u64().expect("numeric request ID");
             if let Some(previous) = previous_id {
-                assert!(id > previous, "one request-ID allocator must survive creation");
+                assert!(
+                    id > previous,
+                    "one request-ID allocator must survive creation"
+                );
             }
             previous_id = Some(id);
         }
@@ -5511,11 +5526,13 @@ else:
         {
             let params = &call["request"]["params"];
             assert_eq!(
-                params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
-                    ["io.modelcontextprotocol/tasks"],
+                params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
                 json!({})
             );
-            assert!(params.get("task").is_none(), "no obsolete task request hint");
+            assert!(
+                params.get("task").is_none(),
+                "no obsolete task request hint"
+            );
             assert!(params.get("ttlMs").is_none(), "no undeclared creation TTL");
         }
     }
@@ -5537,7 +5554,10 @@ else:
             assert_eq!(documents[1]["taskId"], *task_id);
             assert_eq!(documents[1]["status"], "completed");
             assert!(documents[1].get("resultType").is_none());
-            assert!(documents[1].get("_meta").is_none(), "no stale creation metadata");
+            assert!(
+                documents[1].get("_meta").is_none(),
+                "no stale creation metadata"
+            );
             assert_eq!(
                 documents[1]["result"]["_meta"]["com.example/result"],
                 "preserved"
@@ -5582,7 +5602,11 @@ else:
                 assert!(!output.status.success(), "{mode} must not report success");
                 assert_exchange(&events, &["server/discover", "tools/call", "tasks/get"]);
                 let documents = documents(&output);
-                assert_eq!(documents.len(), 2, "receipt and authoritative failure survive");
+                assert_eq!(
+                    documents.len(),
+                    2,
+                    "receipt and authoritative failure survive"
+                );
                 assert_eq!(documents[1]["status"], expected_status);
                 if mode == "input_required" {
                     assert_eq!(
@@ -5628,14 +5652,26 @@ else:
         let mut command = Command::new(get_binary_path());
         command
             .args([
-                "call", "background", "--wait", "--protocol-policy", "modern-only",
-                "--timeout", "30", "--json", "--arguments",
-                &json!({"work": task_id}).to_string(), "--server", "python3",
+                "call",
+                "background",
+                "--wait",
+                "--protocol-policy",
+                "modern-only",
+                "--timeout",
+                "30",
+                "--json",
+                "--arguments",
+                &json!({"work": task_id}).to_string(),
+                "--server",
+                "python3",
                 "--server-arg",
             ])
             .arg(script);
         for argument in [
-            "blocked_output", task_id, log.to_str().unwrap(), "stdio",
+            "blocked_output",
+            task_id,
+            log.to_str().unwrap(),
+            "stdio",
             ready.to_str().unwrap(),
         ] {
             command.args(["--server-arg", argument]);
@@ -5690,7 +5726,10 @@ else:
         assert!(!stdout_str(&output).contains('\u{202e}'));
         let help = run_cli(&["call", "--help"]);
         assert!(help.status.success());
-        let help = stdout_str(&help).split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = stdout_str(&help)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(help.contains("--wait"));
         assert!(help.contains("one or two JSON lines"));
         assert!(help.contains("250ms"));
@@ -5700,19 +5739,40 @@ else:
     fn call_wait_refuses_auto_or_manual_continuation_before_contact() {
         for arguments in [
             vec![
-                "call", "background", "--wait", "--protocol-policy", "auto",
-                "--http-url", "http://127.0.0.1:1/mcp", "--json",
+                "call",
+                "background",
+                "--wait",
+                "--protocol-policy",
+                "auto",
+                "--http-url",
+                "http://127.0.0.1:1/mcp",
+                "--json",
             ],
             vec![
-                "call", "background", "--wait", "--protocol-policy", "modern-only",
-                "--http-url", "http://127.0.0.1:1/mcp",
-                "--input-capability", "roots", "--json",
+                "call",
+                "background",
+                "--wait",
+                "--protocol-policy",
+                "modern-only",
+                "--http-url",
+                "http://127.0.0.1:1/mcp",
+                "--input-capability",
+                "roots",
+                "--json",
             ],
             vec![
-                "call", "background", "--wait", "--protocol-policy", "modern-only",
-                "--http-url", "http://127.0.0.1:1/mcp",
-                "--resume-result-file", "/not-opened/result",
-                "--input-responses-file", "/not-opened/answers", "--json",
+                "call",
+                "background",
+                "--wait",
+                "--protocol-policy",
+                "modern-only",
+                "--http-url",
+                "http://127.0.0.1:1/mcp",
+                "--resume-result-file",
+                "/not-opened/result",
+                "--input-responses-file",
+                "/not-opened/answers",
+                "--json",
             ],
         ] {
             let output = run_cli(&arguments);

@@ -1295,7 +1295,10 @@ fn https_enforcement_sites() -> BTreeMap<String, usize> {
 fn https_inline_count_mismatches(readme: &str, expected_sites: usize) -> Vec<String> {
     let mut mismatches = Vec::new();
     let expected = expected_sites.to_string();
-    for suffix in [" enforcement points refuse", " points protect credential transport"] {
+    for suffix in [
+        " enforcement points refuse",
+        " points protect credential transport",
+    ] {
         let mut cursor = 0usize;
         while let Some(pos) = readme[cursor..].find(suffix) {
             let absolute = cursor + pos;
@@ -1304,7 +1307,9 @@ fn https_inline_count_mismatches(readme: &str, expected_sites: usize) -> Vec<Str
                 && word.chars().all(|c| c.is_ascii_digit())
                 && word != expected
             {
-                mismatches.push(format!("found `{word}{suffix}`, expected `{expected}{suffix}`"));
+                mismatches.push(format!(
+                    "found `{word}{suffix}`, expected `{expected}{suffix}`"
+                ));
             }
             cursor = absolute + suffix.len();
         }
@@ -1418,14 +1423,14 @@ fn planted_https_scheme_is_and_inline_count_consistency_are_detected() {
     assert_eq!(count_https_enforcement_sites(without_wire_scheme), 0);
 
     // Positive + planted negative for internal README prose count consistency.
-    let consistent =
-        "URLs these 32 enforcement points refuse ... where these 32 points protect credential transport";
-    let drifted =
-        "URLs these 32 enforcement points refuse ... where these 23 points protect credential transport";
+    let consistent = "URLs these 32 enforcement points refuse ... where these 32 points protect credential transport";
+    let drifted = "URLs these 32 enforcement points refuse ... where these 23 points protect credential transport";
     assert!(https_inline_count_mismatches(consistent, 32).is_empty());
     assert_eq!(
         https_inline_count_mismatches(drifted, 32),
-        vec!["found `23 points protect credential transport`, expected `32 points protect credential transport`"]
+        vec![
+            "found `23 points protect credential transport`, expected `32 points protect credential transport`"
+        ]
     );
 }
 

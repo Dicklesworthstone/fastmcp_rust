@@ -601,9 +601,8 @@ impl FinalTaskCallToolResult {
                 result_members.insert(key.to_owned(), value);
             }
         }
-        let mut result: FinalCallToolResult =
-            serde_json::from_value(Value::Object(result_members))
-                .map_err(|_| TaskWireError::Invalid("result"))?;
+        let mut result: FinalCallToolResult = serde_json::from_value(Value::Object(result_members))
+            .map_err(|_| TaskWireError::Invalid("result"))?;
         result.structured_content = structured_content;
         Ok(Self {
             result,
@@ -643,8 +642,14 @@ impl FinalTaskCallToolResult {
             // Omitted defaults and optional fields still belong to the typed
             // payload. An additional member must not override that state or
             // introduce an enclosing result discriminator into this object.
-            if ["content", "isError", "structuredContent", "_meta", "resultType"]
-                .contains(&key.as_str())
+            if [
+                "content",
+                "isError",
+                "structuredContent",
+                "_meta",
+                "resultType",
+            ]
+            .contains(&key.as_str())
                 || members.insert(key.clone(), value.clone()).is_some()
             {
                 return Err(TaskWireError::Invalid("result"));
@@ -1908,7 +1913,8 @@ mod tests {
                 ));
                 serde_json::to_string(&created).expect("creation receipt emission")
             } else {
-                let get: GetTaskResult = serde_json::from_str(&wire).expect("completed read receipt");
+                let get: GetTaskResult =
+                    serde_json::from_str(&wire).expect("completed read receipt");
                 serde_json::to_string(&get).expect("read receipt emission")
             };
             assert_eq!(emitted, wire, "both Task envelopes retain the exact result");

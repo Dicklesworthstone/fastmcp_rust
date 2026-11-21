@@ -2089,7 +2089,10 @@ mod tests {
         // bounds remain independent and must not inherit the larger constant.
         assert_eq!(MAX_TOKEN_BYTES, 64 * 1024);
         assert_eq!(MAX_SECRET_GRANT_BYTES, 64 * 1024);
-        assert_eq!(MAX_TOKEN_RESPONSE_BYTES, SecurityDocumentKind::TokenResponse.byte_limit());
+        assert_eq!(
+            MAX_TOKEN_RESPONSE_BYTES,
+            SecurityDocumentKind::TokenResponse.byte_limit()
+        );
     }
 
     #[test]

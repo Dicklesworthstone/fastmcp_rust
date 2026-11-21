@@ -58,8 +58,7 @@ fn id_jag_expected() -> IdJagExpectations<'static> {
 
 fn signed(name: &str) -> &'static str {
     static FIXTURES: OnceLock<Value> = OnceLock::new();
-    FIXTURES
-        .get_or_init(|| serde_json::from_str(SIGNED_FIXTURES).expect("fixture JSON"))[name]
+    FIXTURES.get_or_init(|| serde_json::from_str(SIGNED_FIXTURES).expect("fixture JSON"))[name]
         .as_str()
         .expect("named signed fixture")
 }
@@ -86,8 +85,7 @@ fn signed_oidc_and_id_jag_return_only_their_bound_identity_facts() {
     let jag_keys = id_jag_keys();
     let oidc =
         verify_oidc_id_token(signed("oidc_base"), &oidc_keys, &oidc_expected(), now()).unwrap();
-    let jag =
-        verify_id_jag(signed("id_jag_base"), &jag_keys, &id_jag_expected(), now()).unwrap();
+    let jag = verify_id_jag(signed("id_jag_base"), &jag_keys, &id_jag_expected(), now()).unwrap();
 
     assert_eq!(oidc.issuer(), ISSUER);
     assert_eq!(oidc.client_id(), "native-idp");
@@ -155,10 +153,19 @@ fn signed_singleton_audiences_and_media_type_case_variants_are_accepted() {
     .unwrap();
     assert_eq!(oidc.client_id(), "native-idp");
     assert_eq!(jag.resource(), Some("https://mcp.example/mcp"));
-    oidc_failure("oidc_multi_audience", EnterpriseVerificationError::BindingMismatch);
+    oidc_failure(
+        "oidc_multi_audience",
+        EnterpriseVerificationError::BindingMismatch,
+    );
     oidc_failure("oidc_null_azp", EnterpriseVerificationError::InvalidClaims);
-    id_jag_failure("id_jag_multi_audience", EnterpriseVerificationError::BindingMismatch);
-    id_jag_failure("id_jag_multi_resource", EnterpriseVerificationError::BindingMismatch);
+    id_jag_failure(
+        "id_jag_multi_audience",
+        EnterpriseVerificationError::BindingMismatch,
+    );
+    id_jag_failure(
+        "id_jag_multi_resource",
+        EnterpriseVerificationError::BindingMismatch,
+    );
 }
 
 #[test]
@@ -176,7 +183,10 @@ fn valid_signatures_cannot_change_the_trusted_flow_or_resource_bindings() {
         verify_oidc_id_token(signed("oidc_base"), &keys, &expected, now()).unwrap_err(),
         EnterpriseVerificationError::InvalidNonce,
     );
-    oidc_failure("oidc_foreign_issuer", EnterpriseVerificationError::BindingMismatch);
+    oidc_failure(
+        "oidc_foreign_issuer",
+        EnterpriseVerificationError::BindingMismatch,
+    );
 
     let keys = id_jag_keys();
     for changed in ["audience", "client", "resource"] {
@@ -206,8 +216,14 @@ fn signed_at_hash_requires_the_exact_access_token_and_canonical_128_bits() {
             EnterpriseVerificationError::InvalidAccessTokenHash,
         );
     }
-    oidc_failure("oidc_hash_padding", EnterpriseVerificationError::InvalidAccessTokenHash);
-    oidc_failure("oidc_hash_trailing_bits", EnterpriseVerificationError::InvalidAccessTokenHash);
+    oidc_failure(
+        "oidc_hash_padding",
+        EnterpriseVerificationError::InvalidAccessTokenHash,
+    );
+    oidc_failure(
+        "oidc_hash_trailing_bits",
+        EnterpriseVerificationError::InvalidAccessTokenHash,
+    );
 
     let mut expected = oidc_expected();
     expected.access_token = None;
@@ -233,7 +249,10 @@ fn signed_tenants_use_separate_exact_namespaces_without_normalization() {
         EnterpriseVerificationError::BindingMismatch,
     );
     oidc_failure("oidc_tenant", EnterpriseVerificationError::BindingMismatch);
-    oidc_failure("oidc_null_tenant", EnterpriseVerificationError::BindingMismatch);
+    oidc_failure(
+        "oidc_null_tenant",
+        EnterpriseVerificationError::BindingMismatch,
+    );
 
     let mut expected = id_jag_expected();
     expected.idp_tenant = TenantExpectation::Exact("idp-tenant");
@@ -241,8 +260,14 @@ fn signed_tenants_use_separate_exact_namespaces_without_normalization() {
     let verified =
         verify_id_jag(signed("id_jag_tenants"), &id_jag_keys(), &expected, now()).unwrap();
     assert_eq!(verified.idp_tenant().unwrap().as_str(), "idp-tenant");
-    assert_eq!(verified.resource_tenant().unwrap().as_str(), "resource-tenant");
-    assert_eq!(verified.audience_subject().unwrap().as_str(), "opaque/account");
+    assert_eq!(
+        verified.resource_tenant().unwrap().as_str(),
+        "resource-tenant"
+    );
+    assert_eq!(
+        verified.audience_subject().unwrap().as_str(),
+        "opaque/account"
+    );
     assert_eq!(
         verify_id_jag(
             signed("id_jag_tenant_missing_subject"),
@@ -258,12 +283,18 @@ fn signed_tenants_use_separate_exact_namespaces_without_normalization() {
         verify_id_jag(signed("id_jag_tenants"), &id_jag_keys(), &expected, now()).unwrap_err(),
         EnterpriseVerificationError::BindingMismatch,
     );
-    id_jag_failure("id_jag_tenants", EnterpriseVerificationError::BindingMismatch);
+    id_jag_failure(
+        "id_jag_tenants",
+        EnterpriseVerificationError::BindingMismatch,
+    );
 }
 
 #[test]
 fn signed_optional_resource_and_scope_remain_explicit_caller_policy() {
-    id_jag_failure("id_jag_missing_resource", EnterpriseVerificationError::BindingMismatch);
+    id_jag_failure(
+        "id_jag_missing_resource",
+        EnterpriseVerificationError::BindingMismatch,
+    );
     let mut expected = id_jag_expected();
     expected.require_resource = false;
     let without_resource = verify_id_jag(
@@ -283,13 +314,23 @@ fn signed_optional_resource_and_scope_remain_explicit_caller_policy() {
     )
     .unwrap();
     assert!(without_scope.scope().is_none());
-    id_jag_failure("id_jag_duplicate_scope", EnterpriseVerificationError::InvalidClaims);
-    id_jag_failure("id_jag_empty_jti", EnterpriseVerificationError::InvalidClaims);
+    id_jag_failure(
+        "id_jag_duplicate_scope",
+        EnterpriseVerificationError::InvalidClaims,
+    );
+    id_jag_failure(
+        "id_jag_empty_jti",
+        EnterpriseVerificationError::InvalidClaims,
+    );
 }
 
 #[test]
 fn signed_claims_and_headers_cannot_cross_the_closed_enterprise_profiles() {
-    for name in ["oidc_forbidden_cnf", "oidc_forbidden_disclosure", "oidc_subject_nonascii"] {
+    for name in [
+        "oidc_forbidden_cnf",
+        "oidc_forbidden_disclosure",
+        "oidc_subject_nonascii",
+    ] {
         oidc_failure(name, EnterpriseVerificationError::InvalidClaims);
     }
     for name in [
@@ -312,12 +353,22 @@ fn signed_claims_and_headers_cannot_cross_the_closed_enterprise_profiles() {
         EnterpriseVerificationError::InvalidToken,
     );
     assert_eq!(
-        verify_id_jag(signed("oidc_base"), &id_jag_keys(), &id_jag_expected(), now()).unwrap_err(),
+        verify_id_jag(
+            signed("oidc_base"),
+            &id_jag_keys(),
+            &id_jag_expected(),
+            now()
+        )
+        .unwrap_err(),
         EnterpriseVerificationError::InvalidToken,
     );
     let mut corrupted = signed("oidc_base").to_owned();
     let signature = corrupted.rfind('.').unwrap() + 1;
-    let changed = if &corrupted[signature..=signature] == "A" { "B" } else { "A" };
+    let changed = if &corrupted[signature..=signature] == "A" {
+        "B"
+    } else {
+        "A"
+    };
     corrupted.replace_range(signature..=signature, changed);
     assert_eq!(
         verify_oidc_id_token(&corrupted, &oidc_keys(), &oidc_expected(), now()).unwrap_err(),
@@ -335,7 +386,10 @@ fn signed_numeric_dates_retain_nanoseconds_and_equivalent_exponents() {
     )
     .unwrap();
     assert_eq!(fraction.issued_at(), at(ISSUED) + Duration::from_nanos(1));
-    assert_eq!(fraction.expires_at(), at(ISSUED + 240) + Duration::from_nanos(1));
+    assert_eq!(
+        fraction.expires_at(),
+        at(ISSUED + 240) + Duration::from_nanos(1)
+    );
     let exponent = verify_oidc_id_token(
         signed("oidc_exponent_time"),
         &oidc_keys(),
@@ -345,45 +399,41 @@ fn signed_numeric_dates_retain_nanoseconds_and_equivalent_exponents() {
     .unwrap();
     assert_eq!(exponent.issued_at(), at(ISSUED));
     assert_eq!(exponent.expires_at(), at(ISSUED + 240));
-    oidc_failure("oidc_bad_precision", EnterpriseVerificationError::InvalidTime);
-    oidc_failure("oidc_negative_zero", EnterpriseVerificationError::InvalidTime);
+    oidc_failure(
+        "oidc_bad_precision",
+        EnterpriseVerificationError::InvalidTime,
+    );
+    oidc_failure(
+        "oidc_negative_zero",
+        EnterpriseVerificationError::InvalidTime,
+    );
 }
 
 #[test]
 fn signed_times_enforce_exact_expiration_future_and_authentication_boundaries() {
     let keys = oidc_keys();
     let expected = oidc_expected();
-    assert!(verify_oidc_id_token(
-        signed("oidc_base"),
-        &keys,
-        &expected,
-        at(ISSUED - 60),
-    )
-    .is_ok());
+    assert!(verify_oidc_id_token(signed("oidc_base"), &keys, &expected, at(ISSUED - 60),).is_ok());
     assert_eq!(
-        verify_oidc_id_token(signed("oidc_base"), &keys, &expected, at(ISSUED - 61))
-            .unwrap_err(),
+        verify_oidc_id_token(signed("oidc_base"), &keys, &expected, at(ISSUED - 61)).unwrap_err(),
         EnterpriseVerificationError::NotYetValid,
     );
-    assert!(verify_oidc_id_token(
-        signed("oidc_base"),
-        &keys,
-        &expected,
-        at(ISSUED + 300) - Duration::from_nanos(1),
-    )
-    .is_ok());
+    assert!(
+        verify_oidc_id_token(
+            signed("oidc_base"),
+            &keys,
+            &expected,
+            at(ISSUED + 300) - Duration::from_nanos(1),
+        )
+        .is_ok()
+    );
     assert_eq!(
-        verify_oidc_id_token(signed("oidc_base"), &keys, &expected, at(ISSUED + 300))
-            .unwrap_err(),
+        verify_oidc_id_token(signed("oidc_base"), &keys, &expected, at(ISSUED + 300)).unwrap_err(),
         EnterpriseVerificationError::Expired,
     );
-    assert!(verify_oidc_id_token(
-        signed("oidc_not_before"),
-        &keys,
-        &expected,
-        at(ISSUED + 60),
-    )
-    .is_ok());
+    assert!(
+        verify_oidc_id_token(signed("oidc_not_before"), &keys, &expected, at(ISSUED + 60),).is_ok()
+    );
     assert_eq!(
         verify_oidc_id_token(signed("oidc_not_before"), &keys, &expected, at(ISSUED + 59))
             .unwrap_err(),
@@ -413,7 +463,10 @@ fn signed_times_enforce_exact_expiration_future_and_authentication_boundaries() 
             .unwrap_err(),
         EnterpriseVerificationError::InvalidClaims,
     );
-    oidc_failure("oidc_future_auth_time", EnterpriseVerificationError::InvalidTime);
+    oidc_failure(
+        "oidc_future_auth_time",
+        EnterpriseVerificationError::InvalidTime,
+    );
 
     let mut expected = id_jag_expected();
     expected.time = JwtTimePolicy::oidc_default();
@@ -444,7 +497,10 @@ fn numeric_dates_have_closed_precision_range_and_sign() {
         ("1e-9", Duration::from_nanos(1)),
         ("10e-10", Duration::from_nanos(1)),
         ("2000000000.000000001", Duration::new(ISSUED, 1)),
-        ("253402300799.999999999", Duration::new(253_402_300_799, 999_999_999)),
+        (
+            "253402300799.999999999",
+            Duration::new(253_402_300_799, 999_999_999),
+        ),
     ] {
         let value = serde_json::from_str(lexeme).unwrap();
         assert_eq!(numeric_date(&value), Ok(expected), "{lexeme}");
@@ -506,10 +562,16 @@ fn scope_grammar_limits_are_exact_and_duplicates_do_not_grant_more_scope() {
         "read\"write",
         "read\\write",
     ] {
-        assert_eq!(parse(json!(scope)), Err(EnterpriseVerificationError::InvalidClaims));
+        assert_eq!(
+            parse(json!(scope)),
+            Err(EnterpriseVerificationError::InvalidClaims)
+        );
     }
     for scope in [Value::Null, json!(["read"]), json!(3)] {
-        assert_eq!(parse(scope), Err(EnterpriseVerificationError::InvalidClaims));
+        assert_eq!(
+            parse(scope),
+            Err(EnterpriseVerificationError::InvalidClaims)
+        );
     }
 }
 
@@ -557,8 +619,14 @@ fn trusted_imports_reject_repaired_urls_invalid_generations_and_wrong_key_use() 
 
     for (lifetime, skew) in [
         (Duration::ZERO, Duration::ZERO),
-        (MAX_ENTERPRISE_TOKEN_LIFETIME + Duration::from_secs(1), Duration::ZERO),
-        (Duration::from_secs(1), MAX_ENTERPRISE_CLOCK_SKEW + Duration::from_secs(1)),
+        (
+            MAX_ENTERPRISE_TOKEN_LIFETIME + Duration::from_secs(1),
+            Duration::ZERO,
+        ),
+        (
+            Duration::from_secs(1),
+            MAX_ENTERPRISE_CLOCK_SKEW + Duration::from_secs(1),
+        ),
     ] {
         assert_eq!(
             JwtTimePolicy::new(lifetime, skew),
@@ -566,8 +634,14 @@ fn trusted_imports_reject_repaired_urls_invalid_generations_and_wrong_key_use() 
         );
     }
     assert_eq!(JwtTimePolicy::default(), JwtTimePolicy::oidc_default());
-    assert_eq!(JwtTimePolicy::id_jag_default().max_lifetime(), Duration::from_secs(300));
-    assert_eq!(JwtTimePolicy::oidc_default().clock_skew(), Duration::from_secs(60));
+    assert_eq!(
+        JwtTimePolicy::id_jag_default().max_lifetime(),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        JwtTimePolicy::oidc_default().clock_skew(),
+        Duration::from_secs(60)
+    );
 }
 
 #[test]

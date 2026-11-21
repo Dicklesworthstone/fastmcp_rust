@@ -30,9 +30,9 @@ use fastmcp_core::{CanonicalResourceId, CanonicalResourceIdPolicy, McpRequestCan
 use super::caller::with_caller;
 use super::{BoundBearerCredential, CanonicalHttpUrl};
 
-mod wire;
 #[cfg(test)]
 mod tests;
+mod wire;
 
 /// One error category, never a peer body, URL, code, credential or transport error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,15 +75,23 @@ impl DeviceAuthorizationPolicy {
         maximum_polls: u16,
         maximum_token_lifetime: Duration,
     ) -> Result<Self, DeviceAuthorizationError> {
-        if timeout.is_zero() || timeout > Duration::from_hours(1)
-            || exchange_timeout.is_zero() || exchange_timeout > Duration::from_mins(2)
-            || maximum_polls == 0 || maximum_polls > 1024
+        if timeout.is_zero()
+            || timeout > Duration::from_hours(1)
+            || exchange_timeout.is_zero()
+            || exchange_timeout > Duration::from_mins(2)
+            || maximum_polls == 0
+            || maximum_polls > 1024
             || maximum_token_lifetime.is_zero()
             || maximum_token_lifetime > Duration::from_hours(24)
         {
             return Err(DeviceAuthorizationError::InvalidConfiguration);
         }
-        Ok(Self { timeout, exchange_timeout, maximum_polls, maximum_token_lifetime })
+        Ok(Self {
+            timeout,
+            exchange_timeout,
+            maximum_polls,
+            maximum_token_lifetime,
+        })
     }
 }
 
@@ -114,7 +122,8 @@ pub struct DeviceAuthorizationClient {
 
 impl fmt::Debug for DeviceAuthorizationClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeviceAuthorizationClient").finish_non_exhaustive()
+        f.debug_struct("DeviceAuthorizationClient")
+            .finish_non_exhaustive()
     }
 }
 
@@ -129,12 +138,18 @@ pub struct DeviceVerification {
 }
 
 impl DeviceVerification {
-    pub fn user_code(&self) -> &str { self.user_code.as_str() }
-    pub fn verification_uri(&self) -> &CanonicalHttpUrl { &self.verification_uri }
+    pub fn user_code(&self) -> &str {
+        self.user_code.as_str()
+    }
+    pub fn verification_uri(&self) -> &CanonicalHttpUrl {
+        &self.verification_uri
+    }
     pub fn verification_uri_complete(&self) -> Option<&CanonicalHttpUrl> {
         self.verification_uri_complete.as_ref()
     }
-    pub fn expires_in(&self) -> Duration { self.expires_in }
+    pub fn expires_in(&self) -> Duration {
+        self.expires_in
+    }
 }
 
 /// Exclusively retained grant, with the existing exact-resource bearer binding.
@@ -149,11 +164,21 @@ pub struct DeviceOAuthCredentials {
 }
 
 impl DeviceOAuthCredentials {
-    pub fn client(&self) -> &DeviceAuthorizationClient { &self.client }
-    pub fn bearer_credential(&self) -> &BoundBearerCredential { &self.access }
-    pub fn scopes(&self) -> &[String] { &self.scopes }
-    pub fn expires_at(&self) -> Instant { self.expires_at }
-    pub fn has_refresh_token(&self) -> bool { self.refresh_token.is_some() }
+    pub fn client(&self) -> &DeviceAuthorizationClient {
+        &self.client
+    }
+    pub fn bearer_credential(&self) -> &BoundBearerCredential {
+        &self.access
+    }
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+    pub fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
+    pub fn has_refresh_token(&self) -> bool {
+        self.refresh_token.is_some()
+    }
 
     /// Local-only closure, including all access-token clones. No remote request
     /// is sent and already-created headers or committed effects are not recalled.
@@ -175,22 +200,40 @@ impl DeviceAuthorizationClient {
         client_id: impl Into<String>,
         scopes: Vec<String>,
     ) -> Result<Self, DeviceAuthorizationError> {
-        for endpoint in [&device_endpoint, &token_endpoint, &verification_origin, &resource] {
-            wire::https(endpoint, false).map_err(|_| DeviceAuthorizationError::InvalidConfiguration)?;
+        for endpoint in [
+            &device_endpoint,
+            &token_endpoint,
+            &verification_origin,
+            &resource,
+        ] {
+            wire::https(endpoint, false)
+                .map_err(|_| DeviceAuthorizationError::InvalidConfiguration)?;
         }
         if verification_origin.path() != "/" {
             return Err(DeviceAuthorizationError::InvalidConfiguration);
         }
-        CanonicalResourceId::parse_for_endpoint(resource.as_str(), &resource, CanonicalResourceIdPolicy::DEFAULT)
-            .map_err(|_| DeviceAuthorizationError::InvalidConfiguration)?;
+        CanonicalResourceId::parse_for_endpoint(
+            resource.as_str(),
+            &resource,
+            CanonicalResourceIdPolicy::DEFAULT,
+        )
+        .map_err(|_| DeviceAuthorizationError::InvalidConfiguration)?;
         let client_id = client_id.into();
-        if client_id.is_empty() || client_id.len() > 1024 || client_id.chars().any(char::is_control) {
+        if client_id.is_empty() || client_id.len() > 1024 || client_id.chars().any(char::is_control)
+        {
             return Err(DeviceAuthorizationError::InvalidConfiguration);
         }
-        wire::validate_scopes(&scopes).map_err(|_| DeviceAuthorizationError::InvalidConfiguration)?;
+        wire::validate_scopes(&scopes)
+            .map_err(|_| DeviceAuthorizationError::InvalidConfiguration)?;
         Ok(Self {
-            device_endpoint, token_endpoint, verification_origin, resource, client_id, scopes,
-            roots: Vec::new(), policy: DeviceAuthorizationPolicy::default(),
+            device_endpoint,
+            token_endpoint,
+            verification_origin,
+            resource,
+            client_id,
+            scopes,
+            roots: Vec::new(),
+            policy: DeviceAuthorizationPolicy::default(),
         })
     }
 
@@ -201,19 +244,28 @@ impl DeviceAuthorizationClient {
 
     /// Adds a private CA for both configured device/token endpoints, not the
     /// MCP resource or the user's separate browser. Hostname checking remains on.
-    pub fn with_extra_root_certificate(mut self, root: Certificate) -> Result<Self, DeviceAuthorizationError> {
+    pub fn with_extra_root_certificate(
+        mut self,
+        root: Certificate,
+    ) -> Result<Self, DeviceAuthorizationError> {
         let der = root.as_der();
-        if der.is_empty() || der.len() > 16 * 1024 || self.roots.len() >= 8
+        if der.is_empty()
+            || der.len() > 16 * 1024
+            || self.roots.len() >= 8
             || self.roots.iter().any(|existing| existing.as_slice() == der)
         {
             return Err(DeviceAuthorizationError::InvalidConfiguration);
         }
-        RootCertStore::empty().add(&root).map_err(|_| DeviceAuthorizationError::InvalidConfiguration)?;
+        RootCertStore::empty()
+            .add(&root)
+            .map_err(|_| DeviceAuthorizationError::InvalidConfiguration)?;
         self.roots.push(der.to_vec());
         Ok(self)
     }
 
-    pub fn resource(&self) -> &CanonicalHttpUrl { &self.resource }
+    pub fn resource(&self) -> &CanonicalHttpUrl {
+        &self.resource
+    }
 
     /// Requests one device code, presents it once, then polls at the issuer's
     /// minimum interval. `slow_down` adds five seconds permanently. Every poll
@@ -251,30 +303,55 @@ impl DeviceAuthorizationClient {
     {
         let deadline = operation_deadline(cx, cancellation, self.policy.timeout)?;
         let scope = self.scopes.join(" ");
-        let mut fields = vec![("client_id", self.client_id.as_str()), ("resource", self.resource.as_str())];
-        if !scope.is_empty() { fields.push(("scope", scope.as_str())); }
+        let mut fields = vec![
+            ("client_id", self.client_id.as_str()),
+            ("resource", self.resource.as_str()),
+        ];
+        if !scope.is_empty() {
+            fields.push(("scope", scope.as_str()));
+        }
         let body = wire::form(&fields)?;
         let started = cx.now();
-        let response = self.exchange(cx, cancellation, deadline, exchange, &self.device_endpoint, body).await?;
+        let response = self
+            .exchange(
+                cx,
+                cancellation,
+                deadline,
+                exchange,
+                &self.device_endpoint,
+                body,
+            )
+            .await?;
         if response.status != 200 {
-            return Err(DeviceAuthorizationError::EndpointRejected { status: response.status });
+            return Err(DeviceAuthorizationError::EndpointRejected {
+                status: response.status,
+            });
         }
         let (mut prompt, device_code, interval, lifetime) = wire::device(self, &response.body)?;
         // Count from BEFORE dispatch, not from response arrival or presentation.
         let deadline = deadline.min(add_time(started, lifetime)?);
         check(cx, cancellation, deadline)?;
-        prompt.expires_in = Duration::from_nanos(deadline.as_nanos().saturating_sub(cx.now().as_nanos()));
+        prompt.expires_in =
+            Duration::from_nanos(deadline.as_nanos().saturating_sub(cx.now().as_nanos()));
         within(cx, cancellation, deadline, async {
-            present(prompt).await.map_err(|_| DeviceAuthorizationError::PresentationFailed)
-        }).await?;
-        let mut schedule = PollSchedule { interval, polls: 0, maximum: self.policy.maximum_polls };
+            present(prompt)
+                .await
+                .map_err(|_| DeviceAuthorizationError::PresentationFailed)
+        })
+        .await?;
+        let mut schedule = PollSchedule {
+            interval,
+            polls: 0,
+            maximum: self.policy.maximum_polls,
+        };
         loop {
             check(cx, cancellation, deadline)?;
             let due = schedule.next(cx.now(), deadline)?;
             within(cx, cancellation, deadline, async {
                 Sleep::new(due).await;
                 Ok(())
-            }).await?;
+            })
+            .await?;
             check(cx, cancellation, deadline)?;
             let body = wire::form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
@@ -283,10 +360,20 @@ impl DeviceAuthorizationClient {
                 ("resource", self.resource.as_str()),
             ])?;
             let issued_at = Instant::now();
-            let response = self.exchange(cx, cancellation, deadline, exchange, &self.token_endpoint, body).await?;
+            let response = self
+                .exchange(
+                    cx,
+                    cancellation,
+                    deadline,
+                    exchange,
+                    &self.token_endpoint,
+                    body,
+                )
+                .await?;
             match wire::poll_response(response.status, &response.body)? {
                 wire::PollResponse::Token => {
-                    let credentials = wire::credentials(self, &self.scopes, &response.body, issued_at)?;
+                    let credentials =
+                        wire::credentials(self, &self.scopes, &response.body, issued_at)?;
                     check(cx, cancellation, deadline)?;
                     return Ok(credentials);
                 }
@@ -311,58 +398,110 @@ impl DeviceAuthorizationClient {
             // ambient restrictions, rather than handing I/O an unrestricted Cx.
             let caller = require_runtime(cx)?;
             exchange.post(&caller, endpoint, body).await
-        }).await
+        })
+        .await
     }
 }
 
-struct PollSchedule { interval: Duration, polls: u16, maximum: u16 }
+struct PollSchedule {
+    interval: Duration,
+    polls: u16,
+    maximum: u16,
+}
 impl PollSchedule {
     fn next(&mut self, now: Time, deadline: Time) -> Result<Time, DeviceAuthorizationError> {
-        if self.polls >= self.maximum { return Err(DeviceAuthorizationError::PollLimitExceeded); }
+        if self.polls >= self.maximum {
+            return Err(DeviceAuthorizationError::PollLimitExceeded);
+        }
         let due = add_time(now, self.interval)?;
-        if due >= deadline { return Err(DeviceAuthorizationError::TimedOut); }
+        if due >= deadline {
+            return Err(DeviceAuthorizationError::TimedOut);
+        }
         self.polls += 1;
         Ok(due)
     }
     fn slow_down(&mut self) -> Result<(), DeviceAuthorizationError> {
-        self.interval = self.interval.checked_add(Duration::from_secs(5))
+        self.interval = self
+            .interval
+            .checked_add(Duration::from_secs(5))
             .ok_or(DeviceAuthorizationError::InvalidResponse)?;
         Ok(())
     }
 }
 
-struct ExchangeResponse { status: u16, body: Vec<u8> }
-type ExchangeFuture<'a> = Pin<Box<dyn Future<Output = Result<ExchangeResponse, DeviceAuthorizationError>> + Send + 'a>>;
-trait FormExchange {
-    fn post<'a>(&'a mut self, cx: &'a Cx, endpoint: &'a CanonicalHttpUrl, body: Vec<u8>) -> ExchangeFuture<'a>;
+struct ExchangeResponse {
+    status: u16,
+    body: Vec<u8>,
 }
-struct NativeExchange<'a> { roots: &'a [Vec<u8>] }
+type ExchangeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ExchangeResponse, DeviceAuthorizationError>> + Send + 'a>>;
+trait FormExchange {
+    fn post<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        endpoint: &'a CanonicalHttpUrl,
+        body: Vec<u8>,
+    ) -> ExchangeFuture<'a>;
+}
+struct NativeExchange<'a> {
+    roots: &'a [Vec<u8>],
+}
 impl FormExchange for NativeExchange<'_> {
-    fn post<'a>(&'a mut self, cx: &'a Cx, endpoint: &'a CanonicalHttpUrl, body: Vec<u8>) -> ExchangeFuture<'a> {
+    fn post<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        endpoint: &'a CanonicalHttpUrl,
+        body: Vec<u8>,
+    ) -> ExchangeFuture<'a> {
         Box::pin(async move {
             let mut builder = HttpClient::builder()
-                .redirect_policy(RedirectPolicy::None).retry_policy(RetryPolicy::None)
-                .no_proxy().no_cookie_store().max_body_size(wire::MAX_RESPONSE_BYTES)
+                .redirect_policy(RedirectPolicy::None)
+                .retry_policy(RetryPolicy::None)
+                .no_proxy()
+                .no_cookie_store()
+                .max_body_size(wire::MAX_RESPONSE_BYTES)
                 .max_total_connections(1);
-            for root in self.roots { builder = builder.add_root_certificate(Certificate::from_der(root.clone())); }
-            let response = builder.build().request(cx, Method::Post, endpoint.as_str(), vec![
-                ("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
-                ("Accept".to_owned(), "application/json".to_owned()),
-                ("Accept-Encoding".to_owned(), "identity".to_owned()),
-                ("Connection".to_owned(), "close".to_owned()),
-            ], body).await.map_err(|_| DeviceAuthorizationError::TransportFailed)?;
+            for root in self.roots {
+                builder = builder.add_root_certificate(Certificate::from_der(root.clone()));
+            }
+            let response = builder
+                .build()
+                .request(
+                    cx,
+                    Method::Post,
+                    endpoint.as_str(),
+                    vec![
+                        (
+                            "Content-Type".to_owned(),
+                            "application/x-www-form-urlencoded".to_owned(),
+                        ),
+                        ("Accept".to_owned(), "application/json".to_owned()),
+                        ("Accept-Encoding".to_owned(), "identity".to_owned()),
+                        ("Connection".to_owned(), "close".to_owned()),
+                    ],
+                    body,
+                )
+                .await
+                .map_err(|_| DeviceAuthorizationError::TransportFailed)?;
             wire::headers(&response.headers)?;
             if !response.trailers.is_empty() || response.body.len() > wire::MAX_RESPONSE_BYTES {
                 return Err(DeviceAuthorizationError::InvalidResponse);
             }
-            Ok(ExchangeResponse { status: response.status, body: response.body })
+            Ok(ExchangeResponse {
+                status: response.status,
+                body: response.body,
+            })
         })
     }
 }
 
 fn add_time(now: Time, duration: Duration) -> Result<Time, DeviceAuthorizationError> {
-    let nanos = u64::try_from(duration.as_nanos()).map_err(|_| DeviceAuthorizationError::InvalidResponse)?;
-    now.as_nanos().checked_add(nanos).map(Time::from_nanos).ok_or(DeviceAuthorizationError::InvalidResponse)
+    let nanos = u64::try_from(duration.as_nanos())
+        .map_err(|_| DeviceAuthorizationError::InvalidResponse)?;
+    now.as_nanos()
+        .checked_add(nanos)
+        .map(Time::from_nanos)
+        .ok_or(DeviceAuthorizationError::InvalidResponse)
 }
 
 fn require_runtime(cx: &Cx) -> Result<Cx, DeviceAuthorizationError> {
@@ -374,7 +513,11 @@ fn require_runtime(cx: &Cx) -> Result<Cx, DeviceAuthorizationError> {
     Ok(active)
 }
 
-fn operation_deadline(cx: &Cx, cancellation: &McpRequestCancellation, timeout: Duration) -> Result<Time, DeviceAuthorizationError> {
+fn operation_deadline(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    timeout: Duration,
+) -> Result<Time, DeviceAuthorizationError> {
     with_caller(cx, || {
         check(cx, cancellation, Time::from_nanos(u64::MAX))?;
         require_runtime(cx)?;
@@ -385,38 +528,62 @@ fn operation_deadline(cx: &Cx, cancellation: &McpRequestCancellation, timeout: D
     })
 }
 
-fn check(cx: &Cx, cancellation: &McpRequestCancellation, deadline: Time) -> Result<(), DeviceAuthorizationError> {
+fn check(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    deadline: Time,
+) -> Result<(), DeviceAuthorizationError> {
     use asupersync::{CancelKind, error::ErrorKind};
-    if cancellation.is_cancel_requested() { return Err(DeviceAuthorizationError::Cancelled); }
+    if cancellation.is_cancel_requested() {
+        return Err(DeviceAuthorizationError::Cancelled);
+    }
     if cx.now() >= deadline || cx.budget().deadline.is_some_and(|end| cx.now() >= end) {
         return Err(DeviceAuthorizationError::TimedOut);
     }
-    cx.checkpoint().map_err(|error| match cx.cancel_reason().map(|reason| reason.kind) {
-        Some(CancelKind::Deadline | CancelKind::Timeout) => DeviceAuthorizationError::TimedOut,
-        Some(_) => DeviceAuthorizationError::Cancelled,
-        None => match error.kind() {
-            ErrorKind::DeadlineExceeded | ErrorKind::CancelTimeout => DeviceAuthorizationError::TimedOut,
-            _ => DeviceAuthorizationError::Cancelled,
-        },
-    })
+    cx.checkpoint()
+        .map_err(|error| match cx.cancel_reason().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => DeviceAuthorizationError::TimedOut,
+            Some(_) => DeviceAuthorizationError::Cancelled,
+            None => match error.kind() {
+                ErrorKind::DeadlineExceeded | ErrorKind::CancelTimeout => {
+                    DeviceAuthorizationError::TimedOut
+                }
+                _ => DeviceAuthorizationError::Cancelled,
+            },
+        })
 }
 
-async fn within<T>(cx: &Cx, cancellation: &McpRequestCancellation, deadline: Time, future: impl Future<Output = Result<T, DeviceAuthorizationError>>) -> Result<T, DeviceAuthorizationError> {
-    let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
+async fn within<T>(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    deadline: Time,
+    future: impl Future<Output = Result<T, DeviceAuthorizationError>>,
+) -> Result<T, DeviceAuthorizationError> {
+    let deadline = cx
+        .budget()
+        .deadline
+        .map_or(deadline, |parent| parent.min(deadline));
     let mut timer = std::pin::pin!(Sleep::new(deadline));
     let mut cancelled = std::pin::pin!(cancellation.cancelled());
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut caller_cancelled = std::pin::pin!(receiver.recv(cx));
     let mut future = Box::pin(future);
-    poll_fn(|task| with_caller(cx, || {
-        check(cx, cancellation, deadline)?;
-        require_runtime(cx)?;
-        if cancelled.as_mut().poll(task).is_ready() || caller_cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(DeviceAuthorizationError::Cancelled));
-        }
-        if timer.as_mut().poll(task).is_ready() { return Poll::Ready(Err(DeviceAuthorizationError::TimedOut)); }
-        let result = future.as_mut().poll(task);
-        check(cx, cancellation, deadline)?;
-        result
-    })).await
+    poll_fn(|task| {
+        with_caller(cx, || {
+            check(cx, cancellation, deadline)?;
+            require_runtime(cx)?;
+            if cancelled.as_mut().poll(task).is_ready()
+                || caller_cancelled.as_mut().poll(task).is_ready()
+            {
+                return Poll::Ready(Err(DeviceAuthorizationError::Cancelled));
+            }
+            if timer.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(DeviceAuthorizationError::TimedOut));
+            }
+            let result = future.as_mut().poll(task);
+            check(cx, cancellation, deadline)?;
+            result
+        })
+    })
+    .await
 }

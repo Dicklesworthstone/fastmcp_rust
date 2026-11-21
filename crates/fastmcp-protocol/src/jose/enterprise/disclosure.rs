@@ -89,7 +89,9 @@ pub struct IdJagDisclosurePolicy {
 
 impl fmt::Debug for IdJagDisclosurePolicy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("IdJagDisclosurePolicy").finish_non_exhaustive()
+        formatter
+            .debug_struct("IdJagDisclosurePolicy")
+            .finish_non_exhaustive()
     }
 }
 
@@ -105,8 +107,11 @@ impl IdJagDisclosurePolicy {
             || configuration.rules.len() > 4
             || configuration.reviewed_at < UNIX_EPOCH
             || configuration.review_expires_at <= configuration.reviewed_at
-            || configuration.review_expires_at.duration_since(configuration.reviewed_at)
-                .map_err(|_| invalid)? > MAX_DISCLOSURE_REVIEW_LIFETIME
+            || configuration
+                .review_expires_at
+                .duration_since(configuration.reviewed_at)
+                .map_err(|_| invalid)?
+                > MAX_DISCLOSURE_REVIEW_LIFETIME
         {
             return Err(invalid);
         }
@@ -135,8 +140,7 @@ impl IdJagDisclosurePolicy {
             framed(&mut bytes, claim.name().as_bytes());
             framed(&mut bytes, purpose.as_bytes());
         }
-        let configuration_digest = sha256_bounded(&bytes, MAX_POLICY_BYTES)
-            .map_err(|_| invalid)?;
+        let configuration_digest = sha256_bounded(&bytes, MAX_POLICY_BYTES).map_err(|_| invalid)?;
         Ok(Self {
             policy_id: configuration.policy_id,
             generation: configuration.generation,
@@ -150,13 +154,21 @@ impl IdJagDisclosurePolicy {
     }
 
     #[must_use]
-    pub fn policy_id(&self) -> &str { &self.policy_id }
+    pub fn policy_id(&self) -> &str {
+        &self.policy_id
+    }
     #[must_use]
-    pub const fn generation(&self) -> u64 { self.generation }
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
     #[must_use]
-    pub const fn configuration_digest(&self) -> Sha256Digest { self.configuration_digest }
+    pub const fn configuration_digest(&self) -> Sha256Digest {
+        self.configuration_digest
+    }
     #[must_use]
-    pub const fn review_expires_at(&self) -> SystemTime { self.review_expires_at }
+    pub const fn review_expires_at(&self) -> SystemTime {
+        self.review_expires_at
+    }
 
     pub(super) fn admit_context(
         &self,
@@ -212,20 +224,32 @@ pub struct IdJagDisclosureFacts {
 
 impl IdJagDisclosureFacts {
     #[must_use]
-    pub fn policy_id(&self) -> &str { &self.policy_id }
+    pub fn policy_id(&self) -> &str {
+        &self.policy_id
+    }
     #[must_use]
-    pub const fn generation(&self) -> u64 { self.generation }
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
     #[must_use]
-    pub const fn configuration_digest(&self) -> Sha256Digest { self.configuration_digest }
+    pub const fn configuration_digest(&self) -> Sha256Digest {
+        self.configuration_digest
+    }
     #[must_use]
-    pub const fn review_expires_at(&self) -> SystemTime { self.review_expires_at }
+    pub const fn review_expires_at(&self) -> SystemTime {
+        self.review_expires_at
+    }
     #[must_use]
-    pub fn admitted_claims(&self) -> &[IdJagDisclosureClaim] { &self.admitted_claims }
+    pub fn admitted_claims(&self) -> &[IdJagDisclosureClaim] {
+        &self.admitted_claims
+    }
 }
 
 impl fmt::Debug for IdJagDisclosureFacts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("IdJagDisclosureFacts").finish_non_exhaustive()
+        formatter
+            .debug_struct("IdJagDisclosureFacts")
+            .finish_non_exhaustive()
     }
 }
 
@@ -235,7 +259,9 @@ fn framed(bytes: &mut Vec<u8>, value: &[u8]) {
 }
 
 fn bounded_text(value: &str, maximum: usize) -> bool {
-    !value.is_empty() && value.len() <= maximum && value.trim() == value
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.trim() == value
         && !value.chars().any(char::is_control)
 }
 
@@ -252,14 +278,19 @@ fn validate_optional_claim(
             } else {
                 MAX_AUTHENTICATION_CONTEXT_BYTES
             };
-            if !value.as_str().is_some_and(|value| bounded_text(value, maximum)) {
+            if !value
+                .as_str()
+                .is_some_and(|value| bounded_text(value, maximum))
+            {
                 return Err(invalid);
             }
         }
         IdJagDisclosureClaim::AuthenticationTime => {
             let authentication = numeric_date(value).map_err(|_| invalid)?;
             let issued = numeric_date(claims.get("iat").ok_or(invalid)?).map_err(|_| invalid)?;
-            if authentication > issued { return Err(invalid); }
+            if authentication > issued {
+                return Err(invalid);
+            }
         }
         IdJagDisclosureClaim::AuthenticationMethods => {
             let methods = value.as_array().ok_or(invalid)?;
@@ -270,7 +301,8 @@ fn validate_optional_claim(
             let mut unique = std::collections::BTreeSet::new();
             for method in methods {
                 let method = method.as_str().ok_or(invalid)?;
-                if !bounded_text(method, MAX_AUTHENTICATION_METHOD_BYTES) || !unique.insert(method) {
+                if !bounded_text(method, MAX_AUTHENTICATION_METHOD_BYTES) || !unique.insert(method)
+                {
                     return Err(invalid);
                 }
             }

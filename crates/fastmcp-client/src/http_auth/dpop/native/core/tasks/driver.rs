@@ -17,23 +17,21 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputRequests};
 use fastmcp_protocol::{FinalRequestMeta, RequestId, ServerNotification};
 
-use super::{
-    Admitted, DpopCredential, DpopHttpClient, DpopHttpError, DpopHttpResponse,
-    DpopTaskOperation, DpopTasksError, ManagedCoreError, ManagedCoreLimits,
-    ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError, Prepared, WaitBounds,
-    check_live,
-};
 use super::super::super::within;
 use super::super::stream::{DpopStreamError, DpopStreamLimits, Idle, PreparedStream};
 use super::stream::{TaskStreamDecoder, progress_marker};
+use super::{
+    Admitted, DpopCredential, DpopHttpClient, DpopHttpError, DpopHttpResponse, DpopTaskOperation,
+    DpopTasksError, ManagedCoreError, ManagedCoreLimits, ManagedTaskEvent, ManagedTaskRequest,
+    ManagedTasksError, Prepared, WaitBounds, check_live,
+};
 use crate::http_auth::caller::with_caller;
 use crate::http_auth::managed::tasks::ManagedTaskRequestIds;
 use crate::http_auth::managed::tasks::driver::{
     DriverState, admit_capabilities, next_poll_time, validate_answers,
 };
 pub use crate::http_auth::managed::tasks::driver::{
-    ManagedTaskDriverError, ManagedTaskDriverPolicy, ManagedTaskInputAction,
-    ManagedTaskRunOutcome,
+    ManagedTaskDriverError, ManagedTaskDriverPolicy, ManagedTaskInputAction, ManagedTaskRunOutcome,
 };
 
 /// Sanitized failures; no Task ID, input, proof, token or peer text is retained.
@@ -61,19 +59,29 @@ impl fmt::Display for DpopTaskDriverError {
 
 impl std::error::Error for DpopTaskDriverError {}
 impl From<ManagedTaskDriverError> for DpopTaskDriverError {
-    fn from(error: ManagedTaskDriverError) -> Self { Self::Driver(error) }
+    fn from(error: ManagedTaskDriverError) -> Self {
+        Self::Driver(error)
+    }
 }
 impl From<DpopTasksError> for DpopTaskDriverError {
-    fn from(error: DpopTasksError) -> Self { Self::Task(error) }
+    fn from(error: DpopTasksError) -> Self {
+        Self::Task(error)
+    }
 }
 impl From<ManagedTasksError> for DpopTaskDriverError {
-    fn from(error: ManagedTasksError) -> Self { Self::Task(error.into()) }
+    fn from(error: ManagedTasksError) -> Self {
+        Self::Task(error.into())
+    }
 }
 impl From<ManagedCoreError> for DpopTaskDriverError {
-    fn from(error: ManagedCoreError) -> Self { Self::Task(error.into()) }
+    fn from(error: ManagedCoreError) -> Self {
+        Self::Task(error.into())
+    }
 }
 impl From<DpopHttpError> for DpopTaskDriverError {
-    fn from(error: DpopHttpError) -> Self { Self::Task(error.into()) }
+    fn from(error: DpopHttpError) -> Self {
+        Self::Task(error.into())
+    }
 }
 
 impl From<DpopStreamError> for DpopTaskDriverError {
@@ -114,7 +122,9 @@ impl Run {
     ) -> Result<Self, DpopTaskDriverError> {
         if prefix.is_empty()
             || prefix.len() > 128
-            || !prefix.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            || !prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
         {
             return Err(DpopTaskDriverError::InvalidIdPrefix);
         }
@@ -157,7 +167,9 @@ impl Run {
         if self.remaining_bytes == 0 {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
-        let next = self.sequence.checked_add(1)
+        let next = self
+            .sequence
+            .checked_add(1)
             .ok_or(DpopTaskDriverError::IdentityExhausted)?;
         let discovery = RequestId::String(format!("{}.{}.discover", self.prefix, self.sequence));
         let operation = RequestId::String(format!("{}.{}.task", self.prefix, self.sequence));
@@ -166,14 +178,21 @@ impl Run {
         let prepared = Prepared::new(target, metadata, operation, limits, native_maximum)?;
         // ID custody and answer custody share the existing bounded ledger.
         // Reserve only after both actual wire requests have passed admission.
-        self.state.reserve_ids(&ids, self.policy.maximum_state_bytes)?;
+        self.state
+            .reserve_ids(&ids, self.policy.maximum_state_bytes)?;
         self.sequence = next;
-        if update { self.updates += 1; } else { self.polls += 1; }
+        if update {
+            self.updates += 1;
+        } else {
+            self.polls += 1;
+        }
         Ok(prepared)
     }
 
     fn charge(&mut self, bytes: usize) -> Result<(), DpopTaskDriverError> {
-        self.remaining_bytes = self.remaining_bytes.checked_sub(bytes)
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(bytes)
             .ok_or(ManagedCoreError::ResponseByteLimit)?;
         Ok(())
     }
@@ -197,8 +216,13 @@ impl Run {
 
     // Stream decoders inherit ALL prior payloads, including the discovery
     // already charged by admit. A fresh parser is not a fresh run budget.
-    fn stream_usage(&self, limits: ManagedCoreLimits) -> Result<(usize, usize), DpopTaskDriverError> {
-        let bytes = limits.total_bytes().checked_sub(self.remaining_bytes)
+    fn stream_usage(
+        &self,
+        limits: ManagedCoreLimits,
+    ) -> Result<(usize, usize), DpopTaskDriverError> {
+        let bytes = limits
+            .total_bytes()
+            .checked_sub(self.remaining_bytes)
             .ok_or(ManagedCoreError::ResponseByteLimit)?;
         Ok((bytes, self.notifications))
     }
@@ -294,9 +318,18 @@ impl DpopHttpClient {
         O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
     {
         self.drive_task_with_cancellation(
-            cx, &McpRequestCancellation::new(), credential, metadata, task_id,
-            id_prefix, policy, limits, resolve, observe,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            credential,
+            metadata,
+            task_id,
+            id_prefix,
+            policy,
+            limits,
+            resolve,
+            observe,
+        )
+        .await
     }
 
     /// Local cancellation covers network waits, poll delays and pending host
@@ -325,10 +358,19 @@ impl DpopHttpClient {
         // Reuse the explicit stream path's decoder, quotas and cancellation
         // guard rather than maintaining a second default execution path.
         self.drive_task_with_events(
-            cx, cancellation, credential, metadata, task_id, id_prefix, policy,
-            DpopStreamLimits::new(limits, limits.timeout())?, resolve, observe,
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task_id,
+            id_prefix,
+            policy,
+            DpopStreamLimits::new(limits, limits.timeout())?,
+            resolve,
+            observe,
             |_| true,
-        ).await
+        )
+        .await
     }
 
     /// Explicit JSON-only compatibility mode for an existing Task lifecycle.
@@ -358,9 +400,20 @@ impl DpopHttpClient {
         O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
     {
         self.drive_task_inner(
-            cx, cancellation, credential, metadata, task_id, id_prefix, policy,
-            limits, ReplyMode::Json, resolve, observe, |_| true,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task_id,
+            id_prefix,
+            policy,
+            limits,
+            ReplyMode::Json,
+            resolve,
+            observe,
+            |_| true,
+        )
+        .await
     }
 
     /// Follow one existing Task with incremental operation notifications and
@@ -410,9 +463,20 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         self.drive_task_inner(
-            cx, cancellation, credential, metadata, task_id, id_prefix, policy,
-            limits.core, ReplyMode::Stream(limits), resolve, observe, notify,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task_id,
+            id_prefix,
+            policy,
+            limits.core,
+            ReplyMode::Stream(limits),
+            resolve,
+            observe,
+            notify,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -443,14 +507,29 @@ impl DpopHttpClient {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(DpopHttpError::Cancelled.into());
         }
-        let timeout = policy.timeout.min(limits.timeout()).min(self.policy.timeout);
+        let timeout = policy
+            .timeout
+            .min(limits.timeout())
+            .min(self.policy.timeout);
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let run = Run::new(id_prefix, policy, limits)?;
         self.drive_task_run(
-            cx, cancellation, credential, metadata, task_id, run, bounds,
-            limits, mode, None, resolve, observe, notify,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task_id,
+            run,
+            bounds,
+            limits,
+            mode,
+            None,
+            resolve,
+            observe,
+            notify,
+        )
+        .await
     }
 
     // Both existing-Task and creating-tool entrypoints use this lifecycle.
@@ -480,8 +559,8 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         let policy = run.policy;
-        let input_metadata = serde_json::to_value(&metadata)
-            .map_err(|_| ManagedTasksError::InvalidRequest)?;
+        let input_metadata =
+            serde_json::to_value(&metadata).map_err(|_| ManagedTasksError::InvalidRequest)?;
         let mut due = cx.now();
         loop {
             check_live(cx, cancellation, &self.session, credential, bounds)?;
@@ -498,13 +577,29 @@ impl DpopHttpClient {
                     within(cx, cancellation, &self.session, credential, bounds, async {
                         Sleep::new(due).await;
                         Ok(())
-                    }).await?;
+                    })
+                    .await?;
                 }
                 check_live(cx, cancellation, &self.session, credential, bounds)?;
-                let prepared = run.prepare(self.resource().as_str(), metadata.clone(),
-                    ManagedTaskRequest::Get(task_id.clone()), limits, self.policy.max_body_bytes)?;
-                let event = self.drive_task_selected_pair(cx, cancellation, credential, bounds,
-                    &mut run, prepared, mode, &mut notify).await?;
+                let prepared = run.prepare(
+                    self.resource().as_str(),
+                    metadata.clone(),
+                    ManagedTaskRequest::Get(task_id.clone()),
+                    limits,
+                    self.policy.max_body_bytes,
+                )?;
+                let event = self
+                    .drive_task_selected_pair(
+                        cx,
+                        cancellation,
+                        credential,
+                        bounds,
+                        &mut run,
+                        prepared,
+                        mode,
+                        &mut notify,
+                    )
+                    .await?;
                 let ManagedTaskEvent::Snapshot(snapshot) = event else {
                     return Err(ManagedTaskDriverError::UnexpectedResponse.into());
                 };
@@ -515,16 +610,23 @@ impl DpopHttpClient {
             let observed = with_caller(cx, || observe(&task));
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             observed?;
-            if matches!(task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
+            if matches!(
+                task,
+                Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)
+            ) {
                 return Ok(ManagedTaskRunOutcome::Terminal(Box::new(task)));
             }
             if policy.maximum_updates == 0 && matches!(task, Task::InputRequired { .. }) {
                 return Ok(ManagedTaskRunOutcome::InputRequired(Box::new(task)));
             }
             due = next_poll_time(received, &task, policy.minimum_poll_interval)?;
-            let Task::InputRequired { input_requests, .. } = &task else { continue; };
+            let Task::InputRequired { input_requests, .. } = &task else {
+                continue;
+            };
             let (pending, fingerprints) = run.state.unanswered(input_requests, policy)?;
-            if pending.is_empty() { continue; }
+            if pending.is_empty() {
+                continue;
+            }
             if run.updates >= policy.maximum_updates {
                 return Err(ManagedTaskDriverError::UpdateLimit.into());
             }
@@ -532,27 +634,48 @@ impl DpopHttpClient {
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             let resolution = with_caller(cx, || resolve(callback_inputs));
             check_live(cx, cancellation, &self.session, credential, bounds)?;
-            let action = within(cx, cancellation, &self.session, credential, bounds,
-                async { Ok(resolution.await) }).await?;
+            let action = within(cx, cancellation, &self.session, credential, bounds, async {
+                Ok(resolution.await)
+            })
+            .await?;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             let ManagedTaskInputAction::Respond(responses) = action? else {
                 return Ok(ManagedTaskRunOutcome::InputRequired(Box::new(task)));
             };
             validate_answers(&pending, &responses)?;
             let answered: Vec<_> = responses.keys().cloned().collect();
-            let prepared = run.prepare(self.resource().as_str(), metadata.clone(),
-                ManagedTaskRequest::Update { task: Box::new(task), input_responses: responses },
-                limits, self.policy.max_body_bytes)?;
+            let prepared = run.prepare(
+                self.resource().as_str(),
+                metadata.clone(),
+                ManagedTaskRequest::Update {
+                    task: Box::new(task),
+                    input_responses: responses,
+                },
+                limits,
+                self.policy.max_body_bytes,
+            )?;
             // Include the update's new ID reservation before checking whether
             // its ACK can fit. Do not post an answer that cannot be remembered.
-            run.state.answer_bytes(&answered, &fingerprints, policy.maximum_state_bytes)?;
-            let event = self.drive_task_selected_pair(cx, cancellation, credential, bounds,
-                &mut run, prepared, mode, &mut notify).await?;
+            run.state
+                .answer_bytes(&answered, &fingerprints, policy.maximum_state_bytes)?;
+            let event = self
+                .drive_task_selected_pair(
+                    cx,
+                    cancellation,
+                    credential,
+                    bounds,
+                    &mut run,
+                    prepared,
+                    mode,
+                    &mut notify,
+                )
+                .await?;
             if !matches!(event, ManagedTaskEvent::Updated(_)) {
                 return Err(ManagedTaskDriverError::UnexpectedResponse.into());
             }
             check_live(cx, cancellation, &self.session, credential, bounds)?;
-            run.state.record_answers(&answered, &fingerprints, policy.maximum_state_bytes)?;
+            run.state
+                .record_answers(&answered, &fingerprints, policy.maximum_state_bytes)?;
         }
     }
 
@@ -572,7 +695,9 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         let ReplyMode::Stream(limits) = mode else {
-            return self.drive_task_pair(cx, cancellation, credential, bounds, run, prepared).await;
+            return self
+                .drive_task_pair(cx, cancellation, credential, bounds, run, prepared)
+                .await;
         };
         let idle = Idle::new(cx.now(), limits.idle);
         let pair_bounds = idle.bounds(bounds);
@@ -582,22 +707,43 @@ impl DpopHttpClient {
         // no authority to acknowledge host input.
         let progress = progress_marker(&prepared.operation_wire, limits.core.request_bytes())?;
         check_live(cx, cancellation, &self.session, credential, pair_bounds)?;
-        let response = self.post_resource_with_bounds(cx, cancellation, credential,
-            &prepared.discovery_wire, pair_bounds).await?;
+        let response = self
+            .post_resource_with_bounds(
+                cx,
+                cancellation,
+                credential,
+                &prepared.discovery_wire,
+                pair_bounds,
+            )
+            .await?;
         check_live(cx, cancellation, &self.session, credential, pair_bounds)?;
         let admitted = run.admit(prepared, response)?;
         check_live(cx, cancellation, &self.session, credential, pair_bounds)?;
         let (wire, decoder) = TaskStreamDecoder::with_usage(
-            admitted, limits.core, run.stream_usage(limits.core)?, progress,
+            admitted,
+            limits.core,
+            run.stream_usage(limits.core)?,
+            progress,
         )?;
         // The shared native reader alone decides EOF, proof/nonce handling,
         // observer context, framing and cooperative ready-body yielding. The
         // same absolute bounds enter every round; no public request wrapper
         // may manufacture a new timeout or discard cumulative accounting here.
-        let completed = self.execute_prepared_core_stream(
-            cx, cancellation, credential,
-            PreparedStream { wire, decoder, limits, bounds, idle }, notify,
-        ).await?;
+        let completed = self
+            .execute_prepared_core_stream(
+                cx,
+                cancellation,
+                credential,
+                PreparedStream {
+                    wire,
+                    decoder,
+                    limits,
+                    bounds,
+                    idle,
+                },
+                notify,
+            )
+            .await?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         run.complete_stream(completed.usage, limits.core)?;
         Ok(completed.result)
@@ -613,14 +759,22 @@ impl DpopHttpClient {
         prepared: Prepared,
     ) -> Result<ManagedTaskEvent, DpopTaskDriverError> {
         check_live(cx, cancellation, &self.session, credential, bounds)?;
-        let response = self.post_resource_with_bounds(cx, cancellation, credential,
-            &prepared.discovery_wire, bounds).await?;
+        let response = self
+            .post_resource_with_bounds(
+                cx,
+                cancellation,
+                credential,
+                &prepared.discovery_wire,
+                bounds,
+            )
+            .await?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let admitted = run.admit(prepared, response);
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let admitted = admitted?;
-        let response = self.post_resource_with_bounds(cx, cancellation, credential,
-            &admitted.wire, bounds).await?;
+        let response = self
+            .post_resource_with_bounds(cx, cancellation, credential, &admitted.wire, bounds)
+            .await?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let event = run.finish(admitted, response);
         check_live(cx, cancellation, &self.session, credential, bounds)?;
@@ -647,17 +801,26 @@ mod cancellation_preflight_tests {
     fn client() -> (DpopHttpClient, DpopCredential) {
         let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
         let resource = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
-        let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(), resource)
+        let session =
+            DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(), resource).unwrap();
+        let credential = session
+            .admit_token_response(
+                &issuer,
+                200,
+                br#"{"access_token":"preflight-token","token_type":"DPoP","expires_in":60}"#,
+                Instant::now(),
+                Duration::from_secs(60),
+            )
             .unwrap();
-        let credential = session.admit_token_response(
-            &issuer, 200,
-            br#"{"access_token":"preflight-token","token_type":"DPoP","expires_in":60}"#,
-            Instant::now(), Duration::from_secs(60),
-        ).unwrap();
-        (DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap(), credential)
+        (
+            DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap(),
+            credential,
+        )
     }
 
-    fn no_input(_: TaskInputRequests) -> Ready<Result<ManagedTaskInputAction, ManagedTaskDriverError>> {
+    fn no_input(
+        _: TaskInputRequests,
+    ) -> Ready<Result<ManagedTaskInputAction, ManagedTaskDriverError>> {
         panic!("preflight refusal must not invoke an input resolver")
     }
 
@@ -672,21 +835,36 @@ mod cancellation_preflight_tests {
         let metadata = FinalRequestMeta::new(ClientCapabilities::default());
         let task_id = TaskId::parse("task-one").unwrap();
         let policy = ManagedTaskDriverPolicy::default();
-        let mut drive: Pin<Box<dyn Future<Output = Result<ManagedTaskRunOutcome, DpopTaskDriverError>> + '_>> =
-            if streamed {
-                Box::pin(client.drive_task_with_events(
-                    cx, cancellation, credential, metadata, task_id, prefix, policy,
-                    DpopStreamLimits::default(), no_input,
-                    |_| panic!("preflight refusal must not invoke a snapshot observer"),
-                    |_| panic!("preflight refusal must not invoke a notification observer"),
-                ))
-            } else {
-                Box::pin(client.drive_task_with_cancellation(
-                    cx, cancellation, credential, metadata, task_id, prefix, policy,
-                    ManagedCoreLimits::default(), no_input,
-                    |_| panic!("preflight refusal must not invoke a snapshot observer"),
-                ))
-            };
+        let mut drive: Pin<
+            Box<dyn Future<Output = Result<ManagedTaskRunOutcome, DpopTaskDriverError>> + '_>,
+        > = if streamed {
+            Box::pin(client.drive_task_with_events(
+                cx,
+                cancellation,
+                credential,
+                metadata,
+                task_id,
+                prefix,
+                policy,
+                DpopStreamLimits::default(),
+                no_input,
+                |_| panic!("preflight refusal must not invoke a snapshot observer"),
+                |_| panic!("preflight refusal must not invoke a notification observer"),
+            ))
+        } else {
+            Box::pin(client.drive_task_with_cancellation(
+                cx,
+                cancellation,
+                credential,
+                metadata,
+                task_id,
+                prefix,
+                policy,
+                ManagedCoreLimits::default(),
+                no_input,
+                |_| panic!("preflight refusal must not invoke a snapshot observer"),
+            ))
+        };
         match drive.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(Err(DpopTaskDriverError::Task(DpopTasksError::Core(
                 super::super::DpopCoreError::Transport(error),
@@ -703,10 +881,21 @@ mod cancellation_preflight_tests {
                     let cx = Cx::for_testing();
                     assert!(cx.timer_driver().is_none());
                     let cancellation = McpRequestCancellation::new();
-                    if cancel_cx { cx.set_cancel_requested(true); } else { cancellation.cancel(); }
+                    if cancel_cx {
+                        cx.set_cancel_requested(true);
+                    } else {
+                        cancellation.cancel();
+                    }
                     let (mut client, credential) = client();
                     assert_eq!(
-                        first_poll(&mut client, &cx, &cancellation, &credential, streamed, prefix),
+                        first_poll(
+                            &mut client,
+                            &cx,
+                            &cancellation,
+                            &credential,
+                            streamed,
+                            prefix
+                        ),
                         DpopHttpError::Cancelled,
                     );
                     assert_eq!(cx.checkpoint().is_err(), cancel_cx);
@@ -716,8 +905,14 @@ mod cancellation_preflight_tests {
                     // missing runtime authority to a subsequent explicit call.
                     let fresh_cx = Cx::for_testing();
                     assert_eq!(
-                        first_poll(&mut client, &fresh_cx, &McpRequestCancellation::new(),
-                            &credential, streamed, "fresh"),
+                        first_poll(
+                            &mut client,
+                            &fresh_cx,
+                            &McpRequestCancellation::new(),
+                            &credential,
+                            streamed,
+                            "fresh"
+                        ),
                         DpopHttpError::RuntimeUnavailable,
                     );
                 }
@@ -734,7 +929,14 @@ mod cancellation_preflight_tests {
             let (mut client, credential) = client();
             credential.revoke();
             assert_eq!(
-                first_poll(&mut client, &cx, &cancellation, &credential, streamed, "valid"),
+                first_poll(
+                    &mut client,
+                    &cx,
+                    &cancellation,
+                    &credential,
+                    streamed,
+                    "valid"
+                ),
                 DpopHttpError::Cancelled,
             );
             assert!(cx.checkpoint().is_ok());

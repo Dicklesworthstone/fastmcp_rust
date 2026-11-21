@@ -137,8 +137,13 @@ impl PersistentEnvelopeLimits {
             || !(1024..=256 * MIB).contains(&self.in_flight_bytes)
             || self.call_timeout.is_zero()
             || self.call_timeout > Duration::from_secs(60)
-            || self.plaintext_bytes.checked_add(199).is_none_or(|n| n > self.envelope_bytes)
-            || self.envelope_bytes.checked_add(self.plaintext_bytes)
+            || self
+                .plaintext_bytes
+                .checked_add(199)
+                .is_none_or(|n| n > self.envelope_bytes)
+            || self
+                .envelope_bytes
+                .checked_add(self.plaintext_bytes)
                 .and_then(|n| n.checked_add(self.aad_bytes))
                 .and_then(|n| n.checked_add(CONTROL_RESERVE))
                 .is_none_or(|n| n > self.in_flight_bytes)
@@ -171,15 +176,18 @@ pub struct PersistentEnvelopeConfiguration {
 impl PersistentEnvelopeConfiguration {
     fn validate(&self) -> Result<(), PersistentEnvelopeError> {
         self.limits.validate()?;
-        if !identifier(&self.artifact) || self.ring_generation == 0
-            || self.keys.is_empty() || self.keys.len() > 8
+        if !identifier(&self.artifact)
+            || self.ring_generation == 0
+            || self.keys.is_empty()
+            || self.keys.len() > 8
             || self.keys.iter().filter(|key| key.sealing).count() != 1
         {
             return Err(PersistentEnvelopeError::InvalidConfiguration);
         }
         let mut unique = BTreeSet::new();
         for key in &self.keys {
-            if !codec::key_identifier(&key.key_id) || key.generation == 0
+            if !codec::key_identifier(&key.key_id)
+                || key.generation == 0
                 || !unique.insert((&key.key_id, key.generation))
             {
                 return Err(PersistentEnvelopeError::InvalidConfiguration);
@@ -188,8 +196,11 @@ impl PersistentEnvelopeConfiguration {
         Ok(())
     }
     fn admits(&self, header: &PersistentEnvelopeHeader, sealing: bool) -> bool {
-        self.keys.iter().any(|key| key.key_id == header.key_id()
-            && key.generation == header.generation() && (!sealing || key.sealing))
+        self.keys.iter().any(|key| {
+            key.key_id == header.key_id()
+                && key.generation == header.generation()
+                && (!sealing || key.sealing)
+        })
     }
 }
 
@@ -222,7 +233,10 @@ impl BoundedPlaintext {
         if bytes.len() > MAX_PLAINTEXT || bytes.capacity() > MAX_PLAINTEXT {
             return Err(PersistentEnvelopeError::TooLarge);
         }
-        Ok(Self { bytes, admission: None })
+        Ok(Self {
+            bytes,
+            admission: None,
+        })
     }
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
@@ -248,10 +262,18 @@ pub struct PersistentBlobRevision {
     envelope_digest: [u8; 32],
 }
 impl PersistentBlobRevision {
-    pub const fn namespace_digest(&self) -> [u8; 32] { self.namespace }
-    pub const fn record_id(&self) -> [u8; 16] { self.record_id }
-    pub const fn generation(&self) -> u64 { self.generation }
-    pub const fn envelope_digest(&self) -> [u8; 32] { self.envelope_digest }
+    pub const fn namespace_digest(&self) -> [u8; 32] {
+        self.namespace
+    }
+    pub const fn record_id(&self) -> [u8; 16] {
+        self.record_id
+    }
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub const fn envelope_digest(&self) -> [u8; 32] {
+        self.envelope_digest
+    }
     pub fn encode(&self) -> [u8; REVISION_BYTES] {
         let mut out = [0; REVISION_BYTES];
         out[..10].copy_from_slice(b"FMCPBLR\0\0\x01");
@@ -265,14 +287,25 @@ impl PersistentBlobRevision {
         if bytes.len() != REVISION_BYTES || bytes[..10] != *b"FMCPBLR\0\0\x01" {
             return Err(PersistentEnvelopeError::InvalidRevision);
         }
-        let generation = u64::from_be_bytes(bytes[58..66].try_into()
-            .map_err(|_| PersistentEnvelopeError::InvalidRevision)?);
-        if generation == 0 { return Err(PersistentEnvelopeError::InvalidRevision); }
+        let generation = u64::from_be_bytes(
+            bytes[58..66]
+                .try_into()
+                .map_err(|_| PersistentEnvelopeError::InvalidRevision)?,
+        );
+        if generation == 0 {
+            return Err(PersistentEnvelopeError::InvalidRevision);
+        }
         Ok(Self {
-            namespace: bytes[10..42].try_into().map_err(|_| PersistentEnvelopeError::InvalidRevision)?,
-            record_id: bytes[42..58].try_into().map_err(|_| PersistentEnvelopeError::InvalidRevision)?,
+            namespace: bytes[10..42]
+                .try_into()
+                .map_err(|_| PersistentEnvelopeError::InvalidRevision)?,
+            record_id: bytes[42..58]
+                .try_into()
+                .map_err(|_| PersistentEnvelopeError::InvalidRevision)?,
             generation,
-            envelope_digest: bytes[66..].try_into().map_err(|_| PersistentEnvelopeError::InvalidRevision)?,
+            envelope_digest: bytes[66..]
+                .try_into()
+                .map_err(|_| PersistentEnvelopeError::InvalidRevision)?,
         })
     }
 }
@@ -285,7 +318,11 @@ struct BlobIndex {
 }
 impl BlobIndex {
     fn from_revision(revision: &PersistentBlobRevision) -> Self {
-        Self { namespace: revision.namespace, record_id: revision.record_id, generation: revision.generation }
+        Self {
+            namespace: revision.namespace,
+            record_id: revision.record_id,
+            generation: revision.generation,
+        }
     }
     fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.namespace);
@@ -307,18 +344,39 @@ pub struct ExpectedEnvelopeContext<'a> {
     aad_limit: usize,
 }
 impl ExpectedEnvelopeContext<'_> {
-    pub fn restore_binding(&self) -> &RestoreEpochBinding { self.binding }
-    pub const fn deployment_uuid(&self) -> [u8; 16] { self.deployment_uuid }
-    pub const fn namespace_digest(&self) -> [u8; 32] { self.index.namespace }
-    pub const fn record_id(&self) -> [u8; 16] { self.index.record_id }
-    pub const fn record_generation(&self) -> u64 { self.index.generation }
-    pub const fn store_set_digest(&self) -> [u8; 32] { self.store_set_digest }
-    pub const fn blob_artifact_digest(&self) -> [u8; 32] { self.blob_artifact_digest }
-    pub const fn blob_configuration_fingerprint(&self) -> [u8; 32] { self.blob_configuration_fingerprint }
-    pub const fn blob_generation(&self) -> u64 { self.blob_generation }
+    pub fn restore_binding(&self) -> &RestoreEpochBinding {
+        self.binding
+    }
+    pub const fn deployment_uuid(&self) -> [u8; 16] {
+        self.deployment_uuid
+    }
+    pub const fn namespace_digest(&self) -> [u8; 32] {
+        self.index.namespace
+    }
+    pub const fn record_id(&self) -> [u8; 16] {
+        self.index.record_id
+    }
+    pub const fn record_generation(&self) -> u64 {
+        self.index.generation
+    }
+    pub const fn store_set_digest(&self) -> [u8; 32] {
+        self.store_set_digest
+    }
+    pub const fn blob_artifact_digest(&self) -> [u8; 32] {
+        self.blob_artifact_digest
+    }
+    pub const fn blob_configuration_fingerprint(&self) -> [u8; 32] {
+        self.blob_configuration_fingerprint
+    }
+    pub const fn blob_generation(&self) -> u64 {
+        self.blob_generation
+    }
     /// Shared canonical FMCPENV v1 encoder. The sole purpose is ProtectedBlob
     /// (1), section is Payload, and lifetime discriminator is Persistent (2).
-    pub fn canonical_aad(&self, header: &PersistentEnvelopeHeader) -> Result<Vec<u8>, PersistentEnvelopeError> {
+    pub fn canonical_aad(
+        &self,
+        header: &PersistentEnvelopeHeader,
+    ) -> Result<Vec<u8>, PersistentEnvelopeError> {
         codec::aad(self, header)
     }
 }
@@ -334,13 +392,27 @@ pub struct PersistentEnvelopeRequest<'a> {
     plaintext_bytes: usize,
 }
 impl PersistentEnvelopeRequest<'_> {
-    pub const fn version(&self) -> u16 { 1 }
-    pub const fn operation_id(&self) -> [u8; 16] { self.operation_id }
-    pub const fn request_digest(&self) -> [u8; 32] { self.request_digest }
-    pub const fn deadline(&self) -> Time { self.deadline }
-    pub fn configuration(&self) -> &PersistentEnvelopeConfiguration { self.configuration }
-    pub fn context(&self) -> &ExpectedEnvelopeContext<'_> { &self.context }
-    pub const fn plaintext_bytes(&self) -> usize { self.plaintext_bytes }
+    pub const fn version(&self) -> u16 {
+        1
+    }
+    pub const fn operation_id(&self) -> [u8; 16] {
+        self.operation_id
+    }
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    pub const fn deadline(&self) -> Time {
+        self.deadline
+    }
+    pub fn configuration(&self) -> &PersistentEnvelopeConfiguration {
+        self.configuration
+    }
+    pub fn context(&self) -> &ExpectedEnvelopeContext<'_> {
+        &self.context
+    }
+    pub const fn plaintext_bytes(&self) -> usize {
+        self.plaintext_bytes
+    }
 }
 
 /// Provider attestation/correlation, not independent cryptographic proof.
@@ -356,7 +428,10 @@ pub struct PersistentEnvelopeReceipt {
 impl PersistentEnvelopeReceipt {
     /// Convenience for provider implementations; truthful AEAD and durable nonce
     /// allocation still require provider qualification.
-    pub fn for_request(request: &PersistentEnvelopeRequest<'_>, envelope: &CanonicalEnvelope) -> Result<Self, PersistentEnvelopeError> {
+    pub fn for_request(
+        request: &PersistentEnvelopeRequest<'_>,
+        envelope: &CanonicalEnvelope,
+    ) -> Result<Self, PersistentEnvelopeError> {
         let header = envelope.header()?;
         Ok(Self {
             operation_id: request.operation_id,
@@ -378,12 +453,17 @@ pub struct PersistentOpenResult {
     pub receipt: PersistentEnvelopeReceipt,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PersistentBackendFailureKind { Unavailable, AuthenticationFailed, Conflict }
+pub enum PersistentBackendFailureKind {
+    Unavailable,
+    AuthenticationFailed,
+    Conflict,
+}
 pub struct PersistentBackendFailure {
     pub dispatch: RestoreDispatch,
     pub kind: PersistentBackendFailureKind,
 }
-pub type PersistentBackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PersistentBackendFailure>> + Send + 'a>>;
+pub type PersistentBackendFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, PersistentBackendFailure>> + Send + 'a>>;
 
 /// Complete external persistent crypto custody. Implementers own rollback-safe
 /// nonce domains/ranges, key protection, XC20P AEAD, rotation and late-result
@@ -393,10 +473,16 @@ pub type PersistentBackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, 
 /// Dropping a future is not permission to leak buffers or reuse a nonce.
 pub trait PersistentEnvelopeBackend: Send + Sync + 'static {
     fn seal<'a>(
-        &'a self, cx: &'a Cx, request: &'a PersistentEnvelopeRequest<'a>, plaintext: BoundedPlaintext,
+        &'a self,
+        cx: &'a Cx,
+        request: &'a PersistentEnvelopeRequest<'a>,
+        plaintext: BoundedPlaintext,
     ) -> PersistentBackendFuture<'a, PersistentSealResult>;
     fn open<'a>(
-        &'a self, cx: &'a Cx, request: &'a PersistentEnvelopeRequest<'a>, envelope: &'a CanonicalEnvelope,
+        &'a self,
+        cx: &'a Cx,
+        request: &'a PersistentEnvelopeRequest<'a>,
+        envelope: &'a CanonicalEnvelope,
     ) -> PersistentBackendFuture<'a, PersistentOpenResult>;
 }
 
@@ -422,16 +508,36 @@ pub struct PersistentBlobReadRequest<'a> {
     deadline: Time,
 }
 impl PersistentBlobReadRequest<'_> {
-    pub const fn operation_id(&self) -> [u8; 16] { self.operation_id }
-    pub const fn request_digest(&self) -> [u8; 32] { self.request_digest }
-    pub fn configuration(&self) -> &PersistentBlobBackendConfiguration { self.configuration }
-    pub fn store_id(&self) -> &str { self.store_id }
-    pub const fn store_set_digest(&self) -> [u8; 32] { self.store_set_digest }
-    pub const fn binding_digest(&self) -> [u8; 32] { self.binding_digest }
-    pub const fn store_fence_generation(&self) -> u64 { self.store_fence_generation }
-    pub const fn expected_revision(&self) -> PersistentBlobRevision { self.expected }
-    pub const fn max_envelope_bytes(&self) -> usize { self.envelope_bytes }
-    pub const fn deadline(&self) -> Time { self.deadline }
+    pub const fn operation_id(&self) -> [u8; 16] {
+        self.operation_id
+    }
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    pub fn configuration(&self) -> &PersistentBlobBackendConfiguration {
+        self.configuration
+    }
+    pub fn store_id(&self) -> &str {
+        self.store_id
+    }
+    pub const fn store_set_digest(&self) -> [u8; 32] {
+        self.store_set_digest
+    }
+    pub const fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+    pub const fn store_fence_generation(&self) -> u64 {
+        self.store_fence_generation
+    }
+    pub const fn expected_revision(&self) -> PersistentBlobRevision {
+        self.expected
+    }
+    pub const fn max_envelope_bytes(&self) -> usize {
+        self.envelope_bytes
+    }
+    pub const fn deadline(&self) -> Time {
+        self.deadline
+    }
     pub fn receipt(&self) -> PersistentBlobReceipt {
         blob_receipt(self.operation_id, self.request_digest, self.configuration)
     }
@@ -452,17 +558,35 @@ pub struct PersistentBlobCommitRequest<'a> {
     deadline: Time,
 }
 impl PersistentBlobCommitRequest<'_> {
-    pub fn operation_id(&self) -> [u8; 16] { self.fence.operation_id() }
-    pub const fn request_digest(&self) -> [u8; 32] { self.request_digest }
-    pub fn configuration(&self) -> &PersistentBlobBackendConfiguration { self.configuration }
-    pub fn write_fence(&self) -> &RestoreWriteFence { self.fence }
-    pub const fn expected_revision(&self) -> Option<PersistentBlobRevision> { self.expected }
-    pub const fn next_revision(&self) -> PersistentBlobRevision { self.next }
-    pub fn envelope(&self) -> &CanonicalEnvelope { self.envelope }
+    pub fn operation_id(&self) -> [u8; 16] {
+        self.fence.operation_id()
+    }
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    pub fn configuration(&self) -> &PersistentBlobBackendConfiguration {
+        self.configuration
+    }
+    pub fn write_fence(&self) -> &RestoreWriteFence {
+        self.fence
+    }
+    pub const fn expected_revision(&self) -> Option<PersistentBlobRevision> {
+        self.expected
+    }
+    pub const fn next_revision(&self) -> PersistentBlobRevision {
+        self.next
+    }
+    pub fn envelope(&self) -> &CanonicalEnvelope {
+        self.envelope
+    }
     /// Ciphertext transaction digest, deliberately different from the pre-seal
     /// logical record digest in write_fence(). The durable proof binds BOTH.
-    pub const fn commit_digest(&self) -> [u8; 32] { self.commit_digest }
-    pub const fn deadline(&self) -> Time { self.deadline }
+    pub const fn commit_digest(&self) -> [u8; 32] {
+        self.commit_digest
+    }
+    pub const fn deadline(&self) -> Time {
+        self.deadline
+    }
     pub fn receipt(&self) -> PersistentBlobReceipt {
         blob_receipt(self.operation_id(), self.request_digest, self.configuration)
     }
@@ -488,10 +612,16 @@ pub struct PersistentBlobCommitResult {
 /// Unknown commit outcomes are retained for reconciliation, never retried with
 /// a fresh operation ID. Implementers also own bounded durable indexes/cleanup.
 pub trait PersistentBlobBackend: Send + Sync + 'static {
-    fn read<'a>(&'a self, cx: &'a Cx, request: &'a PersistentBlobReadRequest<'a>)
-        -> PersistentBackendFuture<'a, PersistentBlobReadResult>;
-    fn commit<'a>(&'a self, cx: &'a Cx, request: &'a PersistentBlobCommitRequest<'a>)
-        -> PersistentBackendFuture<'a, PersistentBlobCommitResult>;
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        request: &'a PersistentBlobReadRequest<'a>,
+    ) -> PersistentBackendFuture<'a, PersistentBlobReadResult>;
+    fn commit<'a>(
+        &'a self,
+        cx: &'a Cx,
+        request: &'a PersistentBlobCommitRequest<'a>,
+    ) -> PersistentBackendFuture<'a, PersistentBlobCommitResult>;
 }
 
 /// Sealed transaction consumer. Every write prepares its restore intent BEFORE
@@ -519,12 +649,23 @@ impl PersistentBlobStore {
         configuration.validate()?;
         blob_configuration.validate()?;
         let process = ProcessGenerationGuard::installed()
-            .ok_or(PersistentEnvelopeError::ProcessChanged)?.token();
-        process.verify().map_err(|_| PersistentEnvelopeError::ProcessChanged)?;
-        if restore.is_quarantined() { return Err(PersistentEnvelopeError::Quarantined); }
+            .ok_or(PersistentEnvelopeError::ProcessChanged)?
+            .token();
+        process
+            .verify()
+            .map_err(|_| PersistentEnvelopeError::ProcessChanged)?;
+        if restore.is_quarantined() {
+            return Err(PersistentEnvelopeError::Quarantined);
+        }
         Ok(Self {
-            restore, configuration, blob_configuration, crypto, blobs, process,
-            quarantined: AtomicBool::new(false), active: AtomicUsize::new(0),
+            restore,
+            configuration,
+            blob_configuration,
+            crypto,
+            blobs,
+            process,
+            quarantined: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
             bytes: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -534,30 +675,45 @@ impl PersistentBlobStore {
     }
 
     /// Insert a framework-selected random record ID only if absent.
-    pub async fn create(&self, cx: &Cx, plaintext: BoundedPlaintext, deadline: Time)
-        -> Result<PersistentBlobRevision, PersistentEnvelopeError>
-    {
-        self.scoped(cx, self.create_inner(cx, plaintext, deadline)).await
+    pub async fn create(
+        &self,
+        cx: &Cx,
+        plaintext: BoundedPlaintext,
+        deadline: Time,
+    ) -> Result<PersistentBlobRevision, PersistentEnvelopeError> {
+        self.scoped(cx, self.create_inner(cx, plaintext, deadline))
+            .await
     }
 
     /// Compare the complete trusted prior revision and commit its successor.
-    pub async fn replace(&self, cx: &Cx, expected: &PersistentBlobRevision,
-        plaintext: BoundedPlaintext, deadline: Time)
-        -> Result<PersistentBlobRevision, PersistentEnvelopeError>
-    {
-        self.scoped(cx, self.replace_inner(cx, expected, plaintext, deadline)).await
+    pub async fn replace(
+        &self,
+        cx: &Cx,
+        expected: &PersistentBlobRevision,
+        plaintext: BoundedPlaintext,
+        deadline: Time,
+    ) -> Result<PersistentBlobRevision, PersistentEnvelopeError> {
+        self.scoped(cx, self.replace_inner(cx, expected, plaintext, deadline))
+            .await
     }
 
     /// Read exactly the caller-retained revision; never infer AAD from storage.
-    pub async fn read(&self, cx: &Cx, expected: &PersistentBlobRevision, deadline: Time)
-        -> Result<BoundedPlaintext, PersistentEnvelopeError>
-    {
-        self.scoped(cx, self.read_inner(cx, expected, deadline)).await
+    pub async fn read(
+        &self,
+        cx: &Cx,
+        expected: &PersistentBlobRevision,
+        deadline: Time,
+    ) -> Result<BoundedPlaintext, PersistentEnvelopeError> {
+        self.scoped(cx, self.read_inner(cx, expected, deadline))
+            .await
     }
 
-    async fn create_inner(&self, cx: &Cx, plaintext: BoundedPlaintext, deadline: Time)
-        -> Result<PersistentBlobRevision, PersistentEnvelopeError>
-    {
+    async fn create_inner(
+        &self,
+        cx: &Cx,
+        plaintext: BoundedPlaintext,
+        deadline: Time,
+    ) -> Result<PersistentBlobRevision, PersistentEnvelopeError> {
         let deadline = self.deadline(cx, deadline)?;
         let index = BlobIndex {
             namespace: self.restore.namespace_digest(),
@@ -567,36 +723,54 @@ impl PersistentBlobStore {
         self.write(cx, None, index, plaintext, deadline).await
     }
 
-    async fn replace_inner(&self, cx: &Cx, expected: &PersistentBlobRevision,
-        plaintext: BoundedPlaintext, deadline: Time)
-        -> Result<PersistentBlobRevision, PersistentEnvelopeError>
-    {
+    async fn replace_inner(
+        &self,
+        cx: &Cx,
+        expected: &PersistentBlobRevision,
+        plaintext: BoundedPlaintext,
+        deadline: Time,
+    ) -> Result<PersistentBlobRevision, PersistentEnvelopeError> {
         self.admit_revision(expected)?;
         let deadline = self.deadline(cx, deadline)?;
         let index = BlobIndex {
-            namespace: expected.namespace, record_id: expected.record_id,
-            generation: expected.generation.checked_add(1)
+            namespace: expected.namespace,
+            record_id: expected.record_id,
+            generation: expected
+                .generation
+                .checked_add(1)
                 .ok_or(PersistentEnvelopeError::InvalidRevision)?,
         };
-        self.write(cx, Some(*expected), index, plaintext, deadline).await
+        self.write(cx, Some(*expected), index, plaintext, deadline)
+            .await
     }
 
-    async fn write(&self, cx: &Cx, expected: Option<PersistentBlobRevision>,
-        index: BlobIndex, plaintext: BoundedPlaintext, deadline: Time)
-        -> Result<PersistentBlobRevision, PersistentEnvelopeError>
-    {
+    async fn write(
+        &self,
+        cx: &Cx,
+        expected: Option<PersistentBlobRevision>,
+        index: BlobIndex,
+        plaintext: BoundedPlaintext,
+        deadline: Time,
+    ) -> Result<PersistentBlobRevision, PersistentEnvelopeError> {
         let length = plaintext.as_bytes().len();
         if length > self.configuration.limits.plaintext_bytes
             || plaintext.allocated_bytes() > self.configuration.limits.plaintext_bytes
         {
             return Err(PersistentEnvelopeError::TooLarge);
         }
-        let _active = ActiveLease::acquire(&self.active, self.configuration.limits.active_operations)?;
-        let reserved = plaintext.allocated_bytes().checked_add(self.configuration.limits.envelope_bytes)
+        let _active =
+            ActiveLease::acquire(&self.active, self.configuration.limits.active_operations)?;
+        let reserved = plaintext
+            .allocated_bytes()
+            .checked_add(self.configuration.limits.envelope_bytes)
             .and_then(|n| n.checked_add(self.configuration.limits.aad_bytes))
             .and_then(|n| n.checked_add(CONTROL_RESERVE))
             .ok_or(PersistentEnvelopeError::TooLarge)?;
-        let _bytes = ByteLease::acquire(Arc::clone(&self.bytes), reserved, self.configuration.limits.in_flight_bytes)?;
+        let _bytes = ByteLease::acquire(
+            Arc::clone(&self.bytes),
+            reserved,
+            self.configuration.limits.in_flight_bytes,
+        )?;
         let logical = self.logical_digest(expected, index, length)?;
         let fence = self.restore.prepare_write(cx, logical, deadline).await?;
         fence.check(cx)?;
@@ -605,77 +779,132 @@ impl PersistentBlobStore {
         let request = self.envelope_request(cx, context, length, None, deadline)?;
         let caller = self.caller(cx, deadline)?;
         let future = with_caller(&caller, || self.crypto.seal(&caller, &request, plaintext));
-        let sealed = self.within(&caller, deadline, future).await?.map_err(backend_error)?;
+        let sealed = self
+            .within(&caller, deadline, future)
+            .await?
+            .map_err(backend_error)?;
         fence.check(cx)?;
         self.admit_envelope_result(&request, &sealed.envelope, &sealed.receipt, true)?;
         let header = sealed.envelope.header()?;
-        if header.sealed_bytes() != length.checked_add(16).ok_or(PersistentEnvelopeError::TooLarge)? {
+        if header.sealed_bytes()
+            != length
+                .checked_add(16)
+                .ok_or(PersistentEnvelopeError::TooLarge)?
+        {
             return self.invalid_receipt();
         }
         let next = PersistentBlobRevision {
-            namespace: index.namespace, record_id: index.record_id, generation: index.generation,
-            envelope_digest: digest(sealed.envelope.as_bytes(), self.configuration.limits.envelope_bytes)?,
+            namespace: index.namespace,
+            record_id: index.record_id,
+            generation: index.generation,
+            envelope_digest: digest(
+                sealed.envelope.as_bytes(),
+                self.configuration.limits.envelope_bytes,
+            )?,
         };
         let commit_digest = self.commit_digest(&fence, expected, next)?;
         let request_digest = self.store_request_digest(
-            fence.operation_id(), 2, fence.binding_digest(), fence.store_fence_generation(),
-            &commit_digest, deadline,
+            fence.operation_id(),
+            2,
+            fence.binding_digest(),
+            fence.store_fence_generation(),
+            &commit_digest,
+            deadline,
         )?;
         let commit = PersistentBlobCommitRequest {
-            request_digest, configuration: &self.blob_configuration, fence: &fence,
-            expected, next, envelope: &sealed.envelope, commit_digest, deadline,
+            request_digest,
+            configuration: &self.blob_configuration,
+            fence: &fence,
+            expected,
+            next,
+            envelope: &sealed.envelope,
+            commit_digest,
+            deadline,
         };
         fence.check(cx)?;
         let caller = self.caller(cx, deadline)?;
         let future = with_caller(&caller, || self.blobs.commit(&caller, &commit));
-        let result = self.within(&caller, deadline, future).await?.map_err(backend_error)?;
+        let result = self
+            .within(&caller, deadline, future)
+            .await?
+            .map_err(backend_error)?;
         fence.check(cx)?;
         self.admit_blob_receipt(&result.receipt, fence.operation_id(), request_digest)?;
         match result.outcome {
             PersistentBlobCommitOutcome::Committed(receipt) => {
-                if receipt.commit_digest() != commit_digest { return self.invalid_receipt(); }
-                self.restore.complete_write(cx, fence, receipt, deadline).await?;
+                if receipt.commit_digest() != commit_digest {
+                    return self.invalid_receipt();
+                }
+                self.restore
+                    .complete_write(cx, fence, receipt, deadline)
+                    .await?;
                 self.caller(cx, deadline)?;
                 Ok(next)
             }
             PersistentBlobCommitOutcome::FencedConflict(receipt) => {
-                self.restore.reconcile_write(
-                    cx, fence, DurableRestoreResolution::FencedNotCommitted(receipt), deadline,
-                ).await?;
+                self.restore
+                    .reconcile_write(
+                        cx,
+                        fence,
+                        DurableRestoreResolution::FencedNotCommitted(receipt),
+                        deadline,
+                    )
+                    .await?;
                 self.caller(cx, deadline)?;
                 Err(PersistentEnvelopeError::Conflict)
             }
         }
     }
 
-    async fn read_inner(&self, cx: &Cx, expected: &PersistentBlobRevision, deadline: Time)
-        -> Result<BoundedPlaintext, PersistentEnvelopeError>
-    {
+    async fn read_inner(
+        &self,
+        cx: &Cx,
+        expected: &PersistentBlobRevision,
+        deadline: Time,
+    ) -> Result<BoundedPlaintext, PersistentEnvelopeError> {
         self.admit_revision(expected)?;
         let deadline = self.deadline(cx, deadline)?;
-        let _active = ActiveLease::acquire(&self.active, self.configuration.limits.active_operations)?;
+        let _active =
+            ActiveLease::acquire(&self.active, self.configuration.limits.active_operations)?;
         let reserved = self.configuration.limits.envelope_bytes
-            + self.configuration.limits.plaintext_bytes + self.configuration.limits.aad_bytes
+            + self.configuration.limits.plaintext_bytes
+            + self.configuration.limits.aad_bytes
             + CONTROL_RESERVE;
-        let mut bytes = ByteLease::acquire(Arc::clone(&self.bytes), reserved, self.configuration.limits.in_flight_bytes)?;
+        let mut bytes = ByteLease::acquire(
+            Arc::clone(&self.bytes),
+            reserved,
+            self.configuration.limits.in_flight_bytes,
+        )?;
         let observation = self.restore.current_binding(cx, deadline).await?;
         observation.check(cx)?;
         let deadline = deadline.min(observation.expires_at());
         let id = operation_id(cx)?;
         let request_digest = self.store_request_digest(
-            id, 1, observation.binding().digest(), observation.store_fence_generation(),
-            &expected.encode(), deadline,
+            id,
+            1,
+            observation.binding().digest(),
+            observation.store_fence_generation(),
+            &expected.encode(),
+            deadline,
         )?;
         let request = PersistentBlobReadRequest {
-            operation_id: id, request_digest, configuration: &self.blob_configuration,
-            store_id: self.restore.store_id(), store_set_digest: self.restore.store_set_digest(),
+            operation_id: id,
+            request_digest,
+            configuration: &self.blob_configuration,
+            store_id: self.restore.store_id(),
+            store_set_digest: self.restore.store_set_digest(),
             binding_digest: observation.binding().digest(),
             store_fence_generation: observation.store_fence_generation(),
-            expected: *expected, envelope_bytes: self.configuration.limits.envelope_bytes, deadline,
+            expected: *expected,
+            envelope_bytes: self.configuration.limits.envelope_bytes,
+            deadline,
         };
         let caller = self.caller(cx, deadline)?;
         let future = with_caller(&caller, || self.blobs.read(&caller, &request));
-        let stored = self.within(&caller, deadline, future).await?.map_err(backend_error)?;
+        let stored = self
+            .within(&caller, deadline, future)
+            .await?
+            .map_err(backend_error)?;
         observation.check(cx)?;
         self.admit_blob_receipt(&stored.receipt, id, request_digest)?;
         if stored.envelope.as_bytes().len() > self.configuration.limits.envelope_bytes
@@ -688,7 +917,10 @@ impl PersistentBlobStore {
         if !self.configuration.admits(&header, false) {
             return Err(PersistentEnvelopeError::InvalidEnvelope);
         }
-        let envelope_digest = digest(stored.envelope.as_bytes(), self.configuration.limits.envelope_bytes)?;
+        let envelope_digest = digest(
+            stored.envelope.as_bytes(),
+            self.configuration.limits.envelope_bytes,
+        )?;
         if envelope_digest != expected.envelope_digest {
             return Err(PersistentEnvelopeError::InvalidRevision);
         }
@@ -699,8 +931,13 @@ impl PersistentBlobStore {
         let context = self.context(observation.binding(), BlobIndex::from_revision(expected));
         let open = self.envelope_request(cx, context, length, Some(envelope_digest), deadline)?;
         let caller = self.caller(cx, deadline)?;
-        let future = with_caller(&caller, || self.crypto.open(&caller, &open, &stored.envelope));
-        let mut result = self.within(&caller, deadline, future).await?.map_err(open_backend_error)?;
+        let future = with_caller(&caller, || {
+            self.crypto.open(&caller, &open, &stored.envelope)
+        });
+        let mut result = self
+            .within(&caller, deadline, future)
+            .await?
+            .map_err(open_backend_error)?;
         observation.check(cx)?;
         self.admit_envelope_result(&open, &stored.envelope, &result.receipt, false)?;
         if result.plaintext.as_bytes().len() != length
@@ -714,10 +951,16 @@ impl PersistentBlobStore {
         Ok(result.plaintext)
     }
 
-    fn context<'a>(&self, binding: &'a RestoreEpochBinding, index: BlobIndex) -> ExpectedEnvelopeContext<'a> {
+    fn context<'a>(
+        &self,
+        binding: &'a RestoreEpochBinding,
+        index: BlobIndex,
+    ) -> ExpectedEnvelopeContext<'a> {
         ExpectedEnvelopeContext {
-            binding, deployment_uuid: self.restore.configuration().deployment_uuid,
-            store_set_digest: self.restore.store_set_digest(), index,
+            binding,
+            deployment_uuid: self.restore.configuration().deployment_uuid,
+            store_set_digest: self.restore.store_set_digest(),
+            index,
             blob_artifact_digest: self.blob_configuration.artifact_digest,
             blob_configuration_fingerprint: self.blob_configuration.configuration_fingerprint,
             blob_generation: self.blob_configuration.generation,
@@ -725,10 +968,14 @@ impl PersistentBlobStore {
         }
     }
 
-    fn envelope_request<'a>(&'a self, cx: &Cx, context: ExpectedEnvelopeContext<'a>,
-        length: usize, envelope_digest: Option<[u8; 32]>, deadline: Time)
-        -> Result<PersistentEnvelopeRequest<'a>, PersistentEnvelopeError>
-    {
+    fn envelope_request<'a>(
+        &'a self,
+        cx: &Cx,
+        context: ExpectedEnvelopeContext<'a>,
+        length: usize,
+        envelope_digest: Option<[u8; 32]>,
+        deadline: Time,
+    ) -> Result<PersistentEnvelopeRequest<'a>, PersistentEnvelopeError> {
         let id = operation_id(cx)?;
         let mut encoded = b"FMCPERQ\0\0\x01".to_vec();
         encoded.extend_from_slice(&id);
@@ -746,16 +993,25 @@ impl PersistentBlobStore {
         context.index.encode(&mut encoded);
         encoded.extend_from_slice(&(length as u64).to_be_bytes());
         encoded.extend_from_slice(&deadline.as_nanos().to_be_bytes());
-        if let Some(digest) = envelope_digest { encoded.extend_from_slice(&digest); }
+        if let Some(digest) = envelope_digest {
+            encoded.extend_from_slice(&digest);
+        }
         Ok(PersistentEnvelopeRequest {
-            operation_id: id, request_digest: digest(&encoded, MAX_CONTROL)?, deadline,
-            configuration: &self.configuration, context, plaintext_bytes: length,
+            operation_id: id,
+            request_digest: digest(&encoded, MAX_CONTROL)?,
+            deadline,
+            configuration: &self.configuration,
+            context,
+            plaintext_bytes: length,
         })
     }
 
-    fn logical_digest(&self, expected: Option<PersistentBlobRevision>, index: BlobIndex, length: usize)
-        -> Result<[u8; 32], PersistentEnvelopeError>
-    {
+    fn logical_digest(
+        &self,
+        expected: Option<PersistentBlobRevision>,
+        index: BlobIndex,
+        length: usize,
+    ) -> Result<[u8; 32], PersistentEnvelopeError> {
         let mut bytes = b"FMCPLIN\0\0\x01".to_vec();
         bytes.extend_from_slice(&self.restore.store_set_digest());
         bytes.extend_from_slice(&self.blob_configuration.configuration_fingerprint);
@@ -763,13 +1019,18 @@ impl PersistentBlobStore {
         index.encode(&mut bytes);
         bytes.extend_from_slice(&(length as u64).to_be_bytes());
         bytes.push(u8::from(expected.is_some()));
-        if let Some(expected) = expected { bytes.extend_from_slice(&expected.encode()); }
+        if let Some(expected) = expected {
+            bytes.extend_from_slice(&expected.encode());
+        }
         digest(&bytes, MAX_CONTROL)
     }
 
-    fn commit_digest(&self, fence: &RestoreWriteFence, expected: Option<PersistentBlobRevision>, next: PersistentBlobRevision)
-        -> Result<[u8; 32], PersistentEnvelopeError>
-    {
+    fn commit_digest(
+        &self,
+        fence: &RestoreWriteFence,
+        expected: Option<PersistentBlobRevision>,
+        next: PersistentBlobRevision,
+    ) -> Result<[u8; 32], PersistentEnvelopeError> {
         let mut bytes = b"FMCPCMT\0\0\x01".to_vec();
         bytes.extend_from_slice(&fence.operation_id());
         bytes.extend_from_slice(&fence.binding_digest());
@@ -780,14 +1041,22 @@ impl PersistentBlobStore {
         bytes.extend_from_slice(&self.blob_configuration.configuration_fingerprint);
         bytes.extend_from_slice(&self.blob_configuration.generation.to_be_bytes());
         bytes.push(u8::from(expected.is_some()));
-        if let Some(expected) = expected { bytes.extend_from_slice(&expected.encode()); }
+        if let Some(expected) = expected {
+            bytes.extend_from_slice(&expected.encode());
+        }
         bytes.extend_from_slice(&next.encode());
         digest(&bytes, MAX_CONTROL)
     }
 
-    fn store_request_digest(&self, id: [u8; 16], operation: u8, binding: [u8; 32], fence: u64,
-        input: &[u8], deadline: Time) -> Result<[u8; 32], PersistentEnvelopeError>
-    {
+    fn store_request_digest(
+        &self,
+        id: [u8; 16],
+        operation: u8,
+        binding: [u8; 32],
+        fence: u64,
+        input: &[u8],
+        deadline: Time,
+    ) -> Result<[u8; 32], PersistentEnvelopeError> {
         let mut bytes = b"FMCPBRQ\0\0\x01".to_vec();
         bytes.extend_from_slice(&id);
         bytes.push(operation);
@@ -804,9 +1073,13 @@ impl PersistentBlobStore {
         digest(&bytes, MAX_CONTROL)
     }
 
-    fn admit_envelope_result(&self, request: &PersistentEnvelopeRequest<'_>, envelope: &CanonicalEnvelope,
-        receipt: &PersistentEnvelopeReceipt, sealing: bool) -> Result<(), PersistentEnvelopeError>
-    {
+    fn admit_envelope_result(
+        &self,
+        request: &PersistentEnvelopeRequest<'_>,
+        envelope: &CanonicalEnvelope,
+        receipt: &PersistentEnvelopeReceipt,
+        sealing: bool,
+    ) -> Result<(), PersistentEnvelopeError> {
         if envelope.as_bytes().len() > self.configuration.limits.envelope_bytes
             || envelope.allocated_bytes() > self.configuration.limits.envelope_bytes
         {
@@ -819,7 +1092,11 @@ impl PersistentBlobStore {
             || receipt.configuration_fingerprint != self.configuration.configuration_fingerprint
             || receipt.ring_generation != self.configuration.ring_generation
             || receipt.key_generation != header.generation()
-            || receipt.envelope_digest != digest(envelope.as_bytes(), self.configuration.limits.envelope_bytes)?
+            || receipt.envelope_digest
+                != digest(
+                    envelope.as_bytes(),
+                    self.configuration.limits.envelope_bytes,
+                )?
             || receipt.dispatch != RestoreDispatch::Dispatched
         {
             return self.invalid_receipt();
@@ -829,18 +1106,28 @@ impl PersistentBlobStore {
         drop(request.context.canonical_aad(&header)?);
         Ok(())
     }
-    fn admit_blob_receipt(&self, receipt: &PersistentBlobReceipt, id: [u8; 16], request: [u8; 32])
-        -> Result<(), PersistentEnvelopeError>
-    {
-        if receipt.operation_id != id || receipt.request_digest != request
+    fn admit_blob_receipt(
+        &self,
+        receipt: &PersistentBlobReceipt,
+        id: [u8; 16],
+        request: [u8; 32],
+    ) -> Result<(), PersistentEnvelopeError> {
+        if receipt.operation_id != id
+            || receipt.request_digest != request
             || receipt.artifact_digest != self.blob_configuration.artifact_digest
-            || receipt.configuration_fingerprint != self.blob_configuration.configuration_fingerprint
+            || receipt.configuration_fingerprint
+                != self.blob_configuration.configuration_fingerprint
             || receipt.backend_generation != self.blob_configuration.generation
             || receipt.dispatch != RestoreDispatch::Dispatched
-        { return self.invalid_receipt(); }
+        {
+            return self.invalid_receipt();
+        }
         Ok(())
     }
-    fn admit_revision(&self, revision: &PersistentBlobRevision) -> Result<(), PersistentEnvelopeError> {
+    fn admit_revision(
+        &self,
+        revision: &PersistentBlobRevision,
+    ) -> Result<(), PersistentEnvelopeError> {
         self.check()?;
         if revision.namespace != self.restore.namespace_digest() || revision.generation == 0 {
             return Err(PersistentEnvelopeError::InvalidRevision);
@@ -852,8 +1139,12 @@ impl PersistentBlobStore {
         Err(PersistentEnvelopeError::InvalidReceipt)
     }
     fn check(&self) -> Result<(), PersistentEnvelopeError> {
-        self.process.verify().map_err(|_| PersistentEnvelopeError::ProcessChanged)?;
-        if self.is_quarantined() { return Err(PersistentEnvelopeError::Quarantined); }
+        self.process
+            .verify()
+            .map_err(|_| PersistentEnvelopeError::ProcessChanged)?;
+        if self.is_quarantined() {
+            return Err(PersistentEnvelopeError::Quarantined);
+        }
         Ok(())
     }
     fn deadline(&self, cx: &Cx, deadline: Time) -> Result<Time, PersistentEnvelopeError> {
@@ -861,14 +1152,25 @@ impl PersistentBlobStore {
         with_caller(cx, || {
             let active = Cx::current().ok_or(PersistentEnvelopeError::CapabilityUnavailable)?;
             require_caller(&active)?;
-            active.checkpoint().map_err(|_| PersistentEnvelopeError::Cancelled)?;
+            active
+                .checkpoint()
+                .map_err(|_| PersistentEnvelopeError::Cancelled)?;
             let timeout = u64::try_from(self.configuration.limits.call_timeout.as_nanos())
                 .map_err(|_| PersistentEnvelopeError::InvalidConfiguration)?;
-            let timeout = active.now().as_nanos().checked_add(timeout)
-                .map(Time::from_nanos).ok_or(PersistentEnvelopeError::DeadlineExceeded)?;
+            let timeout = active
+                .now()
+                .as_nanos()
+                .checked_add(timeout)
+                .map(Time::from_nanos)
+                .ok_or(PersistentEnvelopeError::DeadlineExceeded)?;
             let deadline = deadline.min(timeout);
-            let deadline = active.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
-            if active.now() >= deadline { return Err(PersistentEnvelopeError::DeadlineExceeded); }
+            let deadline = active
+                .budget()
+                .deadline
+                .map_or(deadline, |parent| parent.min(deadline));
+            if active.now() >= deadline {
+                return Err(PersistentEnvelopeError::DeadlineExceeded);
+            }
             Ok(deadline)
         })
     }
@@ -877,8 +1179,12 @@ impl PersistentBlobStore {
         with_caller(cx, || {
             let active = Cx::current().ok_or(PersistentEnvelopeError::CapabilityUnavailable)?;
             require_caller(&active)?;
-            active.checkpoint().map_err(|_| PersistentEnvelopeError::Cancelled)?;
-            if active.now() >= deadline { return Err(PersistentEnvelopeError::DeadlineExceeded); }
+            active
+                .checkpoint()
+                .map_err(|_| PersistentEnvelopeError::Cancelled)?;
+            if active.now() >= deadline {
+                return Err(PersistentEnvelopeError::DeadlineExceeded);
+            }
             Ok(active)
         })
     }
@@ -886,10 +1192,13 @@ impl PersistentBlobStore {
     // One retained ceiling covers the WHOLE transaction, including authority
     // awaits and transitions between separate backend calls.
     async fn scoped<F, T>(&self, cx: &Cx, future: F) -> Result<T, PersistentEnvelopeError>
-    where F: Future<Output = Result<T, PersistentEnvelopeError>>
+    where
+        F: Future<Output = Result<T, PersistentEnvelopeError>>,
     {
         let mut future = CallerFuture {
-            cx, ceiling: ambient_capability_ceiling(), future: Some(Box::pin(future)),
+            cx,
+            ceiling: ambient_capability_ceiling(),
+            future: Some(Box::pin(future)),
         };
         poll_fn(|task| {
             future.ceiling = future.ceiling.intersect(ambient_capability_ceiling());
@@ -898,24 +1207,39 @@ impl PersistentBlobStore {
             let active = Cx::current().ok_or(PersistentEnvelopeError::CapabilityUnavailable)?;
             self.check()?;
             require_caller(&active)?;
-            active.checkpoint().map_err(|_| PersistentEnvelopeError::Cancelled)?;
-            let result = future.future.as_mut().expect("transaction future is owned").as_mut().poll(task);
+            active
+                .checkpoint()
+                .map_err(|_| PersistentEnvelopeError::Cancelled)?;
+            let result = future
+                .future
+                .as_mut()
+                .expect("transaction future is owned")
+                .as_mut()
+                .poll(task);
             match result {
                 Poll::Ready(Ok(value)) => {
                     self.check()?;
-                    active.checkpoint().map_err(|_| PersistentEnvelopeError::Cancelled)?;
+                    active
+                        .checkpoint()
+                        .map_err(|_| PersistentEnvelopeError::Cancelled)?;
                     Poll::Ready(Ok(value))
                 }
                 other => other,
             }
-        }).await
+        })
+        .await
     }
 
-    async fn within<F: Future>(&self, cx: &Cx, deadline: Time, future: F)
-        -> Result<F::Output, PersistentEnvelopeError>
-    {
+    async fn within<F: Future>(
+        &self,
+        cx: &Cx,
+        deadline: Time,
+        future: F,
+    ) -> Result<F::Output, PersistentEnvelopeError> {
         let mut future = CallerFuture {
-            cx, ceiling: ambient_capability_ceiling(), future: Some(Box::pin(future)),
+            cx,
+            ceiling: ambient_capability_ceiling(),
+            future: Some(Box::pin(future)),
         };
         let mut sleep = std::pin::pin!(Sleep::new(deadline));
         let (_sender, mut receiver) = oneshot::channel::<()>();
@@ -927,28 +1251,53 @@ impl PersistentBlobStore {
             let active = Cx::current().ok_or(PersistentEnvelopeError::CapabilityUnavailable)?;
             self.check()?;
             require_caller(&active)?;
-            active.checkpoint().map_err(|_| PersistentEnvelopeError::Cancelled)?;
-            if active.now() >= deadline { return Poll::Ready(Err(PersistentEnvelopeError::DeadlineExceeded)); }
-            if cancelled.as_mut().poll(task).is_ready() { return Poll::Ready(Err(PersistentEnvelopeError::Cancelled)); }
+            active
+                .checkpoint()
+                .map_err(|_| PersistentEnvelopeError::Cancelled)?;
+            if active.now() >= deadline {
+                return Poll::Ready(Err(PersistentEnvelopeError::DeadlineExceeded));
+            }
+            if cancelled.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(PersistentEnvelopeError::Cancelled));
+            }
             if sleep.as_mut().poll(task).is_ready() {
                 return Poll::Ready(Err(if active.is_cancel_requested() {
                     PersistentEnvelopeError::Cancelled
-                } else { PersistentEnvelopeError::DeadlineExceeded }));
+                } else {
+                    PersistentEnvelopeError::DeadlineExceeded
+                }));
             }
-            let result = future.future.as_mut().expect("provider future is owned").as_mut().poll(task);
+            let result = future
+                .future
+                .as_mut()
+                .expect("provider future is owned")
+                .as_mut()
+                .poll(task);
             self.check()?;
-            if active.is_cancel_requested() { return Poll::Ready(Err(PersistentEnvelopeError::Cancelled)); }
-            if active.now() >= deadline { return Poll::Ready(Err(PersistentEnvelopeError::DeadlineExceeded)); }
+            if active.is_cancel_requested() {
+                return Poll::Ready(Err(PersistentEnvelopeError::Cancelled));
+            }
+            if active.now() >= deadline {
+                return Poll::Ready(Err(PersistentEnvelopeError::DeadlineExceeded));
+            }
             result.map(Ok)
-        }).await
+        })
+        .await
     }
 }
 
-fn blob_receipt(id: [u8; 16], request_digest: [u8; 32], configuration: &PersistentBlobBackendConfiguration) -> PersistentBlobReceipt {
+fn blob_receipt(
+    id: [u8; 16],
+    request_digest: [u8; 32],
+    configuration: &PersistentBlobBackendConfiguration,
+) -> PersistentBlobReceipt {
     PersistentBlobReceipt {
-        operation_id: id, request_digest, artifact_digest: configuration.artifact_digest,
+        operation_id: id,
+        request_digest,
+        artifact_digest: configuration.artifact_digest,
         configuration_fingerprint: configuration.configuration_fingerprint,
-        backend_generation: configuration.generation, dispatch: RestoreDispatch::Dispatched,
+        backend_generation: configuration.generation,
+        dispatch: RestoreDispatch::Dispatched,
     }
 }
 fn backend_error(failure: PersistentBackendFailure) -> PersistentEnvelopeError {
@@ -972,10 +1321,14 @@ fn open_backend_error(failure: PersistentBackendFailure) -> PersistentEnvelopeEr
     }
 }
 fn identifier(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 128 && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 fn digest(bytes: &[u8], maximum: usize) -> Result<[u8; 32], PersistentEnvelopeError> {
-    sha256_bounded(bytes, maximum).map(|digest| *digest.as_bytes()).map_err(|_| PersistentEnvelopeError::TooLarge)
+    sha256_bounded(bytes, maximum)
+        .map(|digest| *digest.as_bytes())
+        .map_err(|_| PersistentEnvelopeError::TooLarge)
 }
 fn encode_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -985,8 +1338,11 @@ fn operation_id(cx: &Cx) -> Result<[u8; 16], PersistentEnvelopeError> {
     with_caller(cx, || {
         let active = Cx::current().ok_or(PersistentEnvelopeError::CapabilityUnavailable)?;
         require_caller(&active)?;
-        active.checkpoint().map_err(|_| PersistentEnvelopeError::Cancelled)?;
-        let id = draw_security_identifier().map_err(|_| PersistentEnvelopeError::RandomSourceUnavailable)?;
+        active
+            .checkpoint()
+            .map_err(|_| PersistentEnvelopeError::Cancelled)?;
+        let id = draw_security_identifier()
+            .map_err(|_| PersistentEnvelopeError::RandomSourceUnavailable)?;
         let mut out = [0; 16];
         out.copy_from_slice(&id.as_bytes()[..16]);
         Ok(out)
@@ -1000,7 +1356,12 @@ fn with_caller<T>(cx: &Cx, action: impl FnOnce() -> T) -> T {
 }
 fn require_caller(cx: &Cx) -> Result<(), PersistentEnvelopeError> {
     let effects = cx.capabilities();
-    if !effects.time || !effects.entropy || !effects.io || !effects.remote || cx.timer_driver().is_none() {
+    if !effects.time
+        || !effects.entropy
+        || !effects.io
+        || !effects.remote
+        || cx.timer_driver().is_none()
+    {
         return Err(PersistentEnvelopeError::CapabilityUnavailable);
     }
     Ok(())
@@ -1018,21 +1379,38 @@ impl<F> Drop for CallerFuture<'_, F> {
         drop(self.future.take());
     }
 }
-struct ActiveLease<'a> { counter: &'a AtomicUsize }
+struct ActiveLease<'a> {
+    counter: &'a AtomicUsize,
+}
 impl<'a> ActiveLease<'a> {
     fn acquire(counter: &'a AtomicUsize, maximum: usize) -> Result<Self, PersistentEnvelopeError> {
-        counter.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < maximum).then_some(n + 1))
+        counter
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < maximum).then_some(n + 1)
+            })
             .map_err(|_| PersistentEnvelopeError::CapacityExceeded)?;
         Ok(Self { counter })
     }
 }
 impl Drop for ActiveLease<'_> {
-    fn drop(&mut self) { self.counter.fetch_sub(1, Ordering::AcqRel); }
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
-struct ByteLease { counter: Arc<AtomicUsize>, bytes: usize }
+struct ByteLease {
+    counter: Arc<AtomicUsize>,
+    bytes: usize,
+}
 impl ByteLease {
-    fn acquire(counter: Arc<AtomicUsize>, bytes: usize, maximum: usize) -> Result<Self, PersistentEnvelopeError> {
-        counter.try_update(Ordering::AcqRel, Ordering::Acquire, |old| old.checked_add(bytes).filter(|n| *n <= maximum))
+    fn acquire(
+        counter: Arc<AtomicUsize>,
+        bytes: usize,
+        maximum: usize,
+    ) -> Result<Self, PersistentEnvelopeError> {
+        counter
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                old.checked_add(bytes).filter(|n| *n <= maximum)
+            })
             .map_err(|_| PersistentEnvelopeError::CapacityExceeded)?;
         Ok(Self { counter, bytes })
     }
@@ -1043,5 +1421,7 @@ impl ByteLease {
     }
 }
 impl Drop for ByteLease {
-    fn drop(&mut self) { self.counter.fetch_sub(self.bytes, Ordering::AcqRel); }
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
 }

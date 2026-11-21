@@ -30,15 +30,16 @@ fn task(status: &str, ttl: Option<u64>, poll: u64) -> FinalTask {
 }
 
 fn expiry_after(duration: Duration) -> u64 {
-    u64::try_from(
-        (wall_now_nanos() + i128::try_from(duration.as_nanos()).unwrap()) / 1_000_000,
-    )
-    .unwrap()
+    u64::try_from((wall_now_nanos() + i128::try_from(duration.as_nanos()).unwrap()) / 1_000_000)
+        .unwrap()
 }
 
 fn ready<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
-    match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+    match future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
         Poll::Ready(value) => value,
         Poll::Pending => panic!("local admission must finish without a timer or transport"),
     }
@@ -66,7 +67,10 @@ fn retention_uses_creation_instant_not_update_time_or_timestamp_spelling() {
     value["createdAt"] = json!("1970-01-01T01:00:00+01:00");
     value["lastUpdatedAt"] = json!("1970-01-02T00:00:00Z");
     let updated: FinalTask = serde_json::from_str(&value.to_string()).unwrap();
-    assert_eq!(retention_deadline(&updated).unwrap(), retention_deadline(&initial).unwrap());
+    assert_eq!(
+        retention_deadline(&updated).unwrap(),
+        retention_deadline(&initial).unwrap()
+    );
     admit_identity(&initial, &updated).unwrap();
     value["ttlMs"] = json!(1001);
     let extended: FinalTask = serde_json::from_str(&value.to_string()).unwrap();
@@ -170,11 +174,16 @@ fn retention_and_local_timeout_choose_distinct_nonresettable_deadlines() {
     let cx = Cx::for_testing();
     let cancellation = McpRequestCancellation::new();
     let finite = task("working", Some(1_000_000), 1);
-    let mut retention = WaitBudget::at_wall_time(
-        &cx, Duration::from_secs(600), &finite, 500_000_000_000,
-    ).unwrap();
-    assert_eq!(retention.deadline_outcome, FinalTaskWaitOutcome::TaskExpired);
-    assert_eq!(retention.stop_at_wall_time(&cx, &cancellation, 999_999_999_999), None);
+    let mut retention =
+        WaitBudget::at_wall_time(&cx, Duration::from_secs(600), &finite, 500_000_000_000).unwrap();
+    assert_eq!(
+        retention.deadline_outcome,
+        FinalTaskWaitOutcome::TaskExpired
+    );
+    assert_eq!(
+        retention.stop_at_wall_time(&cx, &cancellation, 999_999_999_999),
+        None
+    );
     assert_eq!(
         retention.stop_at_wall_time(&cx, &cancellation, 1_000_000_000_000),
         Some(FinalTaskWaitOutcome::TaskExpired),
@@ -186,10 +195,12 @@ fn retention_and_local_timeout_choose_distinct_nonresettable_deadlines() {
         retention.stop_at_wall_time(&cx, &cancellation, 499_000_000_000),
         Some(FinalTaskWaitOutcome::TaskExpired),
     );
-    let mut local = WaitBudget::at_wall_time(
-        &cx, Duration::from_secs(60), &finite, 500_000_000_000,
-    ).unwrap();
-    assert_eq!(local.deadline_outcome, FinalTaskWaitOutcome::DeadlineElapsed);
+    let mut local =
+        WaitBudget::at_wall_time(&cx, Duration::from_secs(60), &finite, 500_000_000_000).unwrap();
+    assert_eq!(
+        local.deadline_outcome,
+        FinalTaskWaitOutcome::DeadlineElapsed
+    );
     local.wall_deadline = Instant::now();
     assert_eq!(
         local.stop_at_wall_time(&cx, &cancellation, 500_000_000_000),
@@ -208,10 +219,11 @@ fn null_and_maximum_ttls_preserve_finite_local_limits_without_overflow() {
     let cancellation = McpRequestCancellation::new();
     for ttl in [None, Some(u64::MAX)] {
         let task = task("working", ttl, 1);
-        let budget = WaitBudget::at_wall_time(
-            &cx, Duration::from_secs(60), &task, 0,
-        ).unwrap();
-        assert_eq!(budget.deadline_outcome, FinalTaskWaitOutcome::DeadlineElapsed);
+        let budget = WaitBudget::at_wall_time(&cx, Duration::from_secs(60), &task, 0).unwrap();
+        assert_eq!(
+            budget.deadline_outcome,
+            FinalTaskWaitOutcome::DeadlineElapsed
+        );
         assert_eq!(budget.stop_at_wall_time(&cx, &cancellation, 0), None);
         assert!(budget.remaining(&cx) <= Duration::from_secs(60));
     }
@@ -231,8 +243,13 @@ fn expired_working_and_input_snapshots_refuse_before_timer_or_transport() {
         let before = serde_json::to_vec(handle.task()).unwrap();
         let cancellation = McpRequestCancellation::new();
         let outcome = ready(wait_for_task(
-            &mut handle, &cx, &mut NoReads, &cancellation, FinalTaskWaitPolicy::default(),
-        )).unwrap();
+            &mut handle,
+            &cx,
+            &mut NoReads,
+            &cancellation,
+            FinalTaskWaitPolicy::default(),
+        ))
+        .unwrap();
         assert_eq!(outcome, FinalTaskWaitOutcome::TaskExpired);
         assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
         assert!(!cancellation.is_cancel_requested());
@@ -240,9 +257,13 @@ fn expired_working_and_input_snapshots_refuse_before_timer_or_transport() {
     let mut input = FinalTaskHandle::new(task("input_required", None, 1));
     assert_eq!(
         ready(wait_for_task(
-            &mut input, &cx, &mut NoReads, &McpRequestCancellation::new(),
+            &mut input,
+            &cx,
+            &mut NoReads,
+            &McpRequestCancellation::new(),
             FinalTaskWaitPolicy::default(),
-        )).unwrap(),
+        ))
+        .unwrap(),
         FinalTaskWaitOutcome::InputRequired,
     );
 }
@@ -256,8 +277,13 @@ fn already_delivered_terminal_results_survive_remote_retention_expiry() {
     cancellation.cancel();
     assert_eq!(
         ready(wait_for_task(
-            &mut handle, &cx, &mut NoReads, &cancellation, FinalTaskWaitPolicy::default(),
-        )).unwrap(),
+            &mut handle,
+            &cx,
+            &mut NoReads,
+            &cancellation,
+            FinalTaskWaitPolicy::default(),
+        ))
+        .unwrap(),
         FinalTaskWaitOutcome::Completed,
     );
     assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
@@ -265,21 +291,32 @@ fn already_delivered_terminal_results_survive_remote_retention_expiry() {
 
 #[test]
 fn peer_delay_beyond_retention_does_not_trigger_an_early_read() {
-    RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-        let cx = Cx::current().unwrap();
-        let cancellation = McpRequestCancellation::new();
-        let mut handle = FinalTaskHandle::new(task(
-            "working", Some(expiry_after(Duration::from_millis(100))), 60_000,
-        ));
-        let before = serde_json::to_vec(handle.task()).unwrap();
-        let outcome = wait_for_task(
-            &mut handle, &cx, &mut NoReads, &cancellation, FinalTaskWaitPolicy::default(),
-        ).await.unwrap();
-        assert_eq!(outcome, FinalTaskWaitOutcome::TaskExpired);
-        assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
-        assert!(cx.checkpoint().is_ok());
-        assert!(!cancellation.is_cancel_requested());
-    });
+    RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let mut handle = FinalTaskHandle::new(task(
+                "working",
+                Some(expiry_after(Duration::from_millis(100))),
+                60_000,
+            ));
+            let before = serde_json::to_vec(handle.task()).unwrap();
+            let outcome = wait_for_task(
+                &mut handle,
+                &cx,
+                &mut NoReads,
+                &cancellation,
+                FinalTaskWaitPolicy::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, FinalTaskWaitOutcome::TaskExpired);
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+            assert!(cx.checkpoint().is_ok());
+            assert!(!cancellation.is_cancel_requested());
+        });
 }
 
 struct PendingRead {
@@ -309,27 +346,38 @@ impl TaskWaitTransport for PendingRead {
 
 #[test]
 fn retention_interrupts_a_pending_read_and_releases_only_its_owner() {
-    RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-        let cx = Cx::current().unwrap();
-        let cancellation = McpRequestCancellation::new();
-        let mut handle = FinalTaskHandle::new(task(
-            "working", Some(expiry_after(Duration::from_millis(500))), 1,
-        ));
-        let before = serde_json::to_vec(handle.task()).unwrap();
-        let mut transport = PendingRead {
-            reads: Arc::new(AtomicUsize::new(0)),
-            drops: Arc::new(AtomicUsize::new(0)),
-        };
-        let outcome = wait_for_task(
-            &mut handle, &cx, &mut transport, &cancellation, FinalTaskWaitPolicy::default(),
-        ).await.unwrap();
-        assert_eq!(outcome, FinalTaskWaitOutcome::TaskExpired);
-        assert_eq!(transport.reads.load(Ordering::SeqCst), 1);
-        assert_eq!(transport.drops.load(Ordering::SeqCst), 1);
-        assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
-        assert!(!cancellation.is_cancel_requested());
-        assert!(cx.checkpoint().is_ok());
-    });
+    RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let mut handle = FinalTaskHandle::new(task(
+                "working",
+                Some(expiry_after(Duration::from_millis(500))),
+                1,
+            ));
+            let before = serde_json::to_vec(handle.task()).unwrap();
+            let mut transport = PendingRead {
+                reads: Arc::new(AtomicUsize::new(0)),
+                drops: Arc::new(AtomicUsize::new(0)),
+            };
+            let outcome = wait_for_task(
+                &mut handle,
+                &cx,
+                &mut transport,
+                &cancellation,
+                FinalTaskWaitPolicy::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, FinalTaskWaitOutcome::TaskExpired);
+            assert_eq!(transport.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(transport.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        });
 }
 
 struct ReadyRead {
@@ -353,45 +401,69 @@ impl TaskWaitTransport for ReadyRead {
 
 #[test]
 fn live_finite_task_completes_and_preserves_the_exact_admitted_payload() {
-    RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-        let cx = Cx::current().unwrap();
-        let ttl = Some(expiry_after(Duration::from_secs(30)));
-        let mut handle = FinalTaskHandle::new(task("working", ttl, 1));
-        let final_task = task("completed", ttl, 1);
-        let expected = serde_json::to_vec(&final_task).unwrap();
-        let mut transport = ReadyRead { result: final_task, calls: 0 };
-        let cancellation = McpRequestCancellation::new();
-        assert_eq!(
-            wait_for_task(
-                &mut handle, &cx, &mut transport, &cancellation, FinalTaskWaitPolicy::default(),
-            ).await.unwrap(),
-            FinalTaskWaitOutcome::Completed,
-        );
-        assert_eq!(transport.calls, 1);
-        assert_eq!(serde_json::to_vec(handle.task()).unwrap(), expected);
-    });
+    RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cx = Cx::current().unwrap();
+            let ttl = Some(expiry_after(Duration::from_secs(30)));
+            let mut handle = FinalTaskHandle::new(task("working", ttl, 1));
+            let final_task = task("completed", ttl, 1);
+            let expected = serde_json::to_vec(&final_task).unwrap();
+            let mut transport = ReadyRead {
+                result: final_task,
+                calls: 0,
+            };
+            let cancellation = McpRequestCancellation::new();
+            assert_eq!(
+                wait_for_task(
+                    &mut handle,
+                    &cx,
+                    &mut transport,
+                    &cancellation,
+                    FinalTaskWaitPolicy::default(),
+                )
+                .await
+                .unwrap(),
+                FinalTaskWaitOutcome::Completed,
+            );
+            assert_eq!(transport.calls, 1);
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), expected);
+        });
 }
 
 #[test]
 fn a_fresh_working_snapshot_does_not_restart_the_retention_clock() {
-    RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-        let cx = Cx::current().unwrap();
-        let ttl = Some(expiry_after(Duration::from_millis(500)));
-        let mut handle = FinalTaskHandle::new(task("working", ttl, 1));
-        let mut transport = ReadyRead { result: task("working", ttl, 60_000), calls: 0 };
-        let expected = serde_json::to_vec(&transport.result).unwrap();
-        let cancellation = McpRequestCancellation::new();
-        assert_eq!(
-            wait_for_task(
-                &mut handle, &cx, &mut transport, &cancellation, FinalTaskWaitPolicy::default(),
-            ).await.unwrap(),
-            FinalTaskWaitOutcome::TaskExpired,
-        );
-        assert_eq!(transport.calls, 1);
-        assert_eq!(serde_json::to_vec(handle.task()).unwrap(), expected);
-        assert!(!cancellation.is_cancel_requested());
-        assert!(cx.checkpoint().is_ok());
-    });
+    RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cx = Cx::current().unwrap();
+            let ttl = Some(expiry_after(Duration::from_millis(500)));
+            let mut handle = FinalTaskHandle::new(task("working", ttl, 1));
+            let mut transport = ReadyRead {
+                result: task("working", ttl, 60_000),
+                calls: 0,
+            };
+            let expected = serde_json::to_vec(&transport.result).unwrap();
+            let cancellation = McpRequestCancellation::new();
+            assert_eq!(
+                wait_for_task(
+                    &mut handle,
+                    &cx,
+                    &mut transport,
+                    &cancellation,
+                    FinalTaskWaitPolicy::default(),
+                )
+                .await
+                .unwrap(),
+                FinalTaskWaitOutcome::TaskExpired,
+            );
+            assert_eq!(transport.calls, 1);
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), expected);
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        });
 }
 
 struct RetentionUpdates {
@@ -566,20 +638,11 @@ mod caller_authority {
         foreign.set_cancel_requested(true);
         for held_io in [true, false] {
             for ambient_io in [true, false] {
-                let caller = restricted(
-                    &owner,
-                    if held_io { CapMask::all() } else { NO_IO },
-                );
-                let ambient = restricted(
-                    &foreign,
-                    if ambient_io { CapMask::all() } else { NO_IO },
-                );
-                let budget = WaitBudget::new(
-                    &caller,
-                    Duration::from_secs(60),
-                    &task("working", None, 1),
-                )
-                .unwrap();
+                let caller = restricted(&owner, if held_io { CapMask::all() } else { NO_IO });
+                let ambient = restricted(&foreign, if ambient_io { CapMask::all() } else { NO_IO });
+                let budget =
+                    WaitBudget::new(&caller, Duration::from_secs(60), &task("working", None, 1))
+                        .unwrap();
                 let cancellation = McpRequestCancellation::new();
                 let mut wait = Box::pin(budget.guard(
                     &caller,
@@ -596,11 +659,8 @@ mod caller_authority {
                 drop(wait);
                 assert_eq!(timer.pending_count(), 0);
 
-                let mut dropped = Box::pin(budget.guard(
-                    &caller,
-                    &cancellation,
-                    std::future::pending::<()>(),
-                ));
+                let mut dropped =
+                    Box::pin(budget.guard(&caller, &cancellation, std::future::pending::<()>()));
                 assert!(poll_as(dropped.as_mut(), &ambient).is_pending());
                 assert_eq!(timer.pending_count(), 1);
                 drop(dropped);
@@ -617,18 +677,23 @@ mod caller_authority {
         for source in ["allowed", "held", "ambient"] {
             let caller = restricted(
                 &owner,
-                if source == "held" { NO_TIME } else { CapMask::all() },
+                if source == "held" {
+                    NO_TIME
+                } else {
+                    CapMask::all()
+                },
             );
             let ambient = restricted(
                 &owner,
-                if source == "ambient" { NO_TIME } else { CapMask::all() },
+                if source == "ambient" {
+                    NO_TIME
+                } else {
+                    CapMask::all()
+                },
             );
-            let budget = WaitBudget::new(
-                &caller,
-                Duration::from_secs(60),
-                &task("working", None, 1),
-            )
-            .unwrap();
+            let budget =
+                WaitBudget::new(&caller, Duration::from_secs(60), &task("working", None, 1))
+                    .unwrap();
             let cancellation = McpRequestCancellation::new();
             let polled = Cell::new(false);
             let mut wait = Box::pin(budget.guard(&caller, &cancellation, async {
@@ -701,19 +766,16 @@ mod caller_authority {
     fn task_wait_retains_effect_ceiling_between_delay_and_authoritative_read() {
         let (runtime, owner, clock, timer) = runtime();
         for io_allowed in [true, false] {
-            let ambient = restricted(
-                &owner,
-                if io_allowed { CapMask::all() } else { NO_IO },
-            );
+            let ambient = restricted(&owner, if io_allowed { CapMask::all() } else { NO_IO });
             let mut handle = FinalTaskHandle::new(task("working", None, 1));
-            let mut transport = ReadProbe { io_allowed, reads: 0 };
+            let mut transport = ReadProbe {
+                io_allowed,
+                reads: 0,
+            };
             let cancellation = McpRequestCancellation::new();
-            let policy = FinalTaskWaitPolicy::new(
-                Duration::from_secs(60),
-                1,
-                Duration::from_millis(1),
-            )
-            .unwrap();
+            let policy =
+                FinalTaskWaitPolicy::new(Duration::from_secs(60), 1, Duration::from_millis(1))
+                    .unwrap();
             let mut wait = Box::pin(wait_for_task(
                 &mut handle,
                 &owner,
@@ -747,10 +809,7 @@ mod caller_authority {
         foreign.set_cancel_requested(true);
         let cancellation = McpRequestCancellation::new();
         for io_allowed in [true, false] {
-            let ambient = restricted(
-                &foreign,
-                if io_allowed { CapMask::all() } else { NO_IO },
-            );
+            let ambient = restricted(&foreign, if io_allowed { CapMask::all() } else { NO_IO });
             let mut wait = Box::pin(guard_websocket_task_operation(
                 &owner,
                 &cancellation,
@@ -765,7 +824,11 @@ mod caller_authority {
         for time_allowed in [true, false] {
             let ambient = restricted(
                 &owner,
-                if time_allowed { CapMask::all() } else { NO_TIME },
+                if time_allowed {
+                    CapMask::all()
+                } else {
+                    NO_TIME
+                },
             );
             let polled = Cell::new(false);
             let mut wait = Box::pin(guard_websocket_task_operation(

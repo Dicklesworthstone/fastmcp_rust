@@ -3935,8 +3935,8 @@ fn type_to_json_schema(ty: &Type, generic_params: &[Ident]) -> TokenStream2 {
         // Share the JavaScript-safe native integer policy with generic
         // payloads. Calling the body directly preserves concrete schema shapes
         // without adding registry entries or references for primitive fields.
-        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
-        | "u128" | "usize" => quote! {
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => quote! {
             <#ty as fastmcp_protocol::schema::JsonSchemaType>::schema_body(
                 __fastmcp_schema_context
             )
@@ -7072,8 +7072,7 @@ impl SchemaSerdeAttrs {
                     skip_deserializing = true;
                 } else if entry.path().is_ident("skip_serializing_if") {
                     result.skip_serializing_if = true;
-                } else if entry.path().is_ident("with")
-                    || entry.path().is_ident("deserialize_with")
+                } else if entry.path().is_ident("with") || entry.path().is_ident("deserialize_with")
                 {
                     result.custom_deserializer = true;
                 } else if entry.path().is_ident("deny_unknown_fields") {
@@ -7528,7 +7527,9 @@ fn generate_fields_schema(
                             "defaulted or conditionally skipped serde(flatten) fields require an explicit schema",
                         ));
                     }
-                    if field_attrs.rename.is_some() || get_json_schema_rename(&field.attrs).is_some() {
+                    if field_attrs.rename.is_some()
+                        || get_json_schema_rename(&field.attrs).is_some()
+                    {
                         return Err(syn::Error::new_spanned(
                             field,
                             "a flattened field has no property name to rename; rename its inner fields instead",

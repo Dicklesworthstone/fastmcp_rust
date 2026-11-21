@@ -169,10 +169,7 @@ fn source_references_crate(production_source: &str, ident: &str) -> bool {
 }
 
 /// Pure evaluator for a single member manifest + production `src/` texts.
-fn unused_optional_deps_for_member(
-    manifest_toml: &str,
-    src_files: &[&str],
-) -> BTreeSet<String> {
+fn unused_optional_deps_for_member(manifest_toml: &str, src_files: &[&str]) -> BTreeSet<String> {
     let stripped: Vec<String> = src_files
         .iter()
         .map(|src| strip_cfg_test_blocks(src))
@@ -244,7 +241,9 @@ fn every_optional_dependency_is_consumed_by_production_source_or_explicitly_exem
 
     let unexpected: Vec<String> = unconsumed
         .difference(&exempt)
-        .map(|(member, dep)| format!("{member}: optional dependency `{dep}` has zero production src/ references"))
+        .map(|(member, dep)| {
+            format!("{member}: optional dependency `{dep}` has zero production src/ references")
+        })
         .collect();
     assert!(
         unexpected.is_empty(),

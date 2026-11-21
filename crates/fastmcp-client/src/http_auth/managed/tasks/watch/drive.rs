@@ -743,7 +743,8 @@ impl ManagedTaskWatchDriver {
                         client.limits.records,
                     )
                     .await?;
-                let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_terminal(cx).await? else {
+                let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_terminal(cx).await?
+                else {
                     return Err(ManagedTaskWatchError::UnexpectedEvent);
                 };
                 Ok::<_, ManagedTaskWatchError>(snapshot.task)

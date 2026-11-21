@@ -154,8 +154,13 @@ fn live_tool_notifications_precede_the_terminal_and_preserve_every_outcome() {
             // A catalog event was delivered; stale ordinary caches cannot survive.
             let (next, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {
                 peer.discovery("access-one", true).await;
-                peer.rpc("tasks/get", "access-one", task("working", "complete"), false)
-                    .await;
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("working", "complete"),
+                    false,
+                )
+                .await;
             }))
             .await;
             assert!(next.is_ok());
@@ -286,7 +291,11 @@ fn live_tool_limits_are_exact_and_fail_before_the_unadmitted_callback() {
                 async {
                     peer.discovery("access-one", true).await;
                     let (mut stream, request) = request(&peer).await;
-                    frames(&mut stream, &[progress(1), progress(2), terminal(&request, 0)]).await;
+                    frames(
+                        &mut stream,
+                        &[progress(1), progress(2), terminal(&request, 0)],
+                    )
+                    .await;
                 },
             ))
             .await;
@@ -391,7 +400,11 @@ fn live_tool_ready_observer_stop_blocks_buffered_events_and_terminal_delivery() 
                 async {
                     peer.discovery("access-one", true).await;
                     let (mut stream, request) = request(&peer).await;
-                    frames(&mut stream, &[progress(1), progress(2), terminal(&request, 0)]).await;
+                    frames(
+                        &mut stream,
+                        &[progress(1), progress(2), terminal(&request, 0)],
+                    )
+                    .await;
                 },
             ))
             .await;
@@ -422,8 +435,13 @@ fn live_tool_quiet_response_is_released_on_cancellation_logout_revocation_or_dea
             let mut client = peer.client(session.clone()).with_tasks();
             let (primed, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {
                 peer.discovery("access-one", true).await;
-                peer.rpc("tasks/get", "access-one", task("working", "complete"), false)
-                    .await;
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("working", "complete"),
+                    false,
+                )
+                .await;
             }))
             .await;
             primed.unwrap();
@@ -537,13 +555,18 @@ fn live_tool_local_policy_refuses_without_contact_or_retiring_an_existing_connec
         let peer = Peer::new().await;
         let session = peer.login(&cx).await;
         let mut client = peer.client(session);
-        let mut observer = |_: &ServerNotification| {
-            panic!("a refused operation cannot call the host")
-        };
+        let mut observer =
+            |_: &ServerNotification| panic!("a refused operation cannot call the host");
         assert!(matches!(
             client
                 .call_tool_final_outcome_with_events(
-                    &cx, "build", json!({}), None, 1, 1024, &mut observer,
+                    &cx,
+                    "build",
+                    json!({}),
+                    None,
+                    1,
+                    1024,
+                    &mut observer,
                 )
                 .await,
             Err(ManagedHttpClientError::InvalidPolicy)
@@ -552,8 +575,13 @@ fn live_tool_local_policy_refuses_without_contact_or_retiring_an_existing_connec
         let mut client = client.with_tasks();
         let (primed, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {
             peer.discovery("access-one", true).await;
-            peer.rpc("tasks/get", "access-one", task("working", "complete"), false)
-                .await;
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            )
+            .await;
         }))
         .await;
         primed.unwrap();
@@ -561,7 +589,13 @@ fn live_tool_local_policy_refuses_without_contact_or_retiring_an_existing_connec
             assert!(matches!(
                 client
                     .call_tool_final_outcome_with_events(
-                        &cx, "build", json!({}), None, count, bytes, &mut observer,
+                        &cx,
+                        "build",
+                        json!({}),
+                        None,
+                        count,
+                        bytes,
+                        &mut observer,
                     )
                     .await,
                 Err(ManagedHttpClientError::InvalidPolicy)

@@ -1757,7 +1757,8 @@ impl GuardedHttpFetcher {
         url: &GuardedHttpsUrl,
         lifetime: Arc<dyn Send + Sync>,
     ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
-        self.fetch_with_retained_lifetime(cx, url, Some(lifetime)).await
+        self.fetch_with_retained_lifetime(cx, url, Some(lifetime))
+            .await
     }
 
     async fn fetch_with_retained_lifetime(
@@ -2223,7 +2224,8 @@ impl GuardedHttpFetcher {
         url: &GuardedHttpsUrl,
         request: &GuardedHttpRequest,
     ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
-        self.post_with_retained_lifetime(cx, url, request, None).await
+        self.post_with_retained_lifetime(cx, url, request, None)
+            .await
     }
 
     /// POST while retaining a caller's admission/resource guard in every owned
@@ -2242,7 +2244,8 @@ impl GuardedHttpFetcher {
         request: &GuardedHttpRequest,
         lifetime: Arc<dyn Send + Sync>,
     ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
-        self.post_with_retained_lifetime(cx, url, request, Some(lifetime)).await
+        self.post_with_retained_lifetime(cx, url, request, Some(lifetime))
+            .await
     }
 
     async fn post_with_retained_lifetime(
@@ -5401,23 +5404,27 @@ impl StreamableHttpRequestResponseSender {
         {
             return Err(invalid_control());
         }
-        let params: FinalCancelledNotificationParams = serde_json::from_value(
-            notification.params.clone().ok_or_else(invalid_control)?,
-        )
-        .map_err(|_| invalid_control())?;
+        let params: FinalCancelledNotificationParams =
+            serde_json::from_value(notification.params.clone().ok_or_else(invalid_control)?)
+                .map_err(|_| invalid_control())?;
         let subscription_id = params
             .meta
             .as_ref()
             .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
             .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
             .ok_or_else(invalid_control)?;
-        if !params.request_id.correlates_with(self.cancellation.request_id())
+        if !params
+            .request_id
+            .correlates_with(self.cancellation.request_id())
             || !subscription_id.correlates_with(self.cancellation.request_id())
         {
             return Err(invalid_control());
         }
         self.cancellation.checkpoint(cx)?;
-        if !self.responses.request_response_guard_is_active(&self.cancellation)? {
+        if !self
+            .responses
+            .request_response_guard_is_active(&self.cancellation)?
+        {
             return Err(invalid_control());
         }
         self.cancellation.with_message_commit(cx, true, || {
@@ -7132,10 +7139,9 @@ impl DualEraHttpSession {
                 self.modern_ingress.push_request(cx, json_rpc)?;
                 Ok(DualEraHttpEndpointResponse::ModernSse(
                     DualEraHttpSseResponse {
-                        response: self.handler.with_allowed_origin(
-                            sse_http_response(Vec::new()),
-                            origin.as_deref(),
-                        ),
+                        response: self
+                            .handler
+                            .with_allowed_origin(sse_http_response(Vec::new()), origin.as_deref()),
                         body,
                         codec: Codec::new(),
                     },
@@ -8352,9 +8358,11 @@ X/aCEJ5+hA==
                 .expect("loopback POST URL");
                 root_identities.push(fetcher.root_identity().to_owned());
                 results.push(match &lifetime {
-                    Some(lifetime) => fetcher.post_with_lifetime(
-                        &cx, &url, &attempt.request, Arc::clone(lifetime),
-                    ).await,
+                    Some(lifetime) => {
+                        fetcher
+                            .post_with_lifetime(&cx, &url, &attempt.request, Arc::clone(lifetime))
+                            .await
+                    }
                     None => fetcher.post(&cx, &url, &attempt.request).await,
                 });
                 urls.push(url);
@@ -8610,10 +8618,14 @@ X/aCEJ5+hA==
         }
     }
 
-    struct GuardedLifetimeProbe { dropped: Arc<AtomicUsize> }
+    struct GuardedLifetimeProbe {
+        dropped: Arc<AtomicUsize>,
+    }
 
     impl Drop for GuardedLifetimeProbe {
-        fn drop(&mut self) { self.dropped.fetch_add(1, Ordering::AcqRel); }
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     struct LifetimeObservingResolver {
@@ -8631,9 +8643,13 @@ X/aCEJ5+hA==
     }
 
     impl GuardedHttpResolver for LifetimeObservingResolver {
-        fn resolve_all(&self, _: Cx, _: String)
-            -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>>
-        {
+        fn resolve_all(
+            &self,
+            _: Cx,
+            _: String,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>,
+        > {
             Box::pin(LifetimeObservingResolverFuture {
                 lifetime: self.lifetime.clone(),
                 started: Arc::clone(&self.started),
@@ -8666,40 +8682,69 @@ X/aCEJ5+hA==
         let resolver_dropped = Arc::new(AtomicUsize::new(0));
         let alive_at_drop = Arc::new(AtomicUsize::new(0));
         let lifetime_dropped = Arc::new(AtomicUsize::new(0));
-        let lifetime = Arc::new(GuardedLifetimeProbe { dropped: Arc::clone(&lifetime_dropped) });
+        let lifetime = Arc::new(GuardedLifetimeProbe {
+            dropped: Arc::clone(&lifetime_dropped),
+        });
         let weak = Arc::downgrade(&lifetime);
         let fetcher = GuardedHttpFetcher::with_resolver(
-            guarded_test_policy_with_handshake(1024, Duration::from_secs(2), Duration::from_secs(1)),
+            guarded_test_policy_with_handshake(
+                1024,
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            ),
             Arc::new(LifetimeObservingResolver {
-                lifetime: weak.clone(), started: Arc::clone(&started),
-                dropped: Arc::clone(&resolver_dropped), alive_at_drop: Arc::clone(&alive_at_drop),
+                lifetime: weak.clone(),
+                started: Arc::clone(&started),
+                dropped: Arc::clone(&resolver_dropped),
+                alive_at_drop: Arc::clone(&alive_at_drop),
             }),
-        ).unwrap();
+        )
+        .unwrap();
         let url = GuardedHttpsUrl::parse("https://public.example/introspect").unwrap();
         let request = GuardedHttpRequest::new(
-            "application/x-www-form-urlencoded", b"token=opaque".to_vec(),
-        ).unwrap();
+            "application/x-www-form-urlencoded",
+            b"token=opaque".to_vec(),
+        )
+        .unwrap();
         fastmcp_core::block_on(async {
             let cx = Cx::current().unwrap();
             let mut post = Box::pin(fetcher.post_with_lifetime(&cx, &url, &request, lifetime));
-            time::timeout_at(time::wall_now() + Duration::from_secs(1), std::future::poll_fn(|task| {
-                assert!(post.as_mut().poll(task).is_pending());
-                if started.load(Ordering::Acquire) != 0 { return Poll::Ready(()); }
-                task.waker().wake_by_ref();
-                Poll::Pending
-            })).await.expect("resolver starts within a bounded fixture deadline");
+            time::timeout_at(
+                time::wall_now() + Duration::from_secs(1),
+                std::future::poll_fn(|task| {
+                    assert!(post.as_mut().poll(task).is_pending());
+                    if started.load(Ordering::Acquire) != 0 {
+                        return Poll::Ready(());
+                    }
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }),
+            )
+            .await
+            .expect("resolver starts within a bounded fixture deadline");
             assert!(weak.upgrade().is_some());
             drop(post);
             // The phase may settle immediately or on a later runtime turn.
             // Its own destructor observes the guard, independent of scheduling.
-            time::timeout_at(time::wall_now() + Duration::from_secs(1), std::future::poll_fn(|task| {
-                if resolver_dropped.load(Ordering::Acquire) != 0 { return Poll::Ready(()); }
-                task.waker().wake_by_ref();
-                Poll::Pending
-            })).await.expect("cancelled resolver settles");
+            time::timeout_at(
+                time::wall_now() + Duration::from_secs(1),
+                std::future::poll_fn(|task| {
+                    if resolver_dropped.load(Ordering::Acquire) != 0 {
+                        return Poll::Ready(());
+                    }
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }),
+            )
+            .await
+            .expect("cancelled resolver settles");
         });
         assert_eq!(resolver_dropped.load(Ordering::Acquire), 1);
-        assert_eq!(alive_at_drop.load(Ordering::Acquire), 1, "child drops before its capacity guard");
+        assert_eq!(
+            alive_at_drop.load(Ordering::Acquire),
+            1,
+            "child drops before its capacity guard"
+        );
         assert_eq!(lifetime_dropped.load(Ordering::Acquire), 1);
         assert!(weak.upgrade().is_none());
     }
@@ -8710,32 +8755,55 @@ X/aCEJ5+hA==
         let resolver_dropped = Arc::new(AtomicUsize::new(0));
         let alive_at_drop = Arc::new(AtomicUsize::new(0));
         let lifetime_dropped = Arc::new(AtomicUsize::new(0));
-        let lifetime = Arc::new(GuardedLifetimeProbe { dropped: Arc::clone(&lifetime_dropped) });
+        let lifetime = Arc::new(GuardedLifetimeProbe {
+            dropped: Arc::clone(&lifetime_dropped),
+        });
         let weak = Arc::downgrade(&lifetime);
         let fetcher = GuardedHttpFetcher::with_resolver(
-            guarded_test_policy_with_handshake(1024, Duration::from_secs(2), Duration::from_secs(1)),
+            guarded_test_policy_with_handshake(
+                1024,
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            ),
             Arc::new(LifetimeObservingResolver {
-                lifetime: weak.clone(), started: Arc::clone(&started),
-                dropped: Arc::clone(&resolver_dropped), alive_at_drop: Arc::clone(&alive_at_drop),
+                lifetime: weak.clone(),
+                started: Arc::clone(&started),
+                dropped: Arc::clone(&resolver_dropped),
+                alive_at_drop: Arc::clone(&alive_at_drop),
             }),
-        ).unwrap();
+        )
+        .unwrap();
         let url = GuardedHttpsUrl::parse("https://public.example/keys").unwrap();
         fastmcp_core::block_on(async {
             let cx = Cx::current().unwrap();
             let mut get = Box::pin(fetcher.fetch_with_lifetime(&cx, &url, lifetime));
-            time::timeout_at(time::wall_now() + Duration::from_secs(1), std::future::poll_fn(|task| {
-                assert!(get.as_mut().poll(task).is_pending());
-                if started.load(Ordering::Acquire) != 0 { return Poll::Ready(()); }
-                task.waker().wake_by_ref();
-                Poll::Pending
-            })).await.expect("resolver starts within a bounded fixture deadline");
+            time::timeout_at(
+                time::wall_now() + Duration::from_secs(1),
+                std::future::poll_fn(|task| {
+                    assert!(get.as_mut().poll(task).is_pending());
+                    if started.load(Ordering::Acquire) != 0 {
+                        return Poll::Ready(());
+                    }
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }),
+            )
+            .await
+            .expect("resolver starts within a bounded fixture deadline");
             assert!(weak.upgrade().is_some());
             drop(get);
-            time::timeout_at(time::wall_now() + Duration::from_secs(1), std::future::poll_fn(|task| {
-                if resolver_dropped.load(Ordering::Acquire) != 0 { return Poll::Ready(()); }
-                task.waker().wake_by_ref();
-                Poll::Pending
-            })).await.expect("cancelled resolver settles");
+            time::timeout_at(
+                time::wall_now() + Duration::from_secs(1),
+                std::future::poll_fn(|task| {
+                    if resolver_dropped.load(Ordering::Acquire) != 0 {
+                        return Poll::Ready(());
+                    }
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }),
+            )
+            .await
+            .expect("cancelled resolver settles");
         });
         assert_eq!(resolver_dropped.load(Ordering::Acquire), 1);
         assert_eq!(alive_at_drop.load(Ordering::Acquire), 1);
@@ -8747,11 +8815,19 @@ X/aCEJ5+hA==
     fn guarded_post_lifetime_preserves_real_tls_and_exact_request_bytes() {
         for trusted in [true, false] {
             let dropped = Arc::new(AtomicUsize::new(0));
-            let lifetime = Arc::new(GuardedLifetimeProbe { dropped: Arc::clone(&dropped) });
+            let lifetime = Arc::new(GuardedLifetimeProbe {
+                dropped: Arc::clone(&dropped),
+            });
             let request = GuardedHttpRequest::new(
-                "application/x-www-form-urlencoded", b"token=opaque&token_type_hint=access_token".to_vec(),
-            ).unwrap().with_authorization("Basic test-only").unwrap();
-            let roots = if trusted { guarded_loopback_member_roots() } else {
+                "application/x-www-form-urlencoded",
+                b"token=opaque&token_type_hint=access_token".to_vec(),
+            )
+            .unwrap()
+            .with_authorization("Basic test-only")
+            .unwrap();
+            let roots = if trusted {
+                guarded_loopback_member_roots()
+            } else {
                 GuardedRootSet::new(vec![guarded_outside_root()]).unwrap()
             };
             let run = guarded_loopback_posts_retaining(
@@ -8763,16 +8839,22 @@ X/aCEJ5+hA==
             assert_eq!(run.observation.accepted_connections, 1);
             if trusted {
                 assert_eq!(run.results[0].as_ref().unwrap().status, 200);
-                assert_eq!(run.observation.requests,
-                    vec![guarded_encode_post_request(&run.urls[0], &request).unwrap()]);
+                assert_eq!(
+                    run.observation.requests,
+                    vec![guarded_encode_post_request(&run.urls[0], &request).unwrap()]
+                );
             } else {
                 match &run.results[0] {
                     Err(GuardedHttpFetchError::Tls(message)) => assert!(
-                        !message.contains("timed out"), "fixture must reject certificate trust, not time out",
+                        !message.contains("timed out"),
+                        "fixture must reject certificate trust, not time out",
                     ),
                     other => panic!("untrusted root must fail TLS verification: {other:?}"),
                 }
-                assert!(run.observation.requests.is_empty(), "untrusted TLS peer gets no credential");
+                assert!(
+                    run.observation.requests.is_empty(),
+                    "untrusted TLS peer gets no credential"
+                );
             }
         }
     }
@@ -9884,14 +9966,25 @@ X/aCEJ5+hA==
             .with_cors("https://trusted.example");
         assert_eq!(wildcard.headers["vary"], "*");
         let mut wildcard = HttpResponse::ok().with_header("vary", "*");
-        wildcard.headers.insert("Vary".to_owned(), "Accept".to_owned());
-        assert_eq!(wildcard.with_cors("https://trusted.example").headers["vary"], "*");
+        wildcard
+            .headers
+            .insert("Vary".to_owned(), "Accept".to_owned());
+        assert_eq!(
+            wildcard.with_cors("https://trusted.example").headers["vary"],
+            "*"
+        );
 
         let mut duplicated = HttpResponse::ok().with_header("vary", "Accept-Encoding, ORIGIN");
-        duplicated.headers.insert("Vary".to_owned(), "Accept".to_owned());
+        duplicated
+            .headers
+            .insert("Vary".to_owned(), "Accept".to_owned());
         let response = duplicated.with_cors("https://trusted.example");
         assert_eq!(
-            response.headers.keys().filter(|name| name.eq_ignore_ascii_case("vary")).count(),
+            response
+                .headers
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case("vary"))
+                .count(),
             1
         );
         let tokens = response.headers["vary"]
@@ -9940,7 +10033,10 @@ X/aCEJ5+hA==
         assert_eq!(response.status, HttpStatus::OK);
         assert!(response.body.is_empty());
         assert_eq!(
-            response.headers.get("access-control-allow-origin").map(String::as_str),
+            response
+                .headers
+                .get("access-control-allow-origin")
+                .map(String::as_str),
             Some("https://trusted.example")
         );
         let granted = response.headers["access-control-allow-headers"]
@@ -9958,8 +10054,15 @@ X/aCEJ5+hA==
         .map(str::to_owned)
         .into_iter()
         .collect::<HashSet<_>>();
-        assert_eq!(granted, expected, "the browser can send every MCP routing field");
-        assert!(!response.headers.contains_key("access-control-allow-credentials"));
+        assert_eq!(
+            granted, expected,
+            "the browser can send every MCP routing field"
+        );
+        assert!(
+            !response
+                .headers
+                .contains_key("access-control-allow-credentials")
+        );
 
         let request = HttpRequest::new(HttpMethod::Post, "/mcp/v1")
             .with_header("Origin", "https://trusted.example")
@@ -9980,21 +10083,35 @@ X/aCEJ5+hA==
                 .unwrap(),
             );
         assert_eq!(
-            handler.admit_modern_request(&request).unwrap().request().method,
+            handler
+                .admit_modern_request(&request)
+                .unwrap()
+                .request()
+                .method,
             "tools/call",
             "the approved browser headers reach ordinary MCP admission"
         );
         let challenge = HttpResponse::new(HttpStatus::UNAUTHORIZED)
-            .with_header("WWW-Authenticate", "Bearer resource_metadata=\"https://mcp.example/metadata\"")
+            .with_header(
+                "WWW-Authenticate",
+                "Bearer resource_metadata=\"https://mcp.example/metadata\"",
+            )
             .with_header("Retry-After", "1")
             .with_cors("https://trusted.example");
         assert_eq!(
-            challenge.headers.get("access-control-expose-headers").map(String::as_str),
+            challenge
+                .headers
+                .get("access-control-expose-headers")
+                .map(String::as_str),
             Some("WWW-Authenticate, MCP-Protocol-Version, Retry-After")
         );
         assert_eq!(challenge.headers["retry-after"], "1");
         assert!(challenge.headers["www-authenticate"].starts_with("Bearer "));
-        assert!(!challenge.headers.contains_key("access-control-allow-credentials"));
+        assert!(
+            !challenge
+                .headers
+                .contains_key("access-control-allow-credentials")
+        );
     }
 
     #[test]
@@ -10025,7 +10142,11 @@ X/aCEJ5+hA==
             assert_eq!(response.status, HttpStatus::FORBIDDEN, "{forbidden}");
             assert!(response.body.is_empty());
             assert!(!response.headers.contains_key("access-control-allow-origin"));
-            assert!(!response.headers.contains_key("access-control-allow-headers"));
+            assert!(
+                !response
+                    .headers
+                    .contains_key("access-control-allow-headers")
+            );
         }
         assert_eq!(
             handler.handle_options(&accepted).status,
@@ -10054,12 +10175,12 @@ X/aCEJ5+hA==
             "mcp-name=echo".to_owned(),
             "x-caf\u{e9}".to_owned(),
             "x".repeat(MAX_CORS_REQUESTED_HEADER_NAME_BYTES + 1),
-            "x".repeat(
-                MAX_CORS_REQUESTED_HEADERS * (MAX_CORS_REQUESTED_HEADER_NAME_BYTES + 2) + 1,
-            ),
+            "x".repeat(MAX_CORS_REQUESTED_HEADERS * (MAX_CORS_REQUESTED_HEADER_NAME_BYTES + 2) + 1),
         ] {
             let response = handler.handle_options(
-                &accepted.clone().with_header("Access-Control-Request-Headers", invalid),
+                &accepted
+                    .clone()
+                    .with_header("Access-Control-Request-Headers", invalid),
             );
             assert_eq!(response.status, HttpStatus::BAD_REQUEST);
             assert!(!response.headers.contains_key("access-control-allow-origin"));
@@ -10073,7 +10194,10 @@ X/aCEJ5+hA==
             "access-control-request-headers".to_owned(),
             "mcp-method".to_owned(),
         );
-        assert_eq!(handler.handle_options(&duplicate).status, HttpStatus::BAD_REQUEST);
+        assert_eq!(
+            handler.handle_options(&duplicate).status,
+            HttpStatus::BAD_REQUEST
+        );
         assert_eq!(handler.handle_options(&accepted).status, HttpStatus::OK);
     }
 
@@ -10094,7 +10218,9 @@ X/aCEJ5+hA==
             accepted.clone().with_header("Content-Length", "+0"),
             accepted.clone().with_header("Content-Length", "invalid"),
             accepted.clone().with_header("Transfer-Encoding", "chunked"),
-            accepted.clone().with_header("Access-Control-Request-Private-Network", "true"),
+            accepted
+                .clone()
+                .with_header("Access-Control-Request-Private-Network", "true"),
         ] {
             let response = handler.handle_options(&rejected);
             assert_eq!(response.status, HttpStatus::BAD_REQUEST);
@@ -11675,7 +11801,10 @@ Content-Length: {}\r\n\
         assert_eq!(response_stream.pending_responses(), 0);
     }
 
-    fn subscription_cancellation(request_id: serde_json::Value, owner: serde_json::Value) -> JsonRpcRequest {
+    fn subscription_cancellation(
+        request_id: serde_json::Value,
+        owner: serde_json::Value,
+    ) -> JsonRpcRequest {
         JsonRpcRequest::notification(
             "notifications/cancelled",
             Some(serde_json::json!({
@@ -11696,25 +11825,32 @@ Content-Length: {}\r\n\
         let cancellation = first.cancellation();
         let sibling_cancellation = sibling.cancellation();
         let cx = Cx::for_testing();
-        sender.send_notification(
-            &cx,
-            JsonRpcRequest::notification(
-                "notifications/subscriptions/acknowledged",
-                Some(serde_json::json!({
-                    "notifications": {},
-                    "_meta": {FINAL_SUBSCRIPTION_ID_META_KEY: 704},
-                })),
-            ),
-        ).unwrap();
-        sender.send_subscription_cancellation(
-            &cx,
-            subscription_cancellation(
-                serde_json::from_str("704e0").unwrap(),
-                serde_json::from_str("704.0").unwrap(),
-            ),
-        ).unwrap();
+        sender
+            .send_notification(
+                &cx,
+                JsonRpcRequest::notification(
+                    "notifications/subscriptions/acknowledged",
+                    Some(serde_json::json!({
+                        "notifications": {},
+                        "_meta": {FINAL_SUBSCRIPTION_ID_META_KEY: 704},
+                    })),
+                ),
+            )
+            .unwrap();
+        sender
+            .send_subscription_cancellation(
+                &cx,
+                subscription_cancellation(
+                    serde_json::from_str("704e0").unwrap(),
+                    serde_json::from_str("704.0").unwrap(),
+                ),
+            )
+            .unwrap();
         assert!(cancellation.is_terminal_committed());
-        assert!(!cancellation.is_cancelled(), "the winning control remains drainable");
+        assert!(
+            !cancellation.is_cancelled(),
+            "the winning control remains drainable"
+        );
         assert!(matches!(
             clone.send_response(
                 &cx,
@@ -11724,7 +11860,8 @@ Content-Length: {}\r\n\
         ));
         assert!(matches!(
             clone.send_subscription_cancellation(
-                &cx, subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+                &cx,
+                subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
             ),
             Err(TransportError::Closed)
         ));
@@ -11733,7 +11870,10 @@ Content-Length: {}\r\n\
             Some(StreamableHttpRequestResponseMessage::Notification(notification))
                 if notification.method == "notifications/subscriptions/acknowledged"
         ));
-        assert!(!first.is_finished(), "the earlier ACK is not the terminal entry");
+        assert!(
+            !first.is_finished(),
+            "the earlier ACK is not the terminal entry"
+        );
         assert!(matches!(
             first.pop_message().unwrap(),
             Some(StreamableHttpRequestResponseMessage::Notification(notification))
@@ -11745,14 +11885,21 @@ Content-Length: {}\r\n\
         assert!(!sibling.is_finished());
         assert!(!sibling_cancellation.is_cancelled());
         assert!(!sibling_cancellation.is_terminal_committed());
-        sibling.sender().send_response(
-            &cx, JsonRpcResponse::success(705_i64.into(), serde_json::json!({"sibling": true})),
-        ).unwrap();
+        sibling
+            .sender()
+            .send_response(
+                &cx,
+                JsonRpcResponse::success(705_i64.into(), serde_json::json!({"sibling": true})),
+            )
+            .unwrap();
         assert!(sibling.pop_response().unwrap().is_some());
         assert_eq!(responses.pending_responses(), 0);
         let replacement = responses.for_request(RequestId::Number(704)).unwrap();
         assert!(matches!(
-            clone.send_notification(&cx, JsonRpcRequest::notification("notifications/tools/list_changed", None)),
+            clone.send_notification(
+                &cx,
+                JsonRpcRequest::notification("notifications/tools/list_changed", None)
+            ),
             Err(TransportError::Cancelled)
         ));
         assert!(replacement.pop_message().unwrap().is_none());
@@ -11768,13 +11915,23 @@ Content-Length: {}\r\n\
             subscription_cancellation(serde_json::json!("704"), serde_json::json!(704)),
             subscription_cancellation(serde_json::json!(704), serde_json::json!("704")),
             subscription_cancellation(serde_json::json!(704), serde_json::Value::Null),
-            JsonRpcRequest::notification("notifications/cancelled", Some(serde_json::json!({"requestId":704}))),
-            JsonRpcRequest::notification("notifications/cancelled", Some(serde_json::json!({
-                "requestId":704, "reason":null, "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:704},
-            }))),
-            JsonRpcRequest::new("notifications/cancelled", Some(serde_json::json!({
-                "requestId":704, "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:704},
-            })), 704_i64),
+            JsonRpcRequest::notification(
+                "notifications/cancelled",
+                Some(serde_json::json!({"requestId":704})),
+            ),
+            JsonRpcRequest::notification(
+                "notifications/cancelled",
+                Some(serde_json::json!({
+                    "requestId":704, "reason":null, "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:704},
+                })),
+            ),
+            JsonRpcRequest::new(
+                "notifications/cancelled",
+                Some(serde_json::json!({
+                    "requestId":704, "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:704},
+                })),
+                704_i64,
+            ),
         ] {
             let mut transport = StreamableHttpTransport::new();
             let responses = transport.response_stream().unwrap();
@@ -11791,9 +11948,12 @@ Content-Length: {}\r\n\
             assert!(!guard.is_terminal_committed());
             assert!(!guard.is_cancelled());
             assert!(!body.is_finished());
-            sender.send_subscription_cancellation(
-                &cx, subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
-            ).unwrap();
+            sender
+                .send_subscription_cancellation(
+                    &cx,
+                    subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+                )
+                .unwrap();
             assert!(body.pop_message().unwrap().is_some());
             assert!(body.is_finished());
         }
@@ -11807,9 +11967,12 @@ Content-Length: {}\r\n\
         let sender = body.sender();
         let guard = body.cancellation();
         let cx = Cx::for_testing();
-        sender.send_notification(
-            &cx, JsonRpcRequest::notification("notifications/tools/list_changed", None),
-        ).unwrap();
+        sender
+            .send_notification(
+                &cx,
+                JsonRpcRequest::notification("notifications/tools/list_changed", None),
+            )
+            .unwrap();
         let retained = responses.mailbox.lock().unwrap().retained_bytes;
         assert!(matches!(
             sender.send_subscription_cancellation(
@@ -11822,9 +11985,12 @@ Content-Length: {}\r\n\
         assert!(!guard.is_terminal_committed());
         assert!(body.pop_message().unwrap().is_some());
         assert!(!body.is_finished());
-        sender.send_subscription_cancellation(
-            &cx, subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
-        ).unwrap();
+        sender
+            .send_subscription_cancellation(
+                &cx,
+                subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+            )
+            .unwrap();
         assert!(body.pop_message().unwrap().is_some());
         assert!(body.is_finished());
         assert_eq!(responses.pending_responses(), 0);
@@ -11880,19 +12046,27 @@ Content-Length: {}\r\n\
         let reuse_while_cleaning = responses.for_request(RequestId::Number(704));
         drop(mailbox);
         retiring.join().unwrap();
-        assert!(serialized, "ID reuse must wait until old-owner cleanup is complete");
+        assert!(
+            serialized,
+            "ID reuse must wait until old-owner cleanup is complete"
+        );
         assert!(matches!(
             reuse_while_cleaning,
             Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
         let replacement = responses.for_request(RequestId::Number(704)).unwrap();
         let cx = Cx::for_testing();
-        replacement.sender().send_response(
-            &cx, JsonRpcResponse::success(704_i64.into(), serde_json::json!({"replacement": true})),
-        ).unwrap();
+        replacement
+            .sender()
+            .send_response(
+                &cx,
+                JsonRpcResponse::success(704_i64.into(), serde_json::json!({"replacement": true})),
+            )
+            .unwrap();
         assert!(matches!(
             retained_sender.send_subscription_cancellation(
-                &cx, subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+                &cx,
+                subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
             ),
             Err(TransportError::Cancelled)
         ));
@@ -13736,11 +13910,7 @@ Content-Length: {}\r\n\
                 cors_origins: vec!["https://trusted.example".to_owned()],
                 ..HttpHandlerConfig::default()
             }),
-            DualEraHttpEndpointConfig::new(
-                "/legacy/sse",
-                "/legacy/messages",
-                "http://legacy.test",
-            ),
+            DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test"),
         )
         .unwrap()
     }
@@ -13761,11 +13931,15 @@ Content-Length: {}\r\n\
         for (request, status) in [
             (accepted.clone(), HttpStatus::OK),
             (
-                accepted.clone().with_header("Access-Control-Request-Headers", "cookie"),
+                accepted
+                    .clone()
+                    .with_header("Access-Control-Request-Headers", "cookie"),
                 HttpStatus::FORBIDDEN,
             ),
             (
-                accepted.clone().with_header("Origin", "https://foreign.example"),
+                accepted
+                    .clone()
+                    .with_header("Origin", "https://foreign.example"),
                 HttpStatus::FORBIDDEN,
             ),
             (
@@ -13801,11 +13975,12 @@ Content-Length: {}\r\n\
                 .with_header("Origin", "https://trusted.example")
                 .with_header("Accept", media_type);
             let response = session.handle(&cx, request).unwrap();
-            assert_eq!(session.recv_modern_request(&cx).unwrap().method, "tools/call");
-            let completed = JsonRpcResponse::success(
-                RequestId::Number(904),
-                serde_json::json!({"ok": true}),
+            assert_eq!(
+                session.recv_modern_request(&cx).unwrap().method,
+                "tools/call"
             );
+            let completed =
+                JsonRpcResponse::success(RequestId::Number(904), serde_json::json!({"ok": true}));
             let response = match response {
                 DualEraHttpEndpointResponse::ModernJson(response) => {
                     session.send_modern_json_response(&cx, completed).unwrap();
@@ -13822,12 +13997,19 @@ Content-Length: {}\r\n\
             };
             assert_eq!(response.status, HttpStatus::OK);
             assert_eq!(response.headers["content-type"], media_type);
-            assert_eq!(response.headers["access-control-allow-origin"], "https://trusted.example");
+            assert_eq!(
+                response.headers["access-control-allow-origin"],
+                "https://trusted.example"
+            );
             assert_eq!(
                 response.headers["access-control-expose-headers"],
                 "WWW-Authenticate, MCP-Protocol-Version, Retry-After"
             );
-            assert!(!response.headers.contains_key("access-control-allow-credentials"));
+            assert!(
+                !response
+                    .headers
+                    .contains_key("access-control-allow-credentials")
+            );
         }
     }
 

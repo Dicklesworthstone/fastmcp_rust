@@ -551,11 +551,19 @@ fn host_https_redirect_managed_session_executes_one_protected_request() {
                 &mut tls, 200,
                 r#"{"access_token":"host-managed-access","token_type":"Bearer","expires_in":300,"refresh_token":"host-managed-refresh","scope":"tools:read"}"#,
             ).await;
-            let (mut tls, body) = peer.request_with_authorization(
-                "POST", "/mcp", Some("Bearer host-managed-access"),
-            ).await;
-            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["method"], "tools/list");
-            reply(&mut tls, 200, r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#).await;
+            let (mut tls, body) = peer
+                .request_with_authorization("POST", "/mcp", Some("Bearer host-managed-access"))
+                .await;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["method"],
+                "tools/list"
+            );
+            reply(
+                &mut tls,
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#,
+            )
+            .await;
         };
         let application = async {
             let session = ManagedOAuthSession::authorize_with_redirect_driver(
@@ -572,19 +580,29 @@ fn host_https_redirect_managed_session_executes_one_protected_request() {
                     assert_eq!(launch["code_challenge_method"], "S256");
                     std::future::ready(Ok(format!(
                         "{}?state={}&iss={}&code=host-managed-code&vendor=one&vendor=two",
-                        redirect.as_str(), encode_component(&launch["state"]), encode_component(&issuer),
+                        redirect.as_str(),
+                        encode_component(&launch["state"]),
+                        encode_component(&issuer),
                     )))
                 },
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             let request = ModernHttpRequest::new(
                 resource.clone(),
                 br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#.to_vec(),
-                "2026-07-28", "tools/list", None,
-            ).unwrap();
+                "2026-07-28",
+                "tools/list",
+                None,
+            )
+            .unwrap();
             let response = session.clone().execute(&cx, &request).await.unwrap();
             assert_eq!(response.credential_generation(), 1);
             let body = response.read_to_end(&cx, 4096).await.unwrap();
-            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["result"]["tools"], json!([]));
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["result"]["tools"],
+                json!([])
+            );
             assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
             session.close();
         };
@@ -1492,8 +1510,11 @@ fn initial_registration_credential_cannot_be_sent_to_a_different_endpoint() {
                 .unwrap(),
             )
             .unwrap();
-        let ((), result) =
-            Box::pin(pair(peer.registration_discovery(&document), owner.register(&cx))).await;
+        let ((), result) = Box::pin(pair(
+            peer.registration_discovery(&document),
+            owner.register(&cx),
+        ))
+        .await;
         assert!(matches!(
             result,
             Err(OAuthRegistrationError::InitialCredentialRejected)

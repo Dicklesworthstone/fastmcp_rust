@@ -20,22 +20,22 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::tasks_extension::GetTaskResult;
 use fastmcp_protocol::{FinalRequestMeta, ServerNotification};
 
-use super::{DpopTaskCheckpointError, DpopTaskWatchCheckpoint};
 use super::super::{DpopTaskWatchError, DpopTaskWatchPolicy, WatchState};
+use super::{DpopTaskCheckpointError, DpopTaskWatchCheckpoint};
+use crate::http_auth::dpop::native::core::DpopCoreError;
+use crate::http_auth::dpop::native::core::stream::budget::SharedStreamBudget;
+use crate::http_auth::dpop::native::core::stream::{DpopStreamError, DpopStreamLimits};
+use crate::http_auth::dpop::native::core::tasks::ManagedTaskEvent;
 use crate::http_auth::dpop::native::{
     DpopCredential, DpopHttpClient, DpopHttpError, WaitBounds, check_live,
 };
-use crate::http_auth::dpop::native::core::DpopCoreError;
-use crate::http_auth::dpop::native::core::stream::{DpopStreamError, DpopStreamLimits};
-use crate::http_auth::dpop::native::core::stream::budget::SharedStreamBudget;
-use crate::http_auth::dpop::native::core::tasks::ManagedTaskEvent;
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::client::resume_read_deadline;
 use crate::http_auth::rpc::ManagedCoreError;
 
+pub use crate::http_auth::managed::tasks::watch::checkpoint::resume::client::lifecycle::TaskResumeChange;
 pub use crate::http_auth::managed::tasks::watch::checkpoint::resume::{
     TaskResumeBinding, TaskResumeError, TaskResumeRecord,
 };
-pub use crate::http_auth::managed::tasks::watch::checkpoint::resume::client::lifecycle::TaskResumeChange;
 
 /// One authoritative response, separate from its payload-free storage change.
 /// This is neither Clone nor serializable. Debug omits all peer data.
@@ -52,12 +52,24 @@ pub struct DpopTaskResumeSnapshot {
 }
 
 impl DpopTaskResumeSnapshot {
-    pub fn snapshot(&self) -> &GetTaskResult { &self.snapshot }
-    pub fn change(&self) -> &TaskResumeChange { &self.change }
+    pub fn snapshot(&self) -> &GetTaskResult {
+        &self.snapshot
+    }
+    pub fn change(&self) -> &TaskResumeChange {
+        &self.change
+    }
     /// Only active Tasks have a selection. Starting a watch is a separate host
     /// decision with fresh authentication and finite limits, not old authority.
-    pub fn selection(&self) -> Option<&DpopTaskWatchCheckpoint> { self.selection.as_ref() }
-    pub fn into_parts(self) -> (Box<GetTaskResult>, TaskResumeChange, Option<DpopTaskWatchCheckpoint>) {
+    pub fn selection(&self) -> Option<&DpopTaskWatchCheckpoint> {
+        self.selection.as_ref()
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        Box<GetTaskResult>,
+        TaskResumeChange,
+        Option<DpopTaskWatchCheckpoint>,
+    ) {
         (self.snapshot, self.change, self.selection)
     }
 }
@@ -94,16 +106,24 @@ impl std::error::Error for DpopTaskResumeError {
     }
 }
 impl From<TaskResumeError> for DpopTaskResumeError {
-    fn from(error: TaskResumeError) -> Self { Self::Resume(error) }
+    fn from(error: TaskResumeError) -> Self {
+        Self::Resume(error)
+    }
 }
 impl From<DpopTaskCheckpointError> for DpopTaskResumeError {
-    fn from(error: DpopTaskCheckpointError) -> Self { Self::Checkpoint(error) }
+    fn from(error: DpopTaskCheckpointError) -> Self {
+        Self::Checkpoint(error)
+    }
 }
 impl From<DpopTaskWatchError> for DpopTaskResumeError {
-    fn from(error: DpopTaskWatchError) -> Self { Self::Checkpoint(error.into()) }
+    fn from(error: DpopTaskWatchError) -> Self {
+        Self::Checkpoint(error.into())
+    }
 }
 impl From<DpopHttpError> for DpopTaskResumeError {
-    fn from(error: DpopHttpError) -> Self { DpopTaskWatchError::from(error).into() }
+    fn from(error: DpopHttpError) -> Self {
+        DpopTaskWatchError::from(error).into()
+    }
 }
 
 fn classify(error: DpopStreamError) -> DpopTaskResumeError {
@@ -119,21 +139,33 @@ fn classify(error: DpopStreamError) -> DpopTaskResumeError {
 // owner still wins ties and keeps its precise credential/cancellation error.
 fn retained_bounds(owner: WaitBounds, retention: Time) -> WaitBounds {
     if retention < owner.deadline {
-        WaitBounds { deadline: retention, terminal: DpopHttpError::TimedOut }
-    } else { owner }
+        WaitBounds {
+            deadline: retention,
+            terminal: DpopHttpError::TimedOut,
+        }
+    } else {
+        owner
+    }
 }
 
 fn reconciled(
-    cx: &Cx, current: &TaskResumeBinding, previous: &TaskResumeRecord,
+    cx: &Cx,
+    current: &TaskResumeBinding,
+    previous: &TaskResumeRecord,
     snapshot: Box<GetTaskResult>,
 ) -> Result<DpopTaskResumeSnapshot, DpopTaskResumeError> {
     // The shared comparator enforces ID, creation instant, immutable TTL,
     // monotonic update time, status consistency and ORIGINAL host retention.
     let change = TaskResumeChange::from_snapshot(cx, current, previous, &snapshot.task)?;
-    let selection = change.replacement().map(|record| {
-        DpopTaskWatchCheckpoint::new(current.resource(), record.task_id().clone())
-    }).transpose()?;
-    Ok(DpopTaskResumeSnapshot { snapshot, change, selection })
+    let selection = change
+        .replacement()
+        .map(|record| DpopTaskWatchCheckpoint::new(current.resource(), record.task_id().clone()))
+        .transpose()?;
+    Ok(DpopTaskResumeSnapshot {
+        snapshot,
+        change,
+        selection,
+    })
 }
 
 impl DpopHttpClient {
@@ -142,15 +174,28 @@ impl DpopHttpClient {
     /// Open/persist records separately in the host's owned blocking lane.
     #[allow(clippy::too_many_arguments)]
     pub async fn reconcile_task_resume(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        credential: &DpopCredential, metadata: FinalRequestMeta,
-        current: &TaskResumeBinding, record: &TaskResumeRecord,
-        id_prefix: &str, limits: DpopStreamLimits,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        current: &TaskResumeBinding,
+        record: &TaskResumeRecord,
+        id_prefix: &str,
+        limits: DpopStreamLimits,
     ) -> Result<DpopTaskResumeSnapshot, DpopTaskResumeError> {
         self.reconcile_task_resume_with_events(
-            cx, cancellation, credential, metadata, current, record,
-            id_prefix, limits, |_| true,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            current,
+            record,
+            id_prefix,
+            limits,
+            |_| true,
+        )
+        .await
     }
 
     /// Fresh authenticated discovery/get, bounded by the original credential,
@@ -175,35 +220,62 @@ impl DpopHttpClient {
     /// input resolution, remote cancellation, retry or subscription is performed.
     #[allow(clippy::too_many_arguments)]
     pub async fn reconcile_task_resume_with_events<N>(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        credential: &DpopCredential, metadata: FinalRequestMeta,
-        current: &TaskResumeBinding, record: &TaskResumeRecord,
-        id_prefix: &str, limits: DpopStreamLimits, mut notify: N,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        current: &TaskResumeBinding,
+        record: &TaskResumeRecord,
+        id_prefix: &str,
+        limits: DpopStreamLimits,
+        mut notify: N,
     ) -> Result<DpopTaskResumeSnapshot, DpopTaskResumeError>
-    where N: FnMut(&ServerNotification) -> bool,
+    where
+        N: FnMut(&ServerNotification) -> bool,
     {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(DpopHttpError::Cancelled.into());
         }
         let mut state = WatchState::new(id_prefix, DpopTaskWatchPolicy::new(1)?, limits)?;
-        let owner = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
+        let owner = WaitBounds::new(
+            cx,
+            self.policy.timeout.min(limits.core.timeout()),
+            credential,
+        )?;
         self.reconcile_task_resume_with_state(
-            cx, cancellation, credential, metadata, current, record,
-            owner, &mut state, None, &mut notify,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            current,
+            record,
+            owner,
+            &mut state,
+            None,
+            &mut notify,
+        )
+        .await
     }
 
     // A staged restart supplies its original lifetime and aggregate ledger.
     // Saved controls never select a new client or replenish a response budget.
     #[allow(clippy::too_many_arguments)]
     async fn reconcile_task_resume_with_state<N>(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        credential: &DpopCredential, metadata: FinalRequestMeta,
-        current: &TaskResumeBinding, record: &TaskResumeRecord,
-        owner: WaitBounds, state: &mut WatchState,
-        budget: Option<SharedStreamBudget>, notify: &mut N,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        current: &TaskResumeBinding,
+        record: &TaskResumeRecord,
+        owner: WaitBounds,
+        state: &mut WatchState,
+        budget: Option<SharedStreamBudget>,
+        notify: &mut N,
     ) -> Result<DpopTaskResumeSnapshot, DpopTaskResumeError>
-    where N: FnMut(&ServerNotification) -> bool,
+    where
+        N: FnMut(&ServerNotification) -> bool,
     {
         let retention = resume_read_deadline(cx, current, record, self.resource().as_str())?;
         if let Some(budget) = &budget {
@@ -212,16 +284,29 @@ impl DpopHttpClient {
         let (operation, limits) = state.snapshot_request(record.task_id())?;
         let bounds = retained_bounds(owner, retention);
         check_live(cx, cancellation, &self.session, credential, owner)?;
-        if cx.now() >= retention { return Err(TaskResumeError::Unavailable.into()); }
+        if cx.now() >= retention {
+            return Err(TaskResumeError::Unavailable.into());
+        }
         record.admit(cx, current)?;
-        let response = self.request_task_stream_with_budget(
-            cx, cancellation, credential, metadata, operation, limits, bounds, notify,
-            budget.clone(),
-        ).await;
+        let response = self
+            .request_task_stream_with_budget(
+                cx,
+                cancellation,
+                credential,
+                metadata,
+                operation,
+                limits,
+                bounds,
+                notify,
+                budget.clone(),
+            )
+            .await;
         // Stop/revoke/owner timeout outranks unavailable and any peer error.
         // Checking ORIGINAL owner bounds lets retention expiry stay unavailable.
         check_live(cx, cancellation, &self.session, credential, owner)?;
-        if cx.now() >= retention { return Err(TaskResumeError::Unavailable.into()); }
+        if cx.now() >= retention {
+            return Err(TaskResumeError::Unavailable.into());
+        }
         record.admit(cx, current)?;
         let completed = response.map_err(classify)?;
         if let Some(budget) = &budget {
@@ -234,7 +319,9 @@ impl DpopHttpClient {
         };
         let result = reconciled(cx, current, record, snapshot);
         check_live(cx, cancellation, &self.session, credential, owner)?;
-        if cx.now() >= retention { return Err(TaskResumeError::Unavailable.into()); }
+        if cx.now() >= retention {
+            return Err(TaskResumeError::Unavailable.into());
+        }
         record.admit(cx, current)?;
         result
     }
@@ -243,22 +330,40 @@ impl DpopHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::task::{Context, Poll, Waker};
-    use std::time::Duration;
     use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
     use fastmcp_protocol::ClientCapabilities;
     use serde_json::json;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
 
     pub(super) fn binding(subject: &str, resource: &str) -> TaskResumeBinding {
-        let owner = DurableOwnerKey::derive(&PartitionDescriptor::from_verified_facts(
-            "fixture", 1, "https://issuer.example", resource, "tenant", subject,
-            "client", 1, 1, &[b"bound-resource".as_slice()],
-        ).unwrap(), 1).unwrap();
+        let owner = DurableOwnerKey::derive(
+            &PartitionDescriptor::from_verified_facts(
+                "fixture",
+                1,
+                "https://issuer.example",
+                resource,
+                "tenant",
+                subject,
+                "client",
+                1,
+                1,
+                &[b"bound-resource".as_slice()],
+            )
+            .unwrap(),
+            1,
+        )
+        .unwrap();
         TaskResumeBinding::from_verified_owner(
-            fastmcp_core::CanonicalHttpUrl::parse(resource).unwrap(), "fixture", &owner,
-            [2; 32], [3; 32], [4; 32],
-        ).unwrap()
+            fastmcp_core::CanonicalHttpUrl::parse(resource).unwrap(),
+            "fixture",
+            &owner,
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        )
+        .unwrap()
     }
 
     pub(super) fn snapshot(status: &str, second: u8) -> Box<GetTaskResult> {
@@ -274,7 +379,13 @@ mod tests {
     }
 
     pub(super) fn record(cx: &Cx, binding: &TaskResumeBinding) -> TaskResumeRecord {
-        TaskResumeRecord::capture(cx, binding, &snapshot("working", 1).task, Duration::from_secs(3600)).unwrap()
+        TaskResumeRecord::capture(
+            cx,
+            binding,
+            &snapshot("working", 1).task,
+            Duration::from_secs(3600),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -291,7 +402,11 @@ mod tests {
         let next = current.change().replacement().unwrap();
         assert_eq!(next.key(), previous.key());
         let encoded = next.encode().unwrap();
-        assert_eq!(&encoded[encoded.len()-16..], &before[before.len()-16..], "retention must not renew");
+        assert_eq!(
+            &encoded[encoded.len() - 16..],
+            &before[before.len() - 16..],
+            "retention must not renew"
+        );
         assert!(!encoded.windows(6).any(|bytes| bytes == b"SECRET"));
         assert_eq!(current.selection().unwrap().task_id(), previous.task_id());
         assert!(!format!("{current:?}").contains("SECRET"));
@@ -309,8 +424,15 @@ mod tests {
         assert!(result.selection().is_none());
         assert!(result.change().replacement().is_none());
         assert_eq!(result.change().previous(), &previous);
-        assert!(matches!(result.snapshot().task, fastmcp_protocol::tasks_extension::Task::Cancelled(_)));
-        assert_eq!(previous.encode().unwrap(), before, "delivery does not retire the saved lookup");
+        assert!(matches!(
+            result.snapshot().task,
+            fastmcp_protocol::tasks_extension::Task::Cancelled(_)
+        ));
+        assert_eq!(
+            previous.encode().unwrap(),
+            before,
+            "delivery does not retire the saved lookup"
+        );
     }
 
     #[test]
@@ -331,9 +453,18 @@ mod tests {
                     wire["pollIntervalMs"] = json!(2000);
                 }
             }
-            let result = reconciled(&cx, &binding, &previous, Box::new(serde_json::from_value(wire).unwrap()));
-            assert!(matches!(result, Err(DpopTaskResumeError::Resume(
-                TaskResumeError::StaleSnapshot | TaskResumeError::ConflictingSnapshot))));
+            let result = reconciled(
+                &cx,
+                &binding,
+                &previous,
+                Box::new(serde_json::from_value(wire).unwrap()),
+            );
+            assert!(matches!(
+                result,
+                Err(DpopTaskResumeError::Resume(
+                    TaskResumeError::StaleSnapshot | TaskResumeError::ConflictingSnapshot
+                ))
+            ));
             assert_eq!(previous.encode().unwrap(), before);
         }
         assert!(reconciled(&cx, &binding, &previous, snapshot("working", 2)).is_ok());
@@ -349,25 +480,46 @@ mod tests {
         let endpoint = binding("owner", "https://mcp.example/mcp?tenant=other");
         let mut expired = valid.encode().unwrap();
         let n = expired.len();
-        expired[n-16..].copy_from_slice(&1_577_836_810_000_000_000_i128.to_be_bytes());
+        expired[n - 16..].copy_from_slice(&1_577_836_810_000_000_000_i128.to_be_bytes());
         let expired = TaskResumeRecord::decode(&expired).unwrap();
         let cancellation = McpRequestCancellation::new();
         for (binding, saved, available) in [
-            (&owner, &valid, false), (&endpoint, &valid, false),
-            (&current, &expired, false), (&current, &valid, true),
+            (&owner, &valid, false),
+            (&endpoint, &valid, false),
+            (&current, &expired, false),
+            (&current, &valid, true),
         ] {
             let mut future = Box::pin(client.reconcile_task_resume(
-                &cx, &cancellation, &credential,
-                FinalRequestMeta::new(ClientCapabilities::default()), binding, saved,
-                "protected", DpopStreamLimits::default(),
+                &cx,
+                &cancellation,
+                &credential,
+                FinalRequestMeta::new(ClientCapabilities::default()),
+                binding,
+                saved,
+                "protected",
+                DpopStreamLimits::default(),
             ));
-            let result = future.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            let result = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
             if available {
-                assert!(matches!(result, Poll::Ready(Err(DpopTaskResumeError::Checkpoint(
-                    DpopTaskCheckpointError::Watch(DpopTaskWatchError::Stream(DpopStreamError::Core(
-                        DpopCoreError::Transport(DpopHttpError::RuntimeUnavailable)))))))));
+                assert!(matches!(
+                    result,
+                    Poll::Ready(Err(DpopTaskResumeError::Checkpoint(
+                        DpopTaskCheckpointError::Watch(DpopTaskWatchError::Stream(
+                            DpopStreamError::Core(DpopCoreError::Transport(
+                                DpopHttpError::RuntimeUnavailable
+                            ))
+                        ))
+                    )))
+                ));
             } else {
-                assert!(matches!(result, Poll::Ready(Err(DpopTaskResumeError::Resume(TaskResumeError::Unavailable)))));
+                assert!(matches!(
+                    result,
+                    Poll::Ready(Err(DpopTaskResumeError::Resume(
+                        TaskResumeError::Unavailable
+                    )))
+                ));
             }
             drop(future);
             assert!(!client.revocation_handle().is_revoked());
@@ -379,12 +531,24 @@ mod tests {
         let origin = Cx::for_testing().now();
         let owner = WaitBounds {
             deadline: origin.saturating_add_nanos(100),
-            terminal: DpopHttpError::Authorization(crate::http_auth::dpop::DpopClientError::CredentialUnavailable),
+            terminal: DpopHttpError::Authorization(
+                crate::http_auth::dpop::DpopClientError::CredentialUnavailable,
+            ),
         };
         for offset in [50, 100, 150] {
             let bounds = retained_bounds(owner, origin.saturating_add_nanos(offset));
-            assert_eq!(bounds.deadline, origin.saturating_add_nanos(offset.min(100)));
-            assert_eq!(bounds.terminal, if offset < 100 { DpopHttpError::TimedOut } else { owner.terminal });
+            assert_eq!(
+                bounds.deadline,
+                origin.saturating_add_nanos(offset.min(100))
+            );
+            assert_eq!(
+                bounds.terminal,
+                if offset < 100 {
+                    DpopHttpError::TimedOut
+                } else {
+                    owner.terminal
+                }
+            );
         }
     }
 
@@ -392,14 +556,27 @@ mod tests {
     fn unavailable_mapping_does_not_hide_transport_or_observer_failure() {
         for status in [401, 403, 404, 429, 500] {
             let error = classify(ManagedCoreError::HttpStatus { status }.into());
-            assert_eq!(matches!(error, DpopTaskResumeError::Resume(TaskResumeError::Unavailable)),
-                matches!(status, 401 | 403 | 404));
+            assert_eq!(
+                matches!(
+                    error,
+                    DpopTaskResumeError::Resume(TaskResumeError::Unavailable)
+                ),
+                matches!(status, 401 | 403 | 404)
+            );
         }
-        assert!(matches!(classify(DpopHttpError::TransportFailed.into()),
-            DpopTaskResumeError::Checkpoint(DpopTaskCheckpointError::Watch(DpopTaskWatchError::Stream(
-                DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::TransportFailed)))))));
-        assert!(matches!(classify(DpopStreamError::ObserverStopped),
-            DpopTaskResumeError::Checkpoint(DpopTaskCheckpointError::Watch(DpopTaskWatchError::Stream(
-                DpopStreamError::ObserverStopped)))));
+        assert!(matches!(
+            classify(DpopHttpError::TransportFailed.into()),
+            DpopTaskResumeError::Checkpoint(DpopTaskCheckpointError::Watch(
+                DpopTaskWatchError::Stream(DpopStreamError::Core(DpopCoreError::Transport(
+                    DpopHttpError::TransportFailed
+                )))
+            ))
+        ));
+        assert!(matches!(
+            classify(DpopStreamError::ObserverStopped),
+            DpopTaskResumeError::Checkpoint(DpopTaskCheckpointError::Watch(
+                DpopTaskWatchError::Stream(DpopStreamError::ObserverStopped)
+            ))
+        ));
     }
 }

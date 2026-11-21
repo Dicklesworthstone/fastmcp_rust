@@ -712,7 +712,10 @@ async fn initialize_sandbox_view(
         response["result"]["hostCapabilities"]["sandbox"],
         serde_json::to_value(expected).unwrap()
     );
-    assert_eq!(response["result"]["hostCapabilities"]["serverTools"], json!({}));
+    assert_eq!(
+        response["result"]["hostCapabilities"]["serverTools"],
+        json!({})
+    );
     for forbidden in ["unapproved.example.test", "access-one", "refresh-one"] {
         assert!(!raw.contains(forbidden));
     }

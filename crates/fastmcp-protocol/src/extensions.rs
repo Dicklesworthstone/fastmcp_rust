@@ -939,7 +939,8 @@ impl ExtensionRegistryReceipt {
 
 /// Stable registry-validation diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExtensionRegistryError {    /// The identifier did not satisfy the mandatory prefix/name grammar.
+pub enum ExtensionRegistryError {
+    /// The identifier did not satisfy the mandatory prefix/name grammar.
     InvalidIdentifier(String),
     /// The identifier used a reserved official second DNS label.
     ReservedNamespace(String),
@@ -2231,7 +2232,10 @@ impl NegotiatedExtensionSet {
             metadata: BTreeMap<String, Box<serde_json::value::RawValue>>,
         }
         let raw: RawParameters = serde_json::from_str(source).map_err(|_| invalid())?;
-        let value = raw.metadata.get(&correlation.metadata_key).ok_or_else(invalid)?;
+        let value = raw
+            .metadata
+            .get(&correlation.metadata_key)
+            .ok_or_else(invalid)?;
         let request_id = correlation.codec.decode(value.get())?;
         let correlation_key = request_id.correlation_key().map_err(|_| invalid())?;
         let active = self.active.get(capability).ok_or_else(invalid)?;
@@ -2302,7 +2306,9 @@ fn bounded_stdio_notification_parameters(
     struct Buffer(Vec<u8>);
     impl std::io::Write for Buffer {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES.saturating_sub(self.0.len()) {
+            if bytes.len()
+                > MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES.saturating_sub(self.0.len())
+            {
                 return Err(std::io::Error::other("extension notification byte limit"));
             }
             self.0.extend_from_slice(bytes);
@@ -2434,7 +2440,11 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
         }
         let key = ExtensionId::parse(correlation.metadata_key.clone())?;
         if key.as_str().split_once('/').map(|(prefix, _)| prefix)
-            != descriptor.id.as_str().split_once('/').map(|(prefix, _)| prefix)
+            != descriptor
+                .id
+                .as_str()
+                .split_once('/')
+                .map(|(prefix, _)| prefix)
         {
             return Err(ExtensionRegistryError::LocalOwnershipCollision {
                 field: "stdio correlation metadata key",
@@ -2853,7 +2863,13 @@ mod tests {
                             client: &ExtensionSettings,
                             _: &ExtensionSettings| Ok(client.clone());
         registry
-            .negotiate(ProtocolEra::Modern2026, &local, &client, &server, &mut resolver)
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client,
+                &server,
+                &mut resolver,
+            )
             .unwrap()
     }
 
@@ -2861,24 +2877,58 @@ mod tests {
     fn stdio_correlation_codec_preserves_exact_ids_and_bounds() {
         let codec = StdioCorrelationCodec::RequestId;
         for source in ["17", "17.0", "1.7e1"] {
-            assert!(codec.decode(source).unwrap().correlates_with(&crate::RequestId::Number(17)));
+            assert!(
+                codec
+                    .decode(source)
+                    .unwrap()
+                    .correlates_with(&crate::RequestId::Number(17))
+            );
         }
         let large = codec.decode("9007199254740993").unwrap();
         assert!(!large.correlates_with(&codec.decode("9007199254740992").unwrap()));
-        assert!(!codec.decode(r#""17""#).unwrap().correlates_with(&codec.decode("17").unwrap()));
+        assert!(
+            !codec
+                .decode(r#""17""#)
+                .unwrap()
+                .correlates_with(&codec.decode("17").unwrap())
+        );
         for source in ["1.25", "null", "true", "{}", "[]", "1e10001"] {
             assert!(codec.decode(source).is_err(), "{source}");
         }
         let string_limit = crate::jsonrpc::MAX_JSONRPC_STRING_ID_ENCODED_BYTES;
-        assert!(codec.decode(&format!("\"{}\"", "a".repeat(string_limit - 2))).is_ok());
-        assert!(codec.decode(&format!("\"{}\"", "a".repeat(string_limit - 1))).is_err());
+        assert!(
+            codec
+                .decode(&format!("\"{}\"", "a".repeat(string_limit - 2)))
+                .is_ok()
+        );
+        assert!(
+            codec
+                .decode(&format!("\"{}\"", "a".repeat(string_limit - 1)))
+                .is_err()
+        );
         // Both decode to a short legal string; only the second raw token is
         // over the encoded wire limit. A Value-only decoder would miss it.
-        assert!(codec.decode(&format!("\"{}\"", "\\u0061".repeat(42))).is_ok());
-        assert!(codec.decode(&format!("\"{}\"", "\\u0061".repeat(43))).is_err());
+        assert!(
+            codec
+                .decode(&format!("\"{}\"", "\\u0061".repeat(42)))
+                .is_ok()
+        );
+        assert!(
+            codec
+                .decode(&format!("\"{}\"", "\\u0061".repeat(43)))
+                .is_err()
+        );
         let number_limit = crate::jsonrpc::MAX_RAW_JSON_NUMBER_BYTES;
-        assert!(codec.decode(&format!("1{}", "0".repeat(number_limit - 1))).is_ok());
-        assert!(codec.decode(&format!("1{}", "0".repeat(number_limit))).is_err());
+        assert!(
+            codec
+                .decode(&format!("1{}", "0".repeat(number_limit - 1)))
+                .is_ok()
+        );
+        assert!(
+            codec
+                .decode(&format!("1{}", "0".repeat(number_limit)))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2892,25 +2942,74 @@ mod tests {
         );
         for raw in [None, Some(params)] {
             let capsule = negotiated
-                .admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &notification, raw)
+                .admit_stdio_notification(
+                    &registry,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    &notification,
+                    raw,
+                )
                 .unwrap();
-            assert_eq!(capsule.correlation_key(), &crate::RequestId::Number(17).correlation_key().unwrap());
+            assert_eq!(
+                capsule.correlation_key(),
+                &crate::RequestId::Number(17).correlation_key().unwrap()
+            );
             assert_eq!(capsule.extension_id(), &id);
             assert_eq!(capsule.registry_receipt(), registry.receipt().unwrap());
-            assert_eq!(capsule.effective_settings_fingerprint(), negotiated.active(&id).unwrap().effective_settings().fingerprint());
+            assert_eq!(
+                capsule.effective_settings_fingerprint(),
+                negotiated
+                    .active(&id)
+                    .unwrap()
+                    .effective_settings()
+                    .fingerprint()
+            );
         }
-        for (enabled, client, server) in [(false, true, true), (true, false, true), (true, true, false)] {
+        for (enabled, client, server) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
             let inactive = negotiate_stdio_notification(&registry, &id, enabled, client, server);
-            assert!(inactive.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &notification, Some(params)).is_err());
+            assert!(
+                inactive
+                    .admit_stdio_notification(
+                        &registry,
+                        ProtocolEra::Modern2026,
+                        &id,
+                        &notification,
+                        Some(params)
+                    )
+                    .is_err()
+            );
         }
-        assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Legacy2024, &id, &notification, Some(params)).is_err());
+        assert!(
+            negotiated
+                .admit_stdio_notification(
+                    &registry,
+                    ProtocolEra::Legacy2024,
+                    &id,
+                    &notification,
+                    Some(params)
+                )
+                .is_err()
+        );
         let mut other_registry = ExtensionDescriptorRegistry::new();
         let mut changed = registry.descriptor(&id).unwrap().clone();
         changed.stdio_correlation.as_mut().unwrap().metadata_key = "com.example/other".to_owned();
         other_registry.register(changed).unwrap();
         other_registry.freeze().unwrap();
         assert_ne!(registry.receipt(), other_registry.receipt());
-        assert!(matches!(negotiated.admit_stdio_notification(&other_registry, ProtocolEra::Modern2026, &id, &notification, None), Err(ExtensionDispatchError::RegistryReceiptMismatch)));
+        assert!(matches!(
+            negotiated.admit_stdio_notification(
+                &other_registry,
+                ProtocolEra::Modern2026,
+                &id,
+                &notification,
+                None
+            ),
+            Err(ExtensionDispatchError::RegistryReceiptMismatch)
+        ));
         for malformed in [
             json!({"_meta": {"com.example/other": 17}}),
             json!({"_meta": {"com.example/request": null}}),
@@ -2922,21 +3021,43 @@ mod tests {
         ] {
             let mut bad = notification.clone();
             bad.params = Some(malformed);
-            assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &bad, None).is_err());
+            assert!(
+                negotiated
+                    .admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &bad, None)
+                    .is_err()
+            );
         }
         for method in ["example/other_changed", "notifications/progress"] {
             let mut wrong = notification.clone();
             wrong.method = method.to_owned();
-            assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &wrong, None).is_err());
+            assert!(
+                negotiated
+                    .admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &wrong, None)
+                    .is_err()
+            );
         }
         let mut request = notification.clone();
         request.id = Some(crate::RequestId::Number(18));
-        assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &request, None).is_err());
+        assert!(
+            negotiated
+                .admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &request, None)
+                .is_err()
+        );
         for raw in [
             r#"{"temperature":17,"_meta":{"com.example/request":18}}"#,
             r#"{"temperature":17,"_meta":{"com.example/request":17,"com.example/request":17}}"#,
         ] {
-            assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &notification, Some(raw)).is_err());
+            assert!(
+                negotiated
+                    .admit_stdio_notification(
+                        &registry,
+                        ProtocolEra::Modern2026,
+                        &id,
+                        &notification,
+                        Some(raw)
+                    )
+                    .is_err()
+            );
         }
     }
 
@@ -2950,10 +3071,13 @@ mod tests {
             match mutation {
                 0 => correlation.metadata_key = "org.other/request".to_owned(),
                 1 => correlation.methods.push("example/undeclared".to_owned()),
-                2 => correlation.methods.push("example/weather_changed".to_owned()),
+                2 => correlation
+                    .methods
+                    .push("example/weather_changed".to_owned()),
                 3 => {
                     correlation.direction = ExtensionDirection::ClientToServer;
-                    bad.notification.as_mut().unwrap().direction = ExtensionDirection::ClientToServer;
+                    bad.notification.as_mut().unwrap().direction =
+                        ExtensionDirection::ClientToServer;
                 }
                 4 => {
                     bad.notification.as_mut().unwrap().name = "notifications/progress".to_owned();
@@ -2973,9 +3097,11 @@ mod tests {
             other.routing_headers.clear();
             if duplicate_key {
                 other.notification.as_mut().unwrap().name = "example/other_changed".to_owned();
-                other.stdio_correlation.as_mut().unwrap().methods = vec!["example/other_changed".to_owned()];
+                other.stdio_correlation.as_mut().unwrap().methods =
+                    vec!["example/other_changed".to_owned()];
             } else {
-                other.stdio_correlation.as_mut().unwrap().metadata_key = "com.example/other_request".to_owned();
+                other.stdio_correlation.as_mut().unwrap().metadata_key =
+                    "com.example/other_request".to_owned();
             }
             assert!(pair.register(other).is_err());
             assert_eq!(pair.descriptors().len(), 1);

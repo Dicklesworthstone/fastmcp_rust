@@ -1,10 +1,10 @@
 //! Public Task waiting against actual HTTPS, using the parent's TLS fixture.
 
 use super::*;
-use std::collections::HashSet;
 use crate::http_auth::dpop::native::core::tasks::wait::{
     DpopTaskWaitError, DpopTaskWaitOutcome, DpopTaskWaitPolicy,
 };
+use std::collections::HashSet;
 
 fn snapshot(status: &str, interval: u64) -> String {
     let mut value = json!({
@@ -13,9 +13,16 @@ fn snapshot(status: &str, interval: u64) -> String {
         "ttlMs":null,"pollIntervalMs":interval,
     });
     match status {
-        "completed" => { value["result"] = json!({"content":[{"type":"text","text":"exact-result"}]}); }
-        "failed" => { value["error"] = json!({"code":-32603,"message":"private-task-error","data":{"kept":true}}); }
-        "input_required" => { value["inputRequests"] = json!({"roots":{"method":"roots/list"}}); }
+        "completed" => {
+            value["result"] = json!({"content":[{"type":"text","text":"exact-result"}]});
+        }
+        "failed" => {
+            value["error"] =
+                json!({"code":-32603,"message":"private-task-error","data":{"kept":true}});
+        }
+        "input_required" => {
+            value["inputRequests"] = json!({"roots":{"method":"roots/list"}});
+        }
         "working" | "cancelled" => {}
         _ => panic!("invalid Task fixture"),
     }
@@ -24,7 +31,13 @@ fn snapshot(status: &str, interval: u64) -> String {
 
 fn correlated(prefix: &str, index: usize, discovery: bool, body: &str) -> DpopHttpResponse {
     let suffix = if discovery { "discover" } else { "get" };
-    response(200, envelope(&RequestId::String(format!("{prefix}.{index}.{suffix}")), body))
+    response(
+        200,
+        envelope(
+            &RequestId::String(format!("{prefix}.{index}.{suffix}")),
+            body,
+        ),
+    )
 }
 
 fn polling(maximum: usize) -> DpopTaskWaitPolicy {
@@ -49,8 +62,10 @@ async fn answer_poll(
         let suffix = if is_discovery { "discover" } else { "get" };
         assert_eq!(request["id"], format!("{prefix}.{index}.{suffix}"));
         assert_eq!(request["method"], method);
-        assert_eq!(request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
-            json!({TASKS_EXTENSION:{}}));
+        assert_eq!(
+            request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+            json!({TASKS_EXTENSION:{}})
+        );
         assert_eq!(header(&head, "authorization"), "DPoP tasks-token");
         assert_eq!(header(&head, "accept"), "application/json");
         if !is_discovery {
@@ -68,16 +83,29 @@ async fn answer_poll(
 
 #[test]
 fn public_wait_stops_on_every_terminal_input_handoff_and_poll_limit_without_mutations() {
-    for status in ["completed", "failed", "cancelled", "input_required", "working"] {
+    for status in [
+        "completed",
+        "failed",
+        "cancelled",
+        "input_required",
+        "working",
+    ] {
         run(async move {
             let cx = Cx::current().unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let (mut client, credential, acceptor) = configured(&format!(
-                "https://{}/mcp", listener.local_addr().unwrap()));
+            let (mut client, credential, acceptor) =
+                configured(&format!("https://{}/mcp", listener.local_addr().unwrap()));
             let body = snapshot(status, 300_000);
             let mut proofs = HashSet::new();
-            let application = client.wait_task(&cx, &credential, metadata(), id(), "stop",
-                polling(1), ManagedCoreLimits::default());
+            let application = client.wait_task(
+                &cx,
+                &credential,
+                metadata(),
+                id(),
+                "stop",
+                polling(1),
+                ManagedCoreLimits::default(),
+            );
             let peer = answer_poll(&listener, &acceptor, "stop", 0, &body, &mut proofs);
             let (result, ()) = pair(application, peer).await;
             match status {
@@ -105,7 +133,11 @@ fn public_wait_stops_on_every_terminal_input_handoff_and_poll_limit_without_muta
                 }
             }
             assert_eq!(proofs.len(), 2);
-            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                listener
+                    .poll_accept(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             assert!(cx.checkpoint().is_ok());
             assert!(!client.revocation_handle().is_revoked());
         });
@@ -118,21 +150,37 @@ fn public_wait_freshly_negotiates_each_get_and_shares_one_exact_response_budget(
         run(async move {
             let cx = Cx::current().unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let (mut client, credential, acceptor) = configured(&format!(
-                "https://{}/mcp", listener.local_addr().unwrap()));
+            let (mut client, credential, acceptor) =
+                configured(&format!("https://{}/mcp", listener.local_addr().unwrap()));
             let working = snapshot("working", 1);
             let complete = snapshot("completed", 1);
             let sizes: Vec<_> = [
-                (0, true, discovery_result().to_string()), (0, false, working.clone()),
-                (1, true, discovery_result().to_string()), (1, false, complete.clone()),
-            ].into_iter().map(|(index, discovery, body)| {
-                correlated("quota", index, discovery, &body).body.len()
-            }).collect();
+                (0, true, discovery_result().to_string()),
+                (0, false, working.clone()),
+                (1, true, discovery_result().to_string()),
+                (1, false, complete.clone()),
+            ]
+            .into_iter()
+            .map(|(index, discovery, body)| correlated("quota", index, discovery, &body).body.len())
+            .collect();
             let total = sizes.iter().sum::<usize>() - usize::from(!exact);
-            let limits = ManagedCoreLimits::new(8192, *sizes.iter().max().unwrap(), total, 0,
-                Duration::from_secs(10)).unwrap();
-            let application = client.wait_task(&cx, &credential, metadata(), id(), "quota",
-                polling(3), limits);
+            let limits = ManagedCoreLimits::new(
+                8192,
+                *sizes.iter().max().unwrap(),
+                total,
+                0,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+            let application = client.wait_task(
+                &cx,
+                &credential,
+                metadata(),
+                id(),
+                "quota",
+                polling(3),
+                limits,
+            );
             let mut proofs = HashSet::new();
             let peer = async {
                 answer_poll(&listener, &acceptor, "quota", 0, &working, &mut proofs).await;
@@ -142,12 +190,19 @@ fn public_wait_freshly_negotiates_each_get_and_shares_one_exact_response_budget(
             if exact {
                 assert!(matches!(result, Ok(DpopTaskWaitOutcome::Terminal(_))));
             } else {
-                assert!(matches!(result, Err(DpopTaskWaitError::Task(DpopTasksError::Core(
-                    DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit)
-                )))));
+                assert!(matches!(
+                    result,
+                    Err(DpopTaskWaitError::Task(DpopTasksError::Core(
+                        DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit)
+                    )))
+                ));
             }
             assert_eq!(proofs.len(), 4, "each discovery/get uses a fresh proof");
-            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                listener
+                    .poll_accept(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         });
     }
 }
@@ -158,13 +213,21 @@ fn public_wait_cancel_and_abandonment_release_a_later_get_without_revoking_the_s
         run(async move {
             let cx = Cx::current().unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let (mut client, credential, acceptor) = configured(&format!(
-                "https://{}/mcp", listener.local_addr().unwrap()));
+            let (mut client, credential, acceptor) =
+                configured(&format!("https://{}/mcp", listener.local_addr().unwrap()));
             let cancellation = McpRequestCancellation::new();
             let reached = McpRequestCancellation::new();
             let application = async {
-                let mut call = Some(Box::pin(client.wait_task_with_cancellation(&cx, &cancellation,
-                    &credential, metadata(), id(), "cancel", polling(3), ManagedCoreLimits::default())));
+                let mut call = Some(Box::pin(client.wait_task_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    &credential,
+                    metadata(),
+                    id(),
+                    "cancel",
+                    polling(3),
+                    ManagedCoreLimits::default(),
+                )));
                 let mut signal = pin!(reached.cancelled());
                 let mut acted = false;
                 let result = poll_fn(|task| {
@@ -181,24 +244,40 @@ fn public_wait_cancel_and_abandonment_release_a_later_get_without_revoking_the_s
                         cancellation.cancel();
                     }
                     Poll::Pending
-                }).await;
+                })
+                .await;
                 drop(call);
                 if abandon {
                     assert!(result.is_none());
                 } else {
-                    assert!(matches!(result, Some(Err(DpopTaskWaitError::Task(DpopTasksError::Core(
-                        DpopCoreError::Transport(DpopHttpError::Cancelled)
-                    ))))));
+                    assert!(matches!(
+                        result,
+                        Some(Err(DpopTaskWaitError::Task(DpopTasksError::Core(
+                            DpopCoreError::Transport(DpopHttpError::Cancelled)
+                        ))))
+                    ));
                 }
             };
             let peer = async {
                 let mut proofs = HashSet::new();
-                answer_poll(&listener, &acceptor, "cancel", 0, &snapshot("working", 1), &mut proofs).await;
+                answer_poll(
+                    &listener,
+                    &acceptor,
+                    "cancel",
+                    0,
+                    &snapshot("working", 1),
+                    &mut proofs,
+                )
+                .await;
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut socket = acceptor.accept(socket).await.unwrap();
                 let (_, request) = read_request(&mut socket).await;
                 assert_eq!(request["id"], "cancel.1.discover");
-                send(&mut socket, correlated("cancel", 1, true, &discovery_result().to_string())).await;
+                send(
+                    &mut socket,
+                    correlated("cancel", 1, true, &discovery_result().to_string()),
+                )
+                .await;
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut socket = acceptor.accept(socket).await.unwrap();
                 let (_, request) = read_request(&mut socket).await;
@@ -208,8 +287,10 @@ fn public_wait_cancel_and_abandonment_release_a_later_get_without_revoking_the_s
                 socket.flush().await.unwrap();
                 reached.cancel();
                 let mut byte = [0];
-                assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0),
-                    "stopped observation must release its pending TLS read");
+                assert!(
+                    !matches!(socket.read(&mut byte).await, Ok(count) if count > 0),
+                    "stopped observation must release its pending TLS read"
+                );
             };
             pair(application, peer).await;
             assert!(!client.revocation_handle().is_revoked());
@@ -217,12 +298,23 @@ fn public_wait_cancel_and_abandonment_release_a_later_get_without_revoking_the_s
             // The same login can serve an independently selected observation.
             let mut proofs = HashSet::new();
             let body = snapshot("completed", 1);
-            let application = client.wait_task(&cx, &credential, metadata(), id(), "fresh",
-                polling(1), ManagedCoreLimits::default());
+            let application = client.wait_task(
+                &cx,
+                &credential,
+                metadata(),
+                id(),
+                "fresh",
+                polling(1),
+                ManagedCoreLimits::default(),
+            );
             let peer = answer_poll(&listener, &acceptor, "fresh", 0, &body, &mut proofs);
             let (result, ()) = pair(application, peer).await;
             assert!(matches!(result, Ok(DpopTaskWaitOutcome::Terminal(_))));
-            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                listener
+                    .poll_accept(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         });
     }
 }
@@ -232,21 +324,35 @@ fn public_wait_deadline_bounds_a_long_poll_hint_without_another_discovery() {
     run(async {
         let cx = Cx::current().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (mut client, credential, acceptor) = configured(&format!(
-            "https://{}/mcp", listener.local_addr().unwrap()));
+        let (mut client, credential, acceptor) =
+            configured(&format!("https://{}/mcp", listener.local_addr().unwrap()));
         let limits = ManagedCoreLimits::new(8192, 8192, 32_768, 0, Duration::from_secs(1)).unwrap();
         let body = snapshot("working", 300_000);
         let mut proofs = HashSet::new();
-        let application = client.wait_task(&cx, &credential, metadata(), id(), "deadline",
-            polling(64), limits);
+        let application = client.wait_task(
+            &cx,
+            &credential,
+            metadata(),
+            id(),
+            "deadline",
+            polling(64),
+            limits,
+        );
         let peer = answer_poll(&listener, &acceptor, "deadline", 0, &body, &mut proofs);
         let (result, ()) = pair(application, peer).await;
-        assert!(matches!(result, Err(DpopTaskWaitError::Task(DpopTasksError::Core(
-            DpopCoreError::Transport(DpopHttpError::TimedOut)
-        )))));
+        assert!(matches!(
+            result,
+            Err(DpopTaskWaitError::Task(DpopTasksError::Core(
+                DpopCoreError::Transport(DpopHttpError::TimedOut)
+            )))
+        ));
         assert_eq!(proofs.len(), 2);
-        assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending(),
-            "a long peer hint must not be clamped into an early extra poll");
+        assert!(
+            listener
+                .poll_accept(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "a long peer hint must not be clamped into an early extra poll"
+        );
         assert!(cx.checkpoint().is_ok());
     });
 }

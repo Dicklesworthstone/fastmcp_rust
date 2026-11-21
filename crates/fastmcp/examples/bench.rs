@@ -166,8 +166,10 @@ fn count_registered_tools_live(
     runtime.block_on(async {
         let cx = Cx::current().expect("runtime current Cx");
         let (client_transport, server_transport) = create_memory_transport_pair_with_capacity(8);
-        let mut server_task = cx
-            .spawn(move |serve_cx| async move { server.serve_memory(&serve_cx, server_transport).await })
+        let mut server_task =
+            cx.spawn(move |serve_cx| async move {
+                server.serve_memory(&serve_cx, server_transport).await
+            })
             .expect("spawn in-memory benchmark server");
         let mut client = MemoryClient::builder(ClientInfo {
             name: "bench-catalog-verifier".to_owned(),
@@ -310,7 +312,11 @@ fn verify_schema_fixtures(fixtures: &SchemaBenchFixtures) {
         "valid complex instance must pass schema validation"
     );
     assert!(
-        validate(&fixtures.complex_schema, &fixtures.complex_missing_nested_id).is_err(),
+        validate(
+            &fixtures.complex_schema,
+            &fixtures.complex_missing_nested_id
+        )
+        .is_err(),
         "missing nested required id must fail schema validation"
     );
 }
@@ -672,16 +678,20 @@ fn bench_protocol_types() {
         serde_json::json!("2026-07-28"),
     )])
     .expect("valid modern request _meta");
-    benchmark("FinalCallToolParams (2026-07-28) serialize", 100_000, || {
-        let params = FinalCallToolParams {
-            meta: modern_meta.clone(),
-            name: "echo".to_owned(),
-            arguments: FinalArguments::Value(serde_json::json!({"message": "hello"})),
-            input_responses: None,
-            request_state: None,
-        };
-        let _ = black_box(serde_json::to_string(&params));
-    });
+    benchmark(
+        "FinalCallToolParams (2026-07-28) serialize",
+        100_000,
+        || {
+            let params = FinalCallToolParams {
+                meta: modern_meta.clone(),
+                name: "echo".to_owned(),
+                arguments: FinalArguments::Value(serde_json::json!({"message": "hello"})),
+                input_responses: None,
+                request_state: None,
+            };
+            let _ = black_box(serde_json::to_string(&params));
+        },
+    );
 
     // Legacy 2024-11-05 InitializeParams create
     benchmark("InitializeParams (2024-11-05) create", 100_000, || {

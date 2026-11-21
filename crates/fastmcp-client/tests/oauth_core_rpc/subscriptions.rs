@@ -115,7 +115,7 @@ fn catalog_changed(id: i64, method: &str) -> String {
 fn resource_updated(id: i64, uri: &str) -> String {
     json!({"jsonrpc": "2.0", "method": "notifications/resources/updated",
         "params": {"uri": uri, "_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): id}}})
-        .to_string()
+    .to_string()
 }
 
 async fn subscription_stream(peer: &Peer, id: i64) -> TlsStream<TcpStream> {

@@ -1,13 +1,13 @@
 //! Composition of HTTP request admission with detached Task authorization.
 
 use super::*;
-use crate::tasks::*;
 use crate::http_admission::security::HttpSecurityPolicy;
 use crate::http_admission::security::scope_policy::request::ScopeRequestPolicy;
 use crate::http_admission::security::scope_policy::request::operation::{
     OperationScopePolicy, ScopedOperation,
 };
 use crate::http_admission::security::scope_policy::{RequiredScopes, ScopeImplicationPolicy};
+use crate::tasks::*;
 use crate::{
     FinalToolOutcome, HttpAdmissionLimits, HttpEndpointConfig, Server, ServerHttpEndpoint,
     StaticTokenVerifier, TestHttpEndpoint, TokenAuthProvider, ToolHandler,
@@ -245,7 +245,9 @@ fn secured_http_shared_scope_policy_rechecks_original_task_grants() {
                     // an ingress context nor a credential alive for a worker.
                     let execution = Arc::new(ScopedTaskExecutionPolicy {
                         principal: FinalTaskAccessMetadata::principal_for_auth(&facts(&[
-                            "invoke", "manage", "sensitive",
+                            "invoke",
+                            "manage",
+                            "sensitive",
                         ]))
                         .unwrap(),
                         allowed: AtomicBool::new(true),
@@ -293,9 +295,7 @@ fn secured_http_shared_scope_policy_rechecks_original_task_grants() {
                     .unwrap()
                     .with_scope_authorization(scopes)
                     .unwrap();
-                    let runner = runtime
-                        .install_task_service(4, supervisor.clone())
-                        .unwrap();
+                    let runner = runtime.install_task_service(4, supervisor.clone()).unwrap();
                     assert!(!runtime.is_task_service_ready());
                     {
                         // Native per-request embedding does not start a service.

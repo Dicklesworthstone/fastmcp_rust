@@ -235,7 +235,11 @@ mod tests {
             let _owned = owned;
             std::future::pending::<Result<(), OAuthSessionError>>().await
         }));
-        assert!(wait.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            wait.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         drop(wait);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(Arc::strong_count(&wakes), 2);

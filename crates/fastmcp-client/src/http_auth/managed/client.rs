@@ -25,18 +25,18 @@ use super::{ManagedOAuthSession, OAuthSessionError, deadline_after};
 use crate::http_executor::parameter_headers::ReviewedToolHeaders;
 use crate::{ClientBuilder, HttpClient, HttpClientError, ProtocolPolicy};
 
-pub(crate) mod callbacks;
 /// Apps Hosts whose complete lifetime stays inside a managed OAuth grant.
 #[cfg(feature = "apps")]
 pub mod apps;
+pub(crate) mod callbacks;
 mod catalog;
 mod core_listen;
 mod cursors;
 mod extensions;
-pub use catalog::{CatalogError, CatalogLimits, Collected as CatalogCollection, ManagedCatalog};
-pub use extensions::{ManagedExtensionLimits, ManagedExtensionResult};
 pub(crate) use catalog::CatalogCollector;
+pub use catalog::{CatalogError, CatalogLimits, Collected as CatalogCollection, ManagedCatalog};
 use cursors::{CatalogKind, CursorLedger};
+pub use extensions::{ManagedExtensionLimits, ManagedExtensionResult};
 #[cfg(feature = "tasks")]
 mod tasks;
 #[cfg(feature = "tasks")]
@@ -185,9 +185,7 @@ impl CallResult {
             Self::Catalog(Err(_))
             | Self::CoreListen(_)
             | Self::Extension(_)
-            | Self::ExtensionNotification => {
-                Err(ManagedHttpClientError::InvalidPolicy)
-            }
+            | Self::ExtensionNotification => Err(ManagedHttpClientError::InvalidPolicy),
             #[cfg(feature = "tasks")]
             Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
         }

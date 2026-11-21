@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "console")]
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
-use fastmcp_core::stats::ServerStats;
 use fastmcp_core::McpError;
+use fastmcp_core::stats::ServerStats;
 use fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver;
 #[cfg(feature = "apps")]
 use fastmcp_protocol::extensions::{
@@ -52,10 +52,10 @@ use crate::tasks::{
     MAX_CONCURRENT_TASK_HANDOFFS, TaskServiceHost,
 };
 use crate::{
-    AuthProvider, DuplicateBehavior, ExtensionHandlerRegistry, FinalSubscriptionRegistry,
-    HttpServerConfig, LifespanHooks, LoggingConfig, PromptHandler, ResourceHandler, Router, Server,
+    AuthProvider, DEFAULT_MAX_FINAL_SUBSCRIPTION_STREAMS_PER_PRINCIPAL, DuplicateBehavior,
+    ExtensionHandlerRegistry, FinalSubscriptionRegistry, HttpServerConfig, LifespanHooks,
+    LoggingConfig, MAX_FINAL_SUBSCRIPTION_STREAMS, PromptHandler, ResourceHandler, Router, Server,
     ServerExtensionConfigurationError, ServerExtensionRuntime, ToolHandler,
-    DEFAULT_MAX_FINAL_SUBSCRIPTION_STREAMS_PER_PRINCIPAL, MAX_FINAL_SUBSCRIPTION_STREAMS,
 };
 #[cfg(feature = "proxy")]
 use crate::{ProxyCatalog, ProxyClient};
@@ -1023,7 +1023,10 @@ impl ServerBuilder {
     /// Restart recovery and trusted embedding reads and writes remain separate.
     #[cfg(feature = "tasks")]
     #[must_use]
-    pub fn task_access_authorizer(mut self, authorizer: Arc<dyn crate::TaskAccessAuthorizer>) -> Self {
+    pub fn task_access_authorizer(
+        mut self,
+        authorizer: Arc<dyn crate::TaskAccessAuthorizer>,
+    ) -> Self {
         if self.task_access_authorizers.len() >= 16 {
             self.refused_registrations.push(RefusedRegistration {
                 kind: RegistrationKind::TaskService,
@@ -1940,7 +1943,7 @@ impl ServerBuilder {
         self.register_prefixed_typed_proxy_catalog(prefix, proxy_client, catalog)
     }
 
-/// Registers one already-negotiated typed upstream catalog under a caller
+    /// Registers one already-negotiated typed upstream catalog under a caller
     /// prefix. Tools and prompts take `{prefix}/{name}`; exact-final resource
     /// URIs stay unprefixed so they remain absolute.
     ///
@@ -2360,7 +2363,7 @@ impl ServerBuilder {
         )
     }
 
-/// Registers one already-negotiated, typed upstream catalog without any
+    /// Registers one already-negotiated, typed upstream catalog without any
     /// legacy projection. Final components are visible only to final routes;
     /// legacy components remain visible only to exact MCP 2024-11-05 routes.
     ///
@@ -3305,23 +3308,32 @@ impl ServerBuilder {
             } else {
                 #[cfg(feature = "proxy")]
                 {
-                    self.final_task_relay.as_ref().ok_or_else(|| {
-                        McpError::invalid_request("Task access policy requires a Tasks service")
-                    }).and_then(|relay| relay.install_access_authorizers(
-                        std::mem::take(&mut self.task_access_authorizers),
-                    ))
+                    self.final_task_relay
+                        .as_ref()
+                        .ok_or_else(|| {
+                            McpError::invalid_request("Task access policy requires a Tasks service")
+                        })
+                        .and_then(|relay| {
+                            relay.install_access_authorizers(std::mem::take(
+                                &mut self.task_access_authorizers,
+                            ))
+                        })
                 }
                 #[cfg(not(feature = "proxy"))]
                 {
-                    Err(McpError::invalid_request("Task access policy requires a Tasks service"))
+                    Err(McpError::invalid_request(
+                        "Task access policy requires a Tasks service",
+                    ))
                 }
             };
             if let Err(error) = result {
-                return Err(ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
-                    kind: RegistrationKind::TaskService,
-                    name: "task_authorizers".to_owned(),
-                    reason: error.to_string(),
-                }]));
+                return Err(ServerBuildError::InvalidConfiguration(vec![
+                    RefusedRegistration {
+                        kind: RegistrationKind::TaskService,
+                        name: "task_authorizers".to_owned(),
+                        reason: error.to_string(),
+                    },
+                ]));
             }
         }
         Ok(self.build_admitted(
@@ -3496,16 +3508,17 @@ mod tests {
                 _: crate::TaskAccessAction,
                 _: &crate::FinalTaskOperation,
             ) -> fastmcp_core::McpResult<()> {
-                Err(McpError::invalid_request("Task request policy denies access"))
+                Err(McpError::invalid_request(
+                    "Task request policy denies access",
+                ))
             }
         }
 
         impl crate::TaskExecutionAuthorizer for DenyTaskPolicy {
-            fn authorize(
-                &self,
-                _: &crate::FinalTaskAccessMetadata,
-            ) -> fastmcp_core::McpResult<()> {
-                Err(McpError::invalid_request("Task execution policy denies work"))
+            fn authorize(&self, _: &crate::FinalTaskAccessMetadata) -> fastmcp_core::McpResult<()> {
+                Err(McpError::invalid_request(
+                    "Task execution policy denies work",
+                ))
             }
         }
 
@@ -5581,9 +5594,8 @@ mod tests {
         assert!(defaults.timestamps);
         assert!(defaults.targets);
         assert!(!defaults.file_line);
-        let disabled = LoggingConfig::from_lookup(|key| {
-            (key == "FASTMCP_LOG").then(|| "off".to_owned())
-        });
+        let disabled =
+            LoggingConfig::from_lookup(|key| (key == "FASTMCP_LOG").then(|| "off".to_owned()));
         assert_eq!(disabled.level, LevelFilter::Off);
     }
 
@@ -6916,7 +6928,10 @@ mod tests {
                 client
             };
             if relay_tasks {
-                client.final_tasks_relay().unwrap().unwrap()
+                client
+                    .final_tasks_relay()
+                    .unwrap()
+                    .unwrap()
                     .install_access_authorizers(vec![Arc::new(OrdinaryProxyTaskAccessPolicy)])
                     .unwrap();
             }
@@ -10471,10 +10486,7 @@ mod tests {
 
         #[test]
         fn builder_proxy_honors_duplicate_policy_for_every_component_kind() {
-            for behavior in [
-                DuplicateBehavior::Warn,
-                DuplicateBehavior::Ignore,
-            ] {
+            for behavior in [DuplicateBehavior::Warn, DuplicateBehavior::Ignore] {
                 let (client, catalog) = discovered_duplicate_policy_proxy();
                 let server = ServerBuilder::new("srv", "1.0")
                     .on_duplicate(behavior)

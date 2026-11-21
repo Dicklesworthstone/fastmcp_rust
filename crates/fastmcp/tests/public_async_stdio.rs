@@ -78,7 +78,10 @@ impl Facade {
         let operator: fastmcp_rust::StdioOperatorHandle = bound.operator_handle();
         let starting: fastmcp_rust::OperatorStdioSnapshot =
             fastmcp_rust::OperatorSnapshot::capture(&operator).unwrap();
-        assert_eq!(starting.readiness(), fastmcp_rust::OperatorReadiness::Starting);
+        assert_eq!(
+            starting.readiness(),
+            fastmcp_rust::OperatorReadiness::Starting
+        );
         let profile = match self {
             Self::Modern => fastmcp_rust::OperatorProfile::Modern,
             #[cfg(feature = "legacy-2024-11-05")]
@@ -89,7 +92,10 @@ impl Facade {
         assert_eq!(starting.profile(), profile);
         let result = bound.serve(cx).await;
         let stopped = fastmcp_rust::OperatorSnapshot::capture(&operator).unwrap();
-        assert_eq!(stopped.lifecycle(), fastmcp_rust::OperatorLifecycle::Stopped);
+        assert_eq!(
+            stopped.lifecycle(),
+            fastmcp_rust::OperatorLifecycle::Stopped
+        );
         assert_eq!(stopped.contributor().capacity.retained_frames, 0);
         assert_eq!(stopped.contributor().capacity.retained_bytes, 0);
         assert_eq!(
@@ -287,8 +293,7 @@ fn run_subscription_shutdown(cancel_first: bool) {
                 )
                 .await
                 .unwrap();
-                let JsonRpcMessage::Request(acknowledgement) =
-                    peer.recv_async(&cx).await.unwrap()
+                let JsonRpcMessage::Request(acknowledgement) = peer.recv_async(&cx).await.unwrap()
                 else {
                     panic!("an empty-filter listen must receive acknowledgement first");
                 };
@@ -299,7 +304,10 @@ fn run_subscription_shutdown(cancel_first: bool) {
                 );
                 let params = acknowledgement.params.unwrap();
                 assert_eq!(params["notifications"], json!({}));
-                assert_eq!(params["_meta"]["io.modelcontextprotocol/subscriptionId"], id);
+                assert_eq!(
+                    params["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                    id
+                );
             }
 
             if cancel_first {
@@ -326,7 +334,10 @@ fn run_subscription_shutdown(cancel_first: bool) {
             .await
             .unwrap();
             let result = response(&cx, &mut peer, 99).await;
-            assert_eq!(result["content"], json!([{"type": "text", "text": "still live"}]));
+            assert_eq!(
+                result["content"],
+                json!([{"type": "text", "text": "still live"}])
+            );
             assert!(!stopped.load(Ordering::Acquire));
 
             server_cx_rx.try_recv().unwrap().cancel_with(
@@ -347,14 +358,19 @@ fn run_subscription_shutdown(cancel_first: bool) {
                         cancelled.push(params["requestId"].as_i64().unwrap());
                     }
                     Ok(JsonRpcMessage::Response(response)) => {
-                        panic!("server teardown must not fabricate a complete result: {response:?}");
+                        panic!(
+                            "server teardown must not fabricate a complete result: {response:?}"
+                        );
                     }
                     Err(error) if error.is_closed() => break,
                     Err(error) => panic!("native stdio teardown must close cleanly: {error}"),
                 }
             }
             cancelled.sort_unstable();
-            assert_eq!(cancelled, if cancel_first { vec![42] } else { vec![41, 42] });
+            assert_eq!(
+                cancelled,
+                if cancel_first { vec![42] } else { vec![41, 42] }
+            );
             serving.join(&cx).await.unwrap().unwrap();
             assert!(stopped.load(Ordering::Acquire));
             assert!(cx.checkpoint().is_ok());
@@ -639,19 +655,12 @@ printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$1"
         .unwrap()
     }
 
-    async fn connect(
-        cx: &Cx,
-        script: &str,
-        builder: modern::ClientBuilder,
-    ) -> modern::Client {
+    async fn connect(cx: &Cx, script: &str, builder: modern::ClientBuilder) -> modern::Client {
         builder
             .max_retries(0)
             .request_timeout_policy(
-                modern::RequestTimeoutPolicy::new(
-                    Duration::from_secs(5),
-                    Duration::from_secs(5),
-                )
-                .unwrap(),
+                modern::RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(5))
+                    .unwrap(),
             )
             .connect_stdio_with_cx(cx, "sh", &["-c", script, "public-async-peer", &discovery()])
             .await
@@ -734,11 +743,8 @@ while IFS= read -r unexpected; do exit 98; done
             .auto_initialize(true)
             .max_retries(0)
             .request_timeout_policy(
-                modern::RequestTimeoutPolicy::new(
-                    Duration::from_secs(5),
-                    Duration::from_secs(5),
-                )
-                .unwrap(),
+                modern::RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(5))
+                    .unwrap(),
             )
             .connect_stdio_with_cx(
                 cx,
@@ -768,20 +774,24 @@ while IFS= read -r unexpected; do exit 98; done
             let release = DiscoveryRelease::new();
             let expected = discovery_with_instructions();
             let mut client = deferred_metadata_client(&cx, &release, &expected).await;
-            let mut discovering =
-                Box::pin(require_send(client.server_discovery_with_cx(&cx)));
+            let mut discovering = Box::pin(require_send(client.server_discovery_with_cx(&cx)));
             let yielded = std::future::poll_fn(|task_cx| {
                 Poll::Ready(discovering.as_mut().poll(task_cx).is_pending())
             })
             .await;
-            assert!(yielded, "deferred discovery must yield before the peer replies");
+            assert!(
+                yielded,
+                "deferred discovery must yield before the peer replies"
+            );
             drop(discovering);
 
             // A dropped metadata read preserves the one published discovery
             // request. The peer accepts ID 1 once and never answers a duplicate.
             release.release();
             assert_eq!(
-                require_send(client.instructions_with_cx(&cx)).await.unwrap(),
+                require_send(client.instructions_with_cx(&cx))
+                    .await
+                    .unwrap(),
                 expected["instructions"].as_str(),
             );
             require_send(client.ensure_initialized_with_cx(&cx))
@@ -828,7 +838,9 @@ while IFS= read -r unexpected; do exit 98; done
 
             release.release();
             assert_eq!(
-                require_send(client.instructions_with_cx(&cx)).await.unwrap(),
+                require_send(client.instructions_with_cx(&cx))
+                    .await
+                    .unwrap(),
                 expected["instructions"].as_str(),
             );
             assert!(cx.checkpoint().is_ok());
@@ -894,8 +906,7 @@ while IFS= read -r unexpected; do exit 98; done
                 .await
                 .unwrap();
             assert!(!client.is_initialized());
-            let mut initializing =
-                Box::pin(require_send(client.ensure_initialized_with_cx(&cx)));
+            let mut initializing = Box::pin(require_send(client.ensure_initialized_with_cx(&cx)));
             let yielded = std::future::poll_fn(|task_cx| {
                 Poll::Ready(initializing.as_mut().poll(task_cx).is_pending())
             })
@@ -905,7 +916,9 @@ while IFS= read -r unexpected; do exit 98; done
             release.release();
 
             assert_eq!(
-                require_send(client.instructions_with_cx(&cx)).await.unwrap(),
+                require_send(client.instructions_with_cx(&cx))
+                    .await
+                    .unwrap(),
                 Some("Exact legacy instructions."),
             );
             assert!(client.is_initialized());
@@ -923,7 +936,6 @@ while IFS= read -r unexpected; do exit 98; done
             assert!(cx.checkpoint().is_ok());
         });
     }
-
 
     #[cfg(feature = "legacy-2024-11-05")]
     mod legacy_operations {
@@ -981,12 +993,20 @@ case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 76 ;
             let result = match method {
                 "tools/list" => serde_json::to_value(
                     client
-                        .list_tools_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .list_tools_with_cx(
+                            cx,
+                            cancellation,
+                            serde_json::from_value(params).unwrap(),
+                        )
                         .await?,
                 ),
                 "resources/list" => serde_json::to_value(
                     client
-                        .list_resources_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .list_resources_with_cx(
+                            cx,
+                            cancellation,
+                            serde_json::from_value(params).unwrap(),
+                        )
                         .await?,
                 ),
                 "resources/templates/list" => serde_json::to_value(
@@ -1000,7 +1020,11 @@ case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 76 ;
                 ),
                 "prompts/list" => serde_json::to_value(
                     client
-                        .list_prompts_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .list_prompts_with_cx(
+                            cx,
+                            cancellation,
+                            serde_json::from_value(params).unwrap(),
+                        )
                         .await?,
                 ),
                 _ => unreachable!(),
@@ -1018,12 +1042,20 @@ case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 76 ;
             match method {
                 "tools/list" => {
                     client
-                        .list_all_tools_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .list_all_tools_with_cx(
+                            cx,
+                            cancellation,
+                            serde_json::from_value(params).unwrap(),
+                        )
                         .await
                 }
                 "resources/list" => {
                     client
-                        .list_all_resources_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .list_all_resources_with_cx(
+                            cx,
+                            cancellation,
+                            serde_json::from_value(params).unwrap(),
+                        )
                         .await
                 }
                 "resources/templates/list" => {
@@ -1037,7 +1069,11 @@ case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 76 ;
                 }
                 "prompts/list" => {
                     client
-                        .list_all_prompts_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                        .list_all_prompts_with_cx(
+                            cx,
+                            cancellation,
+                            serde_json::from_value(params).unwrap(),
+                        )
                         .await
                 }
                 _ => unreachable!(),
@@ -1062,9 +1098,21 @@ case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 76 ;
             run(|cx| async move {
                 const CURSOR: &str = " opaque /+=? token ";
                 let catalogs = [
-                    ("tools/list", "tools", json!({"name": "echo", "inputSchema": {"type": "object"}})),
-                    ("resources/list", "resources", json!({"name": "source", "uri": "test://source"})),
-                    ("resources/templates/list", "resourceTemplates", json!({"name": "source", "uriTemplate": "test://source/{name}"})),
+                    (
+                        "tools/list",
+                        "tools",
+                        json!({"name": "echo", "inputSchema": {"type": "object"}}),
+                    ),
+                    (
+                        "resources/list",
+                        "resources",
+                        json!({"name": "source", "uri": "test://source"}),
+                    ),
+                    (
+                        "resources/templates/list",
+                        "resourceTemplates",
+                        json!({"name": "source", "uriTemplate": "test://source/{name}"}),
+                    ),
                     ("prompts/list", "prompts", json!({"name": "greet"})),
                 ];
                 let mut script = INITIALIZE.to_owned();
@@ -1103,38 +1151,48 @@ case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 76 ;
                     let mut single_params = params.clone();
                     single_params["cursor"] = json!("one page");
                     let error = require_send(page(
-                        &mut client, &cx, &cancelled, method, single_params.clone(),
+                        &mut client,
+                        &cx,
+                        &cancelled,
+                        method,
+                        single_params.clone(),
                     ))
                     .await
                     .unwrap_err();
                     assert_eq!(error.code, McpErrorCode::RequestCancelled);
-                    let first = require_send(page(
-                        &mut client, &cx, &cancellation, method, single_params,
-                    ))
-                    .await
-                    .unwrap();
+                    let first =
+                        require_send(page(&mut client, &cx, &cancellation, method, single_params))
+                            .await
+                            .unwrap();
                     assert_eq!(first[field], json!([item]));
                     assert_eq!(first["nextCursor"], json!(CURSOR));
 
                     let mut invalid_start = params.clone();
                     invalid_start["cursor"] = json!("");
                     let error = require_send(collect(
-                        &mut client, &cx, &cancellation, method, invalid_start,
+                        &mut client,
+                        &cx,
+                        &cancellation,
+                        method,
+                        invalid_start,
                     ))
                     .await
                     .unwrap_err();
                     assert_eq!(error.code, McpErrorCode::InvalidParams);
                     let error = require_send(collect(
-                        &mut client, &cx, &cancelled, method, params.clone(),
+                        &mut client,
+                        &cx,
+                        &cancelled,
+                        method,
+                        params.clone(),
                     ))
                     .await
                     .unwrap_err();
                     assert_eq!(error.code, McpErrorCode::RequestCancelled);
-                    let catalog = require_send(collect(
-                        &mut client, &cx, &cancellation, method, params,
-                    ))
-                    .await
-                    .unwrap();
+                    let catalog =
+                        require_send(collect(&mut client, &cx, &cancellation, method, params))
+                            .await
+                            .unwrap();
                     assert_eq!(catalog.method(), method);
                     assert_eq!(catalog.item_count(), 3);
                     let pages: &[legacy::LegacyCoreResult] = catalog.pages();
@@ -1142,7 +1200,10 @@ case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 76 ;
                     for (index, page) in pages.iter().enumerate() {
                         assert_eq!(page.method(), method);
                         let value = page_value(page);
-                        assert_eq!(value[field].as_array().unwrap().len(), usize::from(index != 1));
+                        assert_eq!(
+                            value[field].as_array().unwrap().len(),
+                            usize::from(index != 1)
+                        );
                         assert!(value.get("resultType").is_none());
                         let expected = match index {
                             0 => Some(json!("")),
@@ -1218,31 +1279,41 @@ while IFS= read -r unexpected; do exit 96; done
                     McpErrorCode::RequestCancelled,
                 );
                 assert_eq!(
-                    require_send(client.set_log_level_with_cx(&cancelled_cx, legacy::LogLevel::Info))
-                        .await
-                        .unwrap_err()
-                        .code,
+                    require_send(
+                        client.set_log_level_with_cx(&cancelled_cx, legacy::LogLevel::Info)
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
                     McpErrorCode::RequestCancelled,
                 );
                 assert_eq!(
-                    require_send(client.subscribe_resource_with_cx(&cancelled_cx, "test://async/value"))
-                        .await
-                        .unwrap_err()
-                        .code,
+                    require_send(
+                        client.subscribe_resource_with_cx(&cancelled_cx, "test://async/value")
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
                     McpErrorCode::RequestCancelled,
                 );
                 assert_eq!(
-                    require_send(client.unsubscribe_resource_with_cx(&cancelled_cx, "test://async/value"))
-                        .await
-                        .unwrap_err()
-                        .code,
+                    require_send(
+                        client.unsubscribe_resource_with_cx(&cancelled_cx, "test://async/value")
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
                     McpErrorCode::RequestCancelled,
                 );
                 assert_eq!(
-                    require_send(client.read_resource_with_cx(&cx, &cancelled, "test://async/value"))
-                        .await
-                        .unwrap_err()
-                        .code,
+                    require_send(client.read_resource_with_cx(
+                        &cx,
+                        &cancelled,
+                        "test://async/value"
+                    ))
+                    .await
+                    .unwrap_err()
+                    .code,
                     McpErrorCode::RequestCancelled,
                 );
                 require_send(client.ping_with_cx(&cx)).await.unwrap();
@@ -1254,7 +1325,9 @@ while IFS= read -r unexpected; do exit 96; done
                     .unwrap();
 
                 let mut reading = Box::pin(require_send(client.read_resource_with_cx(
-                    &cx, &cancellation, "test://async/value",
+                    &cx,
+                    &cancellation,
+                    "test://async/value",
                 )));
                 let yielded = std::future::poll_fn(|task_cx| {
                     Poll::Ready(reading.as_mut().poll(task_cx).is_pending())
@@ -1283,23 +1356,29 @@ while IFS= read -r unexpected; do exit 96; done
                 assert_eq!(prompt["_meta"]["source"], "legacy");
                 assert_eq!(prompt["vendorResult"], "prompt");
 
-                let completed = require_send(client.complete_with_cx(
-                    &cx,
-                    &cancellation,
-                    serde_json::from_value(json!({
-                        "ref": {"type": "ref/prompt", "name": "greet"},
-                        "argument": {"name": "name", "value": "A"},
-                        "_meta": {"progressToken": "legacy-complete"},
-                    }))
-                    .unwrap(),
-                ))
+                let completed = require_send(
+                    client.complete_with_cx(
+                        &cx,
+                        &cancellation,
+                        serde_json::from_value(json!({
+                            "ref": {"type": "ref/prompt", "name": "greet"},
+                            "argument": {"name": "name", "value": "A"},
+                            "_meta": {"progressToken": "legacy-complete"},
+                        }))
+                        .unwrap(),
+                    ),
+                )
                 .await
                 .unwrap();
                 assert_eq!(completed.completion.values, ["Ada"]);
-                assert_eq!(completed.meta.as_ref().unwrap().get("source"), Some(&json!("legacy")));
-                let tool = require_send(client.call_tool_with_cx(&cx, "echo", json!({"value": "tool"})))
-                    .await
-                    .unwrap();
+                assert_eq!(
+                    completed.meta.as_ref().unwrap().get("source"),
+                    Some(&json!("legacy"))
+                );
+                let tool =
+                    require_send(client.call_tool_with_cx(&cx, "echo", json!({"value": "tool"})))
+                        .await
+                        .unwrap();
                 let tool = serde_json::to_value(tool).unwrap();
                 assert_eq!(tool["content"][0]["text"], "tool value");
                 assert_eq!(tool["content"][0]["vendor"], 9);
@@ -1340,7 +1419,9 @@ while IFS= read -r unexpected; do exit 84; done
                 let mut client = connect(&cx, &script, "").await;
                 let cancellation = legacy::McpRequestCancellation::new();
                 let error = require_send(client.list_all_tools_with_cx(
-                    &cx, &cancellation, legacy::ListToolsParams::default(),
+                    &cx,
+                    &cancellation,
+                    legacy::ListToolsParams::default(),
                 ))
                 .await
                 .unwrap_err();
@@ -1349,13 +1430,18 @@ while IFS= read -r unexpected; do exit 84; done
                 assert_eq!(error.data, Some(json!({"page": 2})));
                 require_send(client.ping_with_cx(&cx)).await.unwrap();
                 let recovered = require_send(client.list_all_prompts_with_cx(
-                    &cx, &cancellation, legacy::ListPromptsParams::default(),
+                    &cx,
+                    &cancellation,
+                    legacy::ListPromptsParams::default(),
                 ))
                 .await
                 .unwrap();
                 assert_eq!(recovered.item_count(), 1);
                 assert_eq!(recovered.pages().len(), 1);
-                assert_eq!(page_value(&recovered.pages()[0])["prompts"][0]["name"], "healthy");
+                assert_eq!(
+                    page_value(&recovered.pages()[0])["prompts"][0]["name"],
+                    "healthy"
+                );
                 require_send(client.close_with_cx(&cx)).await.unwrap();
             });
         }
@@ -1363,7 +1449,9 @@ while IFS= read -r unexpected; do exit 84; done
         #[test]
         fn legacy_async_read_cancellation_retires_only_the_active_request() {
             run(|cx| async move {
-                let script = [INITIALIZE, r#"
+                let script = [
+                    INITIALIZE,
+                    r#"
 read_request
 case "$request" in *'"method":"resources/read"'*) ;; *) exit 80 ;; esac
 original_id=$id
@@ -1375,13 +1463,19 @@ read_request
 case "$request" in *'"method":"ping"'*) ;; *) exit 84 ;; esac
 printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
 while IFS= read -r unexpected; do exit 85; done
-"#].concat();
+"#,
+                ]
+                .concat();
                 let mut client = connect(&cx, &script, "").await;
-                require_send(client.ensure_initialized_with_cx(&cx)).await.unwrap();
+                require_send(client.ensure_initialized_with_cx(&cx))
+                    .await
+                    .unwrap();
                 assert!(client.is_initialized());
                 let cancellation = legacy::McpRequestCancellation::new();
                 let mut reading = Box::pin(require_send(client.read_resource_with_cx(
-                    &cx, &cancellation, "test://async/pending",
+                    &cx,
+                    &cancellation,
+                    "test://async/pending",
                 )));
                 let yielded = std::future::poll_fn(|task_cx| {
                     Poll::Ready(reading.as_mut().poll(task_cx).is_pending())
@@ -1389,7 +1483,10 @@ while IFS= read -r unexpected; do exit 85; done
                 .await;
                 assert!(yielded, "the peer holds the request until cancellation");
                 cancellation.cancel();
-                assert_eq!(reading.await.unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert_eq!(
+                    reading.await.unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
                 require_send(client.ping_with_cx(&cx)).await.unwrap();
                 assert!(cx.checkpoint().is_ok());
                 require_send(client.close_with_cx(&cx)).await.unwrap();
@@ -1422,7 +1519,11 @@ while IFS= read -r unexpected; do exit 85; done
                         let cancellation = legacy::McpRequestCancellation::new();
                         let observed = match method {
                             "tools/list" => client
-                                .list_tools_with_cx(&cx, &cancellation, legacy::ListToolsParams::default())
+                                .list_tools_with_cx(
+                                    &cx,
+                                    &cancellation,
+                                    legacy::ListToolsParams::default(),
+                                )
                                 .await
                                 .map(|_| ()),
                             "resources/read" => client
@@ -1441,9 +1542,11 @@ while IFS= read -r unexpected; do exit 85; done
                                 )
                                 .await
                                 .map(|_| ()),
-                            "resources/subscribe" => client
-                                .subscribe_resource_with_cx(&cx, "test://source")
-                                .await,
+                            "resources/subscribe" => {
+                                client
+                                    .subscribe_resource_with_cx(&cx, "test://source")
+                                    .await
+                            }
                             "ping" => client.ping_with_cx(&cx).await,
                             _ => unreachable!(),
                         };
@@ -1664,20 +1767,19 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{"leve
                         "logging/setLevel",
                         "ping",
                     ] {
-                        for invalid in [json!({"resultType": "complete"}), json!({"unexpected": true})] {
+                        for invalid in [
+                            json!({"resultType": "complete"}),
+                            json!({"unexpected": true}),
+                        ] {
                             let mut script = INITIALIZE.to_owned();
                             exchange(&mut script, method, "", &invalid, false);
                             script.push_str("while IFS= read -r unexpected; do exit 96; done\n");
                             let mut client = connect(&cx, &script, "").await;
                             let cancellation = legacy::McpRequestCancellation::new();
-                            let error = require_send(control(
-                                &mut client,
-                                &cx,
-                                &cancellation,
-                                method,
-                            ))
-                            .await
-                            .unwrap_err();
+                            let error =
+                                require_send(control(&mut client, &cx, &cancellation, method))
+                                    .await
+                                    .unwrap_err();
                             assert_eq!(error.code, McpErrorCode::InvalidRequest);
                             assert!(client.ping_with_cx(&cx).await.is_err());
                             assert!(cx.checkpoint().is_ok());
@@ -1786,14 +1888,13 @@ case "$request" in *'"arguments":{"message":"legacy payload"}'*) ;; *) exit 98 ;
                     );
                     let mut client = connect(&cx, &script, "").await;
                     let cancellation = legacy::McpRequestCancellation::new();
-                    let mut calling = Box::pin(require_send(
-                        client.call_tool_with_cx_and_cancellation(
+                    let mut calling =
+                        Box::pin(require_send(client.call_tool_with_cx_and_cancellation(
                             &cx,
                             &cancellation,
                             "wait",
                             json!({}),
-                        ),
-                    ));
+                        )));
                     let yielded = std::future::poll_fn(|task_cx| {
                         Poll::Ready(calling.as_mut().poll(task_cx).is_pending())
                     })
@@ -1858,13 +1959,10 @@ case "$request" in *'"context":'*) exit 110 ;; esac
                             )),
                         }),
                     };
-                    let error = require_send(client.complete_with_cx(
-                        &cx,
-                        &cancelled,
-                        params.clone(),
-                    ))
-                    .await
-                    .unwrap_err();
+                    let error =
+                        require_send(client.complete_with_cx(&cx, &cancelled, params.clone()))
+                            .await
+                            .unwrap_err();
                     assert_eq!(error.code, McpErrorCode::RequestCancelled);
                     let result: legacy::LegacyCompletionResult = after_pending(
                         client.complete_with_cx(&cx, &cancellation, params),
@@ -1881,7 +1979,6 @@ case "$request" in *'"context":'*) exit 110 ;; esac
                 });
             }
         }
-
     }
 
     async fn collect(
@@ -1894,22 +1991,38 @@ case "$request" in *'"context":'*) exit 110 ;; esac
         match method {
             "tools/list" => {
                 client
-                    .list_all_tools_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                    .list_all_tools_with_cx(
+                        cx,
+                        cancellation,
+                        serde_json::from_value(params).unwrap(),
+                    )
                     .await
             }
             "resources/list" => {
                 client
-                    .list_all_resources_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                    .list_all_resources_with_cx(
+                        cx,
+                        cancellation,
+                        serde_json::from_value(params).unwrap(),
+                    )
                     .await
             }
             "resources/templates/list" => {
                 client
-                    .list_all_resource_templates_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                    .list_all_resource_templates_with_cx(
+                        cx,
+                        cancellation,
+                        serde_json::from_value(params).unwrap(),
+                    )
                     .await
             }
             "prompts/list" => {
                 client
-                    .list_all_prompts_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                    .list_all_prompts_with_cx(
+                        cx,
+                        cancellation,
+                        serde_json::from_value(params).unwrap(),
+                    )
                     .await
             }
             _ => unreachable!(),
@@ -1931,7 +2044,11 @@ case "$request" in *'"context":'*) exit 110 ;; esac
             ),
             "resources/list" => serde_json::to_value(
                 client
-                    .list_resources_with_cx(cx, cancellation, serde_json::from_value(params).unwrap())
+                    .list_resources_with_cx(
+                        cx,
+                        cancellation,
+                        serde_json::from_value(params).unwrap(),
+                    )
                     .await?,
             ),
             "resources/templates/list" => serde_json::to_value(
@@ -1958,9 +2075,21 @@ case "$request" in *'"context":'*) exit 110 ;; esac
         run(|cx| async move {
             const CURSOR: &str = " opaque /+=? token ";
             let catalogs = [
-                ("tools/list", "tools", json!({"name": "echo", "inputSchema": {"type": "object"}})),
-                ("resources/list", "resources", json!({"name": "source", "uri": "test://source"})),
-                ("resources/templates/list", "resourceTemplates", json!({"name": "source", "uriTemplate": "test://source/{name}"})),
+                (
+                    "tools/list",
+                    "tools",
+                    json!({"name": "echo", "inputSchema": {"type": "object"}}),
+                ),
+                (
+                    "resources/list",
+                    "resources",
+                    json!({"name": "source", "uri": "test://source"}),
+                ),
+                (
+                    "resources/templates/list",
+                    "resourceTemplates",
+                    json!({"name": "source", "uriTemplate": "test://source/{name}"}),
+                ),
                 ("prompts/list", "prompts", json!({"name": "greet"})),
             ];
             let mut script = DISCOVER.to_owned();
@@ -1978,9 +2107,7 @@ case "$request" in *'"context":'*) exit 110 ;; esac
                             "case \"$request\" in *'\"cursor\":\" opaque /+=? token \"'*) ;; *) exit 93 ;; esac\n",
                         );
                     } else {
-                        script.push_str(
-                            "case \"$request\" in *'\"cursor\":'*) exit 94 ;; esac\n",
-                        );
+                        script.push_str("case \"$request\" in *'\"cursor\":'*) exit 94 ;; esac\n");
                     }
                     let mut result = json!({
                         "resultType": "complete",
@@ -2002,14 +2129,26 @@ case "$request" in *'"context":'*) exit 110 ;; esac
             for (method, field, _) in catalogs {
                 let params = json!({"includeTags": ["visible"], "excludeTags": ["hidden"]});
                 let first = require_send(catalog_page(
-                    &mut client, &cx, &cancellation, method, params.clone(),
-                )).await.unwrap();
+                    &mut client,
+                    &cx,
+                    &cancellation,
+                    method,
+                    params.clone(),
+                ))
+                .await
+                .unwrap();
                 assert_eq!(first[field].as_array().unwrap().len(), 1);
                 assert_eq!(first["nextCursor"], json!(CURSOR));
                 let hits = client.final_result_cache_stats().hits;
                 let cached = require_send(catalog_page(
-                    &mut client, &cx, &cancellation, method, params.clone(),
-                )).await.unwrap();
+                    &mut client,
+                    &cx,
+                    &cancellation,
+                    method,
+                    params.clone(),
+                ))
+                .await
+                .unwrap();
                 assert_eq!(cached[field], first[field]);
                 assert_eq!(cached["nextCursor"], first["nextCursor"]);
                 assert_eq!(client.final_result_cache_stats().hits, hits + 1);
@@ -2019,8 +2158,14 @@ case "$request" in *'"context":'*) exit 110 ;; esac
                 let cancelled = modern::McpRequestCancellation::new();
                 cancelled.cancel();
                 let error = require_send(catalog_page(
-                    &mut client, &cx, &cancelled, method, params.clone(),
-                )).await.unwrap_err();
+                    &mut client,
+                    &cx,
+                    &cancelled,
+                    method,
+                    params.clone(),
+                ))
+                .await
+                .unwrap_err();
                 assert_eq!(error.code, fastmcp_rust::McpErrorCode::RequestCancelled);
 
                 // Changing only the semantic tag filter must contact the peer;
@@ -2028,15 +2173,22 @@ case "$request" in *'"context":'*) exit 110 ;; esac
                 let mut alternate = params.clone();
                 alternate["includeTags"] = json!(["alternate"]);
                 let changed = require_send(catalog_page(
-                    &mut client, &cx, &cancellation, method, alternate,
-                )).await.unwrap();
+                    &mut client,
+                    &cx,
+                    &cancellation,
+                    method,
+                    alternate,
+                ))
+                .await
+                .unwrap();
                 assert!(changed[field].as_array().unwrap().is_empty());
 
                 let mut next = params;
                 next["cursor"] = json!(CURSOR);
-                let last = require_send(catalog_page(
-                    &mut client, &cx, &cancellation, method, next,
-                )).await.unwrap();
+                let last =
+                    require_send(catalog_page(&mut client, &cx, &cancellation, method, next))
+                        .await
+                        .unwrap();
                 assert_eq!(last[field].as_array().unwrap().len(), 1);
                 assert!(last.get("nextCursor").is_none());
             }
@@ -2045,7 +2197,11 @@ case "$request" in *'"context":'*) exit 110 ;; esac
     }
 
     fn retained_number(extras: &modern::UnknownResultMembers, name: &str) -> String {
-        let member = extras.members().iter().find(|member| member.name == name).unwrap();
+        let member = extras
+            .members()
+            .iter()
+            .find(|member| member.name == name)
+            .unwrap();
         let modern::ExactJsonValue::Number(number) = &member.value else {
             panic!("the exact numeric result sibling must stay numeric");
         };
@@ -2057,9 +2213,21 @@ case "$request" in *'"context":'*) exit 110 ;; esac
         run(|cx| async move {
             let mut script = DISCOVER.to_owned();
             for (method, field, item) in [
-                ("tools/list", "tools", json!({"name": "echo", "inputSchema": {"type": "object"}})),
-                ("resources/list", "resources", json!({"name": "source", "uri": "test://source"})),
-                ("resources/templates/list", "resourceTemplates", json!({"name": "source", "uriTemplate": "test://source/{name}"})),
+                (
+                    "tools/list",
+                    "tools",
+                    json!({"name": "echo", "inputSchema": {"type": "object"}}),
+                ),
+                (
+                    "resources/list",
+                    "resources",
+                    json!({"name": "source", "uri": "test://source"}),
+                ),
+                (
+                    "resources/templates/list",
+                    "resourceTemplates",
+                    json!({"name": "source", "uriTemplate": "test://source/{name}"}),
+                ),
                 ("prompts/list", "prompts", json!({"name": "greet"})),
             ] {
                 for index in 0..3 {
@@ -2077,14 +2245,22 @@ case "$request" in *'"context":'*) exit 110 ;; esac
                     let mut result = json!({
                         "cacheScope": if method == "tools/list" { "public" } else { "private" },
                     });
-                    result[field] = if index == 1 { json!([]) } else { json!([item.clone()]) };
+                    result[field] = if index == 1 {
+                        json!([])
+                    } else {
+                        json!([item.clone()])
+                    };
                     // A diagnosed absent discriminator remains attached to its
                     // own page, just like the page's TTL and unknown siblings.
                     if index != 1 {
                         result["resultType"] = json!("complete");
                     }
                     if index < 2 {
-                        result["nextCursor"] = json!(if index == 0 { "" } else { " opaque /+=? token " });
+                        result["nextCursor"] = json!(if index == 0 {
+                            ""
+                        } else {
+                            " opaque /+=? token "
+                        });
                     }
                     let prefix = result.to_string();
                     let ttl = ["1.200e3", "0", "9.000e2"][index];
@@ -2146,11 +2322,18 @@ case "$request" in *'"context":'*) exit 110 ;; esac
                         ),
                         _ => panic!("the sealed collection must retain its exact catalog family"),
                     };
-                    assert_eq!(payload[field].as_array().unwrap().len(), usize::from(index != 1));
+                    assert_eq!(
+                        payload[field].as_array().unwrap().len(),
+                        usize::from(index != 1)
+                    );
                     assert_eq!(ttl, ["1.200e3", "0", "9.000e2"][index]);
                     assert_eq!(
                         scope,
-                        if method == "tools/list" { modern::CacheScope::Public } else { modern::CacheScope::Private },
+                        if method == "tools/list" {
+                            modern::CacheScope::Public
+                        } else {
+                            modern::CacheScope::Private
+                        },
                     );
                     assert_eq!(diagnosed, index == 1);
                     let expected_cursor = match index {
@@ -2159,7 +2342,10 @@ case "$request" in *'"context":'*) exit 110 ;; esac
                         _ => None,
                     };
                     assert_eq!(payload.get("nextCursor"), expected_cursor.as_ref());
-                    assert_eq!(retained_number(extras, "vendorExact"), "922337203685477580812345678901234567890");
+                    assert_eq!(
+                        retained_number(extras, "vendorExact"),
+                        "922337203685477580812345678901234567890"
+                    );
                     assert_eq!(retained_number(extras, "vendorDecimal"), "1.2300e+400");
                 }
                 let owned_pages: Vec<modern::FinalCoreResult> = catalog.into_pages();
@@ -2201,7 +2387,9 @@ while IFS= read -r unexpected; do exit 34; done
             assert_eq!(error.code, fastmcp_rust::McpErrorCode::InternalError);
             assert_eq!(error.message, "continuation refused");
             assert_eq!(error.data, Some(json!({"page": 2})));
-            require_send(client.ping_with_cx(&cx, &cancellation)).await.unwrap();
+            require_send(client.ping_with_cx(&cx, &cancellation))
+                .await
+                .unwrap();
             let recovered = require_send(collect(&mut client, &cx, &cancellation, "prompts/list"))
                 .await
                 .unwrap();
@@ -2220,18 +2408,29 @@ while IFS= read -r unexpected; do exit 34; done
     ) -> McpResult<modern::FinalCoreResult> {
         match method {
             "tools/call" => {
-                client.call_tool_result_with_cx(cx, cancellation, "echo", json!({"subject": "retained"})).await
+                client
+                    .call_tool_result_with_cx(
+                        cx,
+                        cancellation,
+                        "echo",
+                        json!({"subject": "retained"}),
+                    )
+                    .await
             }
             "resources/read" => {
-                client.read_resource_result_with_cx(cx, cancellation, "test://retained").await
+                client
+                    .read_resource_result_with_cx(cx, cancellation, "test://retained")
+                    .await
             }
             "prompts/get" => {
-                client.get_prompt_result_with_cx(
-                    cx,
-                    cancellation,
-                    "greet",
-                    HashMap::from([("subject".to_owned(), "retained".to_owned())]),
-                ).await
+                client
+                    .get_prompt_result_with_cx(
+                        cx,
+                        cancellation,
+                        "greet",
+                        HashMap::from([("subject".to_owned(), "retained".to_owned())]),
+                    )
+                    .await
             }
             _ => unreachable!(),
         }
@@ -2243,9 +2442,21 @@ while IFS= read -r unexpected; do exit 34; done
             run(|cx| async move {
                 let mut script = DISCOVER.to_owned();
                 for (method, original, completed) in [
-                    ("tools/call", r#""name":"echo""#, r#"{"resultType":"complete","content":[{"type":"text","text":"tool complete"}],"vendorDecimal":1.2300e+400}"#),
-                    ("resources/read", r#""uri":"test://retained""#, r#"{"resultType":"complete","contents":[{"uri":"test://retained","text":"resource complete"}],"ttlMs":0,"cacheScope":"private","vendorDecimal":1.2300e+400}"#),
-                    ("prompts/get", r#""name":"greet""#, r#"{"resultType":"complete","messages":[{"role":"user","content":{"type":"text","text":"prompt complete"}}],"vendorDecimal":1.2300e+400}"#),
+                    (
+                        "tools/call",
+                        r#""name":"echo""#,
+                        r#"{"resultType":"complete","content":[{"type":"text","text":"tool complete"}],"vendorDecimal":1.2300e+400}"#,
+                    ),
+                    (
+                        "resources/read",
+                        r#""uri":"test://retained""#,
+                        r#"{"resultType":"complete","contents":[{"uri":"test://retained","text":"resource complete"}],"ttlMs":0,"cacheScope":"private","vendorDecimal":1.2300e+400}"#,
+                    ),
+                    (
+                        "prompts/get",
+                        r#""name":"greet""#,
+                        r#"{"resultType":"complete","messages":[{"role":"user","content":{"type":"text","text":"prompt complete"}}],"vendorDecimal":1.2300e+400}"#,
+                    ),
                 ] {
                     script.push_str(&format!(
                         "read_request\n\
@@ -2280,21 +2491,25 @@ while IFS= read -r unexpected; do exit 50; done
                     let calls = Arc::clone(&calls);
                     let sibling_ran = Arc::clone(&sibling_ran);
                     modern::ClientBuilder::new().modern_reverse_request_handlers(
-                        modern::ReverseRequestHandlers::new().with_modern_roots_list(move |cx, _, _| {
-                            let calls = Arc::clone(&calls);
-                            let sibling_ran = Arc::clone(&sibling_ran);
-                            Box::pin(async move {
-                                assert_eq!(std::thread::current().id(), worker);
-                                assert!(cx.blocking_pool_handle().is_none());
-                                calls.fetch_add(1, Ordering::AcqRel);
-                                while !sibling_ran.load(Ordering::Acquire) {
-                                    asupersync::runtime::yield_now().await;
-                                }
-                                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-                                serde_json::from_value(json!({"roots": []}))
-                                    .map_err(|_| modern::McpError::internal_error("invalid roots fixture"))
-                            })
-                        }),
+                        modern::ReverseRequestHandlers::new().with_modern_roots_list(
+                            move |cx, _, _| {
+                                let calls = Arc::clone(&calls);
+                                let sibling_ran = Arc::clone(&sibling_ran);
+                                Box::pin(async move {
+                                    assert_eq!(std::thread::current().id(), worker);
+                                    assert!(cx.blocking_pool_handle().is_none());
+                                    calls.fetch_add(1, Ordering::AcqRel);
+                                    while !sibling_ran.load(Ordering::Acquire) {
+                                        asupersync::runtime::yield_now().await;
+                                    }
+                                    asupersync::time::sleep(cx.now(), Duration::from_millis(1))
+                                        .await;
+                                    serde_json::from_value(json!({"roots": []})).map_err(|_| {
+                                        modern::McpError::internal_error("invalid roots fixture")
+                                    })
+                                })
+                            },
+                        ),
                     )
                 } else {
                     modern::ClientBuilder::new()
@@ -2309,7 +2524,8 @@ while IFS= read -r unexpected; do exit 50; done
                         }
                         assert_eq!(std::thread::current().id(), worker);
                         sibling_ran.store(true, Ordering::Release);
-                    }).unwrap()
+                    })
+                    .unwrap()
                 });
                 let cancellation = modern::McpRequestCancellation::new();
                 for method in ["tools/call", "resources/read", "prompts/get"] {
@@ -2319,25 +2535,44 @@ while IFS= read -r unexpected; do exit 50; done
                     assert_eq!(result.method(), method);
                     let extras = match &result {
                         modern::FinalCoreResult::ToolsCall { result, .. } if installed => {
-                            assert_eq!(result.payload.content, vec![modern::ContentBlock::text("tool complete")]);
+                            assert_eq!(
+                                result.payload.content,
+                                vec![modern::ContentBlock::text("tool complete")]
+                            );
                             &result.extras
                         }
                         modern::FinalCoreResult::ResourcesRead { result, .. } if installed => {
-                            assert_eq!(serde_json::to_value(&result.payload.contents).unwrap(), json!([{"uri": "test://retained", "text": "resource complete"}]));
+                            assert_eq!(
+                                serde_json::to_value(&result.payload.contents).unwrap(),
+                                json!([{"uri": "test://retained", "text": "resource complete"}])
+                            );
                             &result.extras
                         }
                         modern::FinalCoreResult::PromptsGet { result, .. } if installed => {
-                            assert_eq!(serde_json::to_value(&result.payload.messages).unwrap(), json!([{"role": "user", "content": {"type": "text", "text": "prompt complete"}}]));
+                            assert_eq!(
+                                serde_json::to_value(&result.payload.messages).unwrap(),
+                                json!([{"role": "user", "content": {"type": "text", "text": "prompt complete"}}])
+                            );
                             &result.extras
                         }
                         modern::FinalCoreResult::ToolsCallInputRequired { result, .. }
                         | modern::FinalCoreResult::ResourcesReadInputRequired { result, .. }
-                        | modern::FinalCoreResult::PromptsGetInputRequired { result, .. } if !installed => {
+                        | modern::FinalCoreResult::PromptsGetInputRequired { result, .. }
+                            if !installed =>
+                        {
                             assert_eq!(result.request_state(), Some("opaque continuation"));
-                            assert!(result.input_requests().unwrap().get("roots-input").is_some());
+                            assert!(
+                                result
+                                    .input_requests()
+                                    .unwrap()
+                                    .get("roots-input")
+                                    .is_some()
+                            );
                             &result.extras
                         }
-                        _ => panic!("the public method must preserve the selected final result algebra"),
+                        _ => panic!(
+                            "the public method must preserve the selected final result algebra"
+                        ),
                     };
                     assert_eq!(retained_number(extras, "vendorDecimal"), "1.2300e+400");
                 }
@@ -2345,17 +2580,25 @@ while IFS= read -r unexpected; do exit 50; done
                     sibling.join(&cx).await.unwrap();
                 }
                 assert_eq!(calls.load(Ordering::Acquire), if installed { 3 } else { 0 });
-                let completion = require_send(client.complete_with_cx(
-                    &cx,
-                    &cancellation,
-                    serde_json::from_value(json!({
-                        "ref": {"type": "ref/prompt", "name": "greet"},
-                        "argument": {"name": "person", "value": "A"},
-                    })).unwrap(),
-                )).await.unwrap();
-                assert_eq!(serde_json::to_value(completion).unwrap(), json!({
-                    "completion": {"values": ["Ada"], "total": 1, "hasMore": false},
-                }));
+                let completion = require_send(
+                    client.complete_with_cx(
+                        &cx,
+                        &cancellation,
+                        serde_json::from_value(json!({
+                            "ref": {"type": "ref/prompt", "name": "greet"},
+                            "argument": {"name": "person", "value": "A"},
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(completion).unwrap(),
+                    json!({
+                        "completion": {"values": ["Ada"], "total": 1, "hasMore": false},
+                    })
+                );
                 client.close_with_cx(&cx).await.unwrap();
             });
         }
@@ -2392,29 +2635,47 @@ while IFS= read -r unexpected; do exit 65; done
                     tools_list_changed: Some(true),
                     ..modern::SubscriptionFilter::default()
                 },
-            )).await.unwrap();
-            require_send(client.ping_with_cx(&cx, &cancellation)).await.unwrap();
+            ))
+            .await
+            .unwrap();
+            require_send(client.ping_with_cx(&cx, &cancellation))
+                .await
+                .unwrap();
             assert!(matches!(
                 require_send(client.next_subscription_event_with_cx(&cx, &cancellation)).await.unwrap(),
                 modern::StdioSubscriptionEvent::Acknowledged(filter)
                     if filter.tools_list_changed == Some(true)
             ));
             assert!(matches!(
-                require_send(client.next_subscription_event_with_cx(&cx, &cancellation)).await.unwrap(),
-                modern::StdioSubscriptionEvent::Notification(modern::ServerNotification::ToolsListChanged(Some(_)))
+                require_send(client.next_subscription_event_with_cx(&cx, &cancellation))
+                    .await
+                    .unwrap(),
+                modern::StdioSubscriptionEvent::Notification(
+                    modern::ServerNotification::ToolsListChanged(Some(_))
+                )
             ));
             assert!(client.take_server_notifications().is_empty());
-            let mut waiting = Box::pin(require_send(client.next_subscription_event_with_cx(&cx, &cancellation)));
-            assert!(std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
-                .await
-                .is_pending());
+            let mut waiting = Box::pin(require_send(
+                client.next_subscription_event_with_cx(&cx, &cancellation),
+            ));
+            assert!(
+                std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                    .await
+                    .is_pending()
+            );
             drop(waiting);
-            require_send(client.ping_with_cx(&cx, &cancellation)).await.unwrap();
+            require_send(client.ping_with_cx(&cx, &cancellation))
+                .await
+                .unwrap();
             assert!(matches!(
-                require_send(client.next_subscription_event_with_cx(&cx, &cancellation)).await.unwrap(),
+                require_send(client.next_subscription_event_with_cx(&cx, &cancellation))
+                    .await
+                    .unwrap(),
                 modern::StdioSubscriptionEvent::Terminal
             ));
-            require_send(client.ping_with_cx(&cx, &cancellation)).await.unwrap();
+            require_send(client.ping_with_cx(&cx, &cancellation))
+                .await
+                .unwrap();
             assert!(cx.checkpoint().is_ok());
             client.close_with_cx(&cx).await.unwrap();
         });
@@ -2458,10 +2719,8 @@ case "$request" in *'"method":"server/discover"'*) ;; *) exit 83 ;; esac
 printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$1"
 while IFS= read -r unexpected; do exit 84; done
 "#].concat();
-            let extensions = std::collections::BTreeMap::from([(
-                modern::TASKS_EXTENSION.to_owned(),
-                json!({}),
-            )]);
+            let extensions =
+                std::collections::BTreeMap::from([(modern::TASKS_EXTENSION.to_owned(), json!({}))]);
             let discovery = discovery_with_extensions(extensions.clone());
             let mut client = modern::ClientBuilder::new()
                 .capabilities(modern::ClientCapabilities {
@@ -2473,7 +2732,8 @@ while IFS= read -r unexpected; do exit 84; done
                     modern::RequestTimeoutPolicy::new(
                         Duration::from_secs(5),
                         Duration::from_secs(5),
-                    ).unwrap(),
+                    )
+                    .unwrap(),
                 )
                 .connect_stdio_with_cx(&cx, "sh", &["-c", &script, "public-tasks-peer", &discovery])
                 .await
@@ -2484,7 +2744,9 @@ while IFS= read -r unexpected; do exit 84; done
                 &cancellation,
                 "durable-tool",
                 json!({"work": "retained"}),
-            )).await.unwrap();
+            ))
+            .await
+            .unwrap();
             let modern::FinalToolCallOutcome::Task(created) = outcome else {
                 panic!("the public API must retain the task outcome, not project it to content");
             };
@@ -2494,12 +2756,19 @@ while IFS= read -r unexpected; do exit 84; done
             let mut filter = modern::SubscriptionFilter::default();
             modern::set_task_subscription_ids(&mut filter, vec![task_id.clone()]).unwrap();
             require_send(client.open_final_task_subscription_listener_with_cx(
-                &cx, &cancellation, filter,
-            )).await.unwrap();
-            let input = require_send(client.get_task_with_cx(
-                &cx, &cancellation, task_id.clone(),
-            )).await.unwrap();
-            assert!(matches!(&input.task, modern::FinalTask::InputRequired { .. }));
+                &cx,
+                &cancellation,
+                filter,
+            ))
+            .await
+            .unwrap();
+            let input = require_send(client.get_task_with_cx(&cx, &cancellation, task_id.clone()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                &input.task,
+                modern::FinalTask::InputRequired { .. }
+            ));
             assert!(matches!(
                 require_send(client.next_final_task_subscription_event_with_cx(&cx, &cancellation)).await.unwrap(),
                 modern::StdioTaskSubscriptionEvent::Acknowledged(filter)
@@ -2513,27 +2782,33 @@ while IFS= read -r unexpected; do exit 84; done
             assert!(client.take_server_notifications().is_empty());
             let invalid = serde_json::from_value(json!({
                 "need-roots": {"action": "accept"},
-            })).unwrap();
-            let error = require_send(client.update_task_with_cx(
-                &cx, &cancellation, &input.task, invalid,
-            )).await.unwrap_err();
+            }))
+            .unwrap();
+            let error =
+                require_send(client.update_task_with_cx(&cx, &cancellation, &input.task, invalid))
+                    .await
+                    .unwrap_err();
             assert_eq!(error.code, fastmcp_rust::McpErrorCode::InvalidParams);
             let updated = require_send(client.update_task_with_cx(
                 &cx,
                 &cancellation,
                 &input.task,
                 serde_json::from_value(json!({"need-roots": {"roots": []}})).unwrap(),
-            )).await.unwrap();
+            ))
+            .await
+            .unwrap();
             assert_eq!(updated.additional["receipt"], "input accepted");
-            let cancelled = require_send(client.cancel_task_with_cx(
-                &cx, &cancellation, task_id.clone(),
-            )).await.unwrap();
+            let cancelled =
+                require_send(client.cancel_task_with_cx(&cx, &cancellation, task_id.clone()))
+                    .await
+                    .unwrap();
             assert_eq!(cancelled.additional["receipt"], "cancellation requested");
             // The acknowledgement does not turn a cancellation request into
             // a terminal Task. A racing completion remains its own outcome.
-            let completed = require_send(client.get_task_with_cx(
-                &cx, &cancellation, task_id.clone(),
-            )).await.unwrap();
+            let completed =
+                require_send(client.get_task_with_cx(&cx, &cancellation, task_id.clone()))
+                    .await
+                    .unwrap();
             assert_eq!(completed.task.base().task_id, task_id);
             let modern::FinalTask::Completed { result, .. } = &completed.task else {
                 panic!("task completion must survive an earlier cancellation acknowledgement");
@@ -2543,10 +2818,14 @@ while IFS= read -r unexpected; do exit 84; done
             assert!(encoded.contains(r#""vendorExact":922337203685477580812345678901234567890"#));
             assert!(encoded.contains(r#""vendorDecimal":1.2300e+400"#));
             assert!(matches!(
-                require_send(client.next_final_task_subscription_event_with_cx(&cx, &cancellation)).await.unwrap(),
+                require_send(client.next_final_task_subscription_event_with_cx(&cx, &cancellation))
+                    .await
+                    .unwrap(),
                 modern::StdioTaskSubscriptionEvent::Terminal
             ));
-            require_send(client.ping_with_cx(&cx, &cancellation)).await.unwrap();
+            require_send(client.ping_with_cx(&cx, &cancellation))
+                .await
+                .unwrap();
             client.close_with_cx(&cx).await.unwrap();
         });
     }

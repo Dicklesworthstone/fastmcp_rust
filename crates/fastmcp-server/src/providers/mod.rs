@@ -68,8 +68,8 @@ pub use introspection::{
 pub mod managed_jwks;
 #[cfg(feature = "jwt-resource-auth")]
 pub use managed_jwks::{
-    GuardedJwksSource, GuardedJwtResourceVerifier, JwksFetchAdmissionPool,
-    JwksRefreshError, JwksRefreshOutcome, JwksRefreshPolicy, ManagedJwtResourceVerifier,
+    GuardedJwksSource, GuardedJwtResourceVerifier, JwksFetchAdmissionPool, JwksRefreshError,
+    JwksRefreshOutcome, JwksRefreshPolicy, ManagedJwtResourceVerifier,
 };
 
 /// Authenticated, request-owned modern core forwarding using a managed login.

@@ -3,20 +3,19 @@ use crate::http_auth::dpop::native::core::stream::task_subscription::watch::inpu
     DpopTaskWatchDriverPolicy, ManagedTaskInputAction,
 };
 
-fn fallback_policy(
-    snapshots: usize,
-    polls: usize,
-    interval: Duration,
-) -> DpopTaskWatchPolicy {
-    DpopTaskWatchPolicy::new(snapshots).unwrap()
-        .with_polling_fallback(polls, interval).unwrap()
+fn fallback_policy(snapshots: usize, polls: usize, interval: Duration) -> DpopTaskWatchPolicy {
+    DpopTaskWatchPolicy::new(snapshots)
+        .unwrap()
+        .with_polling_fallback(polls, interval)
+        .unwrap()
 }
 
 fn fallback_limits(timeout: Duration) -> DpopStreamLimits {
     DpopStreamLimits::new(
         ManagedCoreLimits::new(8192, 8192, 65536, 8, timeout).unwrap(),
         timeout,
-    ).unwrap()
+    )
+    .unwrap()
 }
 
 fn fallback_input_task(keys: &[&str]) -> Value {
@@ -29,17 +28,9 @@ fn fallback_input_task(keys: &[&str]) -> Value {
     task
 }
 
-async fn fallback_get_reply(
-    peer: &mut Peer,
-    prefix: &str,
-    index: usize,
-    result: &Value,
-) {
+async fn fallback_get_reply(peer: &mut Peer, prefix: &str, index: usize, result: &Value) {
     let mut socket = peer.wait_round(prefix, index).await;
-    json_reply(
-        &mut socket,
-        &wait_response(prefix, index, false, result),
-    ).await;
+    json_reply(&mut socket, &wait_response(prefix, index, false, result)).await;
 }
 
 async fn finish_listen(prefix: &str, listen: &mut TlsStream<TcpStream>) {
@@ -56,9 +47,14 @@ fn fallback_recovers_terminal_state_after_clean_subscription_end() {
         let (mut peer, mut client, credential) = Peer::new().await;
         let cancellation = McpRequestCancellation::new();
         let application = client.watch_task_with_cancellation(
-            &cx, &cancellation, &credential, driver_metadata(),
-            TaskId::parse("task-one").unwrap(), "fallback",
-            fallback_policy(4, 1, Duration::from_millis(1)), watch_limits(8),
+            &cx,
+            &cancellation,
+            &credential,
+            driver_metadata(),
+            TaskId::parse("task-one").unwrap(),
+            "fallback",
+            fallback_policy(4, 1, Duration::from_millis(1)),
+            watch_limits(8),
         );
         let server = async {
             peer.watch_snapshot_reply("fallback", 0, "working").await;
@@ -91,9 +87,14 @@ fn fallback_and_snapshot_limits_stop_without_hidden_extra_gets() {
             let cancellation = McpRequestCancellation::new();
             let snapshots = if snapshot_limited { 3 } else { 5 };
             let application = client.watch_task_with_cancellation(
-                &cx, &cancellation, &credential, driver_metadata(),
-                TaskId::parse("task-one").unwrap(), "bounded",
-                fallback_policy(snapshots, 1, Duration::from_millis(1)), watch_limits(8),
+                &cx,
+                &cancellation,
+                &credential,
+                driver_metadata(),
+                TaskId::parse("task-one").unwrap(),
+                "bounded",
+                fallback_policy(snapshots, 1, Duration::from_millis(1)),
+                watch_limits(8),
             );
             let server = async {
                 peer.watch_snapshot_reply("bounded", 0, "working").await;
@@ -127,8 +128,12 @@ fn fallback_honors_peer_poll_hint_and_original_deadline() {
         let (mut peer, mut client, credential) = Peer::new().await;
         let cancellation = McpRequestCancellation::new();
         let application = client.watch_task_with_cancellation(
-            &cx, &cancellation, &credential, driver_metadata(),
-            TaskId::parse("task-one").unwrap(), "hint",
+            &cx,
+            &cancellation,
+            &credential,
+            driver_metadata(),
+            TaskId::parse("task-one").unwrap(),
+            "hint",
             fallback_policy(5, 2, Duration::from_millis(1)),
             fallback_limits(Duration::from_secs(2)),
         );
@@ -142,9 +147,7 @@ fn fallback_honors_peer_poll_hint_and_original_deadline() {
             let mut task = task_result("working");
             task["pollIntervalMs"] = json!(60000);
             fallback_get_reply(&mut peer, "hint", 2, &task).await;
-            asupersync::time::Sleep::new(
-                cx.now().saturating_add_nanos(3_000_000_000),
-            ).await;
+            asupersync::time::Sleep::new(cx.now().saturating_add_nanos(3_000_000_000)).await;
             peer.no_extra(4);
         };
         let (result, ()) = pair(application, server).await;
@@ -165,16 +168,23 @@ fn cancellation_wakes_fallback_sleep_without_dispatching_a_poll() {
         let (mut peer, mut client, credential) = Peer::new().await;
         let cancellation = McpRequestCancellation::new();
         let application = client.watch_task_with_cancellation(
-            &cx, &cancellation, &credential, driver_metadata(),
-            TaskId::parse("task-one").unwrap(), "cancel-fallback",
-            fallback_policy(5, 2, Duration::from_millis(1)), watch_limits(8),
+            &cx,
+            &cancellation,
+            &credential,
+            driver_metadata(),
+            TaskId::parse("task-one").unwrap(),
+            "cancel-fallback",
+            fallback_policy(5, 2, Duration::from_millis(1)),
+            watch_limits(8),
         );
         let server = async {
-            peer.watch_snapshot_reply("cancel-fallback", 0, "working").await;
+            peer.watch_snapshot_reply("cancel-fallback", 0, "working")
+                .await;
             let mut listen = peer.watch_listen("cancel-fallback").await;
             listen.write_all(HEAD).await.unwrap();
             event(&mut listen, &watch_ack("cancel-fallback", true)).await;
-            peer.watch_snapshot_reply("cancel-fallback", 1, "working").await;
+            peer.watch_snapshot_reply("cancel-fallback", 1, "working")
+                .await;
             finish_listen("cancel-fallback", &mut listen).await;
             let mut task = task_result("working");
             task["pollIntervalMs"] = json!(60000);
@@ -200,14 +210,19 @@ fn fallback_never_restores_task_input_update_authority_after_teardown() {
         let cx = Cx::current().unwrap();
         let (mut peer, mut client, credential) = Peer::new().await;
         let cancellation = McpRequestCancellation::new();
-        let policy = DpopTaskWatchDriverPolicy::new(
-            5, 2, 4, 8192, Duration::from_secs(10),
-        ).unwrap()
-            .with_polling_fallback(1, Duration::from_millis(1)).unwrap();
+        let policy = DpopTaskWatchDriverPolicy::new(5, 2, 4, 8192, Duration::from_secs(10))
+            .unwrap()
+            .with_polling_fallback(1, Duration::from_millis(1))
+            .unwrap();
         let application = client.drive_task_with_subscription(
-            &cx, &cancellation, &credential, driver_metadata(),
-            TaskId::parse("task-one").unwrap(), "input-fallback",
-            policy, watch_limits(8),
+            &cx,
+            &cancellation,
+            &credential,
+            driver_metadata(),
+            TaskId::parse("task-one").unwrap(),
+            "input-fallback",
+            policy,
+            watch_limits(8),
             |_| {
                 panic!("fallback after teardown must not resolve Task input");
                 #[allow(unreachable_code)]
@@ -216,18 +231,24 @@ fn fallback_never_restores_task_input_update_authority_after_teardown() {
             |_| Ok(()),
         );
         let server = async {
-            peer.watch_snapshot_reply("input-fallback", 0, "working").await;
+            peer.watch_snapshot_reply("input-fallback", 0, "working")
+                .await;
             let mut listen = peer.watch_listen("input-fallback").await;
             listen.write_all(HEAD).await.unwrap();
             event(&mut listen, &watch_ack("input-fallback", true)).await;
-            peer.watch_snapshot_reply("input-fallback", 1, "working").await;
+            peer.watch_snapshot_reply("input-fallback", 1, "working")
+                .await;
             finish_listen("input-fallback", &mut listen).await;
-            peer.watch_snapshot_reply("input-fallback", 2, "working").await;
+            peer.watch_snapshot_reply("input-fallback", 2, "working")
+                .await;
             let input = fallback_input_task(&["one"]);
             fallback_get_reply(&mut peer, "input-fallback", 3, &input).await;
         };
         let (result, ()) = pair(application, server).await;
-        assert!(matches!(result.unwrap(), DpopTaskWaitOutcome::InputRequired(_)));
+        assert!(matches!(
+            result.unwrap(),
+            DpopTaskWaitOutcome::InputRequired(_)
+        ));
         peer.no_extra(5);
         assert!(cx.checkpoint().is_ok());
     });

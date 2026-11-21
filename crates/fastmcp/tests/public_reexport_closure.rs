@@ -41,11 +41,11 @@
 // `fastmcp_core` or `fastmcp_protocol`, which is the entire point.
 use std::time::Duration;
 
+use fastmcp_rust::ProcessGenerationGuard;
 use fastmcp_rust::http_auth::dpop::{DpopClientError, DpopError, DpopKey, DpopSession};
 use fastmcp_rust::http_auth::sampling::{SamplingRunLimits, SamplingToolLoopLimits};
 use fastmcp_rust::http_auth::{CanonicalHttpUrl, PartitionAuthorization};
 use fastmcp_rust::partition::{CredentialStoreKey, DurableOwnerKey, PartitionDescriptor};
-use fastmcp_rust::ProcessGenerationGuard;
 
 #[test]
 fn facade_builders_expose_mrtr_retention_capacity() {
@@ -197,8 +197,13 @@ fn facade_names_the_partition_types_its_credential_store_api_demands() {
     // `require_admission_field`. Without this, a `derive` that accepted
     // anything would satisfy both positives above (RH-5).
     assert!(
-        CredentialStoreKey::derive(&descriptor, "", "credential-class-refresh", "token-instance-1")
-            .is_err(),
+        CredentialStoreKey::derive(
+            &descriptor,
+            "",
+            "credential-class-refresh",
+            "token-instance-1"
+        )
+        .is_err(),
         "an empty admission field must be refused, so the positives are not vacuous"
     );
 
@@ -472,9 +477,7 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
             .progress(&request_id, &progress_params)
             .await
             .unwrap();
-        effects
-            .cancelled(&cx, &request_id, &cancel_params)
-            .unwrap();
+        effects.cancelled(&cx, &request_id, &cancel_params).unwrap();
         assert_eq!(effects.progress_seen, 1);
         assert_eq!(effects.cancels_seen, 1);
         assert!((effects.last_progress - 0.5).abs() < f64::EPSILON);
@@ -525,7 +528,11 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
             Some(McpAppsCapabilityMarker {})
         );
         assert!(
-            configuration.initialize_result().host_capabilities.logging.is_none(),
+            configuration
+                .initialize_result()
+                .host_capabilities
+                .logging
+                .is_none(),
             "delegation must not mutate the source configuration"
         );
         let delegated_value = serde_json::to_value(&delegated).unwrap();
@@ -554,7 +561,11 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
             "tampered protocolVersion must be rejected by wire response validation"
         );
         assert!(
-            configuration.initialize_result().host_capabilities.logging.is_none(),
+            configuration
+                .initialize_result()
+                .host_capabilities
+                .logging
+                .is_none(),
             "rejected delegation must leave the source configuration unchanged"
         );
     });
@@ -733,7 +744,10 @@ fn facade_names_the_task_claims_a_custom_store_must_return() {
     let _shapes: (
         fn(&FinalTaskSnapshot, &str) -> McpResult<Option<FinalTaskAcceptedInputClaim>>,
         fn(&FinalTaskSnapshot, &str) -> McpResult<Option<FinalTaskInitialWorkClaim>>,
-    ) = (input_handoff_override_shape, initial_work_handoff_override_shape);
+    ) = (
+        input_handoff_override_shape,
+        initial_work_handoff_override_shape,
+    );
 
     // What CAN execute here is the published constructor of the descriptor both
     // claims carry, so this leg is on the same path rather than filler.

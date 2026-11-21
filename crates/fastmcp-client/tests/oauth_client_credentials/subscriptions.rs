@@ -107,7 +107,7 @@ fn catalog_notice(subscription: i64) -> String {
 fn resource_notice(subscription: i64, uri: &str) -> String {
     json!({"jsonrpc":"2.0", "method":"notifications/resources/updated",
         "params":{"uri":uri,"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):subscription}}})
-        .to_string()
+    .to_string()
 }
 async fn stream(
     peer: &Peer,

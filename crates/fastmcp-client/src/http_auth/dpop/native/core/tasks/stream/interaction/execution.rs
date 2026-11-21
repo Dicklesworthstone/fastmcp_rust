@@ -68,13 +68,19 @@ impl std::error::Error for DpopTaskHostedExecutionError {
 }
 
 impl From<DpopTaskHostError> for DpopTaskHostedExecutionError {
-    fn from(error: DpopTaskHostError) -> Self { Self::Conversation(error) }
+    fn from(error: DpopTaskHostError) -> Self {
+        Self::Conversation(error)
+    }
 }
 impl From<DpopTaskWatchError> for DpopTaskHostedExecutionError {
-    fn from(error: DpopTaskWatchError) -> Self { Self::Watch(error) }
+    fn from(error: DpopTaskWatchError) -> Self {
+        Self::Watch(error)
+    }
 }
 impl From<DpopHttpError> for DpopTaskHostedExecutionError {
-    fn from(error: DpopHttpError) -> Self { Self::Conversation(error.into()) }
+    fn from(error: DpopHttpError) -> Self {
+        Self::Conversation(error.into())
+    }
 }
 
 fn admit_initial(
@@ -96,7 +102,9 @@ fn admit_initial(
         for suffix in ["discover", "tool"] {
             let next = RequestId::String(format!("{prefix}:{ordinal}:{suffix}"));
             if ids.iter().any(|id| id.correlates_with(&next)) {
-                return Err(DpopTaskHostError::from(ManagedInteractionError::RepeatedRequestId).into());
+                return Err(
+                    DpopTaskHostError::from(ManagedInteractionError::RepeatedRequestId).into(),
+                );
             }
         }
     }
@@ -175,14 +183,34 @@ impl DpopHttpClient {
             return Err(DpopHttpError::Cancelled.into());
         }
         admit_initial(&operation, id_prefix, limits, task_policy)?;
-        let timeout = self.policy.timeout.min(limits.stream.core.timeout()).min(task_policy.timeout());
+        let timeout = self
+            .policy
+            .timeout
+            .min(limits.stream.core.timeout())
+            .min(task_policy.timeout());
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
-        let completed = self.execute_task_conversation_with_bounds(
-            cx, cancellation, credential, metadata.clone(), operation, id_prefix,
-            limits, bounds, host, notify,
-        ).await?;
-        check_live(cx, cancellation, &self.session, credential, completed.bounds)?;
+        let completed = self
+            .execute_task_conversation_with_bounds(
+                cx,
+                cancellation,
+                credential,
+                metadata.clone(),
+                operation,
+                id_prefix,
+                limits,
+                bounds,
+                host,
+                notify,
+            )
+            .await?;
+        check_live(
+            cx,
+            cancellation,
+            &self.session,
+            credential,
+            completed.bounds,
+        )?;
         let task = match completed.result.result.as_ref() {
             FinalCoreResult::ToolsCall { .. } => {
                 return Ok(DpopTaskHostedExecutionOutcome::Initial(completed.result));
@@ -192,14 +220,27 @@ impl DpopHttpClient {
         };
         // Never enter a public watcher here: that would forget conversation
         // charges and its host deadline at the point remote work first exists.
-        let outcome = self.drive_created_task_with_subscription(
-            cx, cancellation, credential, metadata, task, id_prefix, task_policy,
-            limits.stream, completed.bounds, completed.usage, task_resolve, observe,
-        ).await?;
+        let outcome = self
+            .drive_created_task_with_subscription(
+                cx,
+                cancellation,
+                credential,
+                metadata,
+                task,
+                id_prefix,
+                task_policy,
+                limits.stream,
+                completed.bounds,
+                completed.usage,
+                task_resolve,
+                observe,
+            )
+            .await?;
         match outcome {
             None => Ok(DpopTaskHostedExecutionOutcome::Initial(completed.result)),
             Some(outcome) => Ok(DpopTaskHostedExecutionOutcome::Observed {
-                initial: completed.result, outcome,
+                initial: completed.result,
+                outcome,
             }),
         }
     }
@@ -215,36 +256,67 @@ mod tests {
     }
 
     fn operation(first: RequestId, second: RequestId) -> DpopTaskOperation {
-        DpopTaskOperation::new(first, second, ManagedTaskRequest::CallTool {
-            name: "work".to_owned(), arguments: Some(json!({"secret":"body-only"})),
-        }).unwrap()
+        DpopTaskOperation::new(
+            first,
+            second,
+            ManagedTaskRequest::CallTool {
+                name: "work".to_owned(),
+                arguments: Some(json!({"secret":"body-only"})),
+            },
+        )
+        .unwrap()
     }
 
     fn limits() -> DpopTaskHostLimits {
-        DpopTaskHostLimits::new(DpopStreamLimits::default(), CoreInputLimits::default(), 2, 4).unwrap()
+        DpopTaskHostLimits::new(
+            DpopStreamLimits::default(),
+            CoreInputLimits::default(),
+            2,
+            4,
+        )
+        .unwrap()
     }
 
     #[test]
     fn every_future_namespace_is_reserved_before_creation_in_either_initial_slot() {
-        for name in ["run:1:discover", "run:2:tool", "run.0.discover", "run.2.get",
-            "run.input.0.discover", "run.input.1.update", "run.listen", "run.listen.discover"]
-        {
+        for name in [
+            "run:1:discover",
+            "run:2:tool",
+            "run.0.discover",
+            "run.2.get",
+            "run.input.0.discover",
+            "run.input.1.update",
+            "run.listen",
+            "run.listen.discover",
+        ] {
             for first in [false, true] {
                 let collision = RequestId::String(name.to_owned());
-                let initial = if first { operation(collision, RequestId::Number(9)) }
-                    else { operation(RequestId::Number(9), collision) };
+                let initial = if first {
+                    operation(collision, RequestId::Number(9))
+                } else {
+                    operation(RequestId::Number(9), collision)
+                };
                 let before = (initial.discovery_id.clone(), initial.operation_id.clone());
                 assert!(admit_initial(&initial, "run", &limits(), policy()).is_err());
-                assert_eq!((initial.discovery_id.clone(), initial.operation_id.clone()), before);
+                assert_eq!(
+                    (initial.discovery_id.clone(), initial.operation_id.clone()),
+                    before
+                );
             }
         }
     }
 
     #[test]
     fn valid_nearby_ids_and_prefix_boundaries_do_not_gain_false_collisions() {
-        for name in ["run:0:tool", "run:3:tool", "run.3.get", "run.input.2.update",
-            "run.listen.other", "run.0.tool", "other.0.get"]
-        {
+        for name in [
+            "run:0:tool",
+            "run:3:tool",
+            "run.3.get",
+            "run.input.2.update",
+            "run.listen.other",
+            "run.0.tool",
+            "other.0.get",
+        ] {
             let initial = operation(RequestId::String(name.to_owned()), RequestId::Number(9));
             admit_initial(&initial, "run", &limits(), policy()).unwrap();
         }
@@ -252,23 +324,49 @@ mod tests {
         for prefix in ["a".to_owned(), "_.-".to_owned(), "z".repeat(128)] {
             admit_initial(&initial, &prefix, &limits(), policy()).unwrap();
         }
-        for prefix in [String::new(), "a:b".to_owned(), "a/b".to_owned(), "雪".to_owned(), "z".repeat(129)] {
-            assert!(matches!(admit_initial(&initial, &prefix, &limits(), policy()),
-                Err(DpopTaskHostedExecutionError::Conversation(DpopTaskHostError::InvalidIdPrefix))));
+        for prefix in [
+            String::new(),
+            "a:b".to_owned(),
+            "a/b".to_owned(),
+            "雪".to_owned(),
+            "z".repeat(129),
+        ] {
+            assert!(matches!(
+                admit_initial(&initial, &prefix, &limits(), policy()),
+                Err(DpopTaskHostedExecutionError::Conversation(
+                    DpopTaskHostError::InvalidIdPrefix
+                ))
+            ));
         }
     }
 
     #[test]
     fn existing_task_operations_cannot_be_reinterpreted_as_creating_conversations() {
         let id = fastmcp_protocol::tasks_extension::TaskId::parse("task-one").unwrap();
-        for request in [ManagedTaskRequest::Get(id.clone()), ManagedTaskRequest::Cancel(id)] {
-            let initial = DpopTaskOperation::new(RequestId::Number(1), RequestId::Number(2), request).unwrap();
-            assert!(matches!(admit_initial(&initial, "run", &limits(), policy()),
-                Err(DpopTaskHostedExecutionError::Conversation(DpopTaskHostError::Interaction(
-                    ManagedInteractionError::InvalidInitialRequest)))));
+        for request in [
+            ManagedTaskRequest::Get(id.clone()),
+            ManagedTaskRequest::Cancel(id),
+        ] {
+            let initial =
+                DpopTaskOperation::new(RequestId::Number(1), RequestId::Number(2), request)
+                    .unwrap();
+            assert!(matches!(
+                admit_initial(&initial, "run", &limits(), policy()),
+                Err(DpopTaskHostedExecutionError::Conversation(
+                    DpopTaskHostError::Interaction(ManagedInteractionError::InvalidInitialRequest)
+                ))
+            ));
         }
-        let error = admit_initial(&operation(RequestId::String("run.2.get".to_owned()), RequestId::Number(9)),
-            "run", &limits(), policy()).unwrap_err();
+        let error = admit_initial(
+            &operation(
+                RequestId::String("run.2.get".to_owned()),
+                RequestId::Number(9),
+            ),
+            "run",
+            &limits(),
+            policy(),
+        )
+        .unwrap_err();
         assert!(!format!("{error:?} {error}").contains("run.2.get"));
         assert!(!format!("{error:?} {error}").contains("body-only"));
     }

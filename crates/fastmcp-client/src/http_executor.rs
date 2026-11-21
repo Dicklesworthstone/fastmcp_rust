@@ -306,16 +306,14 @@ pub const MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES: usize = 9 * 1024 * 1024;
 /// Catalog, resource, and Tasks notifications share this aggregate bound.
 /// Incremental reads through [`ModernHttpSubscriptionListener::next_event`]
 /// do not accumulate a collection and are not subject to this lifetime limit.
-pub const MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS: usize =
-    MAX_PENDING_MODERN_HTTP_SSE_EVENTS;
+pub const MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS: usize = MAX_PENDING_MODERN_HTTP_SSE_EVENTS;
 
 /// Maximum admitted JSON payload bytes retained by one HTTP subscription collector.
 ///
 /// This counts the original UTF-8 payload of every retained catalog, resource,
 /// and Tasks notification, including metadata. It is separate from the per-event
 /// [`SseLimits`] and uses LIMIT-01's guarded stream-queue byte bound.
-pub const MAX_COLLECTED_HTTP_SUBSCRIPTION_BYTES: usize =
-    MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES;
+pub const MAX_COLLECTED_HTTP_SUBSCRIPTION_BYTES: usize = MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES;
 
 /// Maximum retained bytes in one legacy SSE event, including its field names
 /// (LIMIT-01 guarded default: 9 MiB).
@@ -3447,7 +3445,10 @@ impl fmt::Display for ModernHttpFinalCoreListenError {
                 write!(formatter, "invalid final core terminal result: {error}")
             }
             Self::ExtensionAdmission(error) => {
-                write!(formatter, "invalid final extension terminal result: {error}")
+                write!(
+                    formatter,
+                    "invalid final extension terminal result: {error}"
+                )
             }
             Self::TasksResultRequiresNegotiatedListener => formatter
                 .write_str("final core listener received a Tasks result without Tasks negotiation"),
@@ -4565,7 +4566,8 @@ fn validate_http_subscription_notification_filter(
 
 /// Errors raised before or while executing one modern POST.
 #[derive(Debug)]
-pub enum ModernHttpExecutorError {    /// Request metadata cannot safely become an HTTP header value.
+pub enum ModernHttpExecutorError {
+    /// Request metadata cannot safely become an HTTP header value.
     InvalidRequestMetadata,
     /// Caller cancellation was observed before dispatching the POST.
     Cancelled,
@@ -4640,7 +4642,10 @@ impl fmt::Display for ModernHttpExecutorError {
             }
             Self::Cancelled => formatter.write_str("modern MCP request was cancelled"),
             Self::CapabilityDenied { capability } => {
-                write!(formatter, "modern MCP request requires {capability} capability")
+                write!(
+                    formatter,
+                    "modern MCP request requires {capability} capability"
+                )
             }
             Self::CredentialUnavailable => {
                 formatter.write_str("modern MCP bearer credential is unavailable")
@@ -7658,7 +7663,7 @@ impl ClientHttpConnection {
         }
     }
 
-/// Sends one client notification through the selected transport.
+    /// Sends one client notification through the selected transport.
     ///
     /// Exact legacy notifications are posted to the pinned message endpoint
     /// without an ID. Modern notifications require the explicit
@@ -7699,17 +7704,18 @@ impl ClientHttpConnection {
                     reject_final_only_legacy_request_metadata(parameters)?;
                 }
                 if let Some(receiver) = persistent_receiver {
-                    let message = JsonRpcMessage::Request(JsonRpcRequest::notification(
-                        method,
-                        parameters,
-                    ));
+                    let message =
+                        JsonRpcMessage::Request(JsonRpcRequest::notification(method, parameters));
                     return receiver.outbound.send(cx, &message).await.map_err(|error| {
                         let state = receiver
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if state.stopped
-                            && matches!(error.error, LegacySseHttpClientError::StreamGenerationEnded)
+                            && matches!(
+                                error.error,
+                                LegacySseHttpClientError::StreamGenerationEnded
+                            )
                         {
                             state.stopped_error()
                         } else {
@@ -7905,7 +7911,8 @@ fn reject_final_only_legacy_request_metadata(
 
 /// Errors raised while connecting or issuing a policy-bound modern HTTP request.
 #[derive(Debug)]
-pub enum ModernHttpClientError {    /// A public constructor selected a protocol policy compiled out of this client.
+pub enum ModernHttpClientError {
+    /// A public constructor selected a protocol policy compiled out of this client.
     FeatureUnavailable(McpError),
     /// Reviewed parameter headers could not be projected onto this exact
     /// request, so nothing was sent.
@@ -9022,10 +9029,8 @@ impl ModernHttpClient {
     ) -> Result<RequestTimeoutPolicy, ModernHttpFinalCoreListenError> {
         let bounded = RequestTimeoutPolicy::new(policy.idle_timeout(), policy.absolute_timeout())
             .map_err(|_| {
-                ModernHttpFinalCoreListenError::Executor(
-                    ModernHttpExecutorError::InvalidTimeoutPolicy,
-                )
-            })?;
+            ModernHttpFinalCoreListenError::Executor(ModernHttpExecutorError::InvalidTimeoutPolicy)
+        })?;
         RequestTimeoutPolicy::new(
             bounded
                 .idle_timeout()
@@ -9771,9 +9776,9 @@ impl ModernHttpClient {
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
             ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed)
         })?;
-        let prepared_parameters = wire_request
-            .params
-            .ok_or(ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed))?;
+        let prepared_parameters = wire_request.params.ok_or(ModernHttpMrtrError::Request(
+            ModernHttpClientError::RequestEncodingFailed,
+        ))?;
         let core_request =
             CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&prepared_parameters))
                 .map_err(|error| {
@@ -10723,7 +10728,8 @@ impl Drop for LegacyPendingPost<'_> {
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
-enum LegacyPersistentResponse {    Response(JsonRpcResponse),
+enum LegacyPersistentResponse {
+    Response(JsonRpcResponse),
     IdMismatch { actual: RequestId },
     Cancelled,
     Deadline(ModernHttpExecutorError),
@@ -10942,7 +10948,9 @@ impl LegacySsePersistentState {
     fn stop(&mut self, effects: &mut LegacySseDeferredEffects) {
         self.post_gate.invalidate();
         self.stopped = true;
-        effects.retired_waiters.extend(self.pending.drain().map(|(_, waiter)| waiter));
+        effects
+            .retired_waiters
+            .extend(self.pending.drain().map(|(_, waiter)| waiter));
         effects.stopped_gates.push(Arc::clone(&self.post_gate));
         self.cancelled_response_ids.clear();
         self.notifications.clear();
@@ -11431,193 +11439,193 @@ impl LegacySsePersistentReceiver {
             };
             let mut owner_cancelled = std::pin::pin!(owner_cx.cancelled());
             loop {
-                    if child_cx.checkpoint().is_err() || owner_cx.checkpoint().is_err() {
+                if child_cx.checkpoint().is_err() || owner_cx.checkpoint().is_err() {
+                    stop_legacy_persistent_state(
+                        &task_state,
+                        Some(LegacySseHttpClientError::Cancelled),
+                    );
+                    break;
+                }
+                if let Err(error) = task_reverse_callbacks.reap_finished_tasks() {
+                    stop_legacy_persistent_state(
+                        &task_state,
+                        Some(LegacySseHttpClientError::ReverseCallbackFailed(error)),
+                    );
+                    break;
+                }
+                if task_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .stopped
+                {
+                    break;
+                }
+                let received = {
+                    let mut receive =
+                        std::pin::pin!(next_legacy_sse_message(&mut reader, &child_cx));
+                    poll_fn(|task_cx| {
+                        if owner_cancelled.as_mut().poll(task_cx).is_ready()
+                            || owner_cx.checkpoint().is_err()
+                        {
+                            return Poll::Ready(Err(LegacySseHttpClientError::Cancelled));
+                        }
+                        let result = receive.as_mut().poll(task_cx);
+                        if owner_cx.checkpoint().is_err() {
+                            return Poll::Ready(Err(LegacySseHttpClientError::Cancelled));
+                        }
+                        result
+                    })
+                    .await
+                };
+                let message = match received {
+                    Ok(Some(message)) => message,
+                    Ok(None) => {
                         stop_legacy_persistent_state(
                             &task_state,
-                            Some(LegacySseHttpClientError::Cancelled),
+                            Some(LegacySseHttpClientError::StreamGenerationEnded),
                         );
                         break;
                     }
-                    if let Err(error) = task_reverse_callbacks.reap_finished_tasks() {
-                        stop_legacy_persistent_state(
-                            &task_state,
-                            Some(LegacySseHttpClientError::ReverseCallbackFailed(error)),
-                        );
+                    Err(error) => {
+                        stop_legacy_persistent_state(&task_state, Some(error));
                         break;
                     }
-                    if task_state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .stopped
-                    {
-                        break;
+                };
+                match message {
+                    JsonRpcMessage::Request(notification) if notification.is_notification() => {
+                        if let Some(request_id) = legacy_cancelled_request_id(&notification) {
+                            // Callback cancellation can wake application code. It must
+                            // not run while the receiver-state mutex is held.
+                            if task_reverse_callbacks.cancel(&request_id) {
+                                continue;
+                            }
+                            match cancel_legacy_persistent_request(
+                                &task_state,
+                                &child_cx,
+                                request_id,
+                            ) {
+                                Ok(true) => continue,
+                                Ok(false) => {}
+                                Err(_) => break,
+                            }
+                        }
+                        let mut effects = LegacySseDeferredEffects::default();
+                        let mut state = task_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if state.notifications.len() >= MAX_QUEUED_LEGACY_NOTIFICATIONS {
+                            state.stop(&mut effects);
+                            break;
+                        }
+                        if notification.method == NOTIFICATIONS_PROGRESS
+                            && let Some(parameters) = notification.params.as_ref()
+                            && let Some(progress) =
+                                crate::parse_valid_client_progress(parameters, None)
+                        {
+                            for waiter in state.pending.values() {
+                                waiter
+                                    .deadline
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .observe_progress(&progress);
+                            }
+                        }
+                        state.notifications.push_back(notification);
                     }
-                    let received = {
-                        let mut receive =
-                            std::pin::pin!(next_legacy_sse_message(&mut reader, &child_cx));
-                        poll_fn(|task_cx| {
-                            if owner_cancelled.as_mut().poll(task_cx).is_ready()
-                                || owner_cx.checkpoint().is_err()
-                            {
-                                return Poll::Ready(Err(LegacySseHttpClientError::Cancelled));
-                            }
-                            let result = receive.as_mut().poll(task_cx);
-                            if owner_cx.checkpoint().is_err() {
-                                return Poll::Ready(Err(LegacySseHttpClientError::Cancelled));
-                            }
-                            result
-                        })
-                        .await
-                    };
-                    let message = match received {
-                        Ok(Some(message)) => message,
-                        Ok(None) => {
+                    JsonRpcMessage::Request(server_request) => {
+                        let Some(dispatch) = legacy_sse_reverse_request_dispatch(
+                            &child_cx,
+                            &client_capabilities,
+                            &reverse_request_handlers,
+                            &task_reverse_callbacks,
+                            task_outbound.clone(),
+                            Arc::clone(&task_state),
+                            &server_request,
+                        ) else {
+                            stop_legacy_persistent_state(&task_state, None);
+                            break;
+                        };
+                        if let LegacySseReverseRequestDispatch::Immediate(response) = dispatch
+                            && let Err(error) = task_reverse_callbacks.send_immediate(
+                                &child_cx,
+                                task_outbound.clone(),
+                                Arc::clone(&task_state),
+                                response,
+                            )
+                        {
                             stop_legacy_persistent_state(
                                 &task_state,
-                                Some(LegacySseHttpClientError::StreamGenerationEnded),
+                                Some(LegacySseHttpClientError::ReverseCallbackFailed(error)),
                             );
+                            task_reverse_callbacks.close();
                             break;
                         }
-                        Err(error) => {
-                            stop_legacy_persistent_state(&task_state, Some(error));
+                    }
+                    JsonRpcMessage::Response(response) => {
+                        let Some(response_id) = response.id.clone() else {
+                            stop_legacy_persistent_state(&task_state, None);
                             break;
-                        }
-                    };
-                    match message {
-                        JsonRpcMessage::Request(notification) if notification.is_notification() => {
-                            if let Some(request_id) = legacy_cancelled_request_id(&notification) {
-                                // Callback cancellation can wake application code. It must
-                                // not run while the receiver-state mutex is held.
-                                if task_reverse_callbacks.cancel(&request_id) {
-                                    continue;
-                                }
-                                match cancel_legacy_persistent_request(
-                                    &task_state,
-                                    &child_cx,
-                                    request_id,
-                                ) {
-                                    Ok(true) => continue,
-                                    Ok(false) => {}
-                                    Err(_) => break,
-                                }
-                            }
-                            let mut effects = LegacySseDeferredEffects::default();
+                        };
+                        let Ok(key) = response_id.correlation_key() else {
+                            stop_legacy_persistent_state(&task_state, None);
+                            break;
+                        };
+                        let mut effects = LegacySseDeferredEffects::default();
+                        let routed = {
                             let mut state = task_state
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if state.notifications.len() >= MAX_QUEUED_LEGACY_NOTIFICATIONS {
-                                state.stop(&mut effects);
-                                break;
-                            }
-                            if notification.method == NOTIFICATIONS_PROGRESS
-                                && let Some(parameters) = notification.params.as_ref()
-                                && let Some(progress) =
-                                    crate::parse_valid_client_progress(parameters, None)
+                            if let Some(position) = state
+                                .cancelled_response_ids
+                                .iter()
+                                .position(|cancelled| cancelled.correlates_with(&response_id))
                             {
-                                for waiter in state.pending.values() {
-                                    waiter
-                                        .deadline
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .observe_progress(&progress);
-                                }
+                                state.cancelled_response_ids.remove(position);
+                                continue;
                             }
-                            state.notifications.push_back(notification);
-                        }
-                        JsonRpcMessage::Request(server_request) => {
-                            let Some(dispatch) = legacy_sse_reverse_request_dispatch(
-                                &child_cx,
-                                &client_capabilities,
-                                &reverse_request_handlers,
-                                &task_reverse_callbacks,
-                                task_outbound.clone(),
-                                Arc::clone(&task_state),
-                                &server_request,
-                            ) else {
-                                stop_legacy_persistent_state(&task_state, None);
-                                break;
-                            };
-                            if let LegacySseReverseRequestDispatch::Immediate(response) = dispatch
-                                && let Err(error) = task_reverse_callbacks.send_immediate(
-                                    &child_cx,
-                                    task_outbound.clone(),
-                                    Arc::clone(&task_state),
-                                    response,
-                                )
-                            {
-                                stop_legacy_persistent_state(
-                                    &task_state,
-                                    Some(LegacySseHttpClientError::ReverseCallbackFailed(error)),
-                                );
-                                task_reverse_callbacks.close();
-                                break;
-                            }
-                        }
-                        JsonRpcMessage::Response(response) => {
-                            let Some(response_id) = response.id.clone() else {
-                                stop_legacy_persistent_state(&task_state, None);
-                                break;
-                            };
-                            let Ok(key) = response_id.correlation_key() else {
-                                stop_legacy_persistent_state(&task_state, None);
-                                break;
-                            };
-                            let mut effects = LegacySseDeferredEffects::default();
-                            let routed = {
-                                let mut state = task_state
+                            if let Some(waiter) = state.pending.remove(&key) {
+                                state.pending_changed(&mut effects);
+                                let deadline = waiter
+                                    .deadline
                                     .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if let Some(position) = state
-                                    .cancelled_response_ids
-                                    .iter()
-                                    .position(|cancelled| cancelled.correlates_with(&response_id))
-                                {
-                                    state.cancelled_response_ids.remove(position);
-                                    continue;
-                                }
-                                if let Some(waiter) = state.pending.remove(&key) {
-                                    state.pending_changed(&mut effects);
-                                    let deadline = waiter
-                                        .deadline
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .response
-                                        .check();
-                                    let response = match deadline {
-                                        Ok(()) => LegacyPersistentResponse::Response(response),
-                                        Err(error) => LegacyPersistentResponse::Deadline(error),
-                                    };
-                                    Some((waiter, response))
-                                } else if state.pending.len() == 1 {
-                                    let waiter = state
-                                        .pending
-                                        .drain()
-                                        .next()
-                                        .map(|(_, waiter)| waiter)
-                                        .expect("sole pending legacy waiter must exist");
-                                    state.stop(&mut effects);
-                                    Some((
-                                        waiter,
-                                        LegacyPersistentResponse::IdMismatch {
-                                            actual: response_id,
-                                        },
-                                    ))
-                                } else {
-                                    state.stop(&mut effects);
-                                    None
-                                }
-                            };
-                            let Some((waiter, response)) = routed else {
-                                break;
-                            };
-                            let _ = waiter.sender.send(&child_cx, response);
-                            drop(effects);
-                        }
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .response
+                                    .check();
+                                let response = match deadline {
+                                    Ok(()) => LegacyPersistentResponse::Response(response),
+                                    Err(error) => LegacyPersistentResponse::Deadline(error),
+                                };
+                                Some((waiter, response))
+                            } else if state.pending.len() == 1 {
+                                let waiter = state
+                                    .pending
+                                    .drain()
+                                    .next()
+                                    .map(|(_, waiter)| waiter)
+                                    .expect("sole pending legacy waiter must exist");
+                                state.stop(&mut effects);
+                                Some((
+                                    waiter,
+                                    LegacyPersistentResponse::IdMismatch {
+                                        actual: response_id,
+                                    },
+                                ))
+                            } else {
+                                state.stop(&mut effects);
+                                None
+                            }
+                        };
+                        let Some((waiter, response)) = routed else {
+                            break;
+                        };
+                        let _ = waiter.sender.send(&child_cx, response);
+                        drop(effects);
                     }
                 }
-                stop_legacy_persistent_state(&task_state, None);
-                task_reverse_callbacks.close();
-            }) {
+            }
+            stop_legacy_persistent_state(&task_state, None);
+            task_reverse_callbacks.close();
+        }) {
             Ok(task) => task,
             Err(error) => {
                 if let Some(mut reader) = shared_reader
@@ -11704,15 +11712,13 @@ impl LegacySsePersistentReceiver {
             if state.pending.is_empty() {
                 state.pending_since = Some(self.clock_cx.now());
             }
-            state
-                .pending
-                .insert(
-                    key.clone(),
-                    LegacyPersistentResponseWaiter {
-                        sender,
-                        deadline: Arc::clone(&deadline),
-                    },
-                );
+            state.pending.insert(
+                key.clone(),
+                LegacyPersistentResponseWaiter {
+                    sender,
+                    deadline: Arc::clone(&deadline),
+                },
+            );
             state.pending_changed(&mut effects);
         }
         let mut pending_post = LegacyPendingPost {
@@ -11761,12 +11767,7 @@ impl LegacySsePersistentReceiver {
                     );
                 }
                 if request_may_have_reached_peer {
-                    retire_abandoned_persistent_waiter(
-                        &mut state,
-                        &key,
-                        request_id,
-                        &mut effects,
-                    )?;
+                    retire_abandoned_persistent_waiter(&mut state, &key, request_id, &mut effects)?;
                 } else {
                     if let Some(waiter) = state.pending.remove(&key) {
                         effects.retired_waiters.push(waiter);
@@ -12508,7 +12509,8 @@ async fn next_legacy_sse_message(
 
 /// Errors emitted by the exact legacy SSE GET plus advertised POST client.
 #[derive(Debug)]
-pub enum LegacySseHttpClientError {    /// The immutable plan omitted its legacy SSE GET target.
+pub enum LegacySseHttpClientError {
+    /// The immutable plan omitted its legacy SSE GET target.
     MissingSseTarget,
     /// The immutable plan omitted its legacy message POST target.
     MissingMessagePostTarget,
@@ -15196,12 +15198,15 @@ mod tests {
             };
             match state.try_lock() {
                 Ok(state) => {
-                    self.observations.pending.store(state.pending.len(), Ordering::SeqCst);
-                    self.observations.tombstones.store(
-                        state.cancelled_response_ids.len(),
-                        Ordering::SeqCst,
-                    );
-                    self.observations.stopped.store(usize::from(state.stopped), Ordering::SeqCst);
+                    self.observations
+                        .pending
+                        .store(state.pending.len(), Ordering::SeqCst);
+                    self.observations
+                        .tombstones
+                        .store(state.cancelled_response_ids.len(), Ordering::SeqCst);
+                    self.observations
+                        .stopped
+                        .store(usize::from(state.stopped), Ordering::SeqCst);
                 }
                 Err(_) => {
                     self.observations.locked.fetch_add(1, Ordering::SeqCst);
@@ -15248,7 +15253,9 @@ mod tests {
         let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
         let (waker, observations) = legacy_receiver_reentrant_waker(&state);
         assert!(super::register_legacy_reader_waker(
-            &state, Some((0, None, false)), &waker,
+            &state,
+            Some((0, None, false)),
+            &waker,
         ));
         drop(waker);
         let (sender, _receiver) = oneshot::channel();
@@ -15278,7 +15285,9 @@ mod tests {
             let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
             let (first, first_observations) = legacy_receiver_reentrant_waker(&state);
             assert!(super::register_legacy_reader_waker(
-                &state, Some((0, None, false)), &first,
+                &state,
+                Some((0, None, false)),
+                &first,
             ));
             drop(first);
             let (replacement, _) = legacy_receiver_reentrant_waker(&state);
@@ -15288,9 +15297,7 @@ mod tests {
                 state.lock().unwrap().stopped = true;
             }
             assert_eq!(
-                super::register_legacy_reader_waker(
-                    &state, Some((0, None, false)), &replacement,
-                ),
+                super::register_legacy_reader_waker(&state, Some((0, None, false)), &replacement,),
                 !change_activity,
             );
             assert_eq!(
@@ -15313,15 +15320,25 @@ mod tests {
             let request_id = RequestId::Number(52);
             let key = request_id.correlation_key().unwrap();
             let (sender, mut receiver) = oneshot::channel();
-            state.lock().unwrap().pending.insert(
-                key.clone(), legacy_test_response_waiter(sender),
-            );
+            state
+                .lock()
+                .unwrap()
+                .pending
+                .insert(key.clone(), legacy_test_response_waiter(sender));
             let cx = Cx::for_request();
             let (waker, observations) = legacy_receiver_reentrant_waker(&state);
             let mut receive = std::pin::pin!(receiver.recv(&cx));
-            assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            assert!(
+                receive
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
             drop(super::LegacyPendingPost {
-                state: &state, key: &key, request_id: &request_id, armed,
+                state: &state,
+                key: &key,
+                request_id: &request_id,
+                armed,
             });
             assert_eq!(observations.locked.load(Ordering::SeqCst), 0);
             if armed {
@@ -15334,7 +15351,12 @@ mod tests {
                 ));
             } else {
                 assert_eq!(observations.wakes.load(Ordering::SeqCst), 0);
-                assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                assert!(
+                    receive
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
                 assert_eq!(state.lock().unwrap().pending.len(), 1);
                 assert!(state.lock().unwrap().cancelled_response_ids.is_empty());
             }
@@ -15353,16 +15375,24 @@ mod tests {
         );
         let (reader, reader_observations) = legacy_receiver_reentrant_waker(&state);
         assert!(super::register_legacy_reader_waker(
-            &state, Some((1, None, false)), &reader,
+            &state,
+            Some((1, None, false)),
+            &reader,
         ));
         drop(reader);
         let cx = Cx::for_request();
         let (waker, observations) = legacy_receiver_reentrant_waker(&state);
         let mut receive = std::pin::pin!(receiver.recv(&cx));
-        assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            receive
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
 
         super::stop_legacy_persistent_state(
-            &state, Some(LegacySseHttpClientError::MessageDecodeFailed),
+            &state,
+            Some(LegacySseHttpClientError::MessageDecodeFailed),
         );
 
         for observed in [&observations, &reader_observations] {
@@ -15388,7 +15418,8 @@ mod tests {
             {
                 let mut state = state.lock().unwrap();
                 state.pending.insert(
-                    request_id.correlation_key().unwrap(), legacy_test_response_waiter(sender),
+                    request_id.correlation_key().unwrap(),
+                    legacy_test_response_waiter(sender),
                 );
                 if full {
                     state.cancelled_response_ids = (0..MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS)
@@ -15399,26 +15430,43 @@ mod tests {
             let cx = Cx::for_request();
             let (waker, observations) = legacy_receiver_reentrant_waker(&state);
             let mut receive = std::pin::pin!(receiver.recv(&cx));
-            assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            assert!(
+                receive
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
             let result = super::cancel_legacy_persistent_request(
-                &state, &cx,
-                if matching { request_id.clone() } else { RequestId::Number(1_000_001) },
+                &state,
+                &cx,
+                if matching {
+                    request_id.clone()
+                } else {
+                    RequestId::Number(1_000_001)
+                },
             );
             assert_eq!(observations.locked.load(Ordering::SeqCst), 0);
             if !matching {
                 assert!(matches!(result, Ok(false)));
                 assert_eq!(observations.wakes.load(Ordering::SeqCst), 0);
-                assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                assert!(
+                    receive
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
                 assert_eq!(state.lock().unwrap().pending.len(), 1);
                 assert!(state.lock().unwrap().cancelled_response_ids.is_empty());
             } else if full {
-                assert!(matches!(result, Err(
-                    ClientHttpConnectionError::LegacyCancelledResponseQueueFull,
-                )));
+                assert!(matches!(
+                    result,
+                    Err(ClientHttpConnectionError::LegacyCancelledResponseQueueFull,)
+                ));
                 assert!(observations.wakes.load(Ordering::SeqCst) > 0);
                 assert_eq!(observations.stopped.load(Ordering::SeqCst), 1);
                 assert!(matches!(
-                    receive.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(Err(_)),
+                    receive.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Err(_)),
                 ));
                 assert!(state.lock().unwrap().cancelled_response_ids.is_empty());
             } else {
@@ -15712,7 +15760,8 @@ mod tests {
                         "event: endpoint\ndata: {advertised}\n\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\n"
                     ),
                 );
-                let Some(mut post) = accept_legacy_test_peer(&listener, &stopped, deadline).unwrap()
+                let Some(mut post) =
+                    accept_legacy_test_peer(&listener, &stopped, deadline).unwrap()
                 else {
                     return;
                 };
@@ -15767,7 +15816,11 @@ mod tests {
                 panic!("fixture opened exact legacy SSE");
             };
             assert!(connection.persistent_receiver.is_none());
-            let stream = connection.client.stream.as_ref().expect("reader was not taken");
+            let stream = connection
+                .client
+                .stream
+                .as_ref()
+                .expect("reader was not taken");
             assert!(stream.response.is_some(), "live generation was not closed");
             assert_eq!(stream.awaiting_responses, 0);
         }
@@ -18456,7 +18509,9 @@ mod tests {
                     *count += 1;
                     false
                 }
-                ModernHttpSubscriptionListenEvent::Terminal { subscription_id, .. } => {
+                ModernHttpSubscriptionListenEvent::Terminal {
+                    subscription_id, ..
+                } => {
                     assert!(subscription_id.correlates_with(&RequestId::Number(2)));
                     true
                 }
@@ -18547,8 +18602,7 @@ mod tests {
                 Err(error)
                     if matches!(
                         error.kind(),
-                        std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionAborted
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
                     ) => {}
                 other => panic!("subscription did not close its owned stream: {other:?}"),
             }
@@ -18633,7 +18687,10 @@ mod tests {
         } else {
             assert_eq!(result.unwrap(), notification_count);
         }
-        assert!(cx.checkpoint().is_ok(), "collection must not cancel its caller");
+        assert!(
+            cx.checkpoint().is_ok(),
+            "collection must not cancel its caller"
+        );
         server.join().expect("subscription bound peer must join");
     }
 
@@ -19270,8 +19327,7 @@ mod tests {
                 "roots-a":{"method":"roots/list"},
                 "roots-b":{"method":"roots/list"},
             });
-            let retained: crate::FinalTask =
-                serde_json::from_value(initial.clone()).unwrap();
+            let retained: crate::FinalTask = serde_json::from_value(initial.clone()).unwrap();
             let before = serde_json::to_vec(&retained).unwrap();
 
             for case in ["wrong-kind", "expired", "wrong-phase", "foreign-only"] {
@@ -22345,7 +22401,9 @@ mod tests {
             write_response(&mut stream, 200, "text/event-stream", body.as_bytes());
             sent.send(()).expect("report completed event bytes");
 
-            let (mut next, _) = listener.accept().expect("accept independent ordinary request");
+            let (mut next, _) = listener
+                .accept()
+                .expect("accept independent ordinary request");
             let request = read_request(&mut next);
             let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
             assert_eq!(request["id"], 3);
@@ -22426,7 +22484,10 @@ mod tests {
             assert!(client.active_http_subscription_request_id().is_none());
             assert!(!client.cancel_http_subscription(&RequestId::Number(2)));
         }
-        assert!(cx.checkpoint().is_ok(), "listener retirement cannot cancel its caller");
+        assert!(
+            cx.checkpoint().is_ok(),
+            "listener retirement cannot cancel its caller"
+        );
         runtime_block_on(client.request_final_core(&cx, "tools/list", serde_json::json!({})))
             .expect("retiring one subscription preserves independent ordinary requests");
         server.join().expect("subscription ownership peer joins");
@@ -22630,13 +22691,29 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut discovery, _) = listener.accept().expect("accept discovery");
             let _ = read_request(&mut discovery);
-            write_response(&mut discovery, 200, "application/json", modern_discovery_body());
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                modern_discovery_body(),
+            );
             let (mut first, _) = listener.accept().expect("accept first subscription");
             let _ = read_request(&mut first);
             begin_chunked_sse(&mut first);
-            let first_terminal = if cancellation_first { CANCELLED } else { COMPLETE };
+            let first_terminal = if cancellation_first {
+                CANCELLED
+            } else {
+                COMPLETE
+            };
             let late_terminal = if second_terminal {
-                format!("data: {}\n\n", if cancellation_first { COMPLETE } else { CANCELLED })
+                format!(
+                    "data: {}\n\n",
+                    if cancellation_first {
+                        COMPLETE
+                    } else {
+                        CANCELLED
+                    }
+                )
             } else {
                 String::new()
             };
@@ -22657,7 +22734,9 @@ mod tests {
                 b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3},\"notifications\":{\"toolsListChanged\":true}}}\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3}}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3}}}\n\n",
             );
             sent.send(()).expect("report terminal bytes sent");
-            first.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            first
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut byte = [0];
             match first.read(&mut byte) {
                 Ok(0) => {}
@@ -22738,7 +22817,10 @@ mod tests {
             assert!(first.stream.pending_events.is_empty());
             assert!(runtime_block_on(first.next_event(&cx)).unwrap().is_none());
         }
-        assert!(cx.checkpoint().is_ok(), "server cancellation must preserve caller context");
+        assert!(
+            cx.checkpoint().is_ok(),
+            "server cancellation must preserve caller context"
+        );
         let sibling = runtime_block_on(sibling.collect(&cx))
             .expect("the first listener's terminal cannot terminate its sibling");
         assert_eq!(sibling.subscription_id, RequestId::Number(3));
@@ -22780,10 +22862,18 @@ mod tests {
     fn public_http_subscription_cancellation_requires_matching_request_and_stream_ids() {
         for (request_id, metadata_id, expected_error) in [
             (serde_json::json!(2), None, "missing"),
-            (serde_json::json!(2), Some(serde_json::json!(true)), "invalid"),
+            (
+                serde_json::json!(2),
+                Some(serde_json::json!(true)),
+                "invalid",
+            ),
             (serde_json::json!(2), Some(serde_json::json!(3)), "foreign"),
             (serde_json::json!(3), Some(serde_json::json!(2)), "request"),
-            (serde_json::json!("2"), Some(serde_json::json!(2)), "request"),
+            (
+                serde_json::json!("2"),
+                Some(serde_json::json!(2)),
+                "request",
+            ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let target = format!("http://{}/mcp", listener.local_addr().unwrap());
@@ -22791,7 +22881,12 @@ mod tests {
             let server = thread::spawn(move || {
                 let (mut discovery, _) = listener.accept().unwrap();
                 let _ = read_request(&mut discovery);
-                write_response(&mut discovery, 200, "application/json", modern_discovery_body());
+                write_response(
+                    &mut discovery,
+                    200,
+                    "application/json",
+                    modern_discovery_body(),
+                );
                 let (mut stream, _) = listener.accept().unwrap();
                 let _ = read_request(&mut stream);
                 let mut params = serde_json::json!({"requestId": request_id});
@@ -22844,7 +22939,10 @@ mod tests {
                     (expected_error, &error),
                     ("missing", ModernHttpSubscriptionListenError::EventMissingId)
                         | ("invalid", ModernHttpSubscriptionListenError::EventInvalidId)
-                        | ("foreign", ModernHttpSubscriptionListenError::EventIdMismatch { .. })
+                        | (
+                            "foreign",
+                            ModernHttpSubscriptionListenError::EventIdMismatch { .. }
+                        )
                         | (
                             "request",
                             ModernHttpSubscriptionListenError::CancellationRequestIdMismatch { .. }

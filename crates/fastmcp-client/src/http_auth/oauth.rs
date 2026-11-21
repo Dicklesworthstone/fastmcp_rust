@@ -921,13 +921,26 @@ fn admit_callback_query(
     let fields = decode_form_fields(query, |name| {
         matches!(
             name,
-            "state" | "iss" | "code" | "error" | "error_description" | "error_uri"
-                | "access_token" | "refresh_token" | "id_token" | "token_type"
-                | "client_secret" | "client_assertion"
+            "state"
+                | "iss"
+                | "code"
+                | "error"
+                | "error_description"
+                | "error_uri"
+                | "access_token"
+                | "refresh_token"
+                | "id_token"
+                | "token_type"
+                | "client_secret"
+                | "client_assertion"
         )
     })?;
     if [
-        "access_token", "refresh_token", "id_token", "token_type", "client_secret",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "token_type",
+        "client_secret",
         "client_assertion",
     ]
     .iter()
@@ -1176,10 +1189,7 @@ fn decode_form_fields(
         let (key, value) = field.split_once('=').ok_or(OAuthError::CallbackRejected)?;
         let key = decode_component(key)?;
         let value = decode_component(value)?;
-        if key.is_empty()
-            || key.len() > 128
-            || value.len() > MAX_CODE_BYTES
-        {
+        if key.is_empty() || key.len() > 128 || value.len() > MAX_CODE_BYTES {
             return Err(OAuthError::CallbackRejected);
         }
         if retain(&key) && fields.insert(key, value).is_some() {
@@ -1367,7 +1377,11 @@ struct TokenResponse {
         deserialize_with = "reject_token_member"
     )]
     _error_description: (),
-    #[serde(default, rename = "error_uri", deserialize_with = "reject_token_member")]
+    #[serde(
+        default,
+        rename = "error_uri",
+        deserialize_with = "reject_token_member"
+    )]
     _error_uri: (),
 }
 
@@ -1721,13 +1735,28 @@ mod tests {
             Ok("host-issued-code".to_owned())
         );
         for suffix in [
-            "&code=other", "&co%64e=other", "&st%61te=other", "&iss=other",
-            "&error=access_denied", "&error_description=private", "&error_uri=private",
-            "&access_token=private", "&refresh_token=private", "&id_token=",
-            "&token_type=Bearer", "&client_secret=private", "&client_assertion=private",
-            "&unknown=%ff", "&unknown=%", "&unknown=%00", "#fragment",
+            "&code=other",
+            "&co%64e=other",
+            "&st%61te=other",
+            "&iss=other",
+            "&error=access_denied",
+            "&error_description=private",
+            "&error_uri=private",
+            "&access_token=private",
+            "&refresh_token=private",
+            "&id_token=",
+            "&token_type=Bearer",
+            "&client_secret=private",
+            "&client_assertion=private",
+            "&unknown=%ff",
+            "&unknown=%",
+            "&unknown=%00",
+            "#fragment",
         ] {
-            assert_eq!(admit(&format!("{callback}{suffix}")), Err(OAuthError::CallbackRejected));
+            assert_eq!(
+                admit(&format!("{callback}{suffix}")),
+                Err(OAuthError::CallbackRejected)
+            );
         }
         for (from, to) in [
             ("https://app.example/", "https://other.example/"),
@@ -1736,14 +1765,20 @@ mod tests {
             ("host-issued-code", ""),
             ("host-issued-code", "private code"),
         ] {
-            assert_eq!(admit(&callback.replace(from, to)), Err(OAuthError::CallbackRejected));
+            assert_eq!(
+                admit(&callback.replace(from, to)),
+                Err(OAuthError::CallbackRejected)
+            );
         }
         let other = AuthorizationAttempt::new().unwrap();
         assert_eq!(
             admit_host_redirect_callback(&callback, &redirect, &other, &configuration.issuer),
             Err(OAuthError::CallbackRejected)
         );
-        let denied = callback.replace("code=host-issued-code", "error=access_denied&error_description=private");
+        let denied = callback.replace(
+            "code=host-issued-code",
+            "error=access_denied&error_description=private",
+        );
         assert_eq!(admit(&denied), Err(OAuthError::AuthorizationDenied));
         assert_eq!(
             admit_host_redirect_callback(&denied, &redirect, &attempt, "https://other.example"),
@@ -1771,7 +1806,9 @@ mod tests {
         use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         let client = OAuthClient::new(config());
         let calls = AtomicUsize::new(0);
@@ -1784,17 +1821,32 @@ mod tests {
             "https://app.example/oauth/return#fragment".to_owned(),
             format!("https://app.example/{}", "a".repeat(MAX_CODE_BYTES)),
         ] {
-            let mut flow = Box::pin(client.authorize_with_redirect_driver(&cx, url(&redirect), |_| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Err(OAuthError::AuthorizationDenied))
-            }));
-            assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(OAuthError::InvalidConfiguration))));
+            let mut flow =
+                Box::pin(
+                    client.authorize_with_redirect_driver(&cx, url(&redirect), |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Err(OAuthError::AuthorizationDenied))
+                    }),
+                );
+            assert!(matches!(
+                flow.as_mut().poll(&mut task),
+                Poll::Ready(Err(OAuthError::InvalidConfiguration))
+            ));
         }
         for ambient in [false, true] {
             for (mask, expected) in [
-                (CapSet::<true, false, true, true, true>::MASK, OAuthError::RuntimeTimerUnavailable),
-                (CapSet::<true, true, false, true, true>::MASK, OAuthError::RuntimeCapabilityUnavailable),
-                (CapSet::<true, true, true, false, true>::MASK, OAuthError::RuntimeCapabilityUnavailable),
+                (
+                    CapSet::<true, false, true, true, true>::MASK,
+                    OAuthError::RuntimeTimerUnavailable,
+                ),
+                (
+                    CapSet::<true, true, false, true, true>::MASK,
+                    OAuthError::RuntimeCapabilityUnavailable,
+                ),
+                (
+                    CapSet::<true, true, true, false, true>::MASK,
+                    OAuthError::RuntimeCapabilityUnavailable,
+                ),
             ] {
                 let restricted = {
                     let _caller = Cx::set_current(Some(cx.clone()));
@@ -1802,30 +1854,52 @@ mod tests {
                     Cx::current().unwrap()
                 };
                 let caller = if ambient { &cx } else { &restricted };
-                let _ambient = Cx::set_current(Some(if ambient { restricted.clone() } else { cx.clone() }));
+                let _ambient = Cx::set_current(Some(if ambient {
+                    restricted.clone()
+                } else {
+                    cx.clone()
+                }));
                 let before = Cx::current().unwrap().capabilities();
                 let mut flow = Box::pin(client.authorize_with_redirect_driver(
-                    caller, url("https://app.example/oauth/return"), |_| {
+                    caller,
+                    url("https://app.example/oauth/return"),
+                    |_| {
                         calls.fetch_add(1, Ordering::SeqCst);
                         std::future::ready(Err(OAuthError::AuthorizationDenied))
                     },
                 ));
-                assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(error)) if error == expected));
+                assert!(
+                    matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(error)) if error == expected)
+                );
                 let after = Cx::current().unwrap().capabilities();
-                assert_eq!((before.time, before.entropy, before.io), (after.time, after.entropy, after.io));
+                assert_eq!(
+                    (before.time, before.entropy, before.io),
+                    (after.time, after.entropy, after.io)
+                );
             }
         }
         for (caller, expected) in [
             (Cx::for_testing(), OAuthError::RuntimeTimerUnavailable),
-            ({ let stopped = runtime.request_cx_with_budget(asupersync::Budget::INFINITE); stopped.set_cancel_requested(true); stopped }, OAuthError::Cancelled),
+            (
+                {
+                    let stopped = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                    stopped.set_cancel_requested(true);
+                    stopped
+                },
+                OAuthError::Cancelled,
+            ),
         ] {
             let mut flow = Box::pin(client.authorize_with_redirect_driver(
-                &caller, url("https://app.example/oauth/return"), |_| {
+                &caller,
+                url("https://app.example/oauth/return"),
+                |_| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     std::future::ready(Err(OAuthError::AuthorizationDenied))
                 },
             ));
-            assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(error)) if error == expected));
+            assert!(
+                matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(error)) if error == expected)
+            );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         // A foreign stopped ambient caller limits effects only. It cannot
@@ -1836,7 +1910,9 @@ mod tests {
             let _ambient = Cx::set_current(Some(foreign));
             let _mask = Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
             let mut flow = Box::pin(client.authorize_with_redirect_driver(
-                &cx, url("https://app.example/oauth/return"), |_| async {
+                &cx,
+                url("https://app.example/oauth/return"),
+                |_| async {
                     calls.fetch_add(1, Ordering::SeqCst);
                     let active = Cx::current().unwrap();
                     assert!(!active.capabilities().spawn);
@@ -1847,7 +1923,10 @@ mod tests {
                     Err(OAuthError::AuthorizationDenied)
                 },
             ));
-            assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(OAuthError::AuthorizationDenied))));
+            assert!(matches!(
+                flow.as_mut().poll(&mut task),
+                Poll::Ready(Err(OAuthError::AuthorizationDenied))
+            ));
             assert!(Cx::current().unwrap().is_cancel_requested());
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1864,26 +1943,38 @@ mod tests {
 
         struct Owned(Arc<AtomicUsize>);
         impl Drop for Owned {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
         }
         #[derive(Default)]
         struct Wakes(AtomicUsize);
         impl Wake for Wakes {
-            fn wake(self: Arc<Self>) { self.wake_by_ref(); }
-            fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
         }
         for mode in 0..3 {
             let clock = Arc::new(VirtualClock::new());
             let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-                .blocking_threads(0, 0).with_timer_driver(timer.clone()).build().unwrap();
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
             let caller = runtime.request_cx_with_budget(
                 asupersync::Budget::INFINITE.with_deadline(Time::from_nanos(1_000_000_000)),
             );
             let token_peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             token_peer.set_nonblocking(true).unwrap();
             let mut configuration = config();
-            configuration.token_endpoint = url(&format!("https://{}/token", token_peer.local_addr().unwrap()));
+            configuration.token_endpoint = url(&format!(
+                "https://{}/token",
+                token_peer.local_addr().unwrap()
+            ));
             let client = OAuthClient::new(configuration);
             let drops = Arc::new(AtomicUsize::new(0));
             let owned = Owned(Arc::clone(&drops));
@@ -1892,7 +1983,9 @@ mod tests {
             let waker = Waker::from(Arc::clone(&wakes));
             let mut task = Context::from_waker(&waker);
             let mut flow = Box::pin(client.authorize_with_redirect_driver(
-                &caller, url("https://app.example/oauth/return"), |_| async {
+                &caller,
+                url("https://app.example/oauth/return"),
+                |_| async {
                     let _owned = owned;
                     calls.fetch_add(1, Ordering::SeqCst);
                     std::future::pending::<Result<String, OAuthError>>().await
@@ -1916,7 +2009,11 @@ mod tests {
             }
             if mode != 2 {
                 assert!(wakes.0.load(Ordering::SeqCst) > before);
-                let expected = if mode == 0 { OAuthError::Cancelled } else { OAuthError::TimedOut };
+                let expected = if mode == 0 {
+                    OAuthError::Cancelled
+                } else {
+                    OAuthError::TimedOut
+                };
                 let outcome = flow
                     .as_mut()
                     .poll(&mut task)
@@ -1929,7 +2026,9 @@ mod tests {
             drop(flow);
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert_eq!(timer.pending_count(), 0);
-            assert!(matches!(token_peer.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+            assert!(
+                matches!(token_peer.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
             drop(caller);
             assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
         }
@@ -1969,18 +2068,12 @@ mod tests {
         let address: SocketAddr = "127.0.0.1:43210".parse().unwrap();
         let redirect = url("https://app.example/oauth/return");
         let admit_both = |query: &str| {
-            let request = format!(
-                "GET {CALLBACK_PATH}?{query} HTTP/1.1\r\nHost: {address}\r\n\r\n"
-            );
+            let request =
+                format!("GET {CALLBACK_PATH}?{query} HTTP/1.1\r\nHost: {address}\r\n\r\n");
             let callback = format!("{}?{query}", redirect.as_str());
             (
                 admit_callback(request.as_bytes(), address, &attempt, &configuration.issuer),
-                admit_host_redirect_callback(
-                    &callback,
-                    &redirect,
-                    &attempt,
-                    &configuration.issuer,
-                ),
+                admit_host_redirect_callback(&callback, &redirect, &attempt, &configuration.issuer),
             )
         };
         let success = encode_form(&[
@@ -3238,49 +3331,72 @@ mod tests {
 
     #[test]
     fn host_https_redirect_callback_rejection_prevents_token_dispatch() {
-        asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-            let cx = Cx::current().unwrap();
-            let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
-            let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
-            let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
-            configuration.token_endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
-            let client = OAuthClient::new(configuration.clone());
-            let redirect = url("https://app.example/oauth/return");
-            let retained = std::sync::Mutex::new(None::<String>);
-            let calls = std::sync::atomic::AtomicUsize::new(0);
-            for case in 0..12 {
-                let result = within(&cx, deadline, client.authorize_with_redirect_driver(
-                    &cx, redirect.clone(), |authorization| {
-                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let valid = host_callback(&authorization, &configuration.issuer);
-                        if case == 0 { *retained.lock().unwrap() = Some(valid.clone()); }
-                        let changed = match case {
-                            0 => valid.replace("state=", "state=wrong"),
-                            1 => host_callback(&authorization, "https://other.example"),
-                            2 => valid.replace("/oauth/return?", "/oauth/return/other?"),
-                            3 => format!("{valid}&co%64e=other"),
-                            4 => format!("{valid}&error=access_denied"),
-                            5 => format!("{valid}&error_description=private-canary"),
-                            6 => format!("{valid}&id_token=private-canary"),
-                            7 => format!("{valid}&unknown=%ff"),
-                            8 => format!("{valid}#fragment"),
-                            9 => format!("{valid}&unknown={}", "a".repeat(MAX_CALLBACK_BYTES)),
-                            10 => retained.lock().unwrap().clone().unwrap(),
-                            _ => return std::future::ready(Err(OAuthError::AuthorizationDenied)),
-                        };
-                        std::future::ready(Ok(changed))
-                    },
-                )).await;
-                let expected = match case {
-                    1 => OAuthError::IssuerMismatch,
-                    11 => OAuthError::AuthorizationDenied,
-                    _ => OAuthError::CallbackRejected,
-                };
-                assert!(matches!(result, Err(error) if error == expected), "callback case {case}");
-                assert_listener_drained(&listener);
-            }
-            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 12);
-        });
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+                let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+                let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+                configuration.token_endpoint =
+                    url(&format!("https://{}/token", listener.local_addr().unwrap()));
+                let client = OAuthClient::new(configuration.clone());
+                let redirect = url("https://app.example/oauth/return");
+                let retained = std::sync::Mutex::new(None::<String>);
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                for case in 0..12 {
+                    let result = within(
+                        &cx,
+                        deadline,
+                        client.authorize_with_redirect_driver(
+                            &cx,
+                            redirect.clone(),
+                            |authorization| {
+                                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let valid = host_callback(&authorization, &configuration.issuer);
+                                if case == 0 {
+                                    *retained.lock().unwrap() = Some(valid.clone());
+                                }
+                                let changed = match case {
+                                    0 => valid.replace("state=", "state=wrong"),
+                                    1 => host_callback(&authorization, "https://other.example"),
+                                    2 => valid.replace("/oauth/return?", "/oauth/return/other?"),
+                                    3 => format!("{valid}&co%64e=other"),
+                                    4 => format!("{valid}&error=access_denied"),
+                                    5 => format!("{valid}&error_description=private-canary"),
+                                    6 => format!("{valid}&id_token=private-canary"),
+                                    7 => format!("{valid}&unknown=%ff"),
+                                    8 => format!("{valid}#fragment"),
+                                    9 => format!(
+                                        "{valid}&unknown={}",
+                                        "a".repeat(MAX_CALLBACK_BYTES)
+                                    ),
+                                    10 => retained.lock().unwrap().clone().unwrap(),
+                                    _ => {
+                                        return std::future::ready(Err(
+                                            OAuthError::AuthorizationDenied,
+                                        ));
+                                    }
+                                };
+                                std::future::ready(Ok(changed))
+                            },
+                        ),
+                    )
+                    .await;
+                    let expected = match case {
+                        1 => OAuthError::IssuerMismatch,
+                        11 => OAuthError::AuthorizationDenied,
+                        _ => OAuthError::CallbackRejected,
+                    };
+                    assert!(
+                        matches!(result, Err(error) if error == expected),
+                        "callback case {case}"
+                    );
+                    assert_listener_drained(&listener);
+                }
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 12);
+            });
     }
 
     #[test]
@@ -3365,7 +3481,9 @@ mod tests {
     #[test]
     fn host_https_redirect_redemption_failure_and_interruption_never_replay() {
         for mode in 0..5 {
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
             let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
             runtime.block_on(async {
                 let healthy = Cx::current().unwrap();
@@ -3461,7 +3579,11 @@ mod tests {
             ),
             (r#""cnf":{}"#, false, false),
             (r#""error_description":null"#, false, false),
-            (r#""error_uri":"https://issuer.example/error""#, false, false),
+            (
+                r#""error_uri":"https://issuer.example/error""#,
+                false,
+                false,
+            ),
             (r#""vendor":{"label":1,"l\u0061bel":2}"#, false, false),
             (r#""vendor":null"#, true, false),
         ] {

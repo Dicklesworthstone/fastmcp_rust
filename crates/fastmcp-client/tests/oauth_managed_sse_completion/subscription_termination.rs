@@ -5,8 +5,8 @@
 use super::*;
 use fastmcp_client::http_auth::rpc::subscription::ManagedSubscription;
 use fastmcp_protocol::{
-    CoreResult, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult,
-    FinalSubscriptionsListenParams, ServerNotification,
+    CoreResult, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalSubscriptionsListenParams,
+    ServerNotification,
 };
 
 fn params() -> FinalSubscriptionsListenParams {
@@ -69,7 +69,10 @@ async fn receive_ack(listen: &mut ManagedSubscription, cx: &Cx) {
         Some(ManagedCoreEvent::Notification(notification))
             if matches!(*notification, ServerNotification::SubscriptionsAcknowledged(_))
     ));
-    assert_eq!(serde_json::to_value(listen.accepted_filter().unwrap()).unwrap(), json!({}));
+    assert_eq!(
+        serde_json::to_value(listen.accepted_filter().unwrap()).unwrap(),
+        json!({})
+    );
 }
 
 #[test]
@@ -83,10 +86,18 @@ fn managed_listen_core_first_terminal_releases_body_without_http_eof() {
                     serde_json::from_str("41e0").unwrap(),
                     Some(serde_json::from_str("41.0").unwrap()),
                 );
-                let first = if cancelled_first { cancelled.clone() } else { complete() };
+                let first = if cancelled_first {
+                    cancelled.clone()
+                } else {
+                    complete()
+                };
                 let mut frames = vec![acknowledgement(), first];
                 if both_signals {
-                    frames.push(if cancelled_first { complete() } else { cancelled });
+                    frames.push(if cancelled_first {
+                        complete()
+                    } else {
+                        cancelled
+                    });
                 }
                 let server = async {
                     closed(open_stream(&peer, &frames).await).await;
@@ -96,11 +107,17 @@ fn managed_listen_core_first_terminal_releases_body_without_http_eof() {
                     // The ACK consumes this entire event quota. Terminal
                     // control still fits its separate cumulative byte bound.
                     let limits = ManagedCoreLimits::new(
-                        4096, 4096, 8192, 1, std::time::Duration::from_secs(10),
-                    ).unwrap();
-                    let mut listen = session.listen_core(
-                        &cx, params(), RequestId::Number(41), limits,
-                    ).await.unwrap();
+                        4096,
+                        4096,
+                        8192,
+                        1,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .unwrap();
+                    let mut listen = session
+                        .listen_core(&cx, params(), RequestId::Number(41), limits)
+                        .await
+                        .unwrap();
                     receive_ack(&mut listen, &cx).await;
                     let terminal = listen.next_event(&cx).await.unwrap().unwrap();
                     if cancelled_first {
@@ -154,19 +171,32 @@ fn managed_listen_core_rejects_foreign_unscoped_and_unacknowledged_cancellation(
                 peer.follow_up().await;
             };
             let application = async {
-                let mut listen = session.listen_core(
-                    &cx, params(), RequestId::Number(41), ManagedCoreLimits::default(),
-                ).await.unwrap();
+                let mut listen = session
+                    .listen_core(
+                        &cx,
+                        params(),
+                        RequestId::Number(41),
+                        ManagedCoreLimits::default(),
+                    )
+                    .await
+                    .unwrap();
                 if acknowledged {
                     receive_ack(&mut listen, &cx).await;
                 }
-                let error = listen.next_event(&cx).await.err().expect("invalid control must fail");
+                let error = listen
+                    .next_event(&cx)
+                    .await
+                    .err()
+                    .expect("invalid control must fail");
                 if acknowledged {
                     assert!(matches!(error, ManagedCoreError::ResponseIdMismatch));
                 } else {
                     assert!(matches!(error, ManagedCoreError::UnexpectedNotification));
                 }
-                assert!(matches!(listen.next_event(&cx).await, Err(ManagedCoreError::Closed)));
+                assert!(matches!(
+                    listen.next_event(&cx).await,
+                    Err(ManagedCoreError::Closed)
+                ));
                 assert!(cx.checkpoint().is_ok());
                 follow_up(&cx, &session).await;
             };
@@ -186,7 +216,11 @@ enum Retire {
 
 #[test]
 fn managed_listen_core_buffered_terminals_cannot_outlive_their_original_authority() {
-    for retire in [Retire::CallerCancellation, Retire::Logout, Retire::CredentialRevocation] {
+    for retire in [
+        Retire::CallerCancellation,
+        Retire::Logout,
+        Retire::CredentialRevocation,
+    ] {
         for cancelled in [false, true] {
             run(|cx| async move {
                 let peer = Peer::new().await;
@@ -207,24 +241,50 @@ fn managed_listen_core_buffered_terminals_cannot_outlive_their_original_authorit
                     peer.follow_up().await;
                 };
                 let application = async {
-                    let mut listen = session.listen_core_with_cancellation(
-                        &cx, &cancel, params(), RequestId::Number(41), ManagedCoreLimits::default(),
-                    ).await.unwrap();
+                    let mut listen = session
+                        .listen_core_with_cancellation(
+                            &cx,
+                            &cancel,
+                            params(),
+                            RequestId::Number(41),
+                            ManagedCoreLimits::default(),
+                        )
+                        .await
+                        .unwrap();
                     receive_ack(&mut listen, &cx).await;
                     match retire {
-                        Retire::CallerCancellation => { cancel.cancel(); }
+                        Retire::CallerCancellation => {
+                            cancel.cancel();
+                        }
                         Retire::Logout => {
                             assert!(session.logout(&cx).await.unwrap().local_closed());
                         }
-                        Retire::CredentialRevocation => { snapshot.credential().revoke(); }
+                        Retire::CredentialRevocation => {
+                            snapshot.credential().revoke();
+                        }
                     }
-                    let error = listen.next_event(&cx).await.err().expect("retired authority cannot publish a terminal");
+                    let error = listen
+                        .next_event(&cx)
+                        .await
+                        .err()
+                        .expect("retired authority cannot publish a terminal");
                     match retire {
-                        Retire::CallerCancellation => assert!(matches!(error, ManagedCoreError::Cancelled)),
-                        Retire::Logout => assert!(matches!(error, ManagedCoreError::Session(OAuthSessionError::Closed))),
-                        Retire::CredentialRevocation => assert!(matches!(error, ManagedCoreError::Session(OAuthSessionError::LoginRequired))),
+                        Retire::CallerCancellation => {
+                            assert!(matches!(error, ManagedCoreError::Cancelled))
+                        }
+                        Retire::Logout => assert!(matches!(
+                            error,
+                            ManagedCoreError::Session(OAuthSessionError::Closed)
+                        )),
+                        Retire::CredentialRevocation => assert!(matches!(
+                            error,
+                            ManagedCoreError::Session(OAuthSessionError::LoginRequired)
+                        )),
                     }
-                    assert!(matches!(listen.next_event(&cx).await, Err(ManagedCoreError::Closed)));
+                    assert!(matches!(
+                        listen.next_event(&cx).await,
+                        Err(ManagedCoreError::Closed)
+                    ));
                     assert!(cx.checkpoint().is_ok());
                     follow_up(&cx, &sibling).await;
                 };

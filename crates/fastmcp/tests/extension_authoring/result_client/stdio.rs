@@ -188,12 +188,7 @@ while IFS= read -r ignored; do :; done
             McpErrorCode::InvalidParams
         );
         client
-            .notify_final_extension(
-                &cx,
-                &id,
-                NOTIFICATION,
-                json!({"value": 11, "hold": false}),
-            )
+            .notify_final_extension(&cx, &id, NOTIFICATION, json!({"value": 11, "hold": false}))
             .await
             .unwrap();
         assert_eq!(
@@ -214,8 +209,7 @@ while IFS= read -r ignored; do :; done
             .await
             .unwrap();
         assert_eq!(
-            third["value"],
-            15,
+            third["value"], 15,
             "a foreign-owner result does not poison the next request"
         );
         let observed = third["observed"].as_array().unwrap();
@@ -232,8 +226,7 @@ while IFS= read -r ignored; do :; done
                 .is_none()
         );
         assert_eq!(
-            observed[1]["id"],
-            3,
+            observed[1]["id"], 3,
             "local refusals and notification consume no request IDs"
         );
         assert_eq!(observed[1]["method"], METHOD);
@@ -311,7 +304,10 @@ while IFS= read -r ignored; do :; done
             })
             .await;
             cancellation.cancel();
-            assert_eq!(request.await.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(
+                request.await.unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
         }
         let result = client
             .request_final_extension(&cx, &id, METHOD, json!({"value": 5}))
@@ -320,8 +316,7 @@ while IFS= read -r ignored; do :; done
         assert_eq!(result["value"], 15);
         let observed = result["observed"].as_array().unwrap();
         assert_eq!(
-            observed[0]["id"],
-            3,
+            observed[0]["id"], 3,
             "pre-cancelled calls consume no request ID"
         );
         assert_eq!(observed[0]["method"], METHOD);

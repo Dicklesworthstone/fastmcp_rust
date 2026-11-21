@@ -245,8 +245,8 @@ impl ClientCredentialsCoreCall {
         let body = match response.metadata().kind() {
             ModernHttpResponseKind::Json => Body::Json(response),
             ModernHttpResponseKind::Sse => {
-                let framing = mcp_sse_limits(limits.frame_bytes())
-                    .ok_or(ManagedCoreError::InvalidLimits)?;
+                let framing =
+                    mcp_sse_limits(limits.frame_bytes()).ok_or(ManagedCoreError::InvalidLimits)?;
                 Body::Sse(
                     response
                         .into_sse_stream(framing)

@@ -3,9 +3,9 @@
 
 use super::*;
 use crate::http_auth::enterprise::policy::{
-    EnterpriseProfileConfiguration, EnterpriseRegistrationConfiguration,
-    IdJagCryptoConfiguration, RequestedEnterpriseScopeSet,
-    ID_JAG_GRANT_PROFILE, ID_JAG_TOKEN_TYPE, JWT_BEARER_GRANT, TOKEN_EXCHANGE_GRANT,
+    EnterpriseProfileConfiguration, EnterpriseRegistrationConfiguration, ID_JAG_GRANT_PROFILE,
+    ID_JAG_TOKEN_TYPE, IdJagCryptoConfiguration, JWT_BEARER_GRANT, RequestedEnterpriseScopeSet,
+    TOKEN_EXCHANGE_GRANT,
 };
 use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
 use serde_json::{Value, json};
@@ -66,11 +66,15 @@ fn profile_with_authentication(
             policy_generation: 23,
         },
         resource: CanonicalResourceId::parse_for_endpoint(
-            url.as_str(), &url, CanonicalResourceIdPolicy::default(),
-        ).unwrap(),
+            url.as_str(),
+            &url,
+            CanonicalResourceIdPolicy::default(),
+        )
+        .unwrap(),
         requested_scopes: RequestedEnterpriseScopeSet::from_literals(
             requested.iter().map(|s| (*s).to_owned()),
-        ).unwrap(),
+        )
+        .unwrap(),
         deployment_scope_allowance: vec!["read".into(), "write".into()],
         policy_generation: 30,
         idp_metadata_generation: 31,
@@ -109,8 +113,10 @@ fn profile_with_authentication(
             "client_id":"native-resource", "grant_types":[JWT_BEARER_GRANT],
             "token_endpoint_auth_method":resource_as_authentication.as_str()
         }),
-    ].map(|value| serde_json::to_vec(&value).unwrap());
-    EnterpriseProfile::from_documents(cfg, &docs[0], &docs[1], &docs[2], &docs[3], &docs[4]).unwrap()
+    ]
+    .map(|value| serde_json::to_vec(&value).unwrap());
+    EnterpriseProfile::from_documents(cfg, &docs[0], &docs[1], &docs[2], &docs[3], &docs[4])
+        .unwrap()
 }
 fn keys() -> (OidcVerificationKeys, IdJagVerificationKeys) {
     let jwks = serde_json::to_vec(&fixtures()["jwks"]).unwrap();
@@ -138,23 +144,40 @@ fn access_body() -> Value {
     })
 }
 fn jag(
-    profile: &EnterpriseProfile, keys: &IdJagVerificationKeys, body: &Value, time: SystemTime,
+    profile: &EnterpriseProfile,
+    keys: &IdJagVerificationKeys,
+    body: &Value,
+    time: SystemTime,
 ) -> Result<EnterpriseResponseOutcome<EnterpriseIdJagResponse>, EnterpriseResponseError> {
     let headers = headers();
     let body = serde_json::to_vec(body).unwrap();
     profile.admit_id_jag_response(
-        EnterpriseTokenResponse { status: 200, headers: &headers, body: &body },
-        keys, TenantExpectation::SingleTenant, ResourceTenantExpectation::SingleTenant,
-        EnterpriseResponsePolicy::default(), time,
+        EnterpriseTokenResponse {
+            status: 200,
+            headers: &headers,
+            body: &body,
+        },
+        keys,
+        TenantExpectation::SingleTenant,
+        ResourceTenantExpectation::SingleTenant,
+        EnterpriseResponsePolicy::default(),
+        time,
     )
 }
 fn finish(
-    admitted: EnterpriseIdJagResponse, body: &Value, time: SystemTime,
+    admitted: EnterpriseIdJagResponse,
+    body: &Value,
+    time: SystemTime,
 ) -> Result<EnterpriseResponseOutcome<EnterpriseAccessTokenResponse>, EnterpriseResponseError> {
     let headers = headers();
     let body = serde_json::to_vec(body).unwrap();
     admitted.admit_access_token_response(
-        EnterpriseTokenResponse { status: 200, headers: &headers, body: &body }, time,
+        EnterpriseTokenResponse {
+            status: 200,
+            headers: &headers,
+            body: &body,
+        },
+        time,
     )
 }
 
@@ -166,8 +189,12 @@ fn enterprise_response_chain_preserves_all_three_scope_sets_and_exact_resource()
     assert_eq!(admitted.assertion().subject().as_str(), "resource-facing");
     assert_eq!(admitted.requested_scopes(), ["read", "write"]);
     assert_eq!(admitted.granted_scopes(), ["read"]);
-    assert_eq!(admitted.effective_expires_at(), now() + Duration::from_secs(60));
-    let final_grant = success(finish(admitted, &access_body(), now() + Duration::from_secs(1)).unwrap());
+    assert_eq!(
+        admitted.effective_expires_at(),
+        now() + Duration::from_secs(60)
+    );
+    let final_grant =
+        success(finish(admitted, &access_body(), now() + Duration::from_secs(1)).unwrap());
     assert_eq!(final_grant.resource(), "https://mcp.example/mcp");
     assert_eq!(final_grant.requested_scopes(), ["read", "write"]);
     assert_eq!(final_grant.idp_granted_scopes(), ["read"]);
@@ -183,14 +210,26 @@ fn enterprise_response_chain_preserves_all_three_scope_sets_and_exact_resource()
 fn enterprise_response_scope_narrowing_needs_a_matching_explicit_idp_grant() {
     let selected = profile(&["read", "write"]);
     let (_, keys) = keys();
-    for scope in [None, Some("write"), Some("read write"), Some(""), Some("read read")] {
+    for scope in [
+        None,
+        Some("write"),
+        Some("read write"),
+        Some(""),
+        Some("read read"),
+    ] {
         let mut body = jag_body();
         match scope {
-            Some(scope) => { body["scope"] = json!(scope); }
-            None => { body.as_object_mut().unwrap().remove("scope"); }
+            Some(scope) => {
+                body["scope"] = json!(scope);
+            }
+            None => {
+                body.as_object_mut().unwrap().remove("scope");
+            }
         }
-        assert!(matches!(jag(&selected, &keys, &body, now()),
-            Err(EnterpriseResponseError::ScopeRejected)));
+        assert!(matches!(
+            jag(&selected, &keys, &body, now()),
+            Err(EnterpriseResponseError::ScopeRejected)
+        ));
     }
     assert!(jag(&selected, &keys, &jag_body(), now()).is_ok());
     let unchanged = profile(&["read"]);
@@ -245,19 +284,34 @@ fn enterprise_oidc_response_checks_real_signature_nonce_and_temporary_access_has
         let body = serde_json::to_vec(&json!({
             "access_token":access, "token_type":"Bearer",
             "id_token":fixtures()["oidc"], "scope":"openid"
-        })).unwrap();
+        }))
+        .unwrap();
         let result = profile.admit_oidc_code_response(
-            EnterpriseTokenResponse { status:200, headers:&headers, body:&body },
-            &keys, nonce, TenantExpectation::SingleTenant, Some(Duration::from_secs(60)),
-            EnterpriseResponsePolicy::default(), now(),
+            EnterpriseTokenResponse {
+                status: 200,
+                headers: &headers,
+                body: &body,
+            },
+            &keys,
+            nonce,
+            TenantExpectation::SingleTenant,
+            Some(Duration::from_secs(60)),
+            EnterpriseResponsePolicy::default(),
+            now(),
         );
         if allowed {
             let assertion = success(result.unwrap());
             assert_eq!(assertion.identity().subject().as_str(), "client-facing");
             assert_eq!(assertion.identity().client_id(), "native-idp");
-            assert_eq!(assertion.identity().expires_at(), now() + Duration::from_secs(240));
+            assert_eq!(
+                assertion.identity().expires_at(),
+                now() + Duration::from_secs(240)
+            );
         } else {
-            assert!(matches!(result, Err(EnterpriseResponseError::AssertionRejected)));
+            assert!(matches!(
+                result,
+                Err(EnterpriseResponseError::AssertionRejected)
+            ));
         }
     }
 }
@@ -268,18 +322,32 @@ fn enterprise_response_never_reinterprets_a_valid_signature_in_another_token_rol
     let (oidc_keys, jag_keys) = keys();
     let mut body = jag_body();
     body["access_token"] = fixtures()["oidc"].clone();
-    assert!(matches!(jag(&profile, &jag_keys, &body, now()),
-        Err(EnterpriseResponseError::AssertionRejected)));
+    assert!(matches!(
+        jag(&profile, &jag_keys, &body, now()),
+        Err(EnterpriseResponseError::AssertionRejected)
+    ));
     let headers = headers();
     let body = serde_json::to_vec(&json!({
         "access_token":"temporary-access", "token_type":"Bearer",
         "id_token":fixtures()["id_jag"], "scope":"openid"
-    })).unwrap();
-    assert!(matches!(profile.admit_oidc_code_response(
-        EnterpriseTokenResponse { status:200, headers:&headers, body:&body },
-        &oidc_keys, "oidc-flow-nonce", TenantExpectation::SingleTenant, None,
-        EnterpriseResponsePolicy::default(), now(),
-    ), Err(EnterpriseResponseError::AssertionRejected)));
+    }))
+    .unwrap();
+    assert!(matches!(
+        profile.admit_oidc_code_response(
+            EnterpriseTokenResponse {
+                status: 200,
+                headers: &headers,
+                body: &body
+            },
+            &oidc_keys,
+            "oidc-flow-nonce",
+            TenantExpectation::SingleTenant,
+            None,
+            EnterpriseResponsePolicy::default(),
+            now(),
+        ),
+        Err(EnterpriseResponseError::AssertionRejected)
+    ));
 }
 
 #[test]
@@ -288,8 +356,10 @@ fn enterprise_response_refuses_wrong_key_generation_before_admitting_peer_data()
     let jwks = serde_json::to_vec(&fixtures()["jwks"]).unwrap();
     for (issuer, generation) in [("https://idp.example", 21), ("https://other.example", 22)] {
         let keys = IdJagVerificationKeys::from_trusted_jwks(issuer, generation, &jwks).unwrap();
-        assert!(matches!(jag(&profile, &keys, &jag_body(), now()),
-            Err(EnterpriseResponseError::PolicyBindingMismatch)));
+        assert!(matches!(
+            jag(&profile, &keys, &jag_body(), now()),
+            Err(EnterpriseResponseError::PolicyBindingMismatch)
+        ));
     }
     let (_, keys) = keys();
     assert!(jag(&profile, &keys, &jag_body(), now()).is_ok());
@@ -299,19 +369,32 @@ fn enterprise_response_refuses_wrong_key_generation_before_admitting_peer_data()
 fn enterprise_response_expiry_is_earliest_and_final_admission_refuses_clock_rewind() {
     let profile = profile(&["read"]);
     let (_, keys) = keys();
-    for time in [now() - Duration::from_secs(1), now() + Duration::from_secs(60)] {
+    for time in [
+        now() - Duration::from_secs(1),
+        now() + Duration::from_secs(60),
+    ] {
         let admitted = success(jag(&profile, &keys, &jag_body(), now()).unwrap());
-        assert!(matches!(finish(admitted, &access_body(), time),
-            Err(EnterpriseResponseError::InvalidLifetime)));
+        assert!(matches!(
+            finish(admitted, &access_body(), time),
+            Err(EnterpriseResponseError::InvalidLifetime)
+        ));
     }
     let mut without_duration = jag_body();
-    without_duration.as_object_mut().unwrap().remove("expires_in");
+    without_duration
+        .as_object_mut()
+        .unwrap()
+        .remove("expires_in");
     let admitted = success(jag(&profile, &keys, &without_duration, now()).unwrap());
-    assert_eq!(admitted.effective_expires_at(), now() + Duration::from_secs(240));
+    assert_eq!(
+        admitted.effective_expires_at(),
+        now() + Duration::from_secs(240)
+    );
     let mut late = jag_body();
     late["expires_in"] = json!(300);
-    assert!(matches!(jag(&profile, &keys, &late, now() + Duration::from_secs(240)),
-        Err(EnterpriseResponseError::InvalidLifetime)));
+    assert!(matches!(
+        jag(&profile, &keys, &late, now() + Duration::from_secs(240)),
+        Err(EnterpriseResponseError::InvalidLifetime)
+    ));
 }
 
 #[test]
@@ -330,7 +413,11 @@ fn enterprise_oidc_basic_400_exception_does_not_admit_id_jag_denials() {
             fields.push(("WWW-Authenticate".into(), r#"Basic realm="issuer""#.into()));
         }
         let oidc = selected.admit_oidc_code_response(
-            EnterpriseTokenResponse { status, headers: &fields, body },
+            EnterpriseTokenResponse {
+                status,
+                headers: &fields,
+                body,
+            },
             &oidc_keys,
             "oidc-flow-nonce",
             TenantExpectation::SingleTenant,
@@ -340,7 +427,11 @@ fn enterprise_oidc_basic_400_exception_does_not_admit_id_jag_denials() {
         );
         assert_enterprise_client_denial(oidc, status, oidc_allowed);
         let exchanged = selected.admit_id_jag_response(
-            EnterpriseTokenResponse { status, headers: &fields, body },
+            EnterpriseTokenResponse {
+                status,
+                headers: &fields,
+                body,
+            },
             &jag_keys,
             TenantExpectation::SingleTenant,
             ResourceTenantExpectation::SingleTenant,
@@ -369,18 +460,18 @@ fn enterprise_final_client_denials_follow_the_selected_registration() {
     ] {
         // Acquire a genuine signed ID-JAG through the public profile path so
         // the final stage must retain the selected resource-AS method.
-        let selected = profile_with_authentication(
-            &["read"],
-            ClientSecretBasic,
-            authentication,
-        );
+        let selected = profile_with_authentication(&["read"], ClientSecretBasic, authentication);
         let admitted = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
         let mut fields = headers();
         if challenged {
             fields.push(("WWW-Authenticate".into(), r#"Basic realm="issuer""#.into()));
         }
         let result = admitted.admit_access_token_response(
-            EnterpriseTokenResponse { status, headers: &fields, body },
+            EnterpriseTokenResponse {
+                status,
+                headers: &fields,
+                body,
+            },
             now(),
         );
         assert_enterprise_client_denial(result, status, allowed);
@@ -391,18 +482,18 @@ fn enterprise_final_client_denials_follow_the_selected_registration() {
 fn enterprise_form_authenticated_id_jag_denials_keep_oauth_400_semantics() {
     use EnterpriseClientAuthentication::ClientSecretPost;
 
-    let selected = profile_with_authentication(
-        &["read"],
-        ClientSecretPost,
-        ClientSecretPost,
-    );
+    let selected = profile_with_authentication(&["read"], ClientSecretPost, ClientSecretPost);
     let (_, jag_keys) = keys();
     let mut fields = headers();
     fields.push(("WWW-Authenticate".into(), r#"Basic realm="issuer""#.into()));
     let body = br#"{"error":"invalid_client"}"#;
     for (status, allowed) in [(400, true), (401, false), (403, false), (500, false)] {
         let result = selected.admit_id_jag_response(
-            EnterpriseTokenResponse { status, headers: &fields, body },
+            EnterpriseTokenResponse {
+                status,
+                headers: &fields,
+                body,
+            },
             &jag_keys,
             TenantExpectation::SingleTenant,
             ResourceTenantExpectation::SingleTenant,
@@ -442,16 +533,30 @@ fn enterprise_public_step_up_surfaces_only_a_bounded_new_flow_indication() {
             "error":"insufficient_user_authentication",
             "error_description":"Fresh login is required", "acr_values":"never-forward-this"
         });
-        if let Some(value) = maximum { body["max_age"] = json!(value); }
+        if let Some(value) = maximum {
+            body["max_age"] = json!(value);
+        }
         let body = serde_json::to_vec(&body).unwrap();
-        let result = profile.admit_id_jag_response(
-            EnterpriseTokenResponse { status:400, headers:&headers, body:&body },
-            &keys, TenantExpectation::SingleTenant, ResourceTenantExpectation::SingleTenant,
-            EnterpriseResponsePolicy::default(), now(),
-        ).unwrap();
+        let result = profile
+            .admit_id_jag_response(
+                EnterpriseTokenResponse {
+                    status: 400,
+                    headers: &headers,
+                    body: &body,
+                },
+                &keys,
+                TenantExpectation::SingleTenant,
+                ResourceTenantExpectation::SingleTenant,
+                EnterpriseResponsePolicy::default(),
+                now(),
+            )
+            .unwrap();
         match result {
             EnterpriseResponseOutcome::StepUpRequired { requirement, .. } => {
-                assert_eq!(requirement.maximum_authentication_age(), maximum.map(Duration::from_secs));
+                assert_eq!(
+                    requirement.maximum_authentication_age(),
+                    maximum.map(Duration::from_secs)
+                );
             }
             _ => panic!("expected an explicit step-up indication"),
         }
@@ -463,18 +568,32 @@ fn enterprise_effective_expiry_uses_one_time_and_checked_absolute_limits() {
     let now = now();
     let signed = now + Duration::from_secs(240);
     let cap = Duration::from_secs(300);
-    assert_eq!(bounded_expiry(now, Some(60), 900, cap, Some(signed)).unwrap(),
-        now + Duration::from_secs(60));
-    assert_eq!(bounded_expiry(now, Some(600), 900, cap, Some(signed)).unwrap(), signed);
-    assert_eq!(bounded_expiry(now, None, 900, cap, Some(signed)).unwrap(), signed);
-    assert_eq!(bounded_expiry(now, None, 900, cap, Some(now + Duration::from_secs(600))).unwrap(),
-        now + cap);
+    assert_eq!(
+        bounded_expiry(now, Some(60), 900, cap, Some(signed)).unwrap(),
+        now + Duration::from_secs(60)
+    );
+    assert_eq!(
+        bounded_expiry(now, Some(600), 900, cap, Some(signed)).unwrap(),
+        signed
+    );
+    assert_eq!(
+        bounded_expiry(now, None, 900, cap, Some(signed)).unwrap(),
+        signed
+    );
+    assert_eq!(
+        bounded_expiry(now, None, 900, cap, Some(now + Duration::from_secs(600))).unwrap(),
+        now + cap
+    );
     for invalid in [Some(0), Some(901), Some(u64::MAX)] {
-        assert_eq!(bounded_expiry(now, invalid, 900, cap, Some(signed)),
-            Err(EnterpriseResponseError::InvalidLifetime));
+        assert_eq!(
+            bounded_expiry(now, invalid, 900, cap, Some(signed)),
+            Err(EnterpriseResponseError::InvalidLifetime)
+        );
     }
-    assert_eq!(bounded_expiry(now, None, 900, cap, Some(now)),
-        Err(EnterpriseResponseError::InvalidLifetime));
+    assert_eq!(
+        bounded_expiry(now, None, 900, cap, Some(now)),
+        Err(EnterpriseResponseError::InvalidLifetime)
+    );
 }
 
 fn disclosure_policy(expires_after: u64) -> IdJagDisclosurePolicy {
@@ -492,7 +611,8 @@ fn disclosure_policy(expires_after: u64) -> IdJagDisclosurePolicy {
             claim: IdJagDisclosureClaim::Email,
             purpose: "Validate and discard an issuer-mandated signed disclosure".to_owned(),
         }],
-    }).unwrap()
+    })
+    .unwrap()
 }
 
 fn disclosure_body() -> Value {
@@ -512,9 +632,17 @@ fn disclosed_jag(
     let headers = headers();
     let body = serde_json::to_vec(body).unwrap();
     profile.admit_id_jag_response_with_disclosure(
-        EnterpriseTokenResponse { status: 200, headers: &headers, body: &body },
-        keys, TenantExpectation::SingleTenant, ResourceTenantExpectation::SingleTenant,
-        EnterpriseResponsePolicy::default(), disclosure, at,
+        EnterpriseTokenResponse {
+            status: 200,
+            headers: &headers,
+            body: &body,
+        },
+        keys,
+        TenantExpectation::SingleTenant,
+        ResourceTenantExpectation::SingleTenant,
+        EnterpriseResponsePolicy::default(),
+        disclosure,
+        at,
     )
 }
 
@@ -530,22 +658,39 @@ fn optional_signed_disclosure_requires_explicit_policy_and_preserves_final_prove
         Err(EnterpriseResponseError::AssertionRejected)
     ));
     let admitted = success(disclosed_jag(&selected, &keys, &body, &disclosure, now()).unwrap());
-    assert_eq!(admitted.effective_expires_at(), now() + Duration::from_secs(30));
+    assert_eq!(
+        admitted.effective_expires_at(),
+        now() + Duration::from_secs(30)
+    );
     assert_eq!(admitted.granted_scopes(), ["read"]);
     let facts = admitted.assertion().disclosure().unwrap();
     assert_eq!(facts.admitted_claims(), &[IdJagDisclosureClaim::Email]);
-    assert_eq!(facts.configuration_digest(), disclosure.configuration_digest());
+    assert_eq!(
+        facts.configuration_digest(),
+        disclosure.configuration_digest()
+    );
     assert_eq!(facts.generation(), 41);
     let headers = headers();
     let access = serde_json::to_vec(&access_body()).unwrap();
-    let token = success(admitted.admit_access_token_response(
-        EnterpriseTokenResponse { status: 200, headers: &headers, body: &access },
-        now() + Duration::from_secs(1),
-    ).unwrap());
+    let token = success(
+        admitted
+            .admit_access_token_response(
+                EnterpriseTokenResponse {
+                    status: 200,
+                    headers: &headers,
+                    body: &access,
+                },
+                now() + Duration::from_secs(1),
+            )
+            .unwrap(),
+    );
     assert_eq!(token.expires_at(), now() + Duration::from_secs(30));
     assert_eq!(token.granted_scopes(), ["read"]);
     let retained = token.id_jag_disclosure().unwrap();
-    assert_eq!(retained.configuration_digest(), disclosure.configuration_digest());
+    assert_eq!(
+        retained.configuration_digest(),
+        disclosure.configuration_digest()
+    );
     assert_eq!(retained.admitted_claims(), &[IdJagDisclosureClaim::Email]);
     let debug = format!("{retained:?}");
     assert!(!debug.contains("hidden-contact"));
@@ -569,7 +714,12 @@ fn disclosure_review_expiry_cannot_cross_initial_or_final_response_admission() {
         let access = serde_json::to_vec(&access_body()).unwrap();
         assert!(matches!(
             admitted.admit_access_token_response(
-                EnterpriseTokenResponse { status: 200, headers: &headers, body: &access }, time,
+                EnterpriseTokenResponse {
+                    status: 200,
+                    headers: &headers,
+                    body: &access
+                },
+                time,
             ),
             Err(EnterpriseResponseError::InvalidLifetime)
         ));

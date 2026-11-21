@@ -218,7 +218,9 @@ async fn dispatch_with_authorization(
         &authorization,
         cancellation.as_ref(),
         revalidation,
-    ).await {
+    )
+    .await
+    {
         Ok(prepared) => prepared,
         Err(response) => return Ok((ServerHttpEndpointResponse::Immediate(response), None)),
     };
@@ -326,7 +328,9 @@ pub(super) async fn begin_sse(
         &authorization,
         None,
         revalidation,
-    ).await {
+    )
+    .await
+    {
         Ok(prepared) => prepared,
         Err(response) => {
             return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(

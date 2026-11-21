@@ -81,11 +81,7 @@ impl CallbackBoundary {
     // even when its constructor has just cancelled or revoked authority.
     // Check between these two host effects, and drop refused work unpolled.
     // Effects already performed inside the constructor cannot be undone.
-    async fn construct_and_run<T, F>(
-        &self,
-        cx: &Cx,
-        construct: impl FnOnce() -> F,
-    ) -> McpResult<T>
+    async fn construct_and_run<T, F>(&self, cx: &Cx, construct: impl FnOnce() -> F) -> McpResult<T>
     where
         F: Future<Output = McpResult<T>>,
     {
@@ -273,9 +269,12 @@ mod tests {
             // intact: what it asserts about is the handler/boundary transition,
             // not a caller refusal.
             let admit = || Ok(());
-            let mut answer = Box::pin(
-                handlers.invoke_embedded_input_request_async(&cx, "roots", request(), &admit),
-            );
+            let mut answer = Box::pin(handlers.invoke_embedded_input_request_async(
+                &cx,
+                "roots",
+                request(),
+                &admit,
+            ));
             let Poll::Ready(result) = answer
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
@@ -284,9 +283,12 @@ mod tests {
             };
             if close {
                 assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
-                let mut again = Box::pin(
-                    handlers.invoke_embedded_input_request_async(&cx, "roots", request(), &admit),
-                );
+                let mut again = Box::pin(handlers.invoke_embedded_input_request_async(
+                    &cx,
+                    "roots",
+                    request(),
+                    &admit,
+                ));
                 assert!(matches!(
                     again.as_mut().poll(&mut Context::from_waker(Waker::noop())),
                     Poll::Ready(Err(_))
@@ -646,8 +648,9 @@ mod construction_tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(()))
             }));
-            let Poll::Ready(Err(error)) =
-                guarded.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            let Poll::Ready(Err(error)) = guarded
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
             else {
                 panic!("invalid authority must fail without invoking its constructor");
             };
@@ -712,7 +715,10 @@ mod construction_tests {
                 );
             }
             drop(guarded);
-            assert_eq!(counts.constructed.load(Ordering::SeqCst), usize::from(started));
+            assert_eq!(
+                counts.constructed.load(Ordering::SeqCst),
+                usize::from(started)
+            );
             assert_eq!(counts.polled.load(Ordering::SeqCst), usize::from(started));
             assert_eq!(counts.dropped.load(Ordering::SeqCst), usize::from(started));
             assert!(!boundary.closed.is_cancel_requested());

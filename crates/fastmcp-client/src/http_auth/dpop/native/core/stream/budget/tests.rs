@@ -4,14 +4,14 @@ struct Notice;
 impl StreamNotification for Notice {}
 
 #[derive(Default)]
-struct Decoder { used: (usize, usize) }
+struct Decoder {
+    used: (usize, usize),
+}
 
 impl StreamDecoder<Notice> for Decoder {
     type Terminal = ();
 
-    fn admit(&mut self, frame: &[u8], _: bool)
-        -> Result<StreamEvent<(), Notice>, DpopStreamError>
-    {
+    fn admit(&mut self, frame: &[u8], _: bool) -> Result<StreamEvent<(), Notice>, DpopStreamError> {
         let event = match frame {
             b"n" => {
                 self.used.1 += 1;
@@ -25,18 +25,28 @@ impl StreamDecoder<Notice> for Decoder {
     }
 
     fn admit_terminal_tail(&mut self, frame: &[u8]) -> Result<(), DpopStreamError> {
-        if frame != b"t" { return Err(ManagedCoreError::InvalidResponse.into()); }
+        if frame != b"t" {
+            return Err(ManagedCoreError::InvalidResponse.into());
+        }
         self.used.0 += 1;
         self.used.1 += 1;
         Ok(())
     }
 
-    fn usage(&self) -> (usize, usize) { self.used }
+    fn usage(&self) -> (usize, usize) {
+        self.used
+    }
 }
 
 fn limits(events: usize) -> ManagedCoreLimits {
-    ManagedCoreLimits::new(8192, 8192, 32768, events,
-        std::time::Duration::from_secs(60)).unwrap()
+    ManagedCoreLimits::new(
+        8192,
+        8192,
+        32768,
+        events,
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -44,7 +54,10 @@ fn two_decoders_cannot_spend_the_same_last_payload_byte() {
     let budget = SharedStreamBudget::new(limits(3), (32767, 0)).unwrap();
     let mut one = Budgeted::new(Decoder::default(), Some(budget.clone()));
     let mut two = Budgeted::new(Decoder::default(), Some(budget.clone()));
-    assert!(matches!(one.admit(b"r", true).unwrap(), StreamEvent::Result(())));
+    assert!(matches!(
+        one.admit(b"r", true).unwrap(),
+        StreamEvent::Result(())
+    ));
     assert!(two.admit(b"r", true).is_err());
     assert_eq!(two.inner.used, (0, 0), "byte refusal precedes decoding");
     assert_eq!(budget.usage().unwrap(), (32768, 0));
@@ -57,10 +70,17 @@ fn notifications_share_a_cap_but_a_terminal_can_use_remaining_bytes() {
     let mut rpc = Budgeted::new(Decoder::default(), Some(budget.clone()));
     listen.admit(b"n", true).unwrap();
     assert!(rpc.admit(b"n", true).is_err());
-    assert_eq!(budget.usage().unwrap(), (1, 1), "refused event spends neither counter");
+    assert_eq!(
+        budget.usage().unwrap(),
+        (1, 1),
+        "refused event spends neither counter"
+    );
     // A different, still-live decoder can complete; a refused exchange is not reused.
     let mut final_get = Budgeted::new(Decoder::default(), Some(budget.clone()));
-    assert!(matches!(final_get.admit(b"r", true).unwrap(), StreamEvent::Result(())));
+    assert!(matches!(
+        final_get.admit(b"r", true).unwrap(),
+        StreamEvent::Result(())
+    ));
     assert_eq!(budget.usage().unwrap(), (2, 1));
 }
 

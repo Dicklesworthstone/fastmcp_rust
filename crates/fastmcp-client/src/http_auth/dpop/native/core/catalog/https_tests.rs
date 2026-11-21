@@ -59,19 +59,30 @@ fn acceptor() -> TlsAcceptorBuilder {
 async fn fixture() -> (TcpListener, DpopHttpClient, DpopCredential) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = CanonicalHttpUrl::parse(&format!(
-        "https://{}/mcp?tenant=one", listener.local_addr().unwrap(),
-    )).unwrap();
+        "https://{}/mcp?tenant=one",
+        listener.local_addr().unwrap(),
+    ))
+    .unwrap();
     let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
     let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(), target).unwrap();
-    let credential = session.admit_token_response(
-        &issuer, 200,
-        br#"{"access_token":"catalog-access","token_type":"DPoP","expires_in":60}"#,
-        Instant::now(), Duration::from_secs(60),
-    ).unwrap();
+    let credential = session
+        .admit_token_response(
+            &issuer,
+            200,
+            br#"{"access_token":"catalog-access","token_type":"DPoP","expires_in":60}"#,
+            Instant::now(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
     let root = Certificate::from_pem(ROOT).unwrap().remove(0);
     let policy = DpopHttpPolicy::default()
-        .with_resource_root_der(root.as_der().to_vec()).unwrap();
-    (listener, DpopHttpClient::new(session, policy).unwrap(), credential)
+        .with_resource_root_der(root.as_der().to_vec())
+        .unwrap();
+    (
+        listener,
+        DpopHttpClient::new(session, policy).unwrap(),
+        credential,
+    )
 }
 
 fn request(method: &str) -> CoreRequest {
@@ -82,14 +93,24 @@ fn request(method: &str) -> CoreRequest {
             "includeTags":["selected"],
             "_meta":FinalRequestMeta::new(ClientCapabilities::default()),
         })),
-    ).unwrap()
+    )
+    .unwrap()
 }
 
 fn payload(method: &str, empty: bool, cursor: Option<&str>) -> Value {
     let (field, entry) = match method {
-        "tools/list" => ("tools", json!({"name":"private-entry","inputSchema":{"type":"object"}})),
-        "resources/list" => ("resources", json!({"name":"private-entry","uri":"note:///item"})),
-        "resources/templates/list" => ("resourceTemplates", json!({"name":"private-entry","uriTemplate":"note:///{id}"})),
+        "tools/list" => (
+            "tools",
+            json!({"name":"private-entry","inputSchema":{"type":"object"}}),
+        ),
+        "resources/list" => (
+            "resources",
+            json!({"name":"private-entry","uri":"note:///item"}),
+        ),
+        "resources/templates/list" => (
+            "resourceTemplates",
+            json!({"name":"private-entry","uriTemplate":"note:///{id}"}),
+        ),
         "prompts/list" => ("prompts", json!({"name":"private-entry"})),
         _ => panic!("not a catalog"),
     };
@@ -107,17 +128,22 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let (mut one, mut two) = (None, None);
     poll_fn(|task| {
         if one.is_none() {
-            if let Poll::Ready(value) = left.as_mut().poll(task) { one = Some(value); }
+            if let Poll::Ready(value) = left.as_mut().poll(task) {
+                one = Some(value);
+            }
         }
         if two.is_none() {
-            if let Poll::Ready(value) = right.as_mut().poll(task) { two = Some(value); }
+            if let Poll::Ready(value) = right.as_mut().poll(task) {
+                two = Some(value);
+            }
         }
         if one.is_some() && two.is_some() {
             Poll::Ready((one.take().unwrap(), two.take().unwrap()))
         } else {
             Poll::Pending
         }
-    }).await
+    })
+    .await
 }
 
 async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, Value) {
@@ -144,9 +170,12 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, Value) {
 }
 
 fn header<'a>(headers: &'a str, wanted: &str) -> &'a str {
-    let fields: Vec<_> = headers.lines().filter_map(|line| line.split_once(':'))
+    let fields: Vec<_> = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
         .filter(|(name, _)| name.eq_ignore_ascii_case(wanted))
-        .map(|(_, value)| value.trim()).collect();
+        .map(|(_, value)| value.trim())
+        .collect();
     assert_eq!(fields.len(), 1, "one {wanted} field must reach the peer");
     fields[0]
 }
@@ -159,7 +188,10 @@ fn claims(segment: &str) -> Value {
     let (mut bits, mut accumulator) = (0_u32, 0_u32);
     let mut bytes = Vec::new();
     for byte in segment.bytes() {
-        let value = ALPHABET.iter().position(|candidate| *candidate == byte).unwrap() as u32;
+        let value = ALPHABET
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .unwrap() as u32;
         accumulator = (accumulator << 6) | value;
         bits += 6;
         if bits >= 8 {
@@ -173,7 +205,11 @@ fn claims(segment: &str) -> Value {
 }
 
 async fn respond<IO: AsyncWrite + Unpin>(
-    io: &mut IO, id: Value, status: u16, result: Value, nonce: &str,
+    io: &mut IO,
+    id: Value,
+    status: u16,
+    result: Value,
+    nonce: &str,
 ) {
     let body = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
     io.write_all(format!(
@@ -189,7 +225,11 @@ fn check_catalog<T: Serialize>(catalog: &ManagedCatalog<T>) {
     assert!(catalog.page_entries(1).unwrap().is_empty());
     assert_eq!(catalog.page_has_continuation(0), Some(true));
     assert_eq!(catalog.page_has_continuation(2), Some(false));
-    for entry in serde_json::to_value(catalog.entries()).unwrap().as_array().unwrap() {
+    for entry in serde_json::to_value(catalog.entries())
+        .unwrap()
+        .as_array()
+        .unwrap()
+    {
         assert_eq!(entry["name"], "private-entry");
     }
     assert!(!format!("{catalog:?}").contains("private-entry"));
@@ -197,13 +237,23 @@ fn check_catalog<T: Serialize>(catalog: &ManagedCatalog<T>) {
 
 #[test]
 fn https_traversal_preserves_filters_and_uses_fresh_ids_proofs_and_resource_nonces() {
-    for method in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+    for method in [
+        "tools/list",
+        "resources/list",
+        "resources/templates/list",
+        "prompts/list",
+    ] {
         run(|cx| async move {
             let (listener, mut client, credential) = fixture().await;
             let target = client.resource().as_str().to_owned();
             let acceptor = acceptor().build().unwrap();
             let application = client.collect_catalog(
-                &cx, &credential, request(method), "wire", ManagedCoreLimits::default(), CatalogLimits::default(),
+                &cx,
+                &credential,
+                request(method),
+                "wire",
+                ManagedCoreLimits::default(),
+                CatalogLimits::default(),
             );
             let server = async {
                 let mut identities = HashSet::new();
@@ -219,7 +269,10 @@ fn https_traversal_preserves_filters_and_uses_fresh_ids_proofs_and_resource_nonc
                     assert_eq!(body["method"], method);
                     assert_eq!(body["id"], format!("wire.{index}"));
                     assert_eq!(body["params"]["includeTags"], json!(["selected"]));
-                    assert_eq!(body["params"].get("cursor"), (index != 0).then_some(&json!("same-雪%2F")));
+                    assert_eq!(
+                        body["params"].get("cursor"),
+                        (index != 0).then_some(&json!("same-雪%2F"))
+                    );
                     let segments: Vec<_> = header(&head, "dpop").split('.').collect();
                     assert_eq!(segments.len(), 3);
                     assert!(!segments[2].is_empty());
@@ -228,29 +281,57 @@ fn https_traversal_preserves_filters_and_uses_fresh_ids_proofs_and_resource_nonc
                     assert_eq!(protected["typ"], "dpop+jwt");
                     assert_eq!(protected["alg"], "ES256");
                     assert!(protected["jwk"].get("d").is_none());
-                    if let Some(key) = &key { assert_eq!(&protected["jwk"], key); }
+                    if let Some(key) = &key {
+                        assert_eq!(&protected["jwk"], key);
+                    }
                     key = Some(protected["jwk"].clone());
                     assert_eq!(proof["htm"], "POST");
                     assert_eq!(proof["htu"], target.split('?').next().unwrap());
                     assert_eq!(proof["ath"], "AOO12QmN2BnA56Mimn-9ypA5UgHbRqWGhu4E9AXpTJU");
                     assert!(identities.insert(proof["jti"].as_str().unwrap().to_owned()));
-                    assert_eq!(proof["nonce"].as_str(), match index { 0 => None, 1 => Some("nonce-0"), _ => Some("nonce-1") });
+                    assert_eq!(
+                        proof["nonce"].as_str(),
+                        match index {
+                            0 => None,
+                            1 => Some("nonce-0"),
+                            _ => Some("nonce-1"),
+                        }
+                    );
                     respond(
-                        &mut socket, body["id"].clone(), 200,
-                        payload(method, index == 1, if index == 2 { None } else { Some("same-雪%2F") }),
+                        &mut socket,
+                        body["id"].clone(),
+                        200,
+                        payload(
+                            method,
+                            index == 1,
+                            if index == 2 {
+                                None
+                            } else {
+                                Some("same-雪%2F")
+                            },
+                        ),
                         &format!("nonce-{index}"),
-                    ).await;
+                    )
+                    .await;
                 }
             };
             let (result, ()) = pair(application, server).await;
             match (method, result.unwrap()) {
                 ("tools/list", CatalogCollection::Tools(catalog)) => check_catalog(&catalog),
-                ("resources/list", CatalogCollection::Resources(catalog)) => check_catalog(&catalog),
-                ("resources/templates/list", CatalogCollection::Templates(catalog)) => check_catalog(&catalog),
+                ("resources/list", CatalogCollection::Resources(catalog)) => {
+                    check_catalog(&catalog)
+                }
+                ("resources/templates/list", CatalogCollection::Templates(catalog)) => {
+                    check_catalog(&catalog)
+                }
                 ("prompts/list", CatalogCollection::Prompts(catalog)) => check_catalog(&catalog),
                 _ => panic!("the initial method must own the complete catalog"),
             }
-            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                listener
+                    .poll_accept(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         });
     }
 }
@@ -261,9 +342,19 @@ fn https_catalog_bounds_and_bad_continuations_never_replay_or_publish_partial_en
         run(|cx| async move {
             let (listener, mut client, credential) = fixture().await;
             let acceptor = acceptor().build().unwrap();
-            let limits = CatalogLimits::new(if case == 1 { 1 } else { 2 }, if case == 2 { 1 } else { 2 }, 8192).unwrap();
+            let limits = CatalogLimits::new(
+                if case == 1 { 1 } else { 2 },
+                if case == 2 { 1 } else { 2 },
+                8192,
+            )
+            .unwrap();
             let application = client.collect_catalog(
-                &cx, &credential, request("tools/list"), "bound", ManagedCoreLimits::default(), limits,
+                &cx,
+                &credential,
+                request("tools/list"),
+                "bound",
+                ManagedCoreLimits::default(),
+                limits,
             );
             let server = async {
                 let expected = if case == 1 { 1 } else { 2 };
@@ -273,27 +364,61 @@ fn https_catalog_bounds_and_bad_continuations_never_replay_or_publish_partial_en
                     let (_, body) = read_request(&mut socket).await;
                     assert_eq!(body["id"], format!("bound.{index}"));
                     let second = index == 1;
-                    let id = if case == 3 && second { json!("bound.0") } else { body["id"].clone() };
+                    let id = if case == 3 && second {
+                        json!("bound.0")
+                    } else {
+                        body["id"].clone()
+                    };
                     respond(
-                        &mut socket, id, if case == 4 && second { 401 } else { 200 },
-                        payload("tools/list", false, if second { None } else { Some("next") }), "admitted-nonce",
-                    ).await;
+                        &mut socket,
+                        id,
+                        if case == 4 && second { 401 } else { 200 },
+                        payload(
+                            "tools/list",
+                            false,
+                            if second { None } else { Some("next") },
+                        ),
+                        "admitted-nonce",
+                    )
+                    .await;
                 }
             };
             let (result, ()) = pair(application, server).await;
             match case {
                 0 => {
-                    let CatalogCollection::Tools(catalog) = result.unwrap() else { panic!("wrong catalog"); };
+                    let CatalogCollection::Tools(catalog) = result.unwrap() else {
+                        panic!("wrong catalog");
+                    };
                     assert_eq!(catalog.entries().len(), 2);
                     assert_eq!(catalog.page_count(), 2);
                 }
-                1 => assert!(matches!(result, Err(DpopCatalogError::Catalog(CatalogError::PageLimit)))),
-                2 => assert!(matches!(result, Err(DpopCatalogError::Catalog(CatalogError::EntryLimit)))),
-                3 => assert!(matches!(result, Err(DpopCatalogError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseIdMismatch))))),
-                _ => assert!(matches!(result, Err(DpopCatalogError::Core(DpopCoreError::Protocol(ManagedCoreError::HttpStatus { status: 401 }))))),
+                1 => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Catalog(CatalogError::PageLimit))
+                )),
+                2 => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Catalog(CatalogError::EntryLimit))
+                )),
+                3 => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::ResponseIdMismatch
+                    )))
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::HttpStatus { status: 401 }
+                    )))
+                )),
             }
             assert!(!client.revocation_handle().is_revoked());
-            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                listener
+                    .poll_accept(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         });
     }
 }
@@ -309,20 +434,36 @@ fn https_stalled_continuation_retires_on_cancellation_revocation_or_owner_abando
             let owner = client.revocation_handle();
             let application = async {
                 let mut operation = pin!(client.collect_catalog_with_cancellation(
-                    &cx, &cancelled, &credential, request("tools/list"), "stop", ManagedCoreLimits::default(), CatalogLimits::default(),
+                    &cx,
+                    &cancelled,
+                    &credential,
+                    request("tools/list"),
+                    "stop",
+                    ManagedCoreLimits::default(),
+                    CatalogLimits::default(),
                 ));
                 let mut dropped = pin!(abandon.cancelled());
                 poll_fn(|task| {
-                    if dropped.as_mut().poll(task).is_ready() { return Poll::Ready(None); }
+                    if dropped.as_mut().poll(task).is_ready() {
+                        return Poll::Ready(None);
+                    }
                     operation.as_mut().poll(task).map(Some)
-                }).await
+                })
+                .await
             };
             let server = async {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut socket = acceptor.accept(socket).await.unwrap();
                 let (_, body) = read_request(&mut socket).await;
                 assert_eq!(body["id"], "stop.0");
-                respond(&mut socket, body["id"].clone(), 200, payload("tools/list", false, Some("next")), "next-nonce").await;
+                respond(
+                    &mut socket,
+                    body["id"].clone(),
+                    200,
+                    payload("tools/list", false, Some("next")),
+                    "next-nonce",
+                )
+                .await;
                 drop(socket);
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut socket = acceptor.accept(socket).await.unwrap();
@@ -331,35 +472,68 @@ fn https_stalled_continuation_retires_on_cancellation_revocation_or_owner_abando
                 // No second-page response exists. This proves that pending
                 // network ownership, not just a post-response check, retires.
                 match cause {
-                    0 => { cancelled.cancel(); }
-                    1 => { credential.revoke(); }
-                    2 => { owner.revoke(); }
-                    _ => { abandon.cancel(); }
+                    0 => {
+                        cancelled.cancel();
+                    }
+                    1 => {
+                        credential.revoke();
+                    }
+                    2 => {
+                        owner.revoke();
+                    }
+                    _ => {
+                        abandon.cancel();
+                    }
                 }
                 let mut byte = [0];
                 assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0));
             };
             let (result, ()) = pair(application, server).await;
             match cause {
-                0 => assert!(matches!(result, Some(Err(DpopCatalogError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled)))))),
-                1 | 2 => assert!(matches!(result, Some(Err(DpopCatalogError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(_))))))),
+                0 => assert!(matches!(
+                    result,
+                    Some(Err(DpopCatalogError::Core(DpopCoreError::Transport(
+                        DpopHttpError::Cancelled
+                    ))))
+                )),
+                1 | 2 => assert!(matches!(
+                    result,
+                    Some(Err(DpopCatalogError::Core(DpopCoreError::Transport(
+                        DpopHttpError::Authorization(_)
+                    ))))
+                )),
                 _ => assert!(result.is_none()),
             }
             assert_eq!(owner.is_revoked(), cause == 2);
             assert!(!cx.is_cancel_requested());
-            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                listener
+                    .poll_accept(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             if cause == 0 || cause == 3 {
                 // A separate explicit operation can still use the live session
                 // and credential after request cancellation or abandonment.
                 let next = client.request_core(
-                    &cx, &credential, request("tools/list"), RequestId::Number(99), ManagedCoreLimits::default(),
+                    &cx,
+                    &credential,
+                    request("tools/list"),
+                    RequestId::Number(99),
+                    ManagedCoreLimits::default(),
                 );
                 let peer = async {
                     let (socket, _) = listener.accept().await.unwrap();
                     let mut socket = acceptor.accept(socket).await.unwrap();
                     let (_, body) = read_request(&mut socket).await;
                     assert_eq!(body["id"], 99);
-                    respond(&mut socket, body["id"].clone(), 200, payload("tools/list", false, None), "later").await;
+                    respond(
+                        &mut socket,
+                        body["id"].clone(),
+                        200,
+                        payload("tools/list", false, None),
+                        "later",
+                    )
+                    .await;
                 };
                 let (result, ()) = pair(next, peer).await;
                 assert!(result.is_ok());
@@ -372,10 +546,19 @@ fn https_stalled_continuation_retires_on_cancellation_revocation_or_owner_abando
 fn https_catalog_deadline_includes_time_spent_on_the_previous_page() {
     run(|cx| async move {
         let (listener, mut client, credential) = fixture().await;
-        client.policy = client.policy.clone().with_timeout(Duration::from_secs(3)).unwrap();
+        client.policy = client
+            .policy
+            .clone()
+            .with_timeout(Duration::from_secs(3))
+            .unwrap();
         let acceptor = acceptor().build().unwrap();
         let application = client.collect_catalog(
-            &cx, &credential, request("tools/list"), "deadline", ManagedCoreLimits::default(), CatalogLimits::default(),
+            &cx,
+            &credential,
+            request("tools/list"),
+            "deadline",
+            ManagedCoreLimits::default(),
+            CatalogLimits::default(),
         );
         let server = async {
             let (socket, _) = listener.accept().await.unwrap();
@@ -384,7 +567,14 @@ fn https_catalog_deadline_includes_time_spent_on_the_previous_page() {
             assert_eq!(body["id"], "deadline.0");
             // Deliberately consume most of the original three-second budget.
             asupersync::time::sleep(cx.now(), Duration::from_secs(2)).await;
-            respond(&mut socket, body["id"].clone(), 200, payload("tools/list", false, Some("next")), "next").await;
+            respond(
+                &mut socket,
+                body["id"].clone(),
+                200,
+                payload("tools/list", false, Some("next")),
+                "next",
+            )
+            .await;
             drop(socket);
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = acceptor.accept(socket).await.unwrap();
@@ -396,19 +586,32 @@ fn https_catalog_deadline_includes_time_spent_on_the_previous_page() {
             started.elapsed()
         };
         let (result, second_page_wait) = pair(application, server).await;
-        assert!(matches!(result, Err(DpopCatalogError::Core(DpopCoreError::Transport(DpopHttpError::TimedOut)))));
+        assert!(matches!(
+            result,
+            Err(DpopCatalogError::Core(DpopCoreError::Transport(
+                DpopHttpError::TimedOut
+            )))
+        ));
         // A fresh three-second timeout for page two violates this assertion.
         // The margin allows scheduling overhead without erasing the distinction.
         assert!(second_page_wait < Duration::from_secs(2));
-        assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            listener
+                .poll_accept(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         assert!(!client.revocation_handle().is_revoked());
     });
 }
 
-const CATALOG_CHANGE: &str = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\r\n\r\n";
+const CATALOG_CHANGE: &str =
+    "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\r\n\r\n";
 
 fn result_event(id: Value, result: Value) -> String {
-    format!("data: {}\r\n\r\n", json!({"jsonrpc":"2.0","id":id,"result":result}))
+    format!(
+        "data: {}\r\n\r\n",
+        json!({"jsonrpc":"2.0","id":id,"result":result})
+    )
 }
 
 async fn respond_events<IO: AsyncWrite + Unpin>(io: &mut IO, body: &str, nonce: &str) {
@@ -416,7 +619,8 @@ async fn respond_events<IO: AsyncWrite + Unpin>(io: &mut IO, body: &str, nonce: 
     // client before the peer's TLS close-notify completes. The test's result
     // and request-count assertions, not teardown success, decide admission.
     let bytes = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nDPoP-Nonce: {nonce}\r\nConnection: close\r\n\r\n{body}", body.len(),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nDPoP-Nonce: {nonce}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
     );
     io.write_all(bytes.as_bytes()).await.unwrap();
     let _ = io.shutdown().await;
@@ -424,16 +628,29 @@ async fn respond_events<IO: AsyncWrite + Unpin>(io: &mut IO, body: &str, nonce: 
 
 #[test]
 fn https_streaming_catalog_preserves_mixed_pages_filters_proofs_and_nonces() {
-    for method in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+    for method in [
+        "tools/list",
+        "resources/list",
+        "resources/templates/list",
+        "prompts/list",
+    ] {
         run(|cx| async move {
             let (listener, mut client, credential) = fixture().await;
             let acceptor = acceptor().build().unwrap();
             let cancellation = McpRequestCancellation::new();
             let mut observed = 0;
             let application = client.collect_catalog_with_events(
-                &cx, &cancellation, &credential, request(method), "stream",
-                DpopStreamLimits::default(), CatalogLimits::default(),
-                |_| { observed += 1; true },
+                &cx,
+                &cancellation,
+                &credential,
+                request(method),
+                "stream",
+                DpopStreamLimits::default(),
+                CatalogLimits::default(),
+                |_| {
+                    observed += 1;
+                    true
+                },
             );
             let server = async {
                 let mut proofs = HashSet::new();
@@ -442,23 +659,46 @@ fn https_streaming_catalog_preserves_mixed_pages_filters_proofs_and_nonces() {
                     let mut socket = acceptor.accept(socket).await.unwrap();
                     let (head, body) = read_request(&mut socket).await;
                     let accept = header(&head, "accept");
-                    assert!(accept.contains("application/json") && accept.contains("text/event-stream"));
+                    assert!(
+                        accept.contains("application/json") && accept.contains("text/event-stream")
+                    );
                     assert_eq!(header(&head, "authorization"), "DPoP catalog-access");
                     assert_eq!(header(&head, "mcp-method"), method);
                     assert_eq!(body["id"], format!("stream.{index}"));
                     assert_eq!(body["method"], method);
                     assert_eq!(body["params"]["includeTags"], json!(["selected"]));
-                    assert_eq!(body["params"].get("cursor"), (index != 0).then_some(&json!("same-雪%2F")));
+                    assert_eq!(
+                        body["params"].get("cursor"),
+                        (index != 0).then_some(&json!("same-雪%2F"))
+                    );
                     let segments: Vec<_> = header(&head, "dpop").split('.').collect();
                     assert_eq!(segments.len(), 3);
                     let proof = claims(segments[1]);
                     assert!(proofs.insert(proof["jti"].as_str().unwrap().to_owned()));
-                    assert_eq!(proof["nonce"].as_str(), match index { 0 => None, 1 => Some("stream-0"), _ => Some("stream-1") });
-                    let page = payload(method, index == 1, if index == 2 { None } else { Some("same-雪%2F") });
+                    assert_eq!(
+                        proof["nonce"].as_str(),
+                        match index {
+                            0 => None,
+                            1 => Some("stream-0"),
+                            _ => Some("stream-1"),
+                        }
+                    );
+                    let page = payload(
+                        method,
+                        index == 1,
+                        if index == 2 {
+                            None
+                        } else {
+                            Some("same-雪%2F")
+                        },
+                    );
                     if index == 1 {
                         respond(&mut socket, body["id"].clone(), 200, page, "stream-1").await;
                     } else {
-                        let events = format!(": heartbeat\r\n{CATALOG_CHANGE}{}", result_event(body["id"].clone(), page));
+                        let events = format!(
+                            ": heartbeat\r\n{CATALOG_CHANGE}{}",
+                            result_event(body["id"].clone(), page)
+                        );
                         respond_events(&mut socket, &events, &format!("stream-{index}")).await;
                     }
                 }
@@ -467,12 +707,20 @@ fn https_streaming_catalog_preserves_mixed_pages_filters_proofs_and_nonces() {
             assert_eq!(observed, 2);
             match (method, result.unwrap()) {
                 ("tools/list", CatalogCollection::Tools(catalog)) => check_catalog(&catalog),
-                ("resources/list", CatalogCollection::Resources(catalog)) => check_catalog(&catalog),
-                ("resources/templates/list", CatalogCollection::Templates(catalog)) => check_catalog(&catalog),
+                ("resources/list", CatalogCollection::Resources(catalog)) => {
+                    check_catalog(&catalog)
+                }
+                ("resources/templates/list", CatalogCollection::Templates(catalog)) => {
+                    check_catalog(&catalog)
+                }
                 ("prompts/list", CatalogCollection::Prompts(catalog)) => check_catalog(&catalog),
                 _ => panic!("the original method must own the complete streaming catalog"),
             }
-            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                listener
+                    .poll_accept(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         });
     }
 }
@@ -486,16 +734,28 @@ fn https_streaming_catalog_waits_for_clean_eof_before_following_a_cursor() {
             let cancellation = McpRequestCancellation::new();
             let mut observed = 0;
             let application = client.collect_catalog_with_events(
-                &cx, &cancellation, &credential, request("tools/list"), "tail",
-                DpopStreamLimits::default(), CatalogLimits::default(),
-                |_| { observed += 1; true },
+                &cx,
+                &cancellation,
+                &credential,
+                request("tools/list"),
+                "tail",
+                DpopStreamLimits::default(),
+                CatalogLimits::default(),
+                |_| {
+                    observed += 1;
+                    true
+                },
             );
             let server = async {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut socket = acceptor.accept(socket).await.unwrap();
                 let (_, body) = read_request(&mut socket).await;
                 assert_eq!(body["id"], "tail.0");
-                let id = if case == 4 { json!("unrelated") } else { body["id"].clone() };
+                let id = if case == 4 {
+                    json!("unrelated")
+                } else {
+                    body["id"].clone()
+                };
                 let terminal = result_event(id, payload("tools/list", false, Some("next")));
                 let events = match case {
                     1 => format!("{terminal}{terminal}"),
@@ -510,21 +770,47 @@ fn https_streaming_catalog_waits_for_clean_eof_before_following_a_cursor() {
                     let (_, body) = read_request(&mut socket).await;
                     assert_eq!(body["id"], "tail.1");
                     assert_eq!(body["params"]["cursor"], "next");
-                    respond(&mut socket, body["id"].clone(), 200, payload("tools/list", false, None), "tail-1").await;
+                    respond(
+                        &mut socket,
+                        body["id"].clone(),
+                        200,
+                        payload("tools/list", false, None),
+                        "tail-1",
+                    )
+                    .await;
                 }
             };
             let (result, ()) = pair(application, server).await;
-            assert_eq!(observed, 0, "late notifications must not escape the terminal boundary");
+            assert_eq!(
+                observed, 0,
+                "late notifications must not escape the terminal boundary"
+            );
             match case {
                 0 => {
-                    let CatalogCollection::Tools(catalog) = result.unwrap() else { panic!("wrong catalog"); };
+                    let CatalogCollection::Tools(catalog) = result.unwrap() else {
+                        panic!("wrong catalog");
+                    };
                     assert_eq!(catalog.entries().len(), 2);
                     assert_eq!(catalog.page_count(), 2);
                 }
-                4 => assert!(matches!(result, Err(DpopCatalogError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseIdMismatch))))),
-                _ => assert!(matches!(result, Err(DpopCatalogError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResponse))))),
+                4 => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::ResponseIdMismatch
+                    )))
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::InvalidResponse
+                    )))
+                )),
             }
-            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                listener
+                    .poll_accept(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             assert!(!client.revocation_handle().is_revoked());
         });
     }
@@ -538,18 +824,35 @@ fn https_streaming_catalog_notification_limits_and_observer_stops_span_pages() {
             let acceptor = acceptor().build().unwrap();
             let cancellation = McpRequestCancellation::new();
             let core = ManagedCoreLimits::new(
-                8192, 8192, 32768, if case == 1 { 1 } else { 2 }, Duration::from_secs(60),
-            ).unwrap();
+                8192,
+                8192,
+                32768,
+                if case == 1 { 1 } else { 2 },
+                Duration::from_secs(60),
+            )
+            .unwrap();
             let limits = DpopStreamLimits::new(core, Duration::from_secs(10)).unwrap();
             let mut observed = 0;
             let application = client.collect_catalog_with_events(
-                &cx, &cancellation, &credential, request("tools/list"), "observe",
-                limits, CatalogLimits::default(), |_| {
+                &cx,
+                &cancellation,
+                &credential,
+                request("tools/list"),
+                "observe",
+                limits,
+                CatalogLimits::default(),
+                |_| {
                     observed += 1;
                     match case {
                         2 => false,
-                        3 => { cancellation.cancel(); true }
-                        4 => { credential.revoke(); true }
+                        3 => {
+                            cancellation.cancel();
+                            true
+                        }
+                        4 => {
+                            credential.revoke();
+                            true
+                        }
                         5 => panic!("catalog observer failure"),
                         _ => true,
                     }
@@ -562,28 +865,63 @@ fn https_streaming_catalog_notification_limits_and_observer_stops_span_pages() {
                     let (_, body) = read_request(&mut socket).await;
                     assert_eq!(body["id"], format!("observe.{index}"));
                     let terminal = result_event(
-                        body["id"].clone(), payload("tools/list", false, if index == 0 { Some("next") } else { None }),
+                        body["id"].clone(),
+                        payload(
+                            "tools/list",
+                            false,
+                            if index == 0 { Some("next") } else { None },
+                        ),
                     );
-                    respond_events(&mut socket, &format!("{CATALOG_CHANGE}{terminal}"), "observe-nonce").await;
+                    respond_events(
+                        &mut socket,
+                        &format!("{CATALOG_CHANGE}{terminal}"),
+                        "observe-nonce",
+                    )
+                    .await;
                 }
             };
             let (result, ()) = pair(application, server).await;
             assert_eq!(observed, if case == 0 { 2 } else { 1 });
             match case {
                 0 => {
-                    let CatalogCollection::Tools(catalog) = result.unwrap() else { panic!("wrong catalog"); };
+                    let CatalogCollection::Tools(catalog) = result.unwrap() else {
+                        panic!("wrong catalog");
+                    };
                     assert_eq!(catalog.page_count(), 2);
                     assert_eq!(catalog.entries().len(), 2);
                 }
-                1 => assert!(matches!(result, Err(DpopCatalogError::Core(DpopCoreError::Protocol(_))))),
-                2 => assert!(matches!(result, Err(DpopCatalogError::Stream(DpopStreamError::ObserverStopped)))),
-                3 => assert!(matches!(result, Err(DpopCatalogError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled))))),
-                4 => assert!(matches!(result, Err(DpopCatalogError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(_)))))),
-                _ => assert!(matches!(result, Err(DpopCatalogError::Stream(DpopStreamError::ObserverPanicked)))),
+                1 => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Core(DpopCoreError::Protocol(_)))
+                )),
+                2 => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Stream(DpopStreamError::ObserverStopped))
+                )),
+                3 => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Core(DpopCoreError::Transport(
+                        DpopHttpError::Cancelled
+                    )))
+                )),
+                4 => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Core(DpopCoreError::Transport(
+                        DpopHttpError::Authorization(_)
+                    )))
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(DpopCatalogError::Stream(DpopStreamError::ObserverPanicked))
+                )),
             }
             assert!(!cx.is_cancel_requested());
             assert!(!client.revocation_handle().is_revoked());
-            assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                listener
+                    .poll_accept(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         });
     }
 }
@@ -592,12 +930,22 @@ fn https_streaming_catalog_notification_limits_and_observer_stops_span_pages() {
 fn https_streaming_catalog_keeps_the_original_deadline_after_a_complete_page() {
     run(|cx| async move {
         let (listener, mut client, credential) = fixture().await;
-        client.policy = client.policy.clone().with_timeout(Duration::from_secs(3)).unwrap();
+        client.policy = client
+            .policy
+            .clone()
+            .with_timeout(Duration::from_secs(3))
+            .unwrap();
         let acceptor = acceptor().build().unwrap();
         let cancellation = McpRequestCancellation::new();
         let application = client.collect_catalog_with_events(
-            &cx, &cancellation, &credential, request("tools/list"), "stream-deadline",
-            DpopStreamLimits::default(), CatalogLimits::default(), |_| true,
+            &cx,
+            &cancellation,
+            &credential,
+            request("tools/list"),
+            "stream-deadline",
+            DpopStreamLimits::default(),
+            CatalogLimits::default(),
+            |_| true,
         );
         let server = async {
             let (socket, _) = listener.accept().await.unwrap();
@@ -605,7 +953,10 @@ fn https_streaming_catalog_keeps_the_original_deadline_after_a_complete_page() {
             let (_, body) = read_request(&mut socket).await;
             assert_eq!(body["id"], "stream-deadline.0");
             asupersync::time::sleep(cx.now(), Duration::from_secs(2)).await;
-            let events = result_event(body["id"].clone(), payload("tools/list", false, Some("next")));
+            let events = result_event(
+                body["id"].clone(),
+                payload("tools/list", false, Some("next")),
+            );
             respond_events(&mut socket, &events, "deadline-next").await;
             drop(socket);
             let (socket, _) = listener.accept().await.unwrap();
@@ -618,9 +969,18 @@ fn https_streaming_catalog_keeps_the_original_deadline_after_a_complete_page() {
             started.elapsed()
         };
         let (result, second_page_wait) = pair(application, server).await;
-        assert!(matches!(result, Err(DpopCatalogError::Core(DpopCoreError::Transport(DpopHttpError::TimedOut)))));
+        assert!(matches!(
+            result,
+            Err(DpopCatalogError::Core(DpopCoreError::Transport(
+                DpopHttpError::TimedOut
+            )))
+        ));
         assert!(second_page_wait < Duration::from_secs(2));
-        assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            listener
+                .poll_accept(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         assert!(!client.revocation_handle().is_revoked());
     });
 }

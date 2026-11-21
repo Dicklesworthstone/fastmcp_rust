@@ -305,7 +305,11 @@ fn dynamic_scopes_do_not_need_to_be_advertised_but_native_trust_still_applies() 
     let issuer = &endpoint_plan.issuers[0];
     let body = issuer_document(serde_json::json!(["unrelated-basic"]));
     let configuration = approved
-        .admit_issuer(issuer, SecurityDocumentKind::AuthorizationServerMetadata, &body)
+        .admit_issuer(
+            issuer,
+            SecurityDocumentKind::AuthorizationServerMetadata,
+            &body,
+        )
         .unwrap();
     let expected = OAuthClientConfiguration::from_trusted_endpoints(
         "https://issuer.example",

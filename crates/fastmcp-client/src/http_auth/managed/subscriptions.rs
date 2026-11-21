@@ -29,8 +29,7 @@ use fastmcp_protocol::tasks_extension::{
 use fastmcp_protocol::{
     CompleteResult, CoreRequest, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
     FinalCancelledNotificationParams, FinalSubscriptionsListenResult, JsonInteger, RequestId,
-    ServerNotification, SubscriptionFilter,
-    decode_strict_jsonrpc_response,
+    ServerNotification, SubscriptionFilter, decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::{CoreResult, ExtensionDirection, FinalCoreResult};
@@ -990,8 +989,12 @@ mod tests {
         }
         let params = json!({"_meta":meta,"notifications":{"toolsListChanged":true}});
         let make_request = || {
-            CoreRequest::decode(ProtocolEra::Modern2026, "subscriptions/listen", Some(&params))
-                .unwrap()
+            CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                "subscriptions/listen",
+                Some(&params),
+            )
+            .unwrap()
         };
         let id = RequestId::Number(1);
         let (wire, _) = prepare(
@@ -1006,13 +1009,8 @@ mod tests {
         let limits = |request_bytes| {
             ManagedSubscriptionLimits::new(request_bytes, 1024, 4, Duration::from_secs(1)).unwrap()
         };
-        let (exact, _) = prepare(
-            "https://mcp.example/mcp",
-            make_request(),
-            &id,
-            limits(size),
-        )
-        .unwrap();
+        let (exact, _) =
+            prepare("https://mcp.example/mcp", make_request(), &id, limits(size)).unwrap();
         assert_eq!(exact.body(), wire.body());
         assert!(matches!(
             prepare(

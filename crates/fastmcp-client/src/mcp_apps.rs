@@ -1027,9 +1027,7 @@ impl McpAppsWireHostConfiguration {
 /// handle without changing its cleanup authority or original deadline.
 #[derive(Default)]
 pub struct McpAppsWireHostCleanup<'operation> {
-    future: Option<
-        Pin<Box<dyn Future<Output = Result<(), McpAppsHostError>> + Send + 'operation>>,
-    >,
+    future: Option<Pin<Box<dyn Future<Output = Result<(), McpAppsHostError>> + Send + 'operation>>>,
 }
 
 impl<'operation> McpAppsWireHostCleanup<'operation> {
@@ -2406,10 +2404,9 @@ async fn receive_wire_host_frame<T: McpAppsWireBridgeTransport>(
         .map(|deadline| Box::pin(Sleep::new(deadline)));
     // An async trait may use a synchronous future factory. Defer that factory
     // too, so construction cannot precede the caller's authority boundary.
-    let mut incoming = pin!(CallerContextFuture::new(
-        &owner,
-        async { transport.receive_from_view(cx).await }
-    ));
+    let mut incoming = pin!(CallerContextFuture::new(&owner, async {
+        transport.receive_from_view(cx).await
+    }));
     poll_fn(|task| {
         owner = wire_caller_snapshot(&owner);
         with_caller_context(&owner, || {
@@ -2460,9 +2457,7 @@ async fn await_wire_operation<T>(
     // synchronous construction also runs inside the retained caller context.
     // A catalog continuation can retain an older, broader deadline owner.
     // The current waiter and live ambient frame can only narrow its effects.
-    let owner = with_caller_context(caller, || {
-        wire_caller_snapshot(&deadline.owner)
-    });
+    let owner = with_caller_context(caller, || wire_caller_snapshot(&deadline.owner));
     // Own the complete wait, including timers and their retained wakers, so
     // abandoning an outbound send cannot widen any destructor's authority.
     CallerContextFuture::new(&owner, async {
@@ -2495,7 +2490,8 @@ async fn await_wire_operation<T>(
                 if deadline.expired() {
                     return Poll::Ready(Err(McpAppsHostError::DeadlineExceeded));
                 }
-                if deadline.owner.checkpoint().is_err() || cancelled.as_mut().poll(task).is_ready() {
+                if deadline.owner.checkpoint().is_err() || cancelled.as_mut().poll(task).is_ready()
+                {
                     return Poll::Ready(Err(McpAppsHostError::Core(McpError::request_cancelled())));
                 }
                 let owner_timer_available =
@@ -3496,11 +3492,10 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 if let Some(policy) = &self.sandbox_policy {
                     McpAppsJsonRpcEnvelope::validate_response_for(method, &result)
                         .map_err(McpAppsHostError::Bridge)?;
-                    let initialized: McpAppsPinnedInitializeResult =
-                        decode_params(Some(&result))?;
-                    let expected = Some(
-                        fastmcp_protocol::McpAppsSandboxCapabilities::from_policy(policy),
-                    );
+                    let initialized: McpAppsPinnedInitializeResult = decode_params(Some(&result))?;
+                    let expected = Some(fastmcp_protocol::McpAppsSandboxCapabilities::from_policy(
+                        policy,
+                    ));
                     if initialized.host_capabilities.sandbox != expected {
                         return Err(wire_policy_denied());
                     }
@@ -3567,11 +3562,9 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                         disconnected: &mut self.disconnected,
                         committed: false,
                     };
-                    await_wire_operation(
-                        cx,
-                        &request.deadline,
-                        async { self.transport.send_to_view(cx, frame).await },
-                    )
+                    await_wire_operation(cx, &request.deadline, async {
+                        self.transport.send_to_view(cx, frame).await
+                    })
                     .await?;
                     if let Some(previous) = request.previous {
                         self.server_catalogs.cursors.remove(&previous);
@@ -3649,11 +3642,11 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 }
                 wire_policy_checkpoint(cx, cancellation)?;
                 let deadline = WireHostDeadline::new(cx);
-                let sampled = await_wire_operation(
-                    cx,
-                    &deadline,
-                    async { policy.sampling_create_message(cx, cancellation, &params).await },
-                )
+                let sampled = await_wire_operation(cx, &deadline, async {
+                    policy
+                        .sampling_create_message(cx, cancellation, &params)
+                        .await
+                })
                 .await?;
                 wire_policy_checkpoint(cx, cancellation)?;
                 let result = encode_wire_host_request_params(sampled)?;
@@ -3843,11 +3836,9 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                             .absolute
                             .min(cx.now().saturating_add_nanos(remaining));
                     }
-                    await_wire_operation(
-                        cx,
-                        &callback_deadline,
-                        async { self.policy.progress(&request_id, &params).await },
-                    )
+                    await_wire_operation(cx, &callback_deadline, async {
+                        self.policy.progress(&request_id, &params).await
+                    })
                     .await?;
                 }
                 return Ok(());
@@ -3985,11 +3976,9 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 if cx.checkpoint().is_err() {
                     return Err(McpAppsHostError::Core(McpError::request_cancelled()));
                 }
-                await_wire_operation(
-                    cx,
-                    &operation_deadline,
-                    async { self.policy.approve_view_tool_call(cx, &tool, params).await },
-                )
+                await_wire_operation(cx, &operation_deadline, async {
+                    self.policy.approve_view_tool_call(cx, &tool, params).await
+                })
                 .await?;
                 if cx.checkpoint().is_err() {
                     return Err(McpAppsHostError::Core(McpError::request_cancelled()));
@@ -4244,11 +4233,9 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         let frame = envelope
             .encode(McpAppsBridgeDirection::HostToView)
             .map_err(McpAppsHostError::Bridge)?;
-        await_wire_operation(
-            cx,
-            &WireHostDeadline::new(cx),
-            async { self.transport.send_to_view(cx, frame).await },
-        )
+        await_wire_operation(cx, &WireHostDeadline::new(cx), async {
+            self.transport.send_to_view(cx, frame).await
+        })
         .await
     }
 }
@@ -6294,7 +6281,8 @@ exec sleep 10
                         let parameters = request["params"].as_object().unwrap();
                         assert!(parameters.keys().all(|key| key == "_meta"));
                         #[cfg(feature = "tasks")]
-                        let tasks_ext_id = fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
+                        let tasks_ext_id =
+                            fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
                         #[cfg(not(feature = "tasks"))]
                         let tasks_ext_id = "io.modelcontextprotocol/tasks";
                         assert!(
@@ -6374,13 +6362,7 @@ exec sleep 10
                 ])
                 .unwrap(),
             )
-            .request_timeout_policy(
-                crate::RequestTimeoutPolicy::new(
-                    timeout,
-                    timeout,
-                )
-                .unwrap(),
-            )
+            .request_timeout_policy(crate::RequestTimeoutPolicy::new(timeout, timeout).unwrap())
             .connect_http_client_with_cx(cx)
             .await
             .unwrap()
@@ -10398,8 +10380,7 @@ exec sleep 10
         };
         view.send_to_host(
             cx,
-            json!({"jsonrpc":"2.0","id":"authority","method":method,"params":params})
-                .to_string(),
+            json!({"jsonrpc":"2.0","id":"authority","method":method,"params":params}).to_string(),
         )
         .await
         .unwrap();
@@ -10422,7 +10403,10 @@ exec sleep 10
         let restored = Cx::current().unwrap();
         assert_eq!(restored.task_id(), foreign.task_id());
         assert_eq!(restored.budget().deadline, foreign.budget().deadline);
-        assert_eq!(restored.is_cancel_requested(), foreign.is_cancel_requested());
+        assert_eq!(
+            restored.is_cancel_requested(),
+            foreign.is_cancel_requested()
+        );
         assert_eq!(restored.capabilities().io, allow_io);
         assert_eq!(Cx::restriction_depth(), depth);
         result
@@ -10493,23 +10477,14 @@ exec sleep 10
                     }
                     if matches!(boundary, WireAuthorityBoundary::Receive) && !allowed {
                         assert!(result.is_err());
-                        let queued = host
-                            .transport
-                            .inner
-                            .receive_from_view(&cx)
-                            .await
-                            .unwrap();
+                        let queued = host.transport.inner.receive_from_view(&cx).await.unwrap();
                         let queued: Value = serde_json::from_str(&queued).unwrap();
-                        assert_eq!(
-                            queued["id"], "authority",
-                            "denial must not consume a frame"
-                        );
+                        assert_eq!(queued["id"], "authority", "denial must not consume a frame");
                     } else {
                         result.unwrap();
-                        let response: Value = serde_json::from_str(
-                            &view.receive_from_host(&cx).await.unwrap(),
-                        )
-                        .unwrap();
+                        let response: Value =
+                            serde_json::from_str(&view.receive_from_host(&cx).await.unwrap())
+                                .unwrap();
                         assert_eq!(response["id"], "authority");
                         assert_eq!(response.get("result").is_some(), allowed);
                         assert_eq!(response.get("error").is_some(), !allowed);
@@ -10678,7 +10653,7 @@ exec sleep 10
                     &cx,
                     json!({"jsonrpc":"2.0","id":"no-time","method":"ui/update-model-context",
                         "params":{"content":[{"type":"text","text":"pending context"}]}})
-                        .to_string(),
+                    .to_string(),
                 )
                 .await
                 .unwrap();
@@ -10752,7 +10727,11 @@ exec sleep 10
         }
 
         impl McpAppsWireBridgeTransport for HeldSendTransport {
-            async fn send_to_view(&mut self, cx: &Cx, frame: String) -> Result<(), McpAppsHostError> {
+            async fn send_to_view(
+                &mut self,
+                cx: &Cx,
+                frame: String,
+            ) -> Result<(), McpAppsHostError> {
                 if self.hold_send {
                     std::future::pending::<()>().await;
                 }
@@ -13246,7 +13225,10 @@ exec sleep 10
                 reply["result"]["protocolVersion"],
                 json!(MCP_APPS_HOST_VIEW_PROTOCOL_VERSION)
             );
-            assert_eq!(reply["result"]["hostInfo"]["name"], json!(config.host_info.name));
+            assert_eq!(
+                reply["result"]["hostInfo"]["name"],
+                json!(config.host_info.name)
+            );
             assert_eq!(reply["result"]["hostCapabilities"]["logging"], json!({}));
             assert_eq!(
                 host.state

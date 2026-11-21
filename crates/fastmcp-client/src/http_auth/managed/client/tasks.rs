@@ -290,9 +290,7 @@ impl ManagedHttpClient {
             | CallResult::Catalog(_)
             | CallResult::CoreListen(_)
             | CallResult::Extension(_)
-            | CallResult::ExtensionNotification => {
-                Err(ManagedHttpClientError::InvalidPolicy)
-            }
+            | CallResult::ExtensionNotification => Err(ManagedHttpClientError::InvalidPolicy),
         }
     }
 

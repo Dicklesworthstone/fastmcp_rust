@@ -44,8 +44,8 @@ use base64::Engine as _;
 use fastmcp_core::{
     ClientRoot, ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
     ElicitationSender, McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult,
-    RootsProvider, SamplingRequest, SamplingResponse, SamplingSender,
-    SamplingStopReason, draw_security_identifier,
+    RootsProvider, SamplingRequest, SamplingResponse, SamplingSender, SamplingStopReason,
+    draw_security_identifier,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -1657,7 +1657,6 @@ impl MrtrInputRequests {
         self.entries.insert(key, request);
         Ok(())
     }
-
 }
 
 impl Serialize for MrtrInputRequests {
@@ -3014,7 +3013,10 @@ impl std::fmt::Debug for MrtrExchangeRegistry {
             .field("max_states", &self.max_states)
             .field("max_states_per_owner", &self.max_states_per_owner)
             .field("max_payload_bytes", &self.max_payload_bytes)
-            .field("max_payload_bytes_per_owner", &self.max_payload_bytes_per_owner)
+            .field(
+                "max_payload_bytes_per_owner",
+                &self.max_payload_bytes_per_owner,
+            )
             .field("max_rounds", &self.max_rounds)
             .field("max_inputs_per_round", &self.max_inputs_per_round)
             .field("max_total_input_requests", &self.max_total_input_requests)
@@ -7625,15 +7627,18 @@ mod tests {
             let sender = make_sender_with_responder(move |request| {
                 assert_eq!(request.method, "sampling/createMessage");
                 let params = request.params.as_ref().unwrap();
-                assert_eq!(params["messages"], serde_json::json!([
-                    {"role": "user", "content": {"type": "text", "text": "Describe these"}},
-                    {"role": "user", "content": {
-                        "type": "image", "data": "AAECA/8=", "mimeType": "image/png"
-                    }},
-                    {"role": "assistant", "content": {
-                        "type": "image", "data": "d2VicA==", "mimeType": "image/webp"
-                    }}
-                ]));
+                assert_eq!(
+                    params["messages"],
+                    serde_json::json!([
+                        {"role": "user", "content": {"type": "text", "text": "Describe these"}},
+                        {"role": "user", "content": {
+                            "type": "image", "data": "AAECA/8=", "mimeType": "image/png"
+                        }},
+                        {"role": "assistant", "content": {
+                            "type": "image", "data": "d2VicA==", "mimeType": "image/webp"
+                        }}
+                    ])
+                );
                 serde_json::json!({
                     "content": {"type": "image", "data": "AAECA/8=", "mimeType": "image/png"},
                     "role": wire_role,
@@ -7648,7 +7653,9 @@ mod tests {
                     SamplingRequestMessage::user("Describe these"),
                     SamplingRequestMessage::image(SamplingRole::User, "AAECA/8=", "image/png"),
                     SamplingRequestMessage::image(
-                        SamplingRole::Assistant, "d2VicA==", "image/webp",
+                        SamplingRole::Assistant,
+                        "d2VicA==",
+                        "image/webp",
                     ),
                 ],
                 50,
@@ -7708,9 +7715,7 @@ mod tests {
 
     #[test]
     fn transport_sampling_sender_preserves_sampling_options() {
-        use fastmcp_core::{
-            SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences,
-        };
+        use fastmcp_core::{SamplingIncludeContext, SamplingModelHint, SamplingModelPreferences};
 
         for (include_context, expected_context) in [
             (None, None),
@@ -7733,12 +7738,15 @@ mod tests {
                         None => assert!(params.get("includeContext").is_none()),
                     }
                     if with_options {
-                        assert_eq!(params["modelPreferences"], serde_json::json!({
-                            "hints": [{"name": "preferred"}, {}, {"name": ""}],
-                            "costPriority": 0.0,
-                            "speedPriority": 0.5,
-                            "intelligencePriority": 1.0
-                        }));
+                        assert_eq!(
+                            params["modelPreferences"],
+                            serde_json::json!({
+                                "hints": [{"name": "preferred"}, {}, {"name": ""}],
+                                "costPriority": 0.0,
+                                "speedPriority": 0.5,
+                                "intelligencePriority": 1.0
+                            })
+                        );
                         assert_eq!(params["metadata"], expected_metadata);
                     } else {
                         assert!(params.get("modelPreferences").is_none());
@@ -7794,8 +7802,7 @@ mod tests {
                 "model": "chosen"
             })
         });
-        let sampling =
-            TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
+        let sampling = TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
         let request = SamplingRequest::prompt("sample", 12)
             .with_model_preferences(fastmcp_core::SamplingModelPreferences::default())
             .with_metadata(serde_json::Map::new());
@@ -7821,7 +7828,9 @@ mod tests {
         let sampling = TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
 
         let request = SamplingRequest {
-            messages: vec![fastmcp_core::SamplingRequestMessage::assistant("Previous response")],
+            messages: vec![fastmcp_core::SamplingRequestMessage::assistant(
+                "Previous response",
+            )],
             max_tokens: 10,
             system_prompt: None,
             temperature: None,
@@ -7886,9 +7895,9 @@ mod tests {
             serde_json::json!({"type": "image", "data": "AAECA/8=", "mimeType": false}),
             serde_json::json!({"type": "audio", "data": "AAECA/8=", "mimeType": "audio/wav"}),
         ] {
-            let sender = make_sender_with_responder(move |_| {
-                serde_json::json!({"content": content, "role": "assistant", "model": "m"})
-            });
+            let sender = make_sender_with_responder(
+                move |_| serde_json::json!({"content": content, "role": "assistant", "model": "m"}),
+            );
             let sampling =
                 TransportSamplingSender::new(McpContext::new(Cx::for_testing(), 0), sender);
             let error = fastmcp_core::block_on(SamplingSender::create_message(

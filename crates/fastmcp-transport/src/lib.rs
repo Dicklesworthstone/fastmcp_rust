@@ -190,7 +190,8 @@ pub trait Transport {
         cx: &Cx,
         message: &JsonRpcMessage,
     ) -> Result<(), TransportSendError> {
-        self.send(cx, message).map_err(TransportSendError::Uncertain)
+        self.send(cx, message)
+            .map_err(TransportSendError::Uncertain)
     }
 
     /// Receive the next JSON-RPC message from this transport.

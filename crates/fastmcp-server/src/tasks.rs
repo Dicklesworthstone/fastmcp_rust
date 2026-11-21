@@ -2906,7 +2906,9 @@ fn prepare_in_memory_final_task_payload_charge(
         .checked_add(notification_bytes)
         .and_then(|bytes| bytes.checked_add(initial_work_bytes))
         .and_then(|bytes| bytes.checked_add(history_bytes))
-        .and_then(|bytes| bytes.checked_add(operation.map_or(0, FinalTaskOperation::retained_bytes)))
+        .and_then(|bytes| {
+            bytes.checked_add(operation.map_or(0, FinalTaskOperation::retained_bytes))
+        })
         .ok_or_else(|| {
             McpError::invalid_params("Final task retained payload byte count overflow")
         })?;
@@ -3110,7 +3112,9 @@ impl InMemoryFinalTaskExecutionAdmission {
             principal,
         };
         state.next_permit_id = permit_id;
-        state.reservations.insert(task_id.clone(), reservation.clone());
+        state
+            .reservations
+            .insert(task_id.clone(), reservation.clone());
         state.per_owner.insert(principal, active + 1);
         // Never construct or drop a last permit while holding its pool lock.
         // All fallible checks precede these mutations; only the RAII owner
@@ -3592,7 +3596,9 @@ impl InMemoryFinalTaskStore {
             .insert(task_id.clone(), notification);
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
-        state.creation_generations.insert(task_id.clone(), generation);
+        state
+            .creation_generations
+            .insert(task_id.clone(), generation);
         state
             .execution_budgets
             .insert(task_id.clone(), execution_budget);
@@ -3914,7 +3920,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .insert(task_id.clone(), notification);
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
-        state.creation_generations.insert(task_id.clone(), generation);
+        state
+            .creation_generations
+            .insert(task_id.clone(), generation);
         state
             .execution_budgets
             .insert(task_id.clone(), execution_budget);
@@ -3951,7 +3959,13 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         principal: Option<Sha256Digest>,
         operation: FinalTaskOperation,
     ) -> McpResult<FinalTaskSnapshot> {
-        self.persist_task_with_work(task, notification, work_descriptor, principal, Some(operation))
+        self.persist_task_with_work(
+            task,
+            notification,
+            work_descriptor,
+            principal,
+            Some(operation),
+        )
     }
 
     fn get_task_access_metadata(
@@ -3959,16 +3973,27 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         task_id: &FinalTaskId,
     ) -> McpResult<Option<FinalTaskAccessMetadata>> {
         self.process.verify()?;
-        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.sample_clock()?;
-        if state.expires_at.get(task_id).is_some_and(|deadline| *deadline <= now) {
+        if state
+            .expires_at
+            .get(task_id)
+            .is_some_and(|deadline| *deadline <= now)
+        {
             return Ok(None);
         }
         Ok(state.generations.get(task_id).copied().map(|generation| {
             FinalTaskAccessMetadata::new(
                 task_id.clone(),
                 generation,
-                state.creation_generations.get(task_id).copied().unwrap_or(0),
+                state
+                    .creation_generations
+                    .get(task_id)
+                    .copied()
+                    .unwrap_or(0),
                 state.authenticated_principals.get(task_id).copied(),
                 state.original_operations.get(task_id).cloned(),
             )
@@ -4275,7 +4300,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             InMemoryFinalTaskHandoffKind::Resumed,
             owner_id,
             now,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         Ok(Some(FinalTaskAcceptedInputClaim {
@@ -4369,9 +4395,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         Ok(Some(
             FinalTaskSnapshot::new(task, generation)
                 .with_creation_generation(in_memory_task_creation_generation(&state, &task_id)?)
-                .with_authenticated_principal(
-                state.authenticated_principals.get(&task_id).copied(),
-            ).with_original_operation(state.original_operations.get(&task_id).cloned()),
+                .with_authenticated_principal(state.authenticated_principals.get(&task_id).copied())
+                .with_original_operation(state.original_operations.get(&task_id).cloned()),
         ))
     }
 
@@ -4438,7 +4463,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             InMemoryFinalTaskHandoffKind::Initial,
             owner_id,
             now,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         Ok(Some(FinalTaskInitialWorkClaim {
@@ -4560,9 +4586,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         Ok(Some(
             FinalTaskSnapshot::new(task, generation)
                 .with_creation_generation(in_memory_task_creation_generation(&state, &task_id)?)
-                .with_authenticated_principal(
-                state.authenticated_principals.get(&task_id).copied(),
-            ).with_original_operation(state.original_operations.get(&task_id).cloned()),
+                .with_authenticated_principal(state.authenticated_principals.get(&task_id).copied())
+                .with_original_operation(state.original_operations.get(&task_id).cloned()),
         ))
     }
 
@@ -4912,8 +4937,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 FinalTaskSnapshot::new(task, generation)
                     .with_creation_generation(in_memory_task_creation_generation(&state, task_id)?)
                     .with_authenticated_principal(
-                    state.authenticated_principals.get(task_id).copied(),
-                ).with_original_operation(state.original_operations.get(task_id).cloned()),
+                        state.authenticated_principals.get(task_id).copied(),
+                    )
+                    .with_original_operation(state.original_operations.get(task_id).cloned()),
             ));
         }
         replace_in_memory_final_task(
@@ -5018,10 +5044,17 @@ fn committed_in_memory_final_task_snapshot(
         .with_original_operation(state.original_operations.get(task_id).cloned()))
 }
 
-fn in_memory_task_creation_generation(state: &InMemoryFinalTaskState, task_id: &FinalTaskId) -> McpResult<u64> {
-    state.creation_generations.get(task_id).copied().ok_or_else(|| {
-        McpError::internal_error("In-memory final task store lost its creation generation")
-    })
+fn in_memory_task_creation_generation(
+    state: &InMemoryFinalTaskState,
+    task_id: &FinalTaskId,
+) -> McpResult<u64> {
+    state
+        .creation_generations
+        .get(task_id)
+        .copied()
+        .ok_or_else(|| {
+            McpError::internal_error("In-memory final task store lost its creation generation")
+        })
 }
 
 /// Compares complete durable task values without relying on handwritten
@@ -5538,7 +5571,8 @@ fn insert_in_memory_final_task_handoff_lease(
         generation,
         owner_id,
         state.authenticated_principals.get(&task_id).copied(),
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     // Capacity is reserved under the task lock before spending an attempt.
@@ -5825,9 +5859,9 @@ impl FinalTaskHandoffAuthority {
     fn ensure_execution_authorized(&self) -> McpResult<()> {
         if !self.execution_revoked.load(TaskServiceOrdering::Acquire)
             && self
-            .runtime
-            .revalidate_task_execution(&self.execution_authorization)
-            .is_ok()
+                .runtime
+                .revalidate_task_execution(&self.execution_authorization)
+                .is_ok()
         {
             return Ok(());
         }
@@ -6558,11 +6592,12 @@ impl FinalTaskRuntimeConfig {
             || !(1..=256).contains(&maximum_per_principal)
             || maximum_per_principal > maximum
             || !(1..=512 * 1_024 * 1_024).contains(&maximum_payload_bytes)
-            || !(1..=128 * 1_024 * 1_024)
-                .contains(&maximum_payload_bytes_per_principal)
+            || !(1..=128 * 1_024 * 1_024).contains(&maximum_payload_bytes_per_principal)
             || maximum_payload_bytes_per_principal > maximum_payload_bytes
         {
-            return Err(McpError::invalid_params("Invalid Task service admission capacity"));
+            return Err(McpError::invalid_params(
+                "Invalid Task service admission capacity",
+            ));
         }
         self.admission.maximum = maximum;
         self.admission.maximum_per_principal = maximum_per_principal;
@@ -6578,7 +6613,9 @@ impl FinalTaskRuntimeConfig {
     /// running or discards a proven committed Task.
     pub fn with_admission_timeout(mut self, timeout: StdDuration) -> McpResult<Self> {
         if timeout.is_zero() || timeout > StdDuration::from_secs(300) {
-            return Err(McpError::invalid_params("Invalid Task service admission timeout"));
+            return Err(McpError::invalid_params(
+                "Invalid Task service admission timeout",
+            ));
         }
         self.admission.timeout = timeout;
         Ok(self)
@@ -6642,11 +6679,7 @@ impl TaskServiceAdmissionPermit {
     /// The last fallible local check before entering the store mutation. A
     /// service exit after this boundary cannot undo a subsequently proven
     /// commit; that work remains available to authoritative recovery.
-    fn admit_commit(
-        &self,
-        runtime: &FinalTaskRuntime,
-        ctx: Option<&McpContext>,
-    ) -> McpResult<()> {
+    fn admit_commit(&self, runtime: &FinalTaskRuntime, ctx: Option<&McpContext>) -> McpResult<()> {
         if !Arc::ptr_eq(&self.ledger, &runtime.admission) {
             return Err(McpError::invalid_request(
                 "Task service admission permit belongs to another runtime",
@@ -7043,11 +7076,26 @@ fn final_task_execution_caller(cx: &Cx) -> McpResult<Cx> {
     if let Some(ambient) = Cx::current() {
         let capabilities = ambient.capabilities();
         for (allowed, without_effect) in [
-            (capabilities.spawn, CapSet::<false, true, true, true, true>::MASK),
-            (capabilities.time, CapSet::<true, false, true, true, true>::MASK),
-            (capabilities.entropy, CapSet::<true, true, false, true, true>::MASK),
-            (capabilities.io, CapSet::<true, true, true, false, true>::MASK),
-            (capabilities.remote, CapSet::<true, true, true, true, false>::MASK),
+            (
+                capabilities.spawn,
+                CapSet::<false, true, true, true, true>::MASK,
+            ),
+            (
+                capabilities.time,
+                CapSet::<true, false, true, true, true>::MASK,
+            ),
+            (
+                capabilities.entropy,
+                CapSet::<true, true, false, true, true>::MASK,
+            ),
+            (
+                capabilities.io,
+                CapSet::<true, true, true, false, true>::MASK,
+            ),
+            (
+                capabilities.remote,
+                CapSet::<true, true, true, true, false>::MASK,
+            ),
         ] {
             if !allowed {
                 ceiling = ceiling.intersect(without_effect);
@@ -7063,7 +7111,9 @@ fn final_task_execution_caller(cx: &Cx) -> McpResult<Cx> {
             "Task execution requires caller spawning and deadline capabilities",
         ));
     }
-    caller.checkpoint().map_err(|_| McpError::request_cancelled())?;
+    caller
+        .checkpoint()
+        .map_err(|_| McpError::request_cancelled())?;
     Ok(caller)
 }
 
@@ -7870,7 +7920,11 @@ impl FinalTaskRuntime {
                 .transpose()?,
         });
         self.persist_new_with_work_while_service_ready(
-            &task, work_descriptor, principal, operation, ctx,
+            &task,
+            work_descriptor,
+            principal,
+            operation,
+            ctx,
         )?;
         Ok(CreateTaskResult {
             task,
@@ -8273,7 +8327,11 @@ impl FinalTaskRuntime {
         let terminal_cancellation =
             self.validate_cancellation_store_result(current, &cancelled_task, cancellation)?;
         if terminal_cancellation {
-            self.emit(cancelled_notification, current.authenticated_principal(), current.creation_generation());
+            self.emit(
+                cancelled_notification,
+                current.authenticated_principal(),
+                current.creation_generation(),
+            );
         }
         self.signal_task_service_cancellation(task_id.clone());
         Ok(FinalCancelTaskResult::default())
@@ -8559,7 +8617,9 @@ impl FinalTaskRuntime {
         if snapshot.creation_generation() == 0
             || snapshot.creation_generation() > snapshot.generation()
         {
-            return Err(McpError::internal_error("Final task store returned invalid creation authority"));
+            return Err(McpError::internal_error(
+                "Final task store returned invalid creation authority",
+            ));
         }
         validate_final_task_storage_shape(snapshot.task()).map_err(|error| {
             McpError::internal_error(format!(
@@ -8813,11 +8873,8 @@ impl FinalTaskRuntime {
         // Four task copies and two notification copies conservatively cover
         // request storage, mutation arguments and receipt validation. Each
         // framework-created notification has less than 256 envelope bytes.
-        let task_bytes = final_task_payload_bytes(
-            task,
-            MAX_FINAL_TASK_METADATA_BYTES,
-            "creation metadata",
-        )?;
+        let task_bytes =
+            final_task_payload_bytes(task, MAX_FINAL_TASK_METADATA_BYTES, "creation metadata")?;
         let descriptor_bytes = final_task_payload_bytes(
             work_descriptor.as_value(),
             MAX_FINAL_TASK_DESCRIPTOR_BYTES,
@@ -8855,13 +8912,11 @@ impl FinalTaskRuntime {
                 principal,
             )?
         } else {
-            self.store.create_task_with_work(
-                task.clone(),
-                notification.clone(),
-                work_descriptor,
-            )?
+            self.store
+                .create_task_with_work(task.clone(), notification.clone(), work_descriptor)?
         };
-        let committed = self.validate_committed_new_task(task, principal, operation.as_ref(), committed)?;
+        let committed =
+            self.validate_committed_new_task(task, principal, operation.as_ref(), committed)?;
         // The durable commit above is the acceptance point. Observer failures
         // and caller/service cancellation cannot revoke the returned handle.
         // A missed wakeup never rolls back or retries this proven create: the
@@ -8900,9 +8955,9 @@ impl FinalTaskRuntime {
                     "Final task creation requires an installed ready task service",
                 )
             })?;
-        let ready_generation = service.ready_generation.ok_or_else(|| {
-            McpError::internal_error("Task service lost its entered generation")
-        })?;
+        let ready_generation = service
+            .ready_generation
+            .ok_or_else(|| McpError::internal_error("Task service lost its entered generation"))?;
         let mut ledger = self
             .admission
             .lock()
@@ -9046,7 +9101,11 @@ impl FinalTaskRuntime {
                 && current.original_operation() == committed.original_operation()
                 && final_tasks_match_exactly(current.task(), committed.task()).unwrap_or(false)
         }) {
-            self.emit(notification, committed.authenticated_principal(), committed.creation_generation());
+            self.emit(
+                notification,
+                committed.authenticated_principal(),
+                committed.creation_generation(),
+            );
         }
     }
 
@@ -9054,7 +9113,12 @@ impl FinalTaskRuntime {
     /// mutation. A panic from one observer is contained and recorded as
     /// delivery degradation; it cannot revoke the already-committed state or
     /// turn the accepted transition into an RPC error.
-    fn emit(&self, notification: FinalTaskStatusNotification, principal: Option<Sha256Digest>, creation_generation: u64) {
+    fn emit(
+        &self,
+        notification: FinalTaskStatusNotification,
+        principal: Option<Sha256Digest>,
+        creation_generation: u64,
+    ) {
         let emitters = {
             let mut registered = self
                 .notification_emitters
@@ -9069,7 +9133,9 @@ impl FinalTaskRuntime {
         // taking strong references to the whole fanout would keep it alive.
         if catch_unwind(AssertUnwindSafe(|| {
             (self.application_notification_emitter)(notification.clone(), principal);
-        })).is_err() {
+        }))
+        .is_err()
+        {
             panicked_emitter_count += 1;
         }
         for emitter in emitters.iter().filter_map(Weak::upgrade) {
@@ -9078,11 +9144,15 @@ impl FinalTaskRuntime {
             // timestamps and payload. Fence the committed incarnation again
             // immediately before each framework delivery. Request observers
             // additionally recheck current grants and the authoritative task.
-            let current = self.store.get_task_access_metadata(&notification.params.task.base().task_id);
-            if !current.is_ok_and(|current| current.is_some_and(|current| {
-                current.creation_generation() == creation_generation
-                    && current.authenticated_principal() == principal
-            })) {
+            let current = self
+                .store
+                .get_task_access_metadata(&notification.params.task.base().task_id);
+            if !current.is_ok_and(|current| {
+                current.is_some_and(|current| {
+                    current.creation_generation() == creation_generation
+                        && current.authenticated_principal() == principal
+                })
+            }) {
                 continue;
             }
             if catch_unwind(AssertUnwindSafe(|| {
@@ -9284,9 +9354,12 @@ impl FinalTaskRuntime {
         // Retaining a runner across service invocations must not revive an
         // old admission permit. Pair its installation ID with a fresh entered
         // generation every time this readiness lease is established.
-        let ready_generation = service.last_ready_generation.checked_add(1).ok_or_else(|| {
-            McpError::internal_error("Task service readiness generation space is exhausted")
-        })?;
+        let ready_generation = service
+            .last_ready_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                McpError::internal_error("Task service readiness generation space is exhausted")
+            })?;
         service.last_ready_generation = ready_generation;
         service.ready_generation = Some(ready_generation);
         Ok(FinalTaskServiceReadinessLease {
@@ -10036,9 +10109,7 @@ impl FinalTaskHandoffExecutor {
                     capability_budget,
                     CapabilityBudgetRequirements::NONE,
                 )
-                .map_err(|_| {
-                    McpError::internal_error("Task attempt capability budget was refused")
-                })
+                .map_err(|_| McpError::internal_error("Task attempt capability budget was refused"))
                 .and_then(|scope| {
                     cx.spawn_in(&scope, move |task_cx| async move {
                         let mut custody = custody;
@@ -10107,10 +10178,7 @@ impl FinalTaskHandoffExecutor {
         Self::finish_handoff(guard, result)
     }
 
-    fn finish_handoff(
-        mut guard: FinalTaskExecutionGuard,
-        result: McpResult<()>,
-    ) -> McpResult<()> {
+    fn finish_handoff(mut guard: FinalTaskExecutionGuard, result: McpResult<()>) -> McpResult<()> {
         match result {
             Ok(()) => {
                 if guard.retire_if_execution_authorization_lost()? {
@@ -10802,9 +10870,10 @@ impl FinalTaskExecutionGuard {
             return Ok(false);
         };
         if current.generation() != self.generation
-            || self.execution_authorization.as_ref().is_none_or(|expected| {
-                !expected.admits_snapshot(&current)
-            })
+            || self
+                .execution_authorization
+                .as_ref()
+                .is_none_or(|expected| !expected.admits_snapshot(&current))
         {
             return Ok(false);
         }
@@ -11049,7 +11118,9 @@ impl FinalTaskExecutionGuard {
                 McpError::internal_error("Final task handoff has no execution budget")
             })?,
             execution_authorization: self.execution_authorization.clone().ok_or_else(|| {
-                McpError::internal_error("Final task handoff has no execution authorization binding")
+                McpError::internal_error(
+                    "Final task handoff has no execution authorization binding",
+                )
             })?,
             execution_revoked: Arc::clone(&self.execution_revoked),
         })
@@ -11114,7 +11185,10 @@ impl Drop for FinalTaskExecutionGuard {
         if self.execution_admission_lost {
             return;
         }
-        if self.retire_if_execution_authorization_lost().unwrap_or(false) {
+        if self
+            .retire_if_execution_authorization_lost()
+            .unwrap_or(false)
+        {
             return;
         }
         if self.retire_if_execution_expired().unwrap_or(false) {
@@ -11712,7 +11786,6 @@ mod tests {
         )
     }
 
-
     fn task_service_test_caller() -> (asupersync::runtime::Runtime, Cx) {
         let runtime = RuntimeBuilder::current_thread()
             .blocking_threads(0, 0)
@@ -11730,7 +11803,12 @@ mod tests {
         if consume {
             Box::pin(runner.take().expect("one-shot runner is present").run(cx))
         } else {
-            Box::pin(runner.as_mut().expect("retained runner is present").run_service(cx))
+            Box::pin(
+                runner
+                    .as_mut()
+                    .expect("retained runner is present")
+                    .run_service(cx),
+            )
         }
     }
 
@@ -11771,7 +11849,10 @@ mod tests {
                     return std::task::Poll::Ready(());
                 }
                 if let std::task::Poll::Ready(result) = service.as_mut().poll(context) {
-                    assert!(condition(), "{description}: service exited early: {result:?}");
+                    assert!(
+                        condition(),
+                        "{description}: service exited early: {result:?}"
+                    );
                     return std::task::Poll::Ready(());
                 }
                 if condition() {
@@ -12109,7 +12190,9 @@ mod tests {
                 {
                     Ok(())
                 } else {
-                    Err(McpError::invalid_request("Unexpected capacity-test operation"))
+                    Err(McpError::invalid_request(
+                        "Unexpected capacity-test operation",
+                    ))
                 }
             }
         }
@@ -12122,7 +12205,10 @@ mod tests {
             Arc::new(
                 InMemoryFinalTaskStore::new(max_tasks)
                     .unwrap()
-                    .with_owner_capacity(max_tasks, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+                    .with_owner_capacity(
+                        max_tasks,
+                        InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+                    )
                     .unwrap()
                     .with_execution_capacity(max_active, max_per_owner)
                     .unwrap(),
@@ -12229,7 +12315,6 @@ mod tests {
             }
         }
 
-
         struct TerminalCleanupSupervisor {
             store: Arc<InMemoryFinalTaskStore>,
             competing: FinalTaskSnapshot,
@@ -12297,89 +12382,117 @@ mod tests {
         fn task_02_execution_capacity_survives_terminal_cleanup_and_future_destructors() {
             for finish_normally in [false, true] {
                 with_task_test_runtime(async {
-                let store = store(2, 1, 1);
-                let first = insert(&store, "capacity-cleanup-a", None);
-                let competing = insert(&store, "capacity-cleanup-b", None);
-                let first_runtime = runtime(&store);
-                let second_runtime = runtime(&store);
-                let cleanup = Arc::new(TerminalCleanupSupervisor {
-                    store: Arc::clone(&store),
-                    competing: competing.clone(),
-                    ready: AtomicBool::new(false),
-                    waker: Mutex::new(None),
-                    drops: Mutex::new(Vec::new()),
-                });
-                let first_runner = runner(&first_runtime, cleanup.clone(), 1);
-                let handoff = initial(&first_runtime, &store, &first, &first_runner.dispatch_owner);
-                let second_probe = Arc::new(CountingPendingSupervisor::default());
-                let mut second_runner = runner(&second_runtime, second_probe.clone(), 2);
-                let cx = Cx::current().unwrap();
-                let mut first_future = first_runner
-                    .resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(handoff));
-                let mut second_service = Box::pin(second_runner.run_service(&cx));
-                drive_task_test_until(&cx, first_future.as_mut(), "terminal cleanup starts", || {
-                    cleanup.waker.lock().unwrap().is_some()
-                }).await;
-                let terminal = store
-                    .get_task_snapshot(&first.task().base().task_id)
-                    .unwrap()
-                    .unwrap();
-                assert!(matches!(terminal.task(), FinalTask::Completed { .. }));
-                assert!(store.state.lock().unwrap().handoff_leases.is_empty());
-                assert_eq!(store.active_task_count(), 1);
-                drive_task_test_until(&cx, second_service.as_mut(), "saturated runner enters", || {
-                    second_runtime.is_task_service_ready()
-                }).await;
-                assert_eq!(second_probe.entries.load(AtomicOrdering::SeqCst), 0);
+                    let store = store(2, 1, 1);
+                    let first = insert(&store, "capacity-cleanup-a", None);
+                    let competing = insert(&store, "capacity-cleanup-b", None);
+                    let first_runtime = runtime(&store);
+                    let second_runtime = runtime(&store);
+                    let cleanup = Arc::new(TerminalCleanupSupervisor {
+                        store: Arc::clone(&store),
+                        competing: competing.clone(),
+                        ready: AtomicBool::new(false),
+                        waker: Mutex::new(None),
+                        drops: Mutex::new(Vec::new()),
+                    });
+                    let first_runner = runner(&first_runtime, cleanup.clone(), 1);
+                    let handoff =
+                        initial(&first_runtime, &store, &first, &first_runner.dispatch_owner);
+                    let second_probe = Arc::new(CountingPendingSupervisor::default());
+                    let mut second_runner = runner(&second_runtime, second_probe.clone(), 2);
+                    let cx = Cx::current().unwrap();
+                    let mut first_future = first_runner
+                        .resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(handoff));
+                    let mut second_service = Box::pin(second_runner.run_service(&cx));
+                    drive_task_test_until(
+                        &cx,
+                        first_future.as_mut(),
+                        "terminal cleanup starts",
+                        || cleanup.waker.lock().unwrap().is_some(),
+                    )
+                    .await;
+                    let terminal = store
+                        .get_task_snapshot(&first.task().base().task_id)
+                        .unwrap()
+                        .unwrap();
+                    assert!(matches!(terminal.task(), FinalTask::Completed { .. }));
+                    assert!(store.state.lock().unwrap().handoff_leases.is_empty());
+                    assert_eq!(store.active_task_count(), 1);
+                    drive_task_test_until(
+                        &cx,
+                        second_service.as_mut(),
+                        "saturated runner enters",
+                        || second_runtime.is_task_service_ready(),
+                    )
+                    .await;
+                    assert_eq!(second_probe.entries.load(AtomicOrdering::SeqCst), 0);
 
-                // Even removing the completed record cannot reclaim the live
-                // application's independently owned execution reservation.
-                if !finish_normally {
-                    assert!(matches!(
+                    // Even removing the completed record cannot reclaim the live
+                    // application's independently owned execution reservation.
+                    if !finish_normally {
+                        assert!(matches!(
+                            store
+                                .reclaim_terminal_task_if_current(
+                                    &cx,
+                                    &terminal.task().base().task_id,
+                                    terminal.generation(),
+                                    TaskRetentionReason::OperatorRequest,
+                                )
+                                .unwrap(),
+                            TaskRetentionReclamation::Reclaimed(_)
+                        ));
+                        assert_eq!(store.task_count(), 1);
+                    }
+                    assert_eq!(store.active_task_count(), 1);
+                    assert_eq!(
                         store
-                            .reclaim_terminal_task_if_current(
-                                &cx,
-                                &terminal.task().base().task_id,
-                                terminal.generation(),
-                                TaskRetentionReason::OperatorRequest,
-                            )
-                            .unwrap(),
-                        TaskRetentionReclamation::Reclaimed(_)
-                    ));
-                    assert_eq!(store.task_count(), 1);
-                }
-                assert_eq!(store.active_task_count(), 1);
-                assert_eq!(
-                    store
-                        .task_execution_budget_if_current(&competing)
+                            .task_execution_budget_if_current(&competing)
+                            .unwrap()
+                            .unwrap()
+                            .attempts(),
+                        0
+                    );
+                    if finish_normally {
+                        cleanup.ready.store(true, AtomicOrdering::SeqCst);
+                        cleanup.waker.lock().unwrap().take().unwrap().wake();
+                        asupersync::time::timeout(
+                            cx.now(),
+                            StdDuration::from_secs(5),
+                            first_future.as_mut(),
+                        )
+                        .await
                         .unwrap()
-                        .unwrap()
-                        .attempts(),
-                    0
-                );
-                if finish_normally {
-                    cleanup.ready.store(true, AtomicOrdering::SeqCst);
-                    cleanup.waker.lock().unwrap().take().unwrap().wake();
-                    asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), first_future.as_mut())
-                        .await.unwrap().unwrap();
-                }
-                drop(first_future);
-                wait_task_test_condition(&cx, "terminal cleanup releases its execution permit", || {
-                    !cleanup.drops.lock().unwrap().is_empty() && store.active_task_count() == 0
-                }).await;
-                assert_eq!(cleanup.drops.lock().unwrap().as_slice(), &[(1, true)]);
-                assert_eq!(store.active_task_count(), 0);
-                second_runtime.signal_task_service(competing.task().base().task_id.clone());
-                drive_task_test_until(&cx, second_service.as_mut(), "released slot admits competing work", || {
-                    second_probe.entries.load(AtomicOrdering::SeqCst) == 1
-                }).await;
-                assert_eq!(second_probe.entries.load(AtomicOrdering::SeqCst), 1);
-                assert_eq!(store.active_task_count(), 1);
-                drop(second_service);
-                wait_task_test_condition(&cx, "competing child settles after service drop", || {
-                    store.active_task_count() == 0
-                }).await;
-                assert_eq!(store.active_task_count(), 0);
+                        .unwrap();
+                    }
+                    drop(first_future);
+                    wait_task_test_condition(
+                        &cx,
+                        "terminal cleanup releases its execution permit",
+                        || {
+                            !cleanup.drops.lock().unwrap().is_empty()
+                                && store.active_task_count() == 0
+                        },
+                    )
+                    .await;
+                    assert_eq!(cleanup.drops.lock().unwrap().as_slice(), &[(1, true)]);
+                    assert_eq!(store.active_task_count(), 0);
+                    second_runtime.signal_task_service(competing.task().base().task_id.clone());
+                    drive_task_test_until(
+                        &cx,
+                        second_service.as_mut(),
+                        "released slot admits competing work",
+                        || second_probe.entries.load(AtomicOrdering::SeqCst) == 1,
+                    )
+                    .await;
+                    assert_eq!(second_probe.entries.load(AtomicOrdering::SeqCst), 1);
+                    assert_eq!(store.active_task_count(), 1);
+                    drop(second_service);
+                    wait_task_test_condition(
+                        &cx,
+                        "competing child settles after service drop",
+                        || store.active_task_count() == 0,
+                    )
+                    .await;
+                    assert_eq!(store.active_task_count(), 0);
                 });
             }
         }
@@ -12387,58 +12500,81 @@ mod tests {
         #[test]
         fn task_02_execution_capacity_input_successor_waits_across_runners() {
             with_task_test_runtime(async {
-            let store = store(1, 1, 1);
-            let original = insert(&store, "capacity-input-cleanup", None);
-            let id = original.task().base().task_id.clone();
-            let first_runtime = runtime(&store);
-            let second_runtime = runtime(&store);
-            let probe = Arc::new(TaskTransitionCleanupProbe::default());
-            let mut first_runner = runner(&first_runtime, probe.clone(), 2);
-            let mut second_runner = runner(&second_runtime, probe.clone(), 2);
-            let cx = Cx::current().unwrap();
-            let mut first_service = Box::pin(first_runner.run_service(&cx));
-            let mut second_service = Box::pin(second_runner.run_service(&cx));
-            drive_task_test_until(&cx, first_service.as_mut(), "predecessor enters input cleanup", || {
-                probe.cleanup_waker.lock().unwrap().is_some()
-            }).await;
-            let inputs =
-                serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
-            second_runtime.update_task(&id, &inputs).unwrap();
-            let successor = store.get_task_snapshot(&id).unwrap().unwrap();
-            let budget = store
-                .task_execution_budget_if_current(&successor)
-                .unwrap()
-                .unwrap();
-            for _ in 0..4 {
+                let store = store(1, 1, 1);
+                let original = insert(&store, "capacity-input-cleanup", None);
+                let id = original.task().base().task_id.clone();
+                let first_runtime = runtime(&store);
+                let second_runtime = runtime(&store);
+                let probe = Arc::new(TaskTransitionCleanupProbe::default());
+                let mut first_runner = runner(&first_runtime, probe.clone(), 2);
+                let mut second_runner = runner(&second_runtime, probe.clone(), 2);
+                let cx = Cx::current().unwrap();
+                let mut first_service = Box::pin(first_runner.run_service(&cx));
+                let mut second_service = Box::pin(second_runner.run_service(&cx));
+                drive_task_test_until(
+                    &cx,
+                    first_service.as_mut(),
+                    "predecessor enters input cleanup",
+                    || probe.cleanup_waker.lock().unwrap().is_some(),
+                )
+                .await;
+                let inputs =
+                    serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+                second_runtime.update_task(&id, &inputs).unwrap();
+                let successor = store.get_task_snapshot(&id).unwrap().unwrap();
+                let budget = store
+                    .task_execution_budget_if_current(&successor)
+                    .unwrap()
+                    .unwrap();
+                for _ in 0..4 {
+                    second_runtime.signal_task_service(id.clone());
+                    let observation = Instant::now() + StdDuration::from_millis(2);
+                    drive_task_test_until(
+                        &cx,
+                        second_service.as_mut(),
+                        "saturated successor waits",
+                        || Instant::now() >= observation,
+                    )
+                    .await;
+                }
+                assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
+                assert_eq!(store.active_task_count(), 1);
+                assert_eq!(
+                    store.task_execution_budget_if_current(&successor).unwrap(),
+                    Some(budget)
+                );
+                assert_eq!(
+                    store.state.lock().unwrap().accepted_inputs.get(&id),
+                    Some(&inputs)
+                );
+                assert!(store.next_accepted_input_snapshot().unwrap().is_none());
+                probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
+                drop(first_service);
+                wait_task_test_condition(&cx, "predecessor child releases input capacity", || {
+                    store.active_task_count() == 0
+                })
+                .await;
+                assert_eq!(store.active_task_count(), 0);
                 second_runtime.signal_task_service(id.clone());
-                let observation = Instant::now() + StdDuration::from_millis(2);
-                drive_task_test_until(&cx, second_service.as_mut(), "saturated successor waits", || {
-                    Instant::now() >= observation
-                }).await;
-            }
-            assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
-            assert_eq!(store.active_task_count(), 1);
-            assert_eq!(
-                store.task_execution_budget_if_current(&successor).unwrap(),
-                Some(budget)
-            );
-            assert_eq!(store.state.lock().unwrap().accepted_inputs.get(&id), Some(&inputs));
-            assert!(store.next_accepted_input_snapshot().unwrap().is_none());
-            probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
-            drop(first_service);
-            wait_task_test_condition(&cx, "predecessor child releases input capacity", || {
-                store.active_task_count() == 0
-            }).await;
-            assert_eq!(store.active_task_count(), 0);
-            second_runtime.signal_task_service(id.clone());
-            drive_task_test_until(&cx, second_service.as_mut(), "input successor completes after cleanup", || {
-                matches!(store.get_task(&id).unwrap(), Some(FinalTask::Completed { .. }))
-                    && store.active_task_count() == 0
-            }).await;
-            assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
-            assert!(matches!(store.get_task(&id).unwrap(), Some(FinalTask::Completed { .. })));
-            assert_eq!(store.active_task_count(), 0);
-            drop(second_service);
+                drive_task_test_until(
+                    &cx,
+                    second_service.as_mut(),
+                    "input successor completes after cleanup",
+                    || {
+                        matches!(
+                            store.get_task(&id).unwrap(),
+                            Some(FinalTask::Completed { .. })
+                        ) && store.active_task_count() == 0
+                    },
+                )
+                .await;
+                assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
+                assert!(matches!(
+                    store.get_task(&id).unwrap(),
+                    Some(FinalTask::Completed { .. })
+                ));
+                assert_eq!(store.active_task_count(), 0);
+                drop(second_service);
             });
         }
 
@@ -12455,7 +12591,9 @@ mod tests {
             );
             let runtime = runtime(&store);
             let id = waiting.task().base().task_id.clone();
-            runtime.require_input(&id, final_roots_request(), None).unwrap();
+            runtime
+                .require_input(&id, final_roots_request(), None)
+                .unwrap();
             let inputs =
                 serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
             runtime.update_task(&id, &inputs).unwrap();
@@ -12472,10 +12610,22 @@ mod tests {
                     .is_none()
             );
             assert!(store.next_accepted_input_snapshot().unwrap().is_none());
-            assert_eq!(store.task_execution_budget_if_current(&resumed).unwrap(), before);
-            assert_eq!(store.state.lock().unwrap().accepted_inputs.get(&id), Some(&inputs));
             assert_eq!(
-                store.next_initial_work_snapshot().unwrap().unwrap().task().base().task_id,
+                store.task_execution_budget_if_current(&resumed).unwrap(),
+                before
+            );
+            assert_eq!(
+                store.state.lock().unwrap().accepted_inputs.get(&id),
+                Some(&inputs)
+            );
+            assert_eq!(
+                store
+                    .next_initial_work_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .task()
+                    .base()
+                    .task_id,
                 other.task().base().task_id
             );
             assert!(
@@ -12511,143 +12661,173 @@ mod tests {
             assert_eq!(store.active_task_count(), 2);
         }
 
-
         #[test]
         fn task_02_execution_capacity_dead_receipts_cannot_release_same_owner_successors() {
             for expire_lease in [false, true] {
                 for poll_stale in [false, true] {
                     with_task_test_runtime(async {
-                    let (store, clock) = clock_store(1, 1, 1);
-                    let snapshot = insert(&store, "capacity-stale-receipt", None);
-                    let runtime = runtime(&store);
-                    let probe = Arc::new(CountingPendingSupervisor::default());
-                    let runner = runner(&runtime, probe.clone(), 1);
-                    let owner = runner.dispatch_owner.as_str();
-                    let old = store
-                        .take_initial_work_handoff_for_owner_if_current(&snapshot, owner)
-                        .unwrap()
-                        .unwrap();
-                    let old_clone = old.clone();
-                    let plain = FinalTaskInitialWorkClaim::new(
-                        old.task_id.clone(),
-                        old.generation,
-                        owner,
-                        old.work_descriptor.clone(),
-                    );
-                    assert_eq!(old, plain);
-                    assert_eq!(format!("{old:?}"), format!("{plain:?}"));
-                    let stale = runtime
-                        .validate_initial_work_claim(&snapshot, owner, old)
-                        .unwrap();
-                    if expire_lease {
-                        *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
-                    } else {
-                        assert!(
-                            store
-                                .restore_initial_work_for_owner_if_current(
-                                    &old_clone.task_id,
-                                    old_clone.generation,
-                                    owner,
-                                    None,
-                                    old_clone.work_descriptor.clone(),
-                                )
-                                .unwrap()
+                        let (store, clock) = clock_store(1, 1, 1);
+                        let snapshot = insert(&store, "capacity-stale-receipt", None);
+                        let runtime = runtime(&store);
+                        let probe = Arc::new(CountingPendingSupervisor::default());
+                        let runner = runner(&runtime, probe.clone(), 1);
+                        let owner = runner.dispatch_owner.as_str();
+                        let old = store
+                            .take_initial_work_handoff_for_owner_if_current(&snapshot, owner)
+                            .unwrap()
+                            .unwrap();
+                        let old_clone = old.clone();
+                        let plain = FinalTaskInitialWorkClaim::new(
+                            old.task_id.clone(),
+                            old.generation,
+                            owner,
+                            old.work_descriptor.clone(),
                         );
-                    }
-                    let current = store
-                        .get_task_snapshot(&snapshot.task().base().task_id)
-                        .unwrap()
-                        .unwrap();
-                    assert_eq!(store.active_task_count(), 0);
-                    let successor = store
-                        .take_initial_work_handoff_for_owner_if_current(&current, owner)
-                        .unwrap()
-                        .unwrap();
-                    let budget = store.task_execution_budget_if_current(&current).unwrap();
-                    let cx = Cx::current().unwrap();
-                    let mut stale_future =
-                        runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(stale));
-                    if poll_stale {
-                        asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), stale_future.as_mut())
-                            .await.unwrap().unwrap();
-                    }
-                    drop(stale_future);
-                    drop(old_clone);
-                    assert_eq!(probe.entries.load(AtomicOrdering::SeqCst), 0);
-                    assert_eq!(store.active_task_count(), 1);
-                    assert_eq!(store.task_execution_budget_if_current(&current).unwrap(), budget);
-                    assert!(store.next_initial_work_snapshot().unwrap().is_none());
-                    let accepted = runtime
-                        .validate_initial_work_claim(&current, owner, successor)
-                        .unwrap();
-                    let mut successor_future =
-                        runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(accepted));
-                    drive_task_test_until(&cx, successor_future.as_mut(), "successor enters after stale receipt rejection", || {
-                        probe.entries.load(AtomicOrdering::SeqCst) == 1
-                    }).await;
-                    assert_eq!(probe.entries.load(AtomicOrdering::SeqCst), 1);
-                    drop(successor_future);
-                    wait_task_test_condition(&cx, "successor child releases only its own reservation", || {
-                        store.active_task_count() == 0
-                    }).await;
-                    assert_eq!(store.active_task_count(), 0);
+                        assert_eq!(old, plain);
+                        assert_eq!(format!("{old:?}"), format!("{plain:?}"));
+                        let stale = runtime
+                            .validate_initial_work_claim(&snapshot, owner, old)
+                            .unwrap();
+                        if expire_lease {
+                            *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+                        } else {
+                            assert!(
+                                store
+                                    .restore_initial_work_for_owner_if_current(
+                                        &old_clone.task_id,
+                                        old_clone.generation,
+                                        owner,
+                                        None,
+                                        old_clone.work_descriptor.clone(),
+                                    )
+                                    .unwrap()
+                            );
+                        }
+                        let current = store
+                            .get_task_snapshot(&snapshot.task().base().task_id)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(store.active_task_count(), 0);
+                        let successor = store
+                            .take_initial_work_handoff_for_owner_if_current(&current, owner)
+                            .unwrap()
+                            .unwrap();
+                        let budget = store.task_execution_budget_if_current(&current).unwrap();
+                        let cx = Cx::current().unwrap();
+                        let mut stale_future =
+                            runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(stale));
+                        if poll_stale {
+                            asupersync::time::timeout(
+                                cx.now(),
+                                StdDuration::from_secs(5),
+                                stale_future.as_mut(),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        }
+                        drop(stale_future);
+                        drop(old_clone);
+                        assert_eq!(probe.entries.load(AtomicOrdering::SeqCst), 0);
+                        assert_eq!(store.active_task_count(), 1);
+                        assert_eq!(
+                            store.task_execution_budget_if_current(&current).unwrap(),
+                            budget
+                        );
+                        assert!(store.next_initial_work_snapshot().unwrap().is_none());
+                        let accepted = runtime
+                            .validate_initial_work_claim(&current, owner, successor)
+                            .unwrap();
+                        let mut successor_future = runner
+                            .resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(accepted));
+                        drive_task_test_until(
+                            &cx,
+                            successor_future.as_mut(),
+                            "successor enters after stale receipt rejection",
+                            || probe.entries.load(AtomicOrdering::SeqCst) == 1,
+                        )
+                        .await;
+                        assert_eq!(probe.entries.load(AtomicOrdering::SeqCst), 1);
+                        drop(successor_future);
+                        wait_task_test_condition(
+                            &cx,
+                            "successor child releases only its own reservation",
+                            || store.active_task_count() == 0,
+                        )
+                        .await;
+                        assert_eq!(store.active_task_count(), 0);
                     });
                 }
             }
         }
 
-
         #[test]
         fn task_02_execution_capacity_live_future_keeps_expired_lease_charged() {
             for start_application in [false, true] {
                 with_task_test_runtime(async {
-                let (store, clock) = clock_store(1, 1, 1);
-                let snapshot = insert(&store, "capacity-expired-live-future", None);
-                let runtime = runtime(&store);
-                let probe = Arc::new(CountingPendingSupervisor::default());
-                let runner = runner(&runtime, probe.clone(), 1);
-                let handoff = initial(&runtime, &store, &snapshot, &runner.dispatch_owner);
-                let cx = Cx::current().unwrap();
-                let mut future =
-                    runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(handoff));
-                if start_application {
-                    drive_task_test_until(&cx, future.as_mut(), "application starts before its lease expires", || {
-                        probe.entries.load(AtomicOrdering::SeqCst) == 1
-                    }).await;
-                }
-                *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
-                let successor = store
-                    .get_task_snapshot(&snapshot.task().base().task_id)
-                    .unwrap()
-                    .unwrap();
-                let budget = store.task_execution_budget_if_current(&successor).unwrap();
-                assert!(successor.generation() > snapshot.generation());
-                assert!(store.state.lock().unwrap().handoff_leases.is_empty());
-                assert_eq!(store.active_task_count(), 1);
-                assert!(store.next_initial_work_snapshot().unwrap().is_none());
-                assert!(
-                    store
-                        .take_initial_work_handoff_for_owner_if_current(&successor, "replacement")
+                    let (store, clock) = clock_store(1, 1, 1);
+                    let snapshot = insert(&store, "capacity-expired-live-future", None);
+                    let runtime = runtime(&store);
+                    let probe = Arc::new(CountingPendingSupervisor::default());
+                    let runner = runner(&runtime, probe.clone(), 1);
+                    let handoff = initial(&runtime, &store, &snapshot, &runner.dispatch_owner);
+                    let cx = Cx::current().unwrap();
+                    let mut future =
+                        runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(handoff));
+                    if start_application {
+                        drive_task_test_until(
+                            &cx,
+                            future.as_mut(),
+                            "application starts before its lease expires",
+                            || probe.entries.load(AtomicOrdering::SeqCst) == 1,
+                        )
+                        .await;
+                    }
+                    *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+                    let successor = store
+                        .get_task_snapshot(&snapshot.task().base().task_id)
                         .unwrap()
-                        .is_none()
-                );
-                assert_eq!(store.task_execution_budget_if_current(&successor).unwrap(), budget);
-                drop(future);
-                wait_task_test_condition(&cx, "expired child's retained reservation settles", || {
-                    store.active_task_count() == 0
-                }).await;
-                assert_eq!(
-                    probe.entries.load(AtomicOrdering::SeqCst),
-                    usize::from(start_application)
-                );
-                assert_eq!(store.active_task_count(), 0);
-                assert!(
-                    store
-                        .take_initial_work_handoff_for_owner_if_current(&successor, "replacement")
-                        .unwrap()
-                        .is_some()
-                );
-                assert_eq!(store.active_task_count(), 1);
+                        .unwrap();
+                    let budget = store.task_execution_budget_if_current(&successor).unwrap();
+                    assert!(successor.generation() > snapshot.generation());
+                    assert!(store.state.lock().unwrap().handoff_leases.is_empty());
+                    assert_eq!(store.active_task_count(), 1);
+                    assert!(store.next_initial_work_snapshot().unwrap().is_none());
+                    assert!(
+                        store
+                            .take_initial_work_handoff_for_owner_if_current(
+                                &successor,
+                                "replacement"
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(
+                        store.task_execution_budget_if_current(&successor).unwrap(),
+                        budget
+                    );
+                    drop(future);
+                    wait_task_test_condition(
+                        &cx,
+                        "expired child's retained reservation settles",
+                        || store.active_task_count() == 0,
+                    )
+                    .await;
+                    assert_eq!(
+                        probe.entries.load(AtomicOrdering::SeqCst),
+                        usize::from(start_application)
+                    );
+                    assert_eq!(store.active_task_count(), 0);
+                    assert!(
+                        store
+                            .take_initial_work_handoff_for_owner_if_current(
+                                &successor,
+                                "replacement"
+                            )
+                            .unwrap()
+                            .is_some()
+                    );
+                    assert_eq!(store.active_task_count(), 1);
                 });
             }
         }
@@ -12655,39 +12835,41 @@ mod tests {
         #[test]
         fn task_02_execution_capacity_cancelled_unpolled_future_releases_on_drop() {
             with_task_test_runtime(async {
-            let store = store(2, 1, 1);
-            let first = insert(&store, "capacity-cancel-a", None);
-            let second = insert(&store, "capacity-cancel-b", None);
-            let runtime = runtime(&store);
-            let probe = Arc::new(CountingPendingSupervisor::default());
-            let runner = runner(&runtime, probe.clone(), 1);
-            let handoff = initial(&runtime, &store, &first, &runner.dispatch_owner);
-            let cx = Cx::current().unwrap();
-            let future = runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(handoff));
-            runtime.cancel_task(&first.task().base().task_id).unwrap();
-            assert!(matches!(
-                store.get_task(&first.task().base().task_id).unwrap(),
-                Some(FinalTask::Cancelled(_))
-            ));
-            assert_eq!(store.active_task_count(), 1);
-            assert!(
-                store
-                    .take_initial_work_handoff_for_owner_if_current(&second, "other")
-                    .unwrap()
-                    .is_none()
-            );
-            drop(future);
-            wait_task_test_condition(&cx, "cancelled unpolled child releases capacity", || {
-                store.active_task_count() == 0
-            }).await;
-            assert_eq!(probe.entries.load(AtomicOrdering::SeqCst), 0);
-            assert_eq!(store.active_task_count(), 0);
-            assert!(
-                store
-                    .take_initial_work_handoff_for_owner_if_current(&second, "other")
-                    .unwrap()
-                    .is_some()
-            );
+                let store = store(2, 1, 1);
+                let first = insert(&store, "capacity-cancel-a", None);
+                let second = insert(&store, "capacity-cancel-b", None);
+                let runtime = runtime(&store);
+                let probe = Arc::new(CountingPendingSupervisor::default());
+                let runner = runner(&runtime, probe.clone(), 1);
+                let handoff = initial(&runtime, &store, &first, &runner.dispatch_owner);
+                let cx = Cx::current().unwrap();
+                let future =
+                    runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(handoff));
+                runtime.cancel_task(&first.task().base().task_id).unwrap();
+                assert!(matches!(
+                    store.get_task(&first.task().base().task_id).unwrap(),
+                    Some(FinalTask::Cancelled(_))
+                ));
+                assert_eq!(store.active_task_count(), 1);
+                assert!(
+                    store
+                        .take_initial_work_handoff_for_owner_if_current(&second, "other")
+                        .unwrap()
+                        .is_none()
+                );
+                drop(future);
+                wait_task_test_condition(&cx, "cancelled unpolled child releases capacity", || {
+                    store.active_task_count() == 0
+                })
+                .await;
+                assert_eq!(probe.entries.load(AtomicOrdering::SeqCst), 0);
+                assert_eq!(store.active_task_count(), 0);
+                assert!(
+                    store
+                        .take_initial_work_handoff_for_owner_if_current(&second, "other")
+                        .unwrap()
+                        .is_some()
+                );
             });
         }
 
@@ -12836,10 +13018,9 @@ mod tests {
                         insert(
                             &store,
                             &format!("capacity-race-{index}"),
-                            Some(Sha256Digest::from_bytes([
-                                if same_principal { 1 } else { index + 1 };
-                                32
-                            ])),
+                            Some(Sha256Digest::from_bytes(
+                                [if same_principal { 1 } else { index + 1 }; 32],
+                            )),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -12855,7 +13036,9 @@ mod tests {
                                 let owner = format!("worker-{index}");
                                 barrier.wait();
                                 store
-                                    .take_initial_work_handoff_for_owner_if_current(snapshot, &owner)
+                                    .take_initial_work_handoff_for_owner_if_current(
+                                        snapshot, &owner,
+                                    )
                                     .unwrap()
                             })
                         })
@@ -12906,104 +13089,152 @@ mod tests {
                     "released principals do not accumulate unbounded accounting entries"
                 );
                 drop(claims);
-                assert_eq!(store.active_task_count(), 0, "old receipt drops release nothing twice");
+                assert_eq!(
+                    store.active_task_count(),
+                    0,
+                    "old receipt drops release nothing twice"
+                );
             }
         }
 
         #[test]
         fn task_02_execution_capacity_is_shared_by_independent_service_runners() {
             with_task_test_runtime(async {
-            let store = store(4, 2, 1);
-            let alice = insert(
-                &store,
-                "capacity-service-a-first",
-                Some(Sha256Digest::from_bytes([1; 32])),
-            );
-            let alice_queued = insert(
-                &store,
-                "capacity-service-a-second",
-                Some(Sha256Digest::from_bytes([1; 32])),
-            );
-            let bob = insert(
-                &store,
-                "capacity-service-b-first",
-                Some(Sha256Digest::from_bytes([2; 32])),
-            );
-            let charlie = insert(
-                &store,
-                "capacity-service-c-first",
-                Some(Sha256Digest::from_bytes([3; 32])),
-            );
-            let probe = Arc::new(ConcurrentTaskProbe::default());
-            let first_runtime = runtime(&store);
-            let second_runtime = runtime(&store);
-            let third_runtime = runtime(&store);
-            let mut first_runner = runner(&first_runtime, probe.clone(), 1);
-            let mut second_runner = runner(&second_runtime, probe.clone(), 1);
-            let mut third_runner = runner(&third_runtime, probe.clone(), 2);
-            let cx = Cx::current().unwrap();
-            let mut first_service = Box::pin(first_runner.run_service(&cx));
-            let mut second_service = Box::pin(second_runner.run_service(&cx));
-            let mut third_service = Box::pin(third_runner.run_service(&cx));
-            drive_task_test_until(&cx, first_service.as_mut(), "first runner admits Alice", || {
-                probe.state.lock().unwrap().live.contains(&alice.task().base().task_id)
-            }).await;
-            drive_task_test_until(&cx, second_service.as_mut(), "second runner passes Alice's saturated partition", || {
-                probe.state.lock().unwrap().live.contains(&bob.task().base().task_id)
-            }).await;
-            for _ in 0..4 {
-                let observation = Instant::now() + StdDuration::from_millis(2);
-                drive_task_test_until(&cx, third_service.as_mut(), "saturation waits without failing recovery", || {
-                    Instant::now() >= observation
-                }).await;
-            }
-            assert_eq!(
-                probe.state.lock().unwrap().started,
-                [alice.task().base().task_id.clone(), bob.task().base().task_id.clone()]
-            );
-            assert_eq!(store.active_task_count(), 2);
-            for queued in [&alice_queued, &charlie] {
-                assert_eq!(
-                    store
-                        .task_execution_budget_if_current(queued)
-                        .unwrap()
-                        .unwrap()
-                        .attempts(),
-                    0
+                let store = store(4, 2, 1);
+                let alice = insert(
+                    &store,
+                    "capacity-service-a-first",
+                    Some(Sha256Digest::from_bytes([1; 32])),
                 );
-            }
-            probe.release(&bob.task().base().task_id, false);
-            drive_task_test_until(&cx, second_service.as_mut(), "released owner slot admits Charlie", || {
-                probe.state.lock().unwrap().live.contains(&charlie.task().base().task_id)
-            }).await;
-            assert!(
-                probe
-                    .state
-                    .lock()
-                    .unwrap()
-                    .live
-                    .contains(&charlie.task().base().task_id),
-                "recovery passes Alice's saturated partition and admits Charlie"
-            );
-            assert_eq!(probe.state.lock().unwrap().peak_live, 2);
-            assert_eq!(store.active_task_count(), 2);
-            assert!(first_runtime.is_task_service_ready());
-            assert!(second_runtime.is_task_service_ready());
-            assert!(third_runtime.is_task_service_ready());
-            drop(third_service);
-            drop(second_service);
-            drop(first_service);
-            wait_task_test_condition(&cx, "all independent runner children settle", || {
-                store.active_task_count() == 0 && probe.state.lock().unwrap().live.is_empty()
-            }).await;
-            assert_eq!(store.active_task_count(), 0);
-            assert!(probe.state.lock().unwrap().live.is_empty());
-            assert!(
-                store
-                    .take_initial_work_handoff_for_owner_if_current(&alice_queued, "replacement")
-                    .unwrap()
-                    .is_some()
-            );
+                let alice_queued = insert(
+                    &store,
+                    "capacity-service-a-second",
+                    Some(Sha256Digest::from_bytes([1; 32])),
+                );
+                let bob = insert(
+                    &store,
+                    "capacity-service-b-first",
+                    Some(Sha256Digest::from_bytes([2; 32])),
+                );
+                let charlie = insert(
+                    &store,
+                    "capacity-service-c-first",
+                    Some(Sha256Digest::from_bytes([3; 32])),
+                );
+                let probe = Arc::new(ConcurrentTaskProbe::default());
+                let first_runtime = runtime(&store);
+                let second_runtime = runtime(&store);
+                let third_runtime = runtime(&store);
+                let mut first_runner = runner(&first_runtime, probe.clone(), 1);
+                let mut second_runner = runner(&second_runtime, probe.clone(), 1);
+                let mut third_runner = runner(&third_runtime, probe.clone(), 2);
+                let cx = Cx::current().unwrap();
+                let mut first_service = Box::pin(first_runner.run_service(&cx));
+                let mut second_service = Box::pin(second_runner.run_service(&cx));
+                let mut third_service = Box::pin(third_runner.run_service(&cx));
+                drive_task_test_until(
+                    &cx,
+                    first_service.as_mut(),
+                    "first runner admits Alice",
+                    || {
+                        probe
+                            .state
+                            .lock()
+                            .unwrap()
+                            .live
+                            .contains(&alice.task().base().task_id)
+                    },
+                )
+                .await;
+                drive_task_test_until(
+                    &cx,
+                    second_service.as_mut(),
+                    "second runner passes Alice's saturated partition",
+                    || {
+                        probe
+                            .state
+                            .lock()
+                            .unwrap()
+                            .live
+                            .contains(&bob.task().base().task_id)
+                    },
+                )
+                .await;
+                for _ in 0..4 {
+                    let observation = Instant::now() + StdDuration::from_millis(2);
+                    drive_task_test_until(
+                        &cx,
+                        third_service.as_mut(),
+                        "saturation waits without failing recovery",
+                        || Instant::now() >= observation,
+                    )
+                    .await;
+                }
+                assert_eq!(
+                    probe.state.lock().unwrap().started,
+                    [
+                        alice.task().base().task_id.clone(),
+                        bob.task().base().task_id.clone()
+                    ]
+                );
+                assert_eq!(store.active_task_count(), 2);
+                for queued in [&alice_queued, &charlie] {
+                    assert_eq!(
+                        store
+                            .task_execution_budget_if_current(queued)
+                            .unwrap()
+                            .unwrap()
+                            .attempts(),
+                        0
+                    );
+                }
+                probe.release(&bob.task().base().task_id, false);
+                drive_task_test_until(
+                    &cx,
+                    second_service.as_mut(),
+                    "released owner slot admits Charlie",
+                    || {
+                        probe
+                            .state
+                            .lock()
+                            .unwrap()
+                            .live
+                            .contains(&charlie.task().base().task_id)
+                    },
+                )
+                .await;
+                assert!(
+                    probe
+                        .state
+                        .lock()
+                        .unwrap()
+                        .live
+                        .contains(&charlie.task().base().task_id),
+                    "recovery passes Alice's saturated partition and admits Charlie"
+                );
+                assert_eq!(probe.state.lock().unwrap().peak_live, 2);
+                assert_eq!(store.active_task_count(), 2);
+                assert!(first_runtime.is_task_service_ready());
+                assert!(second_runtime.is_task_service_ready());
+                assert!(third_runtime.is_task_service_ready());
+                drop(third_service);
+                drop(second_service);
+                drop(first_service);
+                wait_task_test_condition(&cx, "all independent runner children settle", || {
+                    store.active_task_count() == 0 && probe.state.lock().unwrap().live.is_empty()
+                })
+                .await;
+                assert_eq!(store.active_task_count(), 0);
+                assert!(probe.state.lock().unwrap().live.is_empty());
+                assert!(
+                    store
+                        .take_initial_work_handoff_for_owner_if_current(
+                            &alice_queued,
+                            "replacement"
+                        )
+                        .unwrap()
+                        .is_some()
+                );
             });
         }
     }
@@ -13147,52 +13378,58 @@ mod tests {
 
     fn check_concurrent_task_start(concurrency: usize) {
         with_task_test_runtime(async {
-        let mut fixture = concurrent_task_fixture(concurrency, 2);
-        let before = fixture.store.get_task(&fixture.task_ids[1]).unwrap();
-        let cx = Cx::current().unwrap();
-        let mut service = Box::pin(fixture.runner.run_service(&cx));
-        drive_task_test_until(&cx, service.as_mut(), "configured number of children starts", || {
-            fixture.probe.state.lock().unwrap().live.len() == concurrency
-        }).await;
-        assert!(fixture.runtime.is_task_service_ready());
-        {
-            let state = fixture.probe.state.lock().unwrap();
-            assert_eq!(state.started.len(), concurrency);
-            assert_eq!(state.live.len(), concurrency);
-            assert_eq!(state.peak_live, concurrency);
-        }
-        assert_eq!(
-            serde_json::to_value(fixture.store.get_task(&fixture.task_ids[1]).unwrap()).unwrap(),
-            serde_json::to_value(before).unwrap(),
-            "starting or queuing a sibling does not invent a public task transition"
-        );
-        if concurrency == 1 {
+            let mut fixture = concurrent_task_fixture(concurrency, 2);
+            let before = fixture.store.get_task(&fixture.task_ids[1]).unwrap();
+            let cx = Cx::current().unwrap();
+            let mut service = Box::pin(fixture.runner.run_service(&cx));
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "configured number of children starts",
+                || fixture.probe.state.lock().unwrap().live.len() == concurrency,
+            )
+            .await;
+            assert!(fixture.runtime.is_task_service_ready());
+            {
+                let state = fixture.probe.state.lock().unwrap();
+                assert_eq!(state.started.len(), concurrency);
+                assert_eq!(state.live.len(), concurrency);
+                assert_eq!(state.peak_live, concurrency);
+            }
+            assert_eq!(
+                serde_json::to_value(fixture.store.get_task(&fixture.task_ids[1]).unwrap())
+                    .unwrap(),
+                serde_json::to_value(before).unwrap(),
+                "starting or queuing a sibling does not invent a public task transition"
+            );
+            if concurrency == 1 {
+                assert!(
+                    !fixture
+                        .store
+                        .state
+                        .lock()
+                        .unwrap()
+                        .handoff_leases
+                        .contains_key(&fixture.task_ids[1])
+                );
+            }
+            drop(service);
+            wait_task_test_condition(&cx, "bounded service children restore after drop", || {
+                fixture.store.active_task_count() == 0
+                    && fixture.probe.state.lock().unwrap().live.is_empty()
+            })
+            .await;
+            assert!(!fixture.runtime.is_task_service_ready());
+            assert!(fixture.probe.state.lock().unwrap().live.is_empty());
             assert!(
-                !fixture
+                fixture
                     .store
                     .state
                     .lock()
                     .unwrap()
                     .handoff_leases
-                    .contains_key(&fixture.task_ids[1])
+                    .is_empty()
             );
-        }
-        drop(service);
-        wait_task_test_condition(&cx, "bounded service children restore after drop", || {
-            fixture.store.active_task_count() == 0
-                && fixture.probe.state.lock().unwrap().live.is_empty()
-        }).await;
-        assert!(!fixture.runtime.is_task_service_ready());
-        assert!(fixture.probe.state.lock().unwrap().live.is_empty());
-        assert!(
-            fixture
-                .store
-                .state
-                .lock()
-                .unwrap()
-                .handoff_leases
-                .is_empty()
-        );
         });
     }
 
@@ -13210,162 +13447,203 @@ mod tests {
     #[test]
     fn task_service_concurrency_never_exceeds_limit_and_refills_released_slot() {
         with_task_test_runtime(async {
-        let mut fixture = concurrent_task_fixture(2, 3);
-        let cx = Cx::current().unwrap();
-        let mut service = Box::pin(fixture.runner.run_service(&cx));
-        drive_task_test_until(&cx, service.as_mut(), "two configured slots become active", || {
-            fixture.probe.state.lock().unwrap().live.len() == 2
-        }).await;
-        assert_eq!(fixture.probe.state.lock().unwrap().started.len(), 2);
-        assert!(
-            !fixture
-                .store
-                .state
-                .lock()
-                .unwrap()
-                .handoff_leases
-                .contains_key(&fixture.task_ids[2])
-        );
-        fixture.probe.release(&fixture.task_ids[0], false);
-        drive_task_test_until(&cx, service.as_mut(), "released slot starts the queued sibling", || {
-            fixture.probe.state.lock().unwrap().started.len() == 3
-        }).await;
-        {
-            let state = fixture.probe.state.lock().unwrap();
-            assert_eq!(state.started, fixture.task_ids);
-            assert_eq!(state.live.len(), 2);
-            assert_eq!(state.peak_live, 2);
-        }
-        assert!(matches!(
-            fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
-            Some(FinalTask::Completed { .. })
-        ));
-        for task_id in &fixture.task_ids[1..] {
-            fixture.probe.release(task_id, false);
-        }
-        drive_task_test_until(&cx, service.as_mut(), "remaining siblings finish and settle", || {
-            fixture.probe.state.lock().unwrap().live.is_empty()
-                && fixture.store.active_task_count() == 0
-        }).await;
-        assert!(fixture.probe.state.lock().unwrap().live.is_empty());
-        for task_id in &fixture.task_ids {
+            let mut fixture = concurrent_task_fixture(2, 3);
+            let cx = Cx::current().unwrap();
+            let mut service = Box::pin(fixture.runner.run_service(&cx));
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "two configured slots become active",
+                || fixture.probe.state.lock().unwrap().live.len() == 2,
+            )
+            .await;
+            assert_eq!(fixture.probe.state.lock().unwrap().started.len(), 2);
+            assert!(
+                !fixture
+                    .store
+                    .state
+                    .lock()
+                    .unwrap()
+                    .handoff_leases
+                    .contains_key(&fixture.task_ids[2])
+            );
+            fixture.probe.release(&fixture.task_ids[0], false);
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "released slot starts the queued sibling",
+                || fixture.probe.state.lock().unwrap().started.len() == 3,
+            )
+            .await;
+            {
+                let state = fixture.probe.state.lock().unwrap();
+                assert_eq!(state.started, fixture.task_ids);
+                assert_eq!(state.live.len(), 2);
+                assert_eq!(state.peak_live, 2);
+            }
             assert!(matches!(
-                fixture.store.get_task(task_id).unwrap(),
+                fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
                 Some(FinalTask::Completed { .. })
             ));
-        }
-        drop(service);
-        assert!(!fixture.runtime.is_task_service_ready());
+            for task_id in &fixture.task_ids[1..] {
+                fixture.probe.release(task_id, false);
+            }
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "remaining siblings finish and settle",
+                || {
+                    fixture.probe.state.lock().unwrap().live.is_empty()
+                        && fixture.store.active_task_count() == 0
+                },
+            )
+            .await;
+            assert!(fixture.probe.state.lock().unwrap().live.is_empty());
+            for task_id in &fixture.task_ids {
+                assert!(matches!(
+                    fixture.store.get_task(task_id).unwrap(),
+                    Some(FinalTask::Completed { .. })
+                ));
+            }
+            drop(service);
+            assert!(!fixture.runtime.is_task_service_ready());
         });
     }
 
     #[test]
     fn task_service_parallel_cancellation_leaves_sibling_running() {
         with_task_test_runtime(async {
-        let mut fixture = concurrent_task_fixture(2, 2);
-        let cx = Cx::current().unwrap();
-        let mut service = Box::pin(fixture.runner.run_service(&cx));
-        drive_task_test_until(&cx, service.as_mut(), "both sibling children start", || {
-            fixture.probe.state.lock().unwrap().live.len() == 2
-        }).await;
-        let sibling_before = fixture.store.get_task(&fixture.task_ids[1]).unwrap();
-        let sibling_polls = fixture.probe.state.lock().unwrap().polls[&fixture.task_ids[1]];
-        fixture.runtime.cancel_task(&fixture.task_ids[0]).unwrap();
-        drive_task_test_until(&cx, service.as_mut(), "only the cancelled child settles", || {
-            matches!(fixture.store.get_task(&fixture.task_ids[0]).unwrap(), Some(FinalTask::Cancelled(_)))
-                && fixture.probe.state.lock().unwrap().live.len() == 1
-                && fixture.store.active_task_count() == 1
-        }).await;
-        assert!(matches!(
-            fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
-            Some(FinalTask::Cancelled(_))
-        ));
-        {
-            let state = fixture.probe.state.lock().unwrap();
-            assert_eq!(state.live.len(), 1);
-            assert!(state.live.contains(&fixture.task_ids[1]));
+            let mut fixture = concurrent_task_fixture(2, 2);
+            let cx = Cx::current().unwrap();
+            let mut service = Box::pin(fixture.runner.run_service(&cx));
+            drive_task_test_until(&cx, service.as_mut(), "both sibling children start", || {
+                fixture.probe.state.lock().unwrap().live.len() == 2
+            })
+            .await;
+            let sibling_before = fixture.store.get_task(&fixture.task_ids[1]).unwrap();
+            let sibling_polls = fixture.probe.state.lock().unwrap().polls[&fixture.task_ids[1]];
+            fixture.runtime.cancel_task(&fixture.task_ids[0]).unwrap();
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "only the cancelled child settles",
+                || {
+                    matches!(
+                        fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
+                        Some(FinalTask::Cancelled(_))
+                    ) && fixture.probe.state.lock().unwrap().live.len() == 1
+                        && fixture.store.active_task_count() == 1
+                },
+            )
+            .await;
+            assert!(matches!(
+                fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
+                Some(FinalTask::Cancelled(_))
+            ));
+            {
+                let state = fixture.probe.state.lock().unwrap();
+                assert_eq!(state.live.len(), 1);
+                assert!(state.live.contains(&fixture.task_ids[1]));
+                assert_eq!(
+                    state.polls[&fixture.task_ids[1]], sibling_polls,
+                    "a task-local cancellation does not repoll its sibling"
+                );
+            }
             assert_eq!(
-                state.polls[&fixture.task_ids[1]], sibling_polls,
-                "a task-local cancellation does not repoll its sibling"
+                serde_json::to_value(fixture.store.get_task(&fixture.task_ids[1]).unwrap())
+                    .unwrap(),
+                serde_json::to_value(sibling_before).unwrap()
             );
-        }
-        assert_eq!(
-            serde_json::to_value(fixture.store.get_task(&fixture.task_ids[1]).unwrap()).unwrap(),
-            serde_json::to_value(sibling_before).unwrap()
-        );
-        assert!(fixture.runtime.is_task_service_ready());
-        fixture.probe.release(&fixture.task_ids[1], false);
-        drive_task_test_until(&cx, service.as_mut(), "unaffected sibling completes", || {
-            matches!(fixture.store.get_task(&fixture.task_ids[1]).unwrap(), Some(FinalTask::Completed { .. }))
-                && fixture.probe.state.lock().unwrap().live.is_empty()
-                && fixture.store.active_task_count() == 0
-        }).await;
-        assert!(matches!(
-            fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
-            Some(FinalTask::Completed { .. })
-        ));
-        assert!(fixture.probe.state.lock().unwrap().live.is_empty());
-        drop(service);
-        assert!(!fixture.runtime.is_task_service_ready());
+            assert!(fixture.runtime.is_task_service_ready());
+            fixture.probe.release(&fixture.task_ids[1], false);
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "unaffected sibling completes",
+                || {
+                    matches!(
+                        fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ) && fixture.probe.state.lock().unwrap().live.is_empty()
+                        && fixture.store.active_task_count() == 0
+                },
+            )
+            .await;
+            assert!(matches!(
+                fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
+                Some(FinalTask::Completed { .. })
+            ));
+            assert!(fixture.probe.state.lock().unwrap().live.is_empty());
+            drop(service);
+            assert!(!fixture.runtime.is_task_service_ready());
         });
     }
 
     #[test]
     fn task_service_parallel_drop_restores_all_claimed_handoffs() {
         with_task_test_runtime(async {
-        let mut fixture = concurrent_task_fixture(2, 3);
-        let cx = Cx::current().unwrap();
-        let before = fixture
-            .task_ids
-            .iter()
-            .map(|id| serde_json::to_value(fixture.store.get_task(id).unwrap()).unwrap())
-            .collect::<Vec<_>>();
-        for invocation in 0..2 {
-            let mut service = Box::pin(fixture.runner.run_service(&cx));
-            drive_task_test_until(&cx, service.as_mut(), "two children are live before service drop", || {
-                fixture.probe.state.lock().unwrap().live.len() == 2
-            }).await;
-            assert_eq!(fixture.probe.state.lock().unwrap().live.len(), 2);
-            drop(service);
-            wait_task_test_condition(&cx, "dropped service restores every claimed handoff", || {
-                fixture.probe.state.lock().unwrap().live.is_empty()
-                    && fixture.store.active_task_count() == 0
-            }).await;
-            assert!(!fixture.runtime.is_task_service_ready());
-            assert!(fixture.probe.state.lock().unwrap().live.is_empty());
-            let state = fixture.store.state.lock().unwrap();
-            assert!(state.handoff_leases.is_empty());
-            assert_eq!(
-                state.initial_work.len(),
-                3,
-                "all payloads survive invocation {invocation}"
-            );
-            drop(state);
-            assert!(
-                fixture
-                    .runtime
-                    .service_signal
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .cancellation_wake
-                    .state
-                    .lock()
-                    .unwrap()
-                    .active
-                    .is_empty()
-            );
-            let after = fixture
+            let mut fixture = concurrent_task_fixture(2, 3);
+            let cx = Cx::current().unwrap();
+            let before = fixture
                 .task_ids
                 .iter()
                 .map(|id| serde_json::to_value(fixture.store.get_task(id).unwrap()).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(
-                after, before,
-                "dropping the service preserves every public snapshot"
-            );
-        }
+            for invocation in 0..2 {
+                let mut service = Box::pin(fixture.runner.run_service(&cx));
+                drive_task_test_until(
+                    &cx,
+                    service.as_mut(),
+                    "two children are live before service drop",
+                    || fixture.probe.state.lock().unwrap().live.len() == 2,
+                )
+                .await;
+                assert_eq!(fixture.probe.state.lock().unwrap().live.len(), 2);
+                drop(service);
+                wait_task_test_condition(
+                    &cx,
+                    "dropped service restores every claimed handoff",
+                    || {
+                        fixture.probe.state.lock().unwrap().live.is_empty()
+                            && fixture.store.active_task_count() == 0
+                    },
+                )
+                .await;
+                assert!(!fixture.runtime.is_task_service_ready());
+                assert!(fixture.probe.state.lock().unwrap().live.is_empty());
+                let state = fixture.store.state.lock().unwrap();
+                assert!(state.handoff_leases.is_empty());
+                assert_eq!(
+                    state.initial_work.len(),
+                    3,
+                    "all payloads survive invocation {invocation}"
+                );
+                drop(state);
+                assert!(
+                    fixture
+                        .runtime
+                        .service_signal
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .cancellation_wake
+                        .state
+                        .lock()
+                        .unwrap()
+                        .active
+                        .is_empty()
+                );
+                let after = fixture
+                    .task_ids
+                    .iter()
+                    .map(|id| serde_json::to_value(fixture.store.get_task(id).unwrap()).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    after, before,
+                    "dropping the service preserves every public snapshot"
+                );
+            }
         });
     }
 
@@ -13373,55 +13651,70 @@ mod tests {
     fn task_service_parallel_supervisor_error_restores_siblings() {
         for fail_before_first_poll in [false, true] {
             with_task_test_runtime(async {
-            let mut fixture = concurrent_task_fixture(2, 2);
-            let cx = Cx::current().unwrap();
-            let mut service = Box::pin(fixture.runner.run_service(&cx));
-            if !fail_before_first_poll {
-                drive_task_test_until(&cx, service.as_mut(), "both children start before one fails", || {
-                    fixture.probe.state.lock().unwrap().live.len() == 2
-                }).await;
-                assert_eq!(fixture.probe.state.lock().unwrap().live.len(), 2);
-            }
-            fixture.probe.release(&fixture.task_ids[0], true);
-            let error = asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), service.as_mut())
-                .await.unwrap().expect_err("a supervisor error terminates the bounded service");
-            drop(service);
-            wait_task_test_condition(&cx, "failed service settles and restores its siblings", || {
-                fixture.probe.state.lock().unwrap().live.is_empty()
-                    && fixture.store.active_task_count() == 0
-            }).await;
-            assert_eq!(error.message, "concurrent supervisor failed");
-            assert!(!fixture.runtime.is_task_service_ready());
-            assert!(fixture.probe.state.lock().unwrap().live.is_empty());
-            let state = fixture.store.state.lock().unwrap();
-            assert!(state.handoff_leases.is_empty());
-            assert_eq!(
-                state.initial_work.len(),
-                2,
-                "even a claimed sibling that was never polled retains its payload"
-            );
-            assert!(
-                state
-                    .tasks
-                    .values()
-                    .all(|task| matches!(task, FinalTask::Working(_)))
-            );
-            drop(state);
-            assert!(
-                fixture
-                    .runtime
-                    .service_signal
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .cancellation_wake
-                    .state
-                    .lock()
-                    .unwrap()
-                    .active
-                    .is_empty()
-            );
+                let mut fixture = concurrent_task_fixture(2, 2);
+                let cx = Cx::current().unwrap();
+                let mut service = Box::pin(fixture.runner.run_service(&cx));
+                if !fail_before_first_poll {
+                    drive_task_test_until(
+                        &cx,
+                        service.as_mut(),
+                        "both children start before one fails",
+                        || fixture.probe.state.lock().unwrap().live.len() == 2,
+                    )
+                    .await;
+                    assert_eq!(fixture.probe.state.lock().unwrap().live.len(), 2);
+                }
+                fixture.probe.release(&fixture.task_ids[0], true);
+                let error = asupersync::time::timeout(
+                    cx.now(),
+                    StdDuration::from_secs(5),
+                    service.as_mut(),
+                )
+                .await
+                .unwrap()
+                .expect_err("a supervisor error terminates the bounded service");
+                drop(service);
+                wait_task_test_condition(
+                    &cx,
+                    "failed service settles and restores its siblings",
+                    || {
+                        fixture.probe.state.lock().unwrap().live.is_empty()
+                            && fixture.store.active_task_count() == 0
+                    },
+                )
+                .await;
+                assert_eq!(error.message, "concurrent supervisor failed");
+                assert!(!fixture.runtime.is_task_service_ready());
+                assert!(fixture.probe.state.lock().unwrap().live.is_empty());
+                let state = fixture.store.state.lock().unwrap();
+                assert!(state.handoff_leases.is_empty());
+                assert_eq!(
+                    state.initial_work.len(),
+                    2,
+                    "even a claimed sibling that was never polled retains its payload"
+                );
+                assert!(
+                    state
+                        .tasks
+                        .values()
+                        .all(|task| matches!(task, FinalTask::Working(_)))
+                );
+                drop(state);
+                assert!(
+                    fixture
+                        .runtime
+                        .service_signal
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .cancellation_wake
+                        .state
+                        .lock()
+                        .unwrap()
+                        .active
+                        .is_empty()
+                );
             });
         }
     }
@@ -13429,89 +13722,131 @@ mod tests {
     #[test]
     fn task_service_parallel_retryable_low_id_failure_does_not_starve_sibling_on_restart() {
         with_task_test_runtime(async {
-        let mut fixture = concurrent_task_fixture(2, 2);
-        fixture.probe.release(&fixture.task_ids[0], true);
-        fixture.probe.release(&fixture.task_ids[1], false);
-        let cx = Cx::current().unwrap();
-        for _ in 0..2 {
-            let mut service = Box::pin(fixture.runner.run_service(&cx));
-            assert!(asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), service.as_mut())
-                .await.unwrap().is_err());
-            drop(service);
-            wait_task_test_condition(&cx, "failed admission batch settles before restart", || {
-                fixture.store.active_task_count() == 0
-            }).await;
-        }
-        assert!(matches!(
-            fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
-            Some(FinalTask::Working(_))
-        ));
-        assert!(
-            matches!(
-                fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
-                Some(FinalTask::Completed { .. })
-            ),
-            "the first failed admission batch cannot pin recovery before the same failing task forever"
-        );
-        assert_eq!(fixture.probe.state.lock().unwrap().started.iter()
-            .filter(|id| *id == &fixture.task_ids[1]).count(), 1,
-            "the healthy sibling executes exactly once across failed runner restarts");
-        assert!(!fixture.runtime.is_task_service_ready());
+            let mut fixture = concurrent_task_fixture(2, 2);
+            fixture.probe.release(&fixture.task_ids[0], true);
+            fixture.probe.release(&fixture.task_ids[1], false);
+            let cx = Cx::current().unwrap();
+            for _ in 0..2 {
+                let mut service = Box::pin(fixture.runner.run_service(&cx));
+                assert!(
+                    asupersync::time::timeout(
+                        cx.now(),
+                        StdDuration::from_secs(5),
+                        service.as_mut()
+                    )
+                    .await
+                    .unwrap()
+                    .is_err()
+                );
+                drop(service);
+                wait_task_test_condition(
+                    &cx,
+                    "failed admission batch settles before restart",
+                    || fixture.store.active_task_count() == 0,
+                )
+                .await;
+            }
+            assert!(matches!(
+                fixture.store.get_task(&fixture.task_ids[0]).unwrap(),
+                Some(FinalTask::Working(_))
+            ));
+            assert!(
+                matches!(
+                    fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
+                    Some(FinalTask::Completed { .. })
+                ),
+                "the first failed admission batch cannot pin recovery before the same failing task forever"
+            );
+            assert_eq!(
+                fixture
+                    .probe
+                    .state
+                    .lock()
+                    .unwrap()
+                    .started
+                    .iter()
+                    .filter(|id| *id == &fixture.task_ids[1])
+                    .count(),
+                1,
+                "the healthy sibling executes exactly once across failed runner restarts"
+            );
+            assert!(!fixture.runtime.is_task_service_ready());
         });
     }
 
     #[test]
     fn task_service_parallel_mixed_recovery_kinds_do_not_starve_unpolled_sibling() {
         with_task_test_runtime(async {
-        let mut fixture = concurrent_task_fixture(2, 3);
-        let inputs: FinalTaskInputResponses =
-            serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
-        for task_id in &fixture.task_ids[1..] {
-            fixture
-                .runtime
-                .require_input(task_id, final_roots_request(), None)
-                .unwrap();
-            fixture.runtime.update_task(task_id, &inputs).unwrap();
-        }
-        // The initial task and higher-ID resumed task fail. The lower-ID
-        // resumed task must run even when it was claimed but never polled in
-        // the first batch. Speculative cursors for both kinds used to skip it.
-        fixture.probe.release(&fixture.task_ids[0], true);
-        fixture.probe.release(&fixture.task_ids[1], false);
-        fixture.probe.release(&fixture.task_ids[2], true);
-        let cx = Cx::current().unwrap();
-        for _ in 0..2 {
-            let mut service = Box::pin(fixture.runner.run_service(&cx));
-            assert!(asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), service.as_mut())
-                .await.unwrap().is_err());
-            drop(service);
-            wait_task_test_condition(&cx, "mixed recovery batch settles before restart", || {
-                fixture.store.active_task_count() == 0
-            }).await;
-        }
-        assert!(matches!(
-            fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
-            Some(FinalTask::Completed { .. })
-        ));
-        for task_id in [&fixture.task_ids[0], &fixture.task_ids[2]] {
+            let mut fixture = concurrent_task_fixture(2, 3);
+            let inputs: FinalTaskInputResponses =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            for task_id in &fixture.task_ids[1..] {
+                fixture
+                    .runtime
+                    .require_input(task_id, final_roots_request(), None)
+                    .unwrap();
+                fixture.runtime.update_task(task_id, &inputs).unwrap();
+            }
+            // The initial task and higher-ID resumed task fail. The lower-ID
+            // resumed task must run even when it was claimed but never polled in
+            // the first batch. Speculative cursors for both kinds used to skip it.
+            fixture.probe.release(&fixture.task_ids[0], true);
+            fixture.probe.release(&fixture.task_ids[1], false);
+            fixture.probe.release(&fixture.task_ids[2], true);
+            let cx = Cx::current().unwrap();
+            for _ in 0..2 {
+                let mut service = Box::pin(fixture.runner.run_service(&cx));
+                assert!(
+                    asupersync::time::timeout(
+                        cx.now(),
+                        StdDuration::from_secs(5),
+                        service.as_mut()
+                    )
+                    .await
+                    .unwrap()
+                    .is_err()
+                );
+                drop(service);
+                wait_task_test_condition(
+                    &cx,
+                    "mixed recovery batch settles before restart",
+                    || fixture.store.active_task_count() == 0,
+                )
+                .await;
+            }
             assert!(matches!(
-                fixture.store.get_task(task_id).unwrap(),
-                Some(FinalTask::Working(_))
+                fixture.store.get_task(&fixture.task_ids[1]).unwrap(),
+                Some(FinalTask::Completed { .. })
             ));
-        }
-        assert_eq!(fixture.probe.state.lock().unwrap().started.iter()
-            .filter(|id| *id == &fixture.task_ids[1]).count(), 1,
-            "resumed healthy work is neither skipped nor duplicated across restart");
-        assert!(!fixture.runtime.is_task_service_ready());
-        assert!(
-            fixture
-                .store
-                .state
-                .lock()
-                .unwrap()
-                .handoff_leases
-                .is_empty()
-        );
+            for task_id in [&fixture.task_ids[0], &fixture.task_ids[2]] {
+                assert!(matches!(
+                    fixture.store.get_task(task_id).unwrap(),
+                    Some(FinalTask::Working(_))
+                ));
+            }
+            assert_eq!(
+                fixture
+                    .probe
+                    .state
+                    .lock()
+                    .unwrap()
+                    .started
+                    .iter()
+                    .filter(|id| *id == &fixture.task_ids[1])
+                    .count(),
+                1,
+                "resumed healthy work is neither skipped nor duplicated across restart"
+            );
+            assert!(!fixture.runtime.is_task_service_ready());
+            assert!(
+                fixture
+                    .store
+                    .state
+                    .lock()
+                    .unwrap()
+                    .handoff_leases
+                    .is_empty()
+            );
         });
     }
 
@@ -13571,68 +13906,85 @@ mod tests {
     #[test]
     fn task_service_parallel_successor_waits_for_predecessor_cleanup() {
         with_task_test_runtime(async {
-        let store = Arc::new(InMemoryFinalTaskStore::default());
-        let task = final_working_task_with_ttl("concurrent-transition", 60_000);
-        let task_id = task.base().task_id.clone();
-        store
-            .create_task_with_work(
-                task.clone(),
-                final_task_notification(&task),
-                final_test_work_descriptor(),
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let task = final_working_task_with_ttl("concurrent-transition", 60_000);
+            let task_id = task.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    final_test_work_descriptor(),
+                )
+                .unwrap();
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let probe = Arc::new(TaskTransitionCleanupProbe::default());
+            let supervisor: Arc<dyn ApplicationTaskSupervisor> = probe.clone();
+            let mut runner = runtime
+                .install_task_service(1, supervisor)
+                .unwrap()
+                .with_max_concurrent_handoffs(2)
+                .unwrap();
+            let cx = Cx::current().unwrap();
+            let mut service = Box::pin(runner.run_service(&cx));
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "predecessor retains cleanup ownership",
+                || probe.cleanup_waker.lock().unwrap().is_some(),
             )
-            .unwrap();
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let probe = Arc::new(TaskTransitionCleanupProbe::default());
-        let supervisor: Arc<dyn ApplicationTaskSupervisor> = probe.clone();
-        let mut runner = runtime
-            .install_task_service(1, supervisor)
-            .unwrap()
-            .with_max_concurrent_handoffs(2)
-            .unwrap();
-        let cx = Cx::current().unwrap();
-        let mut service = Box::pin(runner.run_service(&cx));
-        drive_task_test_until(&cx, service.as_mut(), "predecessor retains cleanup ownership", || {
-            probe.cleanup_waker.lock().unwrap().is_some()
-        }).await;
-        assert!(matches!(
-            store.get_task(&task_id).unwrap(),
-            Some(FinalTask::InputRequired { .. })
-        ));
-        let inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
-        runtime.update_task(&task_id, &inputs).unwrap();
-        let after_update = serde_json::to_value(store.get_task(&task_id).unwrap()).unwrap();
-        let observation = Instant::now() + StdDuration::from_millis(5);
-        drive_task_test_until(&cx, service.as_mut(), "successor waits without duplicate cancellation registration", || {
-            Instant::now() >= observation
-        }).await;
-        assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(
-            serde_json::to_value(store.get_task(&task_id).unwrap()).unwrap(),
-            after_update
-        );
-        assert!(
-            test_next_accepted_input(&store).unwrap().is_none(),
-            "cleanup-owned successor input cannot be claimed by another runner"
-        );
-        assert_eq!(
-            store.state.lock().unwrap().accepted_inputs.get(&task_id),
-            Some(&inputs),
-            "deferring execution preserves the exact accepted input for recovery"
-        );
-        probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
-        probe.cleanup_waker.lock().unwrap().take().unwrap().wake();
-        drive_task_test_until(&cx, service.as_mut(), "successor executes after predecessor child settles", || {
-            matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Completed { .. }))
-                && store.active_task_count() == 0
-        }).await;
-        assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
-        assert!(matches!(
-            store.get_task(&task_id).unwrap(),
-            Some(FinalTask::Completed { .. })
-        ));
-        assert!(runtime.is_task_service_ready());
-        drop(service);
-        assert!(!runtime.is_task_service_ready());
+            .await;
+            assert!(matches!(
+                store.get_task(&task_id).unwrap(),
+                Some(FinalTask::InputRequired { .. })
+            ));
+            let inputs =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            runtime.update_task(&task_id, &inputs).unwrap();
+            let after_update = serde_json::to_value(store.get_task(&task_id).unwrap()).unwrap();
+            let observation = Instant::now() + StdDuration::from_millis(5);
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "successor waits without duplicate cancellation registration",
+                || Instant::now() >= observation,
+            )
+            .await;
+            assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(
+                serde_json::to_value(store.get_task(&task_id).unwrap()).unwrap(),
+                after_update
+            );
+            assert!(
+                test_next_accepted_input(&store).unwrap().is_none(),
+                "cleanup-owned successor input cannot be claimed by another runner"
+            );
+            assert_eq!(
+                store.state.lock().unwrap().accepted_inputs.get(&task_id),
+                Some(&inputs),
+                "deferring execution preserves the exact accepted input for recovery"
+            );
+            probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
+            probe.cleanup_waker.lock().unwrap().take().unwrap().wake();
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "successor executes after predecessor child settles",
+                || {
+                    matches!(
+                        store.get_task(&task_id).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ) && store.active_task_count() == 0
+                },
+            )
+            .await;
+            assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
+            assert!(matches!(
+                store.get_task(&task_id).unwrap(),
+                Some(FinalTask::Completed { .. })
+            ));
+            assert!(runtime.is_task_service_ready());
+            drop(service);
+            assert!(!runtime.is_task_service_ready());
         });
     }
 
@@ -13647,82 +13999,111 @@ mod tests {
             .with_max_concurrent_handoffs(2)
             .unwrap();
         with_task_test_runtime(async {
-                let cx = Cx::current().unwrap();
-                let mut service = Box::pin(runner.run_service(&cx));
-                drive_task_test_until(&cx, service.as_mut(), "parallel Task service enters", || {
-                    runtime.is_task_service_ready()
-                }).await;
-                let task = runtime
-                    .create_task_with_work(final_test_work_descriptor(), None)
-                    .unwrap()
-                    .task;
-                let task_id = task.base().task_id.clone();
-                drive_task_test_until(&cx, service.as_mut(), "initial work requests input and begins cleanup", || {
-                    probe.cleanup_waker.lock().unwrap().is_some()
-                }).await;
-                let inputs =
-                    serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
-                runtime.update_task(&task_id, &inputs).unwrap();
-                let successor = store.get_task_snapshot(&task_id).unwrap().unwrap();
-                let budget = store
-                    .task_execution_budget_if_current(&successor)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(budget.attempts(), 1);
-                assert!(budget.attempt_deadline().is_none());
-                // Wake recovery more times than the entire configured attempt
-                // allowance while the predecessor is still cleaning up.
-                for _ in 0..12 {
-                    runtime.signal_task_service(task_id.clone());
-                    let observation = Instant::now() + StdDuration::from_millis(2);
-                    drive_task_test_until(&cx, service.as_mut(), "cleanup-owned input remains deferred", || {
-                        Instant::now() >= observation
-                    }).await;
-                    assert_eq!(
-                        store.task_execution_budget_if_current(&successor).unwrap(),
-                        Some(budget)
-                    );
-                    assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
-                }
-                let healthy = runtime
-                    .create_task_with_work(
-                        FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap(),
-                        None,
-                    )
-                    .unwrap()
-                    .task;
-                drive_task_test_until(&cx, service.as_mut(), "healthy sibling passes deferred input", || {
-                    matches!(store.get_task(&healthy.base().task_id).unwrap(), Some(FinalTask::Completed { .. }))
-                }).await;
-                assert!(
-                    matches!(
-                        store.get_task(&healthy.base().task_id).unwrap(),
-                        Some(FinalTask::Completed { .. })
-                    ),
-                    "skipping a cleanup-owned successor must not hide healthy siblings"
-                );
+            let cx = Cx::current().unwrap();
+            let mut service = Box::pin(runner.run_service(&cx));
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "parallel Task service enters",
+                || runtime.is_task_service_ready(),
+            )
+            .await;
+            let task = runtime
+                .create_task_with_work(final_test_work_descriptor(), None)
+                .unwrap()
+                .task;
+            let task_id = task.base().task_id.clone();
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "initial work requests input and begins cleanup",
+                || probe.cleanup_waker.lock().unwrap().is_some(),
+            )
+            .await;
+            let inputs =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            runtime.update_task(&task_id, &inputs).unwrap();
+            let successor = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            let budget = store
+                .task_execution_budget_if_current(&successor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(budget.attempts(), 1);
+            assert!(budget.attempt_deadline().is_none());
+            // Wake recovery more times than the entire configured attempt
+            // allowance while the predecessor is still cleaning up.
+            for _ in 0..12 {
+                runtime.signal_task_service(task_id.clone());
+                let observation = Instant::now() + StdDuration::from_millis(2);
+                drive_task_test_until(
+                    &cx,
+                    service.as_mut(),
+                    "cleanup-owned input remains deferred",
+                    || Instant::now() >= observation,
+                )
+                .await;
                 assert_eq!(
                     store.task_execution_budget_if_current(&successor).unwrap(),
                     Some(budget)
                 );
-                probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
-                probe.cleanup_waker.lock().unwrap().take().unwrap().wake();
-                drive_task_test_until(&cx, service.as_mut(), "deferred input spends its one resumed attempt", || {
-                    matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Completed { .. }))
-                        && store.active_task_count() == 0
-                }).await;
-                assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
-                let completed = store.get_task_snapshot(&task_id).unwrap().unwrap();
-                assert!(matches!(completed.task(), FinalTask::Completed { .. }));
-                let final_budget = store
-                    .task_execution_budget_if_current(&completed)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(final_budget.attempts(), 2);
-                assert_eq!(final_budget.total_deadline(), budget.total_deadline());
-                assert!(runtime.is_task_service_ready());
-                drop(service);
-            });
+                assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
+            }
+            let healthy = runtime
+                .create_task_with_work(
+                    FinalTaskWorkDescriptor::new(serde_json::json!({"finish": true})).unwrap(),
+                    None,
+                )
+                .unwrap()
+                .task;
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "healthy sibling passes deferred input",
+                || {
+                    matches!(
+                        store.get_task(&healthy.base().task_id).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    )
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    store.get_task(&healthy.base().task_id).unwrap(),
+                    Some(FinalTask::Completed { .. })
+                ),
+                "skipping a cleanup-owned successor must not hide healthy siblings"
+            );
+            assert_eq!(
+                store.task_execution_budget_if_current(&successor).unwrap(),
+                Some(budget)
+            );
+            probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
+            probe.cleanup_waker.lock().unwrap().take().unwrap().wake();
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "deferred input spends its one resumed attempt",
+                || {
+                    matches!(
+                        store.get_task(&task_id).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ) && store.active_task_count() == 0
+                },
+            )
+            .await;
+            assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
+            let completed = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert!(matches!(completed.task(), FinalTask::Completed { .. }));
+            let final_budget = store
+                .task_execution_budget_if_current(&completed)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final_budget.attempts(), 2);
+            assert_eq!(final_budget.total_deadline(), budget.total_deadline());
+            assert!(runtime.is_task_service_ready());
+            drop(service);
+        });
     }
 
     #[test]
@@ -13867,7 +14248,10 @@ mod tests {
                     order.len()
                 };
                 complete_final_task_handoff(handoff)?;
-                assert!(observed <= cancel_after, "the caller stops at its recovery boundary");
+                assert!(
+                    observed <= cancel_after,
+                    "the caller stops at its recovery boundary"
+                );
                 Ok(())
             })
         }
@@ -14268,8 +14652,9 @@ mod tests {
                 ),
                 AtomicOrdering::SeqCst,
             );
-            let committed = self.inner
-                .create_task_with_work(task, notification, work_descriptor)?;
+            let committed =
+                self.inner
+                    .create_task_with_work(task, notification, work_descriptor)?;
             let hook = self.after_creation.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook();
@@ -15130,7 +15515,9 @@ mod tests {
         runtime
             .require_input(&task_id, final_roots_request(), None)
             .unwrap();
-        let current = runtime.task_for_request(&owner, &task_id, TaskAccessAction::Update).unwrap();
+        let current = runtime
+            .task_for_request(&owner, &task_id, TaskAccessAction::Update)
+            .unwrap();
         runtime
             .update_task_snapshot(
                 &current,
@@ -15145,14 +15532,22 @@ mod tests {
                 .authenticated_principal(),
             Some(principal)
         );
-        let current = runtime.task_for_request(&owner, &task_id, TaskAccessAction::Cancel).unwrap();
-        let admitted = runtime.admit_task_for_request(&owner, &task_id, TaskAccessAction::Listen).unwrap();
+        let current = runtime
+            .task_for_request(&owner, &task_id, TaskAccessAction::Cancel)
+            .unwrap();
+        let admitted = runtime
+            .admit_task_for_request(&owner, &task_id, TaskAccessAction::Listen)
+            .unwrap();
         runtime.cancel_task_snapshot(&current).unwrap();
-        assert!(runtime.notification_matches_task_access(
-            &owner,
-            &admitted,
-            &store.latest_notification(&task_id).unwrap(),
-        ).unwrap());
+        assert!(
+            runtime
+                .notification_matches_task_access(
+                    &owner,
+                    &admitted,
+                    &store.latest_notification(&task_id).unwrap(),
+                )
+                .unwrap()
+        );
         assert_eq!(
             runtime
                 .task_for_request(&owner, &task_id, TaskAccessAction::Get)
@@ -15178,15 +15573,19 @@ mod tests {
             )
             .unwrap();
         assert!(
-            runtime.task_for_request(&owner, &task_id, TaskAccessAction::Get).is_err(),
+            runtime
+                .task_for_request(&owner, &task_id, TaskAccessAction::Get)
+                .is_err(),
             "expired ownership cannot attach to a reused unprotected ID"
         );
         assert!(
-            runtime.notification_matches_task_access(
-                &owner,
-                &admitted,
-                &store.latest_notification(&task_id).unwrap(),
-            ).is_err(),
+            runtime
+                .notification_matches_task_access(
+                    &owner,
+                    &admitted,
+                    &store.latest_notification(&task_id).unwrap(),
+                )
+                .is_err(),
             "an existing listener cannot inherit the replacement task"
         );
         assert!(
@@ -15224,7 +15623,9 @@ mod tests {
         let before_notification =
             serde_json::to_value(store.latest_notification(&task_id)).unwrap();
         for caller in [&foreign, &McpContext::new(Cx::for_testing(), 1)] {
-            let error = runtime.task_for_request(caller, &task_id, TaskAccessAction::Get).unwrap_err();
+            let error = runtime
+                .task_for_request(caller, &task_id, TaskAccessAction::Get)
+                .unwrap_err();
             assert_eq!(error.message, "Task not found");
             assert_eq!(
                 store
@@ -15247,7 +15648,9 @@ mod tests {
                 before.authenticated_principal()
             );
         }
-        let current = runtime.task_for_request(&owner, &task_id, TaskAccessAction::Cancel).unwrap();
+        let current = runtime
+            .task_for_request(&owner, &task_id, TaskAccessAction::Cancel)
+            .unwrap();
         runtime.cancel_task_snapshot(&current).unwrap();
         assert!(
             runtime.cancel_task_snapshot(&before).is_err(),
@@ -15289,11 +15692,11 @@ mod tests {
         .expect("non-null test work descriptor is valid")
     }
 
-
     mod task_output_schema_tests {
         use super::*;
 
-        const VALID_RESULT: &str = r#"{"content":[],"structuredContent":{"answer":7},"vendor":{"number":1e+00}}"#;
+        const VALID_RESULT: &str =
+            r#"{"content":[],"structuredContent":{"answer":7},"vendor":{"number":1e+00}}"#;
 
         fn output_schema() -> Arc<fastmcp_protocol::AdmittedSchema> {
             Arc::new(
@@ -15349,7 +15752,10 @@ mod tests {
                 store,
                 FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
                 Arc::new(move |notification| {
-                    emitted.lock().unwrap().push(notification.params.task.clone());
+                    emitted
+                        .lock()
+                        .unwrap()
+                        .push(notification.params.task.clone());
                 }),
             )
         }
@@ -15358,7 +15764,10 @@ mod tests {
         fn supervised_completion_accepts_schema_results_and_preserves_exact_wire() {
             for (wire, declared) in [
                 (VALID_RESULT, true),
-                (r#"{"content":[],"isError":true,"structuredContent":{"error":"worker failed"}}"#, true),
+                (
+                    r#"{"content":[],"isError":true,"structuredContent":{"error":"worker failed"}}"#,
+                    true,
+                ),
                 (r#"{"content":[]}"#, false),
             ] {
                 with_task_test_runtime(async {
@@ -15394,12 +15803,20 @@ mod tests {
                         .unwrap()
                         .task;
                     let id = task.base().task_id.clone();
-                    drive_task_test_until(&cx, service.as_mut(), "schema completion is committed", || {
-                        matches!(store.get_task(&id).unwrap(), Some(FinalTask::Completed { .. }))
-                            && store.active_task_count() == 0
-                    })
+                    drive_task_test_until(
+                        &cx,
+                        service.as_mut(),
+                        "schema completion is committed",
+                        || {
+                            matches!(
+                                store.get_task(&id).unwrap(),
+                                Some(FinalTask::Completed { .. })
+                            ) && store.active_task_count() == 0
+                        },
+                    )
                     .await;
-                    let FinalTask::Completed { result, .. } = runtime.get_task(&id).unwrap().task else {
+                    let FinalTask::Completed { result, .. } = runtime.get_task(&id).unwrap().task
+                    else {
                         panic!("the admitted output must complete");
                     };
                     assert_eq!(serde_json::to_string(&result).unwrap(), expected_wire);
@@ -15478,24 +15895,38 @@ mod tests {
                     let rejected = store.get_task_snapshot(&id).unwrap().unwrap();
                     assert_eq!(rejected.generation(), before.generation());
                     assert!(final_tasks_match_exactly(rejected.task(), before.task()).unwrap());
-                    assert!(emitted.lock().unwrap().iter().all(|task| {
-                        !matches!(task, FinalTask::Completed { .. })
-                    }));
+                    assert!(
+                        emitted
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .all(|task| { !matches!(task, FinalTask::Completed { .. }) })
+                    );
 
                     // The unchanged work is retried through the same retained
                     // service owner, with a conforming application result.
                     *supervisor.result.lock().unwrap() = result(VALID_RESULT);
                     let mut retry = Box::pin(runner.run_service(&cx));
-                    drive_task_test_until(&cx, retry.as_mut(), "restored work completes on retry", || {
-                        matches!(store.get_task(&id).unwrap(), Some(FinalTask::Completed { .. }))
-                            && store.active_task_count() == 0
-                    })
+                    drive_task_test_until(
+                        &cx,
+                        retry.as_mut(),
+                        "restored work completes on retry",
+                        || {
+                            matches!(
+                                store.get_task(&id).unwrap(),
+                                Some(FinalTask::Completed { .. })
+                            ) && store.active_task_count() == 0
+                        },
+                    )
                     .await;
                     assert_eq!(supervisor.calls.load(AtomicOrdering::SeqCst), 2);
                     assert_eq!(
-                        emitted.lock().unwrap().iter().filter(|task| {
-                            matches!(task, FinalTask::Completed { .. })
-                        }).count(),
+                        emitted
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|task| { matches!(task, FinalTask::Completed { .. }) })
+                            .count(),
                         1,
                     );
                     assert_final_task_payload_accounting(&store);
@@ -15524,7 +15955,10 @@ mod tests {
                 store.clone(),
                 FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
                 Arc::new(move |notification| {
-                    observed.lock().unwrap().push(notification.params.task.clone());
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(notification.params.task.clone());
                 }),
             );
             let before = store.snapshot();
@@ -15551,7 +15985,9 @@ mod tests {
             // A trusted custom store may write directly, but its invalid
             // result must still be refused by the public runtime read path.
             store.replace_snapshot_for_read(invalid.clone());
-            runtime.get_task(&id).expect_err("invalid stored completion is not exposed");
+            runtime
+                .get_task(&id)
+                .expect_err("invalid stored completion is not exposed");
             assert!(emitted.lock().unwrap().is_empty());
             store.replace_snapshot_for_read(initial.clone());
 
@@ -15621,10 +16057,18 @@ mod tests {
         task_id: &FinalTaskId,
     ) {
         let mut running = Box::pin(runner.run_service(cx));
-        drive_task_test_until(cx, running.as_mut(), "retained runner completes recovered work", || {
-            matches!(store.get_task(task_id).unwrap(), Some(FinalTask::Completed { .. }))
-                && store.active_task_count() == 0
-        }).await;
+        drive_task_test_until(
+            cx,
+            running.as_mut(),
+            "retained runner completes recovered work",
+            || {
+                matches!(
+                    store.get_task(task_id).unwrap(),
+                    Some(FinalTask::Completed { .. })
+                ) && store.active_task_count() == 0
+            },
+        )
+        .await;
         drop(running);
     }
 
@@ -15776,7 +16220,10 @@ mod tests {
             Arc::new(
                 InMemoryFinalTaskStore::with_clock(max_tasks, clock)
                     .expect("positive bounded store capacity is valid")
-                    .with_owner_capacity(max_tasks, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+                    .with_owner_capacity(
+                        max_tasks,
+                        InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+                    )
                     .expect("the expiry fixture explicitly shares its aggregate capacity"),
             ),
             now,
@@ -15882,7 +16329,11 @@ mod tests {
             );
             reserved += expected_reserve;
             total += actual;
-            let owner = state.authenticated_principals.get(task_id).copied().map(Sha256Digest::into_bytes);
+            let owner = state
+                .authenticated_principals
+                .get(task_id)
+                .copied()
+                .map(Sha256Digest::into_bytes);
             assert_eq!(state.payload_accounting.records[task_id].owner, owner);
             let owner_charge = owners.entry(owner).or_default();
             owner_charge.tasks += 1;
@@ -16445,7 +16896,10 @@ mod tests {
             let snapshot = self.snapshot.lock().unwrap();
             Ok((&snapshot.task().base().task_id == task_id).then(|| {
                 FinalTaskAccessMetadata::new(
-                    task_id.clone(), snapshot.generation(), snapshot.creation_generation(), snapshot.authenticated_principal(),
+                    task_id.clone(),
+                    snapshot.generation(),
+                    snapshot.creation_generation(),
+                    snapshot.authenticated_principal(),
                     snapshot.original_operation().cloned(),
                 )
             }))
@@ -19195,7 +19649,10 @@ mod tests {
                 }),
             )
             .unwrap()
-            .with_owner_capacity(maximum_tasks, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+            .with_owner_capacity(
+                maximum_tasks,
+                InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+            )
             .unwrap()
             .with_retention_policy(policy)
             .unwrap();
@@ -20988,7 +21445,6 @@ mod tests {
         ));
     }
 
-
     /// A controlled clock boundary shared by the expiry-bearing read tests.
     /// The clock parks after taking its sample. Only an operation that sampled
     /// before locking lets the other thread acquire state and advance time
@@ -21093,14 +21549,12 @@ mod tests {
             .unwrap()
             .generation();
         let expires_at = probe.store.state.lock().unwrap().expires_at[&task_id];
-        *probe.now.lock().unwrap() =
-            expires_at.checked_sub(StdDuration::from_millis(1)).unwrap();
+        *probe.now.lock().unwrap() = expires_at.checked_sub(StdDuration::from_millis(1)).unwrap();
         let worker_task_id = task_id.clone();
         let (sampled_without_lock, retained) =
             probe.run(move |store| read(store, &worker_task_id, generation));
         assert_eq!(
-            retained,
-            !sampled_without_lock,
+            retained, !sampled_without_lock,
             "a pre-lock clock sample cannot expose a task after its retention deadline"
         );
         // With serialized sampling the first read is the positive, live side
@@ -21206,8 +21660,7 @@ mod tests {
         let expires_at = probe.store.state.lock().unwrap().retention_journal.entries
             [&receipt.sequence()]
             .expires_at;
-        *probe.now.lock().unwrap() =
-            expires_at.checked_sub(StdDuration::from_millis(1)).unwrap();
+        *probe.now.lock().unwrap() = expires_at.checked_sub(StdDuration::from_millis(1)).unwrap();
         (task_id, generation, receipt, expires_at)
     }
 
@@ -21216,7 +21669,9 @@ mod tests {
         let probe = FinalTaskReadClockProbe::new();
         let (_, _, receipt, expires_at) = seed_final_task_clock_retention_receipt(&probe);
         let (sampled_without_lock, page) = probe.run(|store| {
-            store.task_retention_audit(&Cx::for_testing(), None, 1).unwrap()
+            store
+                .task_retention_audit(&Cx::for_testing(), None, 1)
+                .unwrap()
         });
         assert_eq!(
             page.records().len(),
@@ -21501,21 +21956,33 @@ mod tests {
                 let cx = Cx::current().unwrap();
                 let service_budget = cx.budget();
                 let mut running = Box::pin(runner.run_service(&cx));
-                drive_task_test_until(&cx, running.as_mut(), "execution-budget service enters", || {
-                    runtime.is_task_service_ready()
-                }).await;
+                drive_task_test_until(
+                    &cx,
+                    running.as_mut(),
+                    "execution-budget service enters",
+                    || runtime.is_task_service_ready(),
+                )
+                .await;
                 let created = runtime
                     .create_task_with_work(final_test_work_descriptor(), None)
                     .unwrap();
                 let task_id = created.task.base().task_id.clone();
-                drive_task_test_until(&cx, running.as_mut(), "initial attempt reaches its application boundary", || {
-                    if resumed {
-                        matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::InputRequired { .. }))
-                            && store.active_task_count() == 0
-                    } else {
-                        supervisor.polls.load(AtomicOrdering::SeqCst) > 0
-                    }
-                }).await;
+                drive_task_test_until(
+                    &cx,
+                    running.as_mut(),
+                    "initial attempt reaches its application boundary",
+                    || {
+                        if resumed {
+                            matches!(
+                                store.get_task(&task_id).unwrap(),
+                                Some(FinalTask::InputRequired { .. })
+                            ) && store.active_task_count() == 0
+                        } else {
+                            supervisor.polls.load(AtomicOrdering::SeqCst) > 0
+                        }
+                    },
+                )
+                .await;
                 let first = supervisor.budgets.lock().unwrap()[0];
                 if resumed {
                     assert!(matches!(
@@ -21527,9 +21994,13 @@ mod tests {
                         serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
                             .unwrap();
                     runtime.update_task(&task_id, &inputs).unwrap();
-                    drive_task_test_until(&cx, running.as_mut(), "resumed attempt reaches its application boundary", || {
-                        supervisor.polls.load(AtomicOrdering::SeqCst) > 0
-                    }).await;
+                    drive_task_test_until(
+                        &cx,
+                        running.as_mut(),
+                        "resumed attempt reaches its application boundary",
+                        || supervisor.polls.load(AtomicOrdering::SeqCst) > 0,
+                    )
+                    .await;
                 }
                 let budget = *supervisor.budgets.lock().unwrap().last().unwrap();
                 assert_eq!(budget.total_deadline(), first.total_deadline());
@@ -21542,15 +22013,27 @@ mod tests {
                 } else {
                     deadline - StdDuration::from_secs(1)
                 };
-                supervisor.waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
-                drive_task_test_until(&cx, running.as_mut(), "deadline check precedes the next application poll", || {
-                    if expired {
-                        supervisor.dropped.load(AtomicOrdering::SeqCst)
-                            && store.active_task_count() == 0
-                    } else {
-                        supervisor.polls.load(AtomicOrdering::SeqCst) > polls_before
-                    }
-                }).await;
+                supervisor
+                    .waker
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .wake_by_ref();
+                drive_task_test_until(
+                    &cx,
+                    running.as_mut(),
+                    "deadline check precedes the next application poll",
+                    || {
+                        if expired {
+                            supervisor.dropped.load(AtomicOrdering::SeqCst)
+                                && store.active_task_count() == 0
+                        } else {
+                            supervisor.polls.load(AtomicOrdering::SeqCst) > polls_before
+                        }
+                    },
+                )
+                .await;
                 let task = store.get_task(&task_id).unwrap().unwrap();
                 if expired {
                     assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), polls_before);
@@ -21595,10 +22078,18 @@ mod tests {
                             None,
                         )
                         .unwrap();
-                    drive_task_test_until(&cx, running.as_mut(), "healthy work completes after execution expiry", || {
-                        matches!(store.get_task(&sibling.task.base().task_id).unwrap(), Some(FinalTask::Completed { .. }))
-                            && store.active_task_count() == 0
-                    }).await;
+                    drive_task_test_until(
+                        &cx,
+                        running.as_mut(),
+                        "healthy work completes after execution expiry",
+                        || {
+                            matches!(
+                                store.get_task(&sibling.task.base().task_id).unwrap(),
+                                Some(FinalTask::Completed { .. })
+                            ) && store.active_task_count() == 0
+                        },
+                    )
+                    .await;
                     assert!(
                         matches!(
                             store.get_task(&sibling.task.base().task_id).unwrap(),
@@ -21608,9 +22099,12 @@ mod tests {
                     );
                 }
                 drop(running);
-                wait_task_test_condition(&cx, "execution-budget child settles after service drop", || {
-                    store.active_task_count() == 0
-                }).await;
+                wait_task_test_condition(
+                    &cx,
+                    "execution-budget child settles after service drop",
+                    || store.active_task_count() == 0,
+                )
+                .await;
             });
         }
     }
@@ -21677,89 +22171,115 @@ mod tests {
         });
         let mut runner = runtime.install_task_service(2, supervisor.clone()).unwrap();
         with_task_test_runtime(async {
-                let cx = Cx::current().unwrap();
-                let mut running = Box::pin(runner.run_service(&cx));
-                drive_task_test_until(&cx, running.as_mut(), "input-wait service enters", || {
-                    runtime.is_task_service_ready()
-                }).await;
-                let task = runtime
-                    .create_task_with_work(final_test_work_descriptor(), None)
-                    .unwrap()
-                    .task;
-                let task_id = task.base().task_id.clone();
-                drive_task_test_until(&cx, running.as_mut(), "initial attempt settles in input-required state", || {
-                    matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::InputRequired { .. }))
-                        && store.active_task_count() == 0
-                }).await;
-                let waiting = store.get_task_snapshot(&task_id).unwrap().unwrap();
-                assert!(matches!(waiting.task(), FinalTask::InputRequired { .. }));
-                let original = store
-                    .task_execution_budget_if_current(&waiting)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(original.attempts(), 1);
-                assert!(
-                    original.attempt_deadline().is_none(),
-                    "waiting input has no active attempt"
-                );
-                drop(running);
-                drop(runner);
-                *clock.lock().unwrap() = original.total_deadline()
-                    - if expired {
-                        StdDuration::ZERO
-                    } else {
-                        StdDuration::from_secs(1)
-                    };
-                // A replacement runtime has a different retention policy. It must
-                // use the original task's execution deadline and retention record.
-                let recovered = FinalTaskRuntime::new(
-                    store.clone(),
-                    FinalTaskRuntimeConfig::new(5_000, None).unwrap(),
-                    Arc::new(|_| {}),
-                );
-                let mut successor = recovered
-                    .install_task_service(2, supervisor.clone())
-                    .unwrap();
-                let mut recovering = Box::pin(successor.run_service(&cx));
-                drive_task_test_until(&cx, recovering.as_mut(), "replacement service rechecks the original total deadline", || {
-                    recovered.is_task_service_ready()
-                        && (!expired || matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Failed { .. })))
-                }).await;
-                let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
-                let current_budget = store
-                    .task_execution_budget_if_current(&current)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(current_budget.total_deadline(), original.total_deadline());
-                assert_eq!(current.task().base().ttl_ms, task.base().ttl_ms);
-                let inputs =
-                    serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
-                recovered.update_task(&task_id, &inputs).unwrap();
-                if !expired {
-                    drive_task_test_until(&cx, recovering.as_mut(), "live input resumes under the original deadline", || {
-                        supervisor.polls.load(AtomicOrdering::SeqCst) > 0
-                    }).await;
-                }
-                if expired {
-                    let FinalTask::Failed { error, .. } = current.task() else {
-                        panic!("recovery must expire input wait");
-                    };
-                    assert_eq!(error.message, FINAL_TASK_TOTAL_DEADLINE_EXCEEDED);
-                    assert_eq!(supervisor.budgets.lock().unwrap().len(), 1);
-                    assert!(store.state.lock().unwrap().accepted_inputs.is_empty());
+            let cx = Cx::current().unwrap();
+            let mut running = Box::pin(runner.run_service(&cx));
+            drive_task_test_until(&cx, running.as_mut(), "input-wait service enters", || {
+                runtime.is_task_service_ready()
+            })
+            .await;
+            let task = runtime
+                .create_task_with_work(final_test_work_descriptor(), None)
+                .unwrap()
+                .task;
+            let task_id = task.base().task_id.clone();
+            drive_task_test_until(
+                &cx,
+                running.as_mut(),
+                "initial attempt settles in input-required state",
+                || {
+                    matches!(
+                        store.get_task(&task_id).unwrap(),
+                        Some(FinalTask::InputRequired { .. })
+                    ) && store.active_task_count() == 0
+                },
+            )
+            .await;
+            let waiting = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert!(matches!(waiting.task(), FinalTask::InputRequired { .. }));
+            let original = store
+                .task_execution_budget_if_current(&waiting)
+                .unwrap()
+                .unwrap();
+            assert_eq!(original.attempts(), 1);
+            assert!(
+                original.attempt_deadline().is_none(),
+                "waiting input has no active attempt"
+            );
+            drop(running);
+            drop(runner);
+            *clock.lock().unwrap() = original.total_deadline()
+                - if expired {
+                    StdDuration::ZERO
                 } else {
-                    assert!(matches!(current.task(), FinalTask::InputRequired { .. }));
-                    let budget = *supervisor.budgets.lock().unwrap().last().unwrap();
-                    assert_eq!(budget.attempts(), 2);
-                    assert_eq!(budget.attempt_deadline(), Some(original.total_deadline()));
-                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
-                }
-                assert!(recovered.is_task_service_ready());
-                drop(recovering);
-                wait_task_test_condition(&cx, "replacement worker settles before runtime shutdown", || {
-                    store.active_task_count() == 0
-                }).await;
-            });
+                    StdDuration::from_secs(1)
+                };
+            // A replacement runtime has a different retention policy. It must
+            // use the original task's execution deadline and retention record.
+            let recovered = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(5_000, None).unwrap(),
+                Arc::new(|_| {}),
+            );
+            let mut successor = recovered
+                .install_task_service(2, supervisor.clone())
+                .unwrap();
+            let mut recovering = Box::pin(successor.run_service(&cx));
+            drive_task_test_until(
+                &cx,
+                recovering.as_mut(),
+                "replacement service rechecks the original total deadline",
+                || {
+                    recovered.is_task_service_ready()
+                        && (!expired
+                            || matches!(
+                                store.get_task(&task_id).unwrap(),
+                                Some(FinalTask::Failed { .. })
+                            ))
+                },
+            )
+            .await;
+            let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            let current_budget = store
+                .task_execution_budget_if_current(&current)
+                .unwrap()
+                .unwrap();
+            assert_eq!(current_budget.total_deadline(), original.total_deadline());
+            assert_eq!(current.task().base().ttl_ms, task.base().ttl_ms);
+            let inputs =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            recovered.update_task(&task_id, &inputs).unwrap();
+            if !expired {
+                drive_task_test_until(
+                    &cx,
+                    recovering.as_mut(),
+                    "live input resumes under the original deadline",
+                    || supervisor.polls.load(AtomicOrdering::SeqCst) > 0,
+                )
+                .await;
+            }
+            if expired {
+                let FinalTask::Failed { error, .. } = current.task() else {
+                    panic!("recovery must expire input wait");
+                };
+                assert_eq!(error.message, FINAL_TASK_TOTAL_DEADLINE_EXCEEDED);
+                assert_eq!(supervisor.budgets.lock().unwrap().len(), 1);
+                assert!(store.state.lock().unwrap().accepted_inputs.is_empty());
+            } else {
+                assert!(matches!(current.task(), FinalTask::InputRequired { .. }));
+                let budget = *supervisor.budgets.lock().unwrap().last().unwrap();
+                assert_eq!(budget.attempts(), 2);
+                assert_eq!(budget.attempt_deadline(), Some(original.total_deadline()));
+                assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
+            }
+            assert!(recovered.is_task_service_ready());
+            drop(recovering);
+            wait_task_test_condition(
+                &cx,
+                "replacement worker settles before runtime shutdown",
+                || store.active_task_count() == 0,
+            )
+            .await;
+        });
     }
 
     #[test]
@@ -22127,39 +22647,53 @@ mod tests {
             let supervisor = Arc::new(ExecutionPollingSupervisor::default());
             let mut runner = runtime.install_task_service(1, supervisor.clone()).unwrap();
             with_task_test_runtime(async {
-                    let cx = Cx::current().unwrap();
-                    let mut running = Box::pin(runner.run_service(&cx));
-                    drive_task_test_until(&cx, running.as_mut(), "queued execution service enters", || {
-                        runtime.is_task_service_ready()
-                    }).await;
-                    let task = runtime
-                        .create_task_with_work(final_test_work_descriptor(), None)
-                        .unwrap()
-                        .task;
-                    *clock.lock().unwrap() +=
-                        StdDuration::from_millis(if expired { 10_000 } else { 9_000 });
-                    drive_task_test_until(&cx, running.as_mut(), "queued deadline is checked before application entry", || {
+                let cx = Cx::current().unwrap();
+                let mut running = Box::pin(runner.run_service(&cx));
+                drive_task_test_until(
+                    &cx,
+                    running.as_mut(),
+                    "queued execution service enters",
+                    || runtime.is_task_service_ready(),
+                )
+                .await;
+                let task = runtime
+                    .create_task_with_work(final_test_work_descriptor(), None)
+                    .unwrap()
+                    .task;
+                *clock.lock().unwrap() +=
+                    StdDuration::from_millis(if expired { 10_000 } else { 9_000 });
+                drive_task_test_until(
+                    &cx,
+                    running.as_mut(),
+                    "queued deadline is checked before application entry",
+                    || {
                         if expired {
-                            matches!(store.get_task(&task.base().task_id).unwrap(), Some(FinalTask::Failed { .. }))
+                            matches!(
+                                store.get_task(&task.base().task_id).unwrap(),
+                                Some(FinalTask::Failed { .. })
+                            )
                         } else {
                             supervisor.polls.load(AtomicOrdering::SeqCst) > 0
                         }
-                    }).await;
-                    let current = store.get_task(&task.base().task_id).unwrap().unwrap();
-                    if expired {
-                        assert!(matches!(current, FinalTask::Failed { .. }));
-                        assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 0);
-                        assert!(supervisor.budgets.lock().unwrap().is_empty());
-                    } else {
-                        assert!(matches!(current, FinalTask::Working(_)));
-                        assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
-                    }
-                    assert!(runtime.is_task_service_ready());
-                    drop(running);
-                    wait_task_test_condition(&cx, "queued execution child settles after drop", || {
-                        store.active_task_count() == 0
-                    }).await;
-                });
+                    },
+                )
+                .await;
+                let current = store.get_task(&task.base().task_id).unwrap().unwrap();
+                if expired {
+                    assert!(matches!(current, FinalTask::Failed { .. }));
+                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 0);
+                    assert!(supervisor.budgets.lock().unwrap().is_empty());
+                } else {
+                    assert!(matches!(current, FinalTask::Working(_)));
+                    assert_eq!(supervisor.polls.load(AtomicOrdering::SeqCst), 1);
+                }
+                assert!(runtime.is_task_service_ready());
+                drop(running);
+                wait_task_test_condition(&cx, "queued execution child settles after drop", || {
+                    store.active_task_count() == 0
+                })
+                .await;
+            });
         }
     }
 
@@ -22218,31 +22752,39 @@ mod tests {
             let supervisor = Arc::new(ExecutionPollingSupervisor::default());
             let mut runner = runtime.install_task_service(4, supervisor.clone()).unwrap();
             with_task_test_runtime(async {
-                    let cx = Cx::current().unwrap();
-                    let mut running = Box::pin(runner.run_service(&cx));
-                    drive_task_test_until(&cx, running.as_mut(), "expired backlog yields to live application work", || {
-                        matches!(store.get_task(&live_id).unwrap(), Some(FinalTask::Completed { .. }))
-                            && store.next_expired_execution_snapshot().unwrap().is_none()
+                let cx = Cx::current().unwrap();
+                let mut running = Box::pin(runner.run_service(&cx));
+                drive_task_test_until(
+                    &cx,
+                    running.as_mut(),
+                    "expired backlog yields to live application work",
+                    || {
+                        matches!(
+                            store.get_task(&live_id).unwrap(),
+                            Some(FinalTask::Completed { .. })
+                        ) && store.next_expired_execution_snapshot().unwrap().is_none()
                             && store.active_task_count() == 0
-                    }).await;
-                    assert!(runtime.is_task_service_ready());
-                    assert!(matches!(
-                        store.get_task(&live_id).unwrap(),
-                        Some(FinalTask::Completed { .. })
-                    ));
-                    assert_eq!(
-                        supervisor.budgets.lock().unwrap().len(),
-                        1,
-                        "only the healthy record may enter application work"
-                    );
-                    assert!(
-                        store.next_expired_execution_snapshot().unwrap().is_none(),
-                        "bounded self-wake turns eventually retire the entire expired backlog"
-                    );
-                    assert_eq!(store.task_count(), expired_count + 1);
-                    assert_final_task_payload_accounting(&store);
-                    drop(running);
-                });
+                    },
+                )
+                .await;
+                assert!(runtime.is_task_service_ready());
+                assert!(matches!(
+                    store.get_task(&live_id).unwrap(),
+                    Some(FinalTask::Completed { .. })
+                ));
+                assert_eq!(
+                    supervisor.budgets.lock().unwrap().len(),
+                    1,
+                    "only the healthy record may enter application work"
+                );
+                assert!(
+                    store.next_expired_execution_snapshot().unwrap().is_none(),
+                    "bounded self-wake turns eventually retire the entire expired backlog"
+                );
+                assert_eq!(store.task_count(), expired_count + 1);
+                assert_final_task_payload_accounting(&store);
+                drop(running);
+            });
         }
     }
 
@@ -22310,70 +22852,96 @@ mod tests {
         });
         let mut runner = runtime.install_task_service(2, supervisor.clone()).unwrap();
         with_task_test_runtime(async {
-                let cx = Cx::current().unwrap();
-                let mut running = Box::pin(runner.run_service(&cx));
-                drive_task_test_until(&cx, running.as_mut(), "completion-boundary service enters", || {
-                    runtime.is_task_service_ready()
-                }).await;
-                let start = *clock.lock().unwrap();
-                let task = runtime
-                    .create_task_with_work(final_test_work_descriptor(), None)
-                    .unwrap()
-                    .task;
-                let task_id = task.base().task_id.clone();
-                drive_task_test_until(&cx, running.as_mut(), "application reaches its completion boundary", || {
+            let cx = Cx::current().unwrap();
+            let mut running = Box::pin(runner.run_service(&cx));
+            drive_task_test_until(
+                &cx,
+                running.as_mut(),
+                "completion-boundary service enters",
+                || runtime.is_task_service_ready(),
+            )
+            .await;
+            let start = *clock.lock().unwrap();
+            let task = runtime
+                .create_task_with_work(final_test_work_descriptor(), None)
+                .unwrap()
+                .task;
+            let task_id = task.base().task_id.clone();
+            drive_task_test_until(
+                &cx,
+                running.as_mut(),
+                "application reaches its completion boundary",
+                || {
                     if cleanup {
                         supervisor.cleanup_polls.load(AtomicOrdering::SeqCst) > 0
                     } else {
                         supervisor.dropped.load(AtomicOrdering::SeqCst)
                             && store.active_task_count() == 0
                     }
-                }).await;
-                if cleanup {
-                    let polls_before = supervisor.cleanup_polls.load(AtomicOrdering::SeqCst);
-                    *clock.lock().unwrap() =
-                        start + StdDuration::from_millis(if expired { 10_000 } else { 9_000 });
-                    supervisor.waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
-                    drive_task_test_until(&cx, running.as_mut(), "cleanup observes its attempt deadline before another poll", || {
+                },
+            )
+            .await;
+            if cleanup {
+                let polls_before = supervisor.cleanup_polls.load(AtomicOrdering::SeqCst);
+                *clock.lock().unwrap() =
+                    start + StdDuration::from_millis(if expired { 10_000 } else { 9_000 });
+                supervisor
+                    .waker
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .wake_by_ref();
+                drive_task_test_until(
+                    &cx,
+                    running.as_mut(),
+                    "cleanup observes its attempt deadline before another poll",
+                    || {
                         if expired {
                             supervisor.dropped.load(AtomicOrdering::SeqCst)
                                 && store.active_task_count() == 0
                         } else {
                             supervisor.cleanup_polls.load(AtomicOrdering::SeqCst) > polls_before
                         }
-                    }).await;
-                    if expired {
-                        assert_eq!(supervisor.cleanup_polls.load(AtomicOrdering::SeqCst), polls_before);
-                    } else {
-                        assert!(supervisor.cleanup_polls.load(AtomicOrdering::SeqCst) > polls_before);
-                    }
-                    assert_eq!(supervisor.dropped.load(AtomicOrdering::SeqCst), expired);
-                    assert!(
-                        matches!(
-                            store.get_task(&task_id).unwrap(),
-                            Some(FinalTask::Completed { .. })
-                        ),
-                        "bounded cleanup must preserve the already committed success"
+                    },
+                )
+                .await;
+                if expired {
+                    assert_eq!(
+                        supervisor.cleanup_polls.load(AtomicOrdering::SeqCst),
+                        polls_before
                     );
                 } else {
-                    assert_eq!(supervisor.rejected.load(AtomicOrdering::SeqCst), expired);
-                    let current = store.get_task(&task_id).unwrap().unwrap();
-                    if expired {
-                        let FinalTask::Failed { error, .. } = current else {
-                            panic!("late completion must fail");
-                        };
-                        assert_eq!(error.message, FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED);
-                    } else {
-                        assert!(matches!(current, FinalTask::Completed { .. }));
-                    }
+                    assert!(supervisor.cleanup_polls.load(AtomicOrdering::SeqCst) > polls_before);
                 }
-                assert!(runtime.is_task_service_ready());
-                assert_final_task_payload_accounting(&store);
-                drop(running);
-                wait_task_test_condition(&cx, "completion-boundary child settles after drop", || {
-                    store.active_task_count() == 0
-                }).await;
-            });
+                assert_eq!(supervisor.dropped.load(AtomicOrdering::SeqCst), expired);
+                assert!(
+                    matches!(
+                        store.get_task(&task_id).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ),
+                    "bounded cleanup must preserve the already committed success"
+                );
+            } else {
+                assert_eq!(supervisor.rejected.load(AtomicOrdering::SeqCst), expired);
+                let current = store.get_task(&task_id).unwrap().unwrap();
+                if expired {
+                    let FinalTask::Failed { error, .. } = current else {
+                        panic!("late completion must fail");
+                    };
+                    assert_eq!(error.message, FINAL_TASK_ATTEMPT_DEADLINE_EXCEEDED);
+                } else {
+                    assert!(matches!(current, FinalTask::Completed { .. }));
+                }
+            }
+            assert!(runtime.is_task_service_ready());
+            assert_final_task_payload_accounting(&store);
+            drop(running);
+            wait_task_test_condition(&cx, "completion-boundary child settles after drop", || {
+                store.active_task_count() == 0
+            })
+            .await;
+        });
     }
 
     #[test]
@@ -22453,7 +23021,8 @@ mod tests {
             let mut running = Box::pin(runner.run_service(&cx));
             drive_task_test_until(&cx, running.as_mut(), "retention service enters", || {
                 runtime.is_task_service_ready()
-            }).await;
+            })
+            .await;
             assert!(
                 runtime.is_task_service_ready(),
                 "service entered before task creation"
@@ -22462,9 +23031,13 @@ mod tests {
                 .create_task_with_work(final_test_work_descriptor(), None)
                 .expect("create retained task");
             let task_id = created.task.base().task_id.clone();
-            drive_task_test_until(&cx, running.as_mut(), "retained application receives its first poll", || {
-                polls.load(AtomicOrdering::SeqCst) > 0
-            }).await;
+            drive_task_test_until(
+                &cx,
+                running.as_mut(),
+                "retained application receives its first poll",
+                || polls.load(AtomicOrdering::SeqCst) > 0,
+            )
+            .await;
             let polls_before = polls.load(AtomicOrdering::SeqCst);
             assert!(!dropped.load(AtomicOrdering::SeqCst));
             let before = store.get_task(&task_id).expect("retained task read");
@@ -22478,13 +23051,19 @@ mod tests {
                 *now += StdDuration::from_millis(if expired { 1_001 } else { 999 });
             }
             waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
-            drive_task_test_until(&cx, running.as_mut(), "retention check precedes application repoll", || {
-                if expired {
-                    dropped.load(AtomicOrdering::SeqCst) && store.active_task_count() == 0
-                } else {
-                    polls.load(AtomicOrdering::SeqCst) > polls_before
-                }
-            }).await;
+            drive_task_test_until(
+                &cx,
+                running.as_mut(),
+                "retention check precedes application repoll",
+                || {
+                    if expired {
+                        dropped.load(AtomicOrdering::SeqCst) && store.active_task_count() == 0
+                    } else {
+                        polls.load(AtomicOrdering::SeqCst) > polls_before
+                    }
+                },
+            )
+            .await;
             if expired {
                 assert_eq!(
                     polls.load(AtomicOrdering::SeqCst),
@@ -22512,7 +23091,8 @@ mod tests {
             drop(running);
             wait_task_test_condition(&cx, "retention worker settles after service drop", || {
                 dropped.load(AtomicOrdering::SeqCst) && store.active_task_count() == 0
-            }).await;
+            })
+            .await;
             assert!(dropped.load(AtomicOrdering::SeqCst));
         });
     }
@@ -22529,126 +23109,147 @@ mod tests {
 
     fn check_dispatch_lease_before_supervisor_repoll(expired: bool, resumed: bool) {
         with_task_test_runtime(async {
-        let (store, clock) = in_memory_store_with_test_clock(1);
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let inputs: FinalTaskInputResponses =
-            serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
-        let task_id = if resumed {
-            create_accepted_final_input(&runtime, inputs.clone())
-        } else {
-            create_final_task_state_fixture(&runtime, None)
-                .task
-                .base()
-                .task_id
-                .clone()
-        };
-        let handoff = if resumed {
-            FinalTaskSupervisorHandoff::Resumed(
-                runtime.take_accepted_input(&task_id).unwrap().unwrap(),
-            )
-        } else {
-            FinalTaskSupervisorHandoff::Initial(runtime.recover_initial_work().unwrap().unwrap())
-        };
-        let polls = Arc::new(AtomicUsize::new(0));
-        let dropped = Arc::new(AtomicBool::new(false));
-        let waker = Arc::new(Mutex::new(None));
-        let runner = runtime
-            .install_task_service(
-                1,
-                Arc::new(RetentionPollSupervisor {
-                    polls: Arc::clone(&polls),
-                    dropped: Arc::clone(&dropped),
-                    waker: Arc::clone(&waker),
-                }),
-            )
-            .unwrap();
-        let cx = Cx::current().unwrap();
-        let mut running = runner.resume_handoff(&cx, handoff);
-        drive_task_test_until(&cx, running.as_mut(), "dispatch owner begins application work", || {
-            polls.load(AtomicOrdering::SeqCst) > 0
-        }).await;
-        let polls_before = polls.load(AtomicOrdering::SeqCst);
-        let before = store.get_task_snapshot(&task_id).unwrap().unwrap();
-
-        // Only backend time moves: this models a stalled application scheduler
-        // whose heartbeat timer has not yet been polled. Retention remains live
-        // in both cases; the paired scenarios cross only the dispatch lease.
-        *clock.lock().unwrap() += if expired {
-            IN_MEMORY_FINAL_TASK_HANDOFF_LEASE
-        } else {
-            IN_MEMORY_FINAL_TASK_HANDOFF_LEASE - StdDuration::from_millis(1)
-        };
-        waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
-        if expired {
-            assert!(asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), running.as_mut())
-                .await.unwrap().is_err());
-            assert_eq!(
-                polls.load(AtomicOrdering::SeqCst),
-                polls_before,
-                "an expired dispatch owner cannot poll application work again"
-            );
-            assert!(dropped.load(AtomicOrdering::SeqCst));
-            let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
-            assert!(recovered.generation() > before.generation());
-            assert_eq!(
-                serde_json::to_value(recovered.task()).unwrap(),
-                serde_json::to_value(before.task()).unwrap(),
-                "lease loss retains the working task and its retention contract"
-            );
-            if resumed {
-                let claim = store
-                    .take_input_handoff_for_owner_if_current(&recovered, "successor")
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(claim.input_responses, inputs);
-                assert_eq!(claim.work_descriptor, final_test_work_descriptor());
+            let (store, clock) = in_memory_store_with_test_clock(1);
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let inputs: FinalTaskInputResponses =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            let task_id = if resumed {
+                create_accepted_final_input(&runtime, inputs.clone())
             } else {
-                let claim = store
-                    .take_initial_work_handoff_for_owner_if_current(&recovered, "successor")
+                create_final_task_state_fixture(&runtime, None)
+                    .task
+                    .base()
+                    .task_id
+                    .clone()
+            };
+            let handoff = if resumed {
+                FinalTaskSupervisorHandoff::Resumed(
+                    runtime.take_accepted_input(&task_id).unwrap().unwrap(),
+                )
+            } else {
+                FinalTaskSupervisorHandoff::Initial(
+                    runtime.recover_initial_work().unwrap().unwrap(),
+                )
+            };
+            let polls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let waker = Arc::new(Mutex::new(None));
+            let runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(RetentionPollSupervisor {
+                        polls: Arc::clone(&polls),
+                        dropped: Arc::clone(&dropped),
+                        waker: Arc::clone(&waker),
+                    }),
+                )
+                .unwrap();
+            let cx = Cx::current().unwrap();
+            let mut running = runner.resume_handoff(&cx, handoff);
+            drive_task_test_until(
+                &cx,
+                running.as_mut(),
+                "dispatch owner begins application work",
+                || polls.load(AtomicOrdering::SeqCst) > 0,
+            )
+            .await;
+            let polls_before = polls.load(AtomicOrdering::SeqCst);
+            let before = store.get_task_snapshot(&task_id).unwrap().unwrap();
+
+            // Only backend time moves: this models a stalled application scheduler
+            // whose heartbeat timer has not yet been polled. Retention remains live
+            // in both cases; the paired scenarios cross only the dispatch lease.
+            *clock.lock().unwrap() += if expired {
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE
+            } else {
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE - StdDuration::from_millis(1)
+            };
+            waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
+            if expired {
+                assert!(
+                    asupersync::time::timeout(
+                        cx.now(),
+                        StdDuration::from_secs(5),
+                        running.as_mut()
+                    )
+                    .await
+                    .unwrap()
+                    .is_err()
+                );
+                assert_eq!(
+                    polls.load(AtomicOrdering::SeqCst),
+                    polls_before,
+                    "an expired dispatch owner cannot poll application work again"
+                );
+                assert!(dropped.load(AtomicOrdering::SeqCst));
+                let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                assert!(recovered.generation() > before.generation());
+                assert_eq!(
+                    serde_json::to_value(recovered.task()).unwrap(),
+                    serde_json::to_value(before.task()).unwrap(),
+                    "lease loss retains the working task and its retention contract"
+                );
+                if resumed {
+                    let claim = store
+                        .take_input_handoff_for_owner_if_current(&recovered, "successor")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(claim.input_responses, inputs);
+                    assert_eq!(claim.work_descriptor, final_test_work_descriptor());
+                } else {
+                    let claim = store
+                        .take_initial_work_handoff_for_owner_if_current(&recovered, "successor")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(claim.work_descriptor, final_test_work_descriptor());
+                }
+                let successor_fence = store
+                    .begin_handoff_dispatch_for_owner_if_current(
+                        &task_id,
+                        recovered.generation(),
+                        "successor",
+                    )
                     .unwrap()
                     .unwrap();
-                assert_eq!(claim.work_descriptor, final_test_work_descriptor());
-            }
-            let successor_fence = store
-                .begin_handoff_dispatch_for_owner_if_current(
-                    &task_id,
-                    recovered.generation(),
-                    "successor",
+                drop(running);
+                let state = store.state.lock().unwrap();
+                let lease = state.handoff_leases.get(&task_id).unwrap();
+                assert_eq!(lease.owner_id, "successor");
+                assert_eq!(lease.dispatch_fence, Some(successor_fence));
+            } else {
+                drive_task_test_until(
+                    &cx,
+                    running.as_mut(),
+                    "live dispatch lease admits the next poll",
+                    || polls.load(AtomicOrdering::SeqCst) > polls_before,
                 )
-                .unwrap()
-                .unwrap();
-            drop(running);
-            let state = store.state.lock().unwrap();
-            let lease = state.handoff_leases.get(&task_id).unwrap();
-            assert_eq!(lease.owner_id, "successor");
-            assert_eq!(lease.dispatch_fence, Some(successor_fence));
-        } else {
-            drive_task_test_until(&cx, running.as_mut(), "live dispatch lease admits the next poll", || {
-                polls.load(AtomicOrdering::SeqCst) > polls_before
-            }).await;
-            assert!(polls.load(AtomicOrdering::SeqCst) > polls_before);
-            assert!(!dropped.load(AtomicOrdering::SeqCst));
-            let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
-            assert_eq!(current.generation(), before.generation());
-            assert_eq!(
-                serde_json::to_value(current.task()).unwrap(),
-                serde_json::to_value(before.task()).unwrap()
-            );
-            drop(running);
-            wait_task_test_condition(&cx, "live dispatch child settles before lease assertions", || {
-                dropped.load(AtomicOrdering::SeqCst) && store.active_task_count() == 0
-            }).await;
-            assert!(dropped.load(AtomicOrdering::SeqCst));
-            assert!(
-                !store
-                    .state
-                    .lock()
-                    .unwrap()
-                    .handoff_leases
-                    .contains_key(&task_id)
-            );
-        }
-        assert_eq!(store.task_count(), 1);
+                .await;
+                assert!(polls.load(AtomicOrdering::SeqCst) > polls_before);
+                assert!(!dropped.load(AtomicOrdering::SeqCst));
+                let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                assert_eq!(current.generation(), before.generation());
+                assert_eq!(
+                    serde_json::to_value(current.task()).unwrap(),
+                    serde_json::to_value(before.task()).unwrap()
+                );
+                drop(running);
+                wait_task_test_condition(
+                    &cx,
+                    "live dispatch child settles before lease assertions",
+                    || dropped.load(AtomicOrdering::SeqCst) && store.active_task_count() == 0,
+                )
+                .await;
+                assert!(dropped.load(AtomicOrdering::SeqCst));
+                assert!(
+                    !store
+                        .state
+                        .lock()
+                        .unwrap()
+                        .handoff_leases
+                        .contains_key(&task_id)
+                );
+            }
+            assert_eq!(store.task_count(), 1);
         });
     }
 
@@ -22705,73 +23306,90 @@ mod tests {
 
     fn check_cleanup_after_dispatch_transition(owns_transition: bool) {
         with_task_test_runtime(async {
-        let (store, clock) = in_memory_store_with_test_clock(1);
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let task_id = create_final_task_state_fixture(&runtime, None)
-            .task
-            .base()
-            .task_id
-            .clone();
-        let handoff =
-            FinalTaskSupervisorHandoff::Initial(runtime.recover_initial_work().unwrap().unwrap());
-        let polls = Arc::new(AtomicUsize::new(0));
-        let dropped = Arc::new(AtomicBool::new(false));
-        let waker = Arc::new(Mutex::new(None));
-        let runner = runtime
-            .install_task_service(
-                1,
-                Arc::new(DispatchTransitionCleanupSupervisor {
-                    owns_transition,
-                    polls: Arc::clone(&polls),
-                    dropped: Arc::clone(&dropped),
-                    waker: Arc::clone(&waker),
-                }),
-            )
-            .unwrap();
-        let cx = Cx::current().unwrap();
-        let mut running = runner.resume_handoff(&cx, handoff);
-        drive_task_test_until(&cx, running.as_mut(), "transition cleanup starts", || {
-            polls.load(AtomicOrdering::SeqCst) > 0
-        }).await;
-        let polls_before = polls.load(AtomicOrdering::SeqCst);
-        if !owns_transition {
-            runtime
-                .require_input(&task_id, final_roots_request(), None)
+            let (store, clock) = in_memory_store_with_test_clock(1);
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let task_id = create_final_task_state_fixture(&runtime, None)
+                .task
+                .base()
+                .task_id
+                .clone();
+            let handoff = FinalTaskSupervisorHandoff::Initial(
+                runtime.recover_initial_work().unwrap().unwrap(),
+            );
+            let polls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let waker = Arc::new(Mutex::new(None));
+            let runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(DispatchTransitionCleanupSupervisor {
+                        owns_transition,
+                        polls: Arc::clone(&polls),
+                        dropped: Arc::clone(&dropped),
+                        waker: Arc::clone(&waker),
+                    }),
+                )
                 .unwrap();
-        }
-        let before = final_task_restoration_snapshot(&store, &task_id);
-        assert!(matches!(
-            store.get_task(&task_id).unwrap(),
-            Some(FinalTask::InputRequired { .. })
-        ));
-        assert!(
-            !store
-                .state
-                .lock()
-                .unwrap()
-                .handoff_leases
-                .contains_key(&task_id)
-        );
-        *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
-        waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
-        if owns_transition {
-            drive_task_test_until(&cx, running.as_mut(), "own commit receipt permits bounded cleanup", || {
-                polls.load(AtomicOrdering::SeqCst) > polls_before
-            }).await;
-            assert!(polls.load(AtomicOrdering::SeqCst) > polls_before);
-            assert!(!dropped.load(AtomicOrdering::SeqCst));
-        } else {
-            assert!(asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), running.as_mut())
-                .await.unwrap().is_err());
-            assert_eq!(polls.load(AtomicOrdering::SeqCst), polls_before);
+            let cx = Cx::current().unwrap();
+            let mut running = runner.resume_handoff(&cx, handoff);
+            drive_task_test_until(&cx, running.as_mut(), "transition cleanup starts", || {
+                polls.load(AtomicOrdering::SeqCst) > 0
+            })
+            .await;
+            let polls_before = polls.load(AtomicOrdering::SeqCst);
+            if !owns_transition {
+                runtime
+                    .require_input(&task_id, final_roots_request(), None)
+                    .unwrap();
+            }
+            let before = final_task_restoration_snapshot(&store, &task_id);
+            assert!(matches!(
+                store.get_task(&task_id).unwrap(),
+                Some(FinalTask::InputRequired { .. })
+            ));
+            assert!(
+                !store
+                    .state
+                    .lock()
+                    .unwrap()
+                    .handoff_leases
+                    .contains_key(&task_id)
+            );
+            *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+            waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
+            if owns_transition {
+                drive_task_test_until(
+                    &cx,
+                    running.as_mut(),
+                    "own commit receipt permits bounded cleanup",
+                    || polls.load(AtomicOrdering::SeqCst) > polls_before,
+                )
+                .await;
+                assert!(polls.load(AtomicOrdering::SeqCst) > polls_before);
+                assert!(!dropped.load(AtomicOrdering::SeqCst));
+            } else {
+                assert!(
+                    asupersync::time::timeout(
+                        cx.now(),
+                        StdDuration::from_secs(5),
+                        running.as_mut()
+                    )
+                    .await
+                    .unwrap()
+                    .is_err()
+                );
+                assert_eq!(polls.load(AtomicOrdering::SeqCst), polls_before);
+                assert!(dropped.load(AtomicOrdering::SeqCst));
+            }
+            drop(running);
+            wait_task_test_condition(
+                &cx,
+                "transition cleanup child settles before state comparison",
+                || dropped.load(AtomicOrdering::SeqCst) && store.active_task_count() == 0,
+            )
+            .await;
             assert!(dropped.load(AtomicOrdering::SeqCst));
-        }
-        drop(running);
-        wait_task_test_condition(&cx, "transition cleanup child settles before state comparison", || {
-            dropped.load(AtomicOrdering::SeqCst) && store.active_task_count() == 0
-        }).await;
-        assert!(dropped.load(AtomicOrdering::SeqCst));
-        assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+            assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
         });
     }
 
@@ -23161,67 +23779,74 @@ mod tests {
 
     fn check_cancellation_after_dispatch_renewal(reject_cancelled_renewal: bool) {
         with_task_test_runtime(async {
-        let (inner, _clock) = in_memory_store_with_test_clock(1);
-        let store = Arc::new(FastHeartbeatProbeStore {
-            inner: Arc::clone(&inner),
-            heartbeat: IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT,
-            reject_cancelled_renewal,
-        });
-        let runtime = FinalTaskRuntime::new(
-            store,
-            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
-            Arc::new(|_| {}),
-        );
-        let task_id = create_final_task_state_fixture(&runtime, None)
-            .task
-            .base()
-            .task_id
-            .clone();
-        let handoff =
-            FinalTaskSupervisorHandoff::Initial(runtime.recover_initial_work().unwrap().unwrap());
-        let polls = Arc::new(AtomicUsize::new(0));
-        let dropped = Arc::new(AtomicBool::new(false));
-        let runner = runtime
-            .install_task_service(
-                1,
-                Arc::new(RetentionPollSupervisor {
-                    polls: Arc::clone(&polls),
-                    dropped: Arc::clone(&dropped),
-                    waker: Arc::new(Mutex::new(None)),
-                }),
-            )
-            .unwrap();
-        let cx = Cx::current().unwrap();
-        let mut running = runner.resume_handoff(&cx, handoff);
-        drive_task_test_until(&cx, running.as_mut(), "application starts before cancellation intent", || {
-            polls.load(AtomicOrdering::SeqCst) > 0
-        }).await;
-        let polls_before = polls.load(AtomicOrdering::SeqCst);
-        runtime.cancel_task(&task_id).unwrap();
-        assert!(inner.is_cancellation_requested(&task_id).unwrap());
-
-        asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), running.as_mut())
-            .await.unwrap().unwrap();
-        if reject_cancelled_renewal {
-            assert_eq!(
-                polls.load(AtomicOrdering::SeqCst),
-                polls_before,
-                "a refused renewal cannot grant the final cancellation poll"
+            let (inner, _clock) = in_memory_store_with_test_clock(1);
+            let store = Arc::new(FastHeartbeatProbeStore {
+                inner: Arc::clone(&inner),
+                heartbeat: IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT,
+                reject_cancelled_renewal,
+            });
+            let runtime = FinalTaskRuntime::new(
+                store,
+                FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+                Arc::new(|_| {}),
             );
-        } else {
-            assert!(polls.load(AtomicOrdering::SeqCst) > polls_before);
-        }
-        assert!(dropped.load(AtomicOrdering::SeqCst));
-        drop(running);
-        assert!(matches!(
-            inner.get_task(&task_id).unwrap(),
-            Some(FinalTask::Cancelled(_))
-        ));
-        assert!(!inner.is_cancellation_requested(&task_id).unwrap());
-        let state = inner.state.lock().unwrap();
-        assert!(!state.handoff_leases.contains_key(&task_id));
-        assert!(!state.initial_work.contains_key(&task_id));
-        assert!(!state.accepted_inputs.contains_key(&task_id));
+            let task_id = create_final_task_state_fixture(&runtime, None)
+                .task
+                .base()
+                .task_id
+                .clone();
+            let handoff = FinalTaskSupervisorHandoff::Initial(
+                runtime.recover_initial_work().unwrap().unwrap(),
+            );
+            let polls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(RetentionPollSupervisor {
+                        polls: Arc::clone(&polls),
+                        dropped: Arc::clone(&dropped),
+                        waker: Arc::new(Mutex::new(None)),
+                    }),
+                )
+                .unwrap();
+            let cx = Cx::current().unwrap();
+            let mut running = runner.resume_handoff(&cx, handoff);
+            drive_task_test_until(
+                &cx,
+                running.as_mut(),
+                "application starts before cancellation intent",
+                || polls.load(AtomicOrdering::SeqCst) > 0,
+            )
+            .await;
+            let polls_before = polls.load(AtomicOrdering::SeqCst);
+            runtime.cancel_task(&task_id).unwrap();
+            assert!(inner.is_cancellation_requested(&task_id).unwrap());
+
+            asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), running.as_mut())
+                .await
+                .unwrap()
+                .unwrap();
+            if reject_cancelled_renewal {
+                assert_eq!(
+                    polls.load(AtomicOrdering::SeqCst),
+                    polls_before,
+                    "a refused renewal cannot grant the final cancellation poll"
+                );
+            } else {
+                assert!(polls.load(AtomicOrdering::SeqCst) > polls_before);
+            }
+            assert!(dropped.load(AtomicOrdering::SeqCst));
+            drop(running);
+            assert!(matches!(
+                inner.get_task(&task_id).unwrap(),
+                Some(FinalTask::Cancelled(_))
+            ));
+            assert!(!inner.is_cancellation_requested(&task_id).unwrap());
+            let state = inner.state.lock().unwrap();
+            assert!(!state.handoff_leases.contains_key(&task_id));
+            assert!(!state.initial_work.contains_key(&task_id));
+            assert!(!state.accepted_inputs.contains_key(&task_id));
         });
     }
 
@@ -23254,9 +23879,13 @@ mod tests {
         with_task_test_runtime(async {
             let cx = Cx::current().expect("caller runtime supplies service context");
             let mut service = Box::pin(runner.run_service(&cx));
-            drive_task_test_until(&cx, service.as_mut(), "queued-wakeup service enters", || {
-                runtime.is_task_service_ready()
-            }).await;
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "queued-wakeup service enters",
+                || runtime.is_task_service_ready(),
+            )
+            .await;
             let first = runtime
                 .create_task_with_work(
                     FinalTaskWorkDescriptor::new(serde_json::json!({"label": "first"}))
@@ -23282,11 +23911,23 @@ mod tests {
                 .base()
                 .task_id
                 .clone();
-            drive_task_test_until(&cx, service.as_mut(), "queued wakeups complete all retained work", || {
-                matches!(store.get_task(&second).unwrap(), Some(FinalTask::Completed { .. }))
-                    && (!first_should_execute || matches!(store.get_task(&first).unwrap(), Some(FinalTask::Completed { .. })))
-                    && store.active_task_count() == 0
-            }).await;
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "queued wakeups complete all retained work",
+                || {
+                    matches!(
+                        store.get_task(&second).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ) && (!first_should_execute
+                        || matches!(
+                            store.get_task(&first).unwrap(),
+                            Some(FinalTask::Completed { .. })
+                        ))
+                        && store.active_task_count() == 0
+                },
+            )
+            .await;
             assert!(
                 runtime.is_task_service_ready(),
                 "processing advisory wakeups preserves the live service generation"
@@ -23327,7 +23968,9 @@ mod tests {
             }
             cx.cancel_with(CancelKind::User, None);
             asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), service.as_mut())
-                .await.unwrap().unwrap();
+                .await
+                .unwrap()
+                .unwrap();
             assert!(!runtime.is_task_service_ready());
         });
     }
@@ -23383,19 +24026,31 @@ mod tests {
             )
             .expect("successor task service installs");
         with_task_test_runtime(async {
-                let cx = Cx::current().expect("caller runtime supplies service context");
-                let mut service = Box::pin(runner.run_service(&cx));
-                drive_task_test_until(&cx, service.as_mut(), "replacement runner waits for the old lease", || {
-                    runtime.is_task_service_ready()
-                }).await;
-                *now.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) +=
-                    IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
-                drive_task_test_until(&cx, service.as_mut(), "periodic recovery executes the expired lease's retained work", || {
-                    matches!(inner_store.get_task(&task_id).unwrap(), Some(FinalTask::Completed { .. }))
-                        && inner_store.active_task_count() == 0
-                }).await;
-                drop(service);
+            let cx = Cx::current().expect("caller runtime supplies service context");
+            let mut service = Box::pin(runner.run_service(&cx));
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "replacement runner waits for the old lease",
+                || runtime.is_task_service_ready(),
+            )
+            .await;
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "periodic recovery executes the expired lease's retained work",
+                || {
+                    matches!(
+                        inner_store.get_task(&task_id).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ) && inner_store.active_task_count() == 0
+                },
+            )
+            .await;
+            drop(service);
         });
 
         assert_eq!(
@@ -23468,9 +24123,13 @@ mod tests {
         let timed = application_runtime.block_on(async {
             let cx = Cx::current().expect("caller runtime supplies service context");
             let mut service = Box::pin(runner.run_service(&cx));
-            drive_task_test_until(&cx, service.as_mut(), "replacement runner observes a live predecessor lease", || {
-                runtime.is_task_service_ready()
-            }).await;
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "replacement runner observes a live predecessor lease",
+                || runtime.is_task_service_ready(),
+            )
+            .await;
             *now.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) +=
                 IN_MEMORY_FINAL_TASK_HANDOFF_LEASE
@@ -23561,14 +24220,18 @@ mod tests {
             .install_task_service(4, supervisor)
             .expect("install test supervisor runner");
         with_task_test_runtime(async {
-                let service_cx =
-                    Cx::current().expect("the caller runtime supplies the service context");
-                let mut service = Box::pin(runner.run_service(&service_cx));
-                drive_task_test_until(&service_cx, service.as_mut(), "retention expiry settles the first child and admits the second", || {
-                    task2_completed.load(AtomicOrdering::SeqCst) && store.active_task_count() == 0
-                }).await;
-                assert!(runtime.is_task_service_ready());
-                drop(service);
+            let service_cx =
+                Cx::current().expect("the caller runtime supplies the service context");
+            let mut service = Box::pin(runner.run_service(&service_cx));
+            drive_task_test_until(
+                &service_cx,
+                service.as_mut(),
+                "retention expiry settles the first child and admits the second",
+                || task2_completed.load(AtomicOrdering::SeqCst) && store.active_task_count() == 0,
+            )
+            .await;
+            assert!(runtime.is_task_service_ready());
+            drop(service);
         });
 
         assert!(
@@ -25509,9 +26172,16 @@ mod tests {
         }));
         let notification =
             final_task_notification(&final_working_task_without_ttl("task-observer-fanout"));
-        runtime.store.create_task(notification.params.task.clone(), notification.clone()).unwrap();
-        let creation_generation = runtime.store.get_task_snapshot(&notification.params.task.base().task_id)
-            .unwrap().unwrap().creation_generation();
+        runtime
+            .store
+            .create_task(notification.params.task.clone(), notification.clone())
+            .unwrap();
+        let creation_generation = runtime
+            .store
+            .get_task_snapshot(&notification.params.task.base().task_id)
+            .unwrap()
+            .unwrap()
+            .creation_generation();
         for expected in 1..=2 {
             runtime.emit(notification.clone(), None, creation_generation);
             assert_eq!(retired_events.load(AtomicOrdering::SeqCst), 0);
@@ -26585,13 +27255,18 @@ mod tests {
         application_runtime.block_on(async {
             let cx = Cx::current().expect("caller runtime context");
             let mut service = Box::pin(runner.run(&cx));
-            drive_task_test_until(&cx, service.as_mut(), "initial durable work is recovered", || {
-                started.lock().unwrap().len() == 1
-            }).await;
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "initial durable work is recovered",
+                || started.lock().unwrap().len() == 1,
+            )
+            .await;
             drop(service);
             wait_task_test_condition(&cx, "initial worker settles", || {
                 store.active_task_count() == 0
-            }).await;
+            })
+            .await;
         });
 
         assert!(
@@ -26636,7 +27311,9 @@ mod tests {
             .expect("an entered runner accepts a durably recoverable task");
 
         assert!(
-            store.observed_unlocked_ready_service.load(AtomicOrdering::SeqCst),
+            store
+                .observed_unlocked_ready_service
+                .load(AtomicOrdering::SeqCst),
             "the provider can inspect readiness while its creation permit owns admission"
         );
         assert_eq!(runtime.admission.lock().unwrap().total.permits, 0);
@@ -26648,10 +27325,14 @@ mod tests {
     #[test]
     fn task_creation_admission_fences_reentered_generations_and_owner_capacity() {
         let store = Arc::new(InMemoryFinalTaskStore::default());
-        let config = FinalTaskRuntimeConfig::new(60_000, None).unwrap()
-            .with_admission_capacity(3, 1, 4_096, 2_048).unwrap();
+        let config = FinalTaskRuntimeConfig::new(60_000, None)
+            .unwrap()
+            .with_admission_capacity(3, 1, 4_096, 2_048)
+            .unwrap();
         let runtime = FinalTaskRuntime::new(store.clone(), config, Arc::new(|_| {}));
-        let mut runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+        let mut runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .unwrap();
         let (_service_owner, cx) = task_service_test_caller();
         let mut running = Box::pin(runner.run_service(&cx));
         let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
@@ -26659,9 +27340,13 @@ mod tests {
         let first_owner = Some(Sha256Digest::from_bytes([1; 32]));
         let second_owner = Some(Sha256Digest::from_bytes([2; 32]));
         let third_owner = Some(Sha256Digest::from_bytes([3; 32]));
-        let first = runtime.reserve_task_creation(first_owner, 1_000, None).unwrap();
+        let first = runtime
+            .reserve_task_creation(first_owner, 1_000, None)
+            .unwrap();
         assert!(runtime.reserve_task_creation(first_owner, 1, None).is_err());
-        let second = runtime.reserve_task_creation(second_owner, 1_000, None).unwrap();
+        let second = runtime
+            .reserve_task_creation(second_owner, 1_000, None)
+            .unwrap();
         let unowned = runtime.reserve_task_creation(None, 1_000, None).unwrap();
         assert!(runtime.reserve_task_creation(None, 1, None).is_err());
         assert!(runtime.reserve_task_creation(third_owner, 1, None).is_err());
@@ -26671,14 +27356,25 @@ mod tests {
         drop(running);
         let mut running = Box::pin(runner.run_service(&cx));
         assert!(running.as_mut().poll(&mut poll).is_pending());
-        assert!(first.admit_commit(&runtime, None).is_err(), "re-entering the same runner cannot revive an old permit");
-        assert!(runtime.reserve_task_creation(third_owner, 1, None).is_err(), "old providers remain charged across the new invocation");
+        assert!(
+            first.admit_commit(&runtime, None).is_err(),
+            "re-entering the same runner cannot revive an old permit"
+        );
+        assert!(
+            runtime.reserve_task_creation(third_owner, 1, None).is_err(),
+            "old providers remain charged across the new invocation"
+        );
         let old_generation = first.ready_generation;
         drop(first);
-        let successor = runtime.reserve_task_creation(first_owner, 1_000, None).unwrap();
+        let successor = runtime
+            .reserve_task_creation(first_owner, 1_000, None)
+            .unwrap();
         assert!(successor.ready_generation > old_generation);
         drop(second);
-        assert!(successor.admit_commit(&runtime, None).is_ok(), "an old permit's drop preserves the successor's custody");
+        assert!(
+            successor.admit_commit(&runtime, None).is_ok(),
+            "an old permit's drop preserves the successor's custody"
+        );
         assert_eq!(runtime.admission.lock().unwrap().total.permits, 2);
         assert_eq!(runtime.admission.lock().unwrap().total.payload_bytes, 2_000);
         drop(successor);
@@ -26688,24 +27384,41 @@ mod tests {
         assert_eq!(ledger.total.payload_bytes, 0);
         assert!(ledger.principals.is_empty());
         drop(ledger);
-        assert_eq!(store.task_count(), 0, "permits never create Task records on their own");
+        assert_eq!(
+            store.task_count(),
+            0,
+            "permits never create Task records on their own"
+        );
         drop(running);
     }
 
     #[test]
     fn task_creation_admission_expiry_retains_custody_until_drop() {
         let store = Arc::new(InMemoryFinalTaskStore::default());
-        let config = FinalTaskRuntimeConfig::new(60_000, None).unwrap()
-            .with_admission_capacity(1, 1, 4_096, 4_096).unwrap();
+        let config = FinalTaskRuntimeConfig::new(60_000, None)
+            .unwrap()
+            .with_admission_capacity(1, 1, 4_096, 4_096)
+            .unwrap();
         let runtime = FinalTaskRuntime::new(store.clone(), config, Arc::new(|_| {}));
-        let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+        let runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .unwrap();
         let (_service_owner, cx) = task_service_test_caller();
         let running = enter_task_service_runner(runner, &cx);
         let mut permit = runtime.reserve_task_creation(None, 1_000, None).unwrap();
         assert!(permit.admit_commit(&runtime, None).is_ok());
         permit.deadline = Instant::now();
-        assert!(permit.admit_commit(&runtime, None).unwrap_err().message.contains("permit expired"));
-        assert!(runtime.reserve_task_creation(None, 1, None).is_err(), "expiry cannot recycle a provider's live custody");
+        assert!(
+            permit
+                .admit_commit(&runtime, None)
+                .unwrap_err()
+                .message
+                .contains("permit expired")
+        );
+        assert!(
+            runtime.reserve_task_creation(None, 1, None).is_err(),
+            "expiry cannot recycle a provider's live custody"
+        );
         assert_eq!(store.task_count(), 0);
         drop(permit);
         let next = runtime.reserve_task_creation(None, 1_000, None).unwrap();
@@ -26725,29 +27438,63 @@ mod tests {
             Arc::new(|_| {}),
         );
         store.observe_service_signal(Arc::clone(&runtime.service_signal));
-        let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+        let runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .unwrap();
         let (_service_owner, cx) = task_service_test_caller();
         let running = enter_task_service_runner(runner, &cx);
         let cancelled = fastmcp_core::McpRequestCancellation::new();
         let hook_cancellation = cancelled.clone();
-        *store.execution_hook.lock().unwrap() = Some(Box::new(move || { let _ = hook_cancellation.cancel(); }));
+        *store.execution_hook.lock().unwrap() = Some(Box::new(move || {
+            let _ = hook_cancellation.cancel();
+        }));
         let ctx = McpContext::new(Cx::for_testing(), 17).with_request_cancellation(cancelled);
-        assert_eq!(runtime.create_task_for_request(&ctx, final_test_work_descriptor(), None).unwrap_err().code, fastmcp_core::McpErrorCode::RequestCancelled);
-        assert_eq!(inner.task_count(), 0, "cancellation during preparation cannot reach create");
-        assert!(!store.observed_unlocked_ready_service.load(AtomicOrdering::SeqCst));
+        assert_eq!(
+            runtime
+                .create_task_for_request(&ctx, final_test_work_descriptor(), None)
+                .unwrap_err()
+                .code,
+            fastmcp_core::McpErrorCode::RequestCancelled
+        );
+        assert_eq!(
+            inner.task_count(),
+            0,
+            "cancellation during preparation cannot reach create"
+        );
+        assert!(
+            !store
+                .observed_unlocked_ready_service
+                .load(AtomicOrdering::SeqCst)
+        );
         assert_eq!(runtime.admission.lock().unwrap().total.permits, 0);
 
         let ctx = McpContext::new(Cx::for_testing(), 18);
-        let positive = runtime.create_task_for_request(&ctx, final_test_work_descriptor(), None).unwrap();
-        assert!(inner.get_task(&positive.task.base().task_id).unwrap().is_some());
+        let positive = runtime
+            .create_task_for_request(&ctx, final_test_work_descriptor(), None)
+            .unwrap();
+        assert!(
+            inner
+                .get_task(&positive.task.base().task_id)
+                .unwrap()
+                .is_some()
+        );
         let cancelled = fastmcp_core::McpRequestCancellation::new();
         let hook_cancellation = cancelled.clone();
-        *store.after_creation.lock().unwrap() = Some(Box::new(move || { let _ = hook_cancellation.cancel(); }));
-        let ctx = McpContext::new(Cx::for_testing(), 19).with_request_cancellation(cancelled.clone());
-        let accepted = runtime.create_task_for_request(&ctx, final_test_work_descriptor(), None)
+        *store.after_creation.lock().unwrap() = Some(Box::new(move || {
+            let _ = hook_cancellation.cancel();
+        }));
+        let ctx =
+            McpContext::new(Cx::for_testing(), 19).with_request_cancellation(cancelled.clone());
+        let accepted = runtime
+            .create_task_for_request(&ctx, final_test_work_descriptor(), None)
             .expect("cancellation after a valid commit cannot erase its accepted handle");
         assert!(cancelled.is_cancel_requested());
-        assert!(inner.get_task(&accepted.task.base().task_id).unwrap().is_some());
+        assert!(
+            inner
+                .get_task(&accepted.task.base().task_id)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(inner.task_count(), 2);
         assert_eq!(runtime.admission.lock().unwrap().total.permits, 0);
         assert_eq!(runtime.admission.lock().unwrap().total.payload_bytes, 0);
@@ -26776,7 +27523,9 @@ mod tests {
             "changing only entered runner state rejects public task creation"
         );
         assert!(
-            !store.observed_unlocked_ready_service.load(AtomicOrdering::SeqCst),
+            !store
+                .observed_unlocked_ready_service
+                .load(AtomicOrdering::SeqCst),
             "a rejected creation cannot call the durable store"
         );
     }
@@ -26800,8 +27549,7 @@ mod tests {
                     let caller = caller_runtime.request_cx_with_budget(Budget::INFINITE);
                     let host_clock = Arc::new(VirtualClock::new());
                     host_clock.advance(4_000_000_000);
-                    let host_timer =
-                        TimerDriverHandle::with_virtual_clock(Arc::clone(&host_clock));
+                    let host_timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&host_clock));
                     let host_runtime = RuntimeBuilder::current_thread()
                         .blocking_threads(0, 0)
                         .with_timer_driver(host_timer.clone())
@@ -26809,10 +27557,8 @@ mod tests {
                         .unwrap();
                     let host = host_runtime.request_cx_with_budget(Budget::INFINITE);
                     let store = Arc::new(InMemoryFinalTaskStore::default());
-                    let task_runtime = final_task_runtime(
-                        Arc::clone(&store),
-                        Arc::new(AtomicBool::new(false)),
-                    );
+                    let task_runtime =
+                        final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
                     let mut runner = Some(
                         task_runtime
                             .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
@@ -26864,9 +27610,11 @@ mod tests {
                     assert_eq!(caller_timer.pending_count(), 0);
                     assert_eq!(host_timer.pending_count(), 0);
                     assert_eq!(store.task_count(), 0);
-                    assert!(task_runtime
-                        .create_task_with_work(final_test_work_descriptor(), None)
-                        .is_err());
+                    assert!(
+                        task_runtime
+                            .create_task_with_work(final_test_work_descriptor(), None)
+                            .is_err()
+                    );
                     assert_eq!(Cx::current().unwrap().now(), host.now());
                     assert_ne!(Cx::current().unwrap().now(), caller.now());
                     drop(runner);
@@ -26950,10 +27698,8 @@ mod tests {
                     let timer = caller.timer_driver().unwrap();
                     let installed = Cx::set_current(Some(caller.clone()));
                     let store = Arc::new(InMemoryFinalTaskStore::default());
-                    let task_runtime = final_task_runtime(
-                        Arc::clone(&store),
-                        Arc::new(AtomicBool::new(false)),
-                    );
+                    let task_runtime =
+                        final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
                     let mut runner = Some(
                         task_runtime
                             .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
@@ -27010,10 +27756,8 @@ mod tests {
                     let caller = caller_runtime.request_cx_with_budget(Budget::INFINITE);
                     let installed = Cx::set_current(Some(caller.clone()));
                     let store = Arc::new(InMemoryFinalTaskStore::default());
-                    let task_runtime = final_task_runtime(
-                        Arc::clone(&store),
-                        Arc::new(AtomicBool::new(false)),
-                    );
+                    let task_runtime =
+                        final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
                     let mut runner = Some(
                         task_runtime
                             .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
@@ -27104,176 +27848,194 @@ mod tests {
     #[test]
     fn task_03_final_run_service_error_revokes_readiness_and_retries_exact_initial_work() {
         with_task_test_runtime(async {
-        let store = Arc::new(InMemoryFinalTaskStore::default());
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let task = final_working_task_without_ttl("task-run-service-error-initial");
-        let task_id = task.base().task_id.clone();
-        let work_descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({
-            "handler": "run-service-error",
-            "payload": {"initial": true}
-        }))
-        .expect("non-null initial work descriptor is valid");
-        store
-            .create_task_with_work(
-                task.clone(),
-                final_task_notification(&task),
-                work_descriptor.clone(),
-            )
-            .expect("initial work is durable before the service starts");
-
-        let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_FAIL));
-        let mut runner = runtime
-            .install_task_service(
-                1,
-                Arc::new(SwitchableRunServiceSupervisor {
-                    action: Arc::clone(&action),
-                }),
-            )
-            .expect("install retained task service runner");
-        let cx = Cx::current().unwrap();
-        assert!(asupersync::time::timeout(
-            cx.now(), StdDuration::from_secs(5), runner.run_service(&cx),
-        ).await.expect("failed service settles").is_err());
-        assert!(
-            !runtime.is_task_service_ready(),
-            "a supervisor error must revoke the entered retained service readiness"
-        );
-        assert_exact_initial_work_is_recoverable(&store, &task_id, &work_descriptor);
-
-        action.store(RUN_SERVICE_SUPERVISOR_COMPLETE, AtomicOrdering::SeqCst);
-        complete_retained_task_service(&mut runner, &cx, &store, &task_id).await;
-        assert!(
-            !runtime.is_task_service_ready(),
-            "the caller-owned retry exit must revoke readiness again"
-        );
-        assert!(matches!(
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let task = final_working_task_without_ttl("task-run-service-error-initial");
+            let task_id = task.base().task_id.clone();
+            let work_descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({
+                "handler": "run-service-error",
+                "payload": {"initial": true}
+            }))
+            .expect("non-null initial work descriptor is valid");
             store
-                .get_task(&task_id)
-                .expect("retried initial task is readable"),
-            Some(FinalTask::Completed { .. })
-        ));
-        assert!(
-            test_next_initial_work(&store)
-                .expect("completed initial recovery scan is valid")
-                .is_none(),
-            "the successful retry consumes the exact recovered initial handoff"
-        );
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    work_descriptor.clone(),
+                )
+                .expect("initial work is durable before the service starts");
+
+            let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_FAIL));
+            let mut runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(SwitchableRunServiceSupervisor {
+                        action: Arc::clone(&action),
+                    }),
+                )
+                .expect("install retained task service runner");
+            let cx = Cx::current().unwrap();
+            assert!(
+                asupersync::time::timeout(
+                    cx.now(),
+                    StdDuration::from_secs(5),
+                    runner.run_service(&cx),
+                )
+                .await
+                .expect("failed service settles")
+                .is_err()
+            );
+            assert!(
+                !runtime.is_task_service_ready(),
+                "a supervisor error must revoke the entered retained service readiness"
+            );
+            assert_exact_initial_work_is_recoverable(&store, &task_id, &work_descriptor);
+
+            action.store(RUN_SERVICE_SUPERVISOR_COMPLETE, AtomicOrdering::SeqCst);
+            complete_retained_task_service(&mut runner, &cx, &store, &task_id).await;
+            assert!(
+                !runtime.is_task_service_ready(),
+                "the caller-owned retry exit must revoke readiness again"
+            );
+            assert!(matches!(
+                store
+                    .get_task(&task_id)
+                    .expect("retried initial task is readable"),
+                Some(FinalTask::Completed { .. })
+            ));
+            assert!(
+                test_next_initial_work(&store)
+                    .expect("completed initial recovery scan is valid")
+                    .is_none(),
+                "the successful retry consumes the exact recovered initial handoff"
+            );
         });
     }
 
     #[test]
     fn task_03_final_run_service_cancellation_revokes_readiness_and_retries_exact_input() {
         with_task_test_runtime(async {
-        let store = Arc::new(InMemoryFinalTaskStore::default());
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let input_responses: FinalTaskInputResponses = serde_json::from_value(
-            serde_json::json!({"roots": {"roots": [{"uri": "file:///run-service-cancel"}]}}),
-        )
-        .expect("typed accepted input is valid");
-        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
-        let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_PENDING));
-        let mut runner = runtime
-            .install_task_service(
-                1,
-                Arc::new(SwitchableRunServiceSupervisor {
-                    action: Arc::clone(&action),
-                }),
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let input_responses: FinalTaskInputResponses = serde_json::from_value(
+                serde_json::json!({"roots": {"roots": [{"uri": "file:///run-service-cancel"}]}}),
             )
-            .expect("install retained task service runner");
-        let cx = Cx::current().unwrap();
-        let service_region = cx.open_child_region(ChildRegionSpec::inherit()).await.unwrap();
-        let cancelled_cx = service_region.cx().clone();
-        let mut service = Box::pin(runner.run_service(&cancelled_cx));
-        drive_task_test_until(&cx, service.as_mut(), "retained service enters", || {
-            runtime.is_task_service_ready()
-        }).await;
-        assert!(
-            runtime.is_task_service_ready(),
-            "an entered retained service is the only live readiness authority"
-        );
-        cancelled_cx.cancel_with(CancelKind::User, None);
-        asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), service.as_mut())
-            .await.expect("cancelled service settles").unwrap();
-        drop(service);
-        service_region.close().await.unwrap();
+            .expect("typed accepted input is valid");
+            let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+            let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_PENDING));
+            let mut runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(SwitchableRunServiceSupervisor {
+                        action: Arc::clone(&action),
+                    }),
+                )
+                .expect("install retained task service runner");
+            let cx = Cx::current().unwrap();
+            let service_region = cx
+                .open_child_region(ChildRegionSpec::inherit())
+                .await
+                .unwrap();
+            let cancelled_cx = service_region.cx().clone();
+            let mut service = Box::pin(runner.run_service(&cancelled_cx));
+            drive_task_test_until(&cx, service.as_mut(), "retained service enters", || {
+                runtime.is_task_service_ready()
+            })
+            .await;
+            assert!(
+                runtime.is_task_service_ready(),
+                "an entered retained service is the only live readiness authority"
+            );
+            cancelled_cx.cancel_with(CancelKind::User, None);
+            asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), service.as_mut())
+                .await
+                .expect("cancelled service settles")
+                .unwrap();
+            drop(service);
+            service_region.close().await.unwrap();
 
-        assert!(
-            !runtime.is_task_service_ready(),
-            "caller-context cancellation must revoke retained service readiness"
-        );
-        assert_exact_accepted_input_is_recoverable(&store, &task_id, &input_responses);
+            assert!(
+                !runtime.is_task_service_ready(),
+                "caller-context cancellation must revoke retained service readiness"
+            );
+            assert_exact_accepted_input_is_recoverable(&store, &task_id, &input_responses);
 
-        action.store(RUN_SERVICE_SUPERVISOR_COMPLETE, AtomicOrdering::SeqCst);
-        complete_retained_task_service(&mut runner, &cx, &store, &task_id).await;
-        assert!(matches!(
-            store
-                .get_task(&task_id)
-                .expect("retried accepted-input task is readable"),
-            Some(FinalTask::Completed { .. })
-        ));
-        assert!(
-            test_next_accepted_input(&store)
-                .expect("completed accepted-input recovery scan is valid")
-                .is_none(),
-            "the successful retry consumes the exact recovered accepted-input handoff"
-        );
+            action.store(RUN_SERVICE_SUPERVISOR_COMPLETE, AtomicOrdering::SeqCst);
+            complete_retained_task_service(&mut runner, &cx, &store, &task_id).await;
+            assert!(matches!(
+                store
+                    .get_task(&task_id)
+                    .expect("retried accepted-input task is readable"),
+                Some(FinalTask::Completed { .. })
+            ));
+            assert!(
+                test_next_accepted_input(&store)
+                    .expect("completed accepted-input recovery scan is valid")
+                    .is_none(),
+                "the successful retry consumes the exact recovered accepted-input handoff"
+            );
         });
     }
 
     #[test]
     fn task_03_final_run_service_drop_revokes_readiness_and_retries_exact_initial_work() {
         with_task_test_runtime(async {
-        let store = Arc::new(InMemoryFinalTaskStore::default());
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let task = final_working_task_without_ttl("task-run-service-drop-initial");
-        let task_id = task.base().task_id.clone();
-        let work_descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({
-            "handler": "run-service-drop",
-            "payload": {"initial": true}
-        }))
-        .expect("non-null initial work descriptor is valid");
-        store
-            .create_task_with_work(
-                task.clone(),
-                final_task_notification(&task),
-                work_descriptor.clone(),
-            )
-            .expect("initial work is durable before the service starts");
-
-        let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_PENDING));
-        let mut runner = runtime
-            .install_task_service(
-                1,
-                Arc::new(SwitchableRunServiceSupervisor {
-                    action: Arc::clone(&action),
-                }),
-            )
-            .expect("install retained task service runner");
-        let service_cx = Cx::current().unwrap();
-        let mut service = Box::pin(runner.run_service(&service_cx));
-        drive_task_test_until(&service_cx, service.as_mut(), "droppable service enters", || {
-            runtime.is_task_service_ready()
-        }).await;
-        assert!(runtime.is_task_service_ready());
-        drop(service);
-        wait_task_test_condition(&service_cx, "dropped service returns its claim", || {
-            store.active_task_count() == 0
-        }).await;
-
-        assert!(
-            !runtime.is_task_service_ready(),
-            "dropping a retained service future must revoke readiness"
-        );
-        assert_exact_initial_work_is_recoverable(&store, &task_id, &work_descriptor);
-
-        action.store(RUN_SERVICE_SUPERVISOR_COMPLETE, AtomicOrdering::SeqCst);
-        complete_retained_task_service(&mut runner, &service_cx, &store, &task_id).await;
-        assert!(matches!(
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let task = final_working_task_without_ttl("task-run-service-drop-initial");
+            let task_id = task.base().task_id.clone();
+            let work_descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({
+                "handler": "run-service-drop",
+                "payload": {"initial": true}
+            }))
+            .expect("non-null initial work descriptor is valid");
             store
-                .get_task(&task_id)
-                .expect("retried dropped-service task is readable"),
-            Some(FinalTask::Completed { .. })
-        ));
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    work_descriptor.clone(),
+                )
+                .expect("initial work is durable before the service starts");
+
+            let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_PENDING));
+            let mut runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(SwitchableRunServiceSupervisor {
+                        action: Arc::clone(&action),
+                    }),
+                )
+                .expect("install retained task service runner");
+            let service_cx = Cx::current().unwrap();
+            let mut service = Box::pin(runner.run_service(&service_cx));
+            drive_task_test_until(
+                &service_cx,
+                service.as_mut(),
+                "droppable service enters",
+                || runtime.is_task_service_ready(),
+            )
+            .await;
+            assert!(runtime.is_task_service_ready());
+            drop(service);
+            wait_task_test_condition(&service_cx, "dropped service returns its claim", || {
+                store.active_task_count() == 0
+            })
+            .await;
+
+            assert!(
+                !runtime.is_task_service_ready(),
+                "dropping a retained service future must revoke readiness"
+            );
+            assert_exact_initial_work_is_recoverable(&store, &task_id, &work_descriptor);
+
+            action.store(RUN_SERVICE_SUPERVISOR_COMPLETE, AtomicOrdering::SeqCst);
+            complete_retained_task_service(&mut runner, &service_cx, &store, &task_id).await;
+            assert!(matches!(
+                store
+                    .get_task(&task_id)
+                    .expect("retried dropped-service task is readable"),
+                Some(FinalTask::Completed { .. })
+            ));
         });
     }
 
@@ -27385,7 +28147,9 @@ mod tests {
         assert!(
             application_runtime
                 .block_on(async {
-                    runner.run(&Cx::current().expect("caller runtime context")).await
+                    runner
+                        .run(&Cx::current().expect("caller runtime context"))
+                        .await
                 })
                 .is_err(),
             "the application supervisor error remains visible after restoring initial work"
@@ -28336,10 +29100,12 @@ mod tests {
             .expect("build application-owned structured runtime");
         application_runtime
             .block_on(async {
-                runner.resume_handoff(
-                    &Cx::current().expect("caller runtime context"),
-                    FinalTaskSupervisorHandoff::Resumed(accepted),
-                ).await
+                runner
+                    .resume_handoff(
+                        &Cx::current().expect("caller runtime context"),
+                        FinalTaskSupervisorHandoff::Resumed(accepted),
+                    )
+                    .await
             })
             .expect("stale claimed handoff is fenced without invoking application work");
 
@@ -28379,10 +29145,12 @@ mod tests {
 
         application_runtime
             .block_on(async {
-                runner.resume_handoff(
-                    &Cx::current().expect("caller runtime context"),
-                    FinalTaskSupervisorHandoff::Resumed(accepted),
-                ).await
+                runner
+                    .resume_handoff(
+                        &Cx::current().expect("caller runtime context"),
+                        FinalTaskSupervisorHandoff::Resumed(accepted),
+                    )
+                    .await
             })
             .expect("the uncancelled dispatch election reaches application work");
         assert_eq!(
@@ -28430,10 +29198,12 @@ mod tests {
 
         application_runtime
             .block_on(async {
-                runner.resume_handoff(
-                    &Cx::current().expect("caller runtime context"),
-                    FinalTaskSupervisorHandoff::Resumed(accepted),
-                ).await
+                runner
+                    .resume_handoff(
+                        &Cx::current().expect("caller runtime context"),
+                        FinalTaskSupervisorHandoff::Resumed(accepted),
+                    )
+                    .await
             })
             .expect("a cancellation election loser returns without invoking application work");
         assert!(
@@ -28454,39 +29224,46 @@ mod tests {
     #[test]
     fn task_03_final_handoff_drop_restores_exact_resumed_input() {
         with_task_test_runtime(async {
-        let store = Arc::new(InMemoryFinalTaskStore::default());
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let input_responses: FinalTaskInputResponses = serde_json::from_value(
-            serde_json::json!({"roots": {"roots": [{"uri": "file:///drop-restore"}]}}),
-        )
-        .expect("typed retained roots response");
-        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
-        let accepted = runtime
-            .take_accepted_input(&task_id)
-            .expect("claim accepted input before cancellation-style future drop")
-            .expect("accepted input is present before the dropped supervisor future");
-        let (started, started_receiver) = mpsc::channel(1);
-        let started_receiver = Mutex::new(started_receiver);
-        let runner = runtime
-            .install_task_service(1, Arc::new(SignallingPendingFinalTaskSupervisor { started }))
-            .expect("install caller-owned pending service runner");
-        let cx = Cx::current().unwrap();
-        let mut pending = Box::pin(runner.resume_handoff(
-            &cx, FinalTaskSupervisorHandoff::Resumed(accepted),
-        ));
-        drive_task_test_until(&cx, pending.as_mut(), "pending child starts before observer drop", || {
-            started_receiver.lock().unwrap().try_recv().is_ok()
-        }).await;
-        drop(pending);
-        wait_task_test_condition(&cx, "dropped handoff settles before recovery", || {
-            store.active_task_count() == 0
-        }).await;
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let input_responses: FinalTaskInputResponses = serde_json::from_value(
+                serde_json::json!({"roots": {"roots": [{"uri": "file:///drop-restore"}]}}),
+            )
+            .expect("typed retained roots response");
+            let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+            let accepted = runtime
+                .take_accepted_input(&task_id)
+                .expect("claim accepted input before cancellation-style future drop")
+                .expect("accepted input is present before the dropped supervisor future");
+            let (started, started_receiver) = mpsc::channel(1);
+            let started_receiver = Mutex::new(started_receiver);
+            let runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(SignallingPendingFinalTaskSupervisor { started }),
+                )
+                .expect("install caller-owned pending service runner");
+            let cx = Cx::current().unwrap();
+            let mut pending =
+                Box::pin(runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Resumed(accepted)));
+            drive_task_test_until(
+                &cx,
+                pending.as_mut(),
+                "pending child starts before observer drop",
+                || started_receiver.lock().unwrap().try_recv().is_ok(),
+            )
+            .await;
+            drop(pending);
+            wait_task_test_condition(&cx, "dropped handoff settles before recovery", || {
+                store.active_task_count() == 0
+            })
+            .await;
 
-        let restored = runtime
-            .recover_accepted_input()
-            .expect("dropped supervisor handoff recovery scan is valid")
-            .expect("drop lease restores the accepted input");
-        assert_eq!(restored.input_responses(), &input_responses);
+            let restored = runtime
+                .recover_accepted_input()
+                .expect("dropped supervisor handoff recovery scan is valid")
+                .expect("drop lease restores the accepted input");
+            assert_eq!(restored.input_responses(), &input_responses);
         });
     }
 
@@ -28527,10 +29304,12 @@ mod tests {
         assert!(
             application_runtime
                 .block_on(async {
-                    runner.resume_handoff(
-                        &Cx::current().expect("caller runtime context"),
-                        FinalTaskSupervisorHandoff::Resumed(accepted),
-                    ).await
+                    runner
+                        .resume_handoff(
+                            &Cx::current().expect("caller runtime context"),
+                            FinalTaskSupervisorHandoff::Resumed(accepted),
+                        )
+                        .await
                 })
                 .is_err(),
             "the planted supervisor error remains visible after durable restoration"
@@ -28609,10 +29388,12 @@ mod tests {
 
         application_runtime
             .block_on(async {
-                runner.resume_handoff(
-                    &Cx::current().expect("caller runtime context"),
-                    FinalTaskSupervisorHandoff::Resumed(accepted),
-                ).await
+                runner
+                    .resume_handoff(
+                        &Cx::current().expect("caller runtime context"),
+                        FinalTaskSupervisorHandoff::Resumed(accepted),
+                    )
+                    .await
             })
             .expect(
                 "the cancellation winner retires an elected task even when application work fails",
@@ -28669,95 +29450,100 @@ mod tests {
     #[test]
     fn task_03_final_cancelled_elected_handoff_drop_retires_task_under_unlimited_retention() {
         with_task_test_runtime(async {
-        const ELAPSED_MS: u64 = 86_400_000;
-        let (store, now) = in_memory_store_with_test_clock(1);
-        let runtime = FinalTaskRuntime::new(
-            store.clone(),
-            FinalTaskRuntimeConfig::with_unlimited_ttl(&AllowUnlimitedFinalTaskRetention, None)
-                .expect("explicit authority admits unlimited retained handoffs"),
-            Arc::new(|_| {}),
-        );
-        runtime
-            .install_retention_administrator(
-                &Cx::for_testing(),
-                Arc::new(AllowUnlimitedFinalTaskRetention),
-            )
-            .expect("install the required independent retention administration");
-        let input_responses: FinalTaskInputResponses = serde_json::from_value(
-            serde_json::json!({"roots": {"roots": [{"uri": "file:///cancelled-drop"}]}}),
-        )
-        .expect("typed retained roots response");
-        let task_id = create_accepted_final_input(&runtime, input_responses);
-        let accepted = runtime
-            .take_accepted_input(&task_id)
-            .expect("claim accepted input before dropped elected supervisor")
-            .expect("accepted input is present before dropped elected supervisor");
-        let (started, started_receiver) = mpsc::channel(1);
-        let started_receiver = Mutex::new(started_receiver);
-        let runner = runtime
-            .install_task_service(1, Arc::new(SignallingPendingFinalTaskSupervisor { started }))
-            .expect("install caller-owned pending service runner");
-        let cx = Cx::current().unwrap();
-        let mut pending = Box::pin(runner.resume_handoff(
-            &cx, FinalTaskSupervisorHandoff::Resumed(accepted),
-        ));
-        drive_task_test_until(&cx, pending.as_mut(), "cancelled drop child starts", || {
-            started_receiver.lock().unwrap().try_recv().is_ok()
-        }).await;
-        runtime.cancel_task(&task_id)
-            .expect("an elected working task accepts cooperative cancellation");
-        drop(pending);
-        wait_task_test_condition(&cx, "cancelled dropped child settles", || {
-            store.active_task_count() == 0
-        }).await;
-
-        assert!(
-            !runtime
-                .is_cancellation_requested(&task_id)
-                .expect("read terminal cancellation state after dropping the elected future"),
-            "the dropped elected handoff retires an already-recorded cancellation"
-        );
-        assert!(matches!(
+            const ELAPSED_MS: u64 = 86_400_000;
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::with_unlimited_ttl(&AllowUnlimitedFinalTaskRetention, None)
+                    .expect("explicit authority admits unlimited retained handoffs"),
+                Arc::new(|_| {}),
+            );
             runtime
-                .get_task(&task_id)
-                .expect("read automatically retired dropped task")
-                .task,
-            FinalTask::Cancelled(_)
-        ));
-        {
-            let state = store
-                .state
+                .install_retention_administrator(
+                    &Cx::for_testing(),
+                    Arc::new(AllowUnlimitedFinalTaskRetention),
+                )
+                .expect("install the required independent retention administration");
+            let input_responses: FinalTaskInputResponses = serde_json::from_value(
+                serde_json::json!({"roots": {"roots": [{"uri": "file:///cancelled-drop"}]}}),
+            )
+            .expect("typed retained roots response");
+            let task_id = create_accepted_final_input(&runtime, input_responses);
+            let accepted = runtime
+                .take_accepted_input(&task_id)
+                .expect("claim accepted input before dropped elected supervisor")
+                .expect("accepted input is present before dropped elected supervisor");
+            let (started, started_receiver) = mpsc::channel(1);
+            let started_receiver = Mutex::new(started_receiver);
+            let runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(SignallingPendingFinalTaskSupervisor { started }),
+                )
+                .expect("install caller-owned pending service runner");
+            let cx = Cx::current().unwrap();
+            let mut pending =
+                Box::pin(runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Resumed(accepted)));
+            drive_task_test_until(&cx, pending.as_mut(), "cancelled drop child starts", || {
+                started_receiver.lock().unwrap().try_recv().is_ok()
+            })
+            .await;
+            runtime
+                .cancel_task(&task_id)
+                .expect("an elected working task accepts cooperative cancellation");
+            drop(pending);
+            wait_task_test_condition(&cx, "cancelled dropped child settles", || {
+                store.active_task_count() == 0
+            })
+            .await;
+
+            assert!(
+                !runtime
+                    .is_cancellation_requested(&task_id)
+                    .expect("read terminal cancellation state after dropping the elected future"),
+                "the dropped elected handoff retires an already-recorded cancellation"
+            );
+            assert!(matches!(
+                runtime
+                    .get_task(&task_id)
+                    .expect("read automatically retired dropped task")
+                    .task,
+                FinalTask::Cancelled(_)
+            ));
+            {
+                let state = store
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(
+                    !state.handoff_leases.contains_key(&task_id),
+                    "dropping a cancelled elected future retires and releases its exact owner fence"
+                );
+                assert!(
+                    !state.accepted_inputs.contains_key(&task_id),
+                    "cancellation prevents the dropped future from requeueing its input"
+                );
+            }
+
+            let mut clock = now
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *clock = clock
+                .checked_add(StdDuration::from_millis(ELAPSED_MS))
+                .expect("test clock can advance through an unlimited retention interval");
+            drop(clock);
+
             assert!(
-                !state.handoff_leases.contains_key(&task_id),
-                "dropping a cancelled elected future retires and releases its exact owner fence"
+                runtime.get_task(&task_id).is_ok(),
+                "unbounded retention keeps the retired cancelled task inspectable without its fence"
             );
             assert!(
-                !state.accepted_inputs.contains_key(&task_id),
-                "cancellation prevents the dropped future from requeueing its input"
+                runtime
+                    .recover_accepted_input()
+                    .expect("cancelled dropped-future recovery scan is readable")
+                    .is_none(),
+                "a cancelled dropped future cannot replay retained application input"
             );
-        }
-
-        let mut clock = now
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *clock = clock
-            .checked_add(StdDuration::from_millis(ELAPSED_MS))
-            .expect("test clock can advance through an unlimited retention interval");
-        drop(clock);
-
-        assert!(
-            runtime.get_task(&task_id).is_ok(),
-            "unbounded retention keeps the retired cancelled task inspectable without its fence"
-        );
-        assert!(
-            runtime
-                .recover_accepted_input()
-                .expect("cancelled dropped-future recovery scan is readable")
-                .is_none(),
-            "a cancelled dropped future cannot replay retained application input"
-        );
         });
     }
 
@@ -28798,80 +29584,105 @@ mod tests {
     #[test]
     fn task_03_final_pending_supervisor_remains_owned_without_context_cancellation() {
         with_task_test_runtime(async {
-        let store = Arc::new(InMemoryFinalTaskStore::default());
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let input_responses: FinalTaskInputResponses =
-            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
-                .expect("typed retained roots response");
-        let task_id = create_accepted_final_input(&runtime, input_responses);
-        let accepted = runtime
-            .take_accepted_input(&task_id)
-            .expect("claim accepted input before pending supervisor start")
-            .expect("accepted input is present before the pending supervisor starts");
-        let (started, started_receiver) = mpsc::channel(1);
-        let started_receiver = Mutex::new(started_receiver);
-        let runner = runtime
-            .install_task_service(1, Arc::new(SignallingPendingFinalTaskSupervisor { started }))
-            .expect("install caller-owned pending service runner");
-        let cx = Cx::current().unwrap();
-        let mut pending = Box::pin(runner.resume_handoff(
-            &cx, FinalTaskSupervisorHandoff::Resumed(accepted),
-        ));
-        drive_task_test_until(&cx, pending.as_mut(), "uncancelled pending child starts", || {
-            started_receiver.lock().unwrap().try_recv().is_ok()
-        }).await;
-        assert!(
-            runtime
-                .recover_accepted_input()
-                .expect("read pending supervisor recovery state")
-                .is_none(),
-            "without context cancellation the elected pending supervisor retains its durable lease"
-        );
-        drop(pending);
-        wait_task_test_condition(&cx, "pending control child settles after observation", || {
-            store.active_task_count() == 0
-        }).await;
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let input_responses: FinalTaskInputResponses =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                    .expect("typed retained roots response");
+            let task_id = create_accepted_final_input(&runtime, input_responses);
+            let accepted = runtime
+                .take_accepted_input(&task_id)
+                .expect("claim accepted input before pending supervisor start")
+                .expect("accepted input is present before the pending supervisor starts");
+            let (started, started_receiver) = mpsc::channel(1);
+            let started_receiver = Mutex::new(started_receiver);
+            let runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(SignallingPendingFinalTaskSupervisor { started }),
+                )
+                .expect("install caller-owned pending service runner");
+            let cx = Cx::current().unwrap();
+            let mut pending =
+                Box::pin(runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Resumed(accepted)));
+            drive_task_test_until(
+                &cx,
+                pending.as_mut(),
+                "uncancelled pending child starts",
+                || started_receiver.lock().unwrap().try_recv().is_ok(),
+            )
+            .await;
+            assert!(
+                runtime
+                    .recover_accepted_input()
+                    .expect("read pending supervisor recovery state")
+                    .is_none(),
+                "without context cancellation the elected pending supervisor retains its durable lease"
+            );
+            drop(pending);
+            wait_task_test_condition(
+                &cx,
+                "pending control child settles after observation",
+                || store.active_task_count() == 0,
+            )
+            .await;
         });
     }
 
     #[test]
     fn task_03_final_context_cancellation_after_pending_supervisor_start_restores_input() {
         with_task_test_runtime(async {
-        let store = Arc::new(InMemoryFinalTaskStore::default());
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let input_responses: FinalTaskInputResponses =
-            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
-                .expect("typed retained roots response");
-        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
-        let accepted = runtime
-            .take_accepted_input(&task_id)
-            .expect("claim accepted input before pending supervisor start")
-            .expect("accepted input is present before the pending supervisor starts");
-        let (started, started_receiver) = mpsc::channel(1);
-        let started_receiver = Mutex::new(started_receiver);
-        let runner = runtime
-            .install_task_service(1, Arc::new(SignallingPendingFinalTaskSupervisor { started }))
-            .expect("install caller-owned pending service runner");
-        let parent = Cx::current().unwrap();
-        let service_region = parent.open_child_region(ChildRegionSpec::inherit()).await.unwrap();
-        let cx = service_region.cx().clone();
-        let mut pending = Box::pin(runner.resume_handoff(
-            &cx, FinalTaskSupervisorHandoff::Resumed(accepted),
-        ));
-        drive_task_test_until(&parent, pending.as_mut(), "child starts before caller cancellation", || {
-            started_receiver.lock().unwrap().try_recv().is_ok()
-        }).await;
-        cx.cancel_with(CancelKind::User, None);
-        assert!(asupersync::time::timeout(
-            parent.now(), StdDuration::from_secs(5), pending.as_mut(),
-        ).await.expect("cancelled child settles").is_err());
-        drop(pending);
-        service_region.close().await.unwrap();
-        let restored = runtime
-            .recover_accepted_input()
-            .expect("cancelled pending supervisor recovery scan is valid")
-            .expect("context cancellation restores the exact pending input handoff");
-        assert_eq!(restored.input_responses(), &input_responses);
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let input_responses: FinalTaskInputResponses =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                    .expect("typed retained roots response");
+            let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+            let accepted = runtime
+                .take_accepted_input(&task_id)
+                .expect("claim accepted input before pending supervisor start")
+                .expect("accepted input is present before the pending supervisor starts");
+            let (started, started_receiver) = mpsc::channel(1);
+            let started_receiver = Mutex::new(started_receiver);
+            let runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(SignallingPendingFinalTaskSupervisor { started }),
+                )
+                .expect("install caller-owned pending service runner");
+            let parent = Cx::current().unwrap();
+            let service_region = parent
+                .open_child_region(ChildRegionSpec::inherit())
+                .await
+                .unwrap();
+            let cx = service_region.cx().clone();
+            let mut pending =
+                Box::pin(runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Resumed(accepted)));
+            drive_task_test_until(
+                &parent,
+                pending.as_mut(),
+                "child starts before caller cancellation",
+                || started_receiver.lock().unwrap().try_recv().is_ok(),
+            )
+            .await;
+            cx.cancel_with(CancelKind::User, None);
+            assert!(
+                asupersync::time::timeout(
+                    parent.now(),
+                    StdDuration::from_secs(5),
+                    pending.as_mut(),
+                )
+                .await
+                .expect("cancelled child settles")
+                .is_err()
+            );
+            drop(pending);
+            service_region.close().await.unwrap();
+            let restored = runtime
+                .recover_accepted_input()
+                .expect("cancelled pending supervisor recovery scan is valid")
+                .expect("context cancellation restores the exact pending input handoff");
+            assert_eq!(restored.input_responses(), &input_responses);
         });
     }
 
@@ -29008,9 +29819,11 @@ mod tests {
                         runtime_for_task.get_task(&task_id_for_task).unwrap().task,
                         FinalTask::Working(_)
                     ));
-                    assert!(runtime_for_task
-                        .is_cancellation_requested(&task_id_for_task)
-                        .unwrap());
+                    assert!(
+                        runtime_for_task
+                            .is_cancellation_requested(&task_id_for_task)
+                            .unwrap()
+                    );
                 })
                 .expect("cancellation grace must allow unrelated work to progress");
             assert!(matches!(supervisor.join(&cx).await, Ok(Ok(()))));
@@ -29439,11 +30252,20 @@ mod tests {
         with_task_test_runtime(async {
             let cx = Cx::current().unwrap();
             let result = asupersync::time::timeout(
-                cx.now(), StdDuration::from_secs(5),
+                cx.now(),
+                StdDuration::from_secs(5),
                 runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Resumed(accepted)),
-            ).await.expect("panicking child settles");
-            assert!(result.is_err(), "the child panic is reported as a failed attempt");
-            assert!(cx.checkpoint().is_ok(), "a Task panic does not cancel its caller");
+            )
+            .await
+            .expect("panicking child settles");
+            assert!(
+                result.is_err(),
+                "the child panic is reported as a failed attempt"
+            );
+            assert!(
+                cx.checkpoint().is_ok(),
+                "a Task panic does not cancel its caller"
+            );
         });
 
         let restored = runtime
@@ -29482,13 +30304,18 @@ mod tests {
         application_runtime.block_on(async {
             let cx = Cx::current().expect("caller runtime context");
             let mut service = Box::pin(runner.run(&cx));
-            drive_task_test_until(&cx, service.as_mut(), "recovered input reaches its supervisor", || {
-                delivered.lock().unwrap().len() == 1
-            }).await;
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "recovered input reaches its supervisor",
+                || delivered.lock().unwrap().len() == 1,
+            )
+            .await;
             drop(service);
             wait_task_test_condition(&cx, "resumed worker settles", || {
                 store.active_task_count() == 0
-            }).await;
+            })
+            .await;
         });
 
         let delivered = delivered
@@ -29540,12 +30367,15 @@ mod tests {
             let cx = Cx::current().expect("caller runtime context");
             let mut service = Box::pin(runner.run(&cx));
             drive_task_test_until(&cx, service.as_mut(), "bounded recovery continues", || {
-                started.load(AtomicOrdering::SeqCst) == MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN + 1
-            }).await;
+                started.load(AtomicOrdering::SeqCst)
+                    == MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN + 1
+            })
+            .await;
             drop(service);
             wait_task_test_condition(&cx, "bounded recovery workers settle", || {
                 store.active_task_count() == 0
-            }).await;
+            })
+            .await;
         });
 
         assert_eq!(
@@ -29590,13 +30420,18 @@ mod tests {
         application_runtime.block_on(async {
             let cx = Cx::current().expect("caller runtime context");
             let mut service = Box::pin(runner.run(&cx));
-            drive_task_test_until(&cx, service.as_mut(), "paired recovery handoffs run", || {
-                order.lock().unwrap().len() == 2
-            }).await;
+            drive_task_test_until(
+                &cx,
+                service.as_mut(),
+                "paired recovery handoffs run",
+                || order.lock().unwrap().len() == 2,
+            )
+            .await;
             drop(service);
             wait_task_test_condition(&cx, "paired recovery workers settle", || {
                 store.active_task_count() == 0
-            }).await;
+            })
+            .await;
         });
 
         assert_eq!(
@@ -29643,11 +30478,13 @@ mod tests {
             let mut service = Box::pin(runner.run(&cx));
             drive_task_test_until(&cx, service.as_mut(), "two initial handoffs run", || {
                 order.lock().unwrap().len() == 2
-            }).await;
+            })
+            .await;
             drop(service);
             wait_task_test_condition(&cx, "initial recovery workers settle", || {
                 store.active_task_count() == 0
-            }).await;
+            })
+            .await;
         });
 
         assert_eq!(
@@ -29684,7 +30521,9 @@ mod tests {
         assert!(
             application_runtime
                 .block_on(async {
-                    runner.run(&Cx::current().expect("caller runtime context")).await
+                    runner
+                        .run(&Cx::current().expect("caller runtime context"))
+                        .await
                 })
                 .is_err(),
             "the supervisor error remains visible after durable restoration"
@@ -29733,7 +30572,9 @@ mod tests {
         assert!(
             application_runtime
                 .block_on(async {
-                    first_runner.run(&Cx::current().expect("caller runtime context")).await
+                    first_runner
+                        .run(&Cx::current().expect("caller runtime context"))
+                        .await
                 })
                 .is_err(),
             "the first low-ID-only runner exposes its retryable supervisor error"
@@ -29766,7 +30607,9 @@ mod tests {
         assert!(
             application_runtime
                 .block_on(async {
-                    second_runner.run(&Cx::current().expect("caller runtime context")).await
+                    second_runner
+                        .run(&Cx::current().expect("caller runtime context"))
+                        .await
                 })
                 .is_err(),
             "the replacement runner preserves the original retryable error after advancing past it"
@@ -29821,7 +30664,9 @@ mod tests {
         assert!(
             application_runtime
                 .block_on(async {
-                    runner.run(&Cx::current().expect("caller runtime context")).await
+                    runner
+                        .run(&Cx::current().expect("caller runtime context"))
+                        .await
                 })
                 .is_err(),
             "the supervisor error remains visible when a newer transition wins"
@@ -29845,49 +30690,57 @@ mod tests {
     #[test]
     fn task_03_final_public_service_rejects_success_without_transition_and_restores_work() {
         with_task_test_runtime(async {
-        let store = Arc::new(InMemoryFinalTaskStore::default());
-        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
-        let work_descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({
-            "operation": "must-remain-recoverable-after-noop-supervisor",
-        }))
-        .expect("a non-null task descriptor is valid");
-        let runner = runtime
-            .install_task_service(1, Arc::new(NoTransitionFinalTaskSupervisor))
-            .expect("the caller-owned service installs");
-        let service_cx = Cx::current().unwrap();
-        let mut service = Box::pin(runner.run(&service_cx));
-        drive_task_test_until(&service_cx, service.as_mut(), "public service becomes ready", || {
-            runtime.is_task_service_ready()
-        }).await;
-        let task_id = runtime
-            .create_task_with_work(work_descriptor.clone(), None)
-            .expect("the entered service admits public initial work")
-            .task
-            .base()
-            .task_id
-            .clone();
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let work_descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({
+                "operation": "must-remain-recoverable-after-noop-supervisor",
+            }))
+            .expect("a non-null task descriptor is valid");
+            let runner = runtime
+                .install_task_service(1, Arc::new(NoTransitionFinalTaskSupervisor))
+                .expect("the caller-owned service installs");
+            let service_cx = Cx::current().unwrap();
+            let mut service = Box::pin(runner.run(&service_cx));
+            drive_task_test_until(
+                &service_cx,
+                service.as_mut(),
+                "public service becomes ready",
+                || runtime.is_task_service_ready(),
+            )
+            .await;
+            let task_id = runtime
+                .create_task_with_work(work_descriptor.clone(), None)
+                .expect("the entered service admits public initial work")
+                .task
+                .base()
+                .task_id
+                .clone();
 
-        let error = asupersync::time::timeout(
-            service_cx.now(), StdDuration::from_secs(5), service.as_mut(),
-        ).await.expect("no-transition supervisor settles")
+            let error = asupersync::time::timeout(
+                service_cx.now(),
+                StdDuration::from_secs(5),
+                service.as_mut(),
+            )
+            .await
+            .expect("no-transition supervisor settles")
             .expect_err("a no-transition supervisor must not be accepted as successful");
-        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
-        assert_eq!(
-            error.message,
-            "Final task supervisor returned success without a fenced task transition"
-        );
-        assert!(matches!(
-            store
-                .get_task(&task_id)
-                .expect("the unresolved task remains readable"),
-            Some(FinalTask::Working(_))
-        ));
-        let recovered = runtime
-            .recover_initial_work()
-            .expect("the rejected handoff remains recoverable")
-            .expect("the exact initial work is restored for another service generation");
-        assert_eq!(recovered.task_id(), &task_id);
-        assert_eq!(recovered.work_descriptor(), &work_descriptor);
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+            assert_eq!(
+                error.message,
+                "Final task supervisor returned success without a fenced task transition"
+            );
+            assert!(matches!(
+                store
+                    .get_task(&task_id)
+                    .expect("the unresolved task remains readable"),
+                Some(FinalTask::Working(_))
+            ));
+            let recovered = runtime
+                .recover_initial_work()
+                .expect("the rejected handoff remains recoverable")
+                .expect("the exact initial work is restored for another service generation");
+            assert_eq!(recovered.task_id(), &task_id);
+            assert_eq!(recovered.work_descriptor(), &work_descriptor);
         });
     }
 
@@ -29917,10 +30770,12 @@ mod tests {
 
         application_runtime
             .block_on(async {
-                runner.resume_handoff(
-                    &Cx::current().expect("caller runtime context"),
-                    FinalTaskSupervisorHandoff::Initial(initial),
-                ).await
+                runner
+                    .resume_handoff(
+                        &Cx::current().expect("caller runtime context"),
+                        FinalTaskSupervisorHandoff::Initial(initial),
+                    )
+                    .await
             })
             .expect("the elected handoff completes the task");
 
@@ -29982,10 +30837,12 @@ mod tests {
 
         let runner_error = application_runtime
             .block_on(async {
-                runner.resume_handoff(
-                    &Cx::current().expect("caller runtime context"),
-                    FinalTaskSupervisorHandoff::Initial(initial),
-                ).await
+                runner
+                    .resume_handoff(
+                        &Cx::current().expect("caller runtime context"),
+                        FinalTaskSupervisorHandoff::Initial(initial),
+                    )
+                    .await
             })
             .expect_err("an unfenced successful return must leave recovery visibly failed");
         assert_eq!(
@@ -30055,10 +30912,12 @@ mod tests {
 
         application_runtime
             .block_on(async {
-                runner.resume_handoff(
-                    &Cx::current().expect("caller runtime context"),
-                    FinalTaskSupervisorHandoff::Initial(initial),
-                ).await
+                runner
+                    .resume_handoff(
+                        &Cx::current().expect("caller runtime context"),
+                        FinalTaskSupervisorHandoff::Initial(initial),
+                    )
+                    .await
             })
             .expect("the supervisor records its stale-generation rejection");
 
@@ -30134,10 +30993,12 @@ mod tests {
 
         application_runtime
             .block_on(async {
-                runner.resume_handoff(
-                    &Cx::current().expect("caller runtime context"),
-                    FinalTaskSupervisorHandoff::Initial(initial),
-                ).await
+                runner
+                    .resume_handoff(
+                        &Cx::current().expect("caller runtime context"),
+                        FinalTaskSupervisorHandoff::Initial(initial),
+                    )
+                    .await
             })
             .expect("the repeated terminal attempt is contained by the supervisor");
 
@@ -30208,10 +31069,12 @@ mod tests {
 
         application_runtime
             .block_on(async {
-                runner.resume_handoff(
-                    &Cx::current().expect("caller runtime context"),
-                    FinalTaskSupervisorHandoff::Initial(initial),
-                ).await
+                runner
+                    .resume_handoff(
+                        &Cx::current().expect("caller runtime context"),
+                        FinalTaskSupervisorHandoff::Initial(initial),
+                    )
+                    .await
             })
             .expect("the elected handoff records the cancellation outcome");
 
@@ -32329,7 +33192,10 @@ mod tests {
                     let mut child = cx
                         .spawn(|child_cx| async move { child_cx })
                         .expect("application retains permitted child spawning");
-                    let child_cx = child.join(cx).await.expect("nested application child joins");
+                    let child_cx = child
+                        .join(cx)
+                        .await
+                        .expect("nested application child joins");
                     *self.contexts.lock().unwrap() = Some((cx.clone(), child_cx));
                     complete_final_task_handoff(handoff)
                 })
@@ -32351,12 +33217,9 @@ mod tests {
                     "task-service-test",
                 )
                 .add_caveat(CaveatPredicate::ResourceScope("tasks/*".to_owned()));
-                let caller = Cx::current()
-                    .unwrap()
-                    .with_macaroon(token)
-                    .with_remote_cap(
-                        RemoteCap::new().with_default_lease(StdDuration::from_secs(17)),
-                    );
+                let caller = Cx::current().unwrap().with_macaroon(token).with_remote_cap(
+                    RemoteCap::new().with_default_lease(StdDuration::from_secs(17)),
+                );
                 let capability_budget = CapabilityBudget::new()
                     .with_memory_bytes(8 * 1024 * 1024)
                     .with_cpu_units(10_000)
@@ -32377,9 +33240,8 @@ mod tests {
                 std::future::poll_fn(|context| {
                     // The explicit saved caller still has I/O. The invocation's
                     // narrower ambient authority must survive both spawn seams.
-                    let _restriction = Cx::push_restriction(
-                        CapSet::<true, true, true, false, true>::MASK,
-                    );
+                    let _restriction =
+                        Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
                     execution.as_mut().poll(context)
                 })
                 .await
@@ -32394,7 +33256,9 @@ mod tests {
                     assert_eq!(context.macaroon(), caller.macaroon());
                     assert_eq!(context.macaroon().unwrap().caveat_count(), 1);
                     assert!(std::ptr::eq(
-                        context.remote().expect("caller remote authority is retained"),
+                        context
+                            .remote()
+                            .expect("caller remote authority is retained"),
                         caller.remote().unwrap(),
                     ));
                     assert!(!context.capabilities().io);
@@ -32458,7 +33322,10 @@ mod tests {
                 handoff: FinalTaskSupervisorHandoff,
             ) -> FinalTaskSupervisorFuture<'a> {
                 let mode = mode(&handoff);
-                self.contexts.lock().unwrap().insert(mode.clone(), cx.clone());
+                self.contexts
+                    .lock()
+                    .unwrap()
+                    .insert(mode.clone(), cx.clone());
                 Box::pin(async move {
                     let finish = if mode == "self" {
                         &self.finish_self
@@ -32500,9 +33367,11 @@ mod tests {
                 assert_ne!(first_cx.region_id(), service_cx.region_id());
                 assert_ne!(first_cx.task_id(), service_cx.task_id());
                 supervisor.finish_self.store(true, AtomicOrdering::Release);
-                wait_task_test_condition(&cx, "first region closes after its committed result", || {
-                    completed(&runtime, &first) && store.active_task_count() == 1
-                })
+                wait_task_test_condition(
+                    &cx,
+                    "first region closes after its committed result",
+                    || completed(&runtime, &first) && store.active_task_count() == 1,
+                )
                 .await;
                 assert!(first_cx.checkpoint().is_err());
                 assert!(sibling_cx.checkpoint().is_ok());
@@ -32510,7 +33379,9 @@ mod tests {
                 assert!(cx.checkpoint().is_ok());
                 assert!(!service.is_finished());
                 assert!(runtime.is_task_service_ready());
-                supervisor.finish_sibling.store(true, AtomicOrdering::Release);
+                supervisor
+                    .finish_sibling
+                    .store(true, AtomicOrdering::Release);
                 wait_task_test_condition(&cx, "sibling completes on the same live service", || {
                     completed(&runtime, &sibling) && store.active_task_count() == 0
                 })
@@ -32564,33 +33435,49 @@ mod tests {
                     let nested_cleanup = Arc::clone(&cleanup);
                     // Deliberately drop this observation handle. Region ownership
                     // must still account for the descendant and its own region.
-                    drop(cx.spawn(move |nested_cx| async move {
-                        let region = nested_cx
-                            .open_child_region(ChildRegionSpec::inherit())
-                            .await
-                            .unwrap();
-                        let mut descendant = region.cx().spawn(move |descendant_cx| async move {
-                            let _drop = NestedDrop(Arc::clone(&nested_cleanup));
-                            nested_cleanup.started.store(true, AtomicOrdering::Release);
-                            std::future::poll_fn(|context| {
-                                *nested_cleanup.waker.lock().unwrap() = Some(context.waker().clone());
-                                if descendant_cx.checkpoint().is_err() {
-                                    nested_cleanup.cancelled.store(true, AtomicOrdering::Release);
-                                    if nested_cleanup.released.load(AtomicOrdering::Acquire) {
-                                        return std::task::Poll::Ready(());
-                                    }
-                                }
-                                std::task::Poll::Pending
-                            }).await;
-                        }).unwrap();
-                        let _ = descendant.join(&nested_cx).await;
-                        region.cancel(CancelReason::user("nested child settled")).unwrap();
-                        region.close().await.unwrap();
-                        let _ = nested_cx.checkpoint();
-                    }).map_err(|_| McpError::internal_error("nested test task admission"))?);
-                    wait_task_test_condition(cx, "nested descendant starts before supervisor exit", || {
-                        cleanup.started.load(AtomicOrdering::Acquire)
-                    }).await;
+                    drop(
+                        cx.spawn(move |nested_cx| async move {
+                            let region = nested_cx
+                                .open_child_region(ChildRegionSpec::inherit())
+                                .await
+                                .unwrap();
+                            let mut descendant = region
+                                .cx()
+                                .spawn(move |descendant_cx| async move {
+                                    let _drop = NestedDrop(Arc::clone(&nested_cleanup));
+                                    nested_cleanup.started.store(true, AtomicOrdering::Release);
+                                    std::future::poll_fn(|context| {
+                                        *nested_cleanup.waker.lock().unwrap() =
+                                            Some(context.waker().clone());
+                                        if descendant_cx.checkpoint().is_err() {
+                                            nested_cleanup
+                                                .cancelled
+                                                .store(true, AtomicOrdering::Release);
+                                            if nested_cleanup.released.load(AtomicOrdering::Acquire)
+                                            {
+                                                return std::task::Poll::Ready(());
+                                            }
+                                        }
+                                        std::task::Poll::Pending
+                                    })
+                                    .await;
+                                })
+                                .unwrap();
+                            let _ = descendant.join(&nested_cx).await;
+                            region
+                                .cancel(CancelReason::user("nested child settled"))
+                                .unwrap();
+                            region.close().await.unwrap();
+                            let _ = nested_cx.checkpoint();
+                        })
+                        .map_err(|_| McpError::internal_error("nested test task admission"))?,
+                    );
+                    wait_task_test_condition(
+                        cx,
+                        "nested descendant starts before supervisor exit",
+                        || cleanup.started.load(AtomicOrdering::Acquire),
+                    )
+                    .await;
                     if mode == "nested-complete" {
                         complete_final_task_handoff(handoff)
                     } else {
@@ -32607,12 +33494,18 @@ mod tests {
             Arc<NestedCleanup>,
         ) {
             let store = Arc::new(
-                InMemoryFinalTaskStore::new(4).unwrap().with_execution_capacity(1, 1).unwrap(),
+                InMemoryFinalTaskStore::new(4)
+                    .unwrap()
+                    .with_execution_capacity(1, 1)
+                    .unwrap(),
             );
             let cleanup = Arc::new(NestedCleanup::default());
-            let (runtime, runner) = state(store.clone(), Arc::new(NestedSupervisor {
-                cleanup: Arc::clone(&cleanup),
-            }));
+            let (runtime, runner) = state(
+                store.clone(),
+                Arc::new(NestedSupervisor {
+                    cleanup: Arc::clone(&cleanup),
+                }),
+            );
             (store, runtime, runner, cleanup)
         }
 
@@ -32625,18 +33518,29 @@ mod tests {
                 let first = create(&runtime, "nested-complete");
                 wait_task_test_condition(&cx, "completion cancels the nested region", || {
                     completed(&runtime, &first) && cleanup.cancelled.load(AtomicOrdering::Acquire)
-                }).await;
+                })
+                .await;
                 assert_eq!(store.active_task_count(), 1);
                 assert!(!cleanup.dropped.load(AtomicOrdering::Acquire));
                 let next = create(&runtime, "plain");
                 asupersync::time::sleep(cx.now(), StdDuration::from_millis(20)).await;
                 assert!(!completed(&runtime, &next));
                 let queued = store.get_task_snapshot(&next).unwrap().unwrap();
-                assert_eq!(store.task_execution_budget_if_current(&queued).unwrap().unwrap().attempts(), 0);
+                assert_eq!(
+                    store
+                        .task_execution_budget_if_current(&queued)
+                        .unwrap()
+                        .unwrap()
+                        .attempts(),
+                    0
+                );
                 cleanup.release();
-                wait_task_test_condition(&cx, "closed subtree releases the next execution slot", || {
-                    completed(&runtime, &next) && store.active_task_count() == 0
-                }).await;
+                wait_task_test_condition(
+                    &cx,
+                    "closed subtree releases the next execution slot",
+                    || completed(&runtime, &next) && store.active_task_count() == 0,
+                )
+                .await;
                 assert!(cleanup.dropped.load(AtomicOrdering::Acquire));
                 assert!(cx.checkpoint().is_ok());
                 stop(&cx, &mut service).await;
@@ -32652,12 +33556,17 @@ mod tests {
                 let id = create(&runtime, "nested-hold");
                 wait_task_test_condition(&cx, "nested work starts", || {
                     cleanup.started.load(AtomicOrdering::Acquire)
-                }).await;
+                })
+                .await;
                 service.abort_with_reason(CancelReason::user("cancel the service"));
                 wait_task_test_condition(&cx, "service cancellation reaches nested work", || {
                     cleanup.cancelled.load(AtomicOrdering::Acquire)
-                }).await;
-                assert!(!service.is_finished(), "service must await descendant quiescence");
+                })
+                .await;
+                assert!(
+                    !service.is_finished(),
+                    "service must await descendant quiescence"
+                );
                 assert_eq!(store.active_task_count(), 1);
                 assert!(!cleanup.dropped.load(AtomicOrdering::Acquire));
                 cleanup.release();
@@ -32665,7 +33574,8 @@ mod tests {
                 assert!(cleanup.dropped.load(AtomicOrdering::Acquire));
                 assert_eq!(store.active_task_count(), 0);
                 assert_exact_initial_work_is_recoverable(
-                    &store, &id,
+                    &store,
+                    &id,
                     &FinalTaskWorkDescriptor::new(serde_json::json!("nested-hold")).unwrap(),
                 );
                 assert!(cx.checkpoint().is_ok());
@@ -32682,20 +33592,26 @@ mod tests {
                 let mut handoff = Box::pin(runner.resume_task(&cx, &id));
                 drive_task_test_until(&cx, handoff.as_mut(), "nested work starts", || {
                     cleanup.started.load(AtomicOrdering::Acquire)
-                }).await;
+                })
+                .await;
                 drop(handoff);
                 wait_task_test_condition(&cx, "observer abandonment cancels nested work", || {
                     cleanup.cancelled.load(AtomicOrdering::Acquire)
-                }).await;
+                })
+                .await;
                 assert_eq!(store.active_task_count(), 1);
                 assert!(!cleanup.dropped.load(AtomicOrdering::Acquire));
                 cleanup.release();
-                wait_task_test_condition(&cx, "runtime-owned custodian finishes abandoned close", || {
-                    store.active_task_count() == 0
-                }).await;
+                wait_task_test_condition(
+                    &cx,
+                    "runtime-owned custodian finishes abandoned close",
+                    || store.active_task_count() == 0,
+                )
+                .await;
                 assert!(cleanup.dropped.load(AtomicOrdering::Acquire));
                 assert_exact_initial_work_is_recoverable(
-                    &store, &id,
+                    &store,
+                    &id,
                     &FinalTaskWorkDescriptor::new(serde_json::json!("nested-hold")).unwrap(),
                 );
                 assert!(cx.checkpoint().is_ok());
@@ -32733,18 +33649,27 @@ mod tests {
                     (long, long, short),
                 ] {
                     let parent_deadline = cx.now() + parent_duration;
-                    let parent = cx.open_child_region(ChildRegionSpec::inherit().with_budget(
-                        Budget::INFINITE.with_deadline(parent_deadline),
-                    )).await.unwrap();
+                    let parent = cx
+                        .open_child_region(
+                            ChildRegionSpec::inherit()
+                                .with_budget(Budget::INFINITE.with_deadline(parent_deadline)),
+                        )
+                        .await
+                        .unwrap();
                     // Deliberately freeze the backend clock. The runtime deadline
                     // must still stop unwoken application work without a lease
                     // renewal ever extending its original child budget.
                     let frozen = Instant::now();
-                    let store = Arc::new(InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
-                        2, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
-                        FinalTaskExecutionLimits::new(total_duration, attempt_duration, 2).unwrap(),
-                        Arc::new(move || frozen),
-                    ).unwrap());
+                    let store = Arc::new(
+                        InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
+                            2,
+                            InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+                            FinalTaskExecutionLimits::new(total_duration, attempt_duration, 2)
+                                .unwrap(),
+                            Arc::new(move || frozen),
+                        )
+                        .unwrap(),
+                    );
                     let supervisor = Arc::new(DeadlineSupervisor {
                         observed: Mutex::new(None),
                         polls: AtomicUsize::new(0),
@@ -32753,12 +33678,20 @@ mod tests {
                     let _ready = runtime.mark_task_service_ready(runner.service_id).unwrap();
                     let id = create(&runtime, "deadline");
                     let result = asupersync::time::timeout(
-                        cx.now(), StdDuration::from_secs(4), runner.resume_task(parent.cx(), &id),
-                    ).await.expect("fixed child deadline wakes a silent application");
-                    assert!(result.is_err(), "expired caller attempt cannot report application success");
+                        cx.now(),
+                        StdDuration::from_secs(4),
+                        runner.resume_task(parent.cx(), &id),
+                    )
+                    .await
+                    .expect("fixed child deadline wakes a silent application");
+                    assert!(
+                        result.is_err(),
+                        "expired caller attempt cannot report application success"
+                    );
                     let (application_cx, admitted_budget, entered_at) =
                         supervisor.observed.lock().unwrap().take().unwrap();
-                    let deadline = admitted_budget.deadline
+                    let deadline = admitted_budget
+                        .deadline
                         .expect("every attempt has a finite admitted deadline");
                     assert_ne!(application_cx.region_id(), parent.region_id());
                     assert!(application_cx.checkpoint().is_err());
@@ -32768,10 +33701,13 @@ mod tests {
                     assert_eq!(store.active_task_count(), 0);
                     assert_eq!(store.retention_clock_now(), frozen);
                     assert_exact_initial_work_is_recoverable(
-                        &store, &id,
+                        &store,
+                        &id,
                         &FinalTaskWorkDescriptor::new(serde_json::json!("deadline")).unwrap(),
                     );
-                    parent.cancel(CancelReason::user("deadline test parent finished")).unwrap();
+                    parent
+                        .cancel(CancelReason::user("deadline test parent finished"))
+                        .unwrap();
                     parent.close().await.unwrap();
                     assert!(cx.checkpoint().is_ok());
                 }

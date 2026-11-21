@@ -37,11 +37,11 @@ pub mod discovery;
 /// Explicit DPoP proof, credential, and nonce handling for caller-owned HTTPS I/O.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dpop;
+/// Jointly-polled, caller-owned browser driving for native authorization.
+pub mod driver;
 /// Opt-in enterprise registration, assertion and token-response admission.
 #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
 pub mod enterprise;
-/// Jointly-polled, caller-owned browser driving for native authorization.
-pub mod driver;
 /// High-level HTTP calls with shared OAuth renewal and generation-local caches.
 pub mod http_client;
 /// Shared OAuth renewal and authenticated modern HTTP dispatch.

@@ -319,7 +319,9 @@ impl NativeClientRegistration {
             deadline = deadline.min(discovery_deadline(cx, remaining)?);
         }
         let (authorization, token) = self.discovery.admit_issuer_endpoints(issuer, kind, body)?;
-        let revocation = self.discovery.admit_revocation_endpoint(issuer, kind, body)?;
+        let revocation = self
+            .discovery
+            .admit_revocation_endpoint(issuer, kind, body)?;
         let (endpoint, grants) = self.registration_endpoint(issuer, kind, body)?;
         let payload = self.request_body(&grants)?;
         let headers = self.request_headers(&endpoint)?;

@@ -456,7 +456,11 @@ impl RegisteredRestoreStore {
         resolution: DurableRestoreResolution,
         deadline: Time,
     ) -> Result<ReconciledRestoreWrite, RestoreError> {
-        with_operation_caller(cx, self.reconcile_write_inner(cx, fence, resolution, deadline)).await
+        with_operation_caller(
+            cx,
+            self.reconcile_write_inner(cx, fence, resolution, deadline),
+        )
+        .await
     }
 
     async fn reconcile_write_inner(
@@ -601,7 +605,10 @@ struct RecoveryLease {
 
 impl RecoveryLease {
     fn acquire(shared: Arc<Shared>) -> Result<Self, RestoreError> {
-        shared.process.verify().map_err(|_| RestoreError::ProcessChanged)?;
+        shared
+            .process
+            .verify()
+            .map_err(|_| RestoreError::ProcessChanged)?;
         shared
             .recovering
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -624,7 +631,6 @@ impl Drop for RecoveryLease {
         self.shared.recovering.store(false, Ordering::Release);
     }
 }
-
 
 impl RestoreEpochFacade {
     /// Operator bootstrap after process loss, when no old facade survives and
@@ -654,7 +660,8 @@ impl RestoreEpochFacade {
                 InitialAdmission::Recovery,
             )?;
             retired.recover(cx, stores, limits, deadline).await
-        }).await
+        })
+        .await
     }
 
     /// Reconcile a bounded immutable snapshot using the exact predeclared store
@@ -782,7 +789,10 @@ impl RestoreEpochFacade {
                 || page.next_cursor.as_ref().is_some_and(|next| {
                     next.is_empty() || next.len() > limits.cursor_bytes || page.writes.is_empty()
                 })
-                || seen.len().checked_add(page.writes.len()).is_none_or(|n| n > limits.backlog)
+                || seen
+                    .len()
+                    .checked_add(page.writes.len())
+                    .is_none_or(|n| n > limits.backlog)
             {
                 return Err(RestoreError::InvalidReceipt);
             }
@@ -908,7 +918,8 @@ impl RestoreEpochFacade {
             deadline,
         )
         .await?;
-        let mut closed_until_validated = UncertainMutation::new(Arc::clone(&facade.stores[0].shared));
+        let mut closed_until_validated =
+            UncertainMutation::new(Arc::clone(&facade.stores[0].shared));
         closed_until_validated.armed = true;
         CallAccess::Recovery.check(old)?;
         for (store, expected) in facade.stores.iter().zip(stable) {
@@ -929,12 +940,16 @@ async fn recover_store(
     deadline: Time,
 ) -> Result<DurableRestoreResolution, RestoreError> {
     CallAccess::Recovery.check(shared)?;
-    let _admission = CounterLease::acquire(&shared.calls, shared.configuration.limits.active_calls)?;
+    let _admission =
+        CounterLease::acquire(&shared.calls, shared.configuration.limits.active_calls)?;
     let (caller, deadline) = with_caller(cx, || {
         let current = Cx::current().ok_or(RestoreError::CapabilityUnavailable)?;
         require_caller(&current)?;
         current.checkpoint().map_err(|_| RestoreError::Cancelled)?;
-        let deadline = deadline.min(add_time(current.now(), shared.configuration.limits.call_timeout)?);
+        let deadline = deadline.min(add_time(
+            current.now(),
+            shared.configuration.limits.call_timeout,
+        )?);
         let deadline = current
             .budget()
             .deadline

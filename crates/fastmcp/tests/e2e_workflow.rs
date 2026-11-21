@@ -1429,9 +1429,8 @@ fn workflow_two_independent_servers() {
     let mut server_joins = ThreadJoins::new(Vec::new());
 
     // Server A: tools only
-    let (builder_a, client_a_transport, server_a_transport) = TestServer::builder()
-        .with_name("server-a")
-        .build();
+    let (builder_a, client_a_transport, server_a_transport) =
+        TestServer::builder().with_name("server-a").build();
     let server_a = builder_a.tool(EchoTool).build();
     let handle_a = spawn_runtime_server(server_a, server_a_transport, "server A loop");
     server_joins.push(handle_a);

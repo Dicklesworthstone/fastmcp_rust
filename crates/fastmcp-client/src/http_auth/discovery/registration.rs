@@ -494,7 +494,10 @@ mod tests {
             (r#""vendor":{"key":1,"k\u0065y":2}"#, false),
         ] {
             let body = format!("{},{extension}}}", &source[..source.len() - 1]);
-            assert_eq!(owner.admit_response(body.as_bytes(), &grants).is_ok(), accepted);
+            assert_eq!(
+                owner.admit_response(body.as_bytes(), &grants).is_ok(),
+                accepted
+            );
         }
         let mut exact = source.into_bytes();
         exact.resize(SecurityDocumentKind::ClientRegistration.byte_limit(), b' ');

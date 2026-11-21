@@ -23,10 +23,10 @@ use fastmcp_protocol::{
 
 use crate::http_auth::dpop::DpopSession;
 use crate::http_auth::dpop::native::DpopHttpPolicy;
-use crate::http_auth::sampling::{SamplingHost, SamplingHostError, SamplingHostFuture};
 use crate::http_auth::sampling::inputs::mixed::{
     CoreInputHostError, CoreInputHostFuture, CoreInputRequest,
 };
+use crate::http_auth::sampling::{SamplingHost, SamplingHostError, SamplingHostFuture};
 use crate::http_executor::MODERN_MCP_ACCEPT;
 
 const ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo\nApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS\nBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI\nrmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY\nvQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW\nX/aCEJ5+hA==\n-----END CERTIFICATE-----\n";
@@ -67,7 +67,9 @@ struct Host {
 
 impl SamplingHost for Host {
     fn sample<'a>(
-        &'a mut self, _: &'a Cx, _: &'a McpRequestCancellation,
+        &'a mut self,
+        _: &'a Cx,
+        _: &'a McpRequestCancellation,
         _: &'a FinalEmbeddedCreateMessageParams,
     ) -> SamplingHostFuture<'a, FinalCreateMessageResult> {
         self.unexpected += 1;
@@ -75,7 +77,9 @@ impl SamplingHost for Host {
     }
 
     fn approve_tools<'a>(
-        &'a mut self, _: &'a Cx, _: &'a McpRequestCancellation,
+        &'a mut self,
+        _: &'a Cx,
+        _: &'a McpRequestCancellation,
         _: &'a [SamplingContentBlock],
     ) -> SamplingHostFuture<'a, ()> {
         self.unexpected += 1;
@@ -83,7 +87,9 @@ impl SamplingHost for Host {
     }
 
     fn execute_tool<'a>(
-        &'a mut self, _: &'a Cx, _: &'a McpRequestCancellation,
+        &'a mut self,
+        _: &'a Cx,
+        _: &'a McpRequestCancellation,
         _: &'a SamplingContentBlock,
     ) -> SamplingHostFuture<'a, SamplingContentBlock> {
         self.unexpected += 1;
@@ -93,7 +99,9 @@ impl SamplingHost for Host {
 
 impl CoreInputHost for Host {
     fn approve_inputs<'a>(
-        &'a mut self, _: &'a Cx, _: &'a McpRequestCancellation,
+        &'a mut self,
+        _: &'a Cx,
+        _: &'a McpRequestCancellation,
         requests: &'a [CoreInputRequest],
     ) -> CoreInputHostFuture<'a, ()> {
         self.approvals += 1;
@@ -101,25 +109,38 @@ impl CoreInputHost for Host {
         assert_eq!(requests[0].key(), "r");
         let deny = matches!(self.case, Case::DenyHost);
         Box::pin(async move {
-            if deny { Err(CoreInputHostError::Denied) } else { Ok(()) }
+            if deny {
+                Err(CoreInputHostError::Denied)
+            } else {
+                Ok(())
+            }
         })
     }
 
     fn roots<'a>(
-        &'a mut self, _: &'a Cx, _: &'a McpRequestCancellation,
+        &'a mut self,
+        _: &'a Cx,
+        _: &'a McpRequestCancellation,
         _: &'a FinalEmbeddedRootsListParams,
     ) -> CoreInputHostFuture<'a, FinalEmbeddedRootsListResult> {
         self.roots += 1;
         let cancel = matches!(self.case, Case::CancelHost);
         let cancellation = self.cancellation.clone();
         Box::pin(async move {
-            if cancel { cancellation.cancel(); }
-            Ok(serde_json::from_value(json!({"roots":[{"uri":"file:///host-only-private"}]})).unwrap())
+            if cancel {
+                cancellation.cancel();
+            }
+            Ok(
+                serde_json::from_value(json!({"roots":[{"uri":"file:///host-only-private"}]}))
+                    .unwrap(),
+            )
         })
     }
 
     fn form<'a>(
-        &'a mut self, _: &'a Cx, _: &'a McpRequestCancellation,
+        &'a mut self,
+        _: &'a Cx,
+        _: &'a McpRequestCancellation,
         _: &'a FinalEmbeddedFormElicitationParams,
     ) -> CoreInputHostFuture<'a, FinalEmbeddedElicitationResult> {
         self.unexpected += 1;
@@ -127,7 +148,9 @@ impl CoreInputHost for Host {
     }
 
     fn url<'a>(
-        &'a mut self, _: &'a Cx, _: &'a McpRequestCancellation,
+        &'a mut self,
+        _: &'a Cx,
+        _: &'a McpRequestCancellation,
         _: &'a FinalEmbeddedUrlElicitationParams,
     ) -> CoreInputHostFuture<'a, FinalEmbeddedElicitationResult> {
         self.unexpected += 1;
@@ -141,17 +164,22 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let (mut one, mut two) = (None, None);
     poll_fn(|task| {
         if one.is_none() {
-            if let Poll::Ready(value) = left.as_mut().poll(task) { one = Some(value); }
+            if let Poll::Ready(value) = left.as_mut().poll(task) {
+                one = Some(value);
+            }
         }
         if two.is_none() {
-            if let Poll::Ready(value) = right.as_mut().poll(task) { two = Some(value); }
+            if let Poll::Ready(value) = right.as_mut().poll(task) {
+                two = Some(value);
+            }
         }
         if one.is_some() && two.is_some() {
             Poll::Ready((one.take().unwrap(), two.take().unwrap()))
         } else {
             Poll::Pending
         }
-    }).await
+    })
+    .await
 }
 
 async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, Value) {
@@ -178,7 +206,9 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, Value) {
 }
 
 fn field<'a>(headers: &'a str, wanted: &str) -> &'a str {
-    let mut fields = headers.lines().filter_map(|line| line.split_once(':'))
+    let mut fields = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
         .filter(|(name, _)| name.eq_ignore_ascii_case(wanted));
     let (_, value) = fields.next().expect("required header exists");
     assert!(fields.next().is_none(), "required header is a singleton");
@@ -196,10 +226,15 @@ fn check_request(head: &str, body: &Value, original: &Value, round: usize) -> Va
     assert_eq!(field(head, "accept"), MODERN_MCP_ACCEPT);
     assert_eq!(field(head, "mcp-method"), "tools/call");
     assert_eq!(field(head, "mcp-name"), "echo");
-    assert_eq!(field(head, "mcp-param-region"),
-        fastmcp_protocol::http_headers::encode_mcp_header_value("eu 雪").unwrap());
+    assert_eq!(
+        field(head, "mcp-param-region"),
+        fastmcp_protocol::http_headers::encode_mcp_header_value("eu 雪").unwrap()
+    );
     for private in ["body-private", "host-only-private", "opaque-private"] {
-        assert!(!head.contains(private), "private body/state must not become a header");
+        assert!(
+            !head.contains(private),
+            "private body/state must not become a header"
+        );
     }
     let proof = field(head, "dpop");
     let parts: Vec<_> = proof.split('.').collect();
@@ -248,15 +283,24 @@ async fn chunk<IO: AsyncWrite + Unpin>(io: &mut IO, event: &[u8]) {
 }
 
 fn progress(number: usize) -> String {
-    format!("data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":\"owned\",\"progress\":{number}}}}}\n\n")
+    format!(
+        "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":\"owned\",\"progress\":{number}}}}}\n\n"
+    )
 }
 
 #[test]
 fn public_https_streaming_host_preserves_reviews_and_never_replays_failed_rounds() {
     for case in [
-        Case::Sse, Case::JsonThenSse, Case::SseThenJson, Case::DenyHost, Case::CancelHost,
-        Case::CancelObserver, Case::RevokeObserver, Case::IncompleteTail,
-        Case::NotificationLimit, Case::NonceChallenge,
+        Case::Sse,
+        Case::JsonThenSse,
+        Case::SseThenJson,
+        Case::DenyHost,
+        Case::CancelHost,
+        Case::CancelObserver,
+        Case::RevokeObserver,
+        Case::IncompleteTail,
+        Case::NotificationLimit,
+        Case::NonceChallenge,
     ] {
         RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().unwrap())

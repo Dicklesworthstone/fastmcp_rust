@@ -159,8 +159,12 @@ pub enum ManagedTasksError {
     Closed,
     /// The explicit tool-header plan could not be bound or projected locally.
     ParameterHeaders(ToolHeaderDispatchError),
-    HttpStatus { status: u16 },
-    Remote { code: JsonInteger },
+    HttpStatus {
+        status: u16,
+    },
+    Remote {
+        code: JsonInteger,
+    },
     Session(OAuthSessionError),
 }
 
@@ -493,13 +497,16 @@ enum TaskBody {
 fn task_sse_limits(frame_bytes: usize) -> Result<SseLimits, ManagedTasksError> {
     // Preserve space for `data: ` and an optional leading three-byte UTF-8
     // BOM, which the parser counts before stripping it from the first line.
-    let line = frame_bytes.checked_add(16).ok_or(ManagedTasksError::InvalidLimits)?;
+    let line = frame_bytes
+        .checked_add(16)
+        .ok_or(ManagedTasksError::InvalidLimits)?;
     // A payload may span up to 4,096 data lines. Framing overhead is a
     // separate bounded allowance, not 64 bytes shared by the entire event.
     // The ordinary 8 MiB payload therefore has LIMIT-01's 9 MiB event budget.
-    let event = frame_bytes.checked_add(1024 * 1024).ok_or(ManagedTasksError::InvalidLimits)?;
-    SseLimits::with_data_lines(line, event, 64, 4096)
-        .ok_or(ManagedTasksError::InvalidLimits)
+    let event = frame_bytes
+        .checked_add(1024 * 1024)
+        .ok_or(ManagedTasksError::InvalidLimits)?;
+    SseLimits::with_data_lines(line, event, 64, 4096).ok_or(ManagedTasksError::InvalidLimits)
 }
 
 /// One owned response. Pending reads take socket ownership before suspension;
@@ -932,8 +939,11 @@ fn encode_request(
         // Mirror the exact opaque task identity in the actual body, not the
         // JSON-RPC ID, credential identity or resource URL. Never repair a
         // conflicting explicit mirror by silently changing the operation.
-        let task_id = params.get("taskId").and_then(Value::as_str)
-            .filter(|value| !value.is_empty()).ok_or(ManagedTasksError::InvalidRequest)?;
+        let task_id = params
+            .get("taskId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(ManagedTasksError::InvalidRequest)?;
         if name.as_deref().is_some_and(|value| value != task_id) {
             return Err(ManagedTasksError::InvalidRequest);
         }
@@ -1410,13 +1420,15 @@ mod tests {
         let core = crate::http_auth::rpc::ManagedCoreLimits::default();
         assert_eq!(defaults.request_bytes, core.request_bytes());
         assert_eq!(defaults.frame_bytes, core.frame_bytes());
-        assert!(ManagedTasksLimits::new(
-            defaults.request_bytes,
-            defaults.frame_bytes,
-            defaults.records,
-            defaults.timeout,
-        )
-        .is_ok());
+        assert!(
+            ManagedTasksLimits::new(
+                defaults.request_bytes,
+                defaults.frame_bytes,
+                defaults.records,
+                defaults.timeout,
+            )
+            .is_ok()
+        );
         for (request, frame) in [
             (0, defaults.frame_bytes),
             (defaults.request_bytes, 0),
@@ -1495,7 +1507,10 @@ mod tests {
             )
             .unwrap();
             let mut parser = BoundedSseParser::new(task_sse_limits(limits.frame_bytes).unwrap());
-            let framed = format!("{prefix}data: {}\r\n\r\n", std::str::from_utf8(&payload).unwrap());
+            let framed = format!(
+                "{prefix}data: {}\r\n\r\n",
+                std::str::from_utf8(&payload).unwrap()
+            );
             let mut frames = Vec::new();
             for chunk in framed.as_bytes().chunks(4093) {
                 parser
@@ -1550,19 +1565,35 @@ mod tests {
         assert!(framed.len() > payload.len() + 64);
         let mut parser = BoundedSseParser::new(task_sse_limits(payload.len()).unwrap());
         let mut frames = Vec::new();
-        parser.push_with(framed.as_bytes(), |frame| {
-            frames.push(frame);
-            Ok::<(), ()>(())
-        }).unwrap();
+        parser
+            .push_with(framed.as_bytes(), |frame| {
+                frames.push(frame);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
         assert_eq!(frames, vec![payload.clone()]);
-        assert!(decode_stream_record(
-            &TaskDecoder::Get(task_id()), payload.as_bytes(), &RequestId::Number(2),
-            payload.len(), None, &mut None,
-        ).is_ok());
-        assert!(decode_stream_record(
-            &TaskDecoder::Get(task_id()), payload.as_bytes(), &RequestId::Number(2),
-            payload.len() - 1, None, &mut None,
-        ).is_err());
+        assert!(
+            decode_stream_record(
+                &TaskDecoder::Get(task_id()),
+                payload.as_bytes(),
+                &RequestId::Number(2),
+                payload.len(),
+                None,
+                &mut None,
+            )
+            .is_ok()
+        );
+        assert!(
+            decode_stream_record(
+                &TaskDecoder::Get(task_id()),
+                payload.as_bytes(),
+                &RequestId::Number(2),
+                payload.len() - 1,
+                None,
+                &mut None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2020,38 +2051,94 @@ mod tests {
     fn lifecycle_routing_and_exact_sse_payloads_use_the_same_method_owned_identity() {
         use crate::sse::BoundedSseParser;
         for (request, result) in [
-            (ManagedTaskRequest::Get(task_id()),
-                r#"{"resultType":"complete","taskId":"task-one","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000}"#),
-            (ManagedTaskRequest::Cancel(task_id()), r#"{"resultType":"complete"}"#),
-            (ManagedTaskRequest::Update { task: Box::new(input_task()),
-                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap() },
-                r#"{"resultType":"complete"}"#),
+            (
+                ManagedTaskRequest::Get(task_id()),
+                r#"{"resultType":"complete","taskId":"task-one","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000}"#,
+            ),
+            (
+                ManagedTaskRequest::Cancel(task_id()),
+                r#"{"resultType":"complete"}"#,
+            ),
+            (
+                ManagedTaskRequest::Update {
+                    task: Box::new(input_task()),
+                    input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap(),
+                },
+                r#"{"resultType":"complete"}"#,
+            ),
         ] {
-            let prepared = prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2),
-                request, ManagedTasksLimits::default()).unwrap();
+            let prepared = prepare(
+                "https://mcp.example/mcp",
+                &meta(),
+                &RequestId::Number(2),
+                request,
+                ManagedTasksLimits::default(),
+            )
+            .unwrap();
             let body: Value = serde_json::from_slice(prepared.wire.body()).unwrap();
             let headers = prepared.wire.headers();
-            let mirrors: Vec<_> = headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("mcp-name")).collect();
+            let mirrors: Vec<_> = headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("mcp-name"))
+                .collect();
             assert_eq!(mirrors.len(), 1);
             assert_eq!(body["params"]["taskId"], "task-one");
-            assert_eq!(fastmcp_protocol::http_headers::decode_mcp_header_value(mirrors[0].1.as_bytes()).unwrap(), "task-one");
+            assert_eq!(
+                fastmcp_protocol::http_headers::decode_mcp_header_value(mirrors[0].1.as_bytes())
+                    .unwrap(),
+                "task-one"
+            );
             assert_eq!(prepared.wire.target(), "https://mcp.example/mcp");
             let payload = envelope(result);
             let framed = format!("data: {}\r\n\r\n", std::str::from_utf8(&payload).unwrap());
             for split in 0..=framed.len() {
                 let mut parser = BoundedSseParser::new(task_sse_limits(payload.len()).unwrap());
                 let mut frames = Vec::new();
-                let mut accept = |frame: String| { frames.push(frame); Ok::<(), ()>(()) };
-                parser.push_with(&framed.as_bytes()[..split], &mut accept).unwrap();
-                parser.push_with(&framed.as_bytes()[split..], &mut accept).unwrap();
+                let mut accept = |frame: String| {
+                    frames.push(frame);
+                    Ok::<(), ()>(())
+                };
+                parser
+                    .push_with(&framed.as_bytes()[..split], &mut accept)
+                    .unwrap();
+                parser
+                    .push_with(&framed.as_bytes()[split..], &mut accept)
+                    .unwrap();
                 assert_eq!(frames.len(), 1);
                 assert_eq!(frames[0].as_bytes(), payload);
-                assert!(decode_stream_record(&prepared.decoder, frames[0].as_bytes(),
-                    &RequestId::Number(2), payload.len(), None, &mut None).is_ok());
-                assert!(decode_stream_record(&prepared.decoder, frames[0].as_bytes(),
-                    &RequestId::Number(3), payload.len(), None, &mut None).is_err());
-                assert!(decode_stream_record(&prepared.decoder, frames[0].as_bytes(),
-                    &RequestId::Number(2), payload.len() - 1, None, &mut None).is_err());
+                assert!(
+                    decode_stream_record(
+                        &prepared.decoder,
+                        frames[0].as_bytes(),
+                        &RequestId::Number(2),
+                        payload.len(),
+                        None,
+                        &mut None
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    decode_stream_record(
+                        &prepared.decoder,
+                        frames[0].as_bytes(),
+                        &RequestId::Number(3),
+                        payload.len(),
+                        None,
+                        &mut None
+                    )
+                    .is_err()
+                );
+                assert!(
+                    decode_stream_record(
+                        &prepared.decoder,
+                        frames[0].as_bytes(),
+                        &RequestId::Number(2),
+                        payload.len() - 1,
+                        None,
+                        &mut None
+                    )
+                    .is_err()
+                );
             }
         }
     }
@@ -2060,18 +2147,57 @@ mod tests {
     fn lifecycle_encoder_refuses_a_conflicting_or_missing_task_mirror_source() {
         for method in [TASK_GET, TASK_UPDATE, TASK_CANCEL] {
             let params = json!({"taskId":"task-one"});
-            assert!(encode_request("https://mcp.example/mcp", method, &RequestId::Number(2),
-                params.clone(), None, 4096).is_ok());
-            assert!(matches!(encode_request("https://mcp.example/mcp", method, &RequestId::Number(2),
-                params, Some("task-two".to_owned()), 4096), Err(ManagedTasksError::InvalidRequest)));
+            assert!(
+                encode_request(
+                    "https://mcp.example/mcp",
+                    method,
+                    &RequestId::Number(2),
+                    params.clone(),
+                    None,
+                    4096
+                )
+                .is_ok()
+            );
+            assert!(matches!(
+                encode_request(
+                    "https://mcp.example/mcp",
+                    method,
+                    &RequestId::Number(2),
+                    params,
+                    Some("task-two".to_owned()),
+                    4096
+                ),
+                Err(ManagedTasksError::InvalidRequest)
+            ));
             for params in [json!({}), json!({"taskId":null}), json!({"taskId":""})] {
-                assert!(matches!(encode_request("https://mcp.example/mcp", method, &RequestId::Number(2),
-                    params, None, 4096), Err(ManagedTasksError::InvalidRequest)));
+                assert!(matches!(
+                    encode_request(
+                        "https://mcp.example/mcp",
+                        method,
+                        &RequestId::Number(2),
+                        params,
+                        None,
+                        4096
+                    ),
+                    Err(ManagedTasksError::InvalidRequest)
+                ));
             }
         }
-        let discover = encode_request("https://mcp.example/mcp", "server/discover",
-            &RequestId::Number(1), json!({"_meta":meta()}), None, 4096).unwrap();
-        assert!(!discover.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("mcp-name")));
+        let discover = encode_request(
+            "https://mcp.example/mcp",
+            "server/discover",
+            &RequestId::Number(1),
+            json!({"_meta":meta()}),
+            None,
+            4096,
+        )
+        .unwrap();
+        assert!(
+            !discover
+                .headers()
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("mcp-name"))
+        );
     }
 
     fn header_client() -> ManagedTasksClient {
@@ -2109,8 +2235,9 @@ mod tests {
             .into_iter()
             .filter(|(name, _)| name.starts_with("Mcp-Param-"))
             .map(|(name, value)| {
-                let value = fastmcp_protocol::http_headers::decode_mcp_header_value(value.as_bytes())
-                    .unwrap();
+                let value =
+                    fastmcp_protocol::http_headers::decode_mcp_header_value(value.as_bytes())
+                        .unwrap();
                 (name, value)
             })
             .collect()
@@ -2119,80 +2246,147 @@ mod tests {
     #[test]
     fn reviewed_task_rounds_project_the_final_body_without_disclosing_state_or_secrets() {
         let plain = header_client();
-        let client = plain.clone().with_reviewed_tool_headers(
-            reviewed_headers("https://mcp.example/mcp"),
-        ).unwrap();
+        let client = plain
+            .clone()
+            .with_reviewed_tool_headers(reviewed_headers("https://mcp.example/mcp"))
+            .unwrap();
         for continuation in [false, true] {
             let arguments = json!({"region":"north/λ%","count":42,"enabled":false,
                 "secret":"body-only-canary"});
             let mut prepared = prepare(
-                client.session.resource().as_str(), &client.metadata, &RequestId::Number(2),
-                ManagedTaskRequest::CallTool { name: "echo".to_owned(), arguments: Some(arguments) },
+                client.session.resource().as_str(),
+                &client.metadata,
+                &RequestId::Number(2),
+                ManagedTaskRequest::CallTool {
+                    name: "echo".to_owned(),
+                    arguments: Some(arguments),
+                },
                 client.limits,
-            ).unwrap();
+            )
+            .unwrap();
             if continuation {
-                let TaskDecoder::Tool(core) = &prepared.decoder else { panic!("tool decoder") };
+                let TaskDecoder::Tool(core) = &prepared.decoder else {
+                    panic!("tool decoder")
+                };
                 let mut params = core.encode_params().unwrap().unwrap();
                 params["requestState"] = json!("sealed-state-canary");
                 params["inputResponses"] = json!({"roots":{"roots":[]}});
                 prepared.decoder = TaskDecoder::Tool(Box::new(
-                    CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap(),
+                    CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params))
+                        .unwrap(),
                 ));
-                prepared.wire = encode_request(client.session.resource().as_str(), "tools/call",
-                    &RequestId::Number(2), params, Some("echo".to_owned()), client.limits.request_bytes)
-                    .unwrap();
+                prepared.wire = encode_request(
+                    client.session.resource().as_str(),
+                    "tools/call",
+                    &RequestId::Number(2),
+                    params,
+                    Some("echo".to_owned()),
+                    client.limits.request_bytes,
+                )
+                .unwrap();
             }
             let original = prepared.wire.body().to_vec();
-            let round = client.clone().prepare_round(header_ids(), prepared).unwrap();
+            let round = client
+                .clone()
+                .prepare_round(header_ids(), prepared)
+                .unwrap();
             assert_eq!(round.prepared.wire.body(), original);
-            assert_eq!(header_fields(&round.prepared.wire), std::collections::BTreeMap::from([
-                ("Mcp-Param-Region".to_owned(), "north/λ%".to_owned()),
-                ("Mcp-Param-Count".to_owned(), "42".to_owned()),
-                ("Mcp-Param-Enabled".to_owned(), "false".to_owned()),
-            ]));
+            assert_eq!(
+                header_fields(&round.prepared.wire),
+                std::collections::BTreeMap::from([
+                    ("Mcp-Param-Region".to_owned(), "north/λ%".to_owned()),
+                    ("Mcp-Param-Count".to_owned(), "42".to_owned()),
+                    ("Mcp-Param-Enabled".to_owned(), "false".to_owned()),
+                ])
+            );
             assert!(header_fields(&round.discover_wire).is_empty());
             for wire in [&round.prepared.wire, &round.discover_wire] {
-                assert!(!wire.headers().iter().any(|(_, value)|
-                    value.contains("body-only-canary") || value.contains("sealed-state-canary")));
+                assert!(
+                    !wire
+                        .headers()
+                        .iter()
+                        .any(|(_, value)| value.contains("body-only-canary")
+                            || value.contains("sealed-state-canary"))
+                );
             }
             let discover: Value = serde_json::from_slice(round.discover_wire.body()).unwrap();
             assert!(discover["params"].get("requestState").is_none());
             assert!(discover["params"].get("inputResponses").is_none());
         }
-        let prepared = prepare(plain.session.resource().as_str(), &plain.metadata,
-            &RequestId::Number(2), ManagedTaskRequest::CallTool {
-                name: "echo".to_owned(), arguments: Some(json!({"region":"eu"})),
-            }, plain.limits).unwrap();
-        assert!(header_fields(&plain.prepare_round(header_ids(), prepared).unwrap().prepared.wire).is_empty());
+        let prepared = prepare(
+            plain.session.resource().as_str(),
+            &plain.metadata,
+            &RequestId::Number(2),
+            ManagedTaskRequest::CallTool {
+                name: "echo".to_owned(),
+                arguments: Some(json!({"region":"eu"})),
+            },
+            plain.limits,
+        )
+        .unwrap();
+        assert!(
+            header_fields(
+                &plain
+                    .prepare_round(header_ids(), prepared)
+                    .unwrap()
+                    .prepared
+                    .wire
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn reviewed_task_clients_keep_lifecycle_operations_unprojected_and_bound() {
-        let client = header_client().with_reviewed_tool_headers(
-            reviewed_headers("https://mcp.example/mcp"),
-        ).unwrap();
+        let client = header_client()
+            .with_reviewed_tool_headers(reviewed_headers("https://mcp.example/mcp"))
+            .unwrap();
         for request in [
             ManagedTaskRequest::Get(task_id()),
             ManagedTaskRequest::Cancel(task_id()),
-            ManagedTaskRequest::Update { task: Box::new(input_task()),
-                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap() },
+            ManagedTaskRequest::Update {
+                task: Box::new(input_task()),
+                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap(),
+            },
         ] {
-            let prepared = prepare(client.session.resource().as_str(), &client.metadata,
-                &RequestId::Number(2), request, client.limits).unwrap();
+            let prepared = prepare(
+                client.session.resource().as_str(),
+                &client.metadata,
+                &RequestId::Number(2),
+                request,
+                client.limits,
+            )
+            .unwrap();
             let original = prepared.wire.body().to_vec();
             let round = client.prepare_round(header_ids(), prepared).unwrap();
             assert_eq!(round.prepared.wire.body(), original);
             assert!(header_fields(&round.prepared.wire).is_empty());
             assert!(header_fields(&round.discover_wire).is_empty());
-            assert!(round.prepared.wire.headers().iter().any(|(name, value)|
-                name.eq_ignore_ascii_case("mcp-name") && value == "task-one"));
+            assert!(
+                round
+                    .prepared
+                    .wire
+                    .headers()
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("mcp-name")
+                        && value == "task-one")
+            );
         }
-        assert!(matches!(header_client().with_reviewed_tool_headers(
-            reviewed_headers("https://mcp.example/other")),
-            Err(ManagedTasksError::ParameterHeaders(ToolHeaderDispatchError::TargetMismatch))));
-        assert!(matches!(client.clone().with_reviewed_tool_headers(
-            reviewed_headers("https://mcp.example/mcp")),
-            Err(ManagedTasksError::ParameterHeaders(ToolHeaderDispatchError::AlreadyProjected))));
+        assert!(matches!(
+            header_client()
+                .with_reviewed_tool_headers(reviewed_headers("https://mcp.example/other")),
+            Err(ManagedTasksError::ParameterHeaders(
+                ToolHeaderDispatchError::TargetMismatch
+            ))
+        ));
+        assert!(matches!(
+            client
+                .clone()
+                .with_reviewed_tool_headers(reviewed_headers("https://mcp.example/mcp")),
+            Err(ManagedTasksError::ParameterHeaders(
+                ToolHeaderDispatchError::AlreadyProjected
+            ))
+        ));
     }
 
     #[test]
@@ -2201,12 +2395,15 @@ mod tests {
         use std::future::{Future, poll_fn};
         use std::task::Poll;
 
-        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap()
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
             .block_on(async {
                 let cx = Cx::current().unwrap();
-                let client = header_client().with_reviewed_tool_headers(
-                    reviewed_headers("https://mcp.example/mcp"),
-                ).unwrap();
+                let client = header_client()
+                    .with_reviewed_tool_headers(reviewed_headers("https://mcp.example/mcp"))
+                    .unwrap();
                 let cancellation = McpRequestCancellation::new();
                 for (name, arguments) in [
                     ("other", json!({"region":"eu"})),
@@ -2214,8 +2411,12 @@ mod tests {
                     ("echo", json!({"enabled":{"not":"a boolean"}})),
                 ] {
                     let mut request = Box::pin(client.request_with_cancellation(
-                        &cx, &cancellation, header_ids(), ManagedTaskRequest::CallTool {
-                            name: name.to_owned(), arguments: Some(arguments),
+                        &cx,
+                        &cancellation,
+                        header_ids(),
+                        ManagedTaskRequest::CallTool {
+                            name: name.to_owned(),
+                            arguments: Some(arguments),
                         },
                     ));
                     poll_fn(|task| match request.as_mut().poll(task) {
@@ -2224,17 +2425,30 @@ mod tests {
                             Poll::Ready(())
                         }
                         _ => panic!("projection must fail before requesting the absent credential"),
-                    }).await;
+                    })
+                    .await;
                 }
                 assert!(!cancellation.is_cancel_requested());
                 assert!(!client.session.inner.closed.is_cancel_requested());
                 assert!(cx.checkpoint().is_ok());
-                let prepared = prepare(client.session.resource().as_str(), &client.metadata,
-                    &RequestId::Number(2), ManagedTaskRequest::CallTool {
-                        name: "echo".to_owned(), arguments: Some(json!({"count":7})),
-                    }, client.limits).unwrap();
+                let prepared = prepare(
+                    client.session.resource().as_str(),
+                    &client.metadata,
+                    &RequestId::Number(2),
+                    ManagedTaskRequest::CallTool {
+                        name: "echo".to_owned(),
+                        arguments: Some(json!({"count":7})),
+                    },
+                    client.limits,
+                )
+                .unwrap();
                 let valid = client.prepare_round(header_ids(), prepared).unwrap();
-                assert_eq!(header_fields(&valid.prepared.wire).get("Mcp-Param-Count").map(String::as_str), Some("7"));
+                assert_eq!(
+                    header_fields(&valid.prepared.wire)
+                        .get("Mcp-Param-Count")
+                        .map(String::as_str),
+                    Some("7")
+                );
             });
     }
 }

@@ -9,11 +9,11 @@ use std::sync::OnceLock;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::json;
 
-use super::*;
 use super::super::{
     IdJagExpectations, IdJagVerificationKeys, JwtTimePolicy, ResourceTenantExpectation,
     TenantExpectation, verify_id_jag, verify_id_jag_with_disclosure,
 };
+use super::*;
 
 const ISSUED: u64 = 2_000_000_000;
 const ALL_CLAIMS: [IdJagDisclosureClaim; 4] = [
@@ -23,9 +23,20 @@ const ALL_CLAIMS: [IdJagDisclosureClaim; 4] = [
     IdJagDisclosureClaim::AuthenticationMethods,
 ];
 const FIXTURE_NAMES: [&str; 14] = [
-    "base", "email", "all_disclosures", "email_null", "email_too_long",
-    "email_wrong_type", "amr_not_array", "amr_duplicate", "auth_time_future",
-    "unknown_claim", "cnf", "act", "duplicate_email", "foreign_resource",
+    "base",
+    "email",
+    "all_disclosures",
+    "email_null",
+    "email_too_long",
+    "email_wrong_type",
+    "amr_not_array",
+    "amr_duplicate",
+    "auth_time_future",
+    "unknown_claim",
+    "cnf",
+    "act",
+    "duplicate_email",
+    "foreign_resource",
 ];
 
 fn fixtures() -> &'static Value {
@@ -34,7 +45,9 @@ fn fixtures() -> &'static Value {
 }
 
 fn signed(name: &str) -> &'static str {
-    fixtures()[name].as_str().expect("named signed disclosure fixture")
+    fixtures()[name]
+        .as_str()
+        .expect("named signed disclosure fixture")
 }
 
 fn at(seconds: u64) -> SystemTime {
@@ -70,10 +83,13 @@ fn configuration(claims: &[IdJagDisclosureClaim]) -> IdJagDisclosureConfiguratio
         resource_as_issuer: "https://as.example".to_owned(),
         reviewed_at: at(ISSUED - 5),
         review_expires_at: at(ISSUED + 120),
-        rules: claims.iter().map(|claim| IdJagDisclosureRule {
-            claim: *claim,
-            purpose: format!("Validate and discard reviewed {}", claim.name()),
-        }).collect(),
+        rules: claims
+            .iter()
+            .map(|claim| IdJagDisclosureRule {
+                claim: *claim,
+                purpose: format!("Validate and discard reviewed {}", claim.name()),
+            })
+            .collect(),
     }
 }
 
@@ -90,7 +106,10 @@ fn every_disclosure_fixture_has_a_real_rs256_signature_including_invalid_json() 
         n: modulus.as_slice(),
         e: exponent.as_slice(),
     };
-    assert_eq!(fixtures().as_object().unwrap().len(), FIXTURE_NAMES.len() + 1);
+    assert_eq!(
+        fixtures().as_object().unwrap().len(),
+        FIXTURE_NAMES.len() + 1
+    );
     for name in FIXTURE_NAMES {
         let (input, signature) = signed(name).rsplit_once('.').unwrap();
         let signature = URL_SAFE_NO_PAD.decode(signature).unwrap();
@@ -98,7 +117,8 @@ fn every_disclosure_fixture_has_a_real_rs256_signature_including_invalid_json() 
             &ring::signature::RSA_PKCS1_2048_8192_SHA256,
             input.as_bytes(),
             &signature,
-        ).unwrap_or_else(|_| panic!("fixture signature failed: {name}"));
+        )
+        .unwrap_or_else(|_| panic!("fixture signature failed: {name}"));
     }
 }
 
@@ -116,9 +136,9 @@ fn signed_optional_disclosures_require_explicit_permission_and_retain_only_names
     }
 
     let policy = policy(&ALL_CLAIMS);
-    let admitted = verify_id_jag_with_disclosure(
-        signed("all_disclosures"), &keys, &expected, &policy, now(),
-    ).unwrap();
+    let admitted =
+        verify_id_jag_with_disclosure(signed("all_disclosures"), &keys, &expected, &policy, now())
+            .unwrap();
     assert_eq!(admitted.subject().as_str(), "resource-facing");
     assert_eq!(admitted.resource(), Some("https://mcp.example/mcp"));
     assert_eq!(admitted.scope(), Some("read"));
@@ -131,8 +151,12 @@ fn signed_optional_disclosures_require_explicit_permission_and_retain_only_names
 
     let diagnostic = format!("{policy:?} {admitted:?} {facts:?}");
     for private_value in [
-        "hidden-contact@example.test", "urn:example:assurance:reviewed", "pwd", "hwk",
-        "resource-facing", signed("all_disclosures"),
+        "hidden-contact@example.test",
+        "urn:example:assurance:reviewed",
+        "pwd",
+        "hwk",
+        "resource-facing",
+        signed("all_disclosures"),
     ] {
         assert!(!diagnostic.contains(private_value));
     }
@@ -143,28 +167,31 @@ fn partial_and_empty_allowlists_do_not_inherit_other_disclosure_permissions() {
     let keys = keys();
     let expected = expected();
     let email_only = policy(&[IdJagDisclosureClaim::Email]);
-    let admitted = verify_id_jag_with_disclosure(
-        signed("email"), &keys, &expected, &email_only, now(),
-    ).unwrap();
+    let admitted =
+        verify_id_jag_with_disclosure(signed("email"), &keys, &expected, &email_only, now())
+            .unwrap();
     assert_eq!(
         admitted.disclosure().unwrap().admitted_claims(),
         &[IdJagDisclosureClaim::Email],
     );
     assert_eq!(
         verify_id_jag_with_disclosure(
-            signed("all_disclosures"), &keys, &expected, &email_only, now(),
-        ).unwrap_err(),
+            signed("all_disclosures"),
+            &keys,
+            &expected,
+            &email_only,
+            now(),
+        )
+        .unwrap_err(),
         EnterpriseVerificationError::InvalidClaims,
     );
     let empty = policy(&[]);
-    let admitted = verify_id_jag_with_disclosure(
-        signed("base"), &keys, &expected, &empty, now(),
-    ).unwrap();
+    let admitted =
+        verify_id_jag_with_disclosure(signed("base"), &keys, &expected, &empty, now()).unwrap();
     assert!(admitted.disclosure().unwrap().admitted_claims().is_empty());
     assert_eq!(
-        verify_id_jag_with_disclosure(
-            signed("email"), &keys, &expected, &empty, now(),
-        ).unwrap_err(),
+        verify_id_jag_with_disclosure(signed("email"), &keys, &expected, &empty, now(),)
+            .unwrap_err(),
         EnterpriseVerificationError::InvalidClaims,
     );
 }
@@ -175,20 +202,24 @@ fn signed_disclosure_values_refuse_wrong_types_bounds_and_authentication_order()
     let expected = expected();
     let policy = policy(&ALL_CLAIMS);
     for name in [
-        "email_null", "email_too_long", "email_wrong_type",
-        "amr_not_array", "amr_duplicate", "auth_time_future",
+        "email_null",
+        "email_too_long",
+        "email_wrong_type",
+        "amr_not_array",
+        "amr_duplicate",
+        "auth_time_future",
     ] {
         assert_eq!(
-            verify_id_jag_with_disclosure(
-                signed(name), &keys, &expected, &policy, now(),
-            ).unwrap_err(),
+            verify_id_jag_with_disclosure(signed(name), &keys, &expected, &policy, now(),)
+                .unwrap_err(),
             EnterpriseVerificationError::InvalidClaims,
             "{name}",
         );
     }
-    assert!(verify_id_jag_with_disclosure(
-        signed("all_disclosures"), &keys, &expected, &policy, now(),
-    ).is_ok());
+    assert!(
+        verify_id_jag_with_disclosure(signed("all_disclosures"), &keys, &expected, &policy, now(),)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -198,23 +229,35 @@ fn disclosure_permission_cannot_enable_actors_sender_constraints_or_duplicate_me
     let policy = policy(&ALL_CLAIMS);
     for name in ["unknown_claim", "cnf", "act"] {
         assert_eq!(
-            verify_id_jag_with_disclosure(
-                signed(name), &keys, &expected, &policy, now(),
-            ).unwrap_err(),
+            verify_id_jag_with_disclosure(signed(name), &keys, &expected, &policy, now(),)
+                .unwrap_err(),
             EnterpriseVerificationError::InvalidClaims,
             "{name}",
         );
     }
     assert_eq!(
-        verify_id_jag_with_disclosure(
-            signed("duplicate_email"), &keys, &expected, &policy, now(),
-        ).unwrap_err(),
+        verify_id_jag_with_disclosure(signed("duplicate_email"), &keys, &expected, &policy, now(),)
+            .unwrap_err(),
         EnterpriseVerificationError::InvalidToken,
     );
     for name in [
-        "authorization_details", "act", "sub_id", "name", "given_name",
-        "family_name", "preferred_username", "cnf", "jku", "jwk", "x5u",
-        "iss", "sub", "aud", "client_id", "resource", "scope",
+        "authorization_details",
+        "act",
+        "sub_id",
+        "name",
+        "given_name",
+        "family_name",
+        "preferred_username",
+        "cnf",
+        "jku",
+        "jwk",
+        "x5u",
+        "iss",
+        "sub",
+        "aud",
+        "client_id",
+        "resource",
+        "scope",
     ] {
         assert!(IdJagDisclosureClaim::from_name(name).is_none(), "{name}");
     }
@@ -235,9 +278,8 @@ fn optional_claims_do_not_bypass_signature_target_or_signed_expiry_checks() {
     );
     expected.client_id = "different-resource-client";
     assert_eq!(
-        verify_id_jag_with_disclosure(
-            signed("email"), &keys, &expected, &policy, now(),
-        ).unwrap_err(),
+        verify_id_jag_with_disclosure(signed("email"), &keys, &expected, &policy, now(),)
+            .unwrap_err(),
         EnterpriseVerificationError::BindingMismatch,
     );
     expected.client_id = "native-resource";
@@ -251,9 +293,7 @@ fn optional_claims_do_not_bypass_signature_target_or_signed_expiry_checks() {
     let first = if signature.starts_with('A') { 'B' } else { 'A' };
     let altered = format!("{input}.{first}{}", &signature[1..]);
     assert_eq!(
-        verify_id_jag_with_disclosure(
-            &altered, &keys, &expected, &policy, now(),
-        ).unwrap_err(),
+        verify_id_jag_with_disclosure(&altered, &keys, &expected, &policy, now(),).unwrap_err(),
         EnterpriseVerificationError::InvalidToken,
     );
 }
@@ -264,15 +304,15 @@ fn exact_trust_relationship_and_review_window_have_no_implicit_alias_or_skew() {
     let expected = expected();
     let selected = policy(&[IdJagDisclosureClaim::Email]);
     for time in [at(ISSUED - 5), at(ISSUED + 119)] {
-        assert!(verify_id_jag_with_disclosure(
-            signed("email"), &keys, &expected, &selected, time,
-        ).is_ok());
+        assert!(
+            verify_id_jag_with_disclosure(signed("email"), &keys, &expected, &selected, time,)
+                .is_ok()
+        );
     }
     for time in [at(ISSUED - 6), at(ISSUED + 120)] {
         assert_eq!(
-            verify_id_jag_with_disclosure(
-                signed("email"), &keys, &expected, &selected, time,
-            ).unwrap_err(),
+            verify_id_jag_with_disclosure(signed("email"), &keys, &expected, &selected, time,)
+                .unwrap_err(),
             EnterpriseVerificationError::InvalidConfiguration,
         );
     }
@@ -285,9 +325,8 @@ fn exact_trust_relationship_and_review_window_have_no_implicit_alias_or_skew() {
         }
         let other = IdJagDisclosurePolicy::from_trusted_configuration(config).unwrap();
         assert_eq!(
-            verify_id_jag_with_disclosure(
-                signed("email"), &keys, &expected, &other, now(),
-            ).unwrap_err(),
+            verify_id_jag_with_disclosure(signed("email"), &keys, &expected, &other, now(),)
+                .unwrap_err(),
             EnterpriseVerificationError::BindingMismatch,
         );
     }
@@ -306,8 +345,10 @@ fn disclosure_configuration_requires_bounded_reviewed_identity_and_unique_purpos
             5 => config.resource_as_issuer = "https://user@as.example".to_owned(),
             6 => config.reviewed_at = UNIX_EPOCH - Duration::from_secs(1),
             7 => config.review_expires_at = config.reviewed_at,
-            8 => config.review_expires_at =
-                config.reviewed_at + MAX_DISCLOSURE_REVIEW_LIFETIME + Duration::from_nanos(1),
+            8 => {
+                config.review_expires_at =
+                    config.reviewed_at + MAX_DISCLOSURE_REVIEW_LIFETIME + Duration::from_nanos(1)
+            }
             9 => config.rules.push(IdJagDisclosureRule {
                 claim: IdJagDisclosureClaim::Email,
                 purpose: "Another purpose cannot duplicate an existing claim".to_owned(),
@@ -332,7 +373,10 @@ fn disclosure_digest_is_order_independent_and_changes_with_each_authority_dimens
     let mut reordered = configuration(&ALL_CLAIMS);
     reordered.rules.reverse();
     let reordered = IdJagDisclosurePolicy::from_trusted_configuration(reordered).unwrap();
-    assert_eq!(original.configuration_digest(), reordered.configuration_digest());
+    assert_eq!(
+        original.configuration_digest(),
+        reordered.configuration_digest()
+    );
 
     for mutation in 0..8 {
         let mut config = configuration(&ALL_CLAIMS);
@@ -343,12 +387,20 @@ fn disclosure_digest_is_order_independent_and_changes_with_each_authority_dimens
             3 => config.resource_as_issuer.push('/'),
             4 => config.reviewed_at += Duration::from_secs(1),
             5 => config.review_expires_at += Duration::from_secs(1),
-            6 => config.rules[0].purpose.push_str(" for a different reviewed purpose"),
-            7 => { config.rules.pop(); }
+            6 => config.rules[0]
+                .purpose
+                .push_str(" for a different reviewed purpose"),
+            7 => {
+                config.rules.pop();
+            }
             _ => unreachable!(),
         }
         let changed = IdJagDisclosurePolicy::from_trusted_configuration(config).unwrap();
-        assert_ne!(original.configuration_digest(), changed.configuration_digest(), "{mutation}");
+        assert_ne!(
+            original.configuration_digest(),
+            changed.configuration_digest(),
+            "{mutation}"
+        );
     }
 }
 
@@ -356,18 +408,33 @@ fn disclosure_digest_is_order_independent_and_changes_with_each_authority_dimens
 fn optional_disclosure_schemas_enforce_exact_size_and_type_boundaries() {
     let policy = policy(&ALL_CLAIMS);
     let methods: Vec<String> = (0..MAX_AUTHENTICATION_METHODS)
-        .map(|index| format!("{index:02}{}", "m".repeat(MAX_AUTHENTICATION_METHOD_BYTES - 2)))
+        .map(|index| {
+            format!(
+                "{index:02}{}",
+                "m".repeat(MAX_AUTHENTICATION_METHOD_BYTES - 2)
+            )
+        })
         .collect();
     for (name, value) in [
         ("email", json!("x".repeat(MAX_EMAIL_BYTES))),
         ("acr", json!("x".repeat(MAX_AUTHENTICATION_CONTEXT_BYTES))),
         ("amr", json!(methods)),
-        ("auth_time", serde_json::from_str("2000000000.000000000").unwrap()),
+        (
+            "auth_time",
+            serde_json::from_str("2000000000.000000000").unwrap(),
+        ),
     ] {
         let mut claims = Map::new();
         claims.insert("iat".to_owned(), json!(ISSUED));
         claims.insert(name.to_owned(), value);
-        assert_eq!(policy.admit_claims(&claims).unwrap().admitted_claims().len(), 1);
+        assert_eq!(
+            policy
+                .admit_claims(&claims)
+                .unwrap()
+                .admitted_claims()
+                .len(),
+            1
+        );
     }
 
     for (name, value) in [
@@ -375,18 +442,33 @@ fn optional_disclosure_schemas_enforce_exact_size_and_type_boundaries() {
         ("email", json!("x".repeat(MAX_EMAIL_BYTES + 1))),
         ("email", Value::Null),
         ("acr", json!(true)),
-        ("acr", json!("x".repeat(MAX_AUTHENTICATION_CONTEXT_BYTES + 1))),
+        (
+            "acr",
+            json!("x".repeat(MAX_AUTHENTICATION_CONTEXT_BYTES + 1)),
+        ),
         ("amr", json!([])),
         ("amr", json!("pwd")),
         ("amr", json!([null])),
         ("amr", json!(["pwd", "pwd"])),
-        ("amr", json!(["x".repeat(MAX_AUTHENTICATION_METHOD_BYTES + 1)])),
-        ("amr", json!((0..=MAX_AUTHENTICATION_METHODS)
-            .map(|index| format!("method-{index}")).collect::<Vec<_>>())),
+        (
+            "amr",
+            json!(["x".repeat(MAX_AUTHENTICATION_METHOD_BYTES + 1)]),
+        ),
+        (
+            "amr",
+            json!(
+                (0..=MAX_AUTHENTICATION_METHODS)
+                    .map(|index| format!("method-{index}"))
+                    .collect::<Vec<_>>()
+            ),
+        ),
         ("auth_time", json!("2000000000")),
         ("auth_time", json!(ISSUED + 1)),
         ("auth_time", serde_json::from_str("-0").unwrap()),
-        ("auth_time", serde_json::from_str("1999999999.0000000001").unwrap()),
+        (
+            "auth_time",
+            serde_json::from_str("1999999999.0000000001").unwrap(),
+        ),
     ] {
         let mut claims = Map::new();
         claims.insert("iat".to_owned(), json!(ISSUED));

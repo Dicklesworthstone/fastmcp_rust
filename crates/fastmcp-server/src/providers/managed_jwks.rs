@@ -72,7 +72,12 @@ impl JwksRefreshPolicy {
         {
             return Err(JwksRefreshError::InvalidPolicy);
         }
-        Ok(Self { refresh_after, maximum_age, retry_after, attempt_timeout })
+        Ok(Self {
+            refresh_after,
+            maximum_age,
+            retry_after,
+            attempt_timeout,
+        })
     }
 }
 
@@ -168,7 +173,10 @@ impl fmt::Debug for ManagedJwtResourceVerifier {
         let state = self.shared.state.try_read().ok();
         f.debug_struct("ManagedJwtResourceVerifier")
             .field("refresh_policy", &self.refresh_policy)
-            .field("has_keys", &state.as_ref().map(|state| state.active.is_some()))
+            .field(
+                "has_keys",
+                &state.as_ref().map(|state| state.active.is_some()),
+            )
             .field("revoked", &state.as_ref().map(|state| state.revoked))
             .finish_non_exhaustive()
     }
@@ -215,11 +223,18 @@ impl ManagedJwtResourceVerifier {
     /// identical key IDs or bytes. Parsing happens outside the state lock.
     pub fn install_jwks(&self, jwks: &[u8]) -> Result<(), JwksRefreshError> {
         let verifier = self.admit_keys(jwks)?;
-        let mut state = self.shared.state.write().map_err(|_| JwksRefreshError::StateUnavailable)?;
+        let mut state = self
+            .shared
+            .state
+            .write()
+            .map_err(|_| JwksRefreshError::StateUnavailable)?;
         let now = (self.shared.clock)();
         let expires_at = checked_deadline(now, self.refresh_policy.maximum_age)?;
         let next_attempt_at = checked_deadline(now, self.refresh_policy.refresh_after)?;
-        let retired = state.active.replace(Arc::new(KeyGeneration { verifier, expires_at }));
+        let retired = state.active.replace(Arc::new(KeyGeneration {
+            verifier,
+            expires_at,
+        }));
         state.revoked = false;
         state.flight = None;
         state.next_attempt_at = next_attempt_at;
@@ -232,7 +247,11 @@ impl ManagedJwtResourceVerifier {
     /// candidates. Automatic renewal cannot reverse revocation. Returns true
     /// only when this call changes an enabled owner to revoked.
     pub fn revoke_all(&self) -> Result<bool, JwksRefreshError> {
-        let mut state = self.shared.state.write().map_err(|_| JwksRefreshError::StateUnavailable)?;
+        let mut state = self
+            .shared
+            .state
+            .write()
+            .map_err(|_| JwksRefreshError::StateUnavailable)?;
         let changed = !state.revoked;
         state.revoked = true;
         state.flight = None;
@@ -257,8 +276,15 @@ impl ManagedJwtResourceVerifier {
     }
 
     fn fresh_generation(&self) -> Result<Arc<KeyGeneration>, JwtResourceAuthError> {
-        let state = self.shared.state.read().map_err(|_| JwtResourceAuthError::KeysUnavailable)?;
-        let generation = state.active.as_ref().ok_or(JwtResourceAuthError::KeysUnavailable)?;
+        let state = self
+            .shared
+            .state
+            .read()
+            .map_err(|_| JwtResourceAuthError::KeysUnavailable)?;
+        let generation = state
+            .active
+            .as_ref()
+            .ok_or(JwtResourceAuthError::KeysUnavailable)?;
         if state.revoked || (self.shared.clock)() >= generation.expires_at {
             return Err(JwtResourceAuthError::KeysUnavailable);
         }
@@ -271,8 +297,15 @@ impl ManagedJwtResourceVerifier {
         generation: &Arc<KeyGeneration>,
         authenticated: AuthContext,
     ) -> Result<AuthContext, JwtResourceAuthError> {
-        let state = self.shared.state.read().map_err(|_| JwtResourceAuthError::KeysUnavailable)?;
-        let active = state.active.as_ref().ok_or(JwtResourceAuthError::KeysUnavailable)?;
+        let state = self
+            .shared
+            .state
+            .read()
+            .map_err(|_| JwtResourceAuthError::KeysUnavailable)?;
+        let active = state
+            .active
+            .as_ref()
+            .ok_or(JwtResourceAuthError::KeysUnavailable)?;
         if state.revoked || (self.shared.clock)() >= active.expires_at {
             return Err(JwtResourceAuthError::KeysUnavailable);
         }
@@ -318,9 +351,12 @@ impl ManagedJwtResourceVerifier {
             }
             match result {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(result) => Poll::Ready(result.map_err(|_| JwksRefreshError::FetchFailed)),
+                Poll::Ready(result) => {
+                    Poll::Ready(result.map_err(|_| JwksRefreshError::FetchFailed))
+                }
             }
-        }).await?;
+        })
+        .await?;
         let verifier = self.admit_keys(&bytes)?;
         self.publish(ctx, &lease, verifier)?;
         Ok(JwksRefreshOutcome::Updated)
@@ -328,13 +364,21 @@ impl ManagedJwtResourceVerifier {
 
     fn begin_refresh(&self, ctx: &McpContext) -> Result<BeginRefresh, JwksRefreshError> {
         refresh_checkpoint(ctx)?;
-        let mut state = self.shared.state.write().map_err(|_| JwksRefreshError::StateUnavailable)?;
+        let mut state = self
+            .shared
+            .state
+            .write()
+            .map_err(|_| JwksRefreshError::StateUnavailable)?;
         refresh_checkpoint(ctx)?;
         if state.revoked {
             return Err(JwksRefreshError::Revoked);
         }
         let now = (self.shared.clock)();
-        if state.flight.as_ref().is_some_and(|flight| now < flight.deadline) {
+        if state
+            .flight
+            .as_ref()
+            .is_some_and(|flight| now < flight.deadline)
+        {
             return Ok(BeginRefresh::Skip(JwksRefreshOutcome::InProgress));
         }
         if now < state.next_attempt_at {
@@ -349,7 +393,10 @@ impl ManagedJwtResourceVerifier {
         });
         state.next_attempt_at = checked_deadline(now, self.refresh_policy.retry_after)?;
         state.flight = Some(Arc::clone(&ticket));
-        Ok(BeginRefresh::Run(RefreshLease { shared: Arc::clone(&self.shared), ticket }))
+        Ok(BeginRefresh::Run(RefreshLease {
+            shared: Arc::clone(&self.shared),
+            ticket,
+        }))
     }
 
     fn publish(
@@ -358,7 +405,11 @@ impl ManagedJwtResourceVerifier {
         lease: &RefreshLease,
         verifier: JwtResourceVerifier,
     ) -> Result<(), JwksRefreshError> {
-        let mut state = self.shared.state.write().map_err(|_| JwksRefreshError::StateUnavailable)?;
+        let mut state = self
+            .shared
+            .state
+            .write()
+            .map_err(|_| JwksRefreshError::StateUnavailable)?;
         lease.check_state(ctx, &state)?;
         let retired = state.active.replace(Arc::new(KeyGeneration {
             verifier,
@@ -373,12 +424,20 @@ impl ManagedJwtResourceVerifier {
 }
 
 impl TokenVerifier for ManagedJwtResourceVerifier {
-    fn verify(&self, ctx: &McpContext, _request: AuthRequest<'_>, token: &AccessToken) -> McpResult<AuthContext> {
-        self.verify_access_token(ctx, token).map_err(|error| match error {
-            JwtResourceAuthError::Cancelled => McpError::request_cancelled(),
-            JwtResourceAuthError::TimedOut => McpError::new(McpErrorCode::RequestCancelled, "Request timeout exceeded"),
-            _ => McpError::new(McpErrorCode::ResourceForbidden, "Invalid access token"),
-        })
+    fn verify(
+        &self,
+        ctx: &McpContext,
+        _request: AuthRequest<'_>,
+        token: &AccessToken,
+    ) -> McpResult<AuthContext> {
+        self.verify_access_token(ctx, token)
+            .map_err(|error| match error {
+                JwtResourceAuthError::Cancelled => McpError::request_cancelled(),
+                JwtResourceAuthError::TimedOut => {
+                    McpError::new(McpErrorCode::RequestCancelled, "Request timeout exceeded")
+                }
+                _ => McpError::new(McpErrorCode::ResourceForbidden, "Invalid access token"),
+            })
     }
 }
 
@@ -395,7 +454,11 @@ struct RefreshLease {
 
 impl RefreshLease {
     fn check(&self, ctx: &McpContext) -> Result<(), JwksRefreshError> {
-        let state = self.shared.state.read().map_err(|_| JwksRefreshError::StateUnavailable)?;
+        let state = self
+            .shared
+            .state
+            .read()
+            .map_err(|_| JwksRefreshError::StateUnavailable)?;
         self.check_state(ctx, &state)
     }
 
@@ -404,7 +467,11 @@ impl RefreshLease {
         if state.revoked {
             return Err(JwksRefreshError::Revoked);
         }
-        if !state.flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &self.ticket)) {
+        if !state
+            .flight
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &self.ticket))
+        {
             return Err(JwksRefreshError::Superseded);
         }
         if (self.shared.clock)() >= self.ticket.deadline {
@@ -417,7 +484,11 @@ impl RefreshLease {
 impl Drop for RefreshLease {
     fn drop(&mut self) {
         if let Ok(mut state) = self.shared.state.write() {
-            if state.flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &self.ticket)) {
+            if state
+                .flight
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &self.ticket))
+            {
                 state.flight = None;
             }
         }
@@ -425,12 +496,17 @@ impl Drop for RefreshLease {
 }
 
 fn checked_deadline(now: Instant, duration: Duration) -> Result<Instant, JwksRefreshError> {
-    now.checked_add(duration).ok_or(JwksRefreshError::InvalidPolicy)
+    now.checked_add(duration)
+        .ok_or(JwksRefreshError::InvalidPolicy)
 }
 
 fn auth_checkpoint(ctx: &McpContext) -> Result<(), JwtResourceAuthError> {
     if ctx.checkpoint().is_err() {
-        return Err(if ctx.deadline_expired() { JwtResourceAuthError::TimedOut } else { JwtResourceAuthError::Cancelled });
+        return Err(if ctx.deadline_expired() {
+            JwtResourceAuthError::TimedOut
+        } else {
+            JwtResourceAuthError::Cancelled
+        });
     }
     if ctx.deadline_expired() {
         return Err(JwtResourceAuthError::TimedOut);
@@ -448,9 +524,9 @@ fn refresh_checkpoint(ctx: &McpContext) -> Result<(), JwksRefreshError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Waker};
-    use serde_json::json;
 
     // Public, non-secret RSA fixture also used by the base verifier's tests.
     const MODULUS: &str = "t8MS7wd0l_XyiywWPK11xDRyt3e_A38aRu1KtavUW7bzh7Npv4lOKdMah3g9-WRuBRl3c4UFrX6eMncHandPfM-SRzFskeZ2lZhd-7MpJJDUsgSgOnkWH7q7ZXqfRlZa46U26hL6Ou--50i_Ts6uoVM1OHz3ZpPFNcmf6a0m4g21HB_B4K4KDh3wTNL4PWzPBFbaSibcI3NbAHxvepNkxAebUUgmqJYZKTKV3RxeswmbpB7ytQ6y1aVL2JYKz3yH7nG__FrOFsTTDoOzN-mnLWs7oHndJVaTaW0TRyIPlrLPsFLESoF4QwgJZlor3MoaCzPiY-XZ1maXqjROCenFwQ";
@@ -458,7 +534,8 @@ mod tests {
     fn jwks() -> Vec<u8> {
         serde_json::to_vec(&json!({"keys":[{
             "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"one", "n":MODULUS, "e":"AQAB"
-        }]})).unwrap()
+        }]}))
+        .unwrap()
     }
 
     fn ctx() -> McpContext {
@@ -470,22 +547,33 @@ mod tests {
         let clock_elapsed = Arc::clone(&elapsed);
         let origin = Instant::now();
         let policy = JwtResourcePolicy::new(
-            "https://issuer.example", "https://tools.example/mcp",
-            Duration::from_secs(3600), Duration::ZERO,
-        ).unwrap();
+            "https://issuer.example",
+            "https://tools.example/mcp",
+            Duration::from_secs(3600),
+            Duration::ZERO,
+        )
+        .unwrap();
         let refresh = JwksRefreshPolicy::new(
-            Duration::from_secs(10), Duration::from_secs(20),
-            Duration::from_secs(2), Duration::from_secs(3),
-        ).unwrap();
-        let verifier = ManagedJwtResourceVerifier::with_clock(policy, refresh, Arc::new(move || {
-            origin + Duration::from_secs(clock_elapsed.load(Ordering::SeqCst))
-        }));
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let verifier = ManagedJwtResourceVerifier::with_clock(
+            policy,
+            refresh,
+            Arc::new(move || origin + Duration::from_secs(clock_elapsed.load(Ordering::SeqCst))),
+        );
         (verifier, elapsed)
     }
 
     fn ready<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
-        match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
             Poll::Ready(value) => value,
             Poll::Pending => panic!("test future unexpectedly blocked"),
         }
@@ -505,24 +593,43 @@ mod tests {
         let generation = verifier.fresh_generation().unwrap();
         let short = generation.expires_at - Duration::from_secs(5);
         let facts = AuthContext::with_subject("subject").with_verification_valid_until(short);
-        let authenticated = verifier.finish_authentication(&ctx(), &generation, facts).unwrap();
+        let authenticated = verifier
+            .finish_authentication(&ctx(), &generation, facts)
+            .unwrap();
         assert_eq!(authenticated.verification_valid_until(), Some(short));
-        let authenticated = verifier.finish_authentication(&ctx(), &generation, AuthContext::with_subject("subject")).unwrap();
-        assert_eq!(authenticated.verification_valid_until(), Some(generation.expires_at));
+        let authenticated = verifier
+            .finish_authentication(&ctx(), &generation, AuthContext::with_subject("subject"))
+            .unwrap();
+        assert_eq!(
+            authenticated.verification_valid_until(),
+            Some(generation.expires_at)
+        );
     }
 
     #[test]
     fn refresh_installs_bounded_keys_and_clones_share_the_generation() {
         let (verifier, elapsed) = fixture();
         assert!(verifier.fresh_generation().is_err());
-        assert_eq!(ready(verifier.refresh_with(&ctx(), || async { Ok(jwks()) })), Ok(JwksRefreshOutcome::Updated));
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async { Ok(jwks()) })),
+            Ok(JwksRefreshOutcome::Updated)
+        );
         let generation = verifier.fresh_generation().unwrap();
-        assert!(Arc::ptr_eq(&generation, &verifier.clone().fresh_generation().unwrap()));
-        assert_eq!(ready(verifier.refresh_with(&ctx(), || async { panic!("not due") })), Ok(JwksRefreshOutcome::NotDue));
+        assert!(Arc::ptr_eq(
+            &generation,
+            &verifier.clone().fresh_generation().unwrap()
+        ));
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async { panic!("not due") })),
+            Ok(JwksRefreshOutcome::NotDue)
+        );
         elapsed.store(19, Ordering::SeqCst);
         assert!(verifier.fresh_generation().is_ok());
         elapsed.store(20, Ordering::SeqCst);
-        assert!(matches!(verifier.fresh_generation(), Err(JwtResourceAuthError::KeysUnavailable)));
+        assert!(matches!(
+            verifier.fresh_generation(),
+            Err(JwtResourceAuthError::KeysUnavailable)
+        ));
     }
 
     #[test]
@@ -531,12 +638,29 @@ mod tests {
         verifier.install_jwks(&jwks()).unwrap();
         let original = verifier.fresh_generation().unwrap();
         elapsed.store(10, Ordering::SeqCst);
-        assert_eq!(ready(verifier.refresh_with(&ctx(), || async { Err(McpError::internal_error("private peer error")) })), Err(JwksRefreshError::FetchFailed));
-        assert!(Arc::ptr_eq(&original, &verifier.fresh_generation().unwrap()));
-        assert_eq!(ready(verifier.refresh_with(&ctx(), || async { panic!("backoff") })), Ok(JwksRefreshOutcome::NotDue));
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async {
+                Err(McpError::internal_error("private peer error"))
+            })),
+            Err(JwksRefreshError::FetchFailed)
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &verifier.fresh_generation().unwrap()
+        ));
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async { panic!("backoff") })),
+            Ok(JwksRefreshOutcome::NotDue)
+        );
         elapsed.store(12, Ordering::SeqCst);
-        assert_eq!(ready(verifier.refresh_with(&ctx(), || async { Ok(b"{\"keys\":[]}".to_vec()) })), Err(JwksRefreshError::InvalidKeys));
-        assert!(Arc::ptr_eq(&original, &verifier.fresh_generation().unwrap()));
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async { Ok(b"{\"keys\":[]}".to_vec()) })),
+            Err(JwksRefreshError::InvalidKeys)
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &verifier.fresh_generation().unwrap()
+        ));
         elapsed.store(20, Ordering::SeqCst);
         assert!(verifier.fresh_generation().is_err());
     }
@@ -547,11 +671,17 @@ mod tests {
         verifier.install_jwks(&jwks()).unwrap();
         elapsed.store(20, Ordering::SeqCst);
         assert!(verifier.fresh_generation().is_err());
-        assert_eq!(ready(verifier.refresh_with(&ctx(), || async { Ok(jwks()) })), Ok(JwksRefreshOutcome::Updated));
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async { Ok(jwks()) })),
+            Ok(JwksRefreshOutcome::Updated)
+        );
         assert!(verifier.fresh_generation().is_ok());
         assert!(verifier.revoke_all().unwrap());
         assert!(!verifier.revoke_all().unwrap());
-        assert_eq!(ready(verifier.refresh_with(&ctx(), || async { panic!("revoked") })), Err(JwksRefreshError::Revoked));
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async { panic!("revoked") })),
+            Err(JwksRefreshError::Revoked)
+        );
         assert!(verifier.install_jwks(b"{}").is_err());
         assert!(verifier.fresh_generation().is_err());
         verifier.install_jwks(&jwks()).unwrap();
@@ -564,8 +694,19 @@ mod tests {
             let (verifier, _) = fixture();
             let attempt = lease(&verifier);
             let candidate = verifier.admit_keys(&jwks()).unwrap();
-            if revoke { verifier.revoke_all().unwrap(); } else { verifier.install_jwks(&jwks()).unwrap(); }
-            assert_eq!(verifier.publish(&ctx(), &attempt, candidate), Err(if revoke { JwksRefreshError::Revoked } else { JwksRefreshError::Superseded }));
+            if revoke {
+                verifier.revoke_all().unwrap();
+            } else {
+                verifier.install_jwks(&jwks()).unwrap();
+            }
+            assert_eq!(
+                verifier.publish(&ctx(), &attempt, candidate),
+                Err(if revoke {
+                    JwksRefreshError::Revoked
+                } else {
+                    JwksRefreshError::Superseded
+                })
+            );
             assert_eq!(verifier.fresh_generation().is_ok(), !revoke);
         }
     }
@@ -574,14 +715,19 @@ mod tests {
     fn single_flight_expires_and_old_drop_cannot_release_its_successor() {
         let (verifier, elapsed) = fixture();
         let old = lease(&verifier);
-        assert_eq!(ready(verifier.refresh_with(&ctx(), || async { panic!("duplicate fetch") })), Ok(JwksRefreshOutcome::InProgress));
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async { panic!("duplicate fetch") })),
+            Ok(JwksRefreshOutcome::InProgress)
+        );
         elapsed.store(3, Ordering::SeqCst);
         assert_eq!(old.check(&ctx()), Err(JwksRefreshError::TimedOut));
         let next = lease(&verifier);
         assert_eq!(old.check(&ctx()), Err(JwksRefreshError::Superseded));
         drop(old);
         assert!(next.check(&ctx()).is_ok());
-        verifier.publish(&ctx(), &next, verifier.admit_keys(&jwks()).unwrap()).unwrap();
+        verifier
+            .publish(&ctx(), &next, verifier.admit_keys(&jwks()).unwrap())
+            .unwrap();
         assert!(verifier.fresh_generation().is_ok());
     }
 
@@ -589,22 +735,37 @@ mod tests {
     fn abandoned_future_releases_its_slot_but_not_failure_backoff() {
         let (verifier, elapsed) = fixture();
         let context = ctx();
-        let mut future = Box::pin(verifier.refresh_with(&context, std::future::pending::<McpResult<Vec<u8>>>));
-        assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        let mut future =
+            Box::pin(verifier.refresh_with(&context, std::future::pending::<McpResult<Vec<u8>>>));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         drop(future);
         assert!(verifier.shared.state.read().unwrap().flight.is_none());
-        assert_eq!(ready(verifier.refresh_with(&context, || async { panic!("backoff") })), Ok(JwksRefreshOutcome::NotDue));
+        assert_eq!(
+            ready(verifier.refresh_with(&context, || async { panic!("backoff") })),
+            Ok(JwksRefreshOutcome::NotDue)
+        );
         elapsed.store(2, Ordering::SeqCst);
-        assert_eq!(ready(verifier.refresh_with(&context, || async { Ok(jwks()) })), Ok(JwksRefreshOutcome::Updated));
+        assert_eq!(
+            ready(verifier.refresh_with(&context, || async { Ok(jwks()) })),
+            Ok(JwksRefreshOutcome::Updated)
+        );
     }
 
     #[test]
     fn fetch_latency_is_not_added_to_key_freshness() {
         let (verifier, elapsed) = fixture();
-        assert_eq!(ready(verifier.refresh_with(&ctx(), || async {
-            elapsed.store(2, Ordering::SeqCst);
-            Ok(jwks())
-        })), Ok(JwksRefreshOutcome::Updated));
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async {
+                elapsed.store(2, Ordering::SeqCst);
+                Ok(jwks())
+            })),
+            Ok(JwksRefreshOutcome::Updated)
+        );
         elapsed.store(20, Ordering::SeqCst);
         assert!(verifier.fresh_generation().is_err());
     }
@@ -614,10 +775,21 @@ mod tests {
         for revoke in [false, true] {
             let (verifier, elapsed) = fixture();
             let result = ready(verifier.refresh_with(&ctx(), || async {
-                if revoke { verifier.revoke_all().unwrap(); } else { elapsed.store(3, Ordering::SeqCst); }
+                if revoke {
+                    verifier.revoke_all().unwrap();
+                } else {
+                    elapsed.store(3, Ordering::SeqCst);
+                }
                 Ok(jwks())
             }));
-            assert_eq!(result, Err(if revoke { JwksRefreshError::Revoked } else { JwksRefreshError::TimedOut }));
+            assert_eq!(
+                result,
+                Err(if revoke {
+                    JwksRefreshError::Revoked
+                } else {
+                    JwksRefreshError::TimedOut
+                })
+            );
             assert!(verifier.fresh_generation().is_err());
         }
     }
@@ -627,23 +799,52 @@ mod tests {
         let (verifier, elapsed) = fixture();
         verifier.install_jwks(&jwks()).unwrap();
         let candidate = verifier.fresh_generation().unwrap();
-        assert!(verifier.finish_authentication(&ctx(), &candidate, AuthContext::with_subject("alice")).is_ok());
+        assert!(
+            verifier
+                .finish_authentication(&ctx(), &candidate, AuthContext::with_subject("alice"))
+                .is_ok()
+        );
         verifier.install_jwks(&jwks()).unwrap();
-        assert!(matches!(verifier.finish_authentication(&ctx(), &candidate, AuthContext::with_subject("alice")), Err(JwtResourceAuthError::KeysChanged)));
+        assert!(matches!(
+            verifier.finish_authentication(&ctx(), &candidate, AuthContext::with_subject("alice")),
+            Err(JwtResourceAuthError::KeysChanged)
+        ));
         let current = verifier.fresh_generation().unwrap();
         elapsed.store(20, Ordering::SeqCst);
-        assert!(matches!(verifier.finish_authentication(&ctx(), &current, AuthContext::with_subject("alice")), Err(JwtResourceAuthError::KeysUnavailable)));
+        assert!(matches!(
+            verifier.finish_authentication(&ctx(), &current, AuthContext::with_subject("alice")),
+            Err(JwtResourceAuthError::KeysUnavailable)
+        ));
     }
 
     #[test]
     fn invalid_policy_or_oversized_keys_cannot_change_trust() {
-        for (refresh, age, retry, timeout) in [(0,20,2,3), (20,20,2,3), (10,86_401,2,3), (10,20,0,3), (10,20,11,3), (10,20,2,0), (10,20,2,11)] {
-            assert!(JwksRefreshPolicy::new(Duration::from_secs(refresh), Duration::from_secs(age), Duration::from_secs(retry), Duration::from_secs(timeout)).is_err());
+        for (refresh, age, retry, timeout) in [
+            (0, 20, 2, 3),
+            (20, 20, 2, 3),
+            (10, 86_401, 2, 3),
+            (10, 20, 0, 3),
+            (10, 20, 11, 3),
+            (10, 20, 2, 0),
+            (10, 20, 2, 11),
+        ] {
+            assert!(
+                JwksRefreshPolicy::new(
+                    Duration::from_secs(refresh),
+                    Duration::from_secs(age),
+                    Duration::from_secs(retry),
+                    Duration::from_secs(timeout)
+                )
+                .is_err()
+            );
         }
         let (verifier, _) = fixture();
         verifier.install_jwks(&jwks()).unwrap();
         let current = verifier.fresh_generation().unwrap();
-        assert_eq!(verifier.install_jwks(&vec![b' '; MAX_REFRESH_JWKS_BYTES + 1]), Err(JwksRefreshError::InvalidKeys));
+        assert_eq!(
+            verifier.install_jwks(&vec![b' '; MAX_REFRESH_JWKS_BYTES + 1]),
+            Err(JwksRefreshError::InvalidKeys)
+        );
         assert!(Arc::ptr_eq(&current, &verifier.fresh_generation().unwrap()));
         assert!(!format!("{verifier:?}").contains(MODULUS));
     }

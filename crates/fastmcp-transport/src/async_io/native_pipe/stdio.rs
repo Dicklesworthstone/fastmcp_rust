@@ -34,11 +34,26 @@ pub(super) fn caller_capability_ceiling(cx: &Cx) -> io::Result<CapMask> {
     if let Some(active) = Cx::current() {
         let capabilities = active.capabilities();
         for (allowed, without_effect) in [
-            (capabilities.spawn, CapSet::<false, true, true, true, true>::MASK),
-            (capabilities.time, CapSet::<true, false, true, true, true>::MASK),
-            (capabilities.entropy, CapSet::<true, true, false, true, true>::MASK),
-            (capabilities.io, CapSet::<true, true, true, false, true>::MASK),
-            (capabilities.remote, CapSet::<true, true, true, true, false>::MASK),
+            (
+                capabilities.spawn,
+                CapSet::<false, true, true, true, true>::MASK,
+            ),
+            (
+                capabilities.time,
+                CapSet::<true, false, true, true, true>::MASK,
+            ),
+            (
+                capabilities.entropy,
+                CapSet::<true, true, false, true, true>::MASK,
+            ),
+            (
+                capabilities.io,
+                CapSet::<true, true, true, false, true>::MASK,
+            ),
+            (
+                capabilities.remote,
+                CapSet::<true, true, true, true, false>::MASK,
+            ),
         ] {
             if !allowed {
                 ceiling = ceiling.intersect(without_effect);
@@ -532,11 +547,26 @@ mod tests {
         [
             (CapMask::all(), [true; 5]),
             (CapMask::none(), [false; 5]),
-            (CapSet::<false, true, true, true, true>::MASK, [false, true, true, true, true]),
-            (CapSet::<true, false, true, true, true>::MASK, [true, false, true, true, true]),
-            (CapSet::<true, true, false, true, true>::MASK, [true, true, false, true, true]),
-            (CapSet::<true, true, true, false, true>::MASK, [true, true, true, false, true]),
-            (CapSet::<true, true, true, true, false>::MASK, [true, true, true, true, false]),
+            (
+                CapSet::<false, true, true, true, true>::MASK,
+                [false, true, true, true, true],
+            ),
+            (
+                CapSet::<true, false, true, true, true>::MASK,
+                [true, false, true, true, true],
+            ),
+            (
+                CapSet::<true, true, false, true, true>::MASK,
+                [true, true, false, true, true],
+            ),
+            (
+                CapSet::<true, true, true, false, true>::MASK,
+                [true, true, true, false, true],
+            ),
+            (
+                CapSet::<true, true, true, true, false>::MASK,
+                [true, true, true, true, false],
+            ),
         ]
     }
 
@@ -610,10 +640,20 @@ mod tests {
         let no_time = CapSet::<true, false, true, true, true>::MASK;
         for held_restriction in [false, true] {
             for writable in [false, true] {
-                let caller = scoped(&cx, if held_restriction { no_time } else { CapMask::all() }, || {
-                    Cx::current().unwrap()
-                });
-                let host_mask = if held_restriction { CapMask::all() } else { no_time };
+                let caller = scoped(
+                    &cx,
+                    if held_restriction {
+                        no_time
+                    } else {
+                        CapMask::all()
+                    },
+                    || Cx::current().unwrap(),
+                );
+                let host_mask = if held_restriction {
+                    CapMask::all()
+                } else {
+                    no_time
+                };
                 let (input, output) = io::pipe().unwrap();
                 let input_flags = fcntl_getfl(&input).unwrap();
                 let output_flags = fcntl_getfl(&output).unwrap();
@@ -621,11 +661,28 @@ mod tests {
                 let calls = std::sync::atomic::AtomicUsize::new(0);
                 let error = scoped(&cx, host_mask, || {
                     if writable {
-                        claim(&caller, &CountedFd { source: &output, calls: &calls }, true, Arc::clone(&owner))
+                        claim(
+                            &caller,
+                            &CountedFd {
+                                source: &output,
+                                calls: &calls,
+                            },
+                            true,
+                            Arc::clone(&owner),
+                        )
                     } else {
-                        claim(&caller, &CountedFd { source: &input, calls: &calls }, false, Arc::clone(&owner))
+                        claim(
+                            &caller,
+                            &CountedFd {
+                                source: &input,
+                                calls: &calls,
+                            },
+                            false,
+                            Arc::clone(&owner),
+                        )
                     }
-                }).unwrap_err();
+                })
+                .unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 assert_eq!(owner.load(Ordering::Acquire), FREE);
@@ -651,21 +708,28 @@ mod tests {
         let cx = runtime.request_cx_with_budget(
             Budget::INFINITE.with_deadline(asupersync::Time::from_nanos(u64::MAX)),
         );
-        let host = Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(asupersync::Time::ZERO));
+        let host =
+            Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(asupersync::Time::ZERO));
         host.set_cancel_requested(true);
         let mask = CapSet::<false, true, false, true, false>::MASK;
         let (input, output) = io::pipe().unwrap();
         let original = fcntl_getfl(&input).unwrap();
         let owner = owner();
-        let mut reader = NativePipeReader(scoped(&host, mask, || {
-            claim(&cx, &input, false, Arc::clone(&owner))
-        }).unwrap());
+        let mut reader = NativePipeReader(
+            scoped(&host, mask, || {
+                claim(&cx, &input, false, Arc::clone(&owner))
+            })
+            .unwrap(),
+        );
         assert_eq!(effects(&reader.0.cx), [false, true, false, true, false]);
         assert_eq!(reader.0.cx.budget().deadline, cx.budget().deadline);
         assert!(reader.0.cx.checkpoint().is_ok());
         assert_eq!(rustix::io::write(&output, b"live").unwrap(), 4);
         let mut bytes = [0; 4];
-        assert!(matches!(scoped(&host, mask, || read(&mut reader, &mut bytes)), Poll::Ready(Ok(4))));
+        assert!(matches!(
+            scoped(&host, mask, || read(&mut reader, &mut bytes)),
+            Poll::Ready(Ok(4))
+        ));
         assert_eq!(&bytes, b"live");
         reader.close().unwrap();
         assert_eq!(fcntl_getfl(&input).unwrap(), original);
@@ -684,9 +748,12 @@ mod tests {
         let original = fcntl_getfl(&input).unwrap();
         let owner = owner();
         let only_io = CapSet::<false, false, false, true, false>::MASK;
-        let mut reader = NativePipeReader(scoped(&cx, only_io, || {
-            claim(&cx, &input, false, Arc::clone(&owner))
-        }).unwrap());
+        let mut reader = NativePipeReader(
+            scoped(&cx, only_io, || {
+                claim(&cx, &input, false, Arc::clone(&owner))
+            })
+            .unwrap(),
+        );
         assert_eq!(effects(&reader.0.cx), [false, false, false, true, false]);
         let mut bytes = [0; 4];
         assert!(read(&mut reader, &mut bytes).is_pending());

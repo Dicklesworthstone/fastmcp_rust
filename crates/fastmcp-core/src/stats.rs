@@ -579,7 +579,10 @@ impl OperatorSnapshot<OperatorStdioOutput> {
         output: OperatorStdioOutput,
     ) -> Self {
         let (readiness, reason) = if output.failed {
-            (OperatorReadiness::NotReady, Some(OperatorReason::OutputFailed))
+            (
+                OperatorReadiness::NotReady,
+                Some(OperatorReason::OutputFailed),
+            )
         } else {
             match lifecycle {
                 OperatorLifecycle::Starting => (

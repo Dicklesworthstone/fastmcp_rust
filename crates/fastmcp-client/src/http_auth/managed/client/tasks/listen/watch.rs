@@ -79,7 +79,12 @@ impl WatchRequest {
         // using its remainder as a wire limit rejects an exact-fitting payload.
         let result = client
             .connection
-            .get_task_final(cx, request_id, self.task_id.clone(), MAX_TASK_RESPONSE_BYTES)
+            .get_task_final(
+                cx,
+                request_id,
+                self.task_id.clone(),
+                MAX_TASK_RESPONSE_BYTES,
+            )
             .await
             .map_err(HttpClientError::Connection)?;
         // Count snapshot bytes too, not just stream notifications. No second
@@ -131,9 +136,7 @@ impl WatchRequest {
                         error,
                     ))
                 })?
-                .ok_or_else(|| {
-                    refusal("Managed task watch ended without a terminal result")
-                })?;
+                .ok_or_else(|| refusal("Managed task watch ended without a terminal result"))?;
             self.budget.admit(&event)?;
             if matches!(event, ModernHttpSubscriptionListenEvent::Cancelled { .. }) {
                 // The peer ended the observation stream, not the durable Task.
@@ -149,8 +152,7 @@ impl WatchRequest {
                     false
                 }
                 ModernHttpSubscriptionListenEvent::TaskNotification(notification)
-                    if acknowledged
-                        && notification.params.task.base().task_id == self.task_id =>
+                    if acknowledged && notification.params.task.base().task_id == self.task_id =>
                 {
                     false
                 }

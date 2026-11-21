@@ -211,7 +211,11 @@ impl ClientExtensionResultAdmission {
             return None;
         }
         let correlation = descriptor.stdio_correlation.as_ref()?;
-        let value = notification.params.as_ref()?.get("_meta")?.get(&correlation.metadata_key)?;
+        let value = notification
+            .params
+            .as_ref()?
+            .get("_meta")?
+            .get(&correlation.metadata_key)?;
         match value {
             serde_json::Value::String(value)
                 if value.len() <= fastmcp_protocol::MAX_JSONRPC_STRING_ID_ENCODED_BYTES => {}
@@ -403,7 +407,9 @@ impl ClientExtensionRuntime {
             && self
                 .descriptors
                 .method_descriptor(extension_id, method)
-                .is_some_and(|descriptor| descriptor.direction == ExtensionDirection::ClientToServer)
+                .is_some_and(|descriptor| {
+                    descriptor.direction == ExtensionDirection::ClientToServer
+                })
         {
             Ok(())
         } else {

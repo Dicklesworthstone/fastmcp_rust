@@ -8,9 +8,7 @@ use std::sync::Mutex;
 use std::task::Poll;
 
 use super::*;
-use fastmcp_rust::client::http_executor::{
-    ModernHttpExtensionEvent, ModernHttpExtensionExecution,
-};
+use fastmcp_rust::client::http_executor::{ModernHttpExtensionEvent, ModernHttpExtensionExecution};
 use fastmcp_rust::extensions::authoring::ExtensionHttpUpstream;
 use fastmcp_rust::{McpContext, Middleware, MiddlewareDecision};
 
@@ -122,8 +120,10 @@ fn limits() -> fastmcp_rust::client::sse::SseLimits {
 }
 
 async fn terminal(cx: &Cx, execution: &mut ModernHttpExtensionExecution) -> serde_json::Value {
-    let Some(ModernHttpExtensionEvent::Terminal(result)) =
-        execution.next_event(cx).await.expect("typed terminal result")
+    let Some(ModernHttpExtensionEvent::Terminal(result)) = execution
+        .next_event(cx)
+        .await
+        .expect("typed terminal result")
     else {
         panic!("fixture has one terminal result and no intermediate events");
     };
@@ -152,7 +152,12 @@ impl Middleware for UpstreamProbe {
         mut response: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
         if request.method == METHOD {
-            if request.params.as_ref().and_then(|params| params.get("value")) == Some(&json!(13)) {
+            if request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("value"))
+                == Some(&json!(13))
+            {
                 // A normal server middleware can expose a bad peer result after
                 // its typed handler. The gateway must independently validate it.
                 return Ok(json!({"value": "not-an-integer"}));
@@ -181,7 +186,10 @@ fn typed_http_proxy_validates_both_legs_and_rebuilds_identity() {
         assert!(
             builder()
                 .typed_http_proxy_request::<ScaleRequest, ScaleResponse>(
-                    "tools/list", "scale-params-v1", "scale-result-v1", upstream.clone(),
+                    "tools/list",
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
                 )
                 .is_err(),
             "an extension route cannot borrow a core method"
@@ -189,7 +197,10 @@ fn typed_http_proxy_validates_both_legs_and_rebuilds_identity() {
         assert!(
             builder()
                 .typed_http_proxy_request::<ScaleRequest, ScaleResponse>(
-                    METHOD, "different-params-v1", "scale-result-v1", upstream.clone(),
+                    METHOD,
+                    "different-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
                 )
                 .unwrap()
                 .build()
@@ -199,11 +210,16 @@ fn typed_http_proxy_validates_both_legs_and_rebuilds_identity() {
         assert!(
             builder()
                 .typed_http_proxy_request::<ScaleRequest, ScaleResponse>(
-                    METHOD, "scale-params-v1", "scale-result-v1", upstream.clone(),
+                    METHOD,
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
                 )
                 .unwrap()
                 .typed_request_notification::<ScaleResponse>(
-                    "com.example/changed", "changed-v1", "com.example/request-id",
+                    "com.example/changed",
+                    "changed-v1",
+                    "com.example/request-id",
                 )
                 .unwrap()
                 .build()
@@ -244,15 +260,18 @@ fn typed_http_proxy_validates_both_legs_and_rebuilds_identity() {
                 .await
                 .expect_err("a malformed upstream typed result cannot reach the downstream client");
             assert_eq!(
-                client.request_final_extension(&cx, &id, METHOD, json!({"value": 11}))
-                    .await.unwrap(),
+                client
+                    .request_final_extension(&cx, &id, METHOD, json!({"value": 11}))
+                    .await
+                    .unwrap(),
                 json!({"value": 33}),
                 "a rejected peer result does not poison the shared upstream"
             );
             let requests = observed.lock().unwrap();
             assert_eq!(requests.len(), 3);
             assert_ne!(
-                requests[0].id.as_ref(), Some(&downstream_id),
+                requests[0].id.as_ref(),
+                Some(&downstream_id),
                 "the independently allocated upstream ID does not reuse downstream custody"
             );
             assert_ne!(requests[0].id, requests[1].id);
@@ -273,7 +292,8 @@ fn typed_http_proxy_validates_both_legs_and_rebuilds_identity() {
     });
     assert_eq!(retained_calls.load(Ordering::SeqCst), 3);
     assert_eq!(
-        retained_declaration.load(Ordering::SeqCst), 0,
+        retained_declaration.load(Ordering::SeqCst),
+        0,
         "connecting a declaration never invokes its application callbacks"
     );
 }
@@ -286,47 +306,69 @@ fn typed_http_proxy_refuses_effective_settings_mismatch_before_upstream_dispatch
         .extension(registration(Arc::clone(&calls)))
         .unwrap();
     run_http_test(server, move |cx, endpoint| async move {
-        let upstream = connect_upstream(
-            &cx, endpoint, registration(Arc::new(AtomicUsize::new(0))),
-        ).await;
+        let upstream =
+            connect_upstream(&cx, endpoint, registration(Arc::new(AtomicUsize::new(0)))).await;
         let changed = ExtensionBuilder::new(
             EXTENSION,
             1,
             "typed-math-client-v1",
             "typed-math-server-v1",
-            ServerSettings { version: 1, multiplier: 5 },
+            ServerSettings {
+                version: 1,
+                multiplier: 5,
+            },
             |client: ClientSettings, server: ServerSettings| {
                 if client.version != server.version {
                     return Err(McpError::invalid_params("incompatible math version"));
                 }
-                Ok(Settings { multiplier: server.multiplier })
+                Ok(Settings {
+                    multiplier: server.multiplier,
+                })
             },
         )
         .unwrap()
         .typed_http_proxy_request::<ScaleRequest, ScaleResponse>(
-            METHOD, "scale-params-v1", "scale-result-v1", upstream.clone(),
+            METHOD,
+            "scale-params-v1",
+            "scale-result-v1",
+            upstream.clone(),
         )
         .unwrap()
         .build()
         .expect("settings values are negotiated independently of the compiled schema contract");
         let changed = modern::ServerBuilder::new("typed-settings-gateway", "1.0")
-            .extension(changed).unwrap();
+            .extension(changed)
+            .unwrap();
         with_http_server(&cx, changed, |endpoint| async {
             let mut client = connect_downstream(&cx, endpoint).await;
-            client.request_final_extension(
-                &cx, &ExtensionId::parse(EXTENSION).unwrap(), METHOD, json!({"value": 7}),
-            ).await.expect_err("3 and 5 are individually valid but not interchangeable settings");
+            client
+                .request_final_extension(
+                    &cx,
+                    &ExtensionId::parse(EXTENSION).unwrap(),
+                    METHOD,
+                    json!({"value": 7}),
+                )
+                .await
+                .expect_err("3 and 5 are individually valid but not interchangeable settings");
             assert_eq!(calls.load(Ordering::SeqCst), 0);
-        }).await;
+        })
+        .await;
         with_http_server(&cx, gateway(upstream), |endpoint| async {
             let mut client = connect_downstream(&cx, endpoint).await;
             assert_eq!(
-                client.request_final_extension(
-                    &cx, &ExtensionId::parse(EXTENSION).unwrap(), METHOD, json!({"value": 7}),
-                ).await.unwrap(),
+                client
+                    .request_final_extension(
+                        &cx,
+                        &ExtensionId::parse(EXTENSION).unwrap(),
+                        METHOD,
+                        json!({"value": 7}),
+                    )
+                    .await
+                    .unwrap(),
                 json!({"value": 21})
             );
-        }).await;
+        })
+        .await;
     });
     assert_eq!(retained.load(Ordering::SeqCst), 1);
 }
@@ -346,37 +388,46 @@ fn interrupted_request_keeps_siblings(drop_request: bool) {
     let retained = Arc::clone(&observations);
     let registration = builder()
         .typed_request(
-            METHOD, "scale-params-v1", "scale-result-v1",
+            METHOD,
+            "scale-params-v1",
+            "scale-result-v1",
             CancellableScaleHandler(Arc::clone(&observations)),
         )
-        .unwrap().build().unwrap();
+        .unwrap()
+        .build()
+        .unwrap();
     let server = modern::ServerBuilder::new("typed-cancellable-producer", "1.0")
-        .extension(registration).unwrap();
+        .extension(registration)
+        .unwrap();
     run_http_test(server, move |cx, endpoint| async move {
         let upstream = connect_upstream(
-            &cx, endpoint, super::registration(Arc::new(AtomicUsize::new(0))),
-        ).await;
+            &cx,
+            endpoint,
+            super::registration(Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
         with_http_server(&cx, gateway(upstream), |endpoint| async {
             let client = connect_downstream(&cx, endpoint).await;
             let id = ExtensionId::parse(EXTENSION).unwrap();
-            let mut held = client.execute_final_extension(
-                &cx, &id, METHOD, json!({"value": 7}), limits(),
-            ).unwrap();
+            let mut held = client
+                .execute_final_extension(&cx, &id, METHOD, json!({"value": 7}), limits())
+                .unwrap();
             let control = held.control();
             {
                 let mut receiving = Box::pin(held.next_event(&cx));
                 while observations.started.load(Ordering::SeqCst) == 0 {
                     assert!(
                         std::future::poll_fn(|task| Poll::Ready(receiving.as_mut().poll(task)))
-                            .await.is_pending(),
+                            .await
+                            .is_pending(),
                         "the first upstream handler starts and remains parked"
                     );
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
             }
-            let mut sibling = client.execute_final_extension(
-                &cx, &id, METHOD, json!({"value": 11}), limits(),
-            ).unwrap();
+            let mut sibling = client
+                .execute_final_extension(&cx, &id, METHOD, json!({"value": 11}), limits())
+                .unwrap();
             assert_eq!(terminal(&cx, &mut sibling).await, json!({"value": 33}));
             drop(sibling);
             assert_eq!(observations.abandoned.load(Ordering::SeqCst), 0);
@@ -384,21 +435,26 @@ fn interrupted_request_keeps_siblings(drop_request: bool) {
                 drop(held);
             } else {
                 assert!(control.cancel());
-                held.next_event(&cx).await.expect_err("owned cancellation is terminal");
+                held.next_event(&cx)
+                    .await
+                    .expect_err("owned cancellation is terminal");
                 drop(held);
             }
             asupersync::time::timeout(cx.now(), Duration::from_secs(2), async {
                 while observations.abandoned.load(Ordering::SeqCst) == 0 {
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
-            }).await.expect("both HTTP legs release the abandoned handler before listener shutdown");
+            })
+            .await
+            .expect("both HTTP legs release the abandoned handler before listener shutdown");
             assert!(cx.checkpoint().is_ok());
-            let mut following = client.execute_final_extension(
-                &cx, &id, METHOD, json!({"value": 17}), limits(),
-            ).unwrap();
+            let mut following = client
+                .execute_final_extension(&cx, &id, METHOD, json!({"value": 17}), limits())
+                .unwrap();
             assert_eq!(terminal(&cx, &mut following).await, json!({"value": 51}));
             drop(following);
-        }).await;
+        })
+        .await;
     });
     assert_eq!(retained.started.load(Ordering::SeqCst), 3);
     assert_eq!(retained.completed.load(Ordering::SeqCst), 2);
@@ -413,7 +469,8 @@ struct ForgedRequest {
 
 impl Serialize for ForgedRequest {
     fn serialize<S: fastmcp_rust::serde::Serializer>(
-        &self, serializer: S,
+        &self,
+        serializer: S,
     ) -> Result<S::Ok, S::Error> {
         use fastmcp_rust::serde::ser::SerializeMap;
         let mut object = serializer.serialize_map(Some(2))?;
@@ -426,13 +483,19 @@ impl Serialize for ForgedRequest {
 fn forged_registration(calls: Arc<AtomicUsize>) -> ExtensionRegistration {
     builder()
         .typed_request_sync(
-            METHOD, "forged-params-v1", "scale-result-v1",
+            METHOD,
+            "forged-params-v1",
+            "scale-result-v1",
             move |_context: ExtensionContext<'_, Settings>, request: ForgedRequest| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(ScaleResponse { value: request.value })
+                Ok(ScaleResponse {
+                    value: request.value,
+                })
             },
         )
-        .unwrap().build().unwrap()
+        .unwrap()
+        .build()
+        .unwrap()
 }
 
 #[test]
@@ -440,24 +503,41 @@ fn typed_http_proxy_rejects_metadata_synthesized_by_typed_request_serialization(
     let calls = Arc::new(AtomicUsize::new(0));
     let retained = Arc::clone(&calls);
     let server = modern::ServerBuilder::new("typed-forged-producer", "1.0")
-        .extension(forged_registration(calls)).unwrap();
+        .extension(forged_registration(calls))
+        .unwrap();
     run_http_test(server, move |cx, endpoint| async move {
         let upstream = connect_upstream(
-            &cx, endpoint, forged_registration(Arc::new(AtomicUsize::new(0))),
-        ).await;
+            &cx,
+            endpoint,
+            forged_registration(Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
         let registration = builder()
             .typed_http_proxy_request::<ForgedRequest, ScaleResponse>(
-                METHOD, "forged-params-v1", "scale-result-v1", upstream,
+                METHOD,
+                "forged-params-v1",
+                "scale-result-v1",
+                upstream,
             )
-            .unwrap().build().unwrap();
+            .unwrap()
+            .build()
+            .unwrap();
         let gateway = modern::ServerBuilder::new("typed-forged-gateway", "1.0")
-            .extension(registration).unwrap();
+            .extension(registration)
+            .unwrap();
         with_http_server(&cx, gateway, |endpoint| async {
             let mut client = connect_downstream(&cx, endpoint).await;
-            client.request_final_extension(
-                &cx, &ExtensionId::parse(EXTENSION).unwrap(), METHOD, json!({"value": 7}),
-            ).await.expect_err("custom serialization cannot recreate stripped protocol authority");
-        }).await;
+            client
+                .request_final_extension(
+                    &cx,
+                    &ExtensionId::parse(EXTENSION).unwrap(),
+                    METHOD,
+                    json!({"value": 7}),
+                )
+                .await
+                .expect_err("custom serialization cannot recreate stripped protocol authority");
+        })
+        .await;
     });
     assert_eq!(retained.load(Ordering::SeqCst), 0);
 }
@@ -471,35 +551,58 @@ struct Echo {
 fn echo_registration() -> ExtensionRegistration {
     builder()
         .typed_request_sync(
-            METHOD, "echo-params-v1", "echo-result-v1",
+            METHOD,
+            "echo-params-v1",
+            "echo-result-v1",
             |_context: ExtensionContext<'_, Settings>, request: Echo| Ok(request),
         )
-        .unwrap().build().unwrap()
+        .unwrap()
+        .build()
+        .unwrap()
 }
 
 #[test]
 fn typed_http_proxy_preserves_large_typed_results() {
     let server = modern::ServerBuilder::new("typed-large-producer", "1.0")
-        .extension(echo_registration()).unwrap();
+        .extension(echo_registration())
+        .unwrap();
     run_http_test(server, |cx, endpoint| async move {
         let upstream = connect_upstream(&cx, endpoint, echo_registration()).await;
         let registration = builder()
             .typed_http_proxy_request::<Echo, Echo>(
-                METHOD, "echo-params-v1", "echo-result-v1", upstream,
+                METHOD,
+                "echo-params-v1",
+                "echo-result-v1",
+                upstream,
             )
-            .unwrap().build().unwrap();
+            .unwrap()
+            .build()
+            .unwrap();
         let gateway = modern::ServerBuilder::new("typed-large-gateway", "1.0")
-            .extension(registration).unwrap();
+            .extension(registration)
+            .unwrap();
         with_http_server(&cx, gateway, |endpoint| async {
             let mut client = connect_downstream(&cx, endpoint).await;
             let text = "x".repeat(128 * 1024);
-            let result = client.request_final_extension(
-                &cx, &ExtensionId::parse(EXTENSION).unwrap(), METHOD,
-                json!({"text": text}),
-            ).await.unwrap();
+            let result = client
+                .request_final_extension(
+                    &cx,
+                    &ExtensionId::parse(EXTENSION).unwrap(),
+                    METHOD,
+                    json!({"text": text}),
+                )
+                .await
+                .unwrap();
             assert_eq!(result["text"].as_str().unwrap().len(), 128 * 1024);
-            assert!(result["text"].as_str().unwrap().bytes().all(|byte| byte == b'x'));
-        }).await;
+            assert!(
+                result["text"]
+                    .as_str()
+                    .unwrap()
+                    .bytes()
+                    .all(|byte| byte == b'x')
+            );
+        })
+        .await;
     });
 }
 
@@ -509,14 +612,19 @@ fn typed_http_proxy_connection_requires_upstream_activation_for_requests_and_not
     run_http_test(server, |cx, endpoint| async move {
         modern::ClientBuilder::new()
             .connect_extension_http_upstream_with_cx(
-                &cx, endpoint.clone(), registration(Arc::new(AtomicUsize::new(0))),
+                &cx,
+                endpoint.clone(),
+                registration(Arc::new(AtomicUsize::new(0))),
                 &ClientSettings { version: 1 },
-            ).await.expect_err("remote discovery must independently activate the extension");
+            )
+            .await
+            .expect_err("remote discovery must independently activate the extension");
         let observations = Arc::new(NotificationObservations::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let error = modern::ClientBuilder::new()
             .connect_extension_http_upstream_with_cx(
-                &cx, endpoint,
+                &cx,
+                endpoint,
                 duplex_registration(Arc::clone(&calls), Arc::clone(&observations)),
                 &ClientSettings { version: 1 },
             )
@@ -576,17 +684,16 @@ fn notice_producer<Notice: Serialize + fastmcp_rust::schema::JsonSchemaType>(
     malformed: bool,
 ) -> ExtensionRegistration {
     builder()
-        .typed_request_notification::<Notice>(
-            PROXY_NOTICE,
-            "proxy-notice-v1",
-            PROXY_NOTICE_OWNER,
-        )
+        .typed_request_notification::<Notice>(PROXY_NOTICE, "proxy-notice-v1", PROXY_NOTICE_OWNER)
         .unwrap()
         .typed_request(
             METHOD,
             "scale-params-v1",
             "scale-result-v1",
-            ProxyNoticeProducer { observations, malformed },
+            ProxyNoticeProducer {
+                observations,
+                malformed,
+            },
         )
         .unwrap()
         .build()
@@ -602,11 +709,7 @@ where
         + 'static,
 {
     builder()
-        .typed_request_notification::<Notice>(
-            PROXY_NOTICE,
-            "proxy-notice-v1",
-            PROXY_NOTICE_OWNER,
-        )
+        .typed_request_notification::<Notice>(PROXY_NOTICE, "proxy-notice-v1", PROXY_NOTICE_OWNER)
         .unwrap()
         .typed_http_proxy_request_with_notifications::<ScaleRequest, ScaleResponse, Notice>(
             METHOD,
@@ -654,8 +757,10 @@ async fn notice_client(cx: &Cx, endpoint: CanonicalHttpUrl) -> modern::HttpClien
 }
 
 async fn http_notice(cx: &Cx, execution: &mut ModernHttpExtensionExecution, value: u32) {
-    let Some(ModernHttpExtensionEvent::ExtensionNotification { notification, raw_params }) =
-        execution.next_event(cx).await.unwrap()
+    let Some(ModernHttpExtensionEvent::ExtensionNotification {
+        notification,
+        raw_params,
+    }) = execution.next_event(cx).await.unwrap()
     else {
         panic!("the forwarded notice must arrive before the terminal result");
     };
@@ -680,7 +785,10 @@ fn interrupt_notification_proxy(drop_request: bool) {
     let observations = Arc::new(NotificationObservations::default());
     let retained = Arc::clone(&observations);
     let server = modern::ServerBuilder::new("streaming-proxy-producer", "1")
-        .extension(notice_producer::<ScaleResponse>(Arc::clone(&observations), false))
+        .extension(notice_producer::<ScaleResponse>(
+            Arc::clone(&observations),
+            false,
+        ))
         .unwrap();
     run_http_test(server, move |cx, endpoint| async move {
         let upstream = connect_upstream(
@@ -710,7 +818,9 @@ fn interrupt_notification_proxy(drop_request: bool) {
                 drop(held);
             } else {
                 assert!(held.control().cancel());
-                held.next_event(&cx).await.expect_err("cancellation retires the live stream");
+                held.next_event(&cx)
+                    .await
+                    .expect_err("cancellation retires the live stream");
                 drop(held);
             }
             asupersync::time::timeout(cx.now(), Duration::from_secs(2), async {
@@ -738,7 +848,8 @@ fn interrupt_notification_proxy(drop_request: bool) {
 fn typed_http_notification_proxy_reconstructs_memory_request_owners() {
     let server = modern::ServerBuilder::new("notice-owner-producer", "1")
         .extension(notice_producer::<ScaleResponse>(
-            Arc::new(NotificationObservations::default()), false,
+            Arc::new(NotificationObservations::default()),
+            false,
         ))
         .unwrap();
     run_http_test(server, |cx, endpoint| async move {
@@ -755,9 +866,7 @@ fn typed_http_notification_proxy_reconstructs_memory_request_owners() {
             .unwrap();
         let (mut peer, transport) = create_memory_transport_pair_with_capacity(8);
         let mut serving = cx
-            .spawn(move |server_cx| async move {
-                server.serve_memory(&server_cx, transport).await
-            })
+            .spawn(move |server_cx| async move { server.serve_memory(&server_cx, transport).await })
             .unwrap();
         for (owner, value) in [("downstream-five", 5), ("downstream-eleven", 11)] {
             let JsonRpcMessage::Request(mut frame) =
@@ -766,7 +875,9 @@ fn typed_http_notification_proxy_reconstructs_memory_request_owners() {
                 unreachable!()
             };
             frame.id = Some(RequestId::String(owner.to_owned()));
-            peer.send_async(&cx, &JsonRpcMessage::Request(frame)).await.unwrap();
+            peer.send_async(&cx, &JsonRpcMessage::Request(frame))
+                .await
+                .unwrap();
         }
         let mut notices = BTreeMap::new();
         let mut results = BTreeMap::new();
@@ -778,14 +889,22 @@ fn typed_http_notification_proxy_reconstructs_memory_request_owners() {
                     let parameters = notification.params.unwrap();
                     let owner = parameters["_meta"][PROXY_NOTICE_OWNER].as_str().unwrap();
                     assert_eq!(parameters["_meta"], json!({PROXY_NOTICE_OWNER: owner}));
-                    assert!(notices.insert(owner.to_owned(), parameters["value"].clone()).is_none());
+                    assert!(
+                        notices
+                            .insert(owner.to_owned(), parameters["value"].clone())
+                            .is_none()
+                    );
                 }
                 JsonRpcMessage::Response(response) => {
                     assert!(response.error.is_none());
                     let Some(RequestId::String(owner)) = response.id else {
                         panic!("the downstream response must retain its own string ID");
                     };
-                    assert!(results.insert(owner, response.result.unwrap()["value"].clone()).is_none());
+                    assert!(
+                        results
+                            .insert(owner, response.result.unwrap()["value"].clone())
+                            .is_none()
+                    );
                 }
             }
         }
@@ -797,7 +916,10 @@ fn typed_http_notification_proxy_reconstructs_memory_request_owners() {
         assert_eq!(results, expected);
         let (mut input, output) = peer.into_split();
         drop(output);
-        assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+        assert!(matches!(
+            input.recv_async(&cx).await,
+            Err(TransportError::Closed)
+        ));
         serving.join(&cx).await.unwrap().unwrap();
     });
 }
@@ -817,19 +939,29 @@ fn typed_http_notification_proxy_requires_a_matching_codec_and_live_sink_before_
         )
         .await;
         assert!(
-            builder().typed_http_proxy_request::<ScaleRequest, ScaleResponse>(
-                METHOD, "scale-params-v1", "scale-result-v1", upstream.clone(),
-            ).is_err(),
+            builder()
+                .typed_http_proxy_request::<ScaleRequest, ScaleResponse>(
+                    METHOD,
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
+                )
+                .is_err(),
             "the existing request-only API must keep refusing streaming contracts"
         );
         assert!(
             builder()
                 .typed_request_notification::<ScaleResponse>(
-                    PROXY_NOTICE, "proxy-notice-v1", PROXY_NOTICE_OWNER,
+                    PROXY_NOTICE,
+                    "proxy-notice-v1",
+                    PROXY_NOTICE_OWNER,
                 )
                 .unwrap()
                 .typed_http_proxy_request_with_notifications::<ScaleRequest, ScaleResponse, Echo>(
-                    METHOD, "scale-params-v1", "scale-result-v1", upstream.clone(),
+                    METHOD,
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
                 )
                 .is_err(),
             "a similarly named generic parameter cannot replace the declared schema"
@@ -848,8 +980,7 @@ fn typed_http_notification_proxy_requires_a_matching_codec_and_live_sink_before_
             )]),
         };
         let negotiated = server.negotiate_extensions(&discovery).unwrap();
-        let JsonRpcMessage::Request(mut frame) =
-            request(1, Some(json!({"version": 1})), json!(5))
+        let JsonRpcMessage::Request(mut frame) = request(1, Some(json!({"version": 1})), json!(5))
         else {
             unreachable!()
         };
@@ -871,7 +1002,8 @@ fn typed_http_notification_proxy_rejects_remote_schema_violation_and_preserves_s
     // than our locally compiled contract permits. Its own producer is valid.
     let server = modern::ServerBuilder::new("loose-notice-producer", "1")
         .extension(notice_producer::<serde_json::Value>(
-            Arc::new(NotificationObservations::default()), true,
+            Arc::new(NotificationObservations::default()),
+            true,
         ))
         .unwrap();
     run_http_test(server, |cx, endpoint| async move {
@@ -890,7 +1022,9 @@ fn typed_http_notification_proxy_rejects_remote_schema_violation_and_preserves_s
             let mut invalid = client
                 .execute_final_extension(&cx, &id, METHOD, json!({"value": 13}), limits())
                 .unwrap();
-            invalid.next_event(&cx).await
+            invalid
+                .next_event(&cx)
+                .await
                 .expect_err("bad typed notification is never published downstream");
             let mut sibling = client
                 .execute_final_extension(&cx, &id, METHOD, json!({"value": 11}), limits())
@@ -906,7 +1040,8 @@ fn typed_http_notification_proxy_rejects_remote_schema_violation_and_preserves_s
 fn typed_http_notification_proxy_rejects_metadata_synthesized_by_notification_codec() {
     let server = modern::ServerBuilder::new("notice-serialization-producer", "1")
         .extension(notice_producer::<ForgedRequest>(
-            Arc::new(NotificationObservations::default()), false,
+            Arc::new(NotificationObservations::default()),
+            false,
         ))
         .unwrap();
     run_http_test(server, |cx, endpoint| async move {
@@ -923,11 +1058,16 @@ fn typed_http_notification_proxy_rejects_metadata_synthesized_by_notification_co
             let client = notice_client(&cx, endpoint).await;
             let mut invalid = client
                 .execute_final_extension(
-                    &cx, &ExtensionId::parse(EXTENSION).unwrap(), METHOD,
-                    json!({"value": 5}), limits(),
+                    &cx,
+                    &ExtensionId::parse(EXTENSION).unwrap(),
+                    METHOD,
+                    json!({"value": 5}),
+                    limits(),
                 )
                 .unwrap();
-            invalid.next_event(&cx).await
+            invalid
+                .next_event(&cx)
+                .await
                 .expect_err("typed notification cannot recreate upstream authority");
         })
         .await;

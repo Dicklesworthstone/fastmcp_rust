@@ -12,19 +12,22 @@ fn stream_metadata() -> FinalRequestMeta {
 }
 
 fn stream_decoder(run: &mut Run, limits: ManagedCoreLimits) -> (RequestId, TaskStreamDecoder) {
-    let prepared = run.prepare(TARGET, stream_metadata(), get(), limits, 8192).unwrap();
+    let prepared = run
+        .prepare(TARGET, stream_metadata(), get(), limits, 8192)
+        .unwrap();
     let marker = progress_marker(&prepared.operation_wire, limits.request_bytes()).unwrap();
     let admitted = admit(run, prepared);
     let id = admitted.id.clone();
-    let (_, decoder) = TaskStreamDecoder::with_usage(
-        admitted, limits, run.stream_usage(limits).unwrap(), marker,
-    ).unwrap();
+    let (_, decoder) =
+        TaskStreamDecoder::with_usage(admitted, limits, run.stream_usage(limits).unwrap(), marker)
+            .unwrap();
     (id, decoder)
 }
 
 fn notification() -> Vec<u8> {
     serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"notifications/progress",
-        "params":{"progressToken":"owned","progress":1}})).unwrap()
+        "params":{"progressToken":"owned","progress":1}}))
+    .unwrap()
 }
 
 fn result(id: &RequestId) -> Vec<u8> {
@@ -41,8 +44,14 @@ fn notifications_and_discovery_bytes_are_carried_into_every_new_decoder() {
     let first_discovery = decoder.usage().0;
     let progress = notification();
     let terminal = result(&id);
-    assert!(matches!(decoder.admit(&progress, true).unwrap(), StreamEvent::Notification(_)));
-    assert!(matches!(decoder.admit(&terminal, true).unwrap(), StreamEvent::Result(_)));
+    assert!(matches!(
+        decoder.admit(&progress, true).unwrap(),
+        StreamEvent::Notification(_)
+    ));
+    assert!(matches!(
+        decoder.admit(&terminal, true).unwrap(),
+        StreamEvent::Result(_)
+    ));
     let first_usage = (first_discovery + progress.len() + terminal.len(), 1);
     assert_eq!(decoder.usage(), first_usage);
     run.complete_stream(first_usage, limits).unwrap();
@@ -50,16 +59,31 @@ fn notifications_and_discovery_bytes_are_carried_into_every_new_decoder() {
 
     let (id, mut next) = stream_decoder(&mut run, limits);
     let before = next.usage();
-    assert!(before.0 > first_usage.0, "the second discovery also consumes the run budget");
+    assert!(
+        before.0 > first_usage.0,
+        "the second discovery also consumes the run budget"
+    );
     assert_eq!(before.1, 1);
-    assert!(matches!(next.admit(&progress, true),
-        Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::NotificationLimit)))));
+    assert!(matches!(
+        next.admit(&progress, true),
+        Err(DpopStreamError::Core(DpopCoreError::Protocol(
+            ManagedCoreError::NotificationLimit
+        )))
+    ));
     assert_eq!(next.usage(), before);
     let terminal = result(&id);
-    assert!(matches!(next.admit(&terminal, false).unwrap(), StreamEvent::Result(_)),
-        "exhausting notifications does not forbid a JSON terminal");
+    assert!(
+        matches!(
+            next.admit(&terminal, false).unwrap(),
+            StreamEvent::Result(_)
+        ),
+        "exhausting notifications does not forbid a JSON terminal"
+    );
     run.complete_stream(next.usage(), limits).unwrap();
-    assert_eq!(run.stream_usage(limits).unwrap(), (before.0 + terminal.len(), 1));
+    assert_eq!(
+        run.stream_usage(limits).unwrap(),
+        (before.0 + terminal.len(), 1)
+    );
 }
 
 #[test]
@@ -74,7 +98,10 @@ fn invalid_completion_usage_cannot_refill_either_quota_or_partially_commit() {
     }
     run.complete_stream((32768, 4), limits).unwrap();
     assert_eq!((run.remaining_bytes, run.notifications), (0, 4));
-    assert!(run.prepare(TARGET, stream_metadata(), get(), limits, 8192).is_err());
+    assert!(
+        run.prepare(TARGET, stream_metadata(), get(), limits, 8192)
+            .is_err()
+    );
 }
 
 #[test]
@@ -93,11 +120,20 @@ fn precancelled_streamed_driver_never_invokes_any_host_callback() {
     for cancel_cx in [false, true] {
         let cx = Cx::for_testing();
         let cancellation = McpRequestCancellation::new();
-        if cancel_cx { cx.set_cancel_requested(true); } else { cancellation.cancel(); }
+        if cancel_cx {
+            cx.set_cancel_requested(true);
+        } else {
+            cancellation.cancel();
+        }
         let (mut client, credential) = client();
         let mut drive = Box::pin(client.drive_task_with_events(
-            &cx, &cancellation, &credential, stream_metadata(),
-            TaskId::parse("task-one").unwrap(), "stream", ManagedTaskDriverPolicy::default(),
+            &cx,
+            &cancellation,
+            &credential,
+            stream_metadata(),
+            TaskId::parse("task-one").unwrap(),
+            "stream",
+            ManagedTaskDriverPolicy::default(),
             DpopStreamLimits::default(),
             |_| {
                 panic!("cancelled driver invoked resolver");
@@ -107,8 +143,11 @@ fn precancelled_streamed_driver_never_invokes_any_host_callback() {
             |_| panic!("cancelled driver invoked snapshot observer"),
             |_| panic!("cancelled driver invoked notification observer"),
         ));
-        assert!(matches!(drive.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        assert!(matches!(
+            drive.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(DpopTaskDriverError::Task(DpopTasksError::Core(
-                DpopCoreError::Transport(DpopHttpError::Cancelled)))))));
+                DpopCoreError::Transport(DpopHttpError::Cancelled)
+            ))))
+        ));
     }
 }

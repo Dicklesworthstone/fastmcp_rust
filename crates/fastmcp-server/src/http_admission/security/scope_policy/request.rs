@@ -319,10 +319,18 @@ impl crate::TaskAccessAuthorizer for ScopeRequestPolicy {
         }
         Server::enforce_request_context(ctx)?;
         let facts = ctx.auth();
-        let allowed = self.authorize_verified(original.method(), facts.as_ref()).is_ok()
-            && self.authorize_verified(action.method(), facts.as_ref()).is_ok();
+        let allowed = self
+            .authorize_verified(original.method(), facts.as_ref())
+            .is_ok()
+            && self
+                .authorize_verified(action.method(), facts.as_ref())
+                .is_ok();
         Server::enforce_request_context(ctx)?;
-        if allowed { Ok(()) } else { Err(McpError::invalid_params("Task not found")) }
+        if allowed {
+            Ok(())
+        } else {
+            Err(McpError::invalid_params("Task not found"))
+        }
     }
 }
 
@@ -364,7 +372,9 @@ impl Server {
             runtime.install_access_authorizer(Arc::new(policy.clone()))?;
         }
         #[cfg(all(feature = "tasks", feature = "proxy"))]
-        if self.final_task_runtime.is_none() && let Some(relay) = self.final_task_relay.as_ref() {
+        if self.final_task_runtime.is_none()
+            && let Some(relay) = self.final_task_relay.as_ref()
+        {
             relay.install_access_authorizers(vec![Arc::new(policy.clone())])?;
         }
         middleware.insert(0, Box::new(ScopeAdmissionMiddleware(policy)));

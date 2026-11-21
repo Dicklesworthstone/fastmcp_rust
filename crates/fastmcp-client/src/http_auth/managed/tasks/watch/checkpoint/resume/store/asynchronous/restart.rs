@@ -11,11 +11,11 @@ use std::fmt;
 
 use asupersync::Cx;
 
+use super::super::super::client::restart::{TaskResumeRestartPlan, TaskResumeRestartPolicy};
 use super::{
     AsyncTaskResumeStore, CredentialSlotTask, TaskResumeBinding, TaskResumeCompletion,
     TaskResumeProtector, TaskResumeSubmissionFailure,
 };
-use super::super::super::client::restart::{TaskResumeRestartPlan, TaskResumeRestartPolicy};
 
 /// Complete controls loaded under the host's supplied current binding.
 ///
@@ -87,9 +87,8 @@ impl<P: TaskResumeProtector + 'static> AsyncTaskResumeStore<P> {
             current,
             (page_size, policy),
             |store, worker, current, (page_size, policy)| {
-                let plan = TaskResumeRestartPlan::load_store(
-                    worker, current, store, page_size, policy,
-                )?;
+                let plan =
+                    TaskResumeRestartPlan::load_store(worker, current, store, page_size, policy)?;
                 Ok(StagedTaskRestart {
                     current: current.clone(),
                     plan,

@@ -311,8 +311,12 @@ mod tests {
     fn identity_requires_valid_exact_issuer_not_canonical_equivalence() {
         let selected = issuer();
         assert!(
-            admit_identity(&selected, OAUTH, br#"{"issuer":"https://issuer.example/tenant/"}"#)
-                .is_ok()
+            admit_identity(
+                &selected,
+                OAUTH,
+                br#"{"issuer":"https://issuer.example/tenant/"}"#
+            )
+            .is_ok()
         );
         for other in [
             "https://issuer.example/tenant",
@@ -320,7 +324,11 @@ mod tests {
             "https://issuer.example:443/tenant/",
         ] {
             assert!(matches!(
-                admit_identity(&selected, OAUTH, json!({"issuer":other}).to_string().as_bytes()),
+                admit_identity(
+                    &selected,
+                    OAUTH,
+                    json!({"issuer":other}).to_string().as_bytes()
+                ),
                 Err(OAuthDiscoveryError::IssuerMismatch)
             ));
         }
@@ -331,7 +339,11 @@ mod tests {
             "https://issuer.example/tenant/#x",
         ] {
             assert!(matches!(
-                admit_identity(&selected, OAUTH, json!({"issuer":invalid}).to_string().as_bytes()),
+                admit_identity(
+                    &selected,
+                    OAUTH,
+                    json!({"issuer":invalid}).to_string().as_bytes()
+                ),
                 Err(OAuthDiscoveryError::InvalidMetadata)
             ));
         }

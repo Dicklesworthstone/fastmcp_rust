@@ -3564,7 +3564,10 @@ fn prompt_result_fallback_accepts_message_alias_and_maps_error() {
     assert_eq!(expect_text(&messages[0].content), "aliased prompt");
 
     let error = handler
-        .get(&ctx, HashMap::from([("fail".to_owned(), "true".to_owned())]))
+        .get(
+            &ctx,
+            HashMap::from([("fail".to_owned(), "true".to_owned())]),
+        )
         .expect_err("the same aliased prompt preserves its error branch");
     assert_eq!(error.code, fastmcp_rust::McpErrorCode::InternalError);
     assert_eq!(error.message, "aliased prompt unavailable");
@@ -3594,9 +3597,10 @@ fn async_prompt_result_fallback_preserves_mcp_error() {
         } else {
             HashMap::new()
         };
-        let outcome = run_outcome(async move {
-            FallibleAliasedAsyncPromptPrompt.get_async(&ctx, args).await
-        });
+        let outcome =
+            run_outcome(
+                async move { FallibleAliasedAsyncPromptPrompt.get_async(&ctx, args).await },
+            );
         if fail {
             let Outcome::Err(error) = outcome else {
                 panic!("failed prompt must retain an error outcome");
@@ -8127,7 +8131,18 @@ fn integer_schemas_for_interoperability() -> serde_json::Value {
         NestedIntegerSchemas::json_schema(),
         EchoNativeIntegerArguments.definition().input_schema,
         GenericSchemaEnvelope::<(
-            i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize,
+            i8,
+            i16,
+            i32,
+            i64,
+            i128,
+            isize,
+            u8,
+            u16,
+            u32,
+            u64,
+            u128,
+            usize,
         )>::json_schema(),
         GenericSchemaEnvelope::<Vec<BTreeMap<String, Option<u64>>>>::json_schema(),
     ])

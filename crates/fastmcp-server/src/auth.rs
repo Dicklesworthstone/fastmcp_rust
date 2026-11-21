@@ -518,8 +518,7 @@ fn remove_headers_access_token_fields(map: &mut serde_json::Map<String, serde_js
 /// Dropping this future abandons the verification attempt. Implementations must
 /// not detach work, create a runtime, retain a borrowed request after completion,
 /// or publish facts from an expired/cancelled attempt.
-pub type AuthFuture<'a> =
-    Pin<Box<dyn Future<Output = McpResult<AuthContext>> + Send + 'a>>;
+pub type AuthFuture<'a> = Pin<Box<dyn Future<Output = McpResult<AuthContext>> + Send + 'a>>;
 
 /// Reserved local provider classification. Native asynchronous ingress maps it
 /// to a fixed HTTP 503 without exposing provider diagnostics or credential state.
@@ -528,17 +527,36 @@ pub(crate) const AUTH_PROVIDER_UNAVAILABLE_CODE: McpErrorCode = McpErrorCode::Cu
 /// Preserve an ambient effect ceiling when selecting an explicit caller's
 /// drivers. A retained broader Cx must not restore a denied effect on resumption.
 pub(crate) fn ambient_auth_capability_ceiling() -> CapMask {
-    let Some(active) = asupersync::Cx::current() else { return CapMask::all() };
+    let Some(active) = asupersync::Cx::current() else {
+        return CapMask::all();
+    };
     let capabilities = active.capabilities();
     let mut ceiling = CapMask::all();
     for (allowed, without_effect) in [
-        (capabilities.spawn, CapSet::<false, true, true, true, true>::MASK),
-        (capabilities.time, CapSet::<true, false, true, true, true>::MASK),
-        (capabilities.entropy, CapSet::<true, true, false, true, true>::MASK),
-        (capabilities.io, CapSet::<true, true, true, false, true>::MASK),
-        (capabilities.remote, CapSet::<true, true, true, true, false>::MASK),
+        (
+            capabilities.spawn,
+            CapSet::<false, true, true, true, true>::MASK,
+        ),
+        (
+            capabilities.time,
+            CapSet::<true, false, true, true, true>::MASK,
+        ),
+        (
+            capabilities.entropy,
+            CapSet::<true, true, false, true, true>::MASK,
+        ),
+        (
+            capabilities.io,
+            CapSet::<true, true, true, false, true>::MASK,
+        ),
+        (
+            capabilities.remote,
+            CapSet::<true, true, true, true, false>::MASK,
+        ),
     ] {
-        if !allowed { ceiling = ceiling.intersect(without_effect); }
+        if !allowed {
+            ceiling = ceiling.intersect(without_effect);
+        }
     }
     ceiling
 }
@@ -738,8 +756,13 @@ impl TokenAuthProvider {
         access: &AccessToken,
         auth: AuthContext,
     ) -> McpResult<AuthContext> {
-        if auth.verification_valid_until().is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(auth_error("Token verifier returned expired authentication facts"));
+        if auth
+            .verification_valid_until()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(auth_error(
+                "Token verifier returned expired authentication facts",
+            ));
         }
         if principal_fingerprint(Some(&auth)).is_err() {
             return Err(auth_error(
@@ -3752,11 +3775,19 @@ mod async_auth_tests {
         McpContext::new(asupersync::Cx::for_testing(), 77)
     }
     fn request(header: Option<&str>) -> AuthRequest<'_> {
-        AuthRequest { method: "tools/list", params: None, transport_authorization: header, request_id: 77 }
+        AuthRequest {
+            method: "tools/list",
+            params: None,
+            transport_authorization: header,
+            request_id: 77,
+        }
     }
     fn ready<T>(future: impl Future<Output = T>) -> T {
         let mut future = std::pin::pin!(future);
-        match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
             Poll::Ready(value) => value,
             Poll::Pending => panic!("bounded in-memory fixture unexpectedly pending"),
         }
@@ -3764,7 +3795,12 @@ mod async_auth_tests {
 
     struct LocalVerifier(Arc<AtomicUsize>);
     impl TokenVerifier for LocalVerifier {
-        fn verify(&self, _: &McpContext, _: AuthRequest<'_>, _: &AccessToken) -> McpResult<AuthContext> {
+        fn verify(
+            &self,
+            _: &McpContext,
+            _: AuthRequest<'_>,
+            _: &AccessToken,
+        ) -> McpResult<AuthContext> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(AuthContext::with_subject("local-subject"))
         }
@@ -3775,11 +3811,16 @@ mod async_auth_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = TokenAuthProvider::new(LocalVerifier(Arc::clone(&calls)));
         let ctx = context();
-        let synchronous = provider.authenticate(&ctx, request(Some("Bearer local-token"))).unwrap();
-        let asynchronous = ready(provider.authenticate_async(&ctx, request(Some("Bearer local-token")))).unwrap();
+        let synchronous = provider
+            .authenticate(&ctx, request(Some("Bearer local-token")))
+            .unwrap();
+        let asynchronous =
+            ready(provider.authenticate_async(&ctx, request(Some("Bearer local-token")))).unwrap();
         assert_eq!(synchronous.session_owner(), asynchronous.session_owner());
-        assert_eq!(principal_fingerprint(Some(&synchronous)).unwrap(),
-            principal_fingerprint(Some(&asynchronous)).unwrap());
+        assert_eq!(
+            principal_fingerprint(Some(&synchronous)).unwrap(),
+            principal_fingerprint(Some(&asynchronous)).unwrap()
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -3789,15 +3830,28 @@ mod async_auth_tests {
         expiry: Option<Instant>,
     }
     impl TokenVerifier for AsyncOnlyVerifier {
-        fn verify(&self, _: &McpContext, _: AuthRequest<'_>, _: &AccessToken) -> McpResult<AuthContext> {
-            Err(McpError::new(AUTH_PROVIDER_UNAVAILABLE_CODE, "async required"))
+        fn verify(
+            &self,
+            _: &McpContext,
+            _: AuthRequest<'_>,
+            _: &AccessToken,
+        ) -> McpResult<AuthContext> {
+            Err(McpError::new(
+                AUTH_PROVIDER_UNAVAILABLE_CODE,
+                "async required",
+            ))
         }
-        fn verify_async<'a>(&'a self, ctx: &'a McpContext, _: AuthRequest<'a>, _: &'a AccessToken)
-            -> AuthFuture<'a>
-        {
+        fn verify_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _: AuthRequest<'a>,
+            _: &'a AccessToken,
+        ) -> AuthFuture<'a> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                if self.cancel { assert!(ctx.request_cancellation().cancel()); }
+                if self.cancel {
+                    assert!(ctx.request_cancellation().cancel());
+                }
                 let facts = AuthContext::with_subject("async-subject")
                     .with_session_owner(Sha256Digest::from_bytes([33; 32]));
                 Ok(match self.expiry {
@@ -3812,18 +3866,32 @@ mod async_auth_tests {
     fn token_provider_awaits_async_only_verifier_after_strict_credential_admission() {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = TokenAuthProvider::new(AsyncOnlyVerifier {
-            calls: Arc::clone(&calls), cancel: false,
+            calls: Arc::clone(&calls),
+            cancel: false,
             expiry: Some(Instant::now() + Duration::from_secs(30)),
         });
         let ctx = context();
-        assert!(provider.authenticate(&ctx, request(Some("Bearer opaque"))).is_err());
-        for header in [None, Some("Bearer "), Some("Bearer bad token"), Some("Bearer one, Bearer two")] {
+        assert!(
+            provider
+                .authenticate(&ctx, request(Some("Bearer opaque")))
+                .is_err()
+        );
+        for header in [
+            None,
+            Some("Bearer "),
+            Some("Bearer bad token"),
+            Some("Bearer one, Bearer two"),
+        ] {
             assert!(ready(provider.authenticate_async(&ctx, request(header))).is_err());
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let facts = ready(provider.authenticate_async(&ctx, request(Some("Bearer opaque")))).unwrap();
+        let facts =
+            ready(provider.authenticate_async(&ctx, request(Some("Bearer opaque")))).unwrap();
         assert_eq!(facts.subject.as_deref(), Some("async-subject"));
-        assert_eq!(facts.session_owner(), Some(Sha256Digest::from_bytes([33; 32])));
+        assert_eq!(
+            facts.session_owner(),
+            Some(Sha256Digest::from_bytes([33; 32]))
+        );
         assert!(facts.verification_valid_until().is_some());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -3832,9 +3900,14 @@ mod async_auth_tests {
     fn async_verifier_explicit_owner_cannot_bypass_cancellation_or_expiry() {
         for (cancel, expiry) in [(true, None), (false, Some(Instant::now()))] {
             let provider = TokenAuthProvider::new(AsyncOnlyVerifier {
-                calls: Arc::new(AtomicUsize::new(0)), cancel, expiry,
+                calls: Arc::new(AtomicUsize::new(0)),
+                cancel,
+                expiry,
             });
-            assert!(ready(provider.authenticate_async(&context(), request(Some("Bearer opaque")))).is_err());
+            assert!(
+                ready(provider.authenticate_async(&context(), request(Some("Bearer opaque"))))
+                    .is_err()
+            );
         }
     }
 }

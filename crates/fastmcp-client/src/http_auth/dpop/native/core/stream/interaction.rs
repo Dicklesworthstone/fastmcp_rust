@@ -23,8 +23,8 @@ use crate::http_auth::rpc::interaction::{
     ManagedInputReply, ManagedInteractionError, ManagedInteractionLimits, admit_challenge,
     admit_fresh_id, continuation_request, input_required, validate_initial,
 };
-use crate::http_auth::sampling::inputs::mixed::{CoreInputHost, CoreInputLimits};
 use crate::http_auth::sampling::inputs::mixed::session::{CoreInputSession, CoreInputSessionError};
+use crate::http_auth::sampling::inputs::mixed::{CoreInputHost, CoreInputLimits};
 use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 
 /// One frozen policy for network rounds and typed host-input execution.
@@ -184,8 +184,17 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         self.execute_streaming_input_host_configured(
-            cx, cancellation, credential, request, id_prefix, &limits, None, host, observer,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            request,
+            id_prefix,
+            &limits,
+            None,
+            host,
+            observer,
+        )
+        .await
     }
 
     /// Execute a tool conversation with one immutable, explicitly reviewed
@@ -217,8 +226,17 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         self.execute_streaming_input_host_configured(
-            cx, cancellation, credential, request, id_prefix, &limits, Some(reviewed), host, observer,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            request,
+            id_prefix,
+            &limits,
+            Some(reviewed),
+            host,
+            observer,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -247,7 +265,11 @@ impl DpopHttpClient {
         let mut bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let mut inputs = CoreInputSession::new(
-            cx, cancellation, request.clone(), limits.inputs, limits.resolutions,
+            cx,
+            cancellation,
+            request.clone(),
+            limits.inputs,
+            limits.resolutions,
         )?;
         if inputs.deadline() < bounds.deadline {
             bounds.deadline = inputs.deadline();
@@ -256,22 +278,42 @@ impl DpopHttpClient {
         let mut conversation = Conversation::new(request, first_id, limits.interaction)?;
         loop {
             let idle = Idle::new(cx.now(), limits.stream.idle);
-            let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+            let lifetime = Lifetime {
+                cx,
+                cancellation,
+                session: &self.session,
+                credential,
+                bounds,
+            };
             with_caller(cx, || lifetime.check(&idle))?;
             let (wire, decoder) = conversation.prepare(
-                self.resource().as_str(), self.policy.max_body_bytes, reviewed,
+                self.resource().as_str(),
+                self.policy.max_body_bytes,
+                reviewed,
             )?;
-            let completed = self.execute_prepared_core_stream(
-                cx, cancellation, credential,
-                PreparedStream { wire, decoder, limits: limits.stream, bounds, idle },
-                &mut observer,
-            ).await?;
+            let completed = self
+                .execute_prepared_core_stream(
+                    cx,
+                    cancellation,
+                    credential,
+                    PreparedStream {
+                        wire,
+                        decoder,
+                        limits: limits.stream,
+                        bounds,
+                        idle,
+                    },
+                    &mut observer,
+                )
+                .await?;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             let input = match conversation.accept(completed)? {
                 Step::Complete(result) => {
                     check_live(cx, cancellation, &self.session, credential, bounds)?;
                     return Ok(DpopHostResult {
-                        result: *result, usage: inputs.usage(), continuations: conversation.continuations,
+                        result: *result,
+                        usage: inputs.usage(),
+                        continuations: conversation.continuations,
                     });
                 }
                 Step::Input(input) => input,
@@ -281,8 +323,11 @@ impl DpopHttpClient {
             // Only the trusted input engine receives the opaque wire challenge.
             // The application's host sees preflighted descriptors, never state.
             let reply = within(cx, cancellation, &self.session, credential, bounds, async {
-                Ok(inputs.resolve(cx, input.as_ref().clone(), next_id, host).await)
-            }).await??;
+                Ok(inputs
+                    .resolve(cx, input.as_ref().clone(), next_id, host)
+                    .await)
+            })
+            .await??;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             conversation.resume(&input, reply)?;
         }
@@ -294,7 +339,8 @@ fn request_id(prefix: &str, ordinal: usize) -> Result<RequestId, DpopStreamHostE
         return Err(DpopStreamHostError::Host(DpopHostError::InvalidIdPrefix));
     }
     let id = RequestId::String(format!("{prefix}:{ordinal}"));
-    id.validate().map_err(|_| DpopStreamHostError::Host(DpopHostError::InvalidIdPrefix))?;
+    id.validate()
+        .map_err(|_| DpopStreamHostError::Host(DpopHostError::InvalidIdPrefix))?;
     Ok(id)
 }
 
@@ -325,9 +371,14 @@ impl Conversation {
     ) -> Result<Self, DpopStreamHostError> {
         validate_initial(&original)?;
         Ok(Self {
-            current: original.clone(), original,
-            used_ids: vec![request_id.clone()], request_id,
-            limits, usage: (0, 0), continuations: 0, input_responses: 0,
+            current: original.clone(),
+            original,
+            used_ids: vec![request_id.clone()],
+            request_id,
+            limits,
+            usage: (0, 0),
+            continuations: 0,
+            input_responses: 0,
         })
     }
 
@@ -338,13 +389,20 @@ impl Conversation {
         reviewed: Option<&ReviewedToolHeaders>,
     ) -> Result<(ModernHttpRequest, CoreDecoder), DpopStreamHostError> {
         let (wire, mut decoder) = prepare(
-            target, self.current.clone(), self.request_id.clone(), self.limits.core(), transport_limit,
+            target,
+            self.current.clone(),
+            self.request_id.clone(),
+            self.limits.core(),
+            transport_limit,
         )?;
         let wire = match reviewed {
             Some(reviewed) => wire.with_reviewed_tool_headers(reviewed)?,
             None => wire,
         };
-        let bytes = self.usage.0.checked_add(wire.body().len())
+        let bytes = self
+            .usage
+            .0
+            .checked_add(wire.body().len())
             .ok_or(ManagedCoreError::RequestTooLarge)?;
         // Reserve the exact outgoing bytes in the shared decoder before I/O.
         // Its existing admission now refuses a cumulative excess BEFORE a
@@ -365,7 +423,11 @@ impl Conversation {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
         admit_challenge(
-            &self.original, input, self.limits, self.continuations, self.input_responses,
+            &self.original,
+            input,
+            self.limits,
+            self.continuations,
+            self.input_responses,
         )?;
         self.usage = completed.usage;
         Ok(Step::Input(Box::new(input.clone())))
@@ -377,7 +439,10 @@ impl Conversation {
         reply: ManagedInputReply,
     ) -> Result<(), DpopStreamHostError> {
         admit_fresh_id(&self.used_ids, &reply.request_id)?;
-        let count = reply.input_responses.as_ref().map_or(0, FinalInputResponses::len);
+        let count = reply
+            .input_responses
+            .as_ref()
+            .map_or(0, FinalInputResponses::len);
         let current = continuation_request(&self.original, input, reply.input_responses)?;
         self.current = current;
         self.request_id = reply.request_id.clone();

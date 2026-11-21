@@ -17,22 +17,22 @@ use fastmcp_protocol::tasks_extension::{
 };
 use fastmcp_protocol::{
     CoreRequest, CoreResult, ExtensionDirection, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_PROTOCOL_VERSION, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult,
-    FinalRequestMeta, FinalSubscriptionsAcknowledgedNotificationParams, JsonRpcMessage,
-    RequestId, ServerNotification, SubscriptionFilter, decode_strict_jsonrpc_message,
+    FINAL_PROTOCOL_VERSION, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalRequestMeta,
+    FinalSubscriptionsAcknowledgedNotificationParams, JsonRpcMessage, RequestId,
+    ServerNotification, SubscriptionFilter, decode_strict_jsonrpc_message,
     decode_strict_jsonrpc_response,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{
-    CoreDecoder, DpopCredential, DpopHttpClient, DpopStreamError, DpopStreamLimits,
-    Idle, Lifetime, ManagedCoreError, ManagedCoreLimits, ModernHttpRequest,
-    PreparedStream, StreamDecoder, StreamEvent, StreamNotification, WaitBounds, with_caller,
-};
-use super::subscription_end::admit_cancelled;
-use super::super::{BoundedWriter, DpopHttpResponse, decode_response};
 use super::super::tasks::{DpopTasksError, ManagedTasksError};
+use super::super::{BoundedWriter, DpopHttpResponse, decode_response};
+use super::subscription_end::admit_cancelled;
+use super::{
+    CoreDecoder, DpopCredential, DpopHttpClient, DpopStreamError, DpopStreamLimits, Idle, Lifetime,
+    ManagedCoreError, ManagedCoreLimits, ModernHttpRequest, PreparedStream, StreamDecoder,
+    StreamEvent, StreamNotification, WaitBounds, with_caller,
+};
 use crate::http_auth::rpc::subscription::json_subscription_error;
 
 /// One explicit, non-replayable Tasks listen selection. IDs are JSON-RPC
@@ -56,14 +56,23 @@ impl DpopTaskSubscription {
         metadata: FinalRequestMeta,
         task_ids: Vec<TaskId>,
     ) -> Result<Self, ManagedCoreError> {
-        discovery_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
-        subscription_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
+        discovery_id
+            .validate()
+            .map_err(|_| ManagedCoreError::InvalidRequest)?;
+        subscription_id
+            .validate()
+            .map_err(|_| ManagedCoreError::InvalidRequest)?;
         if discovery_id.correlates_with(&subscription_id)
             || !(1..=MAX_TASK_SUBSCRIPTION_IDS).contains(&task_ids.len())
         {
             return Err(ManagedCoreError::InvalidRequest);
         }
-        Ok(Self { discovery_id, subscription_id, metadata, task_ids })
+        Ok(Self {
+            discovery_id,
+            subscription_id,
+            metadata,
+            task_ids,
+        })
     }
 }
 
@@ -101,15 +110,29 @@ fn encode(
     id: &RequestId,
     maximum: usize,
 ) -> Result<ModernHttpRequest, ManagedCoreError> {
-    let params = request.encode_params()
+    let params = request
+        .encode_params()
         .map_err(|_| ManagedCoreError::InvalidRequest)?
         .ok_or(ManagedCoreError::InvalidRequest)?;
-    let mut writer = BoundedWriter { bytes: Vec::new(), maximum };
-    serde_json::to_writer(&mut writer, &json!({
-        "jsonrpc":"2.0", "id":id, "method":request.method(), "params":params,
-    })).map_err(|_| ManagedCoreError::RequestTooLarge)?;
-    ModernHttpRequest::new(target, writer.bytes, FINAL_PROTOCOL_VERSION, request.method(), None)
-        .map_err(|_| ManagedCoreError::InvalidRequest)
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        maximum,
+    };
+    serde_json::to_writer(
+        &mut writer,
+        &json!({
+            "jsonrpc":"2.0", "id":id, "method":request.method(), "params":params,
+        }),
+    )
+    .map_err(|_| ManagedCoreError::RequestTooLarge)?;
+    ModernHttpRequest::new(
+        target,
+        writer.bytes,
+        FINAL_PROTOCOL_VERSION,
+        request.method(),
+        None,
+    )
+    .map_err(|_| ManagedCoreError::InvalidRequest)
 }
 
 impl Prepared {
@@ -124,29 +147,38 @@ impl Prepared {
         }
         let mut metadata = serde_json::to_value(selection.metadata)
             .map_err(|_| ManagedCoreError::InvalidRequest)?;
-        let capabilities = metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
-            .and_then(Value::as_object_mut).ok_or(ManagedCoreError::InvalidRequest)?;
-        if capabilities.get("extensions")
+        let capabilities = metadata
+            .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+            .and_then(Value::as_object_mut)
+            .ok_or(ManagedCoreError::InvalidRequest)?;
+        if capabilities
+            .get("extensions")
             .is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
         {
             return Err(negotiation_error());
         }
         capabilities.insert("extensions".to_owned(), json!({TASKS_EXTENSION:{}}));
         let discovery = CoreRequest::decode(
-            ProtocolEra::Modern2026, "server/discover", Some(&json!({"_meta":metadata})),
-        ).map_err(|_| ManagedCoreError::InvalidRequest)?;
+            ProtocolEra::Modern2026,
+            "server/discover",
+            Some(&json!({"_meta":metadata})),
+        )
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
         let mut filter = SubscriptionFilter::default();
         set_task_subscription_ids(&mut filter, selection.task_ids.clone())
             .map_err(|_| ManagedCoreError::InvalidRequest)?;
         let request = CoreRequest::decode(
-            ProtocolEra::Modern2026, "subscriptions/listen",
+            ProtocolEra::Modern2026,
+            "subscriptions/listen",
             Some(&json!({"_meta":metadata,"notifications":filter})),
-        ).map_err(|_| ManagedCoreError::InvalidRequest)?;
+        )
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
         // Admit BOTH bounded request bodies before discovery, signing or I/O.
         let maximum = limits.request_bytes().min(native_maximum);
         let discovery_wire = encode(target, &discovery, &selection.discovery_id, maximum)?;
         let wire = encode(target, &request, &selection.subscription_id, maximum)?;
-        let discovery_decoder = CoreDecoder::for_request(discovery, selection.discovery_id, limits)?;
+        let discovery_decoder =
+            CoreDecoder::for_request(discovery, selection.discovery_id, limits)?;
         Ok(Self {
             discovery_wire,
             discovery_decoder,
@@ -164,21 +196,29 @@ impl Prepared {
         })
     }
 
-    fn admit(mut self, response: DpopHttpResponse)
-        -> Result<(ModernHttpRequest, TaskSubscriptionDecoder), DpopStreamError>
-    {
+    fn admit(
+        mut self,
+        response: DpopHttpResponse,
+    ) -> Result<(ModernHttpRequest, TaskSubscriptionDecoder), DpopStreamError> {
         let result = decode_response(&mut self.discovery_decoder, response)?;
         let CoreResult::Final(FinalCoreResult::Discover(discovery)) = result else {
             return Err(ManagedCoreError::InvalidResult.into());
         };
-        if !discovery.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
+        if !discovery
+            .supported_versions()
+            .iter()
+            .any(|version| version == FINAL_PROTOCOL_VERSION)
+        {
             return Err(negotiation_error());
         }
         // The existing official descriptor/negotiation gate, not key presence
         // alone, grants authority to receive notifications/tasks on this listen.
         crate::admit_final_tasks_discovery_surface(
-            &discovery, TASK_STATUS_NOTIFICATION, ExtensionDirection::ServerToClient,
-        ).map_err(|_| negotiation_error())?;
+            &discovery,
+            TASK_STATUS_NOTIFICATION,
+            ExtensionDirection::ServerToClient,
+        )
+        .map_err(|_| negotiation_error())?;
         self.decoder.bytes = self.discovery_decoder.usage().0;
         if self.decoder.bytes >= self.decoder.limits.total_bytes() {
             return Err(ManagedCoreError::ResponseByteLimit.into());
@@ -228,31 +268,67 @@ impl DpopHttpClient {
     where
         N: FnMut(&DpopTaskSubscriptionEvent) -> bool,
     {
-        let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
+        let bounds = WaitBounds::new(
+            cx,
+            self.policy.timeout.min(limits.core.timeout()),
+            credential,
+        )?;
         let idle = Idle::new(cx.now(), limits.idle);
         let prepared = with_caller(cx, || -> Result<_, DpopStreamError> {
-            let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+            let life = Lifetime {
+                cx,
+                cancellation,
+                session: &self.session,
+                credential,
+                bounds,
+            };
             life.check(&idle)?;
             let prepared = Prepared::new(
-                self.resource().as_str(), selection, limits.core, self.policy.max_body_bytes,
+                self.resource().as_str(),
+                selection,
+                limits.core,
+                self.policy.max_body_bytes,
             );
             life.check(&idle)?;
             prepared
         })?;
-        let response = self.post_resource_with_bounds(
-            cx, cancellation, credential, &prepared.discovery_wire, idle.bounds(bounds),
-        ).await?;
+        let response = self
+            .post_resource_with_bounds(
+                cx,
+                cancellation,
+                credential,
+                &prepared.discovery_wire,
+                idle.bounds(bounds),
+            )
+            .await?;
         let (wire, decoder) = with_caller(cx, || -> Result<_, DpopStreamError> {
-            let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+            let life = Lifetime {
+                cx,
+                cancellation,
+                session: &self.session,
+                credential,
+                bounds,
+            };
             life.check(&idle)?;
             let admitted = prepared.admit(response);
             life.check(&idle)?;
             admitted
         })?;
         self.execute_prepared_core_stream(
-            cx, cancellation, credential,
-            PreparedStream { wire, decoder, limits, bounds, idle }, &mut observer,
-        ).await?.result
+            cx,
+            cancellation,
+            credential,
+            PreparedStream {
+                wire,
+                decoder,
+                limits,
+                bounds,
+                idle,
+            },
+            &mut observer,
+        )
+        .await?
+        .result
     }
 }
 
@@ -271,19 +347,27 @@ struct TaskSubscriptionDecoder {
     terminal: bool,
 }
 
-fn accepted_ids(filter: &SubscriptionFilter, requested: &[TaskId])
-    -> Result<Vec<TaskId>, ManagedCoreError>
-{
+fn accepted_ids(
+    filter: &SubscriptionFilter,
+    requested: &[TaskId],
+) -> Result<Vec<TaskId>, ManagedCoreError> {
     if filter.tools_list_changed == Some(true)
         || filter.resources_list_changed == Some(true)
         || filter.prompts_list_changed == Some(true)
-        || filter.resource_subscriptions.as_ref().is_some_and(|uris| !uris.is_empty())
-        || filter.additional.keys().any(|key| key != TASK_SUBSCRIPTION_IDS_KEY)
+        || filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| !uris.is_empty())
+        || filter
+            .additional
+            .keys()
+            .any(|key| key != TASK_SUBSCRIPTION_IDS_KEY)
     {
         return Err(ManagedCoreError::UnexpectedNotification);
     }
     let accepted = task_subscription_ids(filter)
-        .map_err(|_| ManagedCoreError::UnexpectedNotification)?.unwrap_or_default();
+        .map_err(|_| ManagedCoreError::UnexpectedNotification)?
+        .unwrap_or_default();
     for (index, id) in accepted.iter().enumerate() {
         if !requested.contains(id) || accepted[..index].contains(id) {
             return Err(ManagedCoreError::UnexpectedNotification);
@@ -295,19 +379,23 @@ fn accepted_ids(filter: &SubscriptionFilter, requested: &[TaskId])
 impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
     type Terminal = TaskSubscriptionResult;
 
-    fn completes_on_terminal(&self) -> bool { true }
+    fn completes_on_terminal(&self) -> bool {
+        true
+    }
 
     fn admit(
         &mut self,
         frame: &[u8],
         allow_notification: bool,
-    ) -> Result<StreamEvent<TaskSubscriptionResult, DpopTaskSubscriptionEvent>, DpopStreamError> {
+    ) -> Result<StreamEvent<TaskSubscriptionResult, DpopTaskSubscriptionEvent>, DpopStreamError>
+    {
         if self.terminal {
             return Err(ManagedCoreError::InvalidResponse.into());
         }
-        let maximum = self.limits.frame_bytes().min(
-            self.limits.total_bytes().saturating_sub(self.bytes),
-        );
+        let maximum = self
+            .limits
+            .frame_bytes()
+            .min(self.limits.total_bytes().saturating_sub(self.bytes));
         if frame.len() > maximum {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
@@ -319,7 +407,11 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
         let mut accepted = None;
         let event = match message {
             JsonRpcMessage::Response(response) => {
-                if !response.id.as_ref().is_some_and(|id| id.correlates_with(&self.id)) {
+                if !response
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| id.correlates_with(&self.id))
+                {
                     return Err(ManagedCoreError::ResponseIdMismatch.into());
                 }
                 if let Some(error) = response.error {
@@ -329,11 +421,17 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
                     return Err(ManagedCoreError::UnexpectedNotification.into());
                 }
                 let (response, source) = decode_strict_jsonrpc_response(frame, maximum)
-                    .map_err(|_| ManagedCoreError::InvalidResponse)?.into_parts();
+                    .map_err(|_| ManagedCoreError::InvalidResponse)?
+                    .into_parts();
                 let source = source.ok_or(ManagedCoreError::InvalidResult)?;
-                let result = self.request.decode_response_result(&response, &source)
+                let result = self
+                    .request
+                    .decode_response_result(&response, &source)
                     .map_err(|_| ManagedCoreError::InvalidResult)?;
-                if !matches!(&result, CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })) {
+                if !matches!(
+                    &result,
+                    CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })
+                ) {
                     return Err(ManagedCoreError::InvalidResult.into());
                 }
                 StreamEvent::Result(Ok(result))
@@ -349,12 +447,16 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
                     admit_cancelled(frame, &self.id, maximum)?;
                     self.terminal = true;
                     self.bytes += frame.len();
-                    return Ok(StreamEvent::Result(Err(DpopStreamError::SubscriptionCancelled)));
+                    return Ok(StreamEvent::Result(Err(
+                        DpopStreamError::SubscriptionCancelled,
+                    )));
                 }
                 if self.notifications >= self.limits.notifications() {
                     return Err(ManagedCoreError::NotificationLimit.into());
                 }
-                let id = request.params.as_ref()
+                let id = request
+                    .params
+                    .as_ref()
                     .and_then(|params| params.get("_meta"))
                     .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
                     .and_then(|id| serde_json::from_value::<RequestId>(id.clone()).ok())
@@ -363,7 +465,9 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
                     return Err(ManagedCoreError::ResponseIdMismatch.into());
                 }
                 let event = if request.method == TASK_STATUS_NOTIFICATION {
-                    let selected = self.accepted.as_ref()
+                    let selected = self
+                        .accepted
+                        .as_ref()
                         .ok_or(ManagedCoreError::UnexpectedNotification)?;
                     // Decode the ORIGINAL envelope, not a Value round-trip:
                     // inlined Task results preserve exact numeric lexemes.
@@ -375,12 +479,14 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
                     DpopTaskSubscriptionEvent::Task(notification)
                 } else {
                     #[derive(Deserialize)]
-                    struct RawNotification { params: Box<serde_json::value::RawValue> }
+                    struct RawNotification {
+                        params: Box<serde_json::value::RawValue>,
+                    }
                     let raw: RawNotification = serde_json::from_slice(frame)
                         .map_err(|_| ManagedCoreError::InvalidResponse)?;
-                    let notification = ServerNotification::decode_with_raw_params(
-                        &request, raw.params.get(),
-                    ).map_err(|_| ManagedCoreError::UnexpectedNotification)?;
+                    let notification =
+                        ServerNotification::decode_with_raw_params(&request, raw.params.get())
+                            .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
                     let ServerNotification::SubscriptionsAcknowledged(ack) = notification else {
                         return Err(ManagedCoreError::UnexpectedNotification.into());
                     };
@@ -394,7 +500,9 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
             }
         };
         // Commit selection and quotas atomically after all admission succeeds.
-        if let Some(accepted) = accepted { self.accepted = Some(accepted); }
+        if let Some(accepted) = accepted {
+            self.accepted = Some(accepted);
+        }
         match &event {
             StreamEvent::Notification(_) => self.notifications += 1,
             StreamEvent::Result(_) => {
@@ -405,7 +513,9 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
         Ok(event)
     }
 
-    fn usage(&self) -> (usize, usize) { (self.bytes, self.notifications) }
+    fn usage(&self) -> (usize, usize) {
+        (self.bytes, self.notifications)
+    }
 }
 
 #[cfg(test)]

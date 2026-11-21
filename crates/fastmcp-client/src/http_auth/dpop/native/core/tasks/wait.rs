@@ -13,12 +13,12 @@ use asupersync::Time;
 use asupersync::time::Sleep;
 use fastmcp_protocol::ServerNotification;
 
+use super::super::stream::{DpopStreamError, DpopStreamLimits};
 use super::{
     Cx, DpopCredential, DpopHttpClient, DpopHttpError, DpopTaskOperation, DpopTasksError,
     FinalRequestMeta, GetTaskResult, ManagedCoreError, ManagedCoreLimits, ManagedTaskEvent,
     ManagedTaskRequest, McpRequestCancellation, RequestId, Task, TaskId, WaitBounds, check_live,
 };
-use super::super::stream::{DpopStreamError, DpopStreamLimits};
 use crate::http_auth::dpop::DpopSession;
 use crate::http_auth::dpop::native::within;
 
@@ -212,7 +212,9 @@ impl PollState {
     }
 
     fn record_stream(&mut self, usage: (usize, usize)) -> Result<(), DpopTaskWaitError> {
-        let notifications = self.remaining_notifications.checked_sub(usage.1)
+        let notifications = self
+            .remaining_notifications
+            .checked_sub(usage.1)
             .ok_or(ManagedCoreError::NotificationLimit)?;
         // Validate both budgets before committing either. Usage includes the
         // discovery envelope and every admitted SSE payload, not just the get.
@@ -222,11 +224,7 @@ impl PollState {
     }
 }
 
-fn next_poll_time(
-    now: Time,
-    task: &Task,
-    minimum: Duration,
-) -> Result<Time, DpopTaskWaitError> {
+fn next_poll_time(now: Time, task: &Task, minimum: Duration) -> Result<Time, DpopTaskWaitError> {
     let peer = task
         .base()
         .poll_interval_ms
@@ -331,9 +329,17 @@ impl DpopHttpClient {
         limits: ManagedCoreLimits,
     ) -> Result<DpopTaskWaitOutcome, DpopTaskWaitError> {
         self.wait_task_with_events(
-            cx, cancellation, credential, metadata, task_id, id_prefix, policy,
-            DpopStreamLimits::new(limits, limits.timeout())?, |_| true,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task_id,
+            id_prefix,
+            policy,
+            DpopStreamLimits::new(limits, limits.timeout())?,
+            |_| true,
+        )
+        .await
     }
 
     /// Observe one existing Task while delivering validated notifications as
@@ -376,7 +382,11 @@ impl DpopHttpClient {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(DpopHttpError::Cancelled.into());
         }
-        let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
+        let bounds = WaitBounds::new(
+            cx,
+            self.policy.timeout.min(limits.core.timeout()),
+            credential,
+        )?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let mut state = PollState::new(id_prefix, policy, limits.core)?;
         let mut due = cx.now();
@@ -428,9 +438,9 @@ mod tests;
 
 #[cfg(test)]
 mod stream_accounting_tests {
-    use super::*;
-    use super::super::{DpopCoreError, DpopHttpResponse, Prepared, TASKS_EXTENSION};
     use super::super::stream::TaskStreamDecoder;
+    use super::super::{DpopCoreError, DpopHttpResponse, Prepared, TASKS_EXTENSION};
+    use super::*;
     use crate::http_auth::dpop::native::core::stream::{StreamDecoder, StreamEvent};
     use fastmcp_protocol::ClientCapabilities;
     use serde_json::json;
@@ -444,17 +454,28 @@ mod stream_accounting_tests {
         let id = operation.operation_id.clone();
         let discovery_id = operation.discovery_id.clone();
         let prepared = Prepared::new(
-            "https://mcp.example/mcp", FinalRequestMeta::new(ClientCapabilities::default()),
-            operation, limits, 4096,
-        ).unwrap();
+            "https://mcp.example/mcp",
+            FinalRequestMeta::new(ClientCapabilities::default()),
+            operation,
+            limits,
+            4096,
+        )
+        .unwrap();
         let body = serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":discovery_id, "result":{
             "resultType":"complete", "supportedVersions":[super::super::super::FINAL_PROTOCOL_VERSION],
             "capabilities":{"extensions":{TASKS_EXTENSION:{}}}, "ttlMs":0, "cacheScope":"private",
             "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"peer","version":"1"}}
         }})).unwrap();
         let bytes = body.len();
-        let admitted = prepared.admit(DpopHttpResponse { status:200, headers:vec![], body }).unwrap();
-        let (_, decoder) = TaskStreamDecoder::with_usage(admitted, limits, (bytes, 0), None).unwrap();
+        let admitted = prepared
+            .admit(DpopHttpResponse {
+                status: 200,
+                headers: vec![],
+                body,
+            })
+            .unwrap();
+        let (_, decoder) =
+            TaskStreamDecoder::with_usage(admitted, limits, (bytes, 0), None).unwrap();
         (decoder, id)
     }
 
@@ -463,7 +484,8 @@ mod stream_accounting_tests {
             "resultType":"complete", "taskId":"task-one", "status":"working",
             "createdAt":"2026-09-16T00:00:00Z", "lastUpdatedAt":"2026-09-16T00:00:00Z",
             "ttlMs":null
-        }})).unwrap()
+        }}))
+        .unwrap()
     }
 
     #[test]
@@ -471,9 +493,14 @@ mod stream_accounting_tests {
         let mut state = PollState::new("stream", DpopTaskWaitPolicy::default(), limits(1)).unwrap();
         let notification = br#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
         let (mut first, id) = decoder(&mut state);
-        assert!(matches!(first.admit(notification, true), Ok(StreamEvent::Notification(_))));
-        assert!(matches!(first.admit(&snapshot(&id), true),
-            Ok(StreamEvent::Result(ManagedTaskEvent::Snapshot(_)))));
+        assert!(matches!(
+            first.admit(notification, true),
+            Ok(StreamEvent::Notification(_))
+        ));
+        assert!(matches!(
+            first.admit(&snapshot(&id), true),
+            Ok(StreamEvent::Result(ManagedTaskEvent::Snapshot(_)))
+        ));
         let usage = first.usage();
         state.record_stream(usage).unwrap();
         assert_eq!(state.remaining_bytes, state.limits.total_bytes() - usage.0);
@@ -481,15 +508,24 @@ mod stream_accounting_tests {
 
         let (mut second, id) = decoder(&mut state);
         let before = second.usage();
-        assert!(matches!(second.admit(notification, true),
-            Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::NotificationLimit)))));
+        assert!(matches!(
+            second.admit(notification, true),
+            Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                ManagedCoreError::NotificationLimit
+            )))
+        ));
         assert_eq!(second.usage(), before);
         // Changing only the extra notification to a terminal remains valid.
-        assert!(matches!(second.admit(&snapshot(&id), true),
-            Ok(StreamEvent::Result(ManagedTaskEvent::Snapshot(_)))));
+        assert!(matches!(
+            second.admit(&snapshot(&id), true),
+            Ok(StreamEvent::Result(ManagedTaskEvent::Snapshot(_)))
+        ));
         state.record_stream(second.usage()).unwrap();
         assert_eq!(state.remaining_notifications, 0);
-        assert_eq!(state.remaining_bytes, state.limits.total_bytes() - usage.0 - second.usage().0);
+        assert_eq!(
+            state.remaining_bytes,
+            state.limits.total_bytes() - usage.0 - second.usage().0
+        );
     }
 
     #[test]
@@ -497,11 +533,20 @@ mod stream_accounting_tests {
         let mut state = PollState::new("stream", DpopTaskWaitPolicy::default(), limits(1)).unwrap();
         let before = (state.remaining_bytes, state.remaining_notifications);
         assert!(state.record_stream((1, 2)).is_err());
-        assert_eq!((state.remaining_bytes, state.remaining_notifications), before);
+        assert_eq!(
+            (state.remaining_bytes, state.remaining_notifications),
+            before
+        );
         assert!(state.record_stream((before.0 + 1, 1)).is_err());
-        assert_eq!((state.remaining_bytes, state.remaining_notifications), before);
+        assert_eq!(
+            (state.remaining_bytes, state.remaining_notifications),
+            before
+        );
         state.record_stream(before).unwrap();
-        assert_eq!((state.remaining_bytes, state.remaining_notifications), (0, 0));
+        assert_eq!(
+            (state.remaining_bytes, state.remaining_notifications),
+            (0, 0)
+        );
         assert!(state.check_available().is_err());
     }
 
@@ -511,16 +556,22 @@ mod stream_accounting_tests {
         let task = DpopTaskWaitError::from(DpopStreamError::Task(DpopTasksError::Task(
             ManagedTasksError::TaskIdMismatch,
         )));
-        assert!(matches!(task, DpopTaskWaitError::Task(DpopTasksError::Task(
-            ManagedTasksError::TaskIdMismatch,
-        ))));
-        let cancelled = DpopTaskWaitError::from(DpopStreamError::Core(
-            DpopCoreError::Transport(DpopHttpError::Cancelled),
+        assert!(matches!(
+            task,
+            DpopTaskWaitError::Task(DpopTasksError::Task(ManagedTasksError::TaskIdMismatch,))
         ));
-        assert!(matches!(cancelled, DpopTaskWaitError::Task(DpopTasksError::Core(
-            DpopCoreError::Transport(DpopHttpError::Cancelled),
-        ))));
-        assert!(matches!(DpopTaskWaitError::from(DpopStreamError::ObserverStopped),
-            DpopTaskWaitError::Stream(DpopStreamError::ObserverStopped)));
+        let cancelled = DpopTaskWaitError::from(DpopStreamError::Core(DpopCoreError::Transport(
+            DpopHttpError::Cancelled,
+        )));
+        assert!(matches!(
+            cancelled,
+            DpopTaskWaitError::Task(DpopTasksError::Core(DpopCoreError::Transport(
+                DpopHttpError::Cancelled
+            ),))
+        ));
+        assert!(matches!(
+            DpopTaskWaitError::from(DpopStreamError::ObserverStopped),
+            DpopTaskWaitError::Stream(DpopStreamError::ObserverStopped)
+        ));
     }
 }

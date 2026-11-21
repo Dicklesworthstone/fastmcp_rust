@@ -1410,7 +1410,8 @@ impl OAuthServerConfig {
         validate_oauth_issuer(&self.issuer)?;
 
         #[cfg(feature = "builtin-auth-server")]
-        if self.development_introspection_profile == DevelopmentIntrospectionProfile::ResourceEvidence
+        if self.development_introspection_profile
+            == DevelopmentIntrospectionProfile::ResourceEvidence
             && (!self.allow_development_token_introspection
                 || self.access_token_lifetime.subsec_nanos() != 0)
         {
@@ -1689,10 +1690,7 @@ impl DevelopmentPrivateKeyJwtPolicy {
         validate_oauth_issuer(&issuer)?;
         validate_client_id_admission(&client_id)?;
         validate_client_assertion_endpoint(&token_endpoint)?;
-        if configuration_generation == 0
-            || client_id == issuer
-            || client_id == token_endpoint
-        {
+        if configuration_generation == 0 || client_id == issuer || client_id == token_endpoint {
             return Err(OAuthError::InvalidRequest(
                 "invalid development client assertion registration".to_string(),
             ));
@@ -2040,11 +2038,9 @@ struct Argon2ConcurrencyGuard;
 impl Argon2ConcurrencyGuard {
     fn try_acquire() -> Option<Self> {
         ACTIVE_ARGON2_VERIFICATIONS
-            .try_update(
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-                |current| (current < MAX_CONCURRENT_ARGON2_VERIFICATIONS).then_some(current + 1),
-            )
+            .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+                (current < MAX_CONCURRENT_ARGON2_VERIFICATIONS).then_some(current + 1)
+            })
             .ok()
             .map(|_| Self)
     }
@@ -2423,7 +2419,8 @@ impl OAuthClient {
         let credential_class_is_consistent = matches!(
             (self.client_type, self.client_secret.is_some()),
             (ClientType::Public, false) | (ClientType::Confidential, true)
-        ) || (private_key_client && self.client_type == ClientType::Confidential);
+        ) || (private_key_client
+            && self.client_type == ClientType::Confidential);
         if !credential_class_is_consistent {
             return Err(OAuthError::InvalidRequest(
                 OAUTH_CLIENT_CREDENTIAL_CLASS_ERROR.to_string(),
@@ -3269,9 +3266,7 @@ impl DevelopmentIntrospectionClock {
 
 #[cfg(feature = "builtin-auth-server")]
 fn development_introspection_clock_unavailable() -> OAuthError {
-    OAuthError::TemporarilyUnavailable(
-        "development introspection clock is unavailable".to_string(),
-    )
+    OAuthError::TemporarilyUnavailable("development introspection clock is unavailable".to_string())
 }
 
 struct TokenIssuanceClock {
@@ -3822,10 +3817,13 @@ impl VerifiedDevelopmentClientAssertion {
             .ok_or_else(invalid_client_assertion)?;
         if client.registration_epoch != self.registration_epoch
             || client.metadata.token_endpoint_auth_method != TokenEndpointAuthMethod::PrivateKeyJwt
-            || client.development_private_key_jwt.as_ref().is_none_or(|policy| {
-                policy.configuration_generation != self.policy.configuration_generation
-                    || !Arc::ptr_eq(policy, &self.policy)
-            })
+            || client
+                .development_private_key_jwt
+                .as_ref()
+                .is_none_or(|policy| {
+                    policy.configuration_generation != self.policy.configuration_generation
+                        || !Arc::ptr_eq(policy, &self.policy)
+                })
         {
             return Err(invalid_client_assertion());
         }
@@ -3833,7 +3831,9 @@ impl VerifiedDevelopmentClientAssertion {
         if now < state.client_assertion_time_floor
             || self.issued_at_unix_seconds > now
             || self.expires_at_unix_seconds <= now
-            || self.not_before_unix_seconds.is_some_and(|not_before| not_before > now)
+            || self
+                .not_before_unix_seconds
+                .is_some_and(|not_before| not_before > now)
             || state
                 .client_assertion_replays
                 .get(&self.replay_key)
@@ -3981,9 +3981,15 @@ impl OAuthServerState {
         let access = self.access_tokens.get(&access_digest).cloned();
         let refresh = self.refresh_tokens.get(&refresh_digest).cloned();
         let refresh_tombstone = self.revoked_tokens.get(&refresh_digest).cloned();
-        if access.as_ref().is_some_and(|entry| entry.client_id != client_id)
-            || refresh.as_ref().is_some_and(|entry| entry.client_id != client_id)
-            || refresh_tombstone.as_ref().is_some_and(|entry| entry.client_id != client_id)
+        if access
+            .as_ref()
+            .is_some_and(|entry| entry.client_id != client_id)
+            || refresh
+                .as_ref()
+                .is_some_and(|entry| entry.client_id != client_id)
+            || refresh_tombstone
+                .as_ref()
+                .is_some_and(|entry| entry.client_id != client_id)
         {
             // RFC 7009 makes unknown tokens and other clients' tokens
             // indistinguishable. The ownership decision and removal share
@@ -4538,14 +4544,19 @@ impl OAuthServer {
         let state = self.state.read().map_err(|_| {
             OAuthError::TemporarilyUnavailable("client registration is unavailable".to_string())
         })?;
-        let client = state.clients.get(client_id).ok_or_else(invalid_client_key_rotation)?;
+        let client = state
+            .clients
+            .get(client_id)
+            .ok_or_else(invalid_client_key_rotation)?;
         if client.metadata.client_type != ClientType::Confidential
             || client.metadata.token_endpoint_auth_method != TokenEndpointAuthMethod::PrivateKeyJwt
             || client.metadata.development_client_credentials.is_none()
         {
             return Err(invalid_client_key_rotation());
         }
-        let policy = client.development_private_key_jwt.as_ref()
+        let policy = client
+            .development_private_key_jwt
+            .as_ref()
             .ok_or_else(invalid_client_key_rotation)?;
         if policy.issuer != self.config.issuer || policy.client_id != client_id {
             return Err(invalid_client_key_rotation());
@@ -4594,16 +4605,21 @@ impl OAuthServer {
         let mut state = self.state.write().map_err(|_| {
             OAuthError::TemporarilyUnavailable("client registration is unavailable".to_string())
         })?;
-        let client = state.clients.get_mut(&previous.client_id)
+        let client = state
+            .clients
+            .get_mut(&previous.client_id)
             .ok_or_else(invalid_client_key_rotation)?;
         if client.registration_epoch != target.registration_epoch
             || client.metadata.client_type != ClientType::Confidential
             || client.metadata.token_endpoint_auth_method != TokenEndpointAuthMethod::PrivateKeyJwt
             || client.metadata.development_client_credentials.is_none()
-            || client.development_private_key_jwt.as_ref().is_none_or(|current| {
-                current.configuration_generation != previous.configuration_generation
-                    || !Arc::ptr_eq(current, previous)
-            })
+            || client
+                .development_private_key_jwt
+                .as_ref()
+                .is_none_or(|current| {
+                    current.configuration_generation != previous.configuration_generation
+                        || !Arc::ptr_eq(current, previous)
+                })
         {
             return Err(invalid_client_key_rotation());
         }
@@ -5082,7 +5098,8 @@ impl OAuthServer {
     ) -> Result<TokenResponse, OAuthError> {
         validate_optional_authorization_resource(Some(resource))?;
         let scopes = canonicalize_request_scopes(scopes)?;
-        let verified = self.verify_development_client_assertion(assertion, token_endpoint, false)?;
+        let verified =
+            self.verify_development_client_assertion(assertion, token_endpoint, false)?;
         let request = TokenRequest {
             grant_type: "client_credentials".to_string(),
             code: None,
@@ -5143,15 +5160,24 @@ impl OAuthServer {
             let state = self.state.read().map_err(|_| {
                 OAuthError::TemporarilyUnavailable("client registration is unavailable".to_string())
             })?;
-            let client = state.clients.get(client_id).ok_or_else(invalid_client_assertion)?;
+            let client = state
+                .clients
+                .get(client_id)
+                .ok_or_else(invalid_client_assertion)?;
             if client.metadata.client_type != ClientType::Confidential
-                || client.metadata.token_endpoint_auth_method != TokenEndpointAuthMethod::PrivateKeyJwt
+                || client.metadata.token_endpoint_auth_method
+                    != TokenEndpointAuthMethod::PrivateKeyJwt
                 || client.metadata.development_client_credentials.is_none()
             {
                 return Err(invalid_client_assertion());
             }
             (
-                Arc::clone(client.development_private_key_jwt.as_ref().ok_or_else(invalid_client_assertion)?),
+                Arc::clone(
+                    client
+                        .development_private_key_jwt
+                        .as_ref()
+                        .ok_or_else(invalid_client_assertion)?,
+                ),
                 client.registration_epoch,
             )
         };
@@ -5177,15 +5203,15 @@ impl OAuthServer {
             .get("nbf")
             .map(|value| value.as_u64().ok_or_else(invalid_client_assertion))
             .transpose()?;
-        let lifetime = expires_at_unix_seconds.checked_sub(issued_at_unix_seconds)
+        let lifetime = expires_at_unix_seconds
+            .checked_sub(issued_at_unix_seconds)
             .ok_or_else(invalid_client_assertion)?;
         let now = client_assertion_unix_seconds()?;
         if !(1..=MAX_DEVELOPMENT_CLIENT_ASSERTION_LIFETIME_SECONDS).contains(&lifetime)
             || issued_at_unix_seconds > now
             || expires_at_unix_seconds <= now
-            || not_before_unix_seconds.is_some_and(|not_before| {
-                not_before > now || not_before >= expires_at_unix_seconds
-            })
+            || not_before_unix_seconds
+                .is_some_and(|not_before| not_before > now || not_before >= expires_at_unix_seconds)
         {
             return Err(invalid_client_assertion());
         }
@@ -5199,7 +5225,9 @@ impl OAuthServer {
             })
             .ok_or_else(invalid_client_assertion)?;
         const MAX_REPLAY_INPUT: usize = CLIENT_ASSERTION_REPLAY_DOMAIN.len()
-            + 16 + MAX_OAUTH_CLIENT_ID_BYTES + MAX_CLIENT_ASSERTION_JTI_BYTES;
+            + 16
+            + MAX_OAUTH_CLIENT_ID_BYTES
+            + MAX_CLIENT_ASSERTION_JTI_BYTES;
         let mut replay_input = Zeroizing::new(Vec::with_capacity(MAX_REPLAY_INPUT));
         replay_input.extend_from_slice(CLIENT_ASSERTION_REPLAY_DOMAIN);
         for value in [client_id, jti] {
@@ -5930,7 +5958,8 @@ impl OAuthServer {
         token: &str,
     ) -> Result<(), OAuthError> {
         let admitted_token = admit_revocation_token_value(token)?;
-        let verified = self.verify_development_client_assertion(assertion, revocation_endpoint, true)?;
+        let verified =
+            self.verify_development_client_assertion(assertion, revocation_endpoint, true)?;
         let mut state = self.state.write().map_err(|_| {
             OAuthError::TemporarilyUnavailable("client registration is unavailable".to_string())
         })?;
@@ -5991,18 +6020,19 @@ impl OAuthServer {
                 "introspection token is outside admitted bounds".to_string(),
             ));
         }
-        let authentication_failed = || {
-            OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string())
-        };
+        let authentication_failed =
+            || OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string());
         if !self.config.allow_development_token_introspection {
             return Err(authentication_failed());
         }
         let state = self.state.try_read().map_err(|_| {
             OAuthError::TemporarilyUnavailable("OAuth issuer state is unavailable".to_string())
         })?;
-        let caller_epoch =
-            authenticate_client_or_dummy(&state, client_id, client_secret, method)?;
-        let caller = state.clients.get(client_id).ok_or_else(authentication_failed)?;
+        let caller_epoch = authenticate_client_or_dummy(&state, client_id, client_secret, method)?;
+        let caller = state
+            .clients
+            .get(client_id)
+            .ok_or_else(authentication_failed)?;
         if caller.registration_epoch != caller_epoch
             || caller.metadata.client_type != ClientType::Confidential
             || method != TokenEndpointAuthMethod::ClientSecretBasic
@@ -6037,9 +6067,10 @@ impl OAuthServer {
             || stored.expires_at <= now
             || stored.family_expires_at <= now
             || stored.resource.as_deref() != Some(grant.resource.as_str())
-            || !state.clients.get(&stored.client_id).is_some_and(|owner| {
-                owner.registration_epoch == stored.registration_epoch
-            })
+            || !state
+                .clients
+                .get(&stored.client_id)
+                .is_some_and(|owner| owner.registration_epoch == stored.registration_epoch)
         {
             return Ok(DevelopmentAccessTokenIntrospection::inactive());
         }
@@ -6052,10 +6083,9 @@ impl OAuthServer {
                     return Ok(DevelopmentAccessTokenIntrospection::inactive());
                 };
                 let clock = self.sample_development_introspection_clock()?;
-                let Some(epoch) = epoch.at_lookup(
-                    clock,
-                    stored.expires_at.min(stored.family_expires_at),
-                ) else {
+                let Some(epoch) =
+                    epoch.at_lookup(clock, stored.expires_at.min(stored.family_expires_at))
+                else {
                     return Ok(DevelopmentAccessTokenIntrospection::inactive());
                 };
                 // The same framed identity as local verification preserves
@@ -6647,7 +6677,9 @@ fn client_secret_argon2id_digest(
         ));
     }
     let _permit = Argon2ConcurrencyGuard::try_acquire().ok_or_else(|| {
-        OAuthError::ServerError("Argon2id client-secret verification capacity exhausted".to_string())
+        OAuthError::ServerError(
+            "Argon2id client-secret verification capacity exhausted".to_string(),
+        )
     })?;
     let mut framed = Zeroizing::new(Vec::with_capacity(
         CLIENT_SECRET_VERIFIER_DOMAIN.len() + secret.len(),
@@ -7185,7 +7217,11 @@ mod tests {
         assert!(metadata.redirect_uris.is_empty());
         assert!(metadata.allowed_scopes.is_empty());
         assert_eq!(
-            metadata.development_token_introspection.unwrap().resource().as_str(),
+            metadata
+                .development_token_introspection
+                .unwrap()
+                .resource()
+                .as_str(),
             TEST_MCP_RESOURCE
         );
         let mut mutated = development_introspection_caller("mutated-reader", TEST_MCP_RESOURCE);
@@ -7193,14 +7229,39 @@ mod tests {
         assert!(server.register_client(mutated).is_err());
 
         for (client_id, secret, method) in [
-            ("ordinary-confidential-client", Some("introspection-caller-secret"), TokenEndpointAuthMethod::ClientSecretBasic),
-            ("introspection-token-client", None, TokenEndpointAuthMethod::None),
-            ("unknown-reader", Some("introspection-caller-secret"), TokenEndpointAuthMethod::ClientSecretBasic),
-            ("resource-reader", Some("wrong-secret"), TokenEndpointAuthMethod::ClientSecretBasic),
-            ("resource-reader", Some("introspection-caller-secret"), TokenEndpointAuthMethod::ClientSecretPost),
+            (
+                "ordinary-confidential-client",
+                Some("introspection-caller-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            ),
+            (
+                "introspection-token-client",
+                None,
+                TokenEndpointAuthMethod::None,
+            ),
+            (
+                "unknown-reader",
+                Some("introspection-caller-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            ),
+            (
+                "resource-reader",
+                Some("wrong-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            ),
+            (
+                "resource-reader",
+                Some("introspection-caller-secret"),
+                TokenEndpointAuthMethod::ClientSecretPost,
+            ),
         ] {
             let error = server
-                .introspect_development_access_token(&issued.access_token, client_id, secret, method)
+                .introspect_development_access_token(
+                    &issued.access_token,
+                    client_id,
+                    secret,
+                    method,
+                )
                 .unwrap_err();
             assert!(matches!(error, OAuthError::InvalidClient(_)));
             assert_eq!(error.description(), OAUTH_CLIENT_AUTHENTICATION_ERROR);
@@ -7221,15 +7282,18 @@ mod tests {
         assert_eq!(active.resource(), Some(TEST_MCP_RESOURCE));
         assert_eq!(active.issuer(), Some("https://fastmcp.invalid/"));
         let wire = serde_json::to_value(&active).unwrap();
-        assert_eq!(wire, serde_json::json!({
-            "active": true,
-            "scope": "read",
-            "client_id": "introspection-token-client",
-            "token_type": "bearer",
-            "sub": "approved-subject",
-            "aud": TEST_MCP_RESOURCE,
-            "iss": "https://fastmcp.invalid/"
-        }));
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "active": true,
+                "scope": "read",
+                "client_id": "introspection-token-client",
+                "token_type": "bearer",
+                "sub": "approved-subject",
+                "aud": TEST_MCP_RESOURCE,
+                "iss": "https://fastmcp.invalid/"
+            })
+        );
         let debug = format!("{active:?}");
         for sensitive in [
             issued.access_token.as_str(),
@@ -7241,10 +7305,18 @@ mod tests {
             assert!(!debug.contains(sensitive));
         }
         assert!(!wire.to_string().contains(&issued.access_token));
-        assert!(!wire.to_string().contains(issued.refresh_token.as_deref().unwrap()));
+        assert!(
+            !wire
+                .to_string()
+                .contains(issued.refresh_token.as_deref().unwrap())
+        );
 
         let unknown = base64url_encode(&[0x55; 32]);
-        for token in [unknown.as_str(), "foreign-token", issued.refresh_token.as_deref().unwrap()] {
+        for token in [
+            unknown.as_str(),
+            "foreign-token",
+            issued.refresh_token.as_deref().unwrap(),
+        ] {
             assert_eq!(
                 serde_json::to_value(development_introspect(&server, token)).unwrap(),
                 serde_json::json!({ "active": false })
@@ -7258,12 +7330,18 @@ mod tests {
                 TokenEndpointAuthMethod::ClientSecretBasic,
             )
             .unwrap();
-        assert_eq!(serde_json::to_value(foreign).unwrap(), serde_json::json!({ "active": false }));
+        assert_eq!(
+            serde_json::to_value(foreign).unwrap(),
+            serde_json::json!({ "active": false })
+        );
         let (code, _) = server
             .authorize(&bounded_authorization_request("introspection-token-client"))
             .unwrap();
         let unbound = server
-            .token(&bounded_code_exchange_request("introspection-token-client", &code))
+            .token(&bounded_code_exchange_request(
+                "introspection-token-client",
+                &code,
+            ))
             .unwrap();
         assert_eq!(
             serde_json::to_value(development_introspect(&server, &unbound.access_token)).unwrap(),
@@ -7277,13 +7355,20 @@ mod tests {
             .unwrap();
         let scope_free = server
             .token(&resource_code_exchange_request(
-                "introspection-token-client", &code, TEST_MCP_RESOURCE,
+                "introspection-token-client",
+                &code,
+                TEST_MCP_RESOURCE,
             ))
             .unwrap();
         let scope_free = development_introspect(&server, &scope_free.access_token);
         assert!(scope_free.is_active());
         assert!(scope_free.scope().is_none());
-        assert!(serde_json::to_value(scope_free).unwrap().get("scope").is_none());
+        assert!(
+            serde_json::to_value(scope_free)
+                .unwrap()
+                .get("scope")
+                .is_none()
+        );
         assert!(development_introspect(&server, &issued.access_token).is_active());
     }
 
@@ -7291,7 +7376,8 @@ mod tests {
     #[test]
     fn development_introspection_is_nonblocking_and_does_not_clean_or_extend_state() {
         let (server, issued) = development_introspection_fixture(true);
-        let canary = insert_expired_authorization_code_cleanup_canary(&server, "introspection-token-client");
+        let canary =
+            insert_expired_authorization_code_cleanup_canary(&server, "introspection-token-client");
         let digest = access_token_digest(&issued.access_token);
         let original = server.state.read().unwrap().access_tokens[&digest].clone();
         assert!(development_introspect(&server, &issued.access_token).is_active());
@@ -7304,32 +7390,52 @@ mod tests {
             let _held_mutation = server.state.write().unwrap();
             assert!(matches!(
                 server.introspect_development_access_token(
-                    &issued.access_token, "resource-reader",
+                    &issued.access_token,
+                    "resource-reader",
                     Some("introspection-caller-secret"),
                     TokenEndpointAuthMethod::ClientSecretBasic,
                 ),
                 Err(OAuthError::TemporarilyUnavailable(_))
             ));
         }
-        for boundary in ["access-expiry", "family-expiry", "owner-epoch", "not-yet-issued"] {
+        for boundary in [
+            "access-expiry",
+            "family-expiry",
+            "owner-epoch",
+            "not-yet-issued",
+        ] {
             let mut candidate = original.clone();
             match boundary {
                 "access-expiry" => candidate.metadata.expires_at = Instant::now(),
                 "family-expiry" => candidate.family_expires_at = Instant::now(),
                 "owner-epoch" => candidate.registration_epoch = test_registration_epoch(0x99),
-                "not-yet-issued" => candidate.metadata.issued_at = Instant::now() + Duration::from_secs(60),
+                "not-yet-issued" => {
+                    candidate.metadata.issued_at = Instant::now() + Duration::from_secs(60)
+                }
                 _ => unreachable!(),
             }
-            server.state.write().unwrap().access_tokens.insert(digest, candidate.clone());
+            server
+                .state
+                .write()
+                .unwrap()
+                .access_tokens
+                .insert(digest, candidate.clone());
             assert_eq!(
-                serde_json::to_value(development_introspect(&server, &issued.access_token)).unwrap(),
-                serde_json::json!({ "active": false }), "{boundary}"
+                serde_json::to_value(development_introspect(&server, &issued.access_token))
+                    .unwrap(),
+                serde_json::json!({ "active": false }),
+                "{boundary}"
             );
             let state = server.state.read().unwrap();
             assert!(state.authorization_codes.contains_key(&canary));
             assert_retained_token_unchanged(&candidate, &state.access_tokens[&digest]);
         }
-        server.state.write().unwrap().access_tokens.insert(digest, original);
+        server
+            .state
+            .write()
+            .unwrap()
+            .access_tokens
+            .insert(digest, original);
         assert!(development_introspect(&server, &issued.access_token).is_active());
     }
 
@@ -7340,23 +7446,37 @@ mod tests {
             let (server, issued) = development_introspection_fixture(true);
             let refresh = issued.refresh_token.as_deref().unwrap();
             let rotated = server
-                .token(&bounded_refresh_request("introspection-token-client", refresh))
+                .token(&bounded_refresh_request(
+                    "introspection-token-client",
+                    refresh,
+                ))
                 .unwrap();
             assert!(development_introspect(&server, &rotated.access_token).is_active());
             assert_eq!(
-                serde_json::to_value(development_introspect(&server, rotated.refresh_token.as_deref().unwrap())).unwrap(),
+                serde_json::to_value(development_introspect(
+                    &server,
+                    rotated.refresh_token.as_deref().unwrap()
+                ))
+                .unwrap(),
                 serde_json::json!({ "active": false })
             );
             if reuse_old_refresh {
                 assert!(matches!(
-                    server.token(&bounded_refresh_request("introspection-token-client", refresh)),
+                    server.token(&bounded_refresh_request(
+                        "introspection-token-client",
+                        refresh
+                    )),
                     Err(OAuthError::InvalidGrant(_))
                 ));
             } else {
-                server.revoke(
-                    rotated.refresh_token.as_deref().unwrap(), "introspection-token-client",
-                    None, TokenEndpointAuthMethod::None,
-                ).unwrap();
+                server
+                    .revoke(
+                        rotated.refresh_token.as_deref().unwrap(),
+                        "introspection-token-client",
+                        None,
+                        TokenEndpointAuthMethod::None,
+                    )
+                    .unwrap();
             }
             for token in [&issued.access_token, &rotated.access_token] {
                 assert_eq!(
@@ -7373,32 +7493,53 @@ mod tests {
         let (server, issued) = development_introspection_fixture(true);
         assert!(development_introspect(&server, &issued.access_token).is_active());
         server.unregister_client("resource-reader").unwrap();
-        server.register_client(
-            OAuthClient::builder("resource-reader")
-                .secret("introspection-caller-secret")
-                .redirect_uri("http://127.0.0.1/callback")
-                .build().unwrap(),
-        ).unwrap();
+        server
+            .register_client(
+                OAuthClient::builder("resource-reader")
+                    .secret("introspection-caller-secret")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
         assert!(matches!(
             server.introspect_development_access_token(
-                &issued.access_token, "resource-reader", Some("introspection-caller-secret"),
+                &issued.access_token,
+                "resource-reader",
+                Some("introspection-caller-secret"),
                 TokenEndpointAuthMethod::ClientSecretBasic,
-            ), Err(OAuthError::InvalidClient(_))
+            ),
+            Err(OAuthError::InvalidClient(_))
         ));
         server.unregister_client("resource-reader").unwrap();
-        server.register_client(development_introspection_caller(
-            "resource-reader", "https://other.example/api",
-        )).unwrap();
+        server
+            .register_client(development_introspection_caller(
+                "resource-reader",
+                "https://other.example/api",
+            ))
+            .unwrap();
         assert!(!development_introspect(&server, &issued.access_token).is_active());
         server.unregister_client("resource-reader").unwrap();
-        server.register_client(development_introspection_caller("resource-reader", TEST_MCP_RESOURCE)).unwrap();
+        server
+            .register_client(development_introspection_caller(
+                "resource-reader",
+                TEST_MCP_RESOURCE,
+            ))
+            .unwrap();
         assert!(development_introspect(&server, &issued.access_token).is_active());
 
-        server.unregister_client("introspection-token-client").unwrap();
-        server.register_client(
-            OAuthClient::builder("introspection-token-client")
-                .redirect_uri("http://127.0.0.1/callback").scope("read").build().unwrap(),
-        ).unwrap();
+        server
+            .unregister_client("introspection-token-client")
+            .unwrap();
+        server
+            .register_client(
+                OAuthClient::builder("introspection-token-client")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             serde_json::to_value(development_introspect(&server, &issued.access_token)).unwrap(),
             serde_json::json!({ "active": false })
@@ -7410,27 +7551,50 @@ mod tests {
     fn development_introspection_routes_and_metadata_require_issuer_opt_in() {
         for enabled in [false, true] {
             let (server, issued) = development_introspection_fixture(enabled);
-            let routes = OAuthHttpRoutes::new(Arc::new(server), "https://fastmcp.invalid/oauth").unwrap();
-            let metadata = serde_json::to_value(routes.authorization_server_metadata().unwrap()).unwrap();
+            let routes =
+                OAuthHttpRoutes::new(Arc::new(server), "https://fastmcp.invalid/oauth").unwrap();
+            let metadata =
+                serde_json::to_value(routes.authorization_server_metadata().unwrap()).unwrap();
             assert_eq!(routes.has_path("/oauth/introspect"), enabled);
-            assert_eq!(routes.introspection_path(), enabled.then_some("/oauth/introspect"));
+            assert_eq!(
+                routes.introspection_path(),
+                enabled.then_some("/oauth/introspect")
+            );
             if enabled {
-                assert_eq!(metadata["introspection_endpoint"], "https://fastmcp.invalid/oauth/introspect");
+                assert_eq!(
+                    metadata["introspection_endpoint"],
+                    "https://fastmcp.invalid/oauth/introspect"
+                );
                 assert_eq!(
                     metadata["introspection_endpoint_auth_methods_supported"],
                     serde_json::json!(["client_secret_basic"])
                 );
-                assert!(routes.validate_non_overlapping_paths(["/oauth/introspect"]).is_err());
+                assert!(
+                    routes
+                        .validate_non_overlapping_paths(["/oauth/introspect"])
+                        .is_err()
+                );
                 assert!(development_introspect(routes.server(), &issued.access_token).is_active());
             } else {
                 assert!(metadata.get("introspection_endpoint").is_none());
-                assert!(metadata.get("introspection_endpoint_auth_methods_supported").is_none());
-                assert!(routes.validate_non_overlapping_paths(["/oauth/introspect"]).is_ok());
+                assert!(
+                    metadata
+                        .get("introspection_endpoint_auth_methods_supported")
+                        .is_none()
+                );
+                assert!(
+                    routes
+                        .validate_non_overlapping_paths(["/oauth/introspect"])
+                        .is_ok()
+                );
                 assert!(matches!(
                     routes.server().introspect_development_access_token(
-                        &issued.access_token, "resource-reader", Some("introspection-caller-secret"),
+                        &issued.access_token,
+                        "resource-reader",
+                        Some("introspection-caller-secret"),
                         TokenEndpointAuthMethod::ClientSecretBasic,
-                    ), Err(OAuthError::InvalidClient(_))
+                    ),
+                    Err(OAuthError::InvalidClient(_))
                 ));
             }
         }
@@ -7483,7 +7647,11 @@ mod tests {
         let promised = Duration::from_secs(capped.expires_at) - later.unix;
         assert!(promised <= family_deadline.duration_since(later.monotonic));
         assert!(epoch.at_lookup(later, later.monotonic).is_none());
-        assert!(epoch.at_lookup(later, later.monotonic + Duration::from_millis(50)).is_none());
+        assert!(
+            epoch
+                .at_lookup(later, later.monotonic + Duration::from_millis(50))
+                .is_none()
+        );
 
         // Even an unobserved clock slowdown cannot extend the lease: every
         // response is capped using the current remaining monotonic lifetime.
@@ -7491,7 +7659,10 @@ mod tests {
             unix: clock.unix + Duration::from_secs(5),
             ..later
         };
-        assert_eq!(epoch.at_lookup(slower_wall, deadline).unwrap().expires_at, 1_700_000_055);
+        assert_eq!(
+            epoch.at_lookup(slower_wall, deadline).unwrap().expires_at,
+            1_700_000_055
+        );
         let jumped_forward = DevelopmentIntrospectionClockSample {
             unix: Duration::from_secs(epoch.expires_at),
             ..later
@@ -7516,32 +7687,42 @@ mod tests {
         assert_eq!(clock.last_unix, Some(first));
 
         let (server, issued) = development_introspection_fixture_with_profile(
-            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+            true,
+            DevelopmentIntrospectionProfile::ResourceEvidence,
         );
         let digest = access_token_digest(&issued.access_token);
         let before = server.state.read().unwrap().access_tokens[&digest].clone();
         let held = server.introspection_clock.lock().unwrap();
         assert!(matches!(
             server.introspect_development_access_token(
-                &issued.access_token, "resource-reader", Some("introspection-caller-secret"),
+                &issued.access_token,
+                "resource-reader",
+                Some("introspection-caller-secret"),
                 TokenEndpointAuthMethod::ClientSecretBasic,
-            ), Err(OAuthError::TemporarilyUnavailable(_))
+            ),
+            Err(OAuthError::TemporarilyUnavailable(_))
         ));
         drop(held);
         assert!(development_introspect(&server, &issued.access_token).is_active());
-        assert_retained_token_unchanged(&before, &server.state.read().unwrap().access_tokens[&digest]);
+        assert_retained_token_unchanged(
+            &before,
+            &server.state.read().unwrap().access_tokens[&digest],
+        );
     }
 
     #[cfg(feature = "builtin-auth-server")]
     #[test]
     fn development_resource_evidence_retains_issuance_and_private_owner_without_state_mutation() {
-        let before_wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let before_wall = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let (server, issued) = development_introspection_fixture_with_profile(
-            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+            true,
+            DevelopmentIntrospectionProfile::ResourceEvidence,
         );
-        let canary = insert_expired_authorization_code_cleanup_canary(
-            &server, "introspection-token-client",
-        );
+        let canary =
+            insert_expired_authorization_code_cleanup_canary(&server, "introspection-token-client");
         let digest = access_token_digest(&issued.access_token);
         let before = server.state.read().unwrap().access_tokens[&digest].clone();
         let active = development_introspect(&server, &issued.access_token);
@@ -7550,19 +7731,35 @@ mod tests {
         assert_eq!(active.subject().unwrap().len(), 43);
         assert_ne!(active.subject(), Some("approved-subject"));
         let expected_owner = oauth_session_owner(
-            &server.config.issuer, &before.client_id, before.registration_epoch,
-            before.subject.as_deref(), before.resource.as_deref(),
-        ).unwrap();
-        assert_eq!(active.subject(), Some(base64url_encode(expected_owner.as_bytes()).as_str()));
+            &server.config.issuer,
+            &before.client_id,
+            before.registration_epoch,
+            before.subject.as_deref(),
+            before.resource.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            active.subject(),
+            Some(base64url_encode(expected_owner.as_bytes()).as_str())
+        );
         assert!(active.issued_at_unix_seconds().unwrap() >= before_wall);
         let retained_epoch = before.introspection_epoch.unwrap();
-        assert_eq!(active.issued_at_unix_seconds(), Some(retained_epoch.issued_at));
+        assert_eq!(
+            active.issued_at_unix_seconds(),
+            Some(retained_epoch.issued_at)
+        );
         assert!(active.expires_at_unix_seconds().unwrap() <= retained_epoch.expires_at);
         assert!(wire["exp"].as_u64().unwrap() > wire["iat"].as_u64().unwrap());
         assert_eq!(wire["client_id"], "introspection-token-client");
         assert_eq!(wire["aud"], TEST_MCP_RESOURCE);
         assert_eq!(wire["iss"], "https://fastmcp.invalid/");
-        for forbidden in ["registration_epoch", "grant_id", "access_token", "refresh_token", "grant_subject"] {
+        for forbidden in [
+            "registration_epoch",
+            "grant_id",
+            "access_token",
+            "refresh_token",
+            "grant_subject",
+        ] {
             assert!(wire.get(forbidden).is_none());
         }
         assert!(!format!("{active:?}").contains(active.subject().unwrap()));
@@ -7575,28 +7772,55 @@ mod tests {
     #[test]
     fn development_resource_evidence_refresh_preserves_owner_and_reuse_revokes_family() {
         let (server, issued) = development_introspection_fixture_with_profile(
-            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+            true,
+            DevelopmentIntrospectionProfile::ResourceEvidence,
         );
         let original = development_introspect(&server, &issued.access_token);
         let refresh = issued.refresh_token.as_deref().unwrap();
         let family_deadline = Instant::now() + Duration::from_secs(120);
-        server.state.write().unwrap().refresh_tokens.get_mut(&refresh_token_digest(refresh))
-            .unwrap().family_expires_at = family_deadline;
-        let refreshed = server.token(&bounded_refresh_request("introspection-token-client", refresh)).unwrap();
+        server
+            .state
+            .write()
+            .unwrap()
+            .refresh_tokens
+            .get_mut(&refresh_token_digest(refresh))
+            .unwrap()
+            .family_expires_at = family_deadline;
+        let refreshed = server
+            .token(&bounded_refresh_request(
+                "introspection-token-client",
+                refresh,
+            ))
+            .unwrap();
         let active = development_introspect(&server, &refreshed.access_token);
         assert_eq!(active.subject(), original.subject());
         assert_eq!(active.scope(), original.scope());
-        assert!(active.issued_at_unix_seconds().unwrap() >= original.issued_at_unix_seconds().unwrap());
-        assert!(active.expires_at_unix_seconds().unwrap() < original.expires_at_unix_seconds().unwrap());
-        let stored = server.state.read().unwrap().access_tokens[&access_token_digest(&refreshed.access_token)].clone();
+        assert!(
+            active.issued_at_unix_seconds().unwrap() >= original.issued_at_unix_seconds().unwrap()
+        );
+        assert!(
+            active.expires_at_unix_seconds().unwrap() < original.expires_at_unix_seconds().unwrap()
+        );
+        let stored = server.state.read().unwrap().access_tokens
+            [&access_token_digest(&refreshed.access_token)]
+            .clone();
         assert_eq!(stored.expires_at, family_deadline);
-        assert!(!development_introspect(&server, refreshed.refresh_token.as_deref().unwrap()).is_active());
+        assert!(
+            !development_introspect(&server, refreshed.refresh_token.as_deref().unwrap())
+                .is_active()
+        );
         assert!(matches!(
-            server.token(&bounded_refresh_request("introspection-token-client", refresh)),
+            server.token(&bounded_refresh_request(
+                "introspection-token-client",
+                refresh
+            )),
             Err(OAuthError::InvalidGrant(_))
         ));
         for access in [&issued.access_token, &refreshed.access_token] {
-            assert_eq!(serde_json::to_value(development_introspect(&server, access)).unwrap(), serde_json::json!({"active":false}));
+            assert_eq!(
+                serde_json::to_value(development_introspect(&server, access)).unwrap(),
+                serde_json::json!({"active":false})
+            );
         }
     }
 
@@ -7604,18 +7828,39 @@ mod tests {
     #[test]
     fn development_resource_evidence_missing_epochs_and_foreign_resources_are_inactive() {
         let (server, issued) = development_introspection_fixture_with_profile(
-            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+            true,
+            DevelopmentIntrospectionProfile::ResourceEvidence,
         );
         let digest = access_token_digest(&issued.access_token);
         let before = server.state.read().unwrap().access_tokens[&digest].clone();
-        let foreign = server.introspect_development_access_token(
-            &issued.access_token, "other-resource-reader", Some("introspection-caller-secret"),
-            TokenEndpointAuthMethod::ClientSecretBasic,
-        ).unwrap();
-        assert_eq!(serde_json::to_value(foreign).unwrap(), serde_json::json!({"active":false}));
-        assert_retained_token_unchanged(&before, &server.state.read().unwrap().access_tokens[&digest]);
-        server.state.write().unwrap().access_tokens.get_mut(&digest).unwrap().introspection_epoch = None;
-        assert_eq!(serde_json::to_value(development_introspect(&server, &issued.access_token)).unwrap(), serde_json::json!({"active":false}));
+        let foreign = server
+            .introspect_development_access_token(
+                &issued.access_token,
+                "other-resource-reader",
+                Some("introspection-caller-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(foreign).unwrap(),
+            serde_json::json!({"active":false})
+        );
+        assert_retained_token_unchanged(
+            &before,
+            &server.state.read().unwrap().access_tokens[&digest],
+        );
+        server
+            .state
+            .write()
+            .unwrap()
+            .access_tokens
+            .get_mut(&digest)
+            .unwrap()
+            .introspection_epoch = None;
+        assert_eq!(
+            serde_json::to_value(development_introspect(&server, &issued.access_token)).unwrap(),
+            serde_json::json!({"active":false})
+        );
         let state = server.state.read().unwrap();
         assert_eq!(state.access_tokens.len(), 1);
         assert_eq!(state.refresh_tokens.len(), 1);
@@ -7626,26 +7871,39 @@ mod tests {
     #[test]
     fn development_resource_evidence_clock_failure_does_not_consume_code_or_refresh() {
         let (server, issued) = development_introspection_fixture_with_profile(
-            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+            true,
+            DevelopmentIntrospectionProfile::ResourceEvidence,
         );
-        let (code, _) = server.authorize(&approved_resource_request("introspection-token-client")).unwrap();
+        let (code, _) = server
+            .authorize(&approved_resource_request("introspection-token-client"))
+            .unwrap();
         let access_digest = access_token_digest(&issued.access_token);
         let refresh = issued.refresh_token.as_deref().unwrap();
         let refresh_digest = refresh_token_digest(refresh);
         let before_access = server.state.read().unwrap().access_tokens[&access_digest].clone();
         let before_refresh = server.state.read().unwrap().refresh_tokens[&refresh_digest].clone();
         server.introspection_clock.lock().unwrap().last_unix = Some(
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap() + Duration::from_secs(60),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                + Duration::from_secs(60),
         );
         for request in [
             resource_code_exchange_request("introspection-token-client", &code, TEST_MCP_RESOURCE),
             bounded_refresh_request("introspection-token-client", refresh),
         ] {
-            assert!(matches!(server.token(&request), Err(OAuthError::TemporarilyUnavailable(_))));
+            assert!(matches!(
+                server.token(&request),
+                Err(OAuthError::TemporarilyUnavailable(_))
+            ));
         }
         assert!(server.introspection_clock.lock().unwrap().rollback_observed);
         let state = server.state.read().unwrap();
-        assert!(state.authorization_codes.contains_key(&authorization_code_digest(&code)));
+        assert!(
+            state
+                .authorization_codes
+                .contains_key(&authorization_code_digest(&code))
+        );
         assert_eq!(state.access_tokens.len(), 1);
         assert_eq!(state.refresh_tokens.len(), 1);
         assert!(state.revoked_tokens.is_empty());
@@ -7709,25 +7967,37 @@ mod tests {
             OAuthServerConfig {
                 allow_development_client_credentials: true,
                 allow_development_token_introspection: true,
-                development_introspection_profile: DevelopmentIntrospectionProfile::ResourceEvidence,
+                development_introspection_profile:
+                    DevelopmentIntrospectionProfile::ResourceEvidence,
                 ..Default::default()
             },
             Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact)),
-        ).unwrap();
+        )
+        .unwrap();
         // The machine client ID exactly equals the approved user's display
         // subject. Only the principal namespace differs between the grants.
-        let client = || OAuthClient::builder("approved-subject")
-            .secret("machine-secret")
-            .redirect_uri("http://127.0.0.1/callback")
-            .scope("read")
-            .development_client_credentials(
-                DevelopmentClientCredentialsGrant::new(
-                    configured_resource(TEST_MCP_RESOURCE), ["read"],
-                ).unwrap(),
-            )
-            .build().unwrap();
+        let client = || {
+            OAuthClient::builder("approved-subject")
+                .secret("machine-secret")
+                .redirect_uri("http://127.0.0.1/callback")
+                .scope("read")
+                .development_client_credentials(
+                    DevelopmentClientCredentialsGrant::new(
+                        configured_resource(TEST_MCP_RESOURCE),
+                        ["read"],
+                    )
+                    .unwrap(),
+                )
+                .build()
+                .unwrap()
+        };
         server.register_client(client()).unwrap();
-        server.register_client(development_introspection_caller("resource-reader", TEST_MCP_RESOURCE)).unwrap();
+        server
+            .register_client(development_introspection_caller(
+                "resource-reader",
+                TEST_MCP_RESOURCE,
+            ))
+            .unwrap();
         let machine_request = TokenRequest {
             client_id: "approved-subject".to_string(),
             scopes: Some(vec!["read".to_string()]),
@@ -7738,21 +8008,35 @@ mod tests {
         assert!(machine_facts.issued_at_unix_seconds().is_some());
         assert!(machine_facts.expires_at_unix_seconds().is_some());
         let next_machine = server.token(&machine_request).unwrap();
-        assert_eq!(machine_facts.subject(), development_introspect(&server, &next_machine.access_token).subject());
+        assert_eq!(
+            machine_facts.subject(),
+            development_introspect(&server, &next_machine.access_token).subject()
+        );
 
-        let (code, _) = server.authorize(&approved_resource_request("approved-subject")).unwrap();
-        let user = server.token(&TokenRequest {
-            client_secret: Some("machine-secret".to_string()),
-            client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
-            ..resource_code_exchange_request("approved-subject", &code, TEST_MCP_RESOURCE)
-        }).unwrap();
+        let (code, _) = server
+            .authorize(&approved_resource_request("approved-subject"))
+            .unwrap();
+        let user = server
+            .token(&TokenRequest {
+                client_secret: Some("machine-secret".to_string()),
+                client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
+                ..resource_code_exchange_request("approved-subject", &code, TEST_MCP_RESOURCE)
+            })
+            .unwrap();
         let user_facts = development_introspect(&server, &user.access_token);
         assert_eq!(machine_facts.client_id(), user_facts.client_id());
         assert_eq!(machine_facts.resource(), user_facts.resource());
         assert_eq!(machine_facts.scope(), user_facts.scope());
         assert_ne!(machine_facts.subject(), user_facts.subject());
 
-        server.revoke(&machine.access_token, "approved-subject", Some("machine-secret"), TokenEndpointAuthMethod::ClientSecretBasic).unwrap();
+        server
+            .revoke(
+                &machine.access_token,
+                "approved-subject",
+                Some("machine-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
+            .unwrap();
         assert!(!development_introspect(&server, &machine.access_token).is_active());
         assert!(development_introspect(&server, &user.access_token).is_active());
         assert!(development_introspect(&server, &next_machine.access_token).is_active());
@@ -7760,7 +8044,10 @@ mod tests {
         assert!(!development_introspect(&server, &user.access_token).is_active());
         assert!(!development_introspect(&server, &next_machine.access_token).is_active());
         let replacement = server.token(&machine_request).unwrap();
-        assert_ne!(machine_facts.subject(), development_introspect(&server, &replacement.access_token).subject());
+        assert_ne!(
+            machine_facts.subject(),
+            development_introspect(&server, &replacement.access_token).subject()
+        );
     }
 
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
@@ -10551,7 +10838,10 @@ mod tests {
 
         let state = server.state.read().unwrap();
         let registered = state.clients.get("confidential-client").unwrap();
-        let verifier = registered.secret_verifier.as_ref().expect("stored verifier");
+        let verifier = registered
+            .secret_verifier
+            .as_ref()
+            .expect("stored verifier");
         assert!(verifier.verify(SECRET.as_bytes()));
         assert!(!verifier.verify(b"wrong-secret"));
         assert!(!format!("{verifier:?}").contains(SECRET));
@@ -10576,12 +10866,10 @@ mod tests {
         let salt_a = [0x11; CLIENT_SECRET_SALT_BYTES];
         let salt_b = [0x22; CLIENT_SECRET_SALT_BYTES];
         let secret = b"argon2id-confidential-client-secret-01";
-        let verifier_a =
-            ClientSecretVerifier::create_with_salt_and_params(secret, salt_a, params)
-                .expect("create Argon2id verifier A");
-        let verifier_b =
-            ClientSecretVerifier::create_with_salt_and_params(secret, salt_b, params)
-                .expect("create Argon2id verifier B");
+        let verifier_a = ClientSecretVerifier::create_with_salt_and_params(secret, salt_a, params)
+            .expect("create Argon2id verifier A");
+        let verifier_b = ClientSecretVerifier::create_with_salt_and_params(secret, salt_b, params)
+            .expect("create Argon2id verifier B");
         assert_ne!(
             verifier_a.digest.as_slice(),
             verifier_b.digest.as_slice(),
@@ -10603,20 +10891,12 @@ mod tests {
         assert!(Argon2ClientSecretParams::try_new(MAX_ARGON2_MEMORY_KIB + 1, 1, 1).is_err());
         assert!(Argon2ClientSecretParams::try_new(MIN_ARGON2_MEMORY_KIB, 0, 1).is_err());
         assert!(
-            Argon2ClientSecretParams::try_new(
-                MIN_ARGON2_MEMORY_KIB,
-                MAX_ARGON2_TIME_COST + 1,
-                1
-            )
-            .is_err()
+            Argon2ClientSecretParams::try_new(MIN_ARGON2_MEMORY_KIB, MAX_ARGON2_TIME_COST + 1, 1)
+                .is_err()
         );
         assert!(
-            Argon2ClientSecretParams::try_new(
-                MIN_ARGON2_MEMORY_KIB,
-                1,
-                MAX_ARGON2_PARALLELISM + 1
-            )
-            .is_err()
+            Argon2ClientSecretParams::try_new(MIN_ARGON2_MEMORY_KIB, 1, MAX_ARGON2_PARALLELISM + 1)
+                .is_err()
         );
 
         // 4) Concurrency ceiling fails closed without panicking and restores permits on drop.
@@ -16175,7 +16455,11 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+#[cfg(all(
+    test,
+    feature = "builtin-auth-server",
+    feature = "oauth-client-credentials"
+))]
 pub(crate) mod development_private_key_jwt_test_support {
     use base64::Engine as _;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -16196,14 +16480,16 @@ pub(crate) mod development_private_key_jwt_test_support {
         serde_json::to_vec(&json!({"keys":[{
             "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"machine-key",
             "n":MODULUS, "e":"AQAB"
-        }]})).unwrap()
+        }]}))
+        .unwrap()
     }
 
     pub(crate) fn rotated_jwks() -> Vec<u8> {
         serde_json::to_vec(&json!({"keys":[{
             "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"rotated-machine-key",
             "n":ROTATED_MODULUS, "e":"AQAB"
-        }]})).unwrap()
+        }]}))
+        .unwrap()
     }
 
     pub(crate) fn sign_rotated(claims: &Value) -> String {
@@ -16233,18 +16519,27 @@ pub(crate) mod development_private_key_jwt_test_support {
             URL_SAFE_NO_PAD.encode(claims)
         );
         let mut signature = vec![0_u8; 256];
-        key.sign(&RSA_PKCS1_SHA256, &SystemRandom::new(), input.as_bytes(), &mut signature)
-            .unwrap();
+        key.sign(
+            &RSA_PKCS1_SHA256,
+            &SystemRandom::new(),
+            input.as_bytes(),
+            &mut signature,
+        )
+        .unwrap();
         format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
     }
 }
 
-#[cfg(all(test, feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+#[cfg(all(
+    test,
+    feature = "builtin-auth-server",
+    feature = "oauth-client-credentials"
+))]
 mod development_private_key_jwt_tests {
-    use super::*;
     use super::development_private_key_jwt_test_support::{
         jwks, rotated_jwks, sign, sign_raw, sign_rotated,
     };
+    use super::*;
     use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceIdPolicy};
     use serde_json::{Value, json};
 
@@ -16257,8 +16552,11 @@ mod development_private_key_jwt_tests {
     fn resource() -> CanonicalResourceId {
         let endpoint = CanonicalHttpUrl::parse(RESOURCE).unwrap();
         CanonicalResourceId::parse_for_endpoint(
-            RESOURCE, &endpoint, CanonicalResourceIdPolicy::DEFAULT,
-        ).unwrap()
+            RESOURCE,
+            &endpoint,
+            CanonicalResourceIdPolicy::DEFAULT,
+        )
+        .unwrap()
     }
 
     fn policy(
@@ -16268,32 +16566,50 @@ mod development_private_key_jwt_tests {
         generation: u64,
     ) -> DevelopmentPrivateKeyJwtPolicy {
         DevelopmentPrivateKeyJwtPolicy::new(
-            ISSUER, client_id, TOKEN_ENDPOINT, token_audience, generation, &jwks(),
-        ).unwrap()
-            .with_revocation_endpoint(REVOCATION_ENDPOINT, revocation_audience).unwrap()
+            ISSUER,
+            client_id,
+            TOKEN_ENDPOINT,
+            token_audience,
+            generation,
+            &jwks(),
+        )
+        .unwrap()
+        .with_revocation_endpoint(REVOCATION_ENDPOINT, revocation_audience)
+        .unwrap()
     }
 
     fn client_with_policy(client_id: &str, policy: DevelopmentPrivateKeyJwtPolicy) -> OAuthClient {
         OAuthClient::builder(client_id)
             .development_private_key_jwt(policy)
             .development_client_credentials(
-                DevelopmentClientCredentialsGrant::new(resource(), ["machine:read", "machine:write"]).unwrap(),
+                DevelopmentClientCredentialsGrant::new(
+                    resource(),
+                    ["machine:read", "machine:write"],
+                )
+                .unwrap(),
             )
-            .build().unwrap()
+            .build()
+            .unwrap()
     }
 
     fn server(
         token_audience: DevelopmentClientAssertionAudience,
         revocation_audience: DevelopmentClientAssertionAudience,
     ) -> Arc<OAuthServer> {
-        let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-            issuer: ISSUER.to_string(),
-            allow_development_client_credentials: true,
-            ..Default::default()
-        }).unwrap());
-        server.register_client(client_with_policy(
-            CLIENT, policy(CLIENT, token_audience, revocation_audience, 1),
-        )).unwrap();
+        let server = Arc::new(
+            OAuthServer::try_new(OAuthServerConfig {
+                issuer: ISSUER.to_string(),
+                allow_development_client_credentials: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        server
+            .register_client(client_with_policy(
+                CLIENT,
+                policy(CLIENT, token_audience, revocation_audience, 1),
+            ))
+            .unwrap();
         server
     }
 
@@ -16314,18 +16630,30 @@ mod development_private_key_jwt_tests {
 
     fn issue(server: &OAuthServer, assertion: &str) -> Result<TokenResponse, OAuthError> {
         server.token_with_development_private_key_jwt(
-            assertion, TOKEN_ENDPOINT, RESOURCE, &["machine:read".to_string()],
+            assertion,
+            TOKEN_ENDPOINT,
+            RESOURCE,
+            &["machine:read".to_string()],
         )
     }
 
     fn auth(server: &Arc<OAuthServer>, token: &str) -> AuthContext {
-        server.token_verifier(resource()).verify(
-            &McpContext::new(asupersync::Cx::for_testing(), 1),
-            AuthRequest {
-                method: "tools/call", params: None, transport_authorization: None, request_id: 1,
-            },
-            &AccessToken { scheme: "Bearer".to_string(), token: token.to_string() },
-        ).unwrap()
+        server
+            .token_verifier(resource())
+            .verify(
+                &McpContext::new(asupersync::Cx::for_testing(), 1),
+                AuthRequest {
+                    method: "tools/call",
+                    params: None,
+                    transport_authorization: None,
+                    request_id: 1,
+                },
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: token.to_string(),
+                },
+            )
+            .unwrap()
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -16341,29 +16669,66 @@ mod development_private_key_jwt_tests {
 
     fn snapshot(server: &OAuthServer) -> Snapshot {
         let state = server.state.read().unwrap();
-        let mut clients: Vec<_> = state.clients.iter()
-            .map(|(id, entry)| (id.clone(), *entry.registration_epoch.as_bytes())).collect();
+        let mut clients: Vec<_> = state
+            .clients
+            .iter()
+            .map(|(id, entry)| (id.clone(), *entry.registration_epoch.as_bytes()))
+            .collect();
         clients.sort();
-        let mut codes: Vec<_> = state.authorization_codes.keys().map(|key| key.0.into_bytes()).collect();
-        let mut access: Vec<_> = state.access_tokens.keys().map(|key| key.0.into_bytes()).collect();
-        let mut refresh: Vec<_> = state.refresh_tokens.keys().map(|key| key.0.into_bytes()).collect();
-        let mut revoked: Vec<_> = state.revoked_tokens.keys().map(|key| key.0.into_bytes()).collect();
-        let mut replay: Vec<_> = state.client_assertion_replays.iter()
-            .map(|(key, entry)| (key.into_bytes(), entry.client_id.clone(), entry.expires_at_unix_seconds))
+        let mut codes: Vec<_> = state
+            .authorization_codes
+            .keys()
+            .map(|key| key.0.into_bytes())
+            .collect();
+        let mut access: Vec<_> = state
+            .access_tokens
+            .keys()
+            .map(|key| key.0.into_bytes())
+            .collect();
+        let mut refresh: Vec<_> = state
+            .refresh_tokens
+            .keys()
+            .map(|key| key.0.into_bytes())
+            .collect();
+        let mut revoked: Vec<_> = state
+            .revoked_tokens
+            .keys()
+            .map(|key| key.0.into_bytes())
+            .collect();
+        let mut replay: Vec<_> = state
+            .client_assertion_replays
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.into_bytes(),
+                    entry.client_id.clone(),
+                    entry.expires_at_unix_seconds,
+                )
+            })
             .collect();
         codes.sort();
         access.sort();
         refresh.sort();
         revoked.sort();
         replay.sort();
-        Snapshot { clients, codes, access, refresh, revoked, replay, time_floor: state.client_assertion_time_floor }
+        Snapshot {
+            clients,
+            codes,
+            access,
+            refresh,
+            revoked,
+            replay,
+            time_floor: state.client_assertion_time_floor,
+        }
     }
 
     #[test]
     fn development_private_key_jwt_registration_requires_exact_trusted_bindings() {
         let valid = policy(
-            CLIENT, DevelopmentClientAssertionAudience::Endpoint,
-            DevelopmentClientAssertionAudience::Endpoint, 7,
+            CLIENT,
+            DevelopmentClientAssertionAudience::Endpoint,
+            DevelopmentClientAssertionAudience::Endpoint,
+            7,
         );
         assert_eq!(valid.issuer(), ISSUER);
         assert_eq!(valid.client_id(), CLIENT);
@@ -16371,7 +16736,10 @@ mod development_private_key_jwt_tests {
         assert_eq!(valid.configuration_generation(), 7);
         let client = client_with_policy(CLIENT, valid.clone());
         assert_eq!(client.client_type, ClientType::Confidential);
-        assert_eq!(client.token_endpoint_auth_method, TokenEndpointAuthMethod::PrivateKeyJwt);
+        assert_eq!(
+            client.token_endpoint_auth_method,
+            TokenEndpointAuthMethod::PrivateKeyJwt
+        );
         assert!(!client.has_client_secret());
         assert!(!client.authenticate(None));
         assert!(client.redirect_uris.is_empty());
@@ -16383,39 +16751,75 @@ mod development_private_key_jwt_tests {
             (ISSUER, "https://issuer.example/oauth/token?next=peer", 7),
             (ISSUER, TOKEN_ENDPOINT, 0),
         ] {
-            assert!(DevelopmentPrivateKeyJwtPolicy::new(
-                issuer, CLIENT, endpoint, DevelopmentClientAssertionAudience::Endpoint,
-                generation, &jwks(),
-            ).is_err());
+            assert!(
+                DevelopmentPrivateKeyJwtPolicy::new(
+                    issuer,
+                    CLIENT,
+                    endpoint,
+                    DevelopmentClientAssertionAudience::Endpoint,
+                    generation,
+                    &jwks(),
+                )
+                .is_err()
+            );
         }
-        assert!(valid.clone().with_revocation_endpoint(
-            TOKEN_ENDPOINT, DevelopmentClientAssertionAudience::Issuer,
-        ).is_err());
-        assert!(OAuthClient::builder("another-client")
-            .development_private_key_jwt(valid.clone())
-            .development_client_credentials(DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap())
-            .build().is_err());
-        assert!(OAuthClient::builder(CLIENT)
-            .secret("must-not-be-combined")
-            .development_private_key_jwt(valid.clone())
-            .development_client_credentials(DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap())
-            .build().is_err());
-        assert!(OAuthClient::builder(CLIENT)
-            .development_private_key_jwt(valid.clone())
-            .development_client_credentials(DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap())
-            .token_endpoint_auth_method(TokenEndpointAuthMethod::ClientSecretBasic)
-            .build().is_err());
-        assert!(OAuthClient::builder(CLIENT)
-            .development_private_key_jwt(valid.clone())
-            .redirect_uri("http://127.0.0.1/callback")
-            .build().is_err());
+        assert!(
+            valid
+                .clone()
+                .with_revocation_endpoint(
+                    TOKEN_ENDPOINT,
+                    DevelopmentClientAssertionAudience::Issuer,
+                )
+                .is_err()
+        );
+        assert!(
+            OAuthClient::builder("another-client")
+                .development_private_key_jwt(valid.clone())
+                .development_client_credentials(
+                    DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap()
+                )
+                .build()
+                .is_err()
+        );
+        assert!(
+            OAuthClient::builder(CLIENT)
+                .secret("must-not-be-combined")
+                .development_private_key_jwt(valid.clone())
+                .development_client_credentials(
+                    DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap()
+                )
+                .build()
+                .is_err()
+        );
+        assert!(
+            OAuthClient::builder(CLIENT)
+                .development_private_key_jwt(valid.clone())
+                .development_client_credentials(
+                    DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap()
+                )
+                .token_endpoint_auth_method(TokenEndpointAuthMethod::ClientSecretBasic)
+                .build()
+                .is_err()
+        );
+        assert!(
+            OAuthClient::builder(CLIENT)
+                .development_private_key_jwt(valid.clone())
+                .redirect_uri("http://127.0.0.1/callback")
+                .build()
+                .is_err()
+        );
         let foreign = OAuthServer::try_new(OAuthServerConfig {
             issuer: "https://another-issuer.example".to_string(),
             allow_development_client_credentials: true,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         let before = snapshot(&foreign);
-        assert!(foreign.register_client(client_with_policy(CLIENT, valid)).is_err());
+        assert!(
+            foreign
+                .register_client(client_with_policy(CLIENT, valid))
+                .is_err()
+        );
         assert_eq!(snapshot(&foreign), before);
     }
 
@@ -16452,13 +16856,20 @@ mod development_private_key_jwt_tests {
                 assert!(verified.claims.as_ref().unwrap()["grant_subject"].is_null());
                 assert!(verified.session_owner().is_some());
                 let revocation = sign(&claims(CLIENT, revoke_aud, "revoke"));
-                server.revoke_with_development_private_key_jwt(
-                    &revocation, REVOCATION_ENDPOINT, &token.access_token,
-                ).unwrap();
+                server
+                    .revoke_with_development_private_key_jwt(
+                        &revocation,
+                        REVOCATION_ENDPOINT,
+                        &token.access_token,
+                    )
+                    .unwrap();
                 assert!(server.validate_access_token(&token.access_token).is_none());
                 assert_eq!(server.stats().refresh_tokens, 0);
                 assert_eq!(server.stats().authorization_codes, 0);
-                assert_eq!(server.state.read().unwrap().client_assertion_replays.len(), 2);
+                assert_eq!(
+                    server.state.read().unwrap().client_assertion_replays.len(),
+                    2
+                );
             }
         }
     }
@@ -16493,14 +16904,26 @@ mod development_private_key_jwt_tests {
             let mut changed = original.clone();
             changed[name] = value;
             let before = snapshot(&server);
-            assert!(matches!(issue(&server, &sign(&changed)), Err(OAuthError::InvalidClient(_))), "{name}");
+            assert!(
+                matches!(
+                    issue(&server, &sign(&changed)),
+                    Err(OAuthError::InvalidClient(_))
+                ),
+                "{name}"
+            );
             assert_eq!(snapshot(&server), before, "{name}");
         }
         for absent in ["iss", "sub", "aud", "iat", "exp", "jti"] {
             let mut changed = original.clone();
             changed.as_object_mut().unwrap().remove(absent);
             let before = snapshot(&server);
-            assert!(matches!(issue(&server, &sign(&changed)), Err(OAuthError::InvalidClient(_))), "{absent}");
+            assert!(
+                matches!(
+                    issue(&server, &sign(&changed)),
+                    Err(OAuthError::InvalidClient(_))
+                ),
+                "{absent}"
+            );
             assert_eq!(snapshot(&server), before);
         }
         for header in [
@@ -16511,9 +16934,15 @@ mod development_private_key_jwt_tests {
             json!({"alg":"none", "kid":"machine-key"}),
             json!({"alg":"RS256", "kid":"machine-key", "jku":"https://keys.example/jwks"}),
         ] {
-            let assertion = sign_raw(&serde_json::to_vec(&header).unwrap(), &serde_json::to_vec(&original).unwrap());
+            let assertion = sign_raw(
+                &serde_json::to_vec(&header).unwrap(),
+                &serde_json::to_vec(&original).unwrap(),
+            );
             let before = snapshot(&server);
-            assert!(matches!(issue(&server, &assertion), Err(OAuthError::InvalidClient(_))));
+            assert!(matches!(
+                issue(&server, &assertion),
+                Err(OAuthError::InvalidClient(_))
+            ));
             assert_eq!(snapshot(&server), before);
         }
         let duplicate_claims = format!(
@@ -16525,7 +16954,10 @@ mod development_private_key_jwt_tests {
             duplicate_claims.as_bytes(),
         );
         let before = snapshot(&server);
-        assert!(matches!(issue(&server, &duplicate), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            issue(&server, &duplicate),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
         let token = issue(&server, &sign(&original)).unwrap();
         assert_eq!(auth(&server, &token.access_token).scopes, ["machine:read"]);
@@ -16537,32 +16969,77 @@ mod development_private_key_jwt_tests {
         let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "unchanged"));
         let before = snapshot(&server);
         for endpoint in [REVOCATION_ENDPOINT, "https://other.example/oauth/token"] {
-            assert!(server.token_with_development_private_key_jwt(
-                &assertion, endpoint, RESOURCE, &["machine:read".to_string()],
-            ).is_err());
+            assert!(
+                server
+                    .token_with_development_private_key_jwt(
+                        &assertion,
+                        endpoint,
+                        RESOURCE,
+                        &["machine:read".to_string()],
+                    )
+                    .is_err()
+            );
             assert_eq!(snapshot(&server), before);
         }
-        assert!(server.token_with_development_private_key_jwt(
-            &assertion, TOKEN_ENDPOINT, "https://resource.example/other", &["machine:read".to_string()],
-        ).is_err());
+        assert!(
+            server
+                .token_with_development_private_key_jwt(
+                    &assertion,
+                    TOKEN_ENDPOINT,
+                    "https://resource.example/other",
+                    &["machine:read".to_string()],
+                )
+                .is_err()
+        );
         assert_eq!(snapshot(&server), before);
-        for scopes in [Vec::new(), vec!["machine:admin".to_string()], vec!["openid".to_string()]] {
-            assert!(server.token_with_development_private_key_jwt(
-                &assertion, TOKEN_ENDPOINT, RESOURCE, &scopes,
-            ).is_err());
+        for scopes in [
+            Vec::new(),
+            vec!["machine:admin".to_string()],
+            vec!["openid".to_string()],
+        ] {
+            assert!(
+                server
+                    .token_with_development_private_key_jwt(
+                        &assertion,
+                        TOKEN_ENDPOINT,
+                        RESOURCE,
+                        &scopes,
+                    )
+                    .is_err()
+            );
             assert_eq!(snapshot(&server), before);
         }
         let token = issue(&server, &assertion).unwrap();
         let wrong_resource = CanonicalHttpUrl::parse("https://resource.example/other").unwrap();
-        let wrong_verifier = server.token_verifier(CanonicalResourceId::parse_for_endpoint(
-            wrong_resource.as_str(), &wrong_resource, CanonicalResourceIdPolicy::DEFAULT,
-        ).unwrap());
-        assert!(wrong_verifier.verify(
-            &McpContext::new(asupersync::Cx::for_testing(), 1),
-            AuthRequest { method: "tools/call", params: None, transport_authorization: None, request_id: 1 },
-            &AccessToken { scheme: "Bearer".to_string(), token: token.access_token.clone() },
-        ).is_err());
-        assert_eq!(auth(&server, &token.access_token).subject.as_deref(), Some(CLIENT));
+        let wrong_verifier = server.token_verifier(
+            CanonicalResourceId::parse_for_endpoint(
+                wrong_resource.as_str(),
+                &wrong_resource,
+                CanonicalResourceIdPolicy::DEFAULT,
+            )
+            .unwrap(),
+        );
+        assert!(
+            wrong_verifier
+                .verify(
+                    &McpContext::new(asupersync::Cx::for_testing(), 1),
+                    AuthRequest {
+                        method: "tools/call",
+                        params: None,
+                        transport_authorization: None,
+                        request_id: 1
+                    },
+                    &AccessToken {
+                        scheme: "Bearer".to_string(),
+                        token: token.access_token.clone()
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(
+            auth(&server, &token.access_token).subject.as_deref(),
+            Some(CLIENT)
+        );
     }
 
     #[test]
@@ -16571,23 +17048,40 @@ mod development_private_key_jwt_tests {
         let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "concurrent"));
         let barrier = Arc::new(std::sync::Barrier::new(8));
         let results = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..8).map(|_| {
-                let server = Arc::clone(&server);
-                let barrier = Arc::clone(&barrier);
-                let assertion = &assertion;
-                scope.spawn(move || {
-                    barrier.wait();
-                    issue(&server, assertion)
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let server = Arc::clone(&server);
+                    let barrier = Arc::clone(&barrier);
+                    let assertion = &assertion;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        issue(&server, assertion)
+                    })
                 })
-            }).collect();
-            workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
         });
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(results.iter().filter(|result| matches!(result, Err(OAuthError::InvalidClient(_)))).count(), 7);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(OAuthError::InvalidClient(_))))
+                .count(),
+            7
+        );
         assert_eq!(server.stats().access_tokens, 1);
-        assert_eq!(server.state.read().unwrap().client_assertion_replays.len(), 1);
+        assert_eq!(
+            server.state.read().unwrap().client_assertion_replays.len(),
+            1
+        );
         let success = results.into_iter().find_map(Result::ok).unwrap();
-        assert_eq!(auth(&server, &success.access_token).subject.as_deref(), Some(CLIENT));
+        assert_eq!(
+            auth(&server, &success.access_token).subject.as_deref(),
+            Some(CLIENT)
+        );
     }
 
     #[test]
@@ -16600,30 +17094,59 @@ mod development_private_key_jwt_tests {
         let first = issue(&server, &assertion).unwrap();
         let first_owner = auth(&server, &first.access_token).session_owner().unwrap();
         let before = snapshot(&server);
-        assert!(matches!(server.revoke_with_development_private_key_jwt(
-            &assertion, REVOCATION_ENDPOINT, &first.access_token,
-        ), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            server.revoke_with_development_private_key_jwt(
+                &assertion,
+                REVOCATION_ENDPOINT,
+                &first.access_token,
+            ),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
         assert!(server.validate_access_token(&first.access_token).is_some());
 
         server.unregister_client(CLIENT).unwrap();
-        server.register_client(client_with_policy(CLIENT, policy(
-            CLIENT, DevelopmentClientAssertionAudience::Issuer,
-            DevelopmentClientAssertionAudience::Issuer, 2,
-        ))).unwrap();
+        server
+            .register_client(client_with_policy(
+                CLIENT,
+                policy(
+                    CLIENT,
+                    DevelopmentClientAssertionAudience::Issuer,
+                    DevelopmentClientAssertionAudience::Issuer,
+                    2,
+                ),
+            ))
+            .unwrap();
         assert!(server.validate_access_token(&first.access_token).is_none());
         let before = snapshot(&server);
-        assert!(matches!(issue(&server, &assertion), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            issue(&server, &assertion),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
-        let fresh = issue(&server, &sign(&claims(CLIENT, ISSUER, "fresh-registration"))).unwrap();
-        assert_ne!(auth(&server, &fresh.access_token).session_owner(), Some(first_owner));
+        let fresh = issue(
+            &server,
+            &sign(&claims(CLIENT, ISSUER, "fresh-registration")),
+        )
+        .unwrap();
+        assert_ne!(
+            auth(&server, &fresh.access_token).session_owner(),
+            Some(first_owner)
+        );
 
         let revocation = sign(&claims(CLIENT, ISSUER, "fresh-revoke"));
-        server.revoke_with_development_private_key_jwt(
-            &revocation, REVOCATION_ENDPOINT, &fresh.access_token,
-        ).unwrap();
+        server
+            .revoke_with_development_private_key_jwt(
+                &revocation,
+                REVOCATION_ENDPOINT,
+                &fresh.access_token,
+            )
+            .unwrap();
         let before = snapshot(&server);
-        assert!(matches!(issue(&server, &revocation), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            issue(&server, &revocation),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
         assert!(server.validate_access_token(&fresh.access_token).is_none());
     }
@@ -16632,27 +17155,39 @@ mod development_private_key_jwt_tests {
     fn development_private_key_jwt_verified_snapshot_cannot_cross_registry_generation() {
         let server = endpoint_server();
         let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "in-flight"));
-        let verified = server.verify_development_client_assertion(
-            &assertion, TOKEN_ENDPOINT, false,
-        ).unwrap_or_else(|_| panic!("signed registration snapshot"));
+        let verified = server
+            .verify_development_client_assertion(&assertion, TOKEN_ENDPOINT, false)
+            .unwrap_or_else(|_| panic!("signed registration snapshot"));
         server.unregister_client(CLIENT).unwrap();
-        server.register_client(client_with_policy(CLIENT, policy(
-            CLIENT, DevelopmentClientAssertionAudience::Endpoint,
-            DevelopmentClientAssertionAudience::Endpoint, 2,
-        ))).unwrap();
+        server
+            .register_client(client_with_policy(
+                CLIENT,
+                policy(
+                    CLIENT,
+                    DevelopmentClientAssertionAudience::Endpoint,
+                    DevelopmentClientAssertionAudience::Endpoint,
+                    2,
+                ),
+            ))
+            .unwrap();
         let request = TokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: CLIENT.to_string(),
             client_secret: None,
             client_authentication_method: TokenEndpointAuthMethod::PrivateKeyJwt,
-            code: None, redirect_uri: None, code_verifier: None, refresh_token: None,
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            refresh_token: None,
             scopes: Some(vec!["machine:read".to_string()]),
             resource: Some(RESOURCE.to_string()),
         };
         let before = snapshot(&server);
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let result = server.token_client_credentials_authenticated_with_draw(
-            &request, Some(&verified), || {
+            &request,
+            Some(&verified),
+            || {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 draw_security_identifier()
             },
@@ -16661,9 +17196,16 @@ mod development_private_key_jwt_tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(snapshot(&server), before);
         // A public TokenRequest naming the method cannot fabricate a verified receipt.
-        assert!(matches!(server.token(&request), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            server.token(&request),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
-        let fresh = issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "after-rotation"))).unwrap();
+        let fresh = issue(
+            &server,
+            &sign(&claims(CLIENT, TOKEN_ENDPOINT, "after-rotation")),
+        )
+        .unwrap();
         assert!(server.validate_access_token(&fresh.access_token).is_some());
     }
 
@@ -16673,25 +17215,52 @@ mod development_private_key_jwt_tests {
         let first_assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "owner-0"));
         let first = issue(&server, &first_assertion).unwrap();
         for index in 1..MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT {
-            issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, &format!("owner-{index}")))).unwrap();
+            issue(
+                &server,
+                &sign(&claims(CLIENT, TOKEN_ENDPOINT, &format!("owner-{index}"))),
+            )
+            .unwrap();
         }
         let before = snapshot(&server);
-        assert!(matches!(issue(
-            &server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "owner-overflow")),
-        ), Err(OAuthError::TemporarilyUnavailable(_))));
+        assert!(matches!(
+            issue(
+                &server,
+                &sign(&claims(CLIENT, TOKEN_ENDPOINT, "owner-overflow")),
+            ),
+            Err(OAuthError::TemporarilyUnavailable(_))
+        ));
         assert_eq!(snapshot(&server), before);
-        assert!(matches!(issue(&server, &first_assertion), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            issue(&server, &first_assertion),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
         assert!(server.validate_access_token(&first.access_token).is_some());
 
-        server.register_client(client_with_policy("other-machine", policy(
-            "other-machine", DevelopmentClientAssertionAudience::Endpoint,
-            DevelopmentClientAssertionAudience::Endpoint, 1,
-        ))).unwrap();
-        let other = issue(&server, &sign(&claims("other-machine", TOKEN_ENDPOINT, "owner-0"))).unwrap();
-        assert_eq!(auth(&server, &other.access_token).subject.as_deref(), Some("other-machine"));
-        assert_eq!(server.state.read().unwrap().client_assertion_replays.len(),
-            MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT + 1);
+        server
+            .register_client(client_with_policy(
+                "other-machine",
+                policy(
+                    "other-machine",
+                    DevelopmentClientAssertionAudience::Endpoint,
+                    DevelopmentClientAssertionAudience::Endpoint,
+                    1,
+                ),
+            ))
+            .unwrap();
+        let other = issue(
+            &server,
+            &sign(&claims("other-machine", TOKEN_ENDPOINT, "owner-0")),
+        )
+        .unwrap();
+        assert_eq!(
+            auth(&server, &other.access_token).subject.as_deref(),
+            Some("other-machine")
+        );
+        assert_eq!(
+            server.state.read().unwrap().client_assertion_replays.len(),
+            MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT + 1
+        );
     }
 
     #[test]
@@ -16706,25 +17275,41 @@ mod development_private_key_jwt_tests {
             for index in 0_u64..u64::try_from(MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS).unwrap() {
                 let key = sha256_bounded(&index.to_be_bytes(), 8).unwrap();
                 first_key.get_or_insert(key);
-                state.client_assertion_replays.insert(key, ClientAssertionReplay {
-                    client_id: format!("retired-client-{}", index / 64),
-                    expires_at_unix_seconds: now + 60,
-                });
+                state.client_assertion_replays.insert(
+                    key,
+                    ClientAssertionReplay {
+                        client_id: format!("retired-client-{}", index / 64),
+                        expires_at_unix_seconds: now + 60,
+                    },
+                );
             }
         }
         let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "global-capacity"));
         let before = snapshot(&server);
-        assert!(matches!(issue(&server, &assertion), Err(OAuthError::TemporarilyUnavailable(_))));
+        assert!(matches!(
+            issue(&server, &assertion),
+            Err(OAuthError::TemporarilyUnavailable(_))
+        ));
         assert_eq!(snapshot(&server), before);
         {
             let mut state = server.state.write().unwrap();
-            state.client_assertion_replays.get_mut(&first_key.unwrap()).unwrap()
+            state
+                .client_assertion_replays
+                .get_mut(&first_key.unwrap())
+                .unwrap()
                 .expires_at_unix_seconds = now.saturating_sub(1);
         }
         let token = issue(&server, &assertion).unwrap();
         let state = server.state.read().unwrap();
-        assert_eq!(state.client_assertion_replays.len(), MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS);
-        assert!(!state.client_assertion_replays.contains_key(&first_key.unwrap()));
+        assert_eq!(
+            state.client_assertion_replays.len(),
+            MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS
+        );
+        assert!(
+            !state
+                .client_assertion_replays
+                .contains_key(&first_key.unwrap())
+        );
         drop(state);
         assert!(server.validate_access_token(&token.access_token).is_some());
     }
@@ -16744,12 +17329,19 @@ mod development_private_key_jwt_tests {
             assert!(state.client_assertion_replays.is_empty());
         }
         let before = snapshot(&server);
-        assert!(matches!(issue(&server, &assertion), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            issue(&server, &assertion),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
         // Even a new jti cannot use the rolled-back clock to evade the floor.
-        assert!(matches!(issue(
-            &server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "after-rollback")),
-        ), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            issue(
+                &server,
+                &sign(&claims(CLIENT, TOKEN_ENDPOINT, "after-rollback")),
+            ),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
         assert!(server.validate_access_token(&token.access_token).is_some());
     }
@@ -16760,92 +17352,157 @@ mod development_private_key_jwt_tests {
         let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "signature"));
         let mut corrupt = assertion.as_bytes().to_vec();
         let signature_start = assertion.rfind('.').unwrap() + 1;
-        corrupt[signature_start] = if corrupt[signature_start] == b'A' { b'B' } else { b'A' };
+        corrupt[signature_start] = if corrupt[signature_start] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
         let before = snapshot(&server);
-        assert!(matches!(issue(
-            &server, std::str::from_utf8(&corrupt).unwrap(),
-        ), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            issue(&server, std::str::from_utf8(&corrupt).unwrap(),),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
 
         // A separately admitted RSA key with the same kid cannot authenticate
         // a signature from the original registration.
         let mut other_jwks: Value = serde_json::from_slice(&jwks()).unwrap();
-        other_jwks["keys"][0]["n"] = json!("nglMZYxKVQoNbg1eyTOptTNw5GbItWLTcvYNFx1fIffaj5yjvmwBg1hZ3WXWnrPiHGQLmWJA8DhSF4ivZsNGR8DT_EZMhCV6oJiiwr-B_I4jiSdVwPkMCNKaI9WNFaZKh5-no6suh4V4-rVVjIecT8N60qlKkpCxlYkgtQ28AUM6RiDrd33DTZdRTjLHxWA5dyz2mlPwdMQvu0vlnZckAPgZauymb8KL5tXl2nv0Am9z08HtNkj259Y4d1KvsjZKczPbuKFiA9zAVOl1hNDQ7dI1ZxvHDJikifFUlx7gMioUOr0Im0MJuDMy6LIAHDpiqTtX5BXssw8IqOHEBV8_sQ");
+        other_jwks["keys"][0]["n"] = json!(
+            "nglMZYxKVQoNbg1eyTOptTNw5GbItWLTcvYNFx1fIffaj5yjvmwBg1hZ3WXWnrPiHGQLmWJA8DhSF4ivZsNGR8DT_EZMhCV6oJiiwr-B_I4jiSdVwPkMCNKaI9WNFaZKh5-no6suh4V4-rVVjIecT8N60qlKkpCxlYkgtQ28AUM6RiDrd33DTZdRTjLHxWA5dyz2mlPwdMQvu0vlnZckAPgZauymb8KL5tXl2nv0Am9z08HtNkj259Y4d1KvsjZKczPbuKFiA9zAVOl1hNDQ7dI1ZxvHDJikifFUlx7gMioUOr0Im0MJuDMy6LIAHDpiqTtX5BXssw8IqOHEBV8_sQ"
+        );
         let other_policy = DevelopmentPrivateKeyJwtPolicy::new(
-            ISSUER, CLIENT, TOKEN_ENDPOINT, DevelopmentClientAssertionAudience::Endpoint,
-            2, &serde_json::to_vec(&other_jwks).unwrap(),
-        ).unwrap();
+            ISSUER,
+            CLIENT,
+            TOKEN_ENDPOINT,
+            DevelopmentClientAssertionAudience::Endpoint,
+            2,
+            &serde_json::to_vec(&other_jwks).unwrap(),
+        )
+        .unwrap();
         let other_server = OAuthServer::try_new(OAuthServerConfig {
             issuer: ISSUER.to_string(),
             allow_development_client_credentials: true,
             ..Default::default()
-        }).unwrap();
-        other_server.register_client(client_with_policy(CLIENT, other_policy)).unwrap();
+        })
+        .unwrap();
+        other_server
+            .register_client(client_with_policy(CLIENT, other_policy))
+            .unwrap();
         let other_before = snapshot(&other_server);
-        assert!(matches!(issue(&other_server, &assertion), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            issue(&other_server, &assertion),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&other_server), other_before);
         let token = issue(&server, &assertion).unwrap();
         assert!(server.validate_access_token(&token.access_token).is_some());
     }
 
     #[test]
-    fn development_private_key_jwt_revocation_requires_separate_agreement_and_preserves_foreign_tokens() {
+    fn development_private_key_jwt_revocation_requires_separate_agreement_and_preserves_foreign_tokens()
+     {
         let no_revocation = DevelopmentPrivateKeyJwtPolicy::new(
-            ISSUER, CLIENT, TOKEN_ENDPOINT, DevelopmentClientAssertionAudience::Issuer, 1, &jwks(),
-        ).unwrap();
-        let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-            issuer: ISSUER.to_string(),
-            allow_development_client_credentials: true,
-            ..Default::default()
-        }).unwrap());
-        server.register_client(client_with_policy(CLIENT, no_revocation)).unwrap();
+            ISSUER,
+            CLIENT,
+            TOKEN_ENDPOINT,
+            DevelopmentClientAssertionAudience::Issuer,
+            1,
+            &jwks(),
+        )
+        .unwrap();
+        let server = Arc::new(
+            OAuthServer::try_new(OAuthServerConfig {
+                issuer: ISSUER.to_string(),
+                allow_development_client_credentials: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        server
+            .register_client(client_with_policy(CLIENT, no_revocation))
+            .unwrap();
         let token = issue(&server, &sign(&claims(CLIENT, ISSUER, "no-revoke-issued"))).unwrap();
         let before = snapshot(&server);
-        assert!(matches!(server.revoke_with_development_private_key_jwt(
-            &sign(&claims(CLIENT, ISSUER, "no-revoke-permission")),
-            REVOCATION_ENDPOINT, &token.access_token,
-        ), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            server.revoke_with_development_private_key_jwt(
+                &sign(&claims(CLIENT, ISSUER, "no-revoke-permission")),
+                REVOCATION_ENDPOINT,
+                &token.access_token,
+            ),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
         assert!(server.validate_access_token(&token.access_token).is_some());
 
-        server.register_client(client_with_policy("other-client", policy(
-            "other-client", DevelopmentClientAssertionAudience::Issuer,
-            DevelopmentClientAssertionAudience::Issuer, 1,
-        ))).unwrap();
+        server
+            .register_client(client_with_policy(
+                "other-client",
+                policy(
+                    "other-client",
+                    DevelopmentClientAssertionAudience::Issuer,
+                    DevelopmentClientAssertionAudience::Issuer,
+                    1,
+                ),
+            ))
+            .unwrap();
         let revoke = sign(&claims("other-client", ISSUER, "foreign-token"));
         let before = snapshot(&server);
-        assert!(matches!(server.revoke_with_development_private_key_jwt(
-            &revoke, TOKEN_ENDPOINT, &token.access_token,
-        ), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            server.revoke_with_development_private_key_jwt(
+                &revoke,
+                TOKEN_ENDPOINT,
+                &token.access_token,
+            ),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(snapshot(&server), before);
         // RFC 7009 unknown/foreign-token success consumes this authentication
         // once, but grants no authority over the first client's live token.
-        server.revoke_with_development_private_key_jwt(
-            &revoke, REVOCATION_ENDPOINT, &token.access_token,
-        ).unwrap();
+        server
+            .revoke_with_development_private_key_jwt(
+                &revoke,
+                REVOCATION_ENDPOINT,
+                &token.access_token,
+            )
+            .unwrap();
         assert!(server.validate_access_token(&token.access_token).is_some());
         let unknown = sign(&claims("other-client", ISSUER, "unknown-token"));
-        server.revoke_with_development_private_key_jwt(
-            &unknown, REVOCATION_ENDPOINT, "unknown-token",
-        ).unwrap();
+        server
+            .revoke_with_development_private_key_jwt(&unknown, REVOCATION_ENDPOINT, "unknown-token")
+            .unwrap();
         assert!(server.validate_access_token(&token.access_token).is_some());
     }
 
     #[test]
     fn development_private_key_jwt_disabled_profile_and_metadata_preserve_basic_behavior() {
         for enabled in [false, true] {
-            let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-                issuer: ISSUER.to_string(),
-                allow_development_client_credentials: enabled,
-                ..Default::default()
-            }).unwrap());
-            server.register_client(client_with_policy(CLIENT, policy(
-                CLIENT, DevelopmentClientAssertionAudience::Endpoint,
-                DevelopmentClientAssertionAudience::Endpoint, 1,
-            ))).unwrap();
-            let routes = OAuthHttpRoutes::new(Arc::clone(&server), "https://issuer.example/oauth").unwrap();
-            let metadata = serde_json::to_value(routes.authorization_server_metadata().unwrap()).unwrap();
-            for field in ["token_endpoint_auth_methods_supported", "revocation_endpoint_auth_methods_supported"] {
+            let server = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    issuer: ISSUER.to_string(),
+                    allow_development_client_credentials: enabled,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            server
+                .register_client(client_with_policy(
+                    CLIENT,
+                    policy(
+                        CLIENT,
+                        DevelopmentClientAssertionAudience::Endpoint,
+                        DevelopmentClientAssertionAudience::Endpoint,
+                        1,
+                    ),
+                ))
+                .unwrap();
+            let routes =
+                OAuthHttpRoutes::new(Arc::clone(&server), "https://issuer.example/oauth").unwrap();
+            let metadata =
+                serde_json::to_value(routes.authorization_server_metadata().unwrap()).unwrap();
+            for field in [
+                "token_endpoint_auth_methods_supported",
+                "revocation_endpoint_auth_methods_supported",
+            ] {
                 let methods = metadata[field].as_array().unwrap();
                 assert_eq!(methods.contains(&json!("private_key_jwt")), enabled);
                 assert!(methods.contains(&json!("client_secret_basic")));
@@ -16864,32 +17521,55 @@ mod development_private_key_jwt_tests {
             if enabled {
                 let token = issue(&server, &assertion).unwrap();
                 let private_owner = auth(&server, &token.access_token).session_owner().unwrap();
-                server.register_client(
-                    OAuthClient::builder("basic-machine").secret("basic-secret")
-                        .development_client_credentials(DevelopmentClientCredentialsGrant::new(
-                            resource(), ["machine:read"],
-                        ).unwrap())
-                        .build().unwrap(),
-                ).unwrap();
-                let basic = server.token(&TokenRequest {
-                    grant_type: "client_credentials".to_string(),
-                    client_id: "basic-machine".to_string(),
-                    client_secret: Some("basic-secret".to_string()),
-                    client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
-                    code: None, redirect_uri: None, code_verifier: None, refresh_token: None,
-                    scopes: Some(vec!["machine:read".to_string()]),
-                    resource: Some(RESOURCE.to_string()),
-                }).unwrap();
-                assert_ne!(auth(&server, &basic.access_token).session_owner(), Some(private_owner));
-                server.revoke(
-                    &basic.access_token, "basic-machine", Some("basic-secret"),
-                    TokenEndpointAuthMethod::ClientSecretBasic,
-                ).unwrap();
+                server
+                    .register_client(
+                        OAuthClient::builder("basic-machine")
+                            .secret("basic-secret")
+                            .development_client_credentials(
+                                DevelopmentClientCredentialsGrant::new(
+                                    resource(),
+                                    ["machine:read"],
+                                )
+                                .unwrap(),
+                            )
+                            .build()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let basic = server
+                    .token(&TokenRequest {
+                        grant_type: "client_credentials".to_string(),
+                        client_id: "basic-machine".to_string(),
+                        client_secret: Some("basic-secret".to_string()),
+                        client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
+                        code: None,
+                        redirect_uri: None,
+                        code_verifier: None,
+                        refresh_token: None,
+                        scopes: Some(vec!["machine:read".to_string()]),
+                        resource: Some(RESOURCE.to_string()),
+                    })
+                    .unwrap();
+                assert_ne!(
+                    auth(&server, &basic.access_token).session_owner(),
+                    Some(private_owner)
+                );
+                server
+                    .revoke(
+                        &basic.access_token,
+                        "basic-machine",
+                        Some("basic-secret"),
+                        TokenEndpointAuthMethod::ClientSecretBasic,
+                    )
+                    .unwrap();
                 assert!(server.validate_access_token(&basic.access_token).is_none());
                 assert!(server.validate_access_token(&token.access_token).is_some());
             } else {
                 let before = snapshot(&server);
-                assert!(matches!(issue(&server, &assertion), Err(OAuthError::UnsupportedGrantType(_))));
+                assert!(matches!(
+                    issue(&server, &assertion),
+                    Err(OAuthError::UnsupportedGrantType(_))
+                ));
                 assert_eq!(snapshot(&server), before);
             }
         }
@@ -16899,47 +17579,72 @@ mod development_private_key_jwt_tests {
     fn development_private_key_jwt_failed_token_preparation_does_not_consume_assertion() {
         let server = endpoint_server();
         let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "entropy-retry"));
-        let verified = server.verify_development_client_assertion(
-            &assertion, TOKEN_ENDPOINT, false,
-        ).unwrap_or_else(|_| panic!("signed registration snapshot"));
+        let verified = server
+            .verify_development_client_assertion(&assertion, TOKEN_ENDPOINT, false)
+            .unwrap_or_else(|_| panic!("signed registration snapshot"));
         let request = TokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: CLIENT.to_string(),
             client_secret: None,
             client_authentication_method: TokenEndpointAuthMethod::PrivateKeyJwt,
-            code: None, redirect_uri: None, code_verifier: None, refresh_token: None,
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            refresh_token: None,
             scopes: Some(vec!["machine:read".to_string()]),
             resource: Some(RESOURCE.to_string()),
         };
         let before = snapshot(&server);
         let result = server.token_client_credentials_authenticated_with_draw(
-            &request, Some(&verified), || Err::<SecurityIdentifier, _>("injected entropy failure"),
+            &request,
+            Some(&verified),
+            || Err::<SecurityIdentifier, _>("injected entropy failure"),
         );
         assert!(matches!(result, Err(OAuthError::ServerError(_))));
         assert_eq!(snapshot(&server), before);
         let token = issue(&server, &assertion).unwrap();
         assert!(server.validate_access_token(&token.access_token).is_some());
 
-        let bounded = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-            issuer: ISSUER.to_string(),
-            allow_development_client_credentials: true,
-            max_access_tokens: 1,
-            max_access_tokens_per_client: 1,
-            ..Default::default()
-        }).unwrap());
-        bounded.register_client(client_with_policy(CLIENT, policy(
-            CLIENT, DevelopmentClientAssertionAudience::Endpoint,
-            DevelopmentClientAssertionAudience::Endpoint, 1,
-        ))).unwrap();
-        let first = issue(&bounded, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "capacity-first"))).unwrap();
+        let bounded = Arc::new(
+            OAuthServer::try_new(OAuthServerConfig {
+                issuer: ISSUER.to_string(),
+                allow_development_client_credentials: true,
+                max_access_tokens: 1,
+                max_access_tokens_per_client: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        bounded
+            .register_client(client_with_policy(
+                CLIENT,
+                policy(
+                    CLIENT,
+                    DevelopmentClientAssertionAudience::Endpoint,
+                    DevelopmentClientAssertionAudience::Endpoint,
+                    1,
+                ),
+            ))
+            .unwrap();
+        let first = issue(
+            &bounded,
+            &sign(&claims(CLIENT, TOKEN_ENDPOINT, "capacity-first")),
+        )
+        .unwrap();
         let queued = sign(&claims(CLIENT, TOKEN_ENDPOINT, "capacity-retry"));
         let before = snapshot(&bounded);
-        assert!(matches!(issue(&bounded, &queued), Err(OAuthError::TemporarilyUnavailable(_))));
+        assert!(matches!(
+            issue(&bounded, &queued),
+            Err(OAuthError::TemporarilyUnavailable(_))
+        ));
         assert_eq!(snapshot(&bounded), before);
-        bounded.revoke_with_development_private_key_jwt(
-            &sign(&claims(CLIENT, REVOCATION_ENDPOINT, "capacity-revoke")),
-            REVOCATION_ENDPOINT, &first.access_token,
-        ).unwrap();
+        bounded
+            .revoke_with_development_private_key_jwt(
+                &sign(&claims(CLIENT, REVOCATION_ENDPOINT, "capacity-revoke")),
+                REVOCATION_ENDPOINT,
+                &first.access_token,
+            )
+            .unwrap();
         let retry = issue(&bounded, &queued).unwrap();
         assert!(bounded.validate_access_token(&retry.access_token).is_some());
         assert!(bounded.validate_access_token(&first.access_token).is_none());
@@ -16948,20 +17653,28 @@ mod development_private_key_jwt_tests {
     fn overlapping_jwks() -> Vec<u8> {
         let mut current: Value = serde_json::from_slice(&jwks()).unwrap();
         let next: Value = serde_json::from_slice(&rotated_jwks()).unwrap();
-        current["keys"].as_array_mut().unwrap().extend(
-            next["keys"].as_array().unwrap().iter().cloned(),
-        );
+        current["keys"]
+            .as_array_mut()
+            .unwrap()
+            .extend(next["keys"].as_array().unwrap().iter().cloned());
         serde_json::to_vec(&current).unwrap()
     }
 
     fn rotation_policy(generation: u64, keys: &[u8]) -> DevelopmentPrivateKeyJwtPolicy {
         DevelopmentPrivateKeyJwtPolicy::new(
-            ISSUER, CLIENT, TOKEN_ENDPOINT, DevelopmentClientAssertionAudience::Endpoint,
-            generation, keys,
-        ).unwrap()
-            .with_revocation_endpoint(
-                REVOCATION_ENDPOINT, DevelopmentClientAssertionAudience::Endpoint,
-            ).unwrap()
+            ISSUER,
+            CLIENT,
+            TOKEN_ENDPOINT,
+            DevelopmentClientAssertionAudience::Endpoint,
+            generation,
+            keys,
+        )
+        .unwrap()
+        .with_revocation_endpoint(
+            REVOCATION_ENDPOINT,
+            DevelopmentClientAssertionAudience::Endpoint,
+        )
+        .unwrap()
     }
 
     fn assert_rotation_unchanged(
@@ -16970,72 +17683,126 @@ mod development_private_key_jwt_tests {
         before: &Snapshot,
     ) {
         assert_eq!(&snapshot(server), before);
-        let current = server.prepare_development_private_key_jwt_rotation(
-            &target.policy.client_id,
-        ).unwrap();
+        let current = server
+            .prepare_development_private_key_jwt_rotation(&target.policy.client_id)
+            .unwrap();
         assert_eq!(current.registration_epoch, target.registration_epoch);
         assert!(Arc::ptr_eq(&current.policy, &target.policy));
     }
 
     #[test]
     fn development_resource_evidence_survives_private_key_rotation_and_observes_revocation() {
-        let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
-            issuer: ISSUER.to_string(),
-            allow_development_client_credentials: true,
-            allow_development_token_introspection: true,
-            development_introspection_profile: DevelopmentIntrospectionProfile::ResourceEvidence,
-            ..Default::default()
-        }).unwrap());
-        server.register_client(client_with_policy(CLIENT, rotation_policy(1, &jwks()))).unwrap();
-        server.register_client(
-            OAuthClient::builder("resource-reader")
-                .secret("reader-secret")
-                .development_token_introspection(DevelopmentTokenIntrospectionGrant::new(resource()).unwrap())
-                .build().unwrap(),
-        ).unwrap();
-        let introspect = |token: &str| server.introspect_development_access_token(
-            token, "resource-reader", Some("reader-secret"), TokenEndpointAuthMethod::ClientSecretBasic,
-        ).unwrap();
-        let first = issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "evidence-before-rotation"))).unwrap();
+        let server = Arc::new(
+            OAuthServer::try_new(OAuthServerConfig {
+                issuer: ISSUER.to_string(),
+                allow_development_client_credentials: true,
+                allow_development_token_introspection: true,
+                development_introspection_profile:
+                    DevelopmentIntrospectionProfile::ResourceEvidence,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        server
+            .register_client(client_with_policy(CLIENT, rotation_policy(1, &jwks())))
+            .unwrap();
+        server
+            .register_client(
+                OAuthClient::builder("resource-reader")
+                    .secret("reader-secret")
+                    .development_token_introspection(
+                        DevelopmentTokenIntrospectionGrant::new(resource()).unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let introspect = |token: &str| {
+            server
+                .introspect_development_access_token(
+                    token,
+                    "resource-reader",
+                    Some("reader-secret"),
+                    TokenEndpointAuthMethod::ClientSecretBasic,
+                )
+                .unwrap()
+        };
+        let first = issue(
+            &server,
+            &sign(&claims(CLIENT, TOKEN_ENDPOINT, "evidence-before-rotation")),
+        )
+        .unwrap();
         let first_facts = introspect(&first.access_token);
         assert!(first_facts.is_active());
-        let retained_epoch = server.state.read().unwrap().access_tokens[
-            &digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap()
-        ].introspection_epoch;
-        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
-        server.rotate_development_private_key_jwt(&target, rotation_policy(2, &rotated_jwks())).unwrap();
+        let retained_epoch = server.state.read().unwrap().access_tokens
+            [&digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap()]
+            .introspection_epoch;
+        let target = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
+        server
+            .rotate_development_private_key_jwt(&target, rotation_policy(2, &rotated_jwks()))
+            .unwrap();
         let after = introspect(&first.access_token);
         assert_eq!(after.subject(), first_facts.subject());
-        assert_eq!(after.issued_at_unix_seconds(), first_facts.issued_at_unix_seconds());
-        assert_eq!(server.state.read().unwrap().access_tokens[
-            &digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap()
-        ].introspection_epoch, retained_epoch);
+        assert_eq!(
+            after.issued_at_unix_seconds(),
+            first_facts.issued_at_unix_seconds()
+        );
+        assert_eq!(
+            server.state.read().unwrap().access_tokens
+                [&digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap()]
+                .introspection_epoch,
+            retained_epoch
+        );
         let before = snapshot(&server);
-        assert!(issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "evidence-retired-key"))).is_err());
+        assert!(
+            issue(
+                &server,
+                &sign(&claims(CLIENT, TOKEN_ENDPOINT, "evidence-retired-key"))
+            )
+            .is_err()
+        );
         assert_eq!(snapshot(&server), before);
-        let second = issue(&server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "evidence-rotated-key"))).unwrap();
-        assert_eq!(introspect(&second.access_token).subject(), first_facts.subject());
-        server.revoke_with_development_private_key_jwt(
-            &sign_rotated(&claims(CLIENT, REVOCATION_ENDPOINT, "evidence-revoke")),
-            REVOCATION_ENDPOINT, &first.access_token,
-        ).unwrap();
-        assert_eq!(serde_json::to_value(introspect(&first.access_token)).unwrap(), json!({"active":false}));
+        let second = issue(
+            &server,
+            &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "evidence-rotated-key")),
+        )
+        .unwrap();
+        assert_eq!(
+            introspect(&second.access_token).subject(),
+            first_facts.subject()
+        );
+        server
+            .revoke_with_development_private_key_jwt(
+                &sign_rotated(&claims(CLIENT, REVOCATION_ENDPOINT, "evidence-revoke")),
+                REVOCATION_ENDPOINT,
+                &first.access_token,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(introspect(&first.access_token)).unwrap(),
+            json!({"active":false})
+        );
         assert!(introspect(&second.access_token).is_active());
     }
 
     #[test]
-    fn development_private_key_jwt_rotation_overlaps_and_retires_real_keys_without_revoking_tokens() {
+    fn development_private_key_jwt_rotation_overlaps_and_retires_real_keys_without_revoking_tokens()
+    {
         let server = endpoint_server();
         let original_claims = claims(CLIENT, TOKEN_ENDPOINT, "before-rotation");
         let first = issue(&server, &sign(&original_claims)).unwrap();
         let owner = auth(&server, &first.access_token).session_owner().unwrap();
         let mut tokens = vec![first.access_token.clone()];
-        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let target = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         assert_eq!(target.configuration_generation(), 1);
         let before = snapshot(&server);
-        server.rotate_development_private_key_jwt(
-            &target, rotation_policy(2, &overlapping_jwks()),
-        ).unwrap();
+        server
+            .rotate_development_private_key_jwt(&target, rotation_policy(2, &overlapping_jwks()))
+            .unwrap();
         assert_eq!(snapshot(&server), before);
 
         for (jti, signer) in [
@@ -17058,16 +17825,23 @@ mod development_private_key_jwt_tests {
         ));
         assert_eq!(snapshot(&server), before);
 
-        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let target = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         assert_eq!(target.configuration_generation(), 2);
-        server.rotate_development_private_key_jwt(
-            &target, rotation_policy(3, &rotated_jwks()),
-        ).unwrap();
+        server
+            .rotate_development_private_key_jwt(&target, rotation_policy(3, &rotated_jwks()))
+            .unwrap();
         assert_eq!(snapshot(&server), before);
-        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let current = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         let before = snapshot(&server);
         assert!(matches!(
-            issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "retired-key"))),
+            issue(
+                &server,
+                &sign(&claims(CLIENT, TOKEN_ENDPOINT, "retired-key"))
+            ),
             Err(OAuthError::InvalidClient(_))
         ));
         assert!(matches!(
@@ -17076,8 +17850,10 @@ mod development_private_key_jwt_tests {
         ));
         assert_rotation_unchanged(&server, &current, &before);
         let token = issue(
-            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "after-retirement")),
-        ).unwrap();
+            &server,
+            &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "after-retirement")),
+        )
+        .unwrap();
         tokens.push(token.access_token.clone());
         for token in &tokens {
             let stored = server.validate_access_token(token).unwrap();
@@ -17086,10 +17862,13 @@ mod development_private_key_jwt_tests {
             assert_eq!(auth(&server, token).session_owner(), Some(owner));
         }
         // The same rotated registration also authenticates explicit revocation.
-        server.revoke_with_development_private_key_jwt(
-            &sign_rotated(&claims(CLIENT, REVOCATION_ENDPOINT, "rotated-revocation")),
-            REVOCATION_ENDPOINT, &first.access_token,
-        ).unwrap();
+        server
+            .revoke_with_development_private_key_jwt(
+                &sign_rotated(&claims(CLIENT, REVOCATION_ENDPOINT, "rotated-revocation")),
+                REVOCATION_ENDPOINT,
+                &first.access_token,
+            )
+            .unwrap();
         assert!(server.validate_access_token(&first.access_token).is_none());
         for token in tokens.iter().skip(1) {
             assert_eq!(auth(&server, token).session_owner(), Some(owner));
@@ -17097,29 +17876,80 @@ mod development_private_key_jwt_tests {
     }
 
     #[test]
-    fn development_private_key_jwt_rotation_rejects_binding_and_generation_changes_without_mutation() {
+    fn development_private_key_jwt_rotation_rejects_binding_and_generation_changes_without_mutation()
+     {
         let server = endpoint_server();
-        let token = issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "binding-owner"))).unwrap();
-        let stale = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
-        server.rotate_development_private_key_jwt(
-            &stale, rotation_policy(3, &overlapping_jwks()),
-        ).unwrap();
-        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let token = issue(
+            &server,
+            &sign(&claims(CLIENT, TOKEN_ENDPOINT, "binding-owner")),
+        )
+        .unwrap();
+        let stale = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
+        server
+            .rotate_development_private_key_jwt(&stale, rotation_policy(3, &overlapping_jwks()))
+            .unwrap();
+        let target = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         let before = snapshot(&server);
         let endpoint = DevelopmentClientAssertionAudience::Endpoint;
         let issuer = DevelopmentClientAssertionAudience::Issuer;
         for (issuer_url, client_id, token_url, token_audience, revocation) in [
-            ("https://other-issuer.example", CLIENT, TOKEN_ENDPOINT, endpoint, Some((REVOCATION_ENDPOINT, endpoint))),
-            (ISSUER, "other-client", TOKEN_ENDPOINT, endpoint, Some((REVOCATION_ENDPOINT, endpoint))),
-            (ISSUER, CLIENT, "https://issuer.example/oauth/other-token", endpoint, Some((REVOCATION_ENDPOINT, endpoint))),
-            (ISSUER, CLIENT, TOKEN_ENDPOINT, issuer, Some((REVOCATION_ENDPOINT, endpoint))),
+            (
+                "https://other-issuer.example",
+                CLIENT,
+                TOKEN_ENDPOINT,
+                endpoint,
+                Some((REVOCATION_ENDPOINT, endpoint)),
+            ),
+            (
+                ISSUER,
+                "other-client",
+                TOKEN_ENDPOINT,
+                endpoint,
+                Some((REVOCATION_ENDPOINT, endpoint)),
+            ),
+            (
+                ISSUER,
+                CLIENT,
+                "https://issuer.example/oauth/other-token",
+                endpoint,
+                Some((REVOCATION_ENDPOINT, endpoint)),
+            ),
+            (
+                ISSUER,
+                CLIENT,
+                TOKEN_ENDPOINT,
+                issuer,
+                Some((REVOCATION_ENDPOINT, endpoint)),
+            ),
             (ISSUER, CLIENT, TOKEN_ENDPOINT, endpoint, None),
-            (ISSUER, CLIENT, TOKEN_ENDPOINT, endpoint, Some(("https://issuer.example/oauth/other-revoke", endpoint))),
-            (ISSUER, CLIENT, TOKEN_ENDPOINT, endpoint, Some((REVOCATION_ENDPOINT, issuer))),
+            (
+                ISSUER,
+                CLIENT,
+                TOKEN_ENDPOINT,
+                endpoint,
+                Some(("https://issuer.example/oauth/other-revoke", endpoint)),
+            ),
+            (
+                ISSUER,
+                CLIENT,
+                TOKEN_ENDPOINT,
+                endpoint,
+                Some((REVOCATION_ENDPOINT, issuer)),
+            ),
         ] {
             let mut replacement = DevelopmentPrivateKeyJwtPolicy::new(
-                issuer_url, client_id, token_url, token_audience, 4, &rotated_jwks(),
-            ).unwrap();
+                issuer_url,
+                client_id,
+                token_url,
+                token_audience,
+                4,
+                &rotated_jwks(),
+            )
+            .unwrap();
             if let Some((url, audience)) = revocation {
                 replacement = replacement.with_revocation_endpoint(url, audience).unwrap();
             }
@@ -17130,42 +17960,59 @@ mod development_private_key_jwt_tests {
             assert_rotation_unchanged(&server, &target, &before);
         }
         for generation in [1, 3] {
-            assert!(matches!(server.rotate_development_private_key_jwt(
-                &target, rotation_policy(generation, &rotated_jwks()),
-            ), Err(OAuthError::InvalidRequest(_))));
+            assert!(matches!(
+                server.rotate_development_private_key_jwt(
+                    &target,
+                    rotation_policy(generation, &rotated_jwks()),
+                ),
+                Err(OAuthError::InvalidRequest(_))
+            ));
             assert_rotation_unchanged(&server, &target, &before);
         }
         // A greater replacement generation cannot rescue an older snapshot.
-        assert!(matches!(server.rotate_development_private_key_jwt(
-            &stale, rotation_policy(4, &rotated_jwks()),
-        ), Err(OAuthError::InvalidRequest(_))));
+        assert!(matches!(
+            server.rotate_development_private_key_jwt(&stale, rotation_policy(4, &rotated_jwks()),),
+            Err(OAuthError::InvalidRequest(_))
+        ));
         assert_rotation_unchanged(&server, &target, &before);
         assert!(server.validate_access_token(&token.access_token).is_some());
-        server.rotate_development_private_key_jwt(
-            &target, rotation_policy(4, &rotated_jwks()),
-        ).unwrap();
+        server
+            .rotate_development_private_key_jwt(&target, rotation_policy(4, &rotated_jwks()))
+            .unwrap();
         let token = issue(
-            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "binding-retry")),
-        ).unwrap();
+            &server,
+            &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "binding-retry")),
+        )
+        .unwrap();
         assert!(server.validate_access_token(&token.access_token).is_some());
     }
 
     #[test]
     fn development_private_key_jwt_rotation_targets_reject_other_clients_and_issuer_instances() {
         let server = endpoint_server();
-        server.register_client(
-            OAuthClient::builder("public-client")
-                .redirect_uri("http://127.0.0.1/callback")
-                .build().unwrap(),
-        ).unwrap();
-        server.register_client(
-            OAuthClient::builder("basic-machine").secret("basic-secret")
-                .development_client_credentials(
-                    DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap(),
-                )
-                .build().unwrap(),
-        ).unwrap();
-        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        server
+            .register_client(
+                OAuthClient::builder("public-client")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        server
+            .register_client(
+                OAuthClient::builder("basic-machine")
+                    .secret("basic-secret")
+                    .development_client_credentials(
+                        DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"])
+                            .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let target = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         let before = snapshot(&server);
         for client_id in ["missing-client", "public-client", "basic-machine"] {
             assert!(matches!(
@@ -17175,50 +18022,76 @@ mod development_private_key_jwt_tests {
             assert_rotation_unchanged(&server, &target, &before);
         }
         let same_issuer = endpoint_server();
-        let other_target = same_issuer.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let other_target = same_issuer
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         let other_before = snapshot(&same_issuer);
-        assert!(matches!(same_issuer.rotate_development_private_key_jwt(
-            &target, rotation_policy(2, &rotated_jwks()),
-        ), Err(OAuthError::InvalidRequest(_))));
+        assert!(matches!(
+            same_issuer
+                .rotate_development_private_key_jwt(&target, rotation_policy(2, &rotated_jwks()),),
+            Err(OAuthError::InvalidRequest(_))
+        ));
         assert_rotation_unchanged(&same_issuer, &other_target, &other_before);
         assert_rotation_unchanged(&server, &target, &before);
-        same_issuer.rotate_development_private_key_jwt(
-            &other_target, rotation_policy(2, &rotated_jwks()),
-        ).unwrap();
+        same_issuer
+            .rotate_development_private_key_jwt(&other_target, rotation_policy(2, &rotated_jwks()))
+            .unwrap();
         let token = issue(
-            &same_issuer, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "own-instance")),
-        ).unwrap();
-        assert!(same_issuer.validate_access_token(&token.access_token).is_some());
+            &same_issuer,
+            &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "own-instance")),
+        )
+        .unwrap();
+        assert!(
+            same_issuer
+                .validate_access_token(&token.access_token)
+                .is_some()
+        );
     }
 
     #[test]
-    fn development_private_key_jwt_rotation_target_cannot_cross_reregistration_with_reset_generation() {
+    fn development_private_key_jwt_rotation_target_cannot_cross_reregistration_with_reset_generation()
+     {
         let server = endpoint_server();
         let first_claims = claims(CLIENT, TOKEN_ENDPOINT, "before-reregistration");
         let first = issue(&server, &sign(&first_claims)).unwrap();
         let first_owner = auth(&server, &first.access_token).session_owner().unwrap();
-        let stale = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let stale = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         server.unregister_client(CLIENT).unwrap();
         // Reuse exactly the same configured keys and generation. Only the new
         // registration epoch and current allocation distinguish this owner.
-        server.register_client(client_with_policy(CLIENT, (*stale.policy).clone())).unwrap();
-        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
-        assert_eq!(current.configuration_generation(), stale.configuration_generation());
+        server
+            .register_client(client_with_policy(CLIENT, (*stale.policy).clone()))
+            .unwrap();
+        let current = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
+        assert_eq!(
+            current.configuration_generation(),
+            stale.configuration_generation()
+        );
         let token = issue(
-            &server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "new-registration")),
-        ).unwrap();
+            &server,
+            &sign(&claims(CLIENT, TOKEN_ENDPOINT, "new-registration")),
+        )
+        .unwrap();
         let current_owner = auth(&server, &token.access_token).session_owner().unwrap();
         assert_ne!(current_owner, first_owner);
         let before = snapshot(&server);
-        assert!(matches!(server.rotate_development_private_key_jwt(
-            &stale, rotation_policy(2, &rotated_jwks()),
-        ), Err(OAuthError::InvalidRequest(_))));
+        assert!(matches!(
+            server.rotate_development_private_key_jwt(&stale, rotation_policy(2, &rotated_jwks()),),
+            Err(OAuthError::InvalidRequest(_))
+        ));
         assert_rotation_unchanged(&server, &current, &before);
-        server.rotate_development_private_key_jwt(
-            &current, rotation_policy(2, &rotated_jwks()),
-        ).unwrap();
+        server
+            .rotate_development_private_key_jwt(&current, rotation_policy(2, &rotated_jwks()))
+            .unwrap();
         assert_eq!(snapshot(&server), before);
-        assert_eq!(auth(&server, &token.access_token).session_owner(), Some(current_owner));
+        assert_eq!(
+            auth(&server, &token.access_token).session_owner(),
+            Some(current_owner)
+        );
         assert!(server.validate_access_token(&first.access_token).is_none());
         let before = snapshot(&server);
         assert!(matches!(
@@ -17227,55 +18100,85 @@ mod development_private_key_jwt_tests {
         ));
         assert_eq!(snapshot(&server), before);
         let fresh = issue(
-            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "after-reregistration-rotation")),
-        ).unwrap();
-        assert_eq!(auth(&server, &fresh.access_token).session_owner(), Some(current_owner));
+            &server,
+            &sign_rotated(&claims(
+                CLIENT,
+                TOKEN_ENDPOINT,
+                "after-reregistration-rotation",
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            auth(&server, &fresh.access_token).session_owner(),
+            Some(current_owner)
+        );
     }
 
     #[test]
     fn development_private_key_jwt_rotation_invalidates_unconsumed_verification_receipts() {
         let server = endpoint_server();
         let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "pending-verification"));
-        let verified = server.verify_development_client_assertion(
-            &assertion, TOKEN_ENDPOINT, false,
-        ).unwrap_or_else(|_| panic!("signed registration snapshot"));
-        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
-        server.rotate_development_private_key_jwt(
-            &target, rotation_policy(2, &overlapping_jwks()),
-        ).unwrap();
-        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let verified = server
+            .verify_development_client_assertion(&assertion, TOKEN_ENDPOINT, false)
+            .unwrap_or_else(|_| panic!("signed registration snapshot"));
+        let target = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
+        server
+            .rotate_development_private_key_jwt(&target, rotation_policy(2, &overlapping_jwks()))
+            .unwrap();
+        let current = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         let before = snapshot(&server);
         let request = TokenRequest {
             grant_type: "client_credentials".to_string(),
             client_id: CLIENT.to_string(),
             client_secret: None,
             client_authentication_method: TokenEndpointAuthMethod::PrivateKeyJwt,
-            code: None, redirect_uri: None, code_verifier: None, refresh_token: None,
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            refresh_token: None,
             scopes: Some(vec!["machine:read".to_string()]),
             resource: Some(RESOURCE.to_string()),
         };
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        assert!(matches!(server.token_client_credentials_authenticated_with_draw(
-            &request, Some(&verified), || {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                draw_security_identifier()
-            },
-        ), Err(OAuthError::InvalidClient(_))));
+        assert!(matches!(
+            server.token_client_credentials_authenticated_with_draw(
+                &request,
+                Some(&verified),
+                || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    draw_security_identifier()
+                },
+            ),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_rotation_unchanged(&server, &current, &before);
         // Its signed bytes still pass a fresh verification because the new
         // policy explicitly retains the old key and the jti was not consumed.
         let token = issue(&server, &assertion).unwrap();
         assert!(server.validate_access_token(&token.access_token).is_some());
-        assert_eq!(server.state.read().unwrap().client_assertion_replays.len(), 1);
+        assert_eq!(
+            server.state.read().unwrap().client_assertion_replays.len(),
+            1
+        );
     }
 
     #[test]
     fn development_private_key_jwt_rotation_competing_snapshots_commit_exactly_once() {
         let server = endpoint_server();
-        let first = issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "concurrent-rotation-owner"))).unwrap();
+        let first = issue(
+            &server,
+            &sign(&claims(CLIENT, TOKEN_ENDPOINT, "concurrent-rotation-owner")),
+        )
+        .unwrap();
         let owner = auth(&server, &first.access_token).session_owner().unwrap();
-        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let target = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         let before = snapshot(&server);
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let replacements = [
@@ -17283,38 +18186,68 @@ mod development_private_key_jwt_tests {
             rotation_policy(3, &rotated_jwks()),
         ];
         let results = std::thread::scope(|scope| {
-            let workers: Vec<_> = replacements.into_iter().map(|replacement| {
-                let server = Arc::clone(&server);
-                let target = target.clone();
-                let barrier = Arc::clone(&barrier);
-                scope.spawn(move || {
-                    let generation = replacement.configuration_generation();
-                    barrier.wait();
-                    (generation, server.rotate_development_private_key_jwt(&target, replacement))
+            let workers: Vec<_> = replacements
+                .into_iter()
+                .map(|replacement| {
+                    let server = Arc::clone(&server);
+                    let target = target.clone();
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        let generation = replacement.configuration_generation();
+                        barrier.wait();
+                        (
+                            generation,
+                            server.rotate_development_private_key_jwt(&target, replacement),
+                        )
+                    })
                 })
-            }).collect();
-            workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
         });
-        let winners: Vec<_> = results.iter()
+        let winners: Vec<_> = results
+            .iter()
             .filter(|(_, result)| result.is_ok())
             .map(|(generation, _)| *generation)
             .collect();
         assert_eq!(winners.len(), 1);
-        assert_eq!(results.iter().filter(|(_, result)| {
-            matches!(result, Err(OAuthError::InvalidRequest(_)))
-        }).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, result)| { matches!(result, Err(OAuthError::InvalidRequest(_))) })
+                .count(),
+            1
+        );
         assert_eq!(snapshot(&server), before);
-        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let current = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         assert_eq!(current.configuration_generation(), winners[0]);
-        assert!(matches!(server.rotate_development_private_key_jwt(
-            &target, rotation_policy(4, &rotated_jwks()),
-        ), Err(OAuthError::InvalidRequest(_))));
+        assert!(matches!(
+            server
+                .rotate_development_private_key_jwt(&target, rotation_policy(4, &rotated_jwks()),),
+            Err(OAuthError::InvalidRequest(_))
+        ));
         assert_rotation_unchanged(&server, &current, &before);
         let token = issue(
-            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "concurrent-rotation-current")),
-        ).unwrap();
-        assert_eq!(auth(&server, &token.access_token).session_owner(), Some(owner));
-        assert_eq!(auth(&server, &first.access_token).session_owner(), Some(owner));
+            &server,
+            &sign_rotated(&claims(
+                CLIENT,
+                TOKEN_ENDPOINT,
+                "concurrent-rotation-current",
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            auth(&server, &token.access_token).session_owner(),
+            Some(owner)
+        );
+        assert_eq!(
+            auth(&server, &first.access_token).session_owner(),
+            Some(owner)
+        );
     }
 
     #[test]
@@ -17325,24 +18258,42 @@ mod development_private_key_jwt_tests {
         let expiry = original_claims["exp"].as_u64().unwrap();
         {
             let mut state = server.state.write().unwrap();
-            for index in 1_u64..u64::try_from(MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT).unwrap() {
+            for index in
+                1_u64..u64::try_from(MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT).unwrap()
+            {
                 let key = sha256_bounded(&index.to_be_bytes(), 8).unwrap();
-                assert!(state.client_assertion_replays.insert(key, ClientAssertionReplay {
-                    client_id: CLIENT.to_string(),
-                    expires_at_unix_seconds: expiry,
-                }).is_none());
+                assert!(
+                    state
+                        .client_assertion_replays
+                        .insert(
+                            key,
+                            ClientAssertionReplay {
+                                client_id: CLIENT.to_string(),
+                                expires_at_unix_seconds: expiry,
+                            }
+                        )
+                        .is_none()
+                );
             }
         }
-        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let target = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         let before = snapshot(&server);
-        server.rotate_development_private_key_jwt(
-            &target, rotation_policy(2, &rotated_jwks()),
-        ).unwrap();
+        server
+            .rotate_development_private_key_jwt(&target, rotation_policy(2, &rotated_jwks()))
+            .unwrap();
         assert_eq!(snapshot(&server), before);
-        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
-        assert!(matches!(issue(
-            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "rotation-over-quota")),
-        ), Err(OAuthError::TemporarilyUnavailable(_))));
+        let current = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
+        assert!(matches!(
+            issue(
+                &server,
+                &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "rotation-over-quota")),
+            ),
+            Err(OAuthError::TemporarilyUnavailable(_))
+        ));
         assert!(matches!(
             issue(&server, &sign_rotated(&original_claims)),
             Err(OAuthError::InvalidClient(_))
@@ -17355,14 +18306,24 @@ mod development_private_key_jwt_tests {
             assert!(state.client_assertion_replays.is_empty());
         }
         let before = snapshot(&server);
-        server.rotate_development_private_key_jwt(
-            &current, rotation_policy(3, &rotated_jwks()),
-        ).unwrap();
+        server
+            .rotate_development_private_key_jwt(&current, rotation_policy(3, &rotated_jwks()))
+            .unwrap();
         assert_eq!(snapshot(&server), before);
-        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
-        assert!(matches!(issue(
-            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "rotation-rolled-back-clock")),
-        ), Err(OAuthError::InvalidClient(_))));
+        let current = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
+        assert!(matches!(
+            issue(
+                &server,
+                &sign_rotated(&claims(
+                    CLIENT,
+                    TOKEN_ENDPOINT,
+                    "rotation-rolled-back-clock"
+                )),
+            ),
+            Err(OAuthError::InvalidClient(_))
+        ));
         assert_rotation_unchanged(&server, &current, &before);
         assert!(server.validate_access_token(&first.access_token).is_some());
     }
@@ -17370,34 +18331,45 @@ mod development_private_key_jwt_tests {
     #[test]
     fn development_private_key_jwt_rotation_target_is_redacted_and_generation_never_wraps() {
         let server = endpoint_server();
-        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let target = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         assert_eq!(
             format!("{target:?}"),
             "DevelopmentPrivateKeyJwtRotationTarget { configuration_generation: 1, .. }"
         );
         let retained = target.clone();
         let before = snapshot(&server);
-        server.rotate_development_private_key_jwt(
-            &target, rotation_policy(u64::MAX, &rotated_jwks()),
-        ).unwrap();
+        server
+            .rotate_development_private_key_jwt(&target, rotation_policy(u64::MAX, &rotated_jwks()))
+            .unwrap();
         assert_eq!(snapshot(&server), before);
         assert_eq!(retained.configuration_generation(), 1);
-        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let current = server
+            .prepare_development_private_key_jwt_rotation(CLIENT)
+            .unwrap();
         assert_eq!(current.configuration_generation(), u64::MAX);
         for generation in [u64::MAX - 1, u64::MAX] {
-            assert!(matches!(server.rotate_development_private_key_jwt(
-                &current, rotation_policy(generation, &jwks()),
-            ), Err(OAuthError::InvalidRequest(_))));
+            assert!(matches!(
+                server.rotate_development_private_key_jwt(
+                    &current,
+                    rotation_policy(generation, &jwks()),
+                ),
+                Err(OAuthError::InvalidRequest(_))
+            ));
             assert_rotation_unchanged(&server, &current, &before);
         }
-        assert!(matches!(server.rotate_development_private_key_jwt(
-            &retained, rotation_policy(u64::MAX, &jwks()),
-        ), Err(OAuthError::InvalidRequest(_))));
+        assert!(matches!(
+            server
+                .rotate_development_private_key_jwt(&retained, rotation_policy(u64::MAX, &jwks()),),
+            Err(OAuthError::InvalidRequest(_))
+        ));
         assert_rotation_unchanged(&server, &current, &before);
         let token = issue(
-            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "maximum-generation")),
-        ).unwrap();
+            &server,
+            &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "maximum-generation")),
+        )
+        .unwrap();
         assert!(server.validate_access_token(&token.access_token).is_some());
     }
-
 }

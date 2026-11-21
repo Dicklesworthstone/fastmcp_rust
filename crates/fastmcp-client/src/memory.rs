@@ -420,9 +420,9 @@ impl MemoryClient {
             ));
         }
         #[cfg(not(feature = "apps"))]
-        if configured.contains_key(
-            fastmcp_protocol::extensions::official_mcp_apps_extension_id().as_str(),
-        ) {
+        if configured
+            .contains_key(fastmcp_protocol::extensions::official_mcp_apps_extension_id().as_str())
+        {
             return Err(McpError::invalid_params(
                 "Memory MCP Apps requires the apps feature",
             ));
@@ -594,15 +594,8 @@ impl MemoryClient {
         parameters: Value,
         timeout_policy: RequestTimeoutPolicy,
     ) -> McpResult<MemoryRequestExecution> {
-        self.execute_core_admitted(
-            cx,
-            cancellation,
-            method,
-            parameters,
-            timeout_policy,
-            false,
-        )
-        .await
+        self.execute_core_admitted(cx, cancellation, method, parameters, timeout_policy, false)
+            .await
     }
 
     async fn execute_core_admitted(
@@ -642,8 +635,7 @@ impl MemoryClient {
                 false
             }
         };
-        let parameters =
-            self.parameters_with_tasks(parameters, allow_tasks || discovery_tasks)?;
+        let parameters = self.parameters_with_tasks(parameters, allow_tasks || discovery_tasks)?;
         let request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&parameters))
             .map_err(|_| McpError::invalid_params("Invalid modern memory core request"))?;
         let next_id = self
@@ -1404,7 +1396,11 @@ impl MemoryClient {
                     return Err(McpError::request_cancelled());
                 }
                 Poll::Ready(Err(error)) => {
-                    return Err(fail_transport(&self.executor, &mut self.subscriptions, error));
+                    return Err(fail_transport(
+                        &self.executor,
+                        &mut self.subscriptions,
+                        error,
+                    ));
                 }
             }
         }
@@ -1438,9 +1434,7 @@ impl MemoryClient {
             McpError::invalid_params("Memory request parameters must be an object")
         })?;
         let mut capabilities = self.session.client_capabilities().clone();
-        if !advertise_tasks
-            && let Some(extensions) = &mut capabilities.extensions
-        {
+        if !advertise_tasks && let Some(extensions) = &mut capabilities.extensions {
             extensions.remove(TASKS_EXTENSION_NAME);
         }
         #[cfg(feature = "apps")]
@@ -1449,9 +1443,8 @@ impl MemoryClient {
             && !self.session.mcp_apps_active()
             && let Some(extensions) = &mut capabilities.extensions
         {
-            extensions.remove(
-                fastmcp_protocol::extensions::official_mcp_apps_extension_id().as_str(),
-            );
+            extensions
+                .remove(fastmcp_protocol::extensions::official_mcp_apps_extension_id().as_str());
         }
         let mut metadata = serde_json::to_value(FinalRequestMeta {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
@@ -1539,13 +1532,15 @@ impl MemoryClient {
                         return Err(error);
                     }
                 }
-                Some(
-                    Ok(Err(TransportError::Cancelled)) | Err(Err(TransportError::Cancelled)),
-                ) => {
+                Some(Ok(Err(TransportError::Cancelled)) | Err(Err(TransportError::Cancelled))) => {
                     return Err(McpError::request_cancelled());
                 }
                 Some(Ok(Err(error)) | Err(Err(error))) => {
-                    return Err(fail_transport(&self.executor, &mut self.subscriptions, error));
+                    return Err(fail_transport(
+                        &self.executor,
+                        &mut self.subscriptions,
+                        error,
+                    ));
                 }
                 Some(Err(Ok(frame))) => {
                     admit_frame(&self.executor, &mut self.subscriptions, cx, frame)?;
@@ -1560,7 +1555,11 @@ impl MemoryClient {
                 }
                 Some(Err(TransportError::Cancelled)) => return Err(McpError::request_cancelled()),
                 Some(Err(error)) => {
-                    return Err(fail_transport(&self.executor, &mut self.subscriptions, error));
+                    return Err(fail_transport(
+                        &self.executor,
+                        &mut self.subscriptions,
+                        error,
+                    ));
                 }
                 None => {}
             }
@@ -2005,7 +2004,10 @@ mod tests {
                     .unwrap();
                 receive(&cx, &mut peer, "tools/list", Some(3)).await;
                 assert_eq!(
-                    OperatorSnapshot::capture(&client).unwrap().requests().pending,
+                    OperatorSnapshot::capture(&client)
+                        .unwrap()
+                        .requests()
+                        .pending,
                     1
                 );
                 if peer_failure {

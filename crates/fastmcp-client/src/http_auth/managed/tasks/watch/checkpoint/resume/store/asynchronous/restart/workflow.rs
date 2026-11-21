@@ -10,13 +10,13 @@ use std::fmt;
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 
-use super::StagedTaskRestart;
-use super::super::{
-    AsyncTaskResumeStore, TaskResumeBinding, TaskResumeCompletion, TaskResumeProtector,
-};
 use super::super::persistence::{
     TaskResumePersistence, TaskResumePersistenceError, TaskResumePersistenceStatus,
 };
+use super::super::{
+    AsyncTaskResumeStore, TaskResumeBinding, TaskResumeCompletion, TaskResumeProtector,
+};
+use super::StagedTaskRestart;
 use crate::http_auth::managed::tasks::ManagedTasksClient;
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::TaskResumeError;
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::client::lifecycle::TaskResumeChange;
@@ -253,7 +253,13 @@ impl<P: TaskResumeProtector + 'static> PersistedManagedTaskRestart<P> {
     }
 
     pub fn into_parts(self) -> PersistedTaskRestartParts<P> {
-        let RestartCommit { current, storage, pending, change, state } = self.commit;
+        let RestartCommit {
+            current,
+            storage,
+            pending,
+            change,
+            state,
+        } = self.commit;
         PersistedTaskRestartParts {
             restart: self.restart,
             current,
@@ -305,11 +311,11 @@ impl<P: TaskResumeProtector + 'static, I: RestartCheckpointItem> RestartCommit<P
         }
     }
 
-    pub(crate) async fn acknowledge(
-        &mut self,
-        cx: &Cx,
-    ) -> Result<I, PersistedTaskRestartError> {
-        let pending = self.pending.as_ref().ok_or(PersistedTaskRestartError::NoPending)?;
+    pub(crate) async fn acknowledge(&mut self, cx: &Cx) -> Result<I, PersistedTaskRestartError> {
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or(PersistedTaskRestartError::NoPending)?;
         let outcome = match self.state {
             RestartCheckpointState::NotAttempted => {
                 let change = pending
@@ -340,14 +346,18 @@ impl<P: TaskResumeProtector + 'static, I: RestartCheckpointItem> RestartCommit<P
         // authority is inferred from transferring the original item now.
         self.change = None;
         self.state = RestartCheckpointState::NotAttempted;
-        self.pending.take().ok_or(PersistedTaskRestartError::NoPending)
+        self.pending
+            .take()
+            .ok_or(PersistedTaskRestartError::NoPending)
     }
 
     pub(crate) fn take_without_persisting(&mut self) -> Result<I, PersistedTaskRestartError> {
         if self.state != RestartCheckpointState::NotAttempted {
             return Err(PersistedTaskRestartError::AcknowledgementRequired);
         }
-        self.pending.take().ok_or(PersistedTaskRestartError::NoPending)
+        self.pending
+            .take()
+            .ok_or(PersistedTaskRestartError::NoPending)
     }
 }
 

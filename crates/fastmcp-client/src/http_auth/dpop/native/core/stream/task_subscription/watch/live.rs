@@ -11,11 +11,11 @@ use asupersync::bytes::Buf;
 use asupersync::http::body::Body;
 use fastmcp_core::McpRequestCancellation;
 
-use super::*;
 use super::super::super::{BYTES_PER_TURN, FRAMES_PER_TURN};
+use super::*;
 use crate::http_auth::dpop::DpopSession;
-use crate::http_auth::dpop::native::{check_live_owner, require_runtime, within_owner};
 use crate::http_auth::dpop::native::core::stream::budget::{Budgeted, SharedStreamBudget};
+use crate::http_auth::dpop::native::{check_live_owner, require_runtime, within_owner};
 
 pub(super) struct ReadOwner<'a> {
     pub(super) cx: &'a Cx,
@@ -27,15 +27,29 @@ pub(super) struct ReadOwner<'a> {
 
 impl<'a> ReadOwner<'a> {
     pub(super) fn new(
-        cx: &'a Cx, cancellation: &'a McpRequestCancellation,
-        session: &DpopSession, credential: &'a DpopCredential, bounds: WaitBounds,
+        cx: &'a Cx,
+        cancellation: &'a McpRequestCancellation,
+        session: &DpopSession,
+        credential: &'a DpopCredential,
+        bounds: WaitBounds,
     ) -> Self {
-        Self { cx, cancellation, owner: session.cancellation.clone(), credential, bounds }
+        Self {
+            cx,
+            cancellation,
+            owner: session.cancellation.clone(),
+            credential,
+            bounds,
+        }
     }
 
     fn check(&self, idle: &Idle) -> Result<(), DpopHttpError> {
-        check_live_owner(self.cx, self.cancellation, &self.owner, self.credential,
-            idle.bounds(self.bounds))?;
+        check_live_owner(
+            self.cx,
+            self.cancellation,
+            &self.owner,
+            self.credential,
+            idle.bounds(self.bounds),
+        )?;
         require_runtime(self.cx)
     }
 }
@@ -49,9 +63,18 @@ pub(super) enum Follow<T> {
     Stopped,
 }
 
-pub(super) enum LiveStep { Hint, Closed }
+pub(super) enum LiveStep {
+    Hint,
+    Closed,
+}
 
-enum Pump { Idle, Yielded, Hint, Teardown, Closed }
+enum Pump {
+    Idle,
+    Yielded,
+    Hint,
+    Teardown,
+    Closed,
+}
 
 pub(super) struct LiveListen<B: Body> {
     body: Option<B>,
@@ -71,39 +94,74 @@ where
 {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        body: B, kind: crate::http_executor::ModernHttpResponseKind,
-        decoder: TaskSubscriptionDecoder, idle: Idle, selected: TaskId,
-        limits: DpopStreamLimits, raw_limit: usize, budget: SharedStreamBudget,
+        body: B,
+        kind: crate::http_executor::ModernHttpResponseKind,
+        decoder: TaskSubscriptionDecoder,
+        idle: Idle,
+        selected: TaskId,
+        limits: DpopStreamLimits,
+        raw_limit: usize,
+        budget: SharedStreamBudget,
     ) -> Result<Self, DpopTaskWatchError> {
-        let reader = Reader::<_, DpopTaskSubscriptionEvent>::new(kind, Budgeted::new(decoder, Some(budget.clone())), limits, raw_limit)?;
-        Ok(Self { body: Some(body), pending: None, reader: Some(reader), idle,
-            selected, dirty: false, closed: false, budget })
+        let reader = Reader::<_, DpopTaskSubscriptionEvent>::new(
+            kind,
+            Budgeted::new(decoder, Some(budget.clone())),
+            limits,
+            raw_limit,
+        )?;
+        Ok(Self {
+            body: Some(body),
+            pending: None,
+            reader: Some(reader),
+            idle,
+            selected,
+            dirty: false,
+            closed: false,
+            budget,
+        })
     }
 
-    pub(super) fn bounds(&self, absolute: WaitBounds) -> WaitBounds { self.idle.bounds(absolute) }
-    pub(super) fn has_hint(&self) -> bool { self.dirty }
-    pub(super) fn clear_hint(&mut self) { self.dirty = false; }
+    pub(super) fn bounds(&self, absolute: WaitBounds) -> WaitBounds {
+        self.idle.bounds(absolute)
+    }
+    pub(super) fn has_hint(&self) -> bool {
+        self.dirty
+    }
+    pub(super) fn clear_hint(&mut self) {
+        self.dirty = false;
+    }
 
     fn teardown(&self) -> bool {
-        self.closed || self.reader.as_ref().is_some_and(|reader| reader.terminal.is_some())
+        self.closed
+            || self
+                .reader
+                .as_ref()
+                .is_some_and(|reader| reader.terminal.is_some())
     }
 
     // A quantum is bounded by BOTH bytes and frames, including empty/trailer
     // frames. A pending Buf is always consumed before asking for the next one.
     // No await or application callback occurs while parsing a quantum.
     fn pump(
-        &mut self, task: &mut Context<'_>, owner: &ReadOwner<'_>,
-        stop_on_hint: bool, stop_on_teardown: bool,
+        &mut self,
+        task: &mut Context<'_>,
+        owner: &ReadOwner<'_>,
+        stop_on_hint: bool,
+        stop_on_teardown: bool,
     ) -> Result<Pump, DpopTaskWatchError> {
         owner.check(&self.idle)?;
         let (mut bytes_left, mut frames_left) = (BYTES_PER_TURN, FRAMES_PER_TURN);
         loop {
-            if self.closed { return Ok(Pump::Closed); }
+            if self.closed {
+                return Ok(Pump::Closed);
+            }
             if self.reader.as_ref().is_some_and(Reader::complete) {
                 return self.finish_response(owner);
             }
             if self.teardown() {
-                if stop_on_teardown { return Ok(Pump::Teardown); }
+                if stop_on_teardown {
+                    return Ok(Pump::Teardown);
+                }
             } else if stop_on_hint && self.dirty {
                 return Ok(Pump::Hint);
             }
@@ -118,11 +176,24 @@ where
                 }
                 let bytes = data.chunk();
                 let count = bytes.len().min(bytes_left);
-                if count == 0 { return Err(DpopHttpError::TransportFailed.into()); }
-                let reader = self.reader.as_mut().ok_or(ManagedCoreError::InvalidResponse)?;
+                if count == 0 {
+                    return Err(DpopHttpError::TransportFailed.into());
+                }
+                let reader = self
+                    .reader
+                    .as_mut()
+                    .ok_or(ManagedCoreError::InvalidResponse)?;
                 let mut hint = false;
-                reader.push_with_check(&bytes[..count], owner.cx, &mut self.idle,
-                    &mut |_| { hint = true; true }, |idle| owner.check(idle))?;
+                reader.push_with_check(
+                    &bytes[..count],
+                    owner.cx,
+                    &mut self.idle,
+                    &mut |_| {
+                        hint = true;
+                        true
+                    },
+                    |idle| owner.check(idle),
+                )?;
                 data.advance(count);
                 bytes_left -= count;
                 if hint {
@@ -131,10 +202,15 @@ where
                 }
                 continue;
             }
-            let body = self.body.as_mut().ok_or(ManagedCoreError::InvalidResponse)?;
+            let body = self
+                .body
+                .as_mut()
+                .ok_or(ManagedCoreError::InvalidResponse)?;
             let frame = match Pin::new(body).poll_frame(task) {
                 Poll::Pending => return Ok(Pump::Idle),
-                Poll::Ready(frame) => frame.transpose().map_err(|_| DpopHttpError::TransportFailed)?,
+                Poll::Ready(frame) => frame
+                    .transpose()
+                    .map_err(|_| DpopHttpError::TransportFailed)?,
             };
             owner.check(&self.idle)?;
             frames_left -= 1;
@@ -147,7 +223,10 @@ where
     }
 
     fn finish_response(&mut self, owner: &ReadOwner<'_>) -> Result<Pump, DpopTaskWatchError> {
-        let reader = self.reader.take().ok_or(ManagedCoreError::InvalidResponse)?;
+        let reader = self
+            .reader
+            .take()
+            .ok_or(ManagedCoreError::InvalidResponse)?;
         self.pending = None;
         self.body = None;
         self.closed = true;
@@ -158,26 +237,36 @@ where
         Ok(Pump::Closed)
     }
 
-    pub(super) async fn next(&mut self, owner: &ReadOwner<'_>)
-        -> Result<LiveStep, DpopTaskWatchError>
-    {
+    pub(super) async fn next(
+        &mut self,
+        owner: &ReadOwner<'_>,
+    ) -> Result<LiveStep, DpopTaskWatchError> {
         let bounds = self.bounds(owner.bounds);
-        within_owner(owner.cx, owner.cancellation, &owner.owner, owner.credential, bounds, async {
-            Ok(poll_fn(|task| {
-                match self.pump(task, owner, true, false) {
+        within_owner(
+            owner.cx,
+            owner.cancellation,
+            &owner.owner,
+            owner.credential,
+            bounds,
+            async {
+                Ok(poll_fn(|task| match self.pump(task, owner, true, false) {
                     Ok(Pump::Hint) => Poll::Ready(Ok(LiveStep::Hint)),
                     Ok(Pump::Closed) => Poll::Ready(Ok(LiveStep::Closed)),
                     Ok(_) => Poll::Pending,
                     Err(error) => Poll::Ready(Err(error)),
-                }
-            }).await)
-        }).await?
+                })
+                .await)
+            },
+        )
+        .await?
     }
 
     // RPCs must settle even if a status hint arrives: aborting an update on a
     // hint could lose its acknowledgement and cause an unsafe mutation retry.
     pub(super) async fn follow<F, T>(
-        &mut self, owner: &ReadOwner<'_>, future: F,
+        &mut self,
+        owner: &ReadOwner<'_>,
+        future: F,
     ) -> Result<Follow<T>, DpopTaskWatchError>
     where
         F: Future<Output = Result<T, DpopTaskWatchError>>,
@@ -190,7 +279,9 @@ where
     // is dropped, not detached. The watch must discard any unsent staging and
     // perform a fresh authenticated get; this does not acknowledge any answer.
     pub(super) async fn follow_input<F, T>(
-        &mut self, owner: &ReadOwner<'_>, future: F,
+        &mut self,
+        owner: &ReadOwner<'_>,
+        future: F,
     ) -> Result<Follow<T>, DpopTaskWatchError>
     where
         F: Future<Output = Result<T, DpopTaskWatchError>>,
@@ -203,7 +294,10 @@ where
     // A completed companion is kept exactly once across receive-side yields;
     // it is never repolled or used before the ready listen prefix is admitted.
     async fn follow_using<F, T>(
-        &mut self, owner: &ReadOwner<'_>, future: F, invalidate_on_hint: bool,
+        &mut self,
+        owner: &ReadOwner<'_>,
+        future: F,
+        invalidate_on_hint: bool,
     ) -> Result<Follow<T>, DpopTaskWatchError>
     where
         F: Future<Output = Result<T, DpopTaskWatchError>>,
@@ -211,46 +305,61 @@ where
         let bounds = self.bounds(owner.bounds);
         let mut future = std::pin::pin!(future);
         let mut ready = None;
-        within_owner(owner.cx, owner.cancellation, &owner.owner, owner.credential, bounds, async {
-            Ok(poll_fn(|task| {
-                match self.pump(task, owner, false, true) {
-                    Ok(Pump::Closed | Pump::Teardown) => return Poll::Ready(Ok(Follow::Stopped)),
-                    Err(error) => return Poll::Ready(Err(error)),
-                    // Never start/poll a companion or reconcile a hint ahead
-                    // of a ready native suffix: it may contain invalid framing.
-                    Ok(Pump::Yielded) => return Poll::Pending,
-                    Ok(_) => {}
-                }
-                if invalidate_on_hint && self.dirty {
-                    return Poll::Ready(Ok(Follow::Changed));
-                }
-                if ready.is_none() {
-                    match future.as_mut().poll(task) {
-                        Poll::Ready(Ok(value)) => ready = Some(value),
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                        Poll::Pending => {}
-                    }
-                }
-                owner.check(&self.idle)?;
-                if ready.is_some() {
+        within_owner(
+            owner.cx,
+            owner.cancellation,
+            &owner.owner,
+            owner.credential,
+            bounds,
+            async {
+                Ok(poll_fn(|task| {
                     match self.pump(task, owner, false, true) {
-                        Ok(Pump::Idle) => {
-                            if invalidate_on_hint && self.dirty {
-                                return Poll::Ready(Ok(Follow::Changed));
-                            }
-                            let Some(value) = ready.take() else {
-                                return Poll::Ready(Err(ManagedCoreError::InvalidResponse.into()));
-                            };
-                            return Poll::Ready(Ok(Follow::Completed(value)));
+                        Ok(Pump::Closed | Pump::Teardown) => {
+                            return Poll::Ready(Ok(Follow::Stopped));
                         }
-                        Ok(Pump::Closed | Pump::Teardown) => return Poll::Ready(Ok(Follow::Stopped)),
                         Err(error) => return Poll::Ready(Err(error)),
+                        // Never start/poll a companion or reconcile a hint ahead
+                        // of a ready native suffix: it may contain invalid framing.
+                        Ok(Pump::Yielded) => return Poll::Pending,
                         Ok(_) => {}
                     }
-                }
-                Poll::Pending
-            }).await)
-        }).await?
+                    if invalidate_on_hint && self.dirty {
+                        return Poll::Ready(Ok(Follow::Changed));
+                    }
+                    if ready.is_none() {
+                        match future.as_mut().poll(task) {
+                            Poll::Ready(Ok(value)) => ready = Some(value),
+                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                            Poll::Pending => {}
+                        }
+                    }
+                    owner.check(&self.idle)?;
+                    if ready.is_some() {
+                        match self.pump(task, owner, false, true) {
+                            Ok(Pump::Idle) => {
+                                if invalidate_on_hint && self.dirty {
+                                    return Poll::Ready(Ok(Follow::Changed));
+                                }
+                                let Some(value) = ready.take() else {
+                                    return Poll::Ready(Err(
+                                        ManagedCoreError::InvalidResponse.into()
+                                    ));
+                                };
+                                return Poll::Ready(Ok(Follow::Completed(value)));
+                            }
+                            Ok(Pump::Closed | Pump::Teardown) => {
+                                return Poll::Ready(Ok(Follow::Stopped));
+                            }
+                            Err(error) => return Poll::Ready(Err(error)),
+                            Ok(_) => {}
+                        }
+                    }
+                    Poll::Pending
+                })
+                .await)
+            },
+        )
+        .await?
     }
 }
 

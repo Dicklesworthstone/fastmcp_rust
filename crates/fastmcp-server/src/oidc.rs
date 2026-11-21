@@ -1942,8 +1942,7 @@ impl OidcProvider {
                 .push("private_key_jwt".to_string());
             doc.revocation_endpoint_auth_methods_supported
                 .push("private_key_jwt".to_string());
-            doc.token_endpoint_auth_signing_alg_values_supported =
-                Some(vec!["RS256".to_string()]);
+            doc.token_endpoint_auth_signing_alg_values_supported = Some(vec!["RS256".to_string()]);
             doc.revocation_endpoint_auth_signing_alg_values_supported =
                 Some(vec!["RS256".to_string()]);
         }

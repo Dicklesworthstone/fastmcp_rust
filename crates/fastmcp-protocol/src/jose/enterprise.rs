@@ -29,8 +29,8 @@ use fastmcp_core::{CanonicalHttpUrl, Sha256Digest, crypto::sha256_bounded};
 use serde_json::{Map, Value};
 
 use super::{
-    AdmittedRsaJwks, MAX_COMPACT_JWS_BYTES, MAX_JWKS_BYTES, MAX_JWS_HEADER_BYTES,
-    decode_base64url, parse_json, split_compact_jws, verify_compact_jws_rs256,
+    AdmittedRsaJwks, MAX_COMPACT_JWS_BYTES, MAX_JWKS_BYTES, MAX_JWS_HEADER_BYTES, decode_base64url,
+    parse_json, split_compact_jws, verify_compact_jws_rs256,
 };
 use crate::security_admission::{AdmittedCompactJws, CompactJwsProfile, admit_compact_jws};
 use disclosure::{IdJagDisclosureFacts, IdJagDisclosurePolicy};
@@ -56,11 +56,31 @@ const MAX_NUMERIC_DATE_LEXEME_BYTES: usize = 32;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const MAX_NUMERIC_DATE_NANOS: u128 = 253_402_300_799_999_999_999;
 const OIDC_CLAIMS: &[&str] = &[
-    "iss", "sub", "aud", "exp", "iat", "nbf", "azp", "nonce", "auth_time", "at_hash", "tenant",
+    "iss",
+    "sub",
+    "aud",
+    "exp",
+    "iat",
+    "nbf",
+    "azp",
+    "nonce",
+    "auth_time",
+    "at_hash",
+    "tenant",
 ];
 const ID_JAG_CLAIMS: &[&str] = &[
-    "iss", "sub", "aud", "client_id", "jti", "exp", "iat", "resource", "scope", "tenant",
-    "aud_tenant", "aud_sub",
+    "iss",
+    "sub",
+    "aud",
+    "client_id",
+    "jti",
+    "exp",
+    "iat",
+    "resource",
+    "scope",
+    "tenant",
+    "aud_tenant",
+    "aud_sub",
 ];
 
 /// Fixed diagnostics never contain a token, claim value, issuer, subject or key.
@@ -117,7 +137,10 @@ impl JwtTimePolicy {
         {
             return Err(EnterpriseVerificationError::InvalidConfiguration);
         }
-        Ok(Self { max_lifetime, clock_skew })
+        Ok(Self {
+            max_lifetime,
+            clock_skew,
+        })
     }
 
     /// One-hour OIDC lifetime and sixty seconds of skew.
@@ -177,7 +200,12 @@ impl PurposeKeys {
             .map_err(|_| EnterpriseVerificationError::InvalidKeys)?;
         let document_digest = sha256_bounded(jwks, MAX_JWKS_BYTES)
             .map_err(|_| EnterpriseVerificationError::InvalidKeys)?;
-        Ok(Self { issuer, generation, keys, document_digest })
+        Ok(Self {
+            issuer,
+            generation,
+            keys,
+            document_digest,
+        })
     }
 }
 
@@ -297,17 +325,34 @@ macro_rules! identity_type {
 
         impl fmt::Debug for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.debug_struct(stringify!($name)).finish_non_exhaustive()
+                formatter
+                    .debug_struct(stringify!($name))
+                    .finish_non_exhaustive()
             }
         }
     };
 }
 
-identity_type!(ClientFacingSubjectId, "An OIDC subject in the client RP's namespace.");
-identity_type!(ResourceFacingSubjectId, "An ID-JAG subject in the resource AS RP's namespace.");
-identity_type!(IdpTenantId, "An exact tenant identifier in the configured IdP namespace.");
-identity_type!(ResourceAsTenantId, "An exact tenant identifier in the resource-AS namespace.");
-identity_type!(ResourceAudienceSubjectId, "An opaque aud_sub; never interchangeable with an OIDC sub.");
+identity_type!(
+    ClientFacingSubjectId,
+    "An OIDC subject in the client RP's namespace."
+);
+identity_type!(
+    ResourceFacingSubjectId,
+    "An ID-JAG subject in the resource AS RP's namespace."
+);
+identity_type!(
+    IdpTenantId,
+    "An exact tenant identifier in the configured IdP namespace."
+);
+identity_type!(
+    ResourceAsTenantId,
+    "An exact tenant identifier in the resource-AS namespace."
+);
+identity_type!(
+    ResourceAudienceSubjectId,
+    "An opaque aud_sub; never interchangeable with an OIDC sub."
+);
 
 /// Verified identity facts only. No bearer, nonce, access token, optional
 /// disclosure claim or serialization capability is retained.
@@ -326,30 +371,52 @@ pub struct VerifiedOidcIdToken {
 
 impl VerifiedOidcIdToken {
     #[must_use]
-    pub fn issuer(&self) -> &str { &self.issuer }
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
     #[must_use]
-    pub fn client_id(&self) -> &str { &self.client_id }
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
     #[must_use]
-    pub const fn subject(&self) -> &ClientFacingSubjectId { &self.subject }
+    pub const fn subject(&self) -> &ClientFacingSubjectId {
+        &self.subject
+    }
     #[must_use]
-    pub const fn tenant(&self) -> Option<&IdpTenantId> { self.tenant.as_ref() }
+    pub const fn tenant(&self) -> Option<&IdpTenantId> {
+        self.tenant.as_ref()
+    }
     #[must_use]
-    pub const fn issued_at(&self) -> SystemTime { self.issued_at }
+    pub const fn issued_at(&self) -> SystemTime {
+        self.issued_at
+    }
     #[must_use]
-    pub const fn expires_at(&self) -> SystemTime { self.expires_at }
+    pub const fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
     #[must_use]
-    pub const fn authentication_time(&self) -> Option<SystemTime> { self.authentication_time }
+    pub const fn authentication_time(&self) -> Option<SystemTime> {
+        self.authentication_time
+    }
     #[must_use]
-    pub fn key_id(&self) -> &str { &self.key_id }
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
     #[must_use]
-    pub const fn generation(&self) -> u64 { self.generation }
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
     #[must_use]
-    pub const fn compact_digest(&self) -> Sha256Digest { self.compact_digest }
+    pub const fn compact_digest(&self) -> Sha256Digest {
+        self.compact_digest
+    }
 }
 
 impl fmt::Debug for VerifiedOidcIdToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("VerifiedOidcIdToken").finish_non_exhaustive()
+        formatter
+            .debug_struct("VerifiedOidcIdToken")
+            .finish_non_exhaustive()
     }
 }
 
@@ -377,43 +444,77 @@ pub struct VerifiedIdJag {
 
 impl VerifiedIdJag {
     #[must_use]
-    pub fn issuer(&self) -> &str { &self.issuer }
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
     #[must_use]
-    pub fn audience(&self) -> &str { &self.audience }
+    pub fn audience(&self) -> &str {
+        &self.audience
+    }
     #[must_use]
-    pub fn client_id(&self) -> &str { &self.client_id }
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
     #[must_use]
-    pub const fn subject(&self) -> &ResourceFacingSubjectId { &self.subject }
+    pub const fn subject(&self) -> &ResourceFacingSubjectId {
+        &self.subject
+    }
     #[must_use]
-    pub const fn idp_tenant(&self) -> Option<&IdpTenantId> { self.idp_tenant.as_ref() }
+    pub const fn idp_tenant(&self) -> Option<&IdpTenantId> {
+        self.idp_tenant.as_ref()
+    }
     #[must_use]
-    pub const fn resource_tenant(&self) -> Option<&ResourceAsTenantId> { self.resource_tenant.as_ref() }
+    pub const fn resource_tenant(&self) -> Option<&ResourceAsTenantId> {
+        self.resource_tenant.as_ref()
+    }
     #[must_use]
-    pub const fn audience_subject(&self) -> Option<&ResourceAudienceSubjectId> { self.audience_subject.as_ref() }
+    pub const fn audience_subject(&self) -> Option<&ResourceAudienceSubjectId> {
+        self.audience_subject.as_ref()
+    }
     #[must_use]
-    pub fn resource(&self) -> Option<&str> { self.resource.as_deref() }
+    pub fn resource(&self) -> Option<&str> {
+        self.resource.as_deref()
+    }
     #[must_use]
-    pub fn scope(&self) -> Option<&str> { self.scope.as_deref() }
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
     #[must_use]
-    pub fn jti(&self) -> &str { &self.jti }
+    pub fn jti(&self) -> &str {
+        &self.jti
+    }
     #[must_use]
-    pub const fn issued_at(&self) -> SystemTime { self.issued_at }
+    pub const fn issued_at(&self) -> SystemTime {
+        self.issued_at
+    }
     #[must_use]
-    pub const fn expires_at(&self) -> SystemTime { self.expires_at }
+    pub const fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
     #[must_use]
-    pub fn key_id(&self) -> &str { &self.key_id }
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
     #[must_use]
-    pub const fn generation(&self) -> u64 { self.generation }
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
     #[must_use]
-    pub const fn compact_digest(&self) -> Sha256Digest { self.compact_digest }
+    pub const fn compact_digest(&self) -> Sha256Digest {
+        self.compact_digest
+    }
     /// Names and policy identity only; optional claim values are discarded.
     #[must_use]
-    pub const fn disclosure(&self) -> Option<&IdJagDisclosureFacts> { self.disclosure.as_ref() }
+    pub const fn disclosure(&self) -> Option<&IdJagDisclosureFacts> {
+        self.disclosure.as_ref()
+    }
 }
 
 impl fmt::Debug for VerifiedIdJag {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("VerifiedIdJag").finish_non_exhaustive()
+        formatter
+            .debug_struct("VerifiedIdJag")
+            .finish_non_exhaustive()
     }
 }
 
@@ -429,8 +530,12 @@ pub fn verify_oidc_id_token(
     validate_identifier(expected.client_id)?;
     validate_identifier(expected.nonce)?;
     validate_tenant_expectation(expected.tenant)?;
-    if expected.max_authentication_age.is_some_and(|age| age > MAX_ENTERPRISE_TOKEN_LIFETIME)
-        || expected.access_token.is_some_and(|token| !valid_access_token(token))
+    if expected
+        .max_authentication_age
+        .is_some_and(|age| age > MAX_ENTERPRISE_TOKEN_LIFETIME)
+        || expected
+            .access_token
+            .is_some_and(|token| !valid_access_token(token))
     {
         return Err(EnterpriseVerificationError::InvalidConfiguration);
     }
@@ -468,19 +573,21 @@ pub fn verify_oidc_id_token(
         return Err(EnterpriseVerificationError::InvalidClaims);
     }
     if let Some(hash) = claims.get("at_hash") {
-        let hash = hash.as_str().ok_or(EnterpriseVerificationError::InvalidAccessTokenHash)?;
-        let access_token = expected.access_token
+        let hash = hash
+            .as_str()
+            .ok_or(EnterpriseVerificationError::InvalidAccessTokenHash)?;
+        let access_token = expected
+            .access_token
             .ok_or(EnterpriseVerificationError::InvalidAccessTokenHash)?;
         if hash.len() != 22 {
             return Err(EnterpriseVerificationError::InvalidAccessTokenHash);
         }
-        let decoded = URL_SAFE_NO_PAD.decode(hash)
+        let decoded = URL_SAFE_NO_PAD
+            .decode(hash)
             .map_err(|_| EnterpriseVerificationError::InvalidAccessTokenHash)?;
         let digest = sha256_bounded(access_token.as_bytes(), MAX_ACCESS_TOKEN_BYTES)
             .map_err(|_| EnterpriseVerificationError::InvalidAccessTokenHash)?;
-        if decoded.len() != 16
-            || !constant_time_equal(&decoded, &digest.as_bytes()[..16])
-        {
+        if decoded.len() != 16 || !constant_time_equal(&decoded, &digest.as_bytes()[..16]) {
             return Err(EnterpriseVerificationError::InvalidAccessTokenHash);
         }
     }
@@ -492,8 +599,11 @@ pub fn verify_oidc_id_token(
         issued_at: system_time(times.issued)?,
         expires_at: system_time(times.expires)?,
         authentication_time: authentication_time.map(system_time).transpose()?,
-        key_id: admitted.header().key_id()
-            .ok_or(EnterpriseVerificationError::InvalidToken)?.to_owned(),
+        key_id: admitted
+            .header()
+            .key_id()
+            .ok_or(EnterpriseVerificationError::InvalidToken)?
+            .to_owned(),
         generation: keys.generation(),
         compact_digest: token_digest(compact)?,
     })
@@ -538,8 +648,7 @@ fn verify_id_jag_with_policy(
     validate_resource(expected.resource)?;
     validate_tenant_expectation(expected.idp_tenant)?;
     if let ResourceTenantExpectation::Exact(tenant) = expected.resource_tenant {
-        validate_tenant(tenant)
-            .map_err(|_| EnterpriseVerificationError::InvalidConfiguration)?;
+        validate_tenant(tenant).map_err(|_| EnterpriseVerificationError::InvalidConfiguration)?;
     }
     if expected.time.max_lifetime > MAX_ID_JAG_LIFETIME {
         return Err(EnterpriseVerificationError::InvalidConfiguration);
@@ -613,8 +722,11 @@ fn verify_id_jag_with_policy(
         jti: jti.to_owned(),
         issued_at: system_time(times.issued)?,
         expires_at: system_time(times.expires)?,
-        key_id: admitted.header().key_id()
-            .ok_or(EnterpriseVerificationError::InvalidToken)?.to_owned(),
+        key_id: admitted
+            .header()
+            .key_id()
+            .ok_or(EnterpriseVerificationError::InvalidToken)?
+            .to_owned(),
         generation: keys.generation(),
         compact_digest: token_digest(compact)?,
         disclosure,
@@ -634,14 +746,19 @@ fn verify_profile(
     // The generic profile admission owns duplicate, type, JSON and base64
     // rules. This local profile also closes header extensions, including cty,
     // so a nested/encrypted token or alternate key source cannot be smuggled.
-    let (header, _, _, _) = split_compact_jws(compact)
-        .map_err(|_| EnterpriseVerificationError::InvalidToken)?;
+    let (header, _, _, _) =
+        split_compact_jws(compact).map_err(|_| EnterpriseVerificationError::InvalidToken)?;
     let header = decode_base64url(header, MAX_JWS_HEADER_BYTES, "header")
         .map_err(|_| EnterpriseVerificationError::InvalidToken)?;
-    let header = parse_json(&header, "header")
-        .map_err(|_| EnterpriseVerificationError::InvalidToken)?;
-    let header = header.as_object().ok_or(EnterpriseVerificationError::InvalidToken)?;
-    if header.keys().any(|key| !matches!(key.as_str(), "alg" | "kid" | "typ")) {
+    let header =
+        parse_json(&header, "header").map_err(|_| EnterpriseVerificationError::InvalidToken)?;
+    let header = header
+        .as_object()
+        .ok_or(EnterpriseVerificationError::InvalidToken)?;
+    if header
+        .keys()
+        .any(|key| !matches!(key.as_str(), "alg" | "kid" | "typ"))
+    {
         return Err(EnterpriseVerificationError::InvalidToken);
     }
     // Use the existing local verifier unchanged. Its key admission and
@@ -714,8 +831,7 @@ fn validate_tenant_expectation(
     expected: TenantExpectation<'_>,
 ) -> Result<(), EnterpriseVerificationError> {
     if let TenantExpectation::Exact(tenant) = expected {
-        validate_tenant(tenant)
-            .map_err(|_| EnterpriseVerificationError::InvalidConfiguration)?;
+        validate_tenant(tenant).map_err(|_| EnterpriseVerificationError::InvalidConfiguration)?;
     }
     Ok(())
 }
@@ -752,7 +868,9 @@ fn claim_string<'a>(
     claims: &'a Map<String, Value>,
     name: &str,
 ) -> Result<&'a str, EnterpriseVerificationError> {
-    claims.get(name).and_then(Value::as_str)
+    claims
+        .get(name)
+        .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or(EnterpriseVerificationError::InvalidClaims)
 }
@@ -774,9 +892,9 @@ fn exact_singleton(
 ) -> Result<(), EnterpriseVerificationError> {
     let actual = match value {
         Some(Value::String(value)) => value,
-        Some(Value::Array(values)) if values.len() == 1 => {
-            values[0].as_str().ok_or(EnterpriseVerificationError::BindingMismatch)?
-        }
+        Some(Value::Array(values)) if values.len() == 1 => values[0]
+            .as_str()
+            .ok_or(EnterpriseVerificationError::BindingMismatch)?,
         _ => return Err(EnterpriseVerificationError::BindingMismatch),
     };
     if actual != expected {
@@ -796,13 +914,13 @@ fn oidc_subject(claims: &Map<String, Value>) -> Result<&str, EnterpriseVerificat
     Ok(subject)
 }
 
-fn scope_claim(
-    claims: &Map<String, Value>,
-) -> Result<Option<String>, EnterpriseVerificationError> {
+fn scope_claim(claims: &Map<String, Value>) -> Result<Option<String>, EnterpriseVerificationError> {
     let Some(scope) = claims.get("scope") else {
         return Ok(None);
     };
-    let scope = scope.as_str().ok_or(EnterpriseVerificationError::InvalidClaims)?;
+    let scope = scope
+        .as_str()
+        .ok_or(EnterpriseVerificationError::InvalidClaims)?;
     if scope.is_empty() || scope.len() > MAX_ENTERPRISE_SCOPE_SET_BYTES {
         return Err(EnterpriseVerificationError::InvalidClaims);
     }
@@ -810,7 +928,9 @@ fn scope_claim(
     for token in scope.split(' ') {
         if token.is_empty()
             || token.len() > MAX_ENTERPRISE_SCOPE_BYTES
-            || !token.bytes().all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+            || !token
+                .bytes()
+                .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
             || unique.len() >= MAX_ENTERPRISE_SCOPE_COUNT
             || !unique.insert(token)
         {
@@ -851,17 +971,28 @@ fn validate_times(
     policy: JwtTimePolicy,
     now: SystemTime,
 ) -> Result<TimeFacts, EnterpriseVerificationError> {
-    let now = now.duration_since(UNIX_EPOCH)
+    let now = now
+        .duration_since(UNIX_EPOCH)
         .map_err(|_| EnterpriseVerificationError::InvalidTime)?;
     if now.as_nanos() > MAX_NUMERIC_DATE_NANOS {
         return Err(EnterpriseVerificationError::InvalidTime);
     }
-    let issued = numeric_date(claims.get("iat").ok_or(EnterpriseVerificationError::InvalidTime)?)?;
-    let expires = numeric_date(claims.get("exp").ok_or(EnterpriseVerificationError::InvalidTime)?)?;
+    let issued = numeric_date(
+        claims
+            .get("iat")
+            .ok_or(EnterpriseVerificationError::InvalidTime)?,
+    )?;
+    let expires = numeric_date(
+        claims
+            .get("exp")
+            .ok_or(EnterpriseVerificationError::InvalidTime)?,
+    )?;
     if expires <= issued || expires - issued > policy.max_lifetime {
         return Err(EnterpriseVerificationError::InvalidTime);
     }
-    let latest = now.as_nanos().checked_add(policy.clock_skew.as_nanos())
+    let latest = now
+        .as_nanos()
+        .checked_add(policy.clock_skew.as_nanos())
         .ok_or(EnterpriseVerificationError::InvalidTime)?;
     if issued.as_nanos() > latest {
         return Err(EnterpriseVerificationError::NotYetValid);
@@ -878,11 +1009,17 @@ fn validate_times(
     if expires.as_nanos() <= now.as_nanos().saturating_sub(policy.clock_skew.as_nanos()) {
         return Err(EnterpriseVerificationError::Expired);
     }
-    Ok(TimeFacts { issued, expires, now })
+    Ok(TimeFacts {
+        issued,
+        expires,
+        now,
+    })
 }
 
 fn system_time(value: Duration) -> Result<SystemTime, EnterpriseVerificationError> {
-    UNIX_EPOCH.checked_add(value).ok_or(EnterpriseVerificationError::InvalidTime)
+    UNIX_EPOCH
+        .checked_add(value)
+        .ok_or(EnterpriseVerificationError::InvalidTime)
 }
 
 /// Parses the preserved number lexeme without floats or an unbounded decimal.
@@ -893,14 +1030,13 @@ fn numeric_date(value: &Value) -> Result<Duration, EnterpriseVerificationError> 
         return Err(EnterpriseVerificationError::InvalidTime);
     };
     let lexeme = number.as_str();
-    if lexeme.is_empty()
-        || lexeme.len() > MAX_NUMERIC_DATE_LEXEME_BYTES
-        || lexeme.starts_with('-')
+    if lexeme.is_empty() || lexeme.len() > MAX_NUMERIC_DATE_LEXEME_BYTES || lexeme.starts_with('-')
     {
         return Err(EnterpriseVerificationError::InvalidTime);
     }
     let (mantissa, exponent) = if let Some(index) = lexeme.find(['e', 'E']) {
-        let exponent = lexeme[index + 1..].parse::<i32>()
+        let exponent = lexeme[index + 1..]
+            .parse::<i32>()
             .map_err(|_| EnterpriseVerificationError::InvalidTime)?;
         if !(-9999..=9999).contains(&exponent) {
             return Err(EnterpriseVerificationError::InvalidTime);
@@ -941,11 +1077,13 @@ fn numeric_date(value: &Value) -> Result<Duration, EnterpriseVerificationError> 
     }
     let mut coefficient = 0_u128;
     for digit in &digits[start..end] {
-        coefficient = coefficient.checked_mul(10)
+        coefficient = coefficient
+            .checked_mul(10)
             .and_then(|value| value.checked_add(u128::from(*digit)))
             .ok_or(EnterpriseVerificationError::InvalidTime)?;
     }
-    let nanoseconds = coefficient.checked_mul(10_u128.pow(power as u32))
+    let nanoseconds = coefficient
+        .checked_mul(10_u128.pow(power as u32))
         .filter(|value| *value <= MAX_NUMERIC_DATE_NANOS)
         .ok_or(EnterpriseVerificationError::InvalidTime)?;
     Ok(Duration::new(

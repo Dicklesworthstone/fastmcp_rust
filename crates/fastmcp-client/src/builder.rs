@@ -54,8 +54,6 @@ use fastmcp_transport::websocket::AsyncWsClientTransport;
 
 #[cfg(all(test, unix, feature = "legacy-2024-11-05"))]
 use crate::ReverseRequestCancellation;
-#[cfg(feature = "websocket-experimental")]
-use crate::{WebSocketClient, WebSocketConnectDeadline};
 use crate::http_executor::{HttpConnectionSettings, ModernHttpExecutorError};
 use crate::{
     AutoStdioFallbackSignal, ChildGuard, ChildOwnership, Client, ClientExtensionRuntime,
@@ -66,6 +64,8 @@ use crate::{
     combine_operation_with_cleanup_async, is_cleanup_unverified, resolve_stdio_command,
     validate_protocol_plan_feature,
 };
+#[cfg(feature = "websocket-experimental")]
+use crate::{WebSocketClient, WebSocketConnectDeadline};
 
 #[cfg(feature = "legacy-2024-11-05")]
 const DEFAULT_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::Auto;
@@ -2064,18 +2064,19 @@ fn stdio_sampling_request_from_params(params: CreateMessageParams) -> McpResult<
     if !params.stop_sequences.is_empty() {
         request = request.with_stop_sequences(params.stop_sequences);
     }
-    request.model_preferences = params.model_preferences.map(|preferences| {
-        fastmcp_core::SamplingModelPreferences {
-            hints: preferences
-                .hints
-                .into_iter()
-                .map(|hint| fastmcp_core::SamplingModelHint { name: hint.name })
-                .collect(),
-            cost_priority: preferences.cost_priority,
-            speed_priority: preferences.speed_priority,
-            intelligence_priority: preferences.intelligence_priority,
-        }
-    });
+    request.model_preferences =
+        params
+            .model_preferences
+            .map(|preferences| fastmcp_core::SamplingModelPreferences {
+                hints: preferences
+                    .hints
+                    .into_iter()
+                    .map(|hint| fastmcp_core::SamplingModelHint { name: hint.name })
+                    .collect(),
+                cost_priority: preferences.cost_priority,
+                speed_priority: preferences.speed_priority,
+                intelligence_priority: preferences.intelligence_priority,
+            });
     request.include_context = params.include_context.map(|context| match context {
         fastmcp_protocol::IncludeContext::None => fastmcp_core::SamplingIncludeContext::None,
         fastmcp_protocol::IncludeContext::ThisServer => {
@@ -2263,9 +2264,7 @@ mod tests {
 
     #[test]
     fn inbound_legacy_stdio_sampling_preserves_images_and_result_roles() {
-        use fastmcp_core::{
-            SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
-        };
+        use fastmcp_core::{SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason};
         use fastmcp_protocol::{Role, SamplingContent, SamplingMessage};
 
         struct RecordingSampler {
@@ -2289,11 +2288,7 @@ mod tests {
 
         let expected_messages = vec![
             SamplingRequestMessage::user("describe"),
-            SamplingRequestMessage::image(
-                SamplingRole::Assistant,
-                "AAECA/8=",
-                "image/png",
-            ),
+            SamplingRequestMessage::image(SamplingRole::Assistant, "AAECA/8=", "image/png"),
             SamplingRequestMessage::image(
                 SamplingRole::User,
                 "aW1hZ2U=",

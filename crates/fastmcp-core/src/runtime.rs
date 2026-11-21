@@ -1178,9 +1178,7 @@ mod tests {
     fn blocking_lane_guards_preserve_nested_declarations_in_any_drop_order() {
         let cx = asupersync::Cx::for_testing();
         let _current = asupersync::Cx::set_current(Some(cx.clone()));
-        let starves = || {
-            super::poll_on_cx(&cx, async { super::bridge_would_starve_its_driver() })
-        };
+        let starves = || super::poll_on_cx(&cx, async { super::bridge_would_starve_its_driver() });
 
         assert!(starves());
         for outer_first in [false, true] {

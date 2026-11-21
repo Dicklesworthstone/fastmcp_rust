@@ -22,15 +22,20 @@ enum Entry {
 fn client() -> (DpopHttpClient, DpopCredential) {
     let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
     let resource = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
-    let session = DpopSession::new(
-        DpopKey::generate().unwrap(), issuer.clone(), resource,
-    ).unwrap();
-    let credential = session.admit_token_response(
-        &issuer, 200,
-        br#"{"access_token":"preflight-token","token_type":"DPoP","expires_in":60}"#,
-        Instant::now(), Duration::from_secs(60),
-    ).unwrap();
-    (DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap(), credential)
+    let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(), resource).unwrap();
+    let credential = session
+        .admit_token_response(
+            &issuer,
+            200,
+            br#"{"access_token":"preflight-token","token_type":"DPoP","expires_in":60}"#,
+            Instant::now(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    (
+        DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap(),
+        credential,
+    )
 }
 
 fn first_poll(
@@ -44,23 +49,44 @@ fn first_poll(
     let metadata = FinalRequestMeta::new(ClientCapabilities::default());
     let task = TaskId::parse("task-one").unwrap();
     let policy = DpopTaskWaitPolicy::default();
-    let mut operation: Pin<Box<dyn Future<Output = Result<
-        DpopTaskWaitOutcome, DpopTaskWaitError,
-    >> + '_>> = match entry {
+    let mut operation: Pin<
+        Box<dyn Future<Output = Result<DpopTaskWaitOutcome, DpopTaskWaitError>> + '_>,
+    > = match entry {
         Entry::Default => Box::pin(client.wait_task(
-            cx, credential, metadata, task, prefix, policy, ManagedCoreLimits::default(),
+            cx,
+            credential,
+            metadata,
+            task,
+            prefix,
+            policy,
+            ManagedCoreLimits::default(),
         )),
         Entry::WithCancellation => Box::pin(client.wait_task_with_cancellation(
-            cx, cancellation, credential, metadata, task, prefix, policy,
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task,
+            prefix,
+            policy,
             ManagedCoreLimits::default(),
         )),
         Entry::WithEvents => Box::pin(client.wait_task_with_events(
-            cx, cancellation, credential, metadata, task, prefix, policy,
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task,
+            prefix,
+            policy,
             DpopStreamLimits::default(),
             |_| panic!("a refused waiter must not publish notifications"),
         )),
     };
-    match operation.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+    match operation
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
         Poll::Ready(Err(DpopTaskWaitError::Task(DpopTasksError::Core(
             DpopCoreError::Transport(error),
         )))) => error,
@@ -127,17 +153,38 @@ fn a_live_waiter_still_requires_a_runtime_and_cancellation_does_not_poison_the_c
         let cancellation = McpRequestCancellation::new();
         // Near-identical control: lack of a runtime is not itself cancellation.
         assert_eq!(
-            first_poll(entry, &mut client, &live, &cancellation, &credential, "valid"),
+            first_poll(
+                entry,
+                &mut client,
+                &live,
+                &cancellation,
+                &credential,
+                "valid"
+            ),
             DpopHttpError::RuntimeUnavailable,
         );
         let cancelled = Cx::for_testing();
         cancelled.set_cancel_requested(true);
         assert_eq!(
-            first_poll(entry, &mut client, &cancelled, &cancellation, &credential, "valid"),
+            first_poll(
+                entry,
+                &mut client,
+                &cancelled,
+                &cancellation,
+                &credential,
+                "valid"
+            ),
             DpopHttpError::Cancelled,
         );
         assert_eq!(
-            first_poll(entry, &mut client, &live, &cancellation, &credential, "valid"),
+            first_poll(
+                entry,
+                &mut client,
+                &live,
+                &cancellation,
+                &credential,
+                "valid"
+            ),
             DpopHttpError::RuntimeUnavailable,
         );
         assert!(live.checkpoint().is_ok());

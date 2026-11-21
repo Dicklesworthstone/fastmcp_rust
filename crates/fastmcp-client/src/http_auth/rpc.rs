@@ -659,7 +659,8 @@ pub(crate) fn admit_http_notification(
         }
         ServerNotification::Progress(progress)
             if progress_marker != Some(&progress.progress_token)
-                || last_progress.is_some_and(|previous| progress.progress.cmp(previous).is_le()) =>
+                || last_progress
+                    .is_some_and(|previous| progress.progress.cmp(previous).is_le()) =>
         {
             return Err(ManagedCoreError::InvalidProgress);
         }
@@ -838,25 +839,41 @@ mod tests {
             FinalHttpRequestMetadata, RequestVersionMetadata, admit_final_http_request,
         };
         fn header<'a>(fields: &'a [(String, String)], wanted: &str) -> Option<&'a str> {
-            fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
                 .map(|(_, value)| value.as_str())
         }
         for (method, parameters, key) in [
             ("tools/call", json!({"name":"echo"}), "name"),
             ("prompts/get", json!({"name":"greeting"}), "name"),
             ("resources/read", json!({"uri":"file:///sample"}), "uri"),
-            ("resources/read", json!({"uri":"https://resources.example/a%2Fb?q=one#part"}), "uri"),
+            (
+                "resources/read",
+                json!({"uri":"https://resources.example/a%2Fb?q=one#part"}),
+                "uri",
+            ),
         ] {
             let core = request(method, parameters);
             let original = core.encode_params().unwrap().unwrap();
             let (wire, _) = prepare(
-                "https://mcp.example/mcp", core, RequestId::Number(7), ManagedCoreLimits::default(),
-            ).unwrap();
+                "https://mcp.example/mcp",
+                core,
+                RequestId::Number(7),
+                ManagedCoreLimits::default(),
+            )
+            .unwrap();
             let body: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
             let headers = wire.headers();
             assert_eq!(body["params"], original);
             assert_eq!(wire.target(), "https://mcp.example/mcp");
-            assert_eq!(headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("mcp-name")).count(), 1);
+            assert_eq!(
+                headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("mcp-name"))
+                    .count(),
+                1
+            );
             let name = header(&headers, "mcp-name").unwrap();
             assert_eq!(
                 fastmcp_protocol::http_headers::decode_mcp_header_value(name.as_bytes()).unwrap(),
@@ -868,24 +885,44 @@ mod tests {
                 admit_final_http_request(FinalHttpRequestMetadata {
                     version: RequestVersionMetadata {
                         header_version: header(&headers, "mcp-protocol-version"),
-                        body_version: body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str(),
+                        body_version:
+                            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+                                .as_str(),
                     },
                     header_method: header(&headers, "mcp-method"),
                     body_method: body["method"].as_str(),
                     header_name,
                     body_name: body["params"][key].as_str(),
-                }).is_ok()
+                })
+                .is_ok()
             };
             assert!(admitted(Some(name)), "the prepared {method} is admitted");
             assert!(!admitted(None), "removing only {method}'s mirror must fail");
-            assert!(!admitted(Some("different")), "changing only the mirror must fail");
+            assert!(
+                !admitted(Some("different")),
+                "changing only the mirror must fail"
+            );
         }
-        for method in ["server/discover", "tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+        for method in [
+            "server/discover",
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
             let (wire, _) = prepare(
-                "https://mcp.example/mcp", request(method, json!({})),
-                RequestId::Number(7), ManagedCoreLimits::default(),
-            ).unwrap();
-            assert!(!wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("mcp-name")));
+                "https://mcp.example/mcp",
+                request(method, json!({})),
+                RequestId::Number(7),
+                ManagedCoreLimits::default(),
+            )
+            .unwrap();
+            assert!(
+                !wire
+                    .headers()
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("mcp-name"))
+            );
         }
     }
 

@@ -2325,9 +2325,12 @@ impl McpContext {
         parameters: serde_json::Value,
     ) -> McpResult<()> {
         self.ensure_live()?;
-        let sender = self.request_extension_notification_sender.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Request-owned extension notifications are unavailable")
-        })?;
+        let sender = self
+            .request_extension_notification_sender
+            .as_ref()
+            .ok_or_else(|| {
+                McpError::invalid_request("Request-owned extension notifications are unavailable")
+            })?;
         // A streamed notification must never be replayed through response caching.
         // Mark before calling the sink because it can fail after publication.
         self.note_notification_emission();
@@ -4939,19 +4942,32 @@ mod tests {
                 }));
             let (context, lease) = context.begin_request_scope().unwrap();
             let retained = context.clone();
-            context.emit_request_extension_notification(serde_json::json!({"value": 1})).unwrap();
+            context
+                .emit_request_extension_notification(serde_json::json!({"value": 1}))
+                .unwrap();
             assert!(context.response_has_notifications());
             assert_eq!(delivered.load(Ordering::SeqCst), 1);
             if cancel {
                 cancellation.cancel();
-                assert!(retained.emit_request_extension_notification(serde_json::json!({"value": 2})).is_err());
+                assert!(
+                    retained
+                        .emit_request_extension_notification(serde_json::json!({"value": 2}))
+                        .is_err()
+                );
             }
             drop(lease);
-            assert!(retained.emit_request_extension_notification(serde_json::json!({"value": 2})).is_err());
+            assert!(
+                retained
+                    .emit_request_extension_notification(serde_json::json!({"value": 2}))
+                    .is_err()
+            );
             assert_eq!(delivered.load(Ordering::SeqCst), 1);
         }
-        assert!(McpContext::new(Cx::for_testing(), 1)
-            .emit_request_extension_notification(serde_json::json!({})).is_err());
+        assert!(
+            McpContext::new(Cx::for_testing(), 1)
+                .emit_request_extension_notification(serde_json::json!({}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -7020,8 +7036,8 @@ mod tests {
             assert_eq!(message.content, image);
             assert_eq!(message.text_content(), None);
 
-            let response = SamplingResponse::image("aW1hZ2U=", "image/webp", "vision")
-                .with_role(role);
+            let response =
+                SamplingResponse::image("aW1hZ2U=", "image/webp", "vision").with_role(role);
             assert_eq!(response.role, role);
             assert_eq!(response.content, image);
             assert_eq!(response.model, "vision");

@@ -1850,9 +1850,7 @@ fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 
 fn public_http_caller() -> Cx {
-    with_public_http_runtime(|runtime| {
-        runtime.request_cx_with_budget(asupersync::Budget::INFINITE)
-    })
+    with_public_http_runtime(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE))
 }
 
 /// Runs one public HTTP operation on the test application's owned runtime. The
@@ -13086,7 +13084,11 @@ fn public_http_subscription_shutdown_transcript(close_first: bool) {
                 .into_sse_stream(SseLimits::new(65_536, 1 << 20, 16).unwrap())
                 .expect("the listen response uses the shipped SSE decoder");
             let acknowledgement: serde_json::Value = serde_json::from_str(
-                &stream.next_event(&cx).await.unwrap().expect("acknowledgement"),
+                &stream
+                    .next_event(&cx)
+                    .await
+                    .unwrap()
+                    .expect("acknowledgement"),
             )
             .unwrap();
             assert_eq!(
@@ -13095,8 +13097,7 @@ fn public_http_subscription_shutdown_transcript(close_first: bool) {
             );
             assert_eq!(acknowledgement["params"]["notifications"], json!({}));
             assert_eq!(
-                acknowledgement["params"]["_meta"]
-                    ["io.modelcontextprotocol/subscriptionId"],
+                acknowledgement["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
                 id
             );
             streams.push((id, stream));
@@ -13113,13 +13114,22 @@ fn public_http_subscription_shutdown_transcript(close_first: bool) {
             .await
             .expect("an ordinary client connects alongside active listens");
         let tools = client.list_tools(&cx, None).await.unwrap();
-        assert!(tools.tools.iter().any(|tool| tool.name == PUBLIC_HTTP_TOUCH_TOOL_NAME));
+        assert!(
+            tools
+                .tools
+                .iter()
+                .any(|tool| tool.name == PUBLIC_HTTP_TOUCH_TOOL_NAME)
+        );
         drop(client);
 
         server.server_cx.set_cancel_requested(true);
         for (id, mut stream) in streams {
             let terminal: serde_json::Value = serde_json::from_str(
-                &stream.next_event(&cx).await.unwrap().expect("server cancellation"),
+                &stream
+                    .next_event(&cx)
+                    .await
+                    .unwrap()
+                    .expect("server cancellation"),
             )
             .unwrap();
             assert_eq!(terminal["method"], "notifications/cancelled");
@@ -13136,7 +13146,9 @@ fn public_http_subscription_shutdown_transcript(close_first: bool) {
                 stream.next_event(&cx).await.unwrap().is_none(),
                 "local teardown must emit no complete result or second control"
             );
-            let end = stream.end_of_stream().expect("the response reached HTTP EOF");
+            let end = stream
+                .end_of_stream()
+                .expect("the response reached HTTP EOF");
             assert!(
                 !end.discarded_pending_event && !end.discarded_partial_line,
                 "shutdown must not hide an unfinished response after its terminal control"
@@ -14070,7 +14082,10 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway_case
                 );
                 break;
             }
-            Some(FinalTaskWatchEvent::TaskReconciled { observed, authoritative }) => {
+            Some(FinalTaskWatchEvent::TaskReconciled {
+                observed,
+                authoritative,
+            }) => {
                 assert_eq!(observed.params.task.base().task_id, task_id);
                 assert_eq!(
                     authoritative.base().task_id,
@@ -15071,7 +15086,10 @@ fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gatewa
                 );
                 break;
             }
-            Some(FinalTaskWatchEvent::TaskReconciled { observed, authoritative }) => {
+            Some(FinalTaskWatchEvent::TaskReconciled {
+                observed,
+                authoritative,
+            }) => {
                 assert_eq!(observed.params.task.base().task_id, task_id);
                 assert_eq!(
                     authoritative.base().task_id,

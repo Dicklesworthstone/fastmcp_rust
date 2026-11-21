@@ -496,7 +496,8 @@ impl RestoreEpochFacade {
         with_operation_caller(
             cx,
             Self::register_inner(cx, configuration, stores, backend, deadline),
-        ).await
+        )
+        .await
     }
 
     async fn register_inner(
@@ -639,7 +640,8 @@ impl RegisteredRestoreStore {
         cx: &Cx,
         deadline: Time,
     ) -> Result<(RestoreEpochBinding, u64, Time), RestoreError> {
-        self.current_with_access(cx, deadline, CallAccess::Ordinary).await
+        self.current_with_access(cx, deadline, CallAccess::Ordinary)
+            .await
     }
 
     async fn current_with_access(
@@ -660,7 +662,10 @@ impl RegisteredRestoreStore {
             deadline,
             access,
         )?;
-        let response = self.shared.call_with_access(cx, &request, None, access).await?;
+        let response = self
+            .shared
+            .call_with_access(cx, &request, None, access)
+            .await?;
         let (bytes, generation) = match response.outcome {
             RestoreAuthorityOutcome::Current {
                 certified_binding,
@@ -946,7 +951,10 @@ impl CallAccess {
         match self {
             Self::Ordinary => shared.check(),
             Self::Recovery => {
-                shared.process.verify().map_err(|_| RestoreError::ProcessChanged)?;
+                shared
+                    .process
+                    .verify()
+                    .map_err(|_| RestoreError::ProcessChanged)?;
                 if !shared.quarantined.load(Ordering::Acquire)
                     || !shared.recovering.load(Ordering::Acquire)
                 {
@@ -1060,7 +1068,11 @@ impl Shared {
                 bytes.extend_from_slice(&receipt.commit_digest);
                 encode_bytes(&mut bytes, &receipt.proof);
             }
-            RestoreAuthorityOperation::ListUnresolvedWrites { limits, expires_at, cursor } => {
+            RestoreAuthorityOperation::ListUnresolvedWrites {
+                limits,
+                expires_at,
+                cursor,
+            } => {
                 recovery::encode_scan_request(&mut bytes, *limits, *expires_at, cursor.as_ref());
             }
             RestoreAuthorityOperation::ReconcileWrite { intent, resolution } => {
@@ -1084,7 +1096,8 @@ impl Shared {
         request: &RestoreAuthorityRequest,
         uncertain: Option<&mut UncertainMutation>,
     ) -> Result<RestoreAuthorityResponse, RestoreError> {
-        self.call_with_access(cx, request, uncertain, CallAccess::Ordinary).await
+        self.call_with_access(cx, request, uncertain, CallAccess::Ordinary)
+            .await
     }
 
     async fn call_with_access(

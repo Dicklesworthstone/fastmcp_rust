@@ -256,7 +256,9 @@ fn memory_extension_current_waiter_cancellation_precedes_buffered_progress() {
                             .unwrap();
                     }
                     assert_eq!(
-                        extension_result(&cx, &mut client, &mut owner).await.unwrap()["value"],
+                        extension_result(&cx, &mut client, &mut owner)
+                            .await
+                            .unwrap()["value"],
                         7
                     );
                     assert!(owner.raw_result_source().is_some());
@@ -284,15 +286,16 @@ fn memory_extension_current_waiter_cancellation_precedes_buffered_progress() {
                         crate::ExecutionTerminalReason::CallerCancelled
                     );
                     client.drive_once(&cx, &live).await.unwrap();
-                    let control =
-                        receive(&cx, &mut peer, "notifications/cancelled", None).await;
+                    let control = receive(&cx, &mut peer, "notifications/cancelled", None).await;
                     assert_eq!(control.params.unwrap()["requestId"], 2);
                 }
                 peer.send_async(&cx, &response(3, json!({"resultType":RESULT,"value":9})))
                     .await
                     .unwrap();
                 assert_eq!(
-                    extension_result(&cx, &mut client, &mut sibling).await.unwrap()["value"],
+                    extension_result(&cx, &mut client, &mut sibling)
+                        .await
+                        .unwrap()["value"],
                     9
                 );
                 assert!(!original.is_cancel_requested());

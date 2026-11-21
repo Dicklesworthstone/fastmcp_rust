@@ -1230,7 +1230,7 @@ impl AdmittedToolRegistration {
             legacy_enabled,
             execution_mode,
             #[cfg(feature = "tasks")]
-            task_operation_registration: _,
+                task_operation_registration: _,
         } = self;
         definition.name.clone_from(&mounted_name);
         if let Some(final_registration) = final_registration.as_mut() {
@@ -4672,7 +4672,8 @@ impl Router {
 
         let result = match outcome {
             Outcome::Ok(result) => {
-                if result.payload.completion.values.len() > fastmcp_protocol::MAX_COMPLETION_VALUES {
+                if result.payload.completion.values.len() > fastmcp_protocol::MAX_COMPLETION_VALUES
+                {
                     return Err(McpError::internal_error(
                         "completion handler returned more than 100 values",
                     ));
@@ -5428,10 +5429,10 @@ impl Router {
                 work_descriptor,
                 status_message,
             } => {
-                let (original_name, original_registration, output_schema) =
-                    original_registration.ok_or_else(|| {
-                        McpError::internal_error("Task original tool registration is missing")
-                    })?;
+                let (original_name, original_registration, output_schema) = original_registration
+                    .ok_or_else(|| {
+                    McpError::internal_error("Task original tool registration is missing")
+                })?;
                 let original = crate::FinalTaskOperation::for_tool_with_output_schema(
                     original_name,
                     original_registration,
@@ -6049,12 +6050,14 @@ impl Router {
                 if is_framework_terminal_tool_error(error.code) {
                     return Err(error);
                 }
-                Ok(LegacyToolDispatchResult::Application(ApplicationToolResult {
-                    content: vec![Content::Text {
-                        text: error.message,
-                    }],
-                    is_error: true,
-                }))
+                Ok(LegacyToolDispatchResult::Application(
+                    ApplicationToolResult {
+                        content: vec![Content::Text {
+                            text: error.message,
+                        }],
+                        is_error: true,
+                    },
+                ))
             }
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
@@ -6199,7 +6202,9 @@ impl Router {
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
         #[cfg(all(feature = "proxy", feature = "tasks"))]
-        if declares_final_tasks && ctx.client_supports_tasks() && ctx.auth().is_some()
+        if declares_final_tasks
+            && ctx.client_supports_tasks()
+            && ctx.auth().is_some()
             && let Some(client) = handler.proxy_catalog_client()
         {
             // A remote Task can already exist when its result arrives. Check
@@ -6463,12 +6468,14 @@ impl Router {
             "resource",
             None,
             |child_cx| {
-                resolved.handler.read_legacy_result_async_with_uri_in_request(
-                    &ctx,
-                    child_cx,
-                    &params.uri,
-                    &resolved.params,
-                )
+                resolved
+                    .handler
+                    .read_legacy_result_async_with_uri_in_request(
+                        &ctx,
+                        child_cx,
+                        &params.uri,
+                        &resolved.params,
+                    )
             },
         )
         .await?;
@@ -22109,7 +22116,8 @@ mod router_tests {
                 let ctx = request_context(&cx, 146, Budget::INFINITE, &state);
                 let caller = RouterToolCaller::new(Arc::clone(&router), state.clone());
 
-                for (arguments, valid) in [(&accepted, true), (&rejected, false), (&accepted, true)] {
+                for (arguments, valid) in [(&accepted, true), (&rejected, false), (&accepted, true)]
+                {
                     let before = calls.load(Ordering::SeqCst);
                     let direct = block_on(router.handle_tools_call(
                         &ctx,
@@ -22131,14 +22139,17 @@ mod router_tests {
                         if valid {
                             assert!(!result.expect("valid tuple reaches the application"));
                         } else {
-                            let error =
-                                result.expect_err("invalid tuple is refused before application code");
+                            let error = result
+                                .expect_err("invalid tuple is refused before application code");
                             assert_eq!(error.code, McpErrorCode::InvalidParams);
                             assert!(error.message.contains("root.values["));
                             assert!(!error.message.contains("tail-secret-canary"));
                         }
                     }
-                    assert_eq!(calls.load(Ordering::SeqCst), before + usize::from(valid) * 2);
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        before + usize::from(valid) * 2
+                    );
                 }
             }
         }
@@ -23380,20 +23391,37 @@ mod router_tests {
         );
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.task_count(), 1);
-        let task_id = fastmcp_protocol::FinalTaskId::parse(result["taskId"].as_str().unwrap()).unwrap();
-        let snapshot = runtime.task_for_request(&request_ctx, &task_id, crate::TaskAccessAction::Get).unwrap();
-        let original_name = snapshot.original_operation().unwrap().tool_name().to_owned();
+        let task_id =
+            fastmcp_protocol::FinalTaskId::parse(result["taskId"].as_str().unwrap()).unwrap();
+        let snapshot = runtime
+            .task_for_request(&request_ctx, &task_id, crate::TaskAccessAction::Get)
+            .unwrap();
+        let original_name = snapshot
+            .original_operation()
+            .unwrap()
+            .tool_name()
+            .to_owned();
         assert!(request_ctx.disable_tool(original_name));
-        assert!(runtime.task_for_request(&request_ctx, &task_id, crate::TaskAccessAction::Get).is_err());
-        router.add_tool_with_behavior(
-            TaskCapableRouterTool { final_calls }, crate::DuplicateBehavior::Replace,
-        ).unwrap();
+        assert!(
+            runtime
+                .task_for_request(&request_ctx, &task_id, crate::TaskAccessAction::Get)
+                .is_err()
+        );
+        router
+            .add_tool_with_behavior(
+                TaskCapableRouterTool { final_calls },
+                crate::DuplicateBehavior::Replace,
+            )
+            .unwrap();
         let fresh_state = SessionState::new();
         let fresh_context = request_context(&cx, 161, Budget::INFINITE, &fresh_state);
-        assert!(runtime.task_for_request(&fresh_context, &task_id, crate::TaskAccessAction::Get).is_err(),
-            "same-name replacement cannot inherit a Task's original registration");
+        assert!(
+            runtime
+                .task_for_request(&fresh_context, &task_id, crate::TaskAccessAction::Get)
+                .is_err(),
+            "same-name replacement cannot inherit a Task's original registration"
+        );
     }
-
 
     #[cfg(feature = "tasks")]
     struct SchemaTaskRouterTool {
@@ -23462,7 +23490,9 @@ mod router_tests {
     fn final_task_output_schema_is_frozen_with_its_original_registration() {
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let runtime = task_runtime_for_router(store.clone());
-        let runner = runtime.install_task_service(1, Arc::new(NoopFinalTaskSupervisor)).unwrap();
+        let runner = runtime
+            .install_task_service(1, Arc::new(NoopFinalTaskSupervisor))
+            .unwrap();
         let service_cx = Cx::for_testing();
         let mut service = Box::pin(runner.run(&service_cx));
         let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
@@ -23470,7 +23500,11 @@ mod router_tests {
         let mut router = Router::new();
         router.set_final_task_runtime(Some(runtime.clone()));
         let revision = Arc::new(AtomicUsize::new(7));
-        router.add_tool(SchemaTaskRouterTool { revision: revision.clone() }).unwrap();
+        router
+            .add_tool(SchemaTaskRouterTool {
+                revision: revision.clone(),
+            })
+            .unwrap();
         // The handler's future definition calls change, while the admitted
         // registration and every Task created from it retain schema 7.
         revision.store(9, Ordering::SeqCst);
@@ -23480,32 +23514,51 @@ mod router_tests {
         let mut request = final_task_capable_tool_request(170);
         request.params.as_mut().unwrap()["name"] = serde_json::json!("schema-task-router-tool");
         let first = block_on(router.dispatch_stateless(&ctx, &request)).unwrap();
-        let first_id = fastmcp_protocol::FinalTaskId::parse(first["taskId"].as_str().unwrap()).unwrap();
+        let first_id =
+            fastmcp_protocol::FinalTaskId::parse(first["taskId"].as_str().unwrap()).unwrap();
         let completion = |answer| {
             serde_json::from_value::<fastmcp_protocol::FinalTaskCallToolResult>(
                 serde_json::json!({"content": [], "structuredContent": {"answer": answer}}),
             )
             .unwrap()
         };
-        runtime.complete_task(&first_id, completion(9), None)
+        runtime
+            .complete_task(&first_id, completion(9), None)
             .expect_err("mutating handler metadata cannot change an admitted Task schema");
-        assert!(matches!(runtime.get_task(&first_id).unwrap().task, fastmcp_protocol::Task::Working(_)));
-        runtime.complete_task(&first_id, completion(7), None)
+        assert!(matches!(
+            runtime.get_task(&first_id).unwrap().task,
+            fastmcp_protocol::Task::Working(_)
+        ));
+        runtime
+            .complete_task(&first_id, completion(7), None)
             .expect("the originally admitted output still completes");
 
-        router.add_tool_with_behavior(
-            SchemaTaskRouterTool { revision },
-            crate::DuplicateBehavior::Replace,
-        ).unwrap();
-        assert!(runtime.task_for_request(&ctx, &first_id, crate::TaskAccessAction::Get).is_err(),
-            "a replacement registration cannot adopt its predecessor's Task");
+        router
+            .add_tool_with_behavior(
+                SchemaTaskRouterTool { revision },
+                crate::DuplicateBehavior::Replace,
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .task_for_request(&ctx, &first_id, crate::TaskAccessAction::Get)
+                .is_err(),
+            "a replacement registration cannot adopt its predecessor's Task"
+        );
         let second = block_on(router.dispatch_stateless(&ctx, &request)).unwrap();
-        let second_id = fastmcp_protocol::FinalTaskId::parse(second["taskId"].as_str().unwrap()).unwrap();
-        runtime.complete_task(&second_id, completion(7), None)
+        let second_id =
+            fastmcp_protocol::FinalTaskId::parse(second["taskId"].as_str().unwrap()).unwrap();
+        runtime
+            .complete_task(&second_id, completion(7), None)
             .expect_err("new Tasks use the replacement's new admitted schema");
-        runtime.complete_task(&second_id, completion(9), None)
+        runtime
+            .complete_task(&second_id, completion(9), None)
             .expect("the replacement schema governs the new Task");
-        assert!(runtime.task_for_request(&ctx, &second_id, crate::TaskAccessAction::Get).is_ok());
+        assert!(
+            runtime
+                .task_for_request(&ctx, &second_id, crate::TaskAccessAction::Get)
+                .is_ok()
+        );
     }
 
     #[cfg(feature = "tasks")]

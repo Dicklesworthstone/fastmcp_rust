@@ -363,13 +363,19 @@ impl crate::TaskAccessAuthorizer for OperationScopePolicy {
         Server::enforce_request_context(ctx)?;
         let facts = ctx.auth();
         let authorize = || -> Result<(), OperationScopeRejection> {
-            self.inner.methods.authorize_verified(original.method(), facts.as_ref())
+            self.inner
+                .methods
+                .authorize_verified(original.method(), facts.as_ref())
                 .map_err(OperationScopeRejection::Method)?;
-            self.inner.methods.authorize_verified(action.method(), facts.as_ref())
+            self.inner
+                .methods
+                .authorize_verified(action.method(), facts.as_ref())
                 .map_err(OperationScopeRejection::Method)?;
             self.authorize_key(
                 (0, original.tool_name()),
-                facts.as_ref().map_or(&[][..], |facts| facts.scopes.as_slice()),
+                facts
+                    .as_ref()
+                    .map_or(&[][..], |facts| facts.scopes.as_slice()),
             )
         };
         let decision = authorize();
@@ -433,7 +439,9 @@ impl Server {
             runtime.install_access_authorizer(Arc::new(policy.clone()))?;
         }
         #[cfg(all(feature = "tasks", feature = "proxy"))]
-        if self.final_task_runtime.is_none() && let Some(relay) = self.final_task_relay.as_ref() {
+        if self.final_task_runtime.is_none()
+            && let Some(relay) = self.final_task_relay.as_ref()
+        {
             relay.install_access_authorizers(vec![Arc::new(policy.clone())])?;
         }
         middleware.insert(0, Box::new(OperationScopeMiddleware(policy)));

@@ -18,7 +18,9 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Optio
     T::deserialize(d).map(Some)
 }
 fn secret<'de, D: Deserializer<'de>>(d: D) -> Result<Option<SecretString>, D::Error> {
-    String::deserialize(d).map(SecretString::from_string).map(Some)
+    String::deserialize(d)
+        .map(SecretString::from_string)
+        .map(Some)
 }
 
 #[derive(Default)]
@@ -85,24 +87,37 @@ pub(super) fn admit(
     admit_security_document(SecurityDocumentKind::TokenResponse, response.body)
         .map_err(|_| Error::InvalidResponse)?;
     let body: Body = serde_json::from_slice(response.body).map_err(|_| Error::InvalidResponse)?;
-    if body.refresh_token.0 || body.authorization_details.0 || body.cnf.0
-        || body.act.0 || body.sub_id.0
+    if body.refresh_token.0
+        || body.authorization_details.0
+        || body.cnf.0
+        || body.act.0
+        || body.sub_id.0
     {
         return Err(Error::InvalidResponse);
     }
     if let Some(error) = body.error.as_deref() {
-        if body.access_token.is_some() || body.id_token.is_some() || body.token_type.is_some()
-            || body.issued_token_type.is_some() || body.scope.is_some()
-            || body.resource.is_some() || body.expires_in.is_some()
+        if body.access_token.is_some()
+            || body.id_token.is_some()
+            || body.token_type.is_some()
+            || body.issued_token_type.is_some()
+            || body.scope.is_some()
+            || body.resource.is_some()
+            || body.expires_in.is_some()
             || !error_text(error, 256)
-            || body.error_description.as_deref().is_some_and(|s| !error_text(s, 2048))
+            || body
+                .error_description
+                .as_deref()
+                .is_some_and(|s| !error_text(s, 2048))
             || body.error_uri.as_deref().is_some_and(|s| !error_uri(s))
         {
             return Err(Error::InvalidResponse);
         }
         if error == "insufficient_user_authentication" {
-            if stage != EnterpriseTokenResponseStage::IdJag || response.status != 400
-                || body.max_age.is_some_and(|age| age > maximum_authentication_age_seconds)
+            if stage != EnterpriseTokenResponseStage::IdJag
+                || response.status != 400
+                || body
+                    .max_age
+                    .is_some_and(|age| age > maximum_authentication_age_seconds)
             {
                 return Err(Error::InvalidResponse);
             }
@@ -135,38 +150,61 @@ pub(super) fn admit(
             "interaction_required" => EnterpriseOAuthErrorCode::InteractionRequired,
             _ => EnterpriseOAuthErrorCode::Extension,
         };
-        return Ok((AdmittedBody::Denied(EnterpriseOAuthDenial {
-            code, status: response.status, basic_challenge: basic_denial,
-        }), diagnostics));
+        return Ok((
+            AdmittedBody::Denied(EnterpriseOAuthDenial {
+                code,
+                status: response.status,
+                basic_challenge: basic_denial,
+            }),
+            diagnostics,
+        ));
     }
     if response.status != 200 {
         return Err(Error::UnexpectedStatus);
     }
-    if body.access_token.is_none() || body.token_type.is_none()
-        || body.error_description.is_some() || body.error_uri.is_some()
-        || body.max_age.is_some() || body.expires_in == Some(0)
+    if body.access_token.is_none()
+        || body.token_type.is_none()
+        || body.error_description.is_some()
+        || body.error_uri.is_some()
+        || body.max_age.is_some()
+        || body.expires_in == Some(0)
     {
         return Err(Error::InvalidResponse);
     }
     match stage {
         EnterpriseTokenResponseStage::OidcCode => {
-            if body.id_token.is_none() || body.issued_token_type.is_some() || body.resource.is_some()
-                || !body.token_type.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("Bearer"))
+            if body.id_token.is_none()
+                || body.issued_token_type.is_some()
+                || body.resource.is_some()
+                || !body
+                    .token_type
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("Bearer"))
             {
                 return Err(Error::InvalidResponse);
             }
         }
         EnterpriseTokenResponseStage::IdJag => {
-            if body.id_token.is_some() || body.resource.is_some()
-                || body.issued_token_type.as_deref() != Some("urn:ietf:params:oauth:token-type:id-jag")
-                || !body.token_type.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("N_A"))
+            if body.id_token.is_some()
+                || body.resource.is_some()
+                || body.issued_token_type.as_deref()
+                    != Some("urn:ietf:params:oauth:token-type:id-jag")
+                || !body
+                    .token_type
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("N_A"))
             {
                 return Err(Error::InvalidResponse);
             }
         }
         EnterpriseTokenResponseStage::AccessToken => {
-            if body.id_token.is_some() || body.issued_token_type.is_some() || body.resource.is_none()
-                || !body.token_type.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("Bearer"))
+            if body.id_token.is_some()
+                || body.issued_token_type.is_some()
+                || body.resource.is_none()
+                || !body
+                    .token_type
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("Bearer"))
             {
                 return Err(Error::InvalidResponse);
             }
@@ -176,18 +214,39 @@ pub(super) fn admit(
 }
 
 fn error_text(value: &str, maximum: usize) -> bool {
-    !value.is_empty() && value.len() <= maximum
-        && value.bytes().all(|b| b == 0x20 || b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.bytes().all(|b| {
+            b == 0x20 || b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b)
+        })
 }
 fn error_uri(value: &str) -> bool {
     // Discarded RFC6749 diagnostic text; never resolved or opened.
-    !value.is_empty() && value.len() <= 2048
-        && value.bytes().all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
+    !value.is_empty()
+        && value.len() <= 2048
+        && value
+            .bytes()
+            .all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
 }
 fn token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte,
-        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
-        | b'^' | b'_' | 0x60 | b'|' | b'~')
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | 0x60
+                | b'|'
+                | b'~'
+        )
 }
 fn ows(value: &str) -> &str {
     value.trim_matches([' ', '\t'])
@@ -204,11 +263,16 @@ fn headers(
     let mut content_type = None;
     let mut content_encoding = false;
     for (name, value) in fields {
-        bytes = bytes.checked_add(name.len()).and_then(|n| n.checked_add(value.len()))
+        bytes = bytes
+            .checked_add(name.len())
+            .and_then(|n| n.checked_add(value.len()))
             .ok_or(Error::InvalidHeaders)?;
-        if bytes > MAX_HEADER_BYTES || name.is_empty() || !name.bytes().all(token_byte)
+        if bytes > MAX_HEADER_BYTES
+            || name.is_empty()
+            || !name.bytes().all(token_byte)
             || value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
-            || name.eq_ignore_ascii_case("DPoP") || name.eq_ignore_ascii_case("DPoP-Nonce")
+            || name.eq_ignore_ascii_case("DPoP")
+            || name.eq_ignore_ascii_case("DPoP-Nonce")
         {
             return Err(Error::InvalidHeaders);
         }
@@ -224,13 +288,19 @@ fn headers(
         }
     }
     let mut media = content_type.ok_or(Error::InvalidHeaders)?.split(';');
-    if !media.next().is_some_and(|s| ows(s).eq_ignore_ascii_case("application/json")) {
+    if !media
+        .next()
+        .is_some_and(|s| ows(s).eq_ignore_ascii_case("application/json"))
+    {
         return Err(Error::InvalidHeaders);
     }
     if let Some(parameter) = media.next() {
-        let (name, value) = ows(parameter).split_once('=').ok_or(Error::InvalidHeaders)?;
+        let (name, value) = ows(parameter)
+            .split_once('=')
+            .ok_or(Error::InvalidHeaders)?;
         if !ows(name).eq_ignore_ascii_case("charset")
-            || !(ows(value).eq_ignore_ascii_case("utf-8") || ows(value).eq_ignore_ascii_case("\"utf-8\""))
+            || !(ows(value).eq_ignore_ascii_case("utf-8")
+                || ows(value).eq_ignore_ascii_case("\"utf-8\""))
             || media.next().is_some()
         {
             return Err(Error::InvalidHeaders);
@@ -239,7 +309,8 @@ fn headers(
     let cache = cache_policy(fields).map_err(|_| Error::InvalidCachePolicy)?;
     Ok(EnterpriseCacheDiagnostics {
         missing_no_store: cache.missing_no_store,
-        missing_pragma_no_cache: stage != EnterpriseTokenResponseStage::OidcCode && cache.missing_pragma_no_cache,
+        missing_pragma_no_cache: stage != EnterpriseTokenResponseStage::OidcCode
+            && cache.missing_pragma_no_cache,
     })
 }
 
@@ -259,16 +330,39 @@ mod tests {
     fn enterprise_token_stages_admit_only_their_own_positive_shape() {
         let headers = head();
         let examples = [
-            (EnterpriseTokenResponseStage::OidcCode, r#"{"access_token":"temporary","token_type":"Bearer","id_token":"signed","scope":"openid"}"#),
-            (EnterpriseTokenResponseStage::IdJag, r#"{"access_token":"signed","token_type":"n_A","issued_token_type":"urn:ietf:params:oauth:token-type:id-jag"}"#),
-            (EnterpriseTokenResponseStage::AccessToken, r#"{"access_token":"final","token_type":"bEaReR","resource":"https://mcp.example/mcp","scope":"read"}"#),
+            (
+                EnterpriseTokenResponseStage::OidcCode,
+                r#"{"access_token":"temporary","token_type":"Bearer","id_token":"signed","scope":"openid"}"#,
+            ),
+            (
+                EnterpriseTokenResponseStage::IdJag,
+                r#"{"access_token":"signed","token_type":"n_A","issued_token_type":"urn:ietf:params:oauth:token-type:id-jag"}"#,
+            ),
+            (
+                EnterpriseTokenResponseStage::AccessToken,
+                r#"{"access_token":"final","token_type":"bEaReR","resource":"https://mcp.example/mcp","scope":"read"}"#,
+            ),
         ];
         for (own, body) in examples {
-            for stage in [EnterpriseTokenResponseStage::OidcCode, EnterpriseTokenResponseStage::IdJag, EnterpriseTokenResponseStage::AccessToken] {
-                let result = admit(&EnterpriseTokenResponse {
-                    status: 200, headers: &headers, body: body.as_bytes(),
-                }, stage, false, 3600);
-                assert_eq!(matches!(result, Ok((AdmittedBody::Success(_), _))), own == stage);
+            for stage in [
+                EnterpriseTokenResponseStage::OidcCode,
+                EnterpriseTokenResponseStage::IdJag,
+                EnterpriseTokenResponseStage::AccessToken,
+            ] {
+                let result = admit(
+                    &EnterpriseTokenResponse {
+                        status: 200,
+                        headers: &headers,
+                        body: body.as_bytes(),
+                    },
+                    stage,
+                    false,
+                    3600,
+                );
+                assert_eq!(
+                    matches!(result, Ok((AdmittedBody::Success(_), _))),
+                    own == stage
+                );
             }
         }
     }
@@ -278,41 +372,90 @@ mod tests {
         let headers = head();
         let base = r#"{"access_token":"signed","token_type":"N_A","issued_token_type":"urn:ietf:params:oauth:token-type:id-jag""#;
         for addition in [
-            r#", "token_type":"N_A"}"#, r#", "refresh_token":null}"#,
-            r#", "expires_in":null}"#, r#", "expires_in":0}"#,
-            r#", "expires_in":1.5}"#, r#", "scope":null}"#,
-            r#", "error":"invalid_grant"}"#, r#", "authorization_details":null}"#,
-            r#", "cnf":{}}"#, r#", "act":null}"#, r#", "sub_id":"alias"}"#,
+            r#", "token_type":"N_A"}"#,
+            r#", "refresh_token":null}"#,
+            r#", "expires_in":null}"#,
+            r#", "expires_in":0}"#,
+            r#", "expires_in":1.5}"#,
+            r#", "scope":null}"#,
+            r#", "error":"invalid_grant"}"#,
+            r#", "authorization_details":null}"#,
+            r#", "cnf":{}}"#,
+            r#", "act":null}"#,
+            r#", "sub_id":"alias"}"#,
             r#", "extension":{"duplicate":1,"duplicate":2}}"#,
         ] {
             let body = format!("{base}{addition}");
-            assert!(admit(&EnterpriseTokenResponse {
-                status: 200, headers: &headers, body: body.as_bytes(),
-            }, EnterpriseTokenResponseStage::IdJag, false, 3600).is_err(), "{addition}");
+            assert!(
+                admit(
+                    &EnterpriseTokenResponse {
+                        status: 200,
+                        headers: &headers,
+                        body: body.as_bytes(),
+                    },
+                    EnterpriseTokenResponseStage::IdJag,
+                    false,
+                    3600
+                )
+                .is_err(),
+                "{addition}"
+            );
         }
         let positive = format!("{base}, \"extension\":{{\"inert\":true}}}}");
-        assert!(admit(&EnterpriseTokenResponse {
-            status: 200, headers: &headers, body: positive.as_bytes(),
-        }, EnterpriseTokenResponseStage::IdJag, false, 3600).is_ok());
+        assert!(
+            admit(
+                &EnterpriseTokenResponse {
+                    status: 200,
+                    headers: &headers,
+                    body: positive.as_bytes(),
+                },
+                EnterpriseTokenResponseStage::IdJag,
+                false,
+                3600
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn enterprise_step_up_is_a_bounded_400_only_nonautomatic_outcome() {
         let headers = head();
         for age in ["", ",\"max_age\":0", ",\"max_age\":3600"] {
-            let body = format!(r#"{{"error":"insufficient_user_authentication","error_description":"Fresh login required","acr_values":"ignored"{age}}}"#);
+            let body = format!(
+                r#"{{"error":"insufficient_user_authentication","error_description":"Fresh login required","acr_values":"ignored"{age}}}"#
+            );
             for status in [200, 201, 400, 401, 403, 429, 500] {
-                let result = admit(&EnterpriseTokenResponse {
-                    status, headers: &headers, body: body.as_bytes(),
-                }, EnterpriseTokenResponseStage::IdJag, true, 3600);
-                assert_eq!(matches!(result, Ok((AdmittedBody::StepUp(_), _))), status == 400);
+                let result = admit(
+                    &EnterpriseTokenResponse {
+                        status,
+                        headers: &headers,
+                        body: body.as_bytes(),
+                    },
+                    EnterpriseTokenResponseStage::IdJag,
+                    true,
+                    3600,
+                );
+                assert_eq!(
+                    matches!(result, Ok((AdmittedBody::StepUp(_), _))),
+                    status == 400
+                );
             }
         }
         for age in ["null", "-1", "1.5", "\"1\"", "3601", "18446744073709551616"] {
             let body = format!(r#"{{"error":"insufficient_user_authentication","max_age":{age}}}"#);
-            assert!(admit(&EnterpriseTokenResponse {
-                status: 400, headers: &headers, body: body.as_bytes(),
-            }, EnterpriseTokenResponseStage::IdJag, true, 3600).is_err());
+            assert!(
+                admit(
+                    &EnterpriseTokenResponse {
+                        status: 400,
+                        headers: &headers,
+                        body: body.as_bytes(),
+                    },
+                    EnterpriseTokenResponseStage::IdJag,
+                    true,
+                    3600
+                )
+                .is_err()
+            );
         }
     }
 
@@ -321,10 +464,14 @@ mod tests {
         let body = br#"{"error":"invalid_client"}"#;
         for (challenge, accepted) in [
             (r#"Basic realm="issuer""#, true),
-            (r#"Bearer realm="other", Basic realm="issuer, with comma", charset="UTF-8""#, true),
+            (
+                r#"Bearer realm="other", Basic realm="issuer, with comma", charset="UTF-8""#,
+                true,
+            ),
             (r#"Bearer realm="issuer""#, false),
             (r#"Basic realm="one", Basic realm="two""#, false),
-            ("Basic", false), ("Basic YWJjZA==", false),
+            ("Basic", false),
+            ("Basic YWJjZA==", false),
             (r#"Basic realm="issuer", realm="issuer""#, false),
             (r#"Basic realm="issuer", charset="UTF-16""#, false),
         ] {
@@ -336,9 +483,16 @@ mod tests {
                 EnterpriseTokenResponseStage::AccessToken,
             ] {
                 for basic in [false, true] {
-                    let result = admit(&EnterpriseTokenResponse {
-                        status: 401, headers: &headers, body,
-                    }, stage, basic, 3600);
+                    let result = admit(
+                        &EnterpriseTokenResponse {
+                            status: 401,
+                            headers: &headers,
+                            body,
+                        },
+                        stage,
+                        basic,
+                        3600,
+                    );
                     assert_eq!(
                         matches!(result, Ok((AdmittedBody::Denied(_), _))),
                         accepted && basic,
@@ -348,9 +502,19 @@ mod tests {
             }
         }
         let headers = head();
-        assert!(matches!(admit(&EnterpriseTokenResponse {
-            status: 400, headers: &headers, body,
-        }, EnterpriseTokenResponseStage::OidcCode, true, 3600), Ok((AdmittedBody::Denied(_), _))));
+        assert!(matches!(
+            admit(
+                &EnterpriseTokenResponse {
+                    status: 400,
+                    headers: &headers,
+                    body,
+                },
+                EnterpriseTokenResponseStage::OidcCode,
+                true,
+                3600
+            ),
+            Ok((AdmittedBody::Denied(_), _))
+        ));
     }
 
     #[test]
@@ -391,7 +555,10 @@ mod tests {
 
     #[test]
     fn enterprise_cache_fields_combine_and_missing_directives_only_diagnose() {
-        let mut fields = vec![("Content-Type".into(), "application/json; charset=\"UTF-8\"".into())];
+        let mut fields = vec![(
+            "Content-Type".into(),
+            "application/json; charset=\"UTF-8\"".into(),
+        )];
         let missing = headers(&fields, EnterpriseTokenResponseStage::IdJag).unwrap();
         assert!(missing.missing_no_store && missing.missing_pragma_no_cache);
         let oidc_missing = headers(&fields, EnterpriseTokenResponseStage::OidcCode).unwrap();
@@ -404,26 +571,42 @@ mod tests {
         let admitted = headers(&fields, EnterpriseTokenResponseStage::IdJag).unwrap();
         assert!(!admitted.missing_no_store && !admitted.missing_pragma_no_cache);
         for directive in [
-            "public", "max-age=0", "s-maxage=1", "no-store=false",
-            "extension=other", "broken=\"unterminated",
+            "public",
+            "max-age=0",
+            "s-maxage=1",
+            "no-store=false",
+            "extension=other",
+            "broken=\"unterminated",
         ] {
             let mut bad = fields.clone();
             bad.push(("Cache-Control".into(), directive.into()));
-            assert!(headers(&bad, EnterpriseTokenResponseStage::IdJag).is_err(), "{directive}");
+            assert!(
+                headers(&bad, EnterpriseTokenResponseStage::IdJag).is_err(),
+                "{directive}"
+            );
         }
         for bad_type in [
-            "text/json", "application/json; charset=\"utf-8",
-            "application/json; charset=utf-16", "application/json; charset=utf-8; charset=utf-8",
+            "text/json",
+            "application/json; charset=\"utf-8",
+            "application/json; charset=utf-16",
+            "application/json; charset=utf-8; charset=utf-8",
             "application/json\u{2003}",
         ] {
-            assert!(headers(&[("Content-Type".into(), bad_type.into())],
-                EnterpriseTokenResponseStage::IdJag).is_err());
+            assert!(
+                headers(
+                    &[("Content-Type".into(), bad_type.into())],
+                    EnterpriseTokenResponseStage::IdJag
+                )
+                .is_err()
+            );
         }
         for forbidden in ["DPoP", "dPoP", "DPoP-Nonce"] {
             let mut bad = fields.clone();
             bad.push((forbidden.into(), "proof-or-challenge".into()));
-            assert_eq!(headers(&bad, EnterpriseTokenResponseStage::IdJag),
-                Err(Error::InvalidHeaders));
+            assert_eq!(
+                headers(&bad, EnterpriseTokenResponseStage::IdJag),
+                Err(Error::InvalidHeaders)
+            );
         }
     }
 }

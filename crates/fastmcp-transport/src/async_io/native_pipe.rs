@@ -911,11 +911,26 @@ mod tests {
         [
             (CapMask::all(), [true; 5]),
             (CapMask::none(), [false; 5]),
-            (CapSet::<false, true, true, true, true>::MASK, [false, true, true, true, true]),
-            (CapSet::<true, false, true, true, true>::MASK, [true, false, true, true, true]),
-            (CapSet::<true, true, false, true, true>::MASK, [true, true, false, true, true]),
-            (CapSet::<true, true, true, false, true>::MASK, [true, true, true, false, true]),
-            (CapSet::<true, true, true, true, false>::MASK, [true, true, true, true, false]),
+            (
+                CapSet::<false, true, true, true, true>::MASK,
+                [false, true, true, true, true],
+            ),
+            (
+                CapSet::<true, false, true, true, true>::MASK,
+                [true, false, true, true, true],
+            ),
+            (
+                CapSet::<true, true, false, true, true>::MASK,
+                [true, true, false, true, true],
+            ),
+            (
+                CapSet::<true, true, true, false, true>::MASK,
+                [true, true, true, false, true],
+            ),
+            (
+                CapSet::<true, true, true, true, false>::MASK,
+                [true, true, true, true, false],
+            ),
         ]
     }
 
@@ -928,9 +943,8 @@ mod tests {
             .blocking_threads(0, 0)
             .build()
             .unwrap();
-        let cx = runtime.request_cx_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-        );
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         let live = runtime.request_cx_with_budget(Budget::INFINITE);
         test(&cx, &live, &clock, &timer);
         assert_eq!(timer.pending_count(), 0);
@@ -969,10 +983,13 @@ mod tests {
                     let (mut reader, mut writer) = result.unwrap();
                     assert_eq!(effects(&reader.0.cx), expected);
                     assert_eq!(effects(&writer.0.cx), expected);
-                    let actual = ready(reader.0.poll_io(
-                        &mut Context::from_waker(Waker::noop()),
-                        |_| Ok(effects(&Cx::current().unwrap())),
-                    ));
+                    let actual = ready(
+                        reader
+                            .0
+                            .poll_io(&mut Context::from_waker(Waker::noop()), |_| {
+                                Ok(effects(&Cx::current().unwrap()))
+                            }),
+                    );
                     assert_eq!(actual, expected);
                     // Cleanup remains available even outside all effect scopes.
                     scoped(&cx, CapMask::none(), || close(&mut writer));
@@ -995,11 +1012,13 @@ mod tests {
         for (mask, expected) in masks() {
             let before = polls.load(Ordering::SeqCst);
             let result: Poll<io::Result<()>> = scoped(&host, mask, || {
-                let result = reader.0.poll_io(&mut Context::from_waker(Waker::noop()), |_| {
-                    polls.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(effects(&Cx::current().unwrap()), expected);
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                });
+                let result = reader
+                    .0
+                    .poll_io(&mut Context::from_waker(Waker::noop()), |_| {
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(effects(&Cx::current().unwrap()), expected);
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    });
                 assert_eq!(effects(&Cx::current().unwrap()), expected);
                 result
             });
@@ -1007,7 +1026,9 @@ mod tests {
                 assert!(result.is_pending());
                 assert_eq!(polls.load(Ordering::SeqCst), before + 1);
             } else {
-                assert!(matches!(result, Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied));
+                assert!(
+                    matches!(result, Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied)
+                );
                 assert_eq!(polls.load(Ordering::SeqCst), before);
                 assert!(reader.0.wait.is_none());
             }
@@ -1133,15 +1154,18 @@ mod tests {
                 let (input, output) = fresh_descriptors().unwrap();
                 let mut reader = NativePipeReader::from_owned_fd(live, input).unwrap();
                 let mut writer = NativePipeWriter::from_owned_fd(cx, output).unwrap();
-                let count = ready(writer.0.poll_io(&mut Context::from_waker(Waker::noop()), |file| {
-                    let count = rustix::io::write(file, b"ok").map_err(io::Error::from)?;
-                    if deadline {
-                        clock.advance(10_000_000);
-                    } else {
-                        cx.set_cancel_requested(true);
-                    }
-                    Ok(count)
-                }));
+                let count = ready(writer.0.poll_io(
+                    &mut Context::from_waker(Waker::noop()),
+                    |file| {
+                        let count = rustix::io::write(file, b"ok").map_err(io::Error::from)?;
+                        if deadline {
+                            clock.advance(10_000_000);
+                        } else {
+                            cx.set_cancel_requested(true);
+                        }
+                        Ok(count)
+                    },
+                ));
                 assert_eq!(count, 2);
                 assert!(cx.checkpoint().is_err());
                 let mut bytes = [0; 2];

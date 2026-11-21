@@ -637,19 +637,25 @@ impl ExtensionHandlerRegistry {
         schema: std::sync::Arc<fastmcp_protocol::schema::AdmittedSchema>,
     ) -> McpResult<()> {
         if self.frozen
-            || self.request_notification_schemas.contains_key(&extension_id)
-            || self.descriptor_registry.descriptor(&extension_id).is_none_or(|descriptor| {
-                descriptor.stdio_correlation.is_none()
-                    || descriptor.notification.as_ref().is_none_or(|notification| {
-                        notification.direction != ExtensionDirection::ServerToClient
-                    })
-            })
+            || self
+                .request_notification_schemas
+                .contains_key(&extension_id)
+            || self
+                .descriptor_registry
+                .descriptor(&extension_id)
+                .is_none_or(|descriptor| {
+                    descriptor.stdio_correlation.is_none()
+                        || descriptor.notification.as_ref().is_none_or(|notification| {
+                            notification.direction != ExtensionDirection::ServerToClient
+                        })
+                })
         {
             return Err(McpError::invalid_params(
                 "Request notification schema has no available descriptor owner",
             ));
         }
-        self.request_notification_schemas.insert(extension_id, schema);
+        self.request_notification_schemas
+            .insert(extension_id, schema);
         Ok(())
     }
 
@@ -658,7 +664,9 @@ impl ExtensionHandlerRegistry {
         &self,
         extension_id: &ExtensionId,
     ) -> Option<std::sync::Arc<fastmcp_protocol::schema::AdmittedSchema>> {
-        self.frozen.then(|| self.request_notification_schemas.get(extension_id).cloned()).flatten()
+        self.frozen
+            .then(|| self.request_notification_schemas.get(extension_id).cloned())
+            .flatten()
     }
 
     /// Returns the mutable descriptor registry before handler freeze.
@@ -1002,12 +1010,7 @@ impl ExtensionHandlerRegistry {
             .map_err(|_| McpError::request_cancelled())?;
         handler
             .handler
-            .invoke_authorized_notification_async(
-                context,
-                admitted,
-                parameters,
-                authorized.payload,
-            )
+            .invoke_authorized_notification_async(context, admitted, parameters, authorized.payload)
             .await?;
         context
             .ensure_live()
@@ -1238,7 +1241,10 @@ impl ExtensionHandlerRegistry {
             .invoke_response_async(
                 context,
                 admitted,
-                request.params.clone().unwrap_or_else(|| serde_json::json!({})),
+                request
+                    .params
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
                 id,
                 handler_admission,
             )

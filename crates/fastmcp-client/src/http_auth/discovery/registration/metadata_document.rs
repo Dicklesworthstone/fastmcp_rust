@@ -353,12 +353,16 @@ impl MetadataDocumentDiscovery {
         kind: SecurityDocumentKind,
         body: &[u8],
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
-        let (authorization, token) = self.discovery.admit_issuer_endpoints(selected, kind, body)?;
+        let (authorization, token) = self
+            .discovery
+            .admit_issuer_endpoints(selected, kind, body)?;
         let metadata: CimdIssuerMetadata = decode_metadata(kind, body)?;
         if metadata.client_id_metadata_document_supported != Some(true) {
             return Err(OAuthDiscoveryError::UnsupportedFlow);
         }
-        let revocation = self.discovery.admit_revocation_endpoint(selected, kind, body)?;
+        let revocation = self
+            .discovery
+            .admit_revocation_endpoint(selected, kind, body)?;
         self.discovery.configure_client(
             selected,
             authorization,

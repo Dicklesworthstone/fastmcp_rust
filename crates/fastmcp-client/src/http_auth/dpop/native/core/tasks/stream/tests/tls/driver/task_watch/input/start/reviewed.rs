@@ -1,22 +1,25 @@
 use super::*;
 use std::sync::Arc;
 
-use fastmcp_core::CanonicalHttpUrl;
 use crate::http_executor::parameter_headers::ReviewedToolHeaders;
+use fastmcp_core::CanonicalHttpUrl;
 
 fn reviewed_operation(target: &str) -> DpopTaskOperation {
-    let reviewed = Arc::new(ReviewedToolHeaders::new(
-        CanonicalHttpUrl::parse(target).unwrap(),
-        "work",
-        json!({
-            "type":"object",
-            "properties":{
-                "region":{"type":"string","x-mcp-header":"Region"},
-                "private":{"type":"string","writeOnly":true}
-            }
-        }),
-        |_| true,
-    ).unwrap());
+    let reviewed = Arc::new(
+        ReviewedToolHeaders::new(
+            CanonicalHttpUrl::parse(target).unwrap(),
+            "work",
+            json!({
+                "type":"object",
+                "properties":{
+                    "region":{"type":"string","x-mcp-header":"Region"},
+                    "private":{"type":"string","writeOnly":true}
+                }
+            }),
+            |_| true,
+        )
+        .unwrap(),
+    );
     DpopTaskOperation::new(
         RequestId::String("reviewed-discovery".to_owned()),
         RequestId::String("reviewed-call".to_owned()),
@@ -24,15 +27,20 @@ fn reviewed_operation(target: &str) -> DpopTaskOperation {
             name: "work".to_owned(),
             arguments: Some(json!({"region":"eu","private":"body-only"})),
         },
-    ).unwrap()
-        .with_reviewed_tool_headers(reviewed).unwrap()
+    )
+    .unwrap()
+    .with_reviewed_tool_headers(reviewed)
+    .unwrap()
 }
 
 async fn reviewed_creation(peer: &mut Peer, result: &Value) {
-    let (mut discovery, _) = peer.receive_named("reviewed-discovery", "server/discover").await;
+    let (mut discovery, _) = peer
+        .receive_named("reviewed-discovery", "server/discover")
+        .await;
     let discovery_response = serde_json::to_vec(&json!({
         "jsonrpc":"2.0","id":"reviewed-discovery","result":discovery_result()
-    })).unwrap();
+    }))
+    .unwrap();
     json_reply(&mut discovery, &discovery_response).await;
 
     let (socket, _) = peer.listener.accept().await.unwrap();
@@ -54,11 +62,15 @@ async fn reviewed_creation(peer: &mut Peer, result: &Value) {
     assert!(!head.contains("body-only"));
     let proof = claims(header(&head, "dpop"));
     assert_eq!(proof["nonce"], "stream-next");
-    assert!(peer.proofs.insert(proof["jti"].as_str().unwrap().to_owned()));
+    assert!(
+        peer.proofs
+            .insert(proof["jti"].as_str().unwrap().to_owned())
+    );
 
     let response = serde_json::to_vec(&json!({
         "jsonrpc":"2.0","id":"reviewed-call","result":result
-    })).unwrap();
+    }))
+    .unwrap();
     json_reply(&mut socket, &response).await;
 }
 
@@ -109,27 +121,46 @@ fn colliding_reviewed_creation_ids_fail_before_any_tls_request() {
         let (peer, mut client, credential) = Peer::new().await;
         let cancellation = McpRequestCancellation::new();
         let target = peer.target.clone();
-        let reviewed = Arc::new(ReviewedToolHeaders::new(
-            CanonicalHttpUrl::parse(&target).unwrap(),
-            "work",
-            json!({"type":"object","properties":{}}),
-            |_| true,
-        ).unwrap());
+        let reviewed = Arc::new(
+            ReviewedToolHeaders::new(
+                CanonicalHttpUrl::parse(&target).unwrap(),
+                "work",
+                json!({"type":"object","properties":{}}),
+                |_| true,
+            )
+            .unwrap(),
+        );
         let operation = DpopTaskOperation::new(
             RequestId::String("collision.0.get".to_owned()),
             RequestId::String("initial-call".to_owned()),
-            ManagedTaskRequest::CallTool { name:"work".to_owned(), arguments:None },
-        ).unwrap().with_reviewed_tool_headers(reviewed).unwrap();
+            ManagedTaskRequest::CallTool {
+                name: "work".to_owned(),
+                arguments: None,
+            },
+        )
+        .unwrap()
+        .with_reviewed_tool_headers(reviewed)
+        .unwrap();
 
-        let result = client.start_and_drive_task_operation_with_subscription(
-            &cx, &cancellation, &credential, driver_metadata(), operation,
-            "collision", policy(2, 1), watch_limits(8),
-            |_| std::future::ready(Ok(ManagedTaskInputAction::ReturnToCaller)),
-            |_| Ok(()),
-        ).await;
+        let result = client
+            .start_and_drive_task_operation_with_subscription(
+                &cx,
+                &cancellation,
+                &credential,
+                driver_metadata(),
+                operation,
+                "collision",
+                policy(2, 1),
+                watch_limits(8),
+                |_| std::future::ready(Ok(ManagedTaskInputAction::ReturnToCaller)),
+                |_| Ok(()),
+            )
+            .await;
         assert!(matches!(
             result,
-            Err(DpopTaskWatchError::Driver(ManagedTaskDriverError::RepeatedRequestId))
+            Err(DpopTaskWatchError::Driver(
+                ManagedTaskDriverError::RepeatedRequestId
+            ))
         ));
         peer.no_extra(0);
         assert!(cx.checkpoint().is_ok());

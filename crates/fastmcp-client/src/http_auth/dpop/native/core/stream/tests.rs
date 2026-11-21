@@ -32,7 +32,8 @@ fn limits() -> DpopStreamLimits {
     DpopStreamLimits::new(
         ManagedCoreLimits::new(8192, 8192, 32768, 16, Duration::from_secs(60)).unwrap(),
         Duration::from_secs(10),
-    ).unwrap()
+    )
+    .unwrap()
 }
 
 fn reader(kind: ModernHttpResponseKind, limits: DpopStreamLimits, wire: usize) -> Reader {
@@ -41,7 +42,8 @@ fn reader(kind: ModernHttpResponseKind, limits: DpopStreamLimits, wire: usize) -
         CoreDecoder::for_request(request(), RequestId::Number(7), limits.core).unwrap(),
         limits,
         wire,
-    ).unwrap()
+    )
+    .unwrap()
 }
 
 fn event(json: &str) -> String {
@@ -54,22 +56,34 @@ fn fixture(f: impl FnOnce(&Lifetime<'_>, &TimerDriverHandle, &Arc<VirtualClock>)
     let runtime = RuntimeBuilder::current_thread()
         .blocking_threads(0, 0)
         .with_timer_driver(timer.clone())
-        .build().unwrap();
+        .build()
+        .unwrap();
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     let token_endpoint = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
     let session = DpopSession::new(
         DpopKey::generate().unwrap(),
         token_endpoint.clone(),
         CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap(),
-    ).unwrap();
-    let credential = session.admit_token_response(
-        &token_endpoint, 200,
-        br#"{"access_token":"stream-token","token_type":"DPoP","expires_in":300}"#,
-        Instant::now(), Duration::from_secs(300),
-    ).unwrap();
+    )
+    .unwrap();
+    let credential = session
+        .admit_token_response(
+            &token_endpoint,
+            200,
+            br#"{"access_token":"stream-token","token_type":"DPoP","expires_in":300}"#,
+            Instant::now(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
     let cancellation = McpRequestCancellation::new();
     let bounds = WaitBounds::new(&cx, Duration::from_secs(60), &credential).unwrap();
-    let lifetime = Lifetime { cx: &cx, cancellation: &cancellation, session: &session, credential: &credential, bounds };
+    let lifetime = Lifetime {
+        cx: &cx,
+        cancellation: &cancellation,
+        session: &session,
+        credential: &credential,
+        bounds,
+    };
     // An unloaned current-thread runtime drives its worker, timers included,
     // on a background thread. Run the hand-driven clock as the root poll so
     // only the test fires the virtual timers it inspects. `block_on` installs
@@ -88,7 +102,10 @@ fn fixture(f: impl FnOnce(&Lifetime<'_>, &TimerDriverHandle, &Arc<VirtualClock>)
 fn streaming_configuration_requires_finite_independent_bounds() {
     let core = limits().core;
     for idle in [Duration::ZERO, Duration::from_secs(61)] {
-        assert!(matches!(DpopStreamLimits::new(core, idle), Err(DpopStreamError::InvalidLimits)));
+        assert!(matches!(
+            DpopStreamLimits::new(core, idle),
+            Err(DpopStreamError::InvalidLimits)
+        ));
     }
     assert!(DpopStreamLimits::new(core, Duration::from_secs(60)).is_ok());
     for sse in [
@@ -97,7 +114,10 @@ fn streaming_configuration_requires_finite_independent_bounds() {
         SseLimits::with_data_lines(1, 8192, 65_537, 1).unwrap(),
         SseLimits::new(1, 8192, 1).unwrap(),
     ] {
-        assert!(matches!(limits().with_sse_limits(sse), Err(DpopStreamError::InvalidLimits)));
+        assert!(matches!(
+            limits().with_sse_limits(sse),
+            Err(DpopStreamError::InvalidLimits)
+        ));
     }
     for configured in [
         DpopStreamLimits::default(),
@@ -111,9 +131,14 @@ fn streaming_configuration_requires_finite_independent_bounds() {
         assert_eq!(configured.sse.max_data_lines(), 4096);
         assert!(configured.with_sse_limits(configured.sse).is_ok());
     }
-    assert!(limits().with_sse_limits(SseLimits::with_data_lines(
-        8 * 1024 * 1024 + 8, 9 * 1024 * 1024, 65_536, 65_536,
-    ).unwrap()).is_ok());
+    assert!(
+        limits()
+            .with_sse_limits(
+                SseLimits::with_data_lines(8 * 1024 * 1024 + 8, 9 * 1024 * 1024, 65_536, 65_536,)
+                    .unwrap()
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -147,7 +172,12 @@ fn default_sse_line_limit_counts_raw_and_replacement_bytes_at_the_exact_boundary
                     let end = parser.finish().unwrap();
                     assert!(!end.discarded_pending_event && !end.discarded_partial_line);
                 } else {
-                    assert_eq!(outcome, Err(SseParseError::LineTooLong { limit_bytes: ceiling }));
+                    assert_eq!(
+                        outcome,
+                        Err(SseParseError::LineTooLong {
+                            limit_bytes: ceiling
+                        })
+                    );
                     assert_eq!(parser.buffered_bytes(), 0);
                     assert_eq!(parser.push(b"\n"), Err(SseParseError::Poisoned));
                 }
@@ -186,12 +216,14 @@ fn default_sse_event_limit_counts_raw_and_replacement_bytes_at_the_exact_boundar
                 let mut parser = BoundedSseParser::new(limits);
                 let mut calls = 0;
                 let outcome = wire.chunks(chunk_bytes).try_for_each(|chunk| {
-                    parser.push_with(chunk, |payload| {
-                        calls += 1;
-                        let overhead = if replacement { 1 } else { 11 };
-                        assert_eq!(payload.len(), ceiling - overhead);
-                        Ok::<(), ()>(())
-                    }).map(|_| ())
+                    parser
+                        .push_with(chunk, |payload| {
+                            calls += 1;
+                            let overhead = if replacement { 1 } else { 11 };
+                            assert_eq!(payload.len(), ceiling - overhead);
+                            Ok::<(), ()>(())
+                        })
+                        .map(|_| ())
                 });
                 if excess == 0 {
                     outcome.unwrap();
@@ -222,9 +254,16 @@ fn notifications_are_incremental_and_every_byte_split_preserves_exact_terminal()
             let mut reader = reader(ModernHttpResponseKind::Sse, limits(), wire.len());
             let mut idle = Idle::new(life.cx.now(), limits().idle);
             let mut calls = 0;
-            let mut observer = |_: &ServerNotification| { calls += 1; true };
-            reader.push(&wire.as_bytes()[..split], life, &mut idle, &mut observer).unwrap();
-            reader.push(&wire.as_bytes()[split..], life, &mut idle, &mut observer).unwrap();
+            let mut observer = |_: &ServerNotification| {
+                calls += 1;
+                true
+            };
+            reader
+                .push(&wire.as_bytes()[..split], life, &mut idle, &mut observer)
+                .unwrap();
+            reader
+                .push(&wire.as_bytes()[split..], life, &mut idle, &mut observer)
+                .unwrap();
             assert_eq!(calls, 1);
             let encoded = reader.finish(life, &idle).unwrap().result.encode().unwrap();
             assert!(encoded.contains("900719925474099312345"));
@@ -234,11 +273,24 @@ fn notifications_are_incremental_and_every_byte_split_preserves_exact_terminal()
         let mut reader = reader(ModernHttpResponseKind::Sse, limits(), 32768);
         let mut idle = Idle::new(life.cx.now(), limits().idle);
         let mut seen = 0;
-        reader.push(first.as_bytes(), life, &mut idle, &mut |_| { seen += 1; true }).unwrap();
-        assert_eq!(seen, 1, "notification must be delivered before terminal bytes exist");
+        reader
+            .push(first.as_bytes(), life, &mut idle, &mut |_| {
+                seen += 1;
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            seen, 1,
+            "notification must be delivered before terminal bytes exist"
+        );
         assert!(reader.terminal.is_none());
-        reader.push(final_event.as_bytes(), life, &mut idle, &mut |_| true).unwrap();
-        assert!(reader.terminal.is_some(), "terminal remains owned until EOF admission");
+        reader
+            .push(final_event.as_bytes(), life, &mut idle, &mut |_| true)
+            .unwrap();
+        assert!(
+            reader.terminal.is_some(),
+            "terminal remains owned until EOF admission"
+        );
         reader.finish(life, &idle).unwrap();
     });
 }
@@ -252,10 +304,21 @@ fn second_terminal_or_late_notification_rejects_the_unpublished_first_result() {
                 let mut reader = reader(ModernHttpResponseKind::Sse, limits(), 32768);
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
                 let mut notifications = 0;
-                let mut observe = |_: &ServerNotification| { notifications += 1; true };
-                let result = reader.push(&wire.as_bytes()[..split], life, &mut idle, &mut observe)
-                    .and_then(|()| reader.push(&wire.as_bytes()[split..], life, &mut idle, &mut observe));
-                assert!(matches!(result, Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)))));
+                let mut observe = |_: &ServerNotification| {
+                    notifications += 1;
+                    true
+                };
+                let result = reader
+                    .push(&wire.as_bytes()[..split], life, &mut idle, &mut observe)
+                    .and_then(|()| {
+                        reader.push(&wire.as_bytes()[split..], life, &mut idle, &mut observe)
+                    });
+                assert!(matches!(
+                    result,
+                    Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::InvalidResponse
+                    )))
+                ));
                 assert_eq!(notifications, 0);
             }
         }
@@ -265,20 +328,44 @@ fn second_terminal_or_late_notification_rejects_the_unpublished_first_result() {
 #[test]
 fn incomplete_sse_tail_never_turns_an_earlier_result_into_success() {
     fixture(|life, _, _| {
-        for tail in ["data: {}\n", ": unterminated", "data:", "unknown: unfinished"] {
+        for tail in [
+            "data: {}\n",
+            ": unterminated",
+            "data:",
+            "unknown: unfinished",
+        ] {
             let mut reader = reader(ModernHttpResponseKind::Sse, limits(), 32768);
             let mut idle = Idle::new(life.cx.now(), limits().idle);
-            reader.push(format!("{}{tail}", event(COMPLETE)).as_bytes(), life, &mut idle, &mut |_| true).unwrap();
-            assert!(matches!(reader.finish(life, &idle), Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)))));
+            reader
+                .push(
+                    format!("{}{tail}", event(COMPLETE)).as_bytes(),
+                    life,
+                    &mut idle,
+                    &mut |_| true,
+                )
+                .unwrap();
+            assert!(matches!(
+                reader.finish(life, &idle),
+                Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                    ManagedCoreError::InvalidResponse
+                )))
+            ));
         }
         let reader = reader(ModernHttpResponseKind::Sse, limits(), 32768);
         let idle = Idle::new(life.cx.now(), limits().idle);
-        assert!(matches!(reader.finish(life, &idle), Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::MissingTerminal)))));
+        assert!(matches!(
+            reader.finish(life, &idle),
+            Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                ManagedCoreError::MissingTerminal
+            )))
+        ));
     });
 }
 
 fn progress(token: &str, number: &str) -> String {
-    event(&format!(r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":{token},"progress":{number}}}}}"#))
+    event(&format!(
+        r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":{token},"progress":{number}}}}}"#
+    ))
 }
 
 #[test]
@@ -289,12 +376,26 @@ fn only_admitted_matching_progress_resets_idle_and_never_the_absolute_bound() {
         let mut idle = Idle::new(life.cx.now(), fixed.idle);
         let before = idle.deadline;
         clock.advance(9_000_000_000);
-        reader.push(progress("\"owned\"", "1").as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+        reader
+            .push(
+                progress("\"owned\"", "1").as_bytes(),
+                life,
+                &mut idle,
+                &mut |_| true,
+            )
+            .unwrap();
         assert_eq!(idle.deadline, before);
         clock.advance(1_000_000_000);
         assert!(matches!(
-            reader.push(progress("\"owned\"", "2").as_bytes(), life, &mut idle, &mut |_| true),
-            Err(DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::TimedOut)))
+            reader.push(
+                progress("\"owned\"", "2").as_bytes(),
+                life,
+                &mut idle,
+                &mut |_| true
+            ),
+            Err(DpopStreamError::Core(DpopCoreError::Transport(
+                DpopHttpError::TimedOut
+            )))
         ));
         assert_eq!(idle.deadline, before);
     });
@@ -303,12 +404,33 @@ fn only_admitted_matching_progress_resets_idle_and_never_the_absolute_bound() {
         let mut idle = Idle::new(life.cx.now(), limits().idle);
         let original = idle.deadline;
         clock.advance(9_000_000_000);
-        reader.push(format!(": alive\n\n{}", event(CHANGE)).as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+        reader
+            .push(
+                format!(": alive\n\n{}", event(CHANGE)).as_bytes(),
+                life,
+                &mut idle,
+                &mut |_| true,
+            )
+            .unwrap();
         assert_eq!(idle.deadline, original);
-        reader.push(progress("\"owned\"", "900719925474099312345").as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+        reader
+            .push(
+                progress("\"owned\"", "900719925474099312345").as_bytes(),
+                life,
+                &mut idle,
+                &mut |_| true,
+            )
+            .unwrap();
         assert_eq!(idle.deadline.as_nanos(), 19_000_000_000);
         clock.advance(9_000_000_000);
-        reader.push(progress("\"owned\"", "900719925474099312346").as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+        reader
+            .push(
+                progress("\"owned\"", "900719925474099312346").as_bytes(),
+                life,
+                &mut idle,
+                &mut |_| true,
+            )
+            .unwrap();
         assert_eq!(idle.deadline.as_nanos(), 28_000_000_000);
         assert_eq!(life.bounds.deadline.as_nanos(), 60_000_000_000);
         idle.progress(Time::from_nanos(59_000_000_000));
@@ -318,11 +440,27 @@ fn only_admitted_matching_progress_resets_idle_and_never_the_absolute_bound() {
         fixture(|life, _, clock| {
             let mut reader = reader(ModernHttpResponseKind::Sse, limits(), 32768);
             let mut idle = Idle::new(life.cx.now(), limits().idle);
-            reader.push(progress("\"owned\"", "1").as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+            reader
+                .push(
+                    progress("\"owned\"", "1").as_bytes(),
+                    life,
+                    &mut idle,
+                    &mut |_| true,
+                )
+                .unwrap();
             clock.advance(9_000_000_000);
             let before = idle.deadline;
-            assert!(matches!(reader.push(progress(token, value).as_bytes(), life, &mut idle, &mut |_| true),
-                Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidProgress)))));
+            assert!(matches!(
+                reader.push(
+                    progress(token, value).as_bytes(),
+                    life,
+                    &mut idle,
+                    &mut |_| true
+                ),
+                Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                    ManagedCoreError::InvalidProgress
+                )))
+            ));
             assert_eq!(idle.deadline, before);
         });
     }
@@ -341,7 +479,9 @@ fn observer_stop_panic_and_same_poll_revocation_prevent_later_callbacks() {
                 match action {
                     0 => return false,
                     1 => panic!("observer-private-canary"),
-                    2 => { life.cancellation.cancel(); }
+                    2 => {
+                        life.cancellation.cancel();
+                    }
                     3 => life.credential.revoke(),
                     _ => life.session.revoke(),
                 }
@@ -353,7 +493,10 @@ fn observer_stop_panic_and_same_poll_revocation_prevent_later_callbacks() {
             match action {
                 0 => assert!(matches!(error, DpopStreamError::ObserverStopped)),
                 1 => assert!(matches!(error, DpopStreamError::ObserverPanicked)),
-                _ => assert!(matches!(error, DpopStreamError::Core(DpopCoreError::Transport(_)))),
+                _ => assert!(matches!(
+                    error,
+                    DpopStreamError::Core(DpopCoreError::Transport(_))
+                )),
             }
         });
     }
@@ -363,30 +506,62 @@ fn observer_stop_panic_and_same_poll_revocation_prevent_later_callbacks() {
 fn wire_and_payload_budgets_are_cumulative_and_chunk_invariant() {
     fixture(|life, _, _| {
         let wire = format!("{}{}", event(CHANGE), event(COMPLETE));
-        let core = ManagedCoreLimits::new(8192, COMPLETE.len(), COMPLETE.len() + CHANGE.len(), 1, Duration::from_secs(60)).unwrap();
+        let core = ManagedCoreLimits::new(
+            8192,
+            COMPLETE.len(),
+            COMPLETE.len() + CHANGE.len(),
+            1,
+            Duration::from_secs(60),
+        )
+        .unwrap();
         let exact = DpopStreamLimits::new(core, Duration::from_secs(10)).unwrap();
         for split in 0..=wire.len() {
             let mut reader = reader(ModernHttpResponseKind::Sse, exact, wire.len() - 1);
             let mut idle = Idle::new(life.cx.now(), exact.idle);
             let mut seen = 0;
-            let mut observe = |_: &ServerNotification| { seen += 1; true };
-            let result = reader.push(&wire.as_bytes()[..split], life, &mut idle, &mut observe)
-                .and_then(|()| reader.push(&wire.as_bytes()[split..], life, &mut idle, &mut observe));
-            assert!(matches!(result, Err(DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::BodyTooLarge)))));
+            let mut observe = |_: &ServerNotification| {
+                seen += 1;
+                true
+            };
+            let result = reader
+                .push(&wire.as_bytes()[..split], life, &mut idle, &mut observe)
+                .and_then(|()| {
+                    reader.push(&wire.as_bytes()[split..], life, &mut idle, &mut observe)
+                });
+            assert!(matches!(
+                result,
+                Err(DpopStreamError::Core(DpopCoreError::Transport(
+                    DpopHttpError::BodyTooLarge
+                )))
+            ));
             assert_eq!(seen, 1);
         }
         let mut reader = reader(ModernHttpResponseKind::Sse, exact, wire.len());
         let mut idle = Idle::new(life.cx.now(), exact.idle);
-        reader.push(wire.as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+        reader
+            .push(wire.as_bytes(), life, &mut idle, &mut |_| true)
+            .unwrap();
         assert_eq!(reader.decoder.usage(), (COMPLETE.len() + CHANGE.len(), 1));
         reader.finish(life, &idle).unwrap();
         let too_small = DpopStreamLimits::new(
-            ManagedCoreLimits::new(8192, COMPLETE.len(), COMPLETE.len() + CHANGE.len() - 1, 1, Duration::from_secs(60)).unwrap(),
+            ManagedCoreLimits::new(
+                8192,
+                COMPLETE.len(),
+                COMPLETE.len() + CHANGE.len() - 1,
+                1,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
             Duration::from_secs(10),
-        ).unwrap();
+        )
+        .unwrap();
         let mut reader = self::reader(ModernHttpResponseKind::Sse, too_small, wire.len());
-        assert!(matches!(reader.push(wire.as_bytes(), life, &mut idle, &mut |_| true),
-            Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit)))));
+        assert!(matches!(
+            reader.push(wire.as_bytes(), life, &mut idle, &mut |_| true),
+            Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                ManagedCoreError::ResponseByteLimit
+            )))
+        ));
     });
 }
 
@@ -396,17 +571,25 @@ fn sse_syntax_and_json_payload_have_independent_exact_byte_limits() {
         let wire = event(COMPLETE);
         let raw_line_bytes = "data: ".len() + COMPLETE.len();
         let core = ManagedCoreLimits::new(
-            8192, COMPLETE.len(), COMPLETE.len(), 0, Duration::from_secs(60),
-        ).unwrap();
+            8192,
+            COMPLETE.len(),
+            COMPLETE.len(),
+            0,
+            Duration::from_secs(60),
+        )
+        .unwrap();
         for exact in [false, true] {
             let parser = SseLimits::with_data_lines(
                 raw_line_bytes,
                 raw_line_bytes - usize::from(!exact),
                 1,
                 1,
-            ).unwrap();
+            )
+            .unwrap();
             let limits = DpopStreamLimits::new(core, Duration::from_secs(10))
-                .unwrap().with_sse_limits(parser).unwrap();
+                .unwrap()
+                .with_sse_limits(parser)
+                .unwrap();
             let mut reader = reader(ModernHttpResponseKind::Sse, limits, wire.len());
             let mut idle = Idle::new(life.cx.now(), limits.idle);
             let outcome = reader.push(wire.as_bytes(), life, &mut idle, &mut |_| true);
@@ -415,9 +598,12 @@ fn sse_syntax_and_json_payload_have_independent_exact_byte_limits() {
                 assert_eq!(reader.decoder.usage(), (COMPLETE.len(), 0));
                 reader.finish(life, &idle).unwrap();
             } else {
-                assert!(matches!(outcome, Err(DpopStreamError::Core(
-                    DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)
-                ))));
+                assert!(matches!(
+                    outcome,
+                    Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::InvalidResponse
+                    )))
+                ));
                 assert_eq!(reader.decoder.usage(), (0, 0));
             }
         }
@@ -431,19 +617,36 @@ fn json_and_sse_preserve_complete_and_input_required_without_automatic_continuat
             for input in [false, true] {
                 let mut params = json!({"uri":"file:///sample", "_meta":FinalRequestMeta::new(ClientCapabilities::default())});
                 params["_meta"]["progressToken"] = json!("owned");
-                let request = CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params)).unwrap();
-                let decoder = CoreDecoder::for_request(request, RequestId::Number(7), limits().core).unwrap();
+                let request =
+                    CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params))
+                        .unwrap();
+                let decoder =
+                    CoreDecoder::for_request(request, RequestId::Number(7), limits().core).unwrap();
                 let mut reader = Reader::new(kind, decoder, limits(), 32768).unwrap();
                 let source = if input {
                     r#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque"}}"#
                 } else {
                     r#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"}}"#
                 };
-                let wire = if kind == ModernHttpResponseKind::Sse { event(source) } else { source.to_owned() };
+                let wire = if kind == ModernHttpResponseKind::Sse {
+                    event(source)
+                } else {
+                    source.to_owned()
+                };
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
-                reader.push(wire.as_bytes(), life, &mut idle, &mut |_| panic!("no callback expected")).unwrap();
+                reader
+                    .push(wire.as_bytes(), life, &mut idle, &mut |_| {
+                        panic!("no callback expected")
+                    })
+                    .unwrap();
                 let result = reader.finish(life, &idle).unwrap().result;
-                assert_eq!(matches!(result, CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. })), input);
+                assert_eq!(
+                    matches!(
+                        result,
+                        CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. })
+                    ),
+                    input
+                );
             }
         }
     });
@@ -452,20 +655,29 @@ fn json_and_sse_preserve_complete_and_input_required_without_automatic_continuat
 #[derive(Default)]
 struct Wakes(AtomicUsize);
 impl Wake for Wakes {
-    fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
-    fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 struct PendingBody(Arc<AtomicUsize>);
 impl Body for PendingBody {
     type Data = asupersync::bytes::BytesCursor;
     type Error = ();
-    fn poll_frame(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         Poll::Pending
     }
 }
 impl Drop for PendingBody {
-    fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[test]
@@ -476,26 +688,50 @@ fn pending_body_and_pending_eof_are_woken_and_disposed_on_all_terminal_transitio
                 let mut reader = reader(ModernHttpResponseKind::Sse, limits(), 32768);
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
                 if have_terminal {
-                    reader.push(event(COMPLETE).as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+                    reader
+                        .push(event(COMPLETE).as_bytes(), life, &mut idle, &mut |_| true)
+                        .unwrap();
                 }
                 let drops = Arc::new(AtomicUsize::new(0));
                 let wakes = Arc::new(Wakes::default());
                 let waker = Waker::from(Arc::clone(&wakes));
                 let mut observe = |_: &ServerNotification| true;
-                let mut waiting = Box::pin(consume(PendingBody(Arc::clone(&drops)), life, idle, reader, &mut observe));
-                assert!(waiting.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                let mut waiting = Box::pin(consume(
+                    PendingBody(Arc::clone(&drops)),
+                    life,
+                    idle,
+                    reader,
+                    &mut observe,
+                ));
+                assert!(
+                    waiting
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
                 assert_eq!(timer.pending_count(), 1);
                 match action {
-                    0 => { life.cancellation.cancel(); }
+                    0 => {
+                        life.cancellation.cancel();
+                    }
                     1 => life.credential.revoke(),
                     2 => life.session.revoke(),
                     3 => life.cx.set_cancel_requested(true),
-                    4 => { clock.advance(10_000_000_000); assert!(timer.process_timers() > 0); }
+                    4 => {
+                        clock.advance(10_000_000_000);
+                        assert!(timer.process_timers() > 0);
+                    }
                     _ => {}
                 }
                 if action != 5 {
-                    assert!(wakes.0.load(Ordering::SeqCst) > 0, "must wake before manual repoll");
-                    assert!(matches!(waiting.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(Err(_))));
+                    assert!(
+                        wakes.0.load(Ordering::SeqCst) > 0,
+                        "must wake before manual repoll"
+                    );
+                    assert!(matches!(
+                        waiting.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(_))
+                    ));
                 }
                 drop(waiting);
                 assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -554,10 +790,16 @@ fn large_ready_buffers_yield_without_changing_notifications_or_exact_results() {
             let wakes = Arc::new(Wakes::default());
             let waker = Waker::from(Arc::clone(&wakes));
             let seen = std::cell::Cell::new(0);
-            let mut observer = |_: &ServerNotification| { seen.set(seen.get() + 1); true };
+            let mut observer = |_: &ServerNotification| {
+                seen.set(seen.get() + 1);
+                true
+            };
             let mut reading = Box::pin(consume(
-                body, life, Idle::new(life.cx.now(), limits().idle),
-                reader(ModernHttpResponseKind::Sse, limits(), wire.len()), &mut observer,
+                body,
+                life,
+                Idle::new(life.cx.now(), limits().idle),
+                reader(ModernHttpResponseKind::Sse, limits(), wire.len()),
+                &mut observer,
             ));
             let mut result = None;
             let mut suspensions = 0;
@@ -573,11 +815,18 @@ fn large_ready_buffers_yield_without_changing_notifications_or_exact_results() {
                             assert_eq!(polls.load(Ordering::SeqCst), 1);
                         }
                     }
-                    Poll::Ready(outcome) => { result = Some(outcome.unwrap()); break; }
+                    Poll::Ready(outcome) => {
+                        result = Some(outcome.unwrap());
+                        break;
+                    }
                 }
             }
             assert_eq!(suspensions, 2, "one large frame must yield internally too");
-            let encoded = result.expect("finite ready body must complete").result.encode().unwrap();
+            let encoded = result
+                .expect("finite ready body must complete")
+                .result
+                .encode()
+                .unwrap();
             assert!(encoded.contains("900719925474099312345"));
             assert!(encoded.contains("1.20e+4"));
             assert_eq!(seen.get(), 1);
@@ -608,17 +857,29 @@ fn empty_ready_data_and_trailer_frames_cannot_evade_the_scheduling_budget() {
             frames.push_back(data_frame(terminal.as_bytes()));
             let polls = Arc::new(AtomicUsize::new(0));
             let drops = Arc::new(AtomicUsize::new(0));
-            let body = ReadyBody { frames, polls: Arc::clone(&polls), drops: Arc::clone(&drops) };
+            let body = ReadyBody {
+                frames,
+                polls: Arc::clone(&polls),
+                drops: Arc::clone(&drops),
+            };
             let wakes = Arc::new(Wakes::default());
             let waker = Waker::from(Arc::clone(&wakes));
             let mut observer = |_: &ServerNotification| panic!("terminal-only stream");
             let mut reading = Box::pin(consume(
-                body, life, Idle::new(life.cx.now(), limits().idle),
-                reader(ModernHttpResponseKind::Sse, limits(), terminal.len()), &mut observer,
+                body,
+                life,
+                Idle::new(life.cx.now(), limits().idle),
+                reader(ModernHttpResponseKind::Sse, limits(), terminal.len()),
+                &mut observer,
             ));
             for turn in 1..=2 {
                 let before = wakes.0.load(Ordering::SeqCst);
-                assert!(reading.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                assert!(
+                    reading
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
                 assert_eq!(polls.load(Ordering::SeqCst), turn * FRAMES_PER_TURN);
                 assert!(wakes.0.load(Ordering::SeqCst) > before);
             }
@@ -654,33 +915,50 @@ fn a_cooperative_yield_keeps_cancellation_authority_and_the_original_idle_deadli
             let waker = Waker::from(Arc::clone(&wakes));
             let mut observer = |_: &ServerNotification| panic!("remaining frame must be withheld");
             let mut reading = Box::pin(consume(
-                body, life, Idle::new(life.cx.now(), limits().idle),
-                reader(ModernHttpResponseKind::Sse, limits(), wire.len()), &mut observer,
+                body,
+                life,
+                Idle::new(life.cx.now(), limits().idle),
+                reader(ModernHttpResponseKind::Sse, limits(), wire.len()),
+                &mut observer,
             ));
-            assert!(reading.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            assert!(
+                reading
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
             assert!(wakes.0.load(Ordering::SeqCst) > 0);
             assert_eq!(polls.load(Ordering::SeqCst), 1);
             wakes.0.store(0, Ordering::SeqCst);
             match action {
-                0 => { life.cancellation.cancel(); }
+                0 => {
+                    life.cancellation.cancel();
+                }
                 1 => life.credential.revoke(),
                 2 => life.session.revoke(),
                 3 => life.cx.set_cancel_requested(true),
-                4 => { clock.advance(10_000_000_000); assert!(timer.process_timers() > 0); }
+                4 => {
+                    clock.advance(10_000_000_000);
+                    assert!(timer.process_timers() > 0);
+                }
                 _ => {}
             }
             if action < 5 {
                 assert!(wakes.0.load(Ordering::SeqCst) > 0);
                 let outcome = reading.as_mut().poll(&mut Context::from_waker(&waker));
                 if action == 4 {
-                    assert!(matches!(outcome, Poll::Ready(Err(DpopStreamError::Core(
-                        DpopCoreError::Transport(DpopHttpError::TimedOut)
-                    )))));
+                    assert!(matches!(
+                        outcome,
+                        Poll::Ready(Err(DpopStreamError::Core(DpopCoreError::Transport(
+                            DpopHttpError::TimedOut
+                        ))))
+                    ));
                 } else {
                     assert!(matches!(outcome, Poll::Ready(Err(_))));
                 }
             } else if action == 5 {
-                let _restriction = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                let _restriction =
+                    Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
                 assert!(matches!(
                     reading.as_mut().poll(&mut Context::from_waker(&waker)),
                     Poll::Ready(Err(DpopStreamError::Core(DpopCoreError::Transport(
@@ -722,8 +1000,11 @@ fn a_small_ready_response_finishes_without_an_unnecessary_yield() {
             let waker = Waker::from(Arc::clone(&wakes));
             let mut observer = |_: &ServerNotification| panic!("terminal-only stream");
             let mut reading = Box::pin(consume(
-                body, life, Idle::new(life.cx.now(), limits().idle),
-                reader(kind, limits(), wire.len()), &mut observer,
+                body,
+                life,
+                Idle::new(life.cx.now(), limits().idle),
+                reader(kind, limits(), wire.len()),
+                &mut observer,
             ));
             assert!(matches!(
                 reading.as_mut().poll(&mut Context::from_waker(&waker)),
@@ -742,19 +1023,30 @@ fn a_small_ready_response_finishes_without_an_unnecessary_yield() {
 fn completed_stream_reports_inherited_and_new_usage_for_json_and_sse() {
     fixture(|life, _, _| {
         for kind in [ModernHttpResponseKind::Json, ModernHttpResponseKind::Sse] {
-            let mut decoder = CoreDecoder::for_request(request(), RequestId::Number(7), limits().core).unwrap();
+            let mut decoder =
+                CoreDecoder::for_request(request(), RequestId::Number(7), limits().core).unwrap();
             decoder.resume_usage(512, 2).unwrap();
             let mut reader = Reader::new(kind, decoder, limits(), 32768).unwrap();
             let mut idle = Idle::new(life.cx.now(), limits().idle);
             let wire = if kind == ModernHttpResponseKind::Sse {
                 format!("{}{}", event(CHANGE), event(COMPLETE))
-            } else { COMPLETE.to_owned() };
+            } else {
+                COMPLETE.to_owned()
+            };
             let mut seen = 0;
-            reader.push(wire.as_bytes(), life, &mut idle, &mut |_| { seen += 1; true }).unwrap();
+            reader
+                .push(wire.as_bytes(), life, &mut idle, &mut |_| {
+                    seen += 1;
+                    true
+                })
+                .unwrap();
             let completed = reader.finish(life, &idle).unwrap();
             let notes = usize::from(kind == ModernHttpResponseKind::Sse);
             assert_eq!(seen, notes);
-            assert_eq!(completed.usage, (512 + COMPLETE.len() + notes * CHANGE.len(), 2 + notes));
+            assert_eq!(
+                completed.usage,
+                (512 + COMPLETE.len() + notes * CHANGE.len(), 2 + notes)
+            );
             assert!(completed.result.encode().unwrap().contains("1.20e+4"));
         }
     });
@@ -764,19 +1056,29 @@ fn completed_stream_reports_inherited_and_new_usage_for_json_and_sse() {
 fn resumed_json_growth_is_refused_at_the_remaining_conversation_budget() {
     fixture(|life, _, _| {
         for exact in [false, true] {
-            let core = ManagedCoreLimits::new(8192, 8192, 8192, 0, Duration::from_secs(60)).unwrap();
+            let core =
+                ManagedCoreLimits::new(8192, 8192, 8192, 0, Duration::from_secs(60)).unwrap();
             let limits = DpopStreamLimits::new(core, Duration::from_secs(10)).unwrap();
-            let mut decoder = CoreDecoder::for_request(request(), RequestId::Number(7), core).unwrap();
+            let mut decoder =
+                CoreDecoder::for_request(request(), RequestId::Number(7), core).unwrap();
             let reserved = 8192 - COMPLETE.len() + usize::from(!exact);
             decoder.resume_usage(reserved, 0).unwrap();
-            let mut reader = Reader::new(ModernHttpResponseKind::Json, decoder, limits, 32768).unwrap();
+            let mut reader =
+                Reader::new(ModernHttpResponseKind::Json, decoder, limits, 32768).unwrap();
             let mut idle = Idle::new(life.cx.now(), limits.idle);
-            let result = reader.push(COMPLETE.as_bytes(), life, &mut idle, &mut |_| panic!("JSON is terminal-only"));
+            let result = reader.push(COMPLETE.as_bytes(), life, &mut idle, &mut |_| {
+                panic!("JSON is terminal-only")
+            });
             if exact {
                 result.unwrap();
                 assert_eq!(reader.finish(life, &idle).unwrap().usage, (8192, 0));
             } else {
-                assert!(matches!(result, Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit)))));
+                assert!(matches!(
+                    result,
+                    Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::ResponseByteLimit
+                    )))
+                ));
                 assert_eq!(reader.decoder.usage(), (reserved, 0));
             }
         }

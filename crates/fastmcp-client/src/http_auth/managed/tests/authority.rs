@@ -84,17 +84,14 @@ fn managed_wait_preserves_all_explicit_and_ambient_effect_intersections() {
             let surrounding = held(&Cx::for_testing(), ambient);
             let expected = explicit & ambient;
             let polls = AtomicUsize::new(0);
-            let mut wait = Box::pin(session.await_active(
-                &caller,
-                &cancellation,
-                deadline,
-                None,
-                async {
-                    polls.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(row(&Cx::current().unwrap()), expected);
-                    Ok(42)
-                },
-            ));
+            let mut wait =
+                Box::pin(
+                    session.await_active(&caller, &cancellation, deadline, None, async {
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(row(&Cx::current().unwrap()), expected);
+                        Ok(42)
+                    }),
+                );
             let _surrounding = Cx::set_current(Some(surrounding));
             let depth = Cx::restriction_depth();
             let admission = deadline_after(&caller, Duration::from_secs(10));
@@ -104,8 +101,14 @@ fn managed_wait_preserves_all_explicit_and_ambient_effect_intersections() {
                 assert!(matches!(outcome, Poll::Ready(Ok(42))));
                 assert_eq!(polls.load(Ordering::SeqCst), 1);
             } else {
-                assert!(matches!(admission, Err(OAuthSessionError::RuntimeTimerUnavailable)));
-                assert!(matches!(outcome, Poll::Ready(Err(OAuthSessionError::RuntimeTimerUnavailable))));
+                assert!(matches!(
+                    admission,
+                    Err(OAuthSessionError::RuntimeTimerUnavailable)
+                ));
+                assert!(matches!(
+                    outcome,
+                    Poll::Ready(Err(OAuthSessionError::RuntimeTimerUnavailable))
+                ));
                 assert_eq!(polls.load(Ordering::SeqCst), 0);
             }
             assert_eq!(row(&Cx::current().unwrap()), ambient);
@@ -128,9 +131,14 @@ fn denied_acquisition_does_not_take_a_permit_or_touch_locked_grant_state() {
     for bits in [ALL & !TIME, 0, TIME] {
         let _ambient = Cx::set_current(Some(held(&Cx::for_testing(), bits)));
         let mut acquisition = Box::pin(session.credential(&cx));
-        let result = acquisition.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        let result = acquisition
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
         if bits & TIME == 0 {
-            assert!(matches!(result, Poll::Ready(Err(OAuthSessionError::RuntimeTimerUnavailable))));
+            assert!(matches!(
+                result,
+                Poll::Ready(Err(OAuthSessionError::RuntimeTimerUnavailable))
+            ));
             assert_eq!(session.inner.pending.load(Ordering::Acquire), 0);
         } else {
             // No I/O capability is needed just to await the already-owned
@@ -177,7 +185,11 @@ fn narrower_pending_scope_retires_owned_work_and_all_wait_registrations() {
     ));
     for bits in [ALL, TIME] {
         let _ambient = Cx::set_current(Some(held(&Cx::for_testing(), bits)));
-        assert!(wait.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            wait.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
     }
     assert_eq!(timer.pending_count(), 1);
     {
@@ -214,15 +226,17 @@ fn foreign_clock_and_cancellation_do_not_replace_the_managed_owner() {
         let _ambient = Cx::set_current(Some(held(&foreign, TIME)));
         let deadline = deadline_after(&cx, Duration::from_secs(10)).unwrap();
         assert_eq!(deadline.as_nanos(), 17_000_000_000);
-        let mut wait = Box::pin(session.await_active(&cx, &cancellation, deadline, None, async {
-            let active = Cx::current().unwrap();
-            assert_eq!(row(&active), TIME);
-            assert_eq!(active.now(), cx.now());
-            assert_ne!(active.now(), foreign.now());
-            assert_eq!(active.budget().deadline, cx.budget().deadline);
-            assert!(active.checkpoint().is_ok());
-            Ok(42)
-        }));
+        let mut wait = Box::pin(
+            session.await_active(&cx, &cancellation, deadline, None, async {
+                let active = Cx::current().unwrap();
+                assert_eq!(row(&active), TIME);
+                assert_eq!(active.now(), cx.now());
+                assert_ne!(active.now(), foreign.now());
+                assert_eq!(active.budget().deadline, cx.budget().deadline);
+                assert!(active.checkpoint().is_ok());
+                Ok(42)
+            }),
+        );
         assert!(matches!(
             wait.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Ok(42))
@@ -275,32 +289,56 @@ fn public_json_and_sse_reads_release_custody_when_time_authority_is_denied() {
     for sse in [false, true] {
         run(async {
             let cx = Cx::current().unwrap();
-            let listener = asupersync::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = asupersync::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
             let session = response_custody_session();
             let cancellation = McpRequestCancellation::new();
             let application = async {
                 let response = open_response(
-                    &cx, &listener, &session, &cancellation, Duration::from_secs(30),
-                ).await;
+                    &cx,
+                    &listener,
+                    &session,
+                    &cancellation,
+                    Duration::from_secs(30),
+                )
+                .await;
                 if sse {
-                    let mut stream = response.into_sse_stream(SseLimits::new(4096, 65536, 8).unwrap()).unwrap();
-                    assert_eq!(stream.next_event(&cx).await.unwrap(), Some("first".to_owned()));
+                    let mut stream = response
+                        .into_sse_stream(SseLimits::new(4096, 65536, 8).unwrap())
+                        .unwrap();
+                    assert_eq!(
+                        stream.next_event(&cx).await.unwrap(),
+                        Some("first".to_owned())
+                    );
                     let mut read = Box::pin(stream.next_event(&cx));
                     let result = poll_fn(|task| {
                         let _restriction = Cx::push_restriction(mask(ALL & !TIME));
                         read.as_mut().poll(task)
-                    }).await;
-                    assert!(matches!(result, Err(OAuthSessionError::RuntimeTimerUnavailable)));
+                    })
+                    .await;
+                    assert!(matches!(
+                        result,
+                        Err(OAuthSessionError::RuntimeTimerUnavailable)
+                    ));
                     drop(read);
-                    assert!(matches!(stream.next_event(&cx).await,
-                        Err(OAuthSessionError::Http(ModernHttpExecutorError::SseStreamClosed))));
+                    assert!(matches!(
+                        stream.next_event(&cx).await,
+                        Err(OAuthSessionError::Http(
+                            ModernHttpExecutorError::SseStreamClosed
+                        ))
+                    ));
                 } else {
                     let mut read = Box::pin(response.read_to_end(&cx, 4096));
                     let result = poll_fn(|task| {
                         let _restriction = Cx::push_restriction(mask(ALL & !TIME));
                         read.as_mut().poll(task)
-                    }).await;
-                    assert!(matches!(result, Err(OAuthSessionError::RuntimeTimerUnavailable)));
+                    })
+                    .await;
+                    assert!(matches!(
+                        result,
+                        Err(OAuthSessionError::RuntimeTimerUnavailable)
+                    ));
                 }
                 assert!(!session.inner.closed.is_cancel_requested());
                 assert!(!cancellation.is_cancel_requested());

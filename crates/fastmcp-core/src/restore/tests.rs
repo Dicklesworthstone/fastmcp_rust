@@ -204,7 +204,9 @@ impl Authority {
             }
             RestoreAuthorityOperation::ListUnresolvedWrites { .. }
             | RestoreAuthorityOperation::ReconcileWrite { .. } => {
-                return Err(RestoreAuthorityFailure { dispatch: RestoreDispatch::NotDispatched });
+                return Err(RestoreAuthorityFailure {
+                    dispatch: RestoreDispatch::NotDispatched,
+                });
             }
         };
         Ok(RestoreAuthorityResponse::for_request(request, outcome))

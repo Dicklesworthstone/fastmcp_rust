@@ -154,7 +154,8 @@ impl SseAuthorizationLease {
             .map_err(|_| SseAuthorizationError::Rejected)?;
         let started = Instant::now();
         let next_check = fresh_until(cx, cx.now(), config.interval)?;
-        let wall_expiry = verification_expiry(started, config.interval, receipt.authenticated.as_ref())?;
+        let wall_expiry =
+            verification_expiry(started, config.interval, receipt.authenticated.as_ref())?;
         Ok(Self {
             server,
             request: request.clone(),
@@ -262,9 +263,9 @@ impl SseAuthorizationLease {
     async fn revalidate_async(&mut self, cx: &Cx) -> Result<(), SseAuthorizationError> {
         let check = self.begin_check(cx)?;
         let mut budget = cx.budget().meet(self.server.create_request_budget(cx));
-        budget.deadline = Some(budget.deadline.map_or(
-            check.provider_deadline, |deadline| deadline.min(check.provider_deadline),
-        ));
+        budget.deadline = Some(budget.deadline.map_or(check.provider_deadline, |deadline| {
+            deadline.min(check.provider_deadline)
+        }));
         if budget.is_past_deadline(cx.now()) {
             return Err(SseAuthorizationError::TimedOut);
         }
@@ -272,7 +273,8 @@ impl SseAuthorizationLease {
             return Err(SseAuthorizationError::Cancelled);
         }
         let (context, _lease) = McpContext::new(
-            cx.clone(), crate::request_id_to_u64(self.request.id.as_ref()),
+            cx.clone(),
+            crate::request_id_to_u64(self.request.id.as_ref()),
         )
         .with_budget_ceiling(budget)
         .begin_request_scope()
@@ -283,36 +285,50 @@ impl SseAuthorizationLease {
             crate::request_id_to_u64(self.request.id.as_ref()),
         );
         let facts = {
-            let mut verification = std::pin::pin!(self.server
-                .authenticate_request_without_commit_async(&context, auth_request));
+            let mut verification = std::pin::pin!(
+                self.server
+                    .authenticate_request_without_commit_async(&context, auth_request)
+            );
             let mut timeout = std::pin::pin!(asupersync::time::Sleep::new(check.provider_deadline));
             poll_fn(|task| {
                 let ceiling = crate::auth::ambient_auth_capability_ceiling();
                 let _current = Cx::set_current(Some(cx.clone()));
                 let _restriction = Cx::push_restriction(ceiling);
                 check_context(cx)?;
-                admit_verdict_time(cx.now(), check.provider_deadline,
-                    check.started.elapsed(), self.config.check_timeout)?;
+                admit_verdict_time(
+                    cx.now(),
+                    check.provider_deadline,
+                    check.started.elapsed(),
+                    self.config.check_timeout,
+                )?;
                 // Only an already-elected terminal drain can pass check_context
                 // with runtime cancellation requested. Mirror that permission
                 // into the framework context for each poll, never across await.
                 let result = if cx.is_cancel_requested() {
-                    context.masked(|| verification.as_mut().poll(task))
+                    context
+                        .masked(|| verification.as_mut().poll(task))
                         .map_err(|_| SseAuthorizationError::Cancelled)?
                 } else {
                     verification.as_mut().poll(task)
                 };
                 check_context(cx)?;
-                admit_verdict_time(cx.now(), check.provider_deadline,
-                    check.started.elapsed(), self.config.check_timeout)?;
+                admit_verdict_time(
+                    cx.now(),
+                    check.provider_deadline,
+                    check.started.elapsed(),
+                    self.config.check_timeout,
+                )?;
                 if result.is_pending()
-                    && (Cx::current().and_then(|active| active.timer_driver()).is_none()
+                    && (Cx::current()
+                        .and_then(|active| active.timer_driver())
+                        .is_none()
                         || timeout.as_mut().poll(task).is_ready())
                 {
                     return Poll::Ready(Err(SseAuthorizationError::TimedOut));
                 }
                 result.map(|result| result.map_err(|_| SseAuthorizationError::Rejected))
-            }).await
+            })
+            .await
         };
         self.finish_check(cx, check, facts)
     }
@@ -339,7 +355,8 @@ impl SseAuthorizationLease {
         self.scopes
             .authorize_request_verified(&self.request, facts.as_ref())
             .map_err(|_| SseAuthorizationError::Rejected)?;
-        self.wall_expiry = verification_expiry(check.started, self.config.interval, facts.as_ref())?;
+        self.wall_expiry =
+            verification_expiry(check.started, self.config.interval, facts.as_ref())?;
         self.next_check = check.next_check;
         self.facts = facts;
         Ok(())
@@ -400,8 +417,11 @@ fn verification_expiry(
     interval: Duration,
     facts: Option<&AuthContext>,
 ) -> Result<Instant, SseAuthorizationError> {
-    let interval_end = started.checked_add(interval).ok_or(SseAuthorizationError::InvalidPolicy)?;
-    let deadline = facts.and_then(AuthContext::verification_valid_until)
+    let interval_end = started
+        .checked_add(interval)
+        .ok_or(SseAuthorizationError::InvalidPolicy)?;
+    let deadline = facts
+        .and_then(AuthContext::verification_valid_until)
         .map_or(interval_end, |deadline| deadline.min(interval_end));
     if Instant::now() >= deadline {
         return Err(SseAuthorizationError::Rejected);
@@ -596,7 +616,10 @@ mod tests {
     }
     impl Future for AsyncVerification<'_> {
         type Output = McpResult<AuthContext>;
-        fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
             self.provider.polls.fetch_add(1, Ordering::SeqCst);
             if self.provider.pending.load(Ordering::SeqCst) {
                 Poll::Pending
@@ -614,27 +637,41 @@ mod tests {
         fn authenticate(&self, _: &McpContext, _: AuthRequest<'_>) -> McpResult<AuthContext> {
             panic!("asynchronous SSE provider must never use synchronous authentication")
         }
-        fn authenticate_async<'a>(&'a self, context: &'a McpContext, request: AuthRequest<'a>)
-            -> crate::AuthFuture<'a>
-        {
+        fn authenticate_async<'a>(
+            &'a self,
+            context: &'a McpContext,
+            request: AuthRequest<'a>,
+        ) -> crate::AuthFuture<'a> {
             self.created.fetch_add(1, Ordering::SeqCst);
-            Box::pin(AsyncVerification { provider: self, context, request })
+            Box::pin(AsyncVerification {
+                provider: self,
+                context,
+                request,
+            })
         }
     }
 
     fn async_fixture(cx: &Cx) -> (AsyncProvider, SseAuthorizationLease) {
         let (inner, old) = fixture_on(cx, SseRevalidationPolicy::default());
         let provider = AsyncProvider {
-            inner, pending: Arc::new(AtomicBool::new(false)),
-            created: Arc::new(AtomicUsize::new(0)), polls: Arc::new(AtomicUsize::new(0)),
+            inner,
+            pending: Arc::new(AtomicBool::new(false)),
+            created: Arc::new(AtomicUsize::new(0)),
+            polls: Arc::new(AtomicUsize::new(0)),
             dropped: Arc::new(AtomicUsize::new(0)),
         };
-        let server = Arc::new(Server::new("async-lease", "1")
-            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
-            .auth_provider(provider.clone()).build());
+        let server = Arc::new(
+            Server::new("async-lease", "1")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
+                .auth_provider(provider.clone())
+                .build(),
+        );
         let receipt = {
             let mut admission = Box::pin(server.preauthenticate_http_request_async(
-                cx, &old.request, &old.authorization,
+                cx,
+                &old.request,
+                &old.authorization,
             ));
             let mut task = std::task::Context::from_waker(std::task::Waker::noop());
             let Poll::Ready(Ok(receipt)) = admission.as_mut().poll(&mut task) else {
@@ -642,8 +679,16 @@ mod tests {
             };
             receipt
         };
-        let lease = SseAuthorizationLease::new(cx, server, &old.request, &old.authorization,
-            &receipt, old.scopes.clone(), old.config).unwrap();
+        let lease = SseAuthorizationLease::new(
+            cx,
+            server,
+            &old.request,
+            &old.authorization,
+            &receipt,
+            old.scopes.clone(),
+            old.config,
+        )
+        .unwrap();
         (provider, lease)
     }
 
@@ -656,7 +701,9 @@ mod tests {
             due(&mut lease, &cx);
             let mut check = Box::pin(lease.check_async(&cx));
             let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-            for _ in 0..3 { assert!(check.as_mut().poll(&mut task).is_pending()); }
+            for _ in 0..3 {
+                assert!(check.as_mut().poll(&mut task).is_pending());
+            }
             assert_eq!(provider.created.load(Ordering::SeqCst), 2);
             assert_eq!(provider.dropped.load(Ordering::SeqCst), 1);
             provider.pending.store(false, Ordering::SeqCst);
@@ -700,7 +747,9 @@ mod tests {
                 .blocking_threads(0, 0)
                 .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
                     Arc::clone(&clock),
-                )).build().unwrap();
+                ))
+                .build()
+                .unwrap();
             let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
             let (provider, mut lease) = async_fixture(&cx);
             provider.pending.store(true, Ordering::SeqCst);
@@ -708,11 +757,19 @@ mod tests {
             let mut check = Box::pin(lease.check_async(&cx));
             let mut task = std::task::Context::from_waker(std::task::Waker::noop());
             assert!(check.as_mut().poll(&mut task).is_pending());
-            if cancel { cx.set_cancel_requested(true); }
-            else { clock.advance_to(Time::from_secs(1)); }
-            assert_eq!(check.as_mut().poll(&mut task), Poll::Ready(Err(if cancel {
-                SseAuthorizationError::Cancelled
-            } else { SseAuthorizationError::TimedOut })));
+            if cancel {
+                cx.set_cancel_requested(true);
+            } else {
+                clock.advance_to(Time::from_secs(1));
+            }
+            assert_eq!(
+                check.as_mut().poll(&mut task),
+                Poll::Ready(Err(if cancel {
+                    SseAuthorizationError::Cancelled
+                } else {
+                    SseAuthorizationError::TimedOut
+                }))
+            );
             drop(check);
             assert!(lease.closed);
             assert!(lease.facts.is_none());
@@ -731,16 +788,24 @@ mod tests {
             cx.set_cancel_requested(true);
             let mut check = Box::pin(lease.check_async(&cx));
             let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-            assert_eq!(cx.masked(|| check.as_mut().poll(&mut task)), Poll::Ready(Ok(())));
+            assert_eq!(
+                cx.masked(|| check.as_mut().poll(&mut task)),
+                Poll::Ready(Ok(()))
+            );
             drop(check);
             assert!(!lease.closed);
             assert_eq!(provider.created.load(Ordering::SeqCst), 2);
             assert!(cx.is_cancel_requested());
             // A drain cannot manufacture a new ordinary ingress receipt.
             let mut opening = Box::pin(lease.server.preauthenticate_http_request_async(
-                &cx, &lease.request, &lease.authorization,
+                &cx,
+                &lease.request,
+                &lease.authorization,
             ));
-            assert!(matches!(cx.masked(|| opening.as_mut().poll(&mut task)), Poll::Ready(Err(_))));
+            assert!(matches!(
+                cx.masked(|| opening.as_mut().poll(&mut task)),
+                Poll::Ready(Err(_))
+            ));
             assert_eq!(provider.created.load(Ordering::SeqCst), 2);
         });
     }
@@ -751,7 +816,12 @@ mod tests {
             let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
             let (provider, mut lease) = async_fixture(&cx);
             let deadline = Instant::now() + Duration::from_secs(2);
-            let facts = provider.inner.facts.lock().unwrap().clone()
+            let facts = provider
+                .inner
+                .facts
+                .lock()
+                .unwrap()
+                .clone()
                 .with_verification_valid_until(deadline);
             *provider.inner.facts.lock().unwrap() = facts;
             due(&mut lease, &cx);
@@ -760,26 +830,49 @@ mod tests {
             assert_eq!(refresh.as_mut().poll(&mut task), Poll::Ready(Ok(())));
             drop(refresh);
             assert_eq!(lease.wall_expiry, deadline);
-            assert_eq!(lease.facts.as_ref().unwrap().verification_valid_until(), Some(deadline));
+            assert_eq!(
+                lease.facts.as_ref().unwrap().verification_valid_until(),
+                Some(deadline)
+            );
             let receipt = {
                 let mut opening = Box::pin(lease.server.preauthenticate_http_request_async(
-                    &cx, &lease.request, &lease.authorization,
+                    &cx,
+                    &lease.request,
+                    &lease.authorization,
                 ));
                 let Poll::Ready(Ok(receipt)) = opening.as_mut().poll(&mut task) else {
                     panic!("bounded opening receipt")
                 };
                 receipt
             };
-            let opened = SseAuthorizationLease::new(&cx, Arc::clone(&lease.server), &lease.request,
-                &lease.authorization, &receipt, lease.scopes.clone(), lease.config).unwrap();
+            let opened = SseAuthorizationLease::new(
+                &cx,
+                Arc::clone(&lease.server),
+                &lease.request,
+                &lease.authorization,
+                &receipt,
+                lease.scopes.clone(),
+                lease.config,
+            )
+            .unwrap();
             assert_eq!(opened.wall_expiry, deadline);
             let expired = Instant::now();
             let mut expired_receipt = receipt;
-            expired_receipt.authenticated = expired_receipt.authenticated
+            expired_receipt.authenticated = expired_receipt
+                .authenticated
                 .map(|facts| facts.with_verification_valid_until(expired));
-            assert!(matches!(SseAuthorizationLease::new(&cx, Arc::clone(&lease.server),
-                &lease.request, &lease.authorization, &expired_receipt, lease.scopes.clone(), lease.config),
-                Err(SseAuthorizationError::Rejected)));
+            assert!(matches!(
+                SseAuthorizationLease::new(
+                    &cx,
+                    Arc::clone(&lease.server),
+                    &lease.request,
+                    &lease.authorization,
+                    &expired_receipt,
+                    lease.scopes.clone(),
+                    lease.config
+                ),
+                Err(SseAuthorizationError::Rejected)
+            ));
         });
     }
 
@@ -792,10 +885,19 @@ mod tests {
             provider.pending.store(true, Ordering::SeqCst);
             let polls = std::cell::Cell::new(0);
             let mut authorization = Some(lease);
-            let operation = poll_fn(|_| { polls.set(polls.get() + 1); Poll::Ready(17) });
-            let mut guarded = Box::pin(super::super::guard_response(&cx, &mut authorization, operation));
+            let operation = poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                Poll::Ready(17)
+            });
+            let mut guarded = Box::pin(super::super::guard_response(
+                &cx,
+                &mut authorization,
+                operation,
+            ));
             let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-            for _ in 0..3 { assert!(guarded.as_mut().poll(&mut task).is_pending()); }
+            for _ in 0..3 {
+                assert!(guarded.as_mut().poll(&mut task).is_pending());
+            }
             assert_eq!(polls.get(), 0);
             assert_eq!(provider.created.load(Ordering::SeqCst), 2);
             provider.pending.store(false, Ordering::SeqCst);
@@ -813,12 +915,22 @@ mod tests {
             provider.inner.facts.lock().unwrap().scopes.clear();
             let polls = std::cell::Cell::new(0);
             let mut authorization = Some(lease);
-            let operation = poll_fn(|_| { polls.set(polls.get() + 1); Poll::Ready(17) });
-            let mut guarded = Box::pin(super::super::guard_response(&cx, &mut authorization, operation));
+            let operation = poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                Poll::Ready(17)
+            });
+            let mut guarded = Box::pin(super::super::guard_response(
+                &cx,
+                &mut authorization,
+                operation,
+            ));
             let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-            assert_eq!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(
-                super::super::SecuredHttpEndpointError::Revalidation(SseAuthorizationError::FactsChanged),
-            )));
+            assert_eq!(
+                guarded.as_mut().poll(&mut task),
+                Poll::Ready(Err(super::super::SecuredHttpEndpointError::Revalidation(
+                    SseAuthorizationError::FactsChanged
+                ),))
+            );
             assert_eq!(polls.get(), 0);
             assert_eq!(provider.dropped.load(Ordering::SeqCst), 2);
         });

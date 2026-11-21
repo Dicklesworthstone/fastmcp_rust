@@ -716,10 +716,7 @@ fn prt_02_b_positive() {
             "traceparent".to_owned(),
             json!("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
         ),
-        (
-            "tracestate".to_owned(),
-            json!(state_n_plus_one),
-        ),
+        ("tracestate".to_owned(), json!(state_n_plus_one)),
     ])
     .expect("invalid optional telemetry cannot reject application metadata");
     assert!(trace_n_plus_one.trace_context().traceparent().is_some());

@@ -9,7 +9,10 @@
 
 use std::fmt;
 use std::future::{Future, poll_fn};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -17,12 +20,12 @@ use asupersync::Cx;
 use asupersync::channel::oneshot;
 use asupersync::time::Sleep;
 use asupersync::types::Time;
-use fastmcp_core::{CanonicalHttpUrl, Sha256Digest};
 use fastmcp_core::runtime::CallerContextFuture;
+use fastmcp_core::{CanonicalHttpUrl, Sha256Digest};
 use fastmcp_protocol::jose::MAX_JWKS_BYTES;
 use fastmcp_transport::{
-    GuardedHttpFetchError, GuardedHttpFetchPolicy, GuardedHttpFetchResponse,
-    GuardedHttpFetcher, GuardedHttpPeerProvenance, GuardedHttpsUrl,
+    GuardedHttpFetchError, GuardedHttpFetchPolicy, GuardedHttpFetchResponse, GuardedHttpFetcher,
+    GuardedHttpPeerProvenance, GuardedHttpsUrl,
 };
 
 use super::policy::EnterpriseProfile;
@@ -52,7 +55,9 @@ impl fmt::Display for EnterpriseKeyFetchError {
             Self::InvalidProfile => "invalid enterprise verification-key profile",
             Self::InvalidEndpoint => "invalid enterprise verification-key endpoint",
             Self::InvalidFetchPolicy => "invalid enterprise verification-key fetch policy",
-            Self::RuntimeUnavailable => "enterprise key acquisition requires caller I/O, time, spawn and timer authority",
+            Self::RuntimeUnavailable => {
+                "enterprise key acquisition requires caller I/O, time, spawn and timer authority"
+            }
             Self::FetchInProgress => "enterprise key acquisition is already in progress",
             Self::Cancelled => "enterprise key acquisition was cancelled",
             Self::TimedOut => "enterprise key acquisition exceeded its deadline",
@@ -78,18 +83,28 @@ pub struct EnterpriseJwksObservation {
 
 impl EnterpriseJwksObservation {
     #[must_use]
-    pub fn endpoint(&self) -> &str { &self.endpoint }
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
     #[must_use]
-    pub const fn key_generation(&self) -> u64 { self.key_generation }
+    pub const fn key_generation(&self) -> u64 {
+        self.key_generation
+    }
     #[must_use]
-    pub const fn document_digest(&self) -> Sha256Digest { self.document_digest }
+    pub const fn document_digest(&self) -> Sha256Digest {
+        self.document_digest
+    }
     #[must_use]
-    pub fn provenance(&self) -> &GuardedHttpPeerProvenance { &self.provenance }
+    pub fn provenance(&self) -> &GuardedHttpPeerProvenance {
+        &self.provenance
+    }
 }
 
 impl fmt::Debug for EnterpriseJwksObservation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("EnterpriseJwksObservation").finish_non_exhaustive()
+        formatter
+            .debug_struct("EnterpriseJwksObservation")
+            .finish_non_exhaustive()
     }
 }
 
@@ -111,24 +126,40 @@ pub struct EnterpriseVerificationKeySet {
 
 impl EnterpriseVerificationKeySet {
     #[must_use]
-    pub fn profile(&self) -> &EnterpriseProfile { &self.profile }
+    pub fn profile(&self) -> &EnterpriseProfile {
+        &self.profile
+    }
     #[must_use]
-    pub fn oidc(&self) -> &OidcVerificationKeys { &self.oidc }
+    pub fn oidc(&self) -> &OidcVerificationKeys {
+        &self.oidc
+    }
     #[must_use]
-    pub fn id_jag(&self) -> &IdJagVerificationKeys { &self.id_jag }
+    pub fn id_jag(&self) -> &IdJagVerificationKeys {
+        &self.id_jag
+    }
     #[must_use]
-    pub fn oidc_observation(&self) -> &EnterpriseJwksObservation { &self.oidc_observation }
+    pub fn oidc_observation(&self) -> &EnterpriseJwksObservation {
+        &self.oidc_observation
+    }
     #[must_use]
-    pub fn id_jag_observation(&self) -> &EnterpriseJwksObservation { &self.id_jag_observation }
+    pub fn id_jag_observation(&self) -> &EnterpriseJwksObservation {
+        &self.id_jag_observation
+    }
     #[must_use]
-    pub fn fetch_policy(&self) -> &GuardedHttpFetchPolicy { &self.fetch_policy }
+    pub fn fetch_policy(&self) -> &GuardedHttpFetchPolicy {
+        &self.fetch_policy
+    }
     #[must_use]
-    pub const fn fetch_policy_generation(&self) -> u64 { self.fetch_policy_generation }
+    pub const fn fetch_policy_generation(&self) -> u64 {
+        self.fetch_policy_generation
+    }
 }
 
 impl fmt::Debug for EnterpriseVerificationKeySet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("EnterpriseVerificationKeySet").finish_non_exhaustive()
+        formatter
+            .debug_struct("EnterpriseVerificationKeySet")
+            .finish_non_exhaustive()
     }
 }
 
@@ -178,13 +209,18 @@ impl EnterpriseKeySource {
         }
         let oidc_url = endpoint(profile.oidc_jwks_uri())?;
         let id_jag_url = endpoint(profile.id_jag_jwks_uri())?;
-        Ok(Self { inner: Arc::new(KeySource {
-            profile, oidc_url, id_jag_url, fetcher,
-            policy_generation: fetch_policy_generation,
-            busy: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            test_exchange: None,
-        }) })
+        Ok(Self {
+            inner: Arc::new(KeySource {
+                profile,
+                oidc_url,
+                id_jag_url,
+                fetcher,
+                policy_generation: fetch_policy_generation,
+                busy: Arc::new(AtomicBool::new(false)),
+                #[cfg(test)]
+                test_exchange: None,
+            }),
+        })
     }
 
     /// Fetches both exact configured endpoints under the supplied caller.
@@ -195,7 +231,10 @@ impl EnterpriseKeySource {
     /// are fetched separately for their independently configured purposes.
     /// Capacity remains charged until all guarded phase children have dropped,
     /// including when this future is cancelled or abandoned.
-    pub async fn fetch(&self, cx: &Cx) -> Result<EnterpriseVerificationKeySet, EnterpriseKeyFetchError> {
+    pub async fn fetch(
+        &self,
+        cx: &Cx,
+    ) -> Result<EnterpriseVerificationKeySet, EnterpriseKeyFetchError> {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_caller)?;
         let permit = Arc::new(FetchPermit::acquire(Arc::clone(&self.inner.busy))?);
         CallerContextFuture::new(&admitted, async {
@@ -204,37 +243,56 @@ impl EnterpriseKeySource {
             let nanos = u64::try_from(timeout.as_nanos())
                 .map_err(|_| EnterpriseKeyFetchError::InvalidFetchPolicy)?;
             let deadline = admitted.now().saturating_add_nanos(nanos);
-            let deadline = admitted.budget().deadline.map_or(deadline, |limit| limit.min(deadline));
+            let deadline = admitted
+                .budget()
+                .deadline
+                .map_or(deadline, |limit| limit.min(deadline));
             let mut timer = std::pin::pin!(Sleep::new(deadline));
             let (_sender, mut receiver) = oneshot::channel::<()>();
             let mut cancelled = std::pin::pin!(receiver.recv(&admitted));
             let mut pair = std::pin::pin!(async {
                 let profile = &self.inner.profile;
-                let response = self.exchange(&admitted, &self.inner.oidc_url, permit.clone()).await?;
+                let response = self
+                    .exchange(&admitted, &self.inner.oidc_url, permit.clone())
+                    .await?;
                 checkpoint(&admitted, deadline, started, timeout)?;
                 admit_response(&response, &self.inner.oidc_url, &self.inner.fetcher)?;
                 let oidc = OidcVerificationKeys::from_trusted_jwks(
-                    profile.idp_issuer(), profile.oidc_key_generation(), &response.body,
-                ).map_err(|_| EnterpriseKeyFetchError::InvalidKeys)?;
+                    profile.idp_issuer(),
+                    profile.oidc_key_generation(),
+                    &response.body,
+                )
+                .map_err(|_| EnterpriseKeyFetchError::InvalidKeys)?;
                 let oidc_observation = EnterpriseJwksObservation {
                     endpoint: profile.oidc_jwks_uri().to_owned(),
-                    key_generation: oidc.generation(), document_digest: oidc.document_digest(),
+                    key_generation: oidc.generation(),
+                    document_digest: oidc.document_digest(),
                     provenance: response.provenance,
                 };
                 checkpoint(&admitted, deadline, started, timeout)?;
-                let response = self.exchange(&admitted, &self.inner.id_jag_url, permit.clone()).await?;
+                let response = self
+                    .exchange(&admitted, &self.inner.id_jag_url, permit.clone())
+                    .await?;
                 checkpoint(&admitted, deadline, started, timeout)?;
                 admit_response(&response, &self.inner.id_jag_url, &self.inner.fetcher)?;
                 let id_jag = IdJagVerificationKeys::from_trusted_jwks(
-                    profile.idp_issuer(), profile.id_jag_key_generation(), &response.body,
-                ).map_err(|_| EnterpriseKeyFetchError::InvalidKeys)?;
+                    profile.idp_issuer(),
+                    profile.id_jag_key_generation(),
+                    &response.body,
+                )
+                .map_err(|_| EnterpriseKeyFetchError::InvalidKeys)?;
                 let id_jag_observation = EnterpriseJwksObservation {
                     endpoint: profile.id_jag_jwks_uri().to_owned(),
-                    key_generation: id_jag.generation(), document_digest: id_jag.document_digest(),
+                    key_generation: id_jag.generation(),
+                    document_digest: id_jag.document_digest(),
                     provenance: response.provenance,
                 };
                 Ok(EnterpriseVerificationKeySet {
-                    profile: profile.clone(), oidc, id_jag, oidc_observation, id_jag_observation,
+                    profile: profile.clone(),
+                    oidc,
+                    id_jag,
+                    oidc_observation,
+                    id_jag_observation,
                     fetch_policy: self.inner.fetcher.policy().clone(),
                     fetch_policy_generation: self.inner.policy_generation,
                 })
@@ -251,8 +309,10 @@ impl EnterpriseKeySource {
                 let result = pair.as_mut().poll(task);
                 checkpoint(&admitted, deadline, started, timeout)?;
                 result
-            }).await
-        }).await
+            })
+            .await
+        })
+        .await
     }
 
     async fn exchange(
@@ -266,13 +326,16 @@ impl EnterpriseKeySource {
             return exchange.get(cx, url, lifetime).await.map_err(fetch_error);
         }
         Box::pin(self.inner.fetcher.fetch_with_lifetime(cx, url, lifetime))
-            .await.map_err(fetch_error)
+            .await
+            .map_err(fetch_error)
     }
 }
 
 impl fmt::Debug for EnterpriseKeySource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("EnterpriseKeySource").finish_non_exhaustive()
+        formatter
+            .debug_struct("EnterpriseKeySource")
+            .finish_non_exhaustive()
     }
 }
 
@@ -285,14 +348,19 @@ impl FetchPermit {
     }
 }
 impl Drop for FetchPermit {
-    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 fn endpoint(value: &str) -> Result<GuardedHttpsUrl, EnterpriseKeyFetchError> {
-    let parsed = CanonicalHttpUrl::parse(value)
-        .map_err(|_| EnterpriseKeyFetchError::InvalidEndpoint)?;
-    if parsed.scheme() != "https" || parsed.as_str() != value
-        || parsed.has_syntax_violation() || parsed.has_userinfo() || parsed.fragment().is_some()
+    let parsed =
+        CanonicalHttpUrl::parse(value).map_err(|_| EnterpriseKeyFetchError::InvalidEndpoint)?;
+    if parsed.scheme() != "https"
+        || parsed.as_str() != value
+        || parsed.has_syntax_violation()
+        || parsed.has_userinfo()
+        || parsed.fragment().is_some()
     {
         return Err(EnterpriseKeyFetchError::InvalidEndpoint);
     }
@@ -301,12 +369,18 @@ fn endpoint(value: &str) -> Result<GuardedHttpsUrl, EnterpriseKeyFetchError> {
 
 fn admit_caller() -> Result<Cx, EnterpriseKeyFetchError> {
     let current = Cx::current().ok_or(EnterpriseKeyFetchError::RuntimeUnavailable)?;
-    if current.checkpoint().is_err() { return Err(EnterpriseKeyFetchError::Cancelled); }
+    if current.checkpoint().is_err() {
+        return Err(EnterpriseKeyFetchError::Cancelled);
+    }
     let caps = current.capabilities();
     if !caps.io || !caps.time || !caps.spawn || current.timer_driver().is_none() {
         return Err(EnterpriseKeyFetchError::RuntimeUnavailable);
     }
-    if current.budget().deadline.is_some_and(|limit| current.now() >= limit) {
+    if current
+        .budget()
+        .deadline
+        .is_some_and(|limit| current.now() >= limit)
+    {
         return Err(EnterpriseKeyFetchError::TimedOut);
     }
     Ok(current)
@@ -343,7 +417,9 @@ fn admit_response(
     url: &GuardedHttpsUrl,
     fetcher: &GuardedHttpFetcher,
 ) -> Result<(), EnterpriseKeyFetchError> {
-    if response.status != 200 || response.redirect.is_some() || response.body.is_empty()
+    if response.status != 200
+        || response.redirect.is_some()
+        || response.body.is_empty()
         || response.body.len() > fetcher.policy().response_body_bytes()
         || response.body.len() > MAX_JWKS_BYTES
     {
@@ -351,11 +427,14 @@ fn admit_response(
     }
     admit_headers(&response.headers)?;
     let peer = &response.provenance;
-    if peer.host != url.host() || peer.selected_address.port() != url.port()
+    if peer.host != url.host()
+        || peer.selected_address.port() != url.port()
         || peer.root_policy_revision != fetcher.root_identity()
         || peer.alpn.as_deref().is_some_and(|alpn| alpn != b"http/1.1")
         || peer.tls_protocol.as_deref().is_some_and(|protocol| {
-            protocol.is_empty() || protocol.len() > 64 || !protocol.is_ascii()
+            protocol.is_empty()
+                || protocol.len() > 64
+                || !protocol.is_ascii()
                 || protocol.chars().any(char::is_control)
         })
     {
@@ -366,31 +445,65 @@ fn admit_response(
 
 fn admit_headers(headers: &[(String, String)]) -> Result<(), EnterpriseKeyFetchError> {
     let invalid = EnterpriseKeyFetchError::InvalidResponse;
-    if headers.len() > 64 { return Err(invalid); }
+    if headers.len() > 64 {
+        return Err(invalid);
+    }
     let mut bytes = 0usize;
     let mut content_type = None;
     let mut content_encoding = false;
     for (name, value) in headers {
-        bytes = bytes.checked_add(name.len()).and_then(|sum| sum.checked_add(value.len()))
-            .and_then(|sum| sum.checked_add(4)).ok_or(invalid)?;
-        if bytes > 16 * 1024 || name.is_empty()
-            || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte,
-                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-'
-                | b'.' | b'^' | b'_' | 0x60 | b'|' | b'~'))
-            || value.bytes().any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+        bytes = bytes
+            .checked_add(name.len())
+            .and_then(|sum| sum.checked_add(value.len()))
+            .and_then(|sum| sum.checked_add(4))
+            .ok_or(invalid)?;
+        if bytes > 16 * 1024
+            || name.is_empty()
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | 0x60
+                            | b'|'
+                            | b'~'
+                    )
+            })
+            || value
+                .bytes()
+                .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
         {
             return Err(invalid);
         }
         if name.eq_ignore_ascii_case("content-type") {
-            if content_type.replace(value.as_str()).is_some() { return Err(invalid); }
+            if content_type.replace(value.as_str()).is_some() {
+                return Err(invalid);
+            }
         } else if name.eq_ignore_ascii_case("content-encoding") {
-            if content_encoding || !value.trim_matches([' ', '\t']).eq_ignore_ascii_case("identity") {
+            if content_encoding
+                || !value
+                    .trim_matches([' ', '\t'])
+                    .eq_ignore_ascii_case("identity")
+            {
                 return Err(invalid);
             }
             content_encoding = true;
         }
     }
-    let mut parts = content_type.ok_or(invalid)?.split(';').map(|part| part.trim_matches([' ', '\t']));
+    let mut parts = content_type
+        .ok_or(invalid)?
+        .split(';')
+        .map(|part| part.trim_matches([' ', '\t']));
     if !parts.next().is_some_and(|kind| {
         kind.eq_ignore_ascii_case("application/json")
             || kind.eq_ignore_ascii_case("application/jwk-set+json")
@@ -400,7 +513,9 @@ fn admit_headers(headers: &[(String, String)]) -> Result<(), EnterpriseKeyFetchE
     if let Some(parameter) = parts.next() {
         let (name, value) = parameter.split_once('=').ok_or(invalid)?;
         let value = value.trim_matches([' ', '\t']);
-        if !name.trim_matches([' ', '\t']).eq_ignore_ascii_case("charset")
+        if !name
+            .trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case("charset")
             || !(value.eq_ignore_ascii_case("utf-8") || value.eq_ignore_ascii_case("\"utf-8\""))
             || parts.next().is_some()
         {

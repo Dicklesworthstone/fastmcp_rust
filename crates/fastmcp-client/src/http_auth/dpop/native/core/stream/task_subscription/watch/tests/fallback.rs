@@ -23,7 +23,9 @@ fn fallback_policy_is_explicit_finite_and_honors_peer_hint() {
     ] {
         assert!(base.with_polling_fallback(polls, interval).is_err());
     }
-    let policy = base.with_polling_fallback(2, Duration::from_millis(100)).unwrap();
+    let policy = base
+        .with_polling_fallback(2, Duration::from_millis(100))
+        .unwrap();
     let mut state = WatchState::new("fallback", policy, limits(4)).unwrap();
     let now = asupersync::Time::from_nanos(1_000);
     state.note_snapshot(now, &working(Some(300))).unwrap();
@@ -45,17 +47,22 @@ fn fallback_policy_is_explicit_finite_and_honors_peer_hint() {
 
 #[test]
 fn fallback_disabled_and_snapshot_budget_remain_fail_closed() {
-    let mut state = WatchState::new(
-        "watch", DpopTaskWatchPolicy::new(4).unwrap(), limits(2),
-    ).unwrap();
-    state.note_snapshot(asupersync::Time::from_nanos(0), &working(None)).unwrap();
+    let mut state =
+        WatchState::new("watch", DpopTaskWatchPolicy::new(4).unwrap(), limits(2)).unwrap();
+    state
+        .note_snapshot(asupersync::Time::from_nanos(0), &working(None))
+        .unwrap();
     assert_eq!(state.begin_fallback_poll().unwrap(), None);
 
-    let policy = DpopTaskWatchPolicy::new(1).unwrap()
-        .with_polling_fallback(1, Duration::from_millis(1)).unwrap();
+    let policy = DpopTaskWatchPolicy::new(1)
+        .unwrap()
+        .with_polling_fallback(1, Duration::from_millis(1))
+        .unwrap();
     let mut state = WatchState::new("watch", policy, limits(2)).unwrap();
     state.snapshot_request(&task()).unwrap();
-    state.note_snapshot(asupersync::Time::from_nanos(0), &working(None)).unwrap();
+    state
+        .note_snapshot(asupersync::Time::from_nanos(0), &working(None))
+        .unwrap();
     assert!(matches!(
         state.begin_fallback_poll(),
         Err(DpopTaskWatchError::SnapshotLimit)

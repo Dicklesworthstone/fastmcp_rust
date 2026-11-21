@@ -108,9 +108,12 @@ impl SubscriptionDrain {
     }
 
     fn fail(&self) {
-        let owner = self.owner.lock().unwrap().as_ref().map(|owner| {
-            (Arc::clone(&owner.terminal), owner.cancellation.clone())
-        });
+        let owner = self
+            .owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|owner| (Arc::clone(&owner.terminal), owner.cancellation.clone()));
         if let Some((terminal, cancellation)) = owner {
             terminal.mark_failed();
             cancellation.cancel();
@@ -283,11 +286,7 @@ mod tests {
         if admitted {
             assert!(admission.elect(crate::ModernSseDispatchElection::Stream));
         }
-        subscription.register(
-            cancellation.clone(),
-            Arc::clone(&terminal),
-            admission,
-        );
+        subscription.register(cancellation.clone(), Arc::clone(&terminal), admission);
         (subscription, terminal, cancellation)
     }
 
@@ -302,7 +301,10 @@ mod tests {
             let release = AtomicBool::new(false);
             let operation = poll_fn(|_| {
                 let first = polls.fetch_add(1, Ordering::SeqCst) == 0;
-                assert!(cx.checkpoint().is_ok(), "only an elected poll may mask shutdown");
+                assert!(
+                    cx.checkpoint().is_ok(),
+                    "only an elected poll may mask shutdown"
+                );
                 if first && cancel_during_poll {
                     cx.set_cancel_requested(true);
                 }
@@ -327,7 +329,11 @@ mod tests {
             for _ in 0..3 {
                 assert!(driving.as_mut().poll(&mut task).is_pending());
             }
-            assert_eq!(polls.load(Ordering::SeqCst), 1, "parked custody must not poll auth or I/O");
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                1,
+                "parked custody must not poll auth or I/O"
+            );
             assert!(!request.is_cancel_requested());
             assert!(terminal.mark_cancellation_enqueued());
             request.cancel();
@@ -337,7 +343,10 @@ mod tests {
             assert_eq!(driving.as_mut().poll(&mut task), Poll::Ready(Ok(37)));
             assert_eq!(polls.load(Ordering::SeqCst), 3);
             assert!(terminal.is_drained());
-            assert!(cx.checkpoint().is_err(), "the elected poll cannot clear caller cancellation");
+            assert!(
+                cx.checkpoint().is_err(),
+                "the elected poll cannot clear caller cancellation"
+            );
             assert!(sibling.checkpoint().is_ok());
         }
     }
@@ -350,7 +359,9 @@ mod tests {
             let (subscription, terminal, request) = subscription_drain(refusal != 0);
             match refusal {
                 0 => assert!(terminal.mark_cancellation_enqueued()),
-                1 => { request.cancel(); }
+                1 => {
+                    request.cancel();
+                }
                 2 => {
                     assert!(terminal.mark_cancellation_enqueued());
                     terminal.mark_failed();
@@ -358,7 +369,10 @@ mod tests {
                 3 => {
                     terminal.mark_control_not_required();
                     terminal.mark_failed();
-                    assert!(terminal.is_committed(), "control alone cannot prove successful receipt");
+                    assert!(
+                        terminal.is_committed(),
+                        "control alone cannot prove successful receipt"
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -390,10 +404,17 @@ mod tests {
         let subscription = SubscriptionDrain::default();
         cx.set_cancel_requested(true);
         let mut driving = Box::pin(drive_connection(
-            &cx, &shutdown, &subscription, Duration::from_secs(1), async { 1 },
+            &cx,
+            &shutdown,
+            &subscription,
+            Duration::from_secs(1),
+            async { 1 },
         ));
         let mut task = Context::from_waker(Waker::noop());
-        assert_eq!(driving.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::Cancelled)));
+        assert_eq!(
+            driving.as_mut().poll(&mut task),
+            Poll::Ready(Err(SecuredHttpEndpointError::Cancelled))
+        );
     }
 
     #[test]
@@ -408,7 +429,8 @@ mod tests {
                 .build()
                 .unwrap();
             let budget = if caller_expires_first {
-                asupersync::Budget::INFINITE.with_deadline(asupersync::Time::from_nanos(500_000_000))
+                asupersync::Budget::INFINITE
+                    .with_deadline(asupersync::Time::from_nanos(500_000_000))
             } else {
                 asupersync::Budget::INFINITE
             };
@@ -438,9 +460,19 @@ mod tests {
             } else {
                 1_000_000_000
             }));
-            assert_eq!(driving.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::TimedOut)));
-            assert_eq!(polls.load(Ordering::SeqCst), 2, "no write may resume at its exact bound");
-            assert_eq!(terminal.state.load(Ordering::Acquire), FINAL_TERMINAL_FAILED);
+            assert_eq!(
+                driving.as_mut().poll(&mut task),
+                Poll::Ready(Err(SecuredHttpEndpointError::TimedOut))
+            );
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                2,
+                "no write may resume at its exact bound"
+            );
+            assert_eq!(
+                terminal.state.load(Ordering::Acquire),
+                FINAL_TERMINAL_FAILED
+            );
             drop(driving);
             assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
         }

@@ -14,8 +14,7 @@ use asupersync::Cx;
 use fastmcp_core::{McpRequestCancellation, McpResult};
 use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::extensions::{
-    ClientExtensionDiscovery, ExtensionDescriptorRegistry,
-    ExtensionSettingsCompatibilityResolver,
+    ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettingsCompatibilityResolver,
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -35,8 +34,8 @@ use super::{
     ManagedCoreError, ManagedCoreLimits, ModernHttpRequest, WaitBounds, check_live,
     decode_response,
 };
-use crate::http_auth::rpc::admit_http_notification;
 use crate::http_auth::caller::with_caller;
+use crate::http_auth::rpc::admit_http_notification;
 use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime};
 
 /// One-way, proof-bound extension notifications over authenticated DPoP HTTPS.
@@ -99,11 +98,17 @@ impl DpopExtensionOperation {
         method: impl Into<String>,
         parameters: Value,
     ) -> Result<Self, ManagedCoreError> {
-        discovery_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
-        operation_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
+        discovery_id
+            .validate()
+            .map_err(|_| ManagedCoreError::InvalidRequest)?;
+        operation_id
+            .validate()
+            .map_err(|_| ManagedCoreError::InvalidRequest)?;
         if discovery_id.correlates_with(&operation_id)
             || !parameters.is_object()
-            || parameters.get("_meta").is_some_and(|value| !value.is_object())
+            || parameters
+                .get("_meta")
+                .is_some_and(|value| !value.is_object())
         {
             return Err(ManagedCoreError::InvalidRequest);
         }
@@ -130,7 +135,8 @@ pub struct DpopExtensionResult {
 
 impl fmt::Debug for DpopExtensionResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("DpopExtensionResult")
+        formatter
+            .debug_struct("DpopExtensionResult")
             .field("result_bytes", &self.raw_result_source.len())
             .finish_non_exhaustive()
     }
@@ -138,16 +144,24 @@ impl fmt::Debug for DpopExtensionResult {
 
 impl DpopExtensionResult {
     #[must_use]
-    pub fn request_id(&self) -> &RequestId { &self.request_id }
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
 
     #[must_use]
-    pub fn result(&self) -> &Value { &self.result }
+    pub fn result(&self) -> &Value {
+        &self.result
+    }
 
     #[must_use]
-    pub fn raw_result_source(&self) -> &str { &self.raw_result_source }
+    pub fn raw_result_source(&self) -> &str {
+        &self.raw_result_source
+    }
 
     #[must_use]
-    pub fn into_result(self) -> Value { self.result }
+    pub fn into_result(self) -> Value {
+        self.result
+    }
 }
 
 // Request and notification owners share only discovery preparation/admission.
@@ -168,44 +182,67 @@ impl PreparedDiscovery {
         native_maximum: usize,
     ) -> Result<(Self, Value), ManagedCoreError> {
         if metadata.protocol_version != FINAL_PROTOCOL_VERSION
-            || [FINAL_PROTOCOL_VERSION_META_KEY, FINAL_CLIENT_CAPABILITIES_META_KEY,
-                FINAL_CLIENT_INFO_META_KEY].iter()
-                .any(|key| metadata.additional_metadata.contains_key(*key))
+            || [
+                FINAL_PROTOCOL_VERSION_META_KEY,
+                FINAL_CLIENT_CAPABILITIES_META_KEY,
+                FINAL_CLIENT_INFO_META_KEY,
+            ]
+            .iter()
+            .any(|key| metadata.additional_metadata.contains_key(*key))
         {
             return Err(ManagedCoreError::InvalidRequest);
         }
-        let mut metadata = serde_json::to_value(metadata)
-            .map_err(|_| ManagedCoreError::InvalidRequest)?;
-        let capabilities = metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
-            .and_then(Value::as_object_mut).ok_or(ManagedCoreError::InvalidRequest)?;
-        if capabilities.get("extensions")
+        let mut metadata =
+            serde_json::to_value(metadata).map_err(|_| ManagedCoreError::InvalidRequest)?;
+        let capabilities = metadata
+            .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+            .and_then(Value::as_object_mut)
+            .ok_or(ManagedCoreError::InvalidRequest)?;
+        if capabilities
+            .get("extensions")
             .is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
         {
             return Err(ManagedCoreError::UnsupportedRequest);
         }
-        capabilities.insert("extensions".to_owned(),
+        capabilities.insert(
+            "extensions".to_owned(),
             serde_json::to_value(configuration.runtime.client_wire_extensions())
-                .map_err(|_| ManagedCoreError::InvalidRequest)?);
+                .map_err(|_| ManagedCoreError::InvalidRequest)?,
+        );
         let discovery = CoreRequest::decode(
-            ProtocolEra::Modern2026, "server/discover", Some(&json!({"_meta":metadata})),
-        ).map_err(|_| ManagedCoreError::InvalidRequest)?;
-        let parameters = discovery.encode_params()
+            ProtocolEra::Modern2026,
+            "server/discover",
+            Some(&json!({"_meta":metadata})),
+        )
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
+        let parameters = discovery
+            .encode_params()
             .map_err(|_| ManagedCoreError::InvalidRequest)?
             .ok_or(ManagedCoreError::InvalidRequest)?;
-        let wire = wire(target, "server/discover", &discovery_id, parameters,
-            limits.request_bytes().min(native_maximum))?;
+        let wire = wire(
+            target,
+            "server/discover",
+            &discovery_id,
+            parameters,
+            limits.request_bytes().min(native_maximum),
+        )?;
         let decoder = CoreDecoder::for_request(discovery, discovery_id, limits)?;
         Ok((Self { wire, decoder }, metadata))
     }
 
-    fn admit(mut self, response: DpopHttpResponse)
-        -> Result<(ServerDiscoverResult, (usize, usize)), DpopCoreError>
-    {
+    fn admit(
+        mut self,
+        response: DpopHttpResponse,
+    ) -> Result<(ServerDiscoverResult, (usize, usize)), DpopCoreError> {
         let result = decode_response(&mut self.decoder, response)?;
         let CoreResult::Final(FinalCoreResult::Discover(discovery)) = result else {
             return Err(ManagedCoreError::InvalidResponse.into());
         };
-        if !discovery.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
+        if !discovery
+            .supported_versions()
+            .iter()
+            .any(|version| version == FINAL_PROTOCOL_VERSION)
+        {
             return Err(ManagedCoreError::UnsupportedRequest.into());
         }
         // The decoder charges every byte. An empty notification acknowledgement
@@ -235,10 +272,17 @@ fn wire(
     parameters: Value,
     maximum: usize,
 ) -> Result<ModernHttpRequest, ManagedCoreError> {
-    let mut writer = BoundedWriter { bytes: Vec::new(), maximum };
-    serde_json::to_writer(&mut writer, &json!({
-        "jsonrpc":"2.0", "id":id, "method":method, "params":parameters,
-    })).map_err(|_| ManagedCoreError::RequestTooLarge)?;
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        maximum,
+    };
+    serde_json::to_writer(
+        &mut writer,
+        &json!({
+            "jsonrpc":"2.0", "id":id, "method":method, "params":parameters,
+        }),
+    )
+    .map_err(|_| ManagedCoreError::RequestTooLarge)?;
     ModernHttpRequest::new(target, writer.bytes, FINAL_PROTOCOL_VERSION, method, None)
         .map_err(|_| ManagedCoreError::InvalidRequest)
 }
@@ -252,20 +296,32 @@ impl Prepared {
         limits: ManagedCoreLimits,
         native_maximum: usize,
     ) -> Result<Self, ManagedCoreError> {
-        configuration.runtime
+        configuration
+            .runtime
             .admit_local_method(&operation.extension_id, &operation.method)
             .map_err(|_| ManagedCoreError::UnsupportedRequest)?;
         let (discovery, mut metadata) = PreparedDiscovery::new(
-            target, configuration, metadata, operation.discovery_id, limits, native_maximum,
+            target,
+            configuration,
+            metadata,
+            operation.discovery_id,
+            limits,
+            native_maximum,
         )?;
         let maximum = limits.request_bytes().min(native_maximum);
         let mut parameters = operation.parameters;
-        let object = parameters.as_object_mut().ok_or(ManagedCoreError::InvalidRequest)?;
-        let metadata_object = metadata.as_object_mut().ok_or(ManagedCoreError::InvalidRequest)?;
+        let object = parameters
+            .as_object_mut()
+            .ok_or(ManagedCoreError::InvalidRequest)?;
+        let metadata_object = metadata
+            .as_object_mut()
+            .ok_or(ManagedCoreError::InvalidRequest)?;
         if let Some(extra) = object.remove("_meta") {
             let extra = extra.as_object().ok_or(ManagedCoreError::InvalidRequest)?;
             for (name, value) in extra {
-                if metadata_object.get(name).is_some_and(|previous| previous != value)
+                if metadata_object
+                    .get(name)
+                    .is_some_and(|previous| previous != value)
                     || (name == FINAL_CLIENT_INFO_META_KEY && !metadata_object.contains_key(name))
                 {
                     return Err(ManagedCoreError::InvalidRequest);
@@ -276,15 +332,25 @@ impl Prepared {
         // Reuse the final request metadata grammar without promoting a core
         // method or synthetic discovery result into extension authority.
         CoreRequest::decode(
-            ProtocolEra::Modern2026, "server/discover", Some(&json!({"_meta":metadata})),
-        ).map_err(|_| ManagedCoreError::InvalidRequest)?;
-        let progress = metadata.get("progressToken")
-            .map(|value| serde_json::from_value(value.clone())
-                .map_err(|_| ManagedCoreError::InvalidRequest))
+            ProtocolEra::Modern2026,
+            "server/discover",
+            Some(&json!({"_meta":metadata})),
+        )
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
+        let progress = metadata
+            .get("progressToken")
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|_| ManagedCoreError::InvalidRequest)
+            })
             .transpose()?;
         object.insert("_meta".to_owned(), metadata);
-        let operation_wire = wire(target, &operation.method, &operation.operation_id,
-            parameters, maximum)?;
+        let operation_wire = wire(
+            target,
+            &operation.method,
+            &operation.operation_id,
+            parameters,
+            maximum,
+        )?;
         Ok(Self {
             runtime: Arc::clone(&configuration.runtime),
             extension_id: operation.extension_id,
@@ -297,27 +363,35 @@ impl Prepared {
         })
     }
 
-    fn admit(self, response: DpopHttpResponse)
-        -> Result<(ModernHttpRequest, ExtensionDecoder), DpopStreamError>
-    {
+    fn admit(
+        self,
+        response: DpopHttpResponse,
+    ) -> Result<(ModernHttpRequest, ExtensionDecoder), DpopStreamError> {
         let (discovery, (bytes, notifications)) = self.discovery.admit(response)?;
-        let negotiated = self.runtime.negotiate(&discovery)
+        let negotiated = self
+            .runtime
+            .negotiate(&discovery)
             .map_err(|_| ManagedCoreError::UnsupportedRequest)?;
-        let admission = self.runtime.admit_request(&negotiated, &self.extension_id, &self.method)
+        let admission = self
+            .runtime
+            .admit_request(&negotiated, &self.extension_id, &self.method)
             .map_err(|_| ManagedCoreError::UnsupportedRequest)?;
         if bytes >= self.limits.total_bytes() {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
-        Ok((self.operation_wire, ExtensionDecoder {
-            admission,
-            id: self.operation_id,
-            limits: self.limits,
-            bytes,
-            notifications,
-            progress: self.progress,
-            last_progress: None,
-            terminal: false,
-        }))
+        Ok((
+            self.operation_wire,
+            ExtensionDecoder {
+                admission,
+                id: self.operation_id,
+                limits: self.limits,
+                bytes,
+                notifications,
+                progress: self.progress,
+                last_progress: None,
+                terminal: false,
+            },
+        ))
     }
 }
 
@@ -337,13 +411,17 @@ struct ExtensionDecoder {
 impl StreamDecoder for ExtensionDecoder {
     type Terminal = DpopExtensionResult;
 
-    fn admit(&mut self, frame: &[u8], allow_notification: bool)
-        -> Result<StreamEvent<Self::Terminal>, DpopStreamError>
-    {
+    fn admit(
+        &mut self,
+        frame: &[u8],
+        allow_notification: bool,
+    ) -> Result<StreamEvent<Self::Terminal>, DpopStreamError> {
         if self.terminal {
             return Err(ManagedCoreError::InvalidResponse.into());
         }
-        let maximum = self.limits.frame_bytes()
+        let maximum = self
+            .limits
+            .frame_bytes()
             .min(self.limits.total_bytes().saturating_sub(self.bytes));
         if frame.len() > maximum {
             return Err(ManagedCoreError::ResponseByteLimit.into());
@@ -355,19 +433,26 @@ impl StreamDecoder for ExtensionDecoder {
                 let admitted = decode_strict_jsonrpc_response(frame, maximum)
                     .map_err(|_| ManagedCoreError::InvalidResponse)?;
                 let (response, source) = admitted.into_parts();
-                if !response.id.as_ref().is_some_and(|id| id.correlates_with(&self.id)) {
+                if !response
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| id.correlates_with(&self.id))
+                {
                     return Err(ManagedCoreError::ResponseIdMismatch.into());
                 }
                 if let Some(error) = response.error {
                     return Err(ManagedCoreError::Remote { code: error.code }.into());
                 }
                 let raw_result_source = source.ok_or(ManagedCoreError::InvalidResult)?;
-                self.admission.decode_result(&raw_result_source)
+                self.admission
+                    .decode_result(&raw_result_source)
                     .map_err(|_| ManagedCoreError::InvalidResult)?;
                 let result = response.result.ok_or(ManagedCoreError::InvalidResult)?;
                 self.terminal = true;
                 StreamEvent::Result(DpopExtensionResult {
-                    request_id: self.id.clone(), result, raw_result_source,
+                    request_id: self.id.clone(),
+                    result,
+                    raw_result_source,
                 })
             }
             JsonRpcMessage::Request(request) => {
@@ -378,7 +463,10 @@ impl StreamDecoder for ExtensionDecoder {
                     return Err(ManagedCoreError::NotificationLimit.into());
                 }
                 let notification = admit_http_notification(
-                    frame, &request, self.progress.as_ref(), self.last_progress.as_ref(),
+                    frame,
+                    &request,
+                    self.progress.as_ref(),
+                    self.last_progress.as_ref(),
                 )?;
                 if let ServerNotification::Progress(progress) = &notification {
                     self.last_progress = Some(progress.progress.clone());
@@ -391,7 +479,9 @@ impl StreamDecoder for ExtensionDecoder {
         Ok(event)
     }
 
-    fn usage(&self) -> (usize, usize) { (self.bytes, self.notifications) }
+    fn usage(&self) -> (usize, usize) {
+        (self.bytes, self.notifications)
+    }
 }
 
 impl DpopHttpClient {
@@ -412,8 +502,16 @@ impl DpopHttpClient {
         limits: DpopStreamLimits,
     ) -> Result<DpopExtensionResult, DpopStreamError> {
         self.request_final_extension_with_events(
-            cx, cancellation, credential, configuration, metadata, operation, limits, |_| true,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            configuration,
+            metadata,
+            operation,
+            limits,
+            |_| true,
+        )
+        .await
     }
 
     /// Executes discovery followed by exactly one admitted extension operation.
@@ -454,31 +552,80 @@ impl DpopHttpClient {
     where
         N: FnMut(&ServerNotification) -> bool,
     {
-        let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
+        let bounds = WaitBounds::new(
+            cx,
+            self.policy.timeout.min(limits.core.timeout()),
+            credential,
+        )?;
         let idle = Idle::new(cx.now(), limits.idle);
-        check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+        check_live(
+            cx,
+            cancellation,
+            &self.session,
+            credential,
+            idle.bounds(bounds),
+        )?;
         let prepared = Prepared::new(
-            self.resource().as_str(), configuration, metadata, operation,
-            limits.core, self.policy.max_body_bytes,
+            self.resource().as_str(),
+            configuration,
+            metadata,
+            operation,
+            limits.core,
+            self.policy.max_body_bytes,
         );
-        check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+        check_live(
+            cx,
+            cancellation,
+            &self.session,
+            credential,
+            idle.bounds(bounds),
+        )?;
         let prepared = prepared?;
-        let response = self.post_resource_with_bounds(
-            cx, cancellation, credential, &prepared.discovery.wire, idle.bounds(bounds),
-        ).await?;
-        check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+        let response = self
+            .post_resource_with_bounds(
+                cx,
+                cancellation,
+                credential,
+                &prepared.discovery.wire,
+                idle.bounds(bounds),
+            )
+            .await?;
+        check_live(
+            cx,
+            cancellation,
+            &self.session,
+            credential,
+            idle.bounds(bounds),
+        )?;
         // The resolver factory and resolver are caller code. Select the
         // supplied identity while intersecting ambient effects, contain panic,
         // and let same-poll cancellation/revocation win before any second POST.
         let admitted = with_caller(cx, || {
             catch_unwind(AssertUnwindSafe(|| prepared.admit(response)))
         });
-        check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+        check_live(
+            cx,
+            cancellation,
+            &self.session,
+            credential,
+            idle.bounds(bounds),
+        )?;
         let (wire, decoder) = admitted.map_err(|_| ManagedCoreError::UnsupportedRequest)??;
-        let outcome = self.execute_prepared_core_stream(
-            cx, cancellation, credential,
-            PreparedStream { wire, decoder, limits, bounds, idle }, &mut observer,
-        ).await;
+        let outcome = self
+            .execute_prepared_core_stream(
+                cx,
+                cancellation,
+                credential,
+                PreparedStream {
+                    wire,
+                    decoder,
+                    limits,
+                    bounds,
+                    idle,
+                },
+                &mut observer,
+            )
+            .await;
         // Apply the outer owner check to error publication too. A decoder or
         // callback failure cannot bypass cancellation or original token expiry.
         check_live(cx, cancellation, &self.session, credential, bounds)?;

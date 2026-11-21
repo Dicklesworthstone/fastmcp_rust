@@ -7,17 +7,20 @@
 
 use super::*;
 use std::future::{Future, poll_fn};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize},
+};
 use std::task::{Context, Poll, Waker};
 
+use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
+use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::net::TcpListener;
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::sync::Mutex;
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptorBuilder};
-use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
-use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
-use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
 use fastmcp_protocol::{
     ClientCapabilities, FinalHttpRequestMetadata, RequestVersionMetadata, admit_final_http_request,
 };
@@ -47,17 +50,22 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let (mut one, mut two) = (None, None);
     poll_fn(|task| {
         if one.is_none() {
-            if let Poll::Ready(value) = left.as_mut().poll(task) { one = Some(value); }
+            if let Poll::Ready(value) = left.as_mut().poll(task) {
+                one = Some(value);
+            }
         }
         if two.is_none() {
-            if let Poll::Ready(value) = right.as_mut().poll(task) { two = Some(value); }
+            if let Poll::Ready(value) = right.as_mut().poll(task) {
+                two = Some(value);
+            }
         }
         if one.is_some() && two.is_some() {
             Poll::Ready((one.take().unwrap(), two.take().unwrap()))
         } else {
             Poll::Pending
         }
-    }).await
+    })
+    .await
 }
 
 async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (Vec<(String, String)>, Value) {
@@ -73,9 +81,16 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (Vec<(String, Strin
     };
     let head = std::str::from_utf8(&bytes[..end]).unwrap();
     assert!(head.starts_with("POST /mcp?tenant=one HTTP/1.1\r\n"));
-    let fields: Vec<_> = head.lines().skip(1).filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.to_owned(), value.trim().to_owned())).collect();
-    let length = header(&fields, "content-length").unwrap().parse::<usize>().unwrap();
+    let fields: Vec<_> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
+        .collect();
+    let length = header(&fields, "content-length")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
     assert!(end + length <= 32 * 1024);
     while bytes.len() < end + length {
         let count = io.read(&mut buffer).await.unwrap();
@@ -87,7 +102,9 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (Vec<(String, Strin
 }
 
 fn header<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(key))
+    fields
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
         .map(|(_, value)| value.as_str())
 }
 
@@ -95,13 +112,15 @@ fn admit(fields: &[(String, String)], body: &Value, mirror: Option<&str>) -> boo
     admit_final_http_request(FinalHttpRequestMetadata {
         version: RequestVersionMetadata {
             header_version: header(fields, "mcp-protocol-version"),
-            body_version: body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str(),
+            body_version: body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+                .as_str(),
         },
         header_method: header(fields, "mcp-method"),
         body_method: body["method"].as_str(),
         header_name: mirror,
         body_name: body["params"]["taskId"].as_str(),
-    }).is_ok()
+    })
+    .is_ok()
 }
 
 async fn json_reply<IO: AsyncWrite + Unpin>(io: &mut IO, body: &Value) {
@@ -115,7 +134,9 @@ async fn json_reply<IO: AsyncWrite + Unpin>(io: &mut IO, body: &Value) {
 }
 
 async fn chunk<IO: AsyncWrite + Unpin>(io: &mut IO, body: &str) {
-    io.write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes()).await.unwrap();
+    io.write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes())
+        .await
+        .unwrap();
     io.flush().await.unwrap();
 }
 
@@ -124,11 +145,14 @@ fn operation(method: &str) -> ManagedTaskRequest {
         TASK_GET => ManagedTaskRequest::Get(TaskId::parse("task-one").unwrap()),
         TASK_CANCEL => ManagedTaskRequest::Cancel(TaskId::parse("task-one").unwrap()),
         TASK_UPDATE => ManagedTaskRequest::Update {
-            task: Box::new(serde_json::from_value(json!({
-                "taskId":"task-one", "status":"input_required",
-                "createdAt":"2026-09-16T00:00:00Z", "lastUpdatedAt":"2026-09-16T00:00:00Z",
-                "ttlMs":60000, "inputRequests":{"roots":{"method":"roots/list"}}
-            })).unwrap()),
+            task: Box::new(
+                serde_json::from_value(json!({
+                    "taskId":"task-one", "status":"input_required",
+                    "createdAt":"2026-09-16T00:00:00Z", "lastUpdatedAt":"2026-09-16T00:00:00Z",
+                    "ttlMs":60000, "inputRequests":{"roots":{"method":"roots/list"}}
+                }))
+                .unwrap(),
+            ),
             input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap(),
         },
         _ => panic!("unexpected fixture operation"),
@@ -138,8 +162,15 @@ fn operation(method: &str) -> ManagedTaskRequest {
 #[test]
 fn native_https_lifecycle_preserves_routing_incremental_delivery_and_terminal_ownership() {
     for method in [TASK_GET, TASK_UPDATE, TASK_CANCEL] {
-        for case in [Case::Json, Case::Sse, Case::ForeignId, Case::TrailingRecord,
-            Case::MissingTerminal, Case::Cancelled, Case::Revoked] {
+        for case in [
+            Case::Json,
+            Case::Sse,
+            Case::ForeignId,
+            Case::TrailingRecord,
+            Case::MissingTerminal,
+            Case::Cancelled,
+            Case::Revoked,
+        ] {
             RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
                 .build().unwrap().block_on(async {
                     let cx = Cx::current().unwrap();
@@ -346,7 +377,9 @@ fn form_fields(value: &str) -> std::collections::BTreeMap<String, String> {
     fields
 }
 
-async fn read_token_form<IO: AsyncRead + Unpin>(io: &mut IO) -> std::collections::BTreeMap<String, String> {
+async fn read_token_form<IO: AsyncRead + Unpin>(
+    io: &mut IO,
+) -> std::collections::BTreeMap<String, String> {
     let mut bytes = Vec::new();
     let mut buffer = [0; 2048];
     let end = loop {
@@ -359,11 +392,21 @@ async fn read_token_form<IO: AsyncRead + Unpin>(io: &mut IO) -> std::collections
     };
     let head = std::str::from_utf8(&bytes[..end]).unwrap();
     assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
-    let fields: Vec<_> = head.lines().skip(1).filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.to_owned(), value.trim().to_owned())).collect();
-    assert_eq!(header(&fields, "content-type"), Some("application/x-www-form-urlencoded"));
+    let fields: Vec<_> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
+        .collect();
+    assert_eq!(
+        header(&fields, "content-type"),
+        Some("application/x-www-form-urlencoded")
+    );
     assert!(projected_fields(&fields).is_empty());
-    let length = header(&fields, "content-length").unwrap().parse::<usize>().unwrap();
+    let length = header(&fields, "content-length")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
     assert!(end + length <= 32 * 1024);
     while bytes.len() < end + length {
         let count = io.read(&mut buffer).await.unwrap();
@@ -379,8 +422,12 @@ fn projected_fields(fields: &[(String, String)]) -> std::collections::BTreeMap<S
     for (name, value) in fields {
         let name = name.to_ascii_lowercase();
         if name.starts_with("mcp-param-") {
-            let value = fastmcp_protocol::http_headers::decode_mcp_header_value(value.as_bytes()).unwrap();
-            assert!(projected.insert(name, value).is_none(), "duplicate parameter header");
+            let value =
+                fastmcp_protocol::http_headers::decode_mcp_header_value(value.as_bytes()).unwrap();
+            assert!(
+                projected.insert(name, value).is_none(),
+                "duplicate parameter header"
+            );
         }
     }
     projected
@@ -406,29 +453,45 @@ fn tool_reply(kind: &str) -> Value {
 }
 
 fn assert_tool_kind(kind: &str, result: &FinalCoreResult) {
-    assert!(matches!((kind, result),
+    assert!(matches!(
+        (kind, result),
         ("complete", FinalCoreResult::ToolsCall { .. })
-        | ("task", FinalCoreResult::ToolsCallTask { .. })
-        | ("input_required", FinalCoreResult::ToolsCallInputRequired { .. })
+            | ("task", FinalCoreResult::ToolsCallTask { .. })
+            | (
+                "input_required",
+                FinalCoreResult::ToolsCallInputRequired { .. }
+            )
     ));
 }
 
 fn sequential_ids(discovery: i64) -> ManagedTaskRequestIds {
-    ManagedTaskRequestIds::new(RequestId::Number(discovery), RequestId::Number(discovery + 1)).unwrap()
+    ManagedTaskRequestIds::new(
+        RequestId::Number(discovery),
+        RequestId::Number(discovery + 1),
+    )
+    .unwrap()
 }
 
 async fn reviewed_discovery<IO: AsyncRead + AsyncWrite + Unpin>(io: &mut IO, id: i64) {
     let (fields, body) = read_request(io).await;
     assert_eq!(body["id"], id);
     assert_eq!(body["method"], "server/discover");
-    assert_eq!(header(&fields, "authorization"), Some("Bearer reviewed-task-token"));
+    assert_eq!(
+        header(&fields, "authorization"),
+        Some("Bearer reviewed-task-token")
+    );
     assert!(header(&fields, "mcp-name").is_none());
     assert!(projected_fields(&fields).is_empty());
     for member in ["name", "arguments", "requestState", "inputResponses"] {
-        assert!(body["params"].get(member).is_none(), "discovery leaked {member}");
+        assert!(
+            body["params"].get(member).is_none(),
+            "discovery leaked {member}"
+        );
     }
-    assert_eq!(body["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
-        json!({TASKS_EXTENSION:{}}));
+    assert_eq!(
+        body["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+        json!({TASKS_EXTENSION:{}})
+    );
     json_reply(io, &json!({"jsonrpc":"2.0", "id":id, "result":{
         "resultType":"complete", "supportedVersions":[FINAL_PROTOCOL_VERSION],
         "capabilities":{"tools":{}, "extensions":{TASKS_EXTENSION:{}}},
@@ -437,36 +500,60 @@ async fn reviewed_discovery<IO: AsyncRead + AsyncWrite + Unpin>(io: &mut IO, id:
     }})).await;
 }
 
-fn assert_reviewed_tool_post(fields: &[(String, String)], body: &Value, resumed: bool, reviewed: bool) {
+fn assert_reviewed_tool_post(
+    fields: &[(String, String)],
+    body: &Value,
+    resumed: bool,
+    reviewed: bool,
+) {
     assert_eq!(body["method"], "tools/call");
     assert_eq!(body["params"]["name"], "echo");
     assert_eq!(body["params"]["arguments"], reviewed_tool_arguments());
-    assert_eq!(header(fields, "authorization"), Some("Bearer reviewed-task-token"));
-    let routing = |mirror| admit_final_http_request(FinalHttpRequestMetadata {
-        version: RequestVersionMetadata {
-            header_version: header(fields, "mcp-protocol-version"),
-            body_version: body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str(),
-        },
-        header_method: header(fields, "mcp-method"), body_method: body["method"].as_str(),
-        header_name: mirror, body_name: body["params"]["name"].as_str(),
-    }).is_ok();
+    assert_eq!(
+        header(fields, "authorization"),
+        Some("Bearer reviewed-task-token")
+    );
+    let routing = |mirror| {
+        admit_final_http_request(FinalHttpRequestMetadata {
+            version: RequestVersionMetadata {
+                header_version: header(fields, "mcp-protocol-version"),
+                body_version: body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+                    .as_str(),
+            },
+            header_method: header(fields, "mcp-method"),
+            body_method: body["method"].as_str(),
+            header_name: mirror,
+            body_name: body["params"]["name"].as_str(),
+        })
+        .is_ok()
+    };
     assert!(routing(header(fields, "mcp-name")));
     assert!(!routing(None));
     assert!(!routing(Some("other-tool")));
     if reviewed {
-        assert_eq!(projected_fields(fields), std::collections::BTreeMap::from([
-            ("mcp-param-region".to_owned(), "north/λ%".to_owned()),
-            ("mcp-param-count".to_owned(), "42".to_owned()),
-            ("mcp-param-enabled".to_owned(), "false".to_owned()),
-        ]));
+        assert_eq!(
+            projected_fields(fields),
+            std::collections::BTreeMap::from([
+                ("mcp-param-region".to_owned(), "north/λ%".to_owned()),
+                ("mcp-param-count".to_owned(), "42".to_owned()),
+                ("mcp-param-enabled".to_owned(), "false".to_owned()),
+            ])
+        );
     } else {
         assert!(projected_fields(fields).is_empty());
     }
-    assert!(!fields.iter().any(|(_, value)|
-        value.contains("body-only-canary") || value.contains("sealed-state-canary")));
+    assert!(
+        !fields
+            .iter()
+            .any(|(_, value)| value.contains("body-only-canary")
+                || value.contains("sealed-state-canary"))
+    );
     if resumed {
         assert_eq!(body["params"]["requestState"], "sealed-state-canary");
-        assert_eq!(body["params"]["inputResponses"], json!({"roots":{"roots":[]}}));
+        assert_eq!(
+            body["params"]["inputResponses"],
+            json!({"roots":{"roots":[]}})
+        );
     } else {
         assert!(body["params"].get("requestState").is_none());
         assert!(body["params"].get("inputResponses").is_none());

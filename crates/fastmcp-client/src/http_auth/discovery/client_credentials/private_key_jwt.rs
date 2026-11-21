@@ -111,9 +111,11 @@ impl PrivateKeyJwtRegistration {
         if generation == 0 || remaining.is_zero() || remaining > MAX_REGISTRATION_LIFETIME {
             return Err(ClientCredentialsError::InvalidRegistration);
         }
-        let document: RegistrationDocument =
-            decode_metadata(fastmcp_protocol::SecurityDocumentKind::ClientRegistration, document)
-                .map_err(|_| ClientCredentialsError::InvalidRegistration)?;
+        let document: RegistrationDocument = decode_metadata(
+            fastmcp_protocol::SecurityDocumentKind::ClientRegistration,
+            document,
+        )
+        .map_err(|_| ClientCredentialsError::InvalidRegistration)?;
         validate_array(&document.grant_types)
             .map_err(|_| ClientCredentialsError::InvalidRegistration)?;
         if !has(&document.grant_types, "client_credentials")
@@ -338,10 +340,7 @@ impl PrivateKeyJwtAuthentication {
         })
     }
 
-    pub(super) fn admits_revocation(
-        &self,
-        endpoint: &str,
-    ) -> Result<bool, ClientCredentialsError> {
+    pub(super) fn admits_revocation(&self, endpoint: &str) -> Result<bool, ClientCredentialsError> {
         self.check()?;
         let Some(registered) = &self.registration.revocation else {
             return Ok(false);

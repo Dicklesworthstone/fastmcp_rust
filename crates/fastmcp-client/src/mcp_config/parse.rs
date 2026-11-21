@@ -486,9 +486,8 @@ mod tests {
             ("sandbox", r#"{"enabled":true}"#),
             ("dev", r#"{"watch":"**/*.rs"}"#),
         ] {
-            let changed = format!(
-                r#"{{"mcpServers":{{"local":{{"command":"server","{field}":{value}}}}}}}"#
-            );
+            let changed =
+                format!(r#"{{"mcpServers":{{"local":{{"command":"server","{field}":{value}}}}}}}"#);
             assert!(
                 McpConfig::from_json(&changed).is_err(),
                 "native server control {field} must not be discarded"
@@ -500,9 +499,8 @@ mod tests {
         }
 
         for field in ["url", "headers", "envFile", "sandbox"] {
-            let toml = format!(
-                "[mcp_servers.local]\ncommand = \"server\"\n{field} = \"unsupported\"\n"
-            );
+            let toml =
+                format!("[mcp_servers.local]\ncommand = \"server\"\n{field} = \"unsupported\"\n");
             assert!(
                 McpConfig::from_toml(&toml).is_err(),
                 "TOML native server control {field} must not be discarded"
@@ -527,7 +525,6 @@ mod tests {
         assert_eq!(local.cwd.as_deref(), Some("/workspace"));
         assert!(local.disabled);
     }
-
 
     #[test]
     fn literal_http_registry_entries_round_trip_without_a_stdio_command() {
@@ -569,7 +566,11 @@ mod tests {
                         assert!(!remote.stdio_configured);
                         assert_eq!(remote.disabled, disabled);
                         assert_eq!(
-                            remote.http_endpoint_config().unwrap().endpoint_bundle().key(),
+                            remote
+                                .http_endpoint_config()
+                                .unwrap()
+                                .endpoint_bundle()
+                                .key(),
                             key
                         );
                     }
@@ -577,7 +578,11 @@ mod tests {
                         serde_json::from_value(encoded["mcpServers"]["remote"].clone()).unwrap();
                     assert!(!direct.stdio_configured);
                     assert_eq!(
-                        direct.http_endpoint_config().unwrap().endpoint_bundle().key(),
+                        direct
+                            .http_endpoint_config()
+                            .unwrap()
+                            .endpoint_bundle()
+                            .key(),
                         key
                     );
                 }
@@ -593,7 +598,10 @@ mod tests {
         let endpoint = |url: &str| HttpEndpointConfig::from_literal_url(url.to_owned()).unwrap();
         let first = endpoint("https://example.test/mcp?tenant=one");
         let equivalent = endpoint("https://EXAMPLE.test:443/mcp?tenant=one");
-        assert_eq!(first.endpoint_bundle().key(), equivalent.endpoint_bundle().key());
+        assert_eq!(
+            first.endpoint_bundle().key(),
+            equivalent.endpoint_bundle().key()
+        );
         for changed in [
             "https://example.test/other?tenant=one",
             "https://example.test/mcp?tenant=two",
@@ -601,12 +609,17 @@ mod tests {
             "https://example.test/mcp",
         ] {
             let changed = endpoint(changed);
-            assert_ne!(first.endpoint_bundle().key(), changed.endpoint_bundle().key());
+            assert_ne!(
+                first.endpoint_bundle().key(),
+                changed.endpoint_bundle().key()
+            );
             assert_ne!(first.security_partition, changed.security_partition);
             assert_ne!(first.credential_partition, changed.credential_partition);
         }
         assert_ne!(
-            endpoint("https://example.test/mcp?").endpoint_bundle().key(),
+            endpoint("https://example.test/mcp?")
+                .endpoint_bundle()
+                .key(),
             endpoint("https://example.test/mcp").endpoint_bundle().key()
         );
         assert!(!first.security_partition.contains("tenant"));
@@ -625,7 +638,10 @@ mod tests {
                 ("cwd", serde_json::Value::Null),
                 ("http", serde_json::Value::Null),
                 ("headers", serde_json::json!({})),
-                ("headers", serde_json::json!({"Authorization": "Bearer secret-control"})),
+                (
+                    "headers",
+                    serde_json::json!({"Authorization": "Bearer secret-control"}),
+                ),
                 ("auth", serde_json::json!({"token": "secret-control"})),
                 ("envFile", serde_json::json!("/run/secrets/mcp.env")),
                 ("sandbox", serde_json::json!({"enabled": true})),
@@ -639,7 +655,10 @@ mod tests {
                     McpConfig::from_json(&source).unwrap_err(),
                     McpConfig::from_jsonc(&source).unwrap_err(),
                 ] {
-                    assert!(matches!(error, ConfigError::ParseError(_)), "{registry}: {field}");
+                    assert!(
+                        matches!(error, ConfigError::ParseError(_)),
+                        "{registry}: {field}"
+                    );
                     assert!(!format!("{error:?}").contains("secret-control"));
                 }
             }
@@ -701,7 +720,10 @@ mod tests {
         ] {
             for registry in ["mcpServers", "mcp_servers", "servers"] {
                 let source = format!(r#"{{"{registry}":{{"remote":{{{fields}}}}}}}"#);
-                assert!(McpConfig::from_json(&source).is_err(), "{registry}: {fields}");
+                assert!(
+                    McpConfig::from_json(&source).is_err(),
+                    "{registry}: {fields}"
+                );
                 assert!(McpConfig::from_jsonc(&source).is_err());
             }
         }

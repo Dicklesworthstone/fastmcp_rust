@@ -262,8 +262,7 @@ impl ManagedHttpClient {
         max_notifications: usize,
         max_payload_bytes: usize,
         observer: &mut (dyn FnMut(&ModernHttpSubscriptionListenEvent) -> ControlFlow<()> + Send),
-    ) -> Result<Option<ModernHttpSubscriptionTermination>, ManagedHttpClientError>
-    {
+    ) -> Result<Option<ModernHttpSubscriptionTermination>, ManagedHttpClientError> {
         self.listen_task_events_with_cancellation(
             cx,
             &McpRequestCancellation::new(),
@@ -286,8 +285,7 @@ impl ManagedHttpClient {
         max_notifications: usize,
         max_payload_bytes: usize,
         observer: &mut (dyn FnMut(&ModernHttpSubscriptionListenEvent) -> ControlFlow<()> + Send),
-    ) -> Result<Option<ModernHttpSubscriptionTermination>, ManagedHttpClientError>
-    {
+    ) -> Result<Option<ModernHttpSubscriptionTermination>, ManagedHttpClientError> {
         self.admit_tasks(cx, cancellation)?;
         let request = ListenRequest::new(task_ids, max_notifications, max_payload_bytes, observer)?;
         match self

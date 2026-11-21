@@ -1738,8 +1738,7 @@ fn validate_supported_schema_keywords(
         // remain absent from SUPPORTED so custom dialects retain their closed
         // keyword contract. The 2019 recursive keywords still require their
         // own semantics and cannot become unchecked extension annotations.
-        let unsupported_reserved =
-            matches!(keyword.as_str(), "$recursiveAnchor" | "$recursiveRef");
+        let unsupported_reserved = matches!(keyword.as_str(), "$recursiveAnchor" | "$recursiveRef");
         if unsupported_reserved || (!unknown_annotations && !SUPPORTED.contains(&keyword.as_str()))
         {
             return Err(SchemaAdmissionError::new(
@@ -2809,9 +2808,7 @@ fn compile_schema_pattern(source: &str) -> Result<Regex, regex::Error> {
         }
         syntax_source.push('\\');
         syntax_source.push(escape);
-        if let Some(prefix) =
-            schema_pattern_escape_prefix(escape, characters.as_str(), flags)
-        {
+        if let Some(prefix) = schema_pattern_escape_prefix(escape, characters.as_str(), flags) {
             syntax_source.push_str(prefix);
             normalized.push('\\');
             normalized.push(escape);
@@ -5523,7 +5520,9 @@ fn mark_dynamic_reference_evaluated_array_items<'a>(
     match resolve_dynamic_reference_with_work(root_schema, schema, reference, context) {
         Ok(target) if branch_is_valid(target, value, path, context) => {
             if let Some(target) = target.as_object() {
-                mark_evaluated_array_items(target, value, arr, path, true, evaluated, errors, context);
+                mark_evaluated_array_items(
+                    target, value, arr, path, true, evaluated, errors, context,
+                );
             }
         }
         Ok(_) => {}
@@ -9393,8 +9392,7 @@ mod tests {
             assert_eq!(admitted.schema(), &source);
 
             let mut wrong_scope = source.clone();
-            wrong_scope["$defs"]["outer"]["properties"]["local"]["$ref"] =
-                json!("#rootOnly");
+            wrong_scope["$defs"]["outer"]["properties"]["local"]["$ref"] = json!("#rootOnly");
             let error = admit_final_schema(wrong_scope)
                 .expect_err("an inner fragment cannot escape to an outer resource's anchor");
             assert_eq!(error.path(), "$.$defs.outer.properties.local.$ref");
@@ -9459,7 +9457,14 @@ mod tests {
             );
         }
         for reference in [
-            "bad%", "bad%2", "bad%ZZ", "bad path", "é", "child#fragment", "1:child", ":child",
+            "bad%",
+            "bad%2",
+            "bad%ZZ",
+            "bad path",
+            "é",
+            "child#fragment",
+            "1:child",
+            ":child",
         ] {
             assert!(
                 resolve_uri_reference(Some("file:/schemas/root"), reference).is_none(),
@@ -9802,7 +9807,10 @@ mod tests {
                 "$ref": format!("#/$defs/choices/anyOf/{token}")
             });
             let errors = validate(&source, &json!(0)).unwrap_err();
-            assert_eq!(errors[0].message, "invalid local schema reference", "{token}");
+            assert_eq!(
+                errors[0].message, "invalid local schema reference",
+                "{token}"
+            );
         }
         for token in ["-".to_owned(), "12".to_owned(), "9".repeat(100)] {
             let source = json!({
@@ -9811,8 +9819,7 @@ mod tests {
             });
             let errors = validate(&source, &json!(0)).unwrap_err();
             assert_eq!(
-                errors[0].message,
-                "unresolved local schema reference",
+                errors[0].message, "unresolved local schema reference",
                 "{token}"
             );
         }
@@ -10649,9 +10656,8 @@ mod tests {
                 } else {
                     schema.validate(&instance)
                 };
-                let errors = result.expect_err(
-                    "an unevaluated number cannot become a successful branch mismatch",
-                );
+                let errors = result
+                    .expect_err("an unevaluated number cannot become a successful branch mismatch");
                 assert_eq!(errors.len(), 1);
                 assert_eq!(errors[0].path, "root.value");
                 assert_eq!(errors[0].code(), "SchemaResourceLimit");
@@ -10672,9 +10678,8 @@ mod tests {
             } else {
                 schema.validate(&instance)
             };
-            let errors = result.expect_err(
-                "minContains zero cannot discard an exact-number resource failure",
-            );
+            let errors = result
+                .expect_err("minContains zero cannot discard an exact-number resource failure");
             assert_eq!(errors.len(), 1);
             assert_eq!(errors[0].path, "root[0]");
             assert_eq!(errors[0].code(), "SchemaResourceLimit");
@@ -10997,7 +11002,8 @@ mod tests {
         let accepted = arbitrary_precision_number(MAX_SCHEMA_INSTANCE_BYTES);
         let planted = arbitrary_precision_number(MAX_SCHEMA_INSTANCE_BYTES + 1);
         for source in [Value::Bool(true), json!({})] {
-            validate(&source, &accepted).expect("the exact raw numeric byte boundary remains valid");
+            validate(&source, &accepted)
+                .expect("the exact raw numeric byte boundary remains valid");
             for result in [
                 validate(&source, &planted),
                 validate_strict(&source, &planted),
@@ -11333,7 +11339,10 @@ mod tests {
             assert!(unconstrained.validate(&json!([null])).is_ok(), "{keyword}");
             let false_subschema = admit_final_schema(json!({keyword: [false]}))
                 .expect("a singleton false schema is structurally valid");
-            assert!(false_subschema.validate(&json!([null])).is_err(), "{keyword}");
+            assert!(
+                false_subschema.validate(&json!([null])).is_err(),
+                "{keyword}"
+            );
         }
     }
 
@@ -12021,7 +12030,9 @@ mod tests {
         for (pattern, prefix, suffix) in [(r"^.$", "", ""), (r"^a.b$", "a", "b")] {
             let source = json!({"pattern": pattern});
             let admitted = admit_final_schema(source.clone()).unwrap();
-            for (characters, expected) in [(accepted.as_slice(), true), (rejected.as_slice(), false)] {
+            for (characters, expected) in
+                [(accepted.as_slice(), true), (rejected.as_slice(), false)]
+            {
                 for character in characters {
                     let value = json!(format!("{prefix}{character}{suffix}"));
                     assert_eq!(
@@ -12075,11 +12086,7 @@ mod tests {
             (r"^(?P<a[>a)\b.$", "aπ", "ab"),
             (r"(?x)^( ?P<a.1>.)$", "a", "\r"),
             (r"(?x)^(?P<a.1>( ?s).).$", "\ra", "\r\r"),
-            (
-                "(?x)^( # capture prefix [ . \\b\n ?<a[>.)$",
-                "a",
-                "\r",
-            ),
+            ("(?x)^( # capture prefix [ . \\b\n ?<a[>.)$", "a", "\r"),
             // Existing case-insensitive engine extensions keep their word
             // boundaries, but their flags must not escape a scoped group.
             (r"(?i:^\bπ\b$)", "π", "!"),
@@ -12144,17 +12151,9 @@ mod tests {
             (r"^π\b{end}.$", "π!", "πa"),
             (r"^\b{start-half}π.$", "πa", "π\r"),
             (r"^π\b{end-half}.$", "π!", "πa"),
-            (
-                "(?x)^\\b{ s # name } . [\n t a r t }π.$",
-                "πa",
-                "π\r",
-            ),
+            ("(?x)^\\b{ s # name } . [\n t a r t }π.$", "πa", "π\r"),
             (r"^a\b{1}.$", "aπ", "ab"),
-            (
-                "(?x)^a\\b{ # count } start\n 1 }.$",
-                "aπ",
-                "ab",
-            ),
+            ("(?x)^a\\b{ # count } start\n 1 }.$", "aπ", "ab"),
         ] {
             let source = json!({"pattern": pattern});
             let admitted = admit_final_schema(source.clone()).unwrap();
@@ -12197,29 +12196,46 @@ mod tests {
                 "additionalProperties": false
             });
             let admitted = admit_final_schema(source.clone()).unwrap();
-            assert!(admitted.validate(&json!({accepted: 1})).is_ok(), "{pattern}");
-            assert!(admitted.validate(&json!({rejected: 1})).is_err(), "{pattern}");
+            assert!(
+                admitted.validate(&json!({accepted: 1})).is_ok(),
+                "{pattern}"
+            );
+            assert!(
+                admitted.validate(&json!({rejected: 1})).is_err(),
+                "{pattern}"
+            );
             assert!(
                 admitted.validate(&json!({accepted: "1"})).is_err(),
                 "{pattern}"
             );
-            assert!(validate(&source, &json!({accepted: 1})).is_ok(), "{pattern}");
-            assert!(validate(&source, &json!({rejected: 1})).is_err(), "{pattern}");
+            assert!(
+                validate(&source, &json!({accepted: 1})).is_ok(),
+                "{pattern}"
+            );
+            assert!(
+                validate(&source, &json!({rejected: 1})).is_err(),
+                "{pattern}"
+            );
 
             let evaluated = admit_final_schema(json!({
                 "allOf": [{"patternProperties": {pattern: {"type": "integer"}}}],
                 "unevaluatedProperties": false
             }))
             .unwrap();
-            assert!(evaluated.validate(&json!({accepted: 1})).is_ok(), "{pattern}");
-            assert!(evaluated.validate(&json!({rejected: 1})).is_err(), "{pattern}");
+            assert!(
+                evaluated.validate(&json!({accepted: 1})).is_ok(),
+                "{pattern}"
+            );
+            assert!(
+                evaluated.validate(&json!({rejected: 1})).is_err(),
+                "{pattern}"
+            );
             assert!(
                 evaluated.validate(&json!({accepted: "1"})).is_err(),
                 "{pattern}"
             );
 
-            let names =
-                admit_final_schema(json!({"propertyNames": {"pattern": pattern}})).unwrap();
+            let names = admit_final_schema(json!({"propertyNames": {"pattern": pattern}})).unwrap();
             assert!(names.validate(&json!({accepted: 1})).is_ok(), "{pattern}");
             assert!(names.validate(&json!({rejected: 1})).is_err(), "{pattern}");
         }

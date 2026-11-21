@@ -200,17 +200,16 @@ use session::{
 #[cfg(feature = "tasks")]
 pub use tasks::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-    FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
-    TaskExecutionAuthorizer,
-    FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskExecutionBudget,
-    FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskInitialWorkClaim,
-    FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
-    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
-    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    InMemoryFinalTaskStore, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES,
-    MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS, TaskRetentionAdministrator, TaskRetentionAuditPage,
-    TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
-    TaskRetentionReclamation, TaskRetentionTarget,
+    FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskAccessMetadata,
+    FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
+    FinalTaskInitialWorkClaim, FinalTaskNotificationEmitter, FinalTaskOperation,
+    FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+    MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
+    TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskRetentionAdministrator,
+    TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
+    TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
 };
 #[cfg(all(test, feature = "tasks"))]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
@@ -620,7 +619,9 @@ use fastmcp_protocol::{
     UnsubscribeResourceParams,
 };
 #[cfg(test)]
-use fastmcp_protocol::{CompleteResult, FinalCoreResult, FinalSubscriptionsListenResult, ResultMeta};
+use fastmcp_protocol::{
+    CompleteResult, FinalCoreResult, FinalSubscriptionsListenResult, ResultMeta,
+};
 #[cfg(feature = "legacy-2024-11-05")]
 use legacy_2024::{
     Legacy2024AdapterError, Legacy2024Handler, Legacy2024HandlerError, Legacy2024Outbound,
@@ -3413,7 +3414,8 @@ type SubscriptionDeliverySender = Arc<
 >;
 
 #[derive(Clone)]
-enum PumpIoMode {    Split,
+enum PumpIoMode {
+    Split,
     #[cfg(all(test, feature = "websocket"))]
     GuardedSplit(SubscriptionDeliverySender),
     #[cfg(not(feature = "legacy-2024-11-05"))]
@@ -4212,12 +4214,15 @@ impl LoggingConfig {
                 _ => config.level,
             };
         }
-        config.timestamps = !lookup("FASTMCP_LOG_TIMESTAMPS")
-            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"));
-        config.targets = !lookup("FASTMCP_LOG_TARGETS")
-            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"));
-        config.file_line = lookup("FASTMCP_LOG_FILE_LINE")
-            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        config.timestamps = !lookup("FASTMCP_LOG_TIMESTAMPS").is_some_and(|value| {
+            matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no")
+        });
+        config.targets = !lookup("FASTMCP_LOG_TARGETS").is_some_and(|value| {
+            matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no")
+        });
+        config.file_line = lookup("FASTMCP_LOG_FILE_LINE").is_some_and(|value| {
+            matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+        });
         config
     }
 }
@@ -5463,7 +5468,9 @@ impl Drop for FinalSubscriptionEventReservation {
         {
             *bytes -= self.bytes;
             if *bytes == 0 {
-                admission.principal_event_bytes.remove(&self.stream.principal);
+                admission
+                    .principal_event_bytes
+                    .remove(&self.stream.principal);
             }
         }
     }
@@ -6114,7 +6121,9 @@ impl FinalSubscriptionLease {
             }
             entry
         };
-        let delivery = entry.as_ref().and_then(|entry| entry.terminal_delivery.clone());
+        let delivery = entry
+            .as_ref()
+            .and_then(|entry| entry.terminal_delivery.clone());
         if let Some(entry) = entry {
             FinalSubscriptionRegistry::terminate_removed_entry(entry);
         }
@@ -6129,7 +6138,10 @@ impl FinalSubscriptionLease {
             }
             if self.is_peer_terminated()
                 || cancellation.is_cancel_requested()
-                    && !self.election.terminal_callback_pending.load(Ordering::Acquire)
+                    && !self
+                        .election
+                        .terminal_callback_pending
+                        .load(Ordering::Acquire)
             {
                 // Success is published before the callback-pending flag is
                 // cleared; do not lose it across the two snapshots above.
@@ -6142,7 +6154,10 @@ impl FinalSubscriptionLease {
                 return Err(McpError::request_cancelled());
             }
             if Instant::now() >= deadline
-                || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+                || cx
+                    .budget()
+                    .deadline
+                    .is_some_and(|deadline| cx.now() >= deadline)
             {
                 if let Some(delivery) = &delivery {
                     delivery.mark_failed();
@@ -6177,11 +6192,17 @@ impl FinalSubscriptionLease {
 
     async fn server_termination_completed(&self, cx: &Cx) -> bool {
         let deadline = Instant::now() + HTTP_TERMINAL_DRAIN_TIMEOUT;
-        while self.election.terminal_callback_pending.load(Ordering::Acquire)
+        while self
+            .election
+            .terminal_callback_pending
+            .load(Ordering::Acquire)
             && !self.has_graceful_completion()
         {
             if Instant::now() >= deadline
-                || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+                || cx
+                    .budget()
+                    .deadline
+                    .is_some_and(|deadline| cx.now() >= deadline)
             {
                 return false;
             }
@@ -6269,7 +6290,9 @@ fn complete_final_subscription_server_termination(
     // A transport consumer can finish a queued control and cancel the request
     // before its sender callback has returned. Keep that wake distinguishable
     // from peer cancellation until this exact callback publishes its outcome.
-    election.terminal_callback_pending.store(true, Ordering::Release);
+    election
+        .terminal_callback_pending
+        .store(true, Ordering::Release);
     let sent = send_final_subscription_termination_control(
         subscription_id,
         terminal_delivery,
@@ -6281,12 +6304,16 @@ fn complete_final_subscription_server_termination(
             delivery.mark_failed();
         }
         request_cancellation.cancel();
-        election.terminal_callback_pending.store(false, Ordering::Release);
+        election
+            .terminal_callback_pending
+            .store(false, Ordering::Release);
         return false;
     }
     election.graceful_completion.store(true, Ordering::Release);
     request_cancellation.cancel();
-    election.terminal_callback_pending.store(false, Ordering::Release);
+    election
+        .terminal_callback_pending
+        .store(false, Ordering::Release);
     true
 }
 
@@ -6809,7 +6836,8 @@ impl FinalSubscriptionRegistry {
         let empty_params = fastmcp_protocol::FinalEmptyNotificationParams::default();
         let (source_bytes, metadata, params_empty) = match &notification {
             ServerNotification::ResourceUpdated(params) => {
-                if params.additional.contains_key("uri") || params.additional.contains_key("_meta") {
+                if params.additional.contains_key("uri") || params.additional.contains_key("_meta")
+                {
                     return Err(McpError::invalid_params(
                         "subscription notification additional member collides",
                     ));
@@ -7169,7 +7197,8 @@ impl FinalSubscriptionRegistry {
                     first = false;
                 }
                 FinalSubscriptionPhase::ServerTerminationPending(1)
-                    if (sent || !authorized) && !entry.request_cancellation.is_cancel_requested() =>
+                    if (sent || !authorized)
+                        && !entry.request_cancellation.is_cancel_requested() =>
                 {
                     events.clear();
                     *phase = FinalSubscriptionPhase::ServerTerminated;
@@ -10632,7 +10661,10 @@ fn raw_websocket_upgrade_authorization_is_admissible(head: &[u8]) -> Result<(), 
 }
 
 #[cfg(all(test, feature = "websocket"))]
-#[allow(dead_code, reason = "retained comparison path; public WebSocket serving is native")]
+#[allow(
+    dead_code,
+    reason = "retained comparison path; public WebSocket serving is native"
+)]
 async fn run_websocket_dispatch_bridge(
     cx: &Cx,
     server: Arc<Server>,
@@ -11455,16 +11487,20 @@ impl ServerHttpSession {
                 admitted_notification = Some(admitted_request.clone());
             }
             http_parameter_headers = Some(http_admission::http_parameter_headers(&request.headers));
-            auth_receipt = match self.preauthenticate_modern_http_request(
-                cx,
-                &admitted_request,
-                &transport_authorization,
-                modern_request_cancellation.as_ref(),
-            ).await {
+            auth_receipt = match self
+                .preauthenticate_modern_http_request(
+                    cx,
+                    &admitted_request,
+                    &transport_authorization,
+                    modern_request_cancellation.as_ref(),
+                )
+                .await
+            {
                 Ok(receipt) => Some(AuthDispatchCustody::Http(receipt)),
                 Err(response) => {
                     return Ok(ServerHttpEndpointResponse::Immediate(
-                        self.server.http_response_with_allowed_origin(&request, response),
+                        self.server
+                            .http_response_with_allowed_origin(&request, response),
                     ));
                 }
             };
@@ -11723,7 +11759,10 @@ impl ServerHttpSession {
     ) -> Result<AuthAdmissionReceipt, HttpResponse> {
         self.server
             .preauthenticate_http_request_with_cancellation_async(
-                cx, request, transport_authorization, cancellation,
+                cx,
+                request,
+                transport_authorization,
+                cancellation,
             )
             .await
     }
@@ -11744,7 +11783,8 @@ impl ServerHttpSession {
         let admitted = request
             .or(synthetic.as_ref())
             .expect("synthetic fills GET /sse");
-        self.server.preauthenticate_http_request(cx, admitted, transport_authorization)
+        self.server
+            .preauthenticate_http_request(cx, admitted, transport_authorization)
     }
 
     fn admit_modern_http_request(
@@ -11763,7 +11803,9 @@ impl ServerHttpSession {
             &request.path,
             &headers,
             &request.body,
-            self.server.extension_handler_registry().map(ExtensionHandlerRegistry::descriptor_registry),
+            self.server
+                .extension_handler_registry()
+                .map(ExtensionHandlerRegistry::descriptor_registry),
         )
     }
 
@@ -12310,16 +12352,20 @@ impl ServerHttpSession {
                     ))));
                 }
             };
-        let auth_receipt = match self.preauthenticate_modern_http_request(
-            cx,
-            &admitted_request,
-            &transport_authorization,
-            modern_request_cancellation.as_ref(),
-        ).await {
+        let auth_receipt = match self
+            .preauthenticate_modern_http_request(
+                cx,
+                &admitted_request,
+                &transport_authorization,
+                modern_request_cancellation.as_ref(),
+            )
+            .await
+        {
             Ok(receipt) => AuthDispatchCustody::Http(receipt),
             Err(response) => {
                 return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(
-                    self.server.http_response_with_allowed_origin(&request, response),
+                    self.server
+                        .http_response_with_allowed_origin(&request, response),
                 ))));
             }
         };
@@ -12897,7 +12943,10 @@ fn oauth_http_client_credentials(
 
 fn oauth_http_has_client_assertion(admission: &OAuthParameterAdmission) -> bool {
     admission.parameters().iter().any(|parameter| {
-        matches!(parameter.name(), "client_assertion" | "client_assertion_type")
+        matches!(
+            parameter.name(),
+            "client_assertion" | "client_assertion_type"
+        )
     })
 }
 
@@ -12910,9 +12959,10 @@ fn oauth_http_private_key_jwt(
     authorization: Option<&str>,
 ) -> Result<zeroize::Zeroizing<String>, HttpResponse> {
     if authorization.is_some()
-        || admission.parameters().iter().any(|parameter| {
-            matches!(parameter.name(), "client_id" | "client_secret")
-        })
+        || admission
+            .parameters()
+            .iter()
+            .any(|parameter| matches!(parameter.name(), "client_id" | "client_secret"))
     {
         return Err(oauth_http_invalid_request());
     }
@@ -12943,7 +12993,10 @@ fn oauth_http_private_key_jwt_token(
         ));
     }
     if admission.parameters().iter().any(|parameter| {
-        matches!(parameter.name(), "code" | "redirect_uri" | "code_verifier" | "refresh_token")
+        matches!(
+            parameter.name(),
+            "code" | "redirect_uri" | "code_verifier" | "refresh_token"
+        )
     }) {
         return oauth_http_invalid_request();
     }
@@ -12960,9 +13013,9 @@ fn oauth_http_private_key_jwt_token(
             let value = value.into_string();
             if value.split(' ').any(|scope| {
                 scope.is_empty()
-                    || !scope.bytes().all(|byte| {
-                        matches!(byte, 0x21 | 0x23..=0x5B | 0x5D..=0x7E)
-                    })
+                    || !scope
+                        .bytes()
+                        .all(|byte| matches!(byte, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
             }) {
                 return oauth_http_error(OAuthError::InvalidScope(
                     "invalid machine scope syntax".to_string(),
@@ -12979,13 +13032,14 @@ fn oauth_http_private_key_jwt_token(
     };
     // This is the same trusted spelling used in authorization-server metadata.
     // Host, forwarded headers and body fields never select an assertion target.
-    let endpoint = format!("{}/token", routes.public_endpoint_base().trim_end_matches('/'));
-    match routes.server().token_with_development_private_key_jwt(
-        assertion,
-        &endpoint,
-        &resource,
-        &scopes,
-    ) {
+    let endpoint = format!(
+        "{}/token",
+        routes.public_endpoint_base().trim_end_matches('/')
+    );
+    match routes
+        .server()
+        .token_with_development_private_key_jwt(assertion, &endpoint, &resource, &scopes)
+    {
         Ok(response) => oauth_http_no_store(HttpResponse::ok().with_json(&response)),
         Err(error) => oauth_http_error(error),
     }
@@ -13470,11 +13524,10 @@ fn dispatch_oauth_h1_request(
             "{}/revoke",
             routes.public_endpoint_base().trim_end_matches('/'),
         );
-        return match routes.server().revoke_with_development_private_key_jwt(
-            &assertion,
-            &endpoint,
-            &token,
-        ) {
+        return match routes
+            .server()
+            .revoke_with_development_private_key_jwt(&assertion, &endpoint, &token)
+        {
             Ok(()) => oauth_http_no_store(HttpResponse::ok()),
             Err(error) => oauth_http_error(error),
         };
@@ -13800,7 +13853,11 @@ fn native_http_write_authority(
 ) -> Result<NativeHttpWriteAuthority, ()> {
     // A terminal drain can mask shutdown cancellation, never the caller's
     // original deadline. This also covers a ready write at exact equality.
-    if cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline) {
+    if cx
+        .budget()
+        .deadline
+        .is_some_and(|deadline| cx.now() >= deadline)
+    {
         return Err(());
     }
     let listener_stopped = listener_shutdown.is_requested();
@@ -13820,16 +13877,19 @@ fn native_http_write_authority(
             // One deadline spans the election wait, every queued/partial
             // frame, the terminal flush and the final HTTP chunk. Progress
             // must not restart the whole subscription shutdown allowance.
-            let mut deadline = delivery.native_shutdown_deadline
+            let mut deadline = delivery
+                .native_shutdown_deadline
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let deadline = deadline.get_or_insert_with(|| Instant::now() + HTTP_TERMINAL_DRAIN_TIMEOUT);
+            let deadline =
+                deadline.get_or_insert_with(|| Instant::now() + HTTP_TERMINAL_DRAIN_TIMEOUT);
             if Instant::now() >= *deadline {
                 return Err(());
             }
         }
         if matches!(completion, FINAL_TERMINAL_ENQUEUED | FINAL_TERMINAL_DRAINED)
-            && (!subscription || matches!(control, FINAL_TERMINAL_ENQUEUED | FINAL_TERMINAL_DRAINED))
+            && (!subscription
+                || matches!(control, FINAL_TERMINAL_ENQUEUED | FINAL_TERMINAL_DRAINED))
         {
             return Ok(NativeHttpWriteAuthority::Terminal);
         }
@@ -13840,7 +13900,11 @@ fn native_http_write_authority(
             return Ok(NativeHttpWriteAuthority::AwaitingSubscriptionTermination);
         }
     }
-    if cancelled { Err(()) } else { Ok(NativeHttpWriteAuthority::Ordinary) }
+    if cancelled {
+        Err(())
+    } else {
+        Ok(NativeHttpWriteAuthority::Ordinary)
+    }
 }
 
 /// Own one complete response write through its flush. The pinned operation
@@ -13892,7 +13956,9 @@ where
                 }
                 // Socket writes observe the ambient Cx too. Mask only this
                 // poll; no mask crosses an await or the write deadline.
-                Ok(NativeHttpWriteAuthority::Terminal) => cx.masked(|| write.as_mut().poll(task_cx)),
+                Ok(NativeHttpWriteAuthority::Terminal) => {
+                    cx.masked(|| write.as_mut().poll(task_cx))
+                }
                 Ok(NativeHttpWriteAuthority::Ordinary) => write.as_mut().poll(task_cx),
                 Ok(NativeHttpWriteAuthority::AwaitingSubscriptionTermination) => {
                     task_cx.waker().wake_by_ref();
@@ -14618,7 +14684,9 @@ fn spawn_modern_sse_dispatch(
         let inbound = inbound.with_cx(request_cx.clone());
         let cancellation = response_sender.request_cancellation();
         let subscription_request = request.method == SUBSCRIPTIONS_LISTEN;
-        terminal_delivery.subscription_request.store(subscription_request, Ordering::Release);
+        terminal_delivery
+            .subscription_request
+            .store(subscription_request, Ordering::Release);
         let mut duplicate_response = None;
         let _active_request = match request.id.clone() {
             Some(id) => match ActiveRequestGuard::try_new_with_cancellation(
@@ -15832,12 +15900,17 @@ async fn serve_http_connection(
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
-        if let Err(response) =
-            admit_modern_http_post(
-                http_config, "POST", raw_path, &headers, &request.body,
-                endpoint.server.extension_handler_registry().map(ExtensionHandlerRegistry::descriptor_registry),
-            )
-        {
+        if let Err(response) = admit_modern_http_post(
+            http_config,
+            "POST",
+            raw_path,
+            &headers,
+            &request.body,
+            endpoint
+                .server
+                .extension_handler_registry()
+                .map(ExtensionHandlerRegistry::descriptor_registry),
+        ) {
             let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
             return;
         }
@@ -16253,12 +16326,17 @@ async fn serve_modern_http_connection(
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
-        if let Err(response) =
-            admit_modern_http_post(
-                http_config, "POST", raw_path, &headers, &request.body,
-                endpoint.server.extension_handler_registry().map(ExtensionHandlerRegistry::descriptor_registry),
-            )
-        {
+        if let Err(response) = admit_modern_http_post(
+            http_config,
+            "POST",
+            raw_path,
+            &headers,
+            &request.body,
+            endpoint
+                .server
+                .extension_handler_registry()
+                .map(ExtensionHandlerRegistry::descriptor_registry),
+        ) {
             let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
             return;
         }
@@ -17136,8 +17214,8 @@ impl Server {
                 let mut cancel_forwarded = false;
                 std::future::poll_fn(|task_cx| {
                     fastmcp_core::runtime::with_caller_context(context.cx(), || {
-                        let has_timer = Cx::current()
-                            .is_some_and(|caller| caller.timer_driver().is_some());
+                        let has_timer =
+                            Cx::current().is_some_and(|caller| caller.timer_driver().is_some());
                         if !cancel_forwarded
                             && (context.cx().now() >= deadline
                                 || Self::enforce_request_context(&context).is_err()
@@ -17320,9 +17398,9 @@ impl Server {
                             )))
                         }
                         Ok(result) => result,
-                        Err(_) => {
-                            std::task::Poll::Ready(Err(extension_panic_error("notification_handler")))
-                        }
+                        Err(_) => std::task::Poll::Ready(Err(extension_panic_error(
+                            "notification_handler",
+                        ))),
                     }
                 })
             })
@@ -17383,7 +17461,9 @@ impl Server {
         require_exact_modern_extension_metadata(request)?;
         request_ctx.ensure_live()?;
         if request.is_notification() {
-            return Err(McpError::invalid_params("Extension request is not admitted"));
+            return Err(McpError::invalid_params(
+                "Extension request is not admitted",
+            ));
         }
         let client = final_client_extension_discovery(request)?;
         let negotiated = self.negotiate_extensions(&client).map_err(|error| {
@@ -17685,22 +17765,20 @@ impl Server {
     ) -> McpResult<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
         request_ctx.ensure_live()?;
         let client = final_client_extension_discovery(request)?;
-        let current = self
-            .negotiate_extensions(&client)
-            .map_err(|error| {
-                // Name the refusal. `map_err(|_| ...)` discarded the only thing
-                // that distinguished NotConfigured from ResolverPoisoned from
-                // each of the seven Protocol variants, so a -32602 on this path
-                // was unactionable from the wire and from a test panic alike --
-                // the reason bd-extauth-three-of-five-red-dvh3l cannot state its
-                // own root cause. Same code and same refusal condition; only a
-                // reason is added. ServerExtensionNegotiationError's Display
-                // carries fixed phrases plus extension ids, which the peer
-                // already advertises, so this discloses nothing new.
-                McpError::invalid_params(format!(
-                    "Extension request negotiation was rejected: {error}"
-                ))
-            })?;
+        let current = self.negotiate_extensions(&client).map_err(|error| {
+            // Name the refusal. `map_err(|_| ...)` discarded the only thing
+            // that distinguished NotConfigured from ResolverPoisoned from
+            // each of the seven Protocol variants, so a -32602 on this path
+            // was unactionable from the wire and from a test panic alike --
+            // the reason bd-extauth-three-of-five-red-dvh3l cannot state its
+            // own root cause. Same code and same refusal condition; only a
+            // reason is added. ServerExtensionNegotiationError's Display
+            // carries fixed phrases plus extension ids, which the peer
+            // already advertises, so this discloses nothing new.
+            McpError::invalid_params(format!(
+                "Extension request negotiation was rejected: {error}"
+            ))
+        })?;
         request_ctx.ensure_live()?;
         if &current != supplied {
             return Err(McpError::invalid_params(
@@ -18647,8 +18725,8 @@ impl Server {
                     }
                     .map(Some)
                 }
-                None if request.method == SUBSCRIPTIONS_LISTEN => {
-                    self.dispatch_final_subscriptions_listen(
+                None if request.method == SUBSCRIPTIONS_LISTEN => self
+                    .dispatch_final_subscriptions_listen(
                         &request_ctx,
                         &request,
                         modern_http_owner,
@@ -18657,8 +18735,7 @@ impl Server {
                         Arc::clone(&notification_sender),
                     )
                     .await
-                    .map(|()| None)
-                }
+                    .map(|()| None),
                 None => match Arc::clone(&self.router)
                     .dispatch_stateless_owned_with_handler_admission(
                         request_ctx.clone(),
@@ -18965,50 +19042,54 @@ impl Server {
         #[cfg(feature = "tasks")]
         let mut task_access_revalidation = None;
         #[cfg(feature = "tasks")]
-        let notification_sender =
-            if tasks_requested && let Some(runtime) = self.final_task_runtime.as_ref() {
-                let mut admitted_tasks = BTreeMap::new();
-                for task_id in task_subscription_ids(&params.notifications)
-                    .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
-                    .unwrap_or_default()
-                {
-                    let metadata = runtime.admit_task_for_request(
-                        request_ctx, &task_id, TaskAccessAction::Listen,
-                    )?;
-                    admitted_tasks.insert(task_id, metadata);
-                }
-                let admitted_tasks = Arc::new(admitted_tasks);
-                task_access_revalidation = Some((runtime.clone(), Arc::clone(&admitted_tasks)));
-                let runtime = runtime.clone();
-                let task_context = request_ctx.clone();
-                let task_cancellation = request_cancellation.clone();
-                let guarded: NotificationSender = Arc::new(move |notification| {
-                    if notification.method == fastmcp_protocol::TASK_STATUS_NOTIFICATION {
-                        let event = serde_json::to_value(&notification).ok().and_then(|wire| {
-                            serde_json::from_value::<FinalTaskStatusNotification>(wire).ok()
-                        });
-                        let Some(event) = event else {
+        let notification_sender = if tasks_requested
+            && let Some(runtime) = self.final_task_runtime.as_ref()
+        {
+            let mut admitted_tasks = BTreeMap::new();
+            for task_id in task_subscription_ids(&params.notifications)
+                .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+                .unwrap_or_default()
+            {
+                let metadata = runtime.admit_task_for_request(
+                    request_ctx,
+                    &task_id,
+                    TaskAccessAction::Listen,
+                )?;
+                admitted_tasks.insert(task_id, metadata);
+            }
+            let admitted_tasks = Arc::new(admitted_tasks);
+            task_access_revalidation = Some((runtime.clone(), Arc::clone(&admitted_tasks)));
+            let runtime = runtime.clone();
+            let task_context = request_ctx.clone();
+            let task_cancellation = request_cancellation.clone();
+            let guarded: NotificationSender = Arc::new(move |notification| {
+                if notification.method == fastmcp_protocol::TASK_STATUS_NOTIFICATION {
+                    let event = serde_json::to_value(&notification).ok().and_then(|wire| {
+                        serde_json::from_value::<FinalTaskStatusNotification>(wire).ok()
+                    });
+                    let Some(event) = event else {
+                        return;
+                    };
+                    let Some(admitted) = admitted_tasks.get(&event.params.task.base().task_id)
+                    else {
+                        return;
+                    };
+                    match runtime.notification_matches_task_access(&task_context, admitted, &event)
+                    {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(_) => {
+                            task_cancellation.cancel();
                             return;
-                        };
-                        let Some(admitted) = admitted_tasks.get(&event.params.task.base().task_id)
-                        else {
-                            return;
-                        };
-                        match runtime.notification_matches_task_access(&task_context, admitted, &event) {
-                            Ok(true) => {}
-                            Ok(false) => return,
-                            Err(_) => {
-                                task_cancellation.cancel();
-                                return;
-                            }
                         }
                     }
-                    notification_sender(notification);
-                });
-                guarded
-            } else {
-                notification_sender
-            };
+                }
+                notification_sender(notification);
+            });
+            guarded
+        } else {
+            notification_sender
+        };
         #[cfg(not(feature = "tasks"))]
         let tasks_requested = false;
 
@@ -19157,7 +19238,10 @@ impl Server {
                     "Task subscriptions require the caller's timer driver",
                 ));
             }
-            if !admitted.values().all(|metadata| runtime.task_access_is_current(request_ctx, metadata)) {
+            if !admitted
+                .values()
+                .all(|metadata| runtime.task_access_is_current(request_ctx, metadata))
+            {
                 return Err(McpError::invalid_params("Task not found"));
             }
         }
@@ -19191,9 +19275,9 @@ impl Server {
             if request_ctx.cx().now() >= task_access_check_at {
                 task_access_check_at = request_ctx.cx().now().saturating_add_nanos(1_000_000_000);
                 if let Some((runtime, admitted)) = task_access_revalidation.as_ref()
-                    && !admitted.values().all(|metadata| {
-                        runtime.task_access_is_current(request_ctx, metadata)
-                    })
+                    && !admitted
+                        .values()
+                        .all(|metadata| runtime.task_access_is_current(request_ctx, metadata))
                 {
                     request_cancellation.cancel();
                 }
@@ -19218,9 +19302,10 @@ impl Server {
                     && !request_cancellation.is_cancel_requested()
                 {
                     if Instant::now() >= deadline
-                        || request_ctx.budget().deadline.is_some_and(|deadline| {
-                            request_ctx.cx().now() >= deadline
-                        })
+                        || request_ctx
+                            .budget()
+                            .deadline
+                            .is_some_and(|deadline| request_ctx.cx().now() >= deadline)
                     {
                         if let Some(delivery) = &terminal_delivery {
                             delivery.mark_failed();
@@ -19236,31 +19321,45 @@ impl Server {
             if let Some(listener) = mixed_relay_listener.as_mut() {
                 let operation = listener.next_event(request_ctx.cx(), &request_cancellation);
                 let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
-                    runtime.guard_task_subscription_operation(
-                        request_ctx.cx(), request_ctx, admitted, &request_cancellation, operation,
-                    ).await
+                    runtime
+                        .guard_task_subscription_operation(
+                            request_ctx.cx(),
+                            request_ctx,
+                            admitted,
+                            &request_cancellation,
+                            operation,
+                        )
+                        .await
                 } else {
                     operation.await
                 };
                 match event {
                     Ok(proxy::ProxyMixedSubscriptionEvent::Catalog(notification)) => {
                         if lease.publish(notification).is_err() {
-                            return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
                         }
                         continue;
                     }
                     Ok(proxy::ProxyMixedSubscriptionEvent::Task(notification)) => {
                         if lease.publish_task(notification).is_err() {
-                            return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
                         }
                         continue;
                     }
                     Ok(proxy::ProxyMixedSubscriptionEvent::Terminal) => {
-                        return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                        return lease
+                            .terminate(request_ctx.cx(), &request_cancellation)
+                            .await;
                     }
                     Err(_) if request_ctx.ensure_live().is_err() => continue,
                     Err(_) => {
-                        return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                        return lease
+                            .terminate(request_ctx.cx(), &request_cancellation)
+                            .await;
                     }
                 }
             }
@@ -19268,28 +19367,42 @@ impl Server {
             if let Some(listener) = relay_listener.as_mut() {
                 let operation = listener.next_async(request_ctx.cx(), &request_cancellation);
                 let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
-                    runtime.guard_task_subscription_operation(
-                        request_ctx.cx(), request_ctx, admitted, &request_cancellation, operation,
-                    ).await
+                    runtime
+                        .guard_task_subscription_operation(
+                            request_ctx.cx(),
+                            request_ctx,
+                            admitted,
+                            &request_cancellation,
+                            operation,
+                        )
+                        .await
                 } else {
                     operation.await
                 };
                 match event {
                     Ok(ProxyFinalTaskListenerEvent::Notification(notification)) => {
                         if lease.publish_task(notification).is_err() {
-                            return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
                         }
                         continue;
                     }
                     Ok(ProxyFinalTaskListenerEvent::Terminal) => {
-                        return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                        return lease
+                            .terminate(request_ctx.cx(), &request_cancellation)
+                            .await;
                     }
                     Ok(ProxyFinalTaskListenerEvent::Acknowledged(_)) => {
-                        return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                        return lease
+                            .terminate(request_ctx.cx(), &request_cancellation)
+                            .await;
                     }
                     Err(_) if request_ctx.ensure_live().is_err() => continue,
                     Err(_) => {
-                        return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                        return lease
+                            .terminate(request_ctx.cx(), &request_cancellation)
+                            .await;
                     }
                 }
             }
@@ -19298,9 +19411,15 @@ impl Server {
                 let operation = listener.next_async(request_ctx.cx(), &request_cancellation);
                 #[cfg(feature = "tasks")]
                 let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
-                    runtime.guard_task_subscription_operation(
-                        request_ctx.cx(), request_ctx, admitted, &request_cancellation, operation,
-                    ).await
+                    runtime
+                        .guard_task_subscription_operation(
+                            request_ctx.cx(),
+                            request_ctx,
+                            admitted,
+                            &request_cancellation,
+                            operation,
+                        )
+                        .await
                 } else {
                     operation.await
                 };
@@ -19312,19 +19431,27 @@ impl Server {
                         // lease. Publishing globally duplicates overlapping
                         // listeners and crosses their authorization boundary.
                         if lease.publish(notification).is_err() {
-                            return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
                         }
                         continue;
                     }
                     Ok(ProxyCatalogListenerEvent::Terminal) => {
-                        return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                        return lease
+                            .terminate(request_ctx.cx(), &request_cancellation)
+                            .await;
                     }
                     Ok(ProxyCatalogListenerEvent::Acknowledged(_)) => {
-                        return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                        return lease
+                            .terminate(request_ctx.cx(), &request_cancellation)
+                            .await;
                     }
                     Err(_) if request_ctx.ensure_live().is_err() => continue,
                     Err(_) => {
-                        return lease.terminate(request_ctx.cx(), &request_cancellation).await;
+                        return lease
+                            .terminate(request_ctx.cx(), &request_cancellation)
+                            .await;
                     }
                 }
             }
@@ -19649,7 +19776,8 @@ impl Server {
                             &notification_send,
                         ) {
                             if let Err(error) = returning_send_result(&error) {
-                                notification_failure.lock()
+                                notification_failure
+                                    .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .get_or_insert(error);
                             }
@@ -20929,7 +21057,10 @@ impl Server {
         {
             return None;
         }
-        Some(self.configured_http_request_handler().handle_options(request))
+        Some(
+            self.configured_http_request_handler()
+                .handle_options(request),
+        )
     }
 
     /// Makes native authentication refusals readable only to explicitly allowed
@@ -20940,7 +21071,9 @@ impl Server {
         response: HttpResponse,
     ) -> HttpResponse {
         if let Some(origin) = request.header("origin")
-            && self.configured_http_request_handler().is_origin_allowed(origin)
+            && self
+                .configured_http_request_handler()
+                .is_origin_allowed(origin)
         {
             response.with_cors(origin)
         } else {
@@ -24188,8 +24321,8 @@ impl Server {
         let mut info =
             ClientCapabilityInfo::new().with_elicitation(elicitation_form, elicitation_url);
         if let Some(sampling) = caps.sampling.as_ref() {
-            info = info
-                .with_sampling_capabilities(sampling.context.clone(), sampling.tools.clone());
+            info =
+                info.with_sampling_capabilities(sampling.context.clone(), sampling.tools.clone());
         }
         if let Some(roots) = caps.roots.as_ref() {
             info = info.with_roots(roots.list_changed);
@@ -24769,8 +24902,7 @@ impl Server {
                         None,
                     )?;
                     Ok(value)
-                })
-            {
+                }) {
                 Ok(value) => (Ok(value), false),
                 Err(error) => {
                     terminal_cancellation |= error.code == McpErrorCode::RequestCancelled;
@@ -24991,8 +25123,12 @@ impl Server {
         transport_authorization: &TransportAuthorization,
     ) -> Result<AuthAdmissionReceipt, HttpResponse> {
         self.preauthenticate_http_request_with_cancellation_async(
-            cx, request, transport_authorization, None,
-        ).await
+            cx,
+            request,
+            transport_authorization,
+            None,
+        )
+        .await
     }
 
     async fn preauthenticate_http_request_with_cancellation_async(
@@ -25042,8 +25178,9 @@ impl Server {
                     authenticated,
                 })
             }
-            Err(error) if error.code == auth::AUTH_PROVIDER_UNAVAILABLE_CODE
-                || error.code == McpErrorCode::RequestCancelled =>
+            Err(error)
+                if error.code == auth::AUTH_PROVIDER_UNAVAILABLE_CODE
+                    || error.code == McpErrorCode::RequestCancelled =>
             {
                 Err(native_http_authentication_unavailable())
             }
@@ -25155,9 +25292,12 @@ impl Server {
             .ok_or_else(|| McpError::internal_error("request scope could not be established"))?;
         Self::enforce_request_context(&context)?;
         let fingerprint = match auth_receipt {
-            Some(receipt) => {
-                receipt.commit(&context, inbound, &mut sanitized, websocket_connection_generation)?
-            }
+            Some(receipt) => receipt.commit(
+                &context,
+                inbound,
+                &mut sanitized,
+                websocket_connection_generation,
+            )?,
             None => {
                 let fingerprint = self.authenticate_request(
                     &context,
@@ -25254,10 +25394,14 @@ impl Server {
     }
 
     fn enforce_authentication_freshness(auth: Option<&AuthContext>) -> McpResult<()> {
-        if auth.and_then(AuthContext::verification_valid_until)
+        if auth
+            .and_then(AuthContext::verification_valid_until)
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return Err(McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed"));
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Authentication failed",
+            ));
         }
         Ok(())
     }
@@ -25297,12 +25441,18 @@ impl Server {
         request: AuthRequest<'_>,
     ) -> McpResult<(Sha256Digest, Option<AuthContext>)> {
         if !request.credential_sources_are_admissible() {
-            return Err(McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed"));
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Authentication failed",
+            ));
         }
         let credential_present = request.has_any_credential_source();
         let Some(provider) = &self.auth_provider else {
             if credential_present {
-                return Err(McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed"));
+                return Err(McpError::new(
+                    McpErrorCode::ResourceForbidden,
+                    "Authentication failed",
+                ));
             }
             return auth::principal_fingerprint(None).map(|fingerprint| (fingerprint, None));
         };
@@ -25310,18 +25460,24 @@ impl Server {
         Self::enforce_request_context(&staged_ctx)?;
         let started = Instant::now();
         let ceiling = staged_ctx.cx().now().saturating_add_nanos(30_000_000_000);
-        let deadline = staged_ctx.budget().deadline.map_or(ceiling, |value| value.min(ceiling));
-        let mut authentication = catch_extension_unwind(|| {
-            provider.authenticate_async(&staged_ctx, request)
-        }).map_err(|_| extension_panic_error("auth_provider"))?;
+        let deadline = staged_ctx
+            .budget()
+            .deadline
+            .map_or(ceiling, |value| value.min(ceiling));
+        let mut authentication =
+            catch_extension_unwind(|| provider.authenticate_async(&staged_ctx, request))
+                .map_err(|_| extension_panic_error("auth_provider"))?;
         let cancellation = staged_ctx.request_cancellation().clone();
         let mut cancelled = std::pin::pin!(cancellation.cancelled());
         let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
         let mut runtime_cancelled = std::pin::pin!(receiver.recv(staged_ctx.cx()));
         let mut timer = std::pin::pin!(asupersync::time::Sleep::new(deadline));
-        let unavailable = || McpError::new(
-            auth::AUTH_PROVIDER_UNAVAILABLE_CODE, "Authentication provider unavailable",
-        );
+        let unavailable = || {
+            McpError::new(
+                auth::AUTH_PROVIDER_UNAVAILABLE_CODE,
+                "Authentication provider unavailable",
+            )
+        };
         let result = std::future::poll_fn(|task| {
             let ceiling = auth::ambient_auth_capability_ceiling();
             let _current = Cx::set_current(Some(staged_ctx.cx().clone()));
@@ -25333,8 +25489,8 @@ impl Server {
             // An elected response drain can already be runtime-masked. Its
             // caller also masks this context per poll; ordinary ingress cannot
             // enter through that path or suppress its cancellation observation.
-            let masked_drain = staged_ctx.cx().is_cancel_requested()
-                && staged_ctx.cx().checkpoint().is_ok();
+            let masked_drain =
+                staged_ctx.cx().is_cancel_requested() && staged_ctx.cx().checkpoint().is_ok();
             if !masked_drain
                 && (cancelled.as_mut().poll(task).is_ready()
                     || runtime_cancelled.as_mut().poll(task).is_ready())
@@ -25350,7 +25506,10 @@ impl Server {
             if result.is_pending() {
                 // Sleep otherwise falls back to a process-global driver. A
                 // retained broad Cx must not restore ambient-denied time.
-                if Cx::current().and_then(|active| active.timer_driver()).is_none() {
+                if Cx::current()
+                    .and_then(|active| active.timer_driver())
+                    .is_none()
+                {
                     return std::task::Poll::Ready(Err(unavailable()));
                 }
                 if timer.as_mut().poll(task).is_ready() {
@@ -25358,7 +25517,8 @@ impl Server {
                 }
             }
             result
-        }).await;
+        })
+        .await;
         let auth = result.map_err(|provider_error| {
             if provider_error.code == auth::AUTH_PROVIDER_UNAVAILABLE_CODE
                 || provider_error.code == McpErrorCode::RequestCancelled
@@ -31070,9 +31230,8 @@ mod lib_unit_tests {
             let source = Cx::for_request_with_budget(Budget::INFINITE);
             let caller = {
                 let _source = Cx::set_current(Some(source));
-                let _restriction = caller_denied.then(|| {
-                    Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
-                });
+                let _restriction = caller_denied
+                    .then(|| Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK));
                 Cx::current().unwrap()
             };
             let denied = caller_denied || host_denied;
@@ -31088,9 +31247,8 @@ mod lib_unit_tests {
             request.body = serde_json::to_vec(&body).unwrap();
             {
                 let _host = Cx::set_current(Some(host.clone()));
-                let _restriction = host_denied.then(|| {
-                    Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
-                });
+                let _restriction = host_denied
+                    .then(|| Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK));
                 let mut task = Context::from_waker(std::task::Waker::noop());
                 let mut request = Box::pin(session.handle_async(&caller, request));
                 let Poll::Ready(Ok(ServerHttpEndpointResponse::Immediate(response))) =
@@ -31111,8 +31269,14 @@ mod lib_unit_tests {
                 assert_eq!(probe.authorization_io.load(Ordering::Acquire), !denied);
                 assert_eq!(probe.resolver_io.load(Ordering::Acquire), !denied);
                 assert_eq!(probe.started.load(Ordering::Acquire), 1);
-                assert_eq!(probe.io_effects.load(Ordering::Acquire), usize::from(!denied));
-                assert_eq!(probe.completed.load(Ordering::Acquire), usize::from(!denied));
+                assert_eq!(
+                    probe.io_effects.load(Ordering::Acquire),
+                    usize::from(!denied)
+                );
+                assert_eq!(
+                    probe.completed.load(Ordering::Acquire),
+                    usize::from(!denied)
+                );
                 assert_eq!(probe.abandoned.load(Ordering::Acquire), usize::from(denied));
                 let restored = Cx::current().unwrap();
                 assert_eq!(restored.task_id(), host.task_id());
@@ -31197,8 +31361,14 @@ mod lib_unit_tests {
                     assert_eq!(probe.resolved.load(Ordering::Acquire), 1);
                     assert_eq!(probe.authorization_io.load(Ordering::Acquire), !denied);
                     assert_eq!(probe.resolver_io.load(Ordering::Acquire), !denied);
-                    assert_eq!(probe.io_effects.load(Ordering::Acquire), usize::from(!denied));
-                    assert_eq!(probe.completed.load(Ordering::Acquire), usize::from(!denied));
+                    assert_eq!(
+                        probe.io_effects.load(Ordering::Acquire),
+                        usize::from(!denied)
+                    );
+                    assert_eq!(
+                        probe.completed.load(Ordering::Acquire),
+                        usize::from(!denied)
+                    );
                     assert_eq!(probe.abandoned.load(Ordering::Acquire), usize::from(denied));
                     assert_eq!(*probe.cleanup_io.lock().unwrap(), vec![!denied]);
                     assert!(source.capabilities().io, "the original caller is unchanged");
@@ -31260,7 +31430,10 @@ mod lib_unit_tests {
                 assert_eq!(timer.pending_count(), 1);
             }
             let no_time = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
-            assert!(context.cx().timer_driver().is_some(), "the retained caller has a timer");
+            assert!(
+                context.cx().timer_driver().is_some(),
+                "the retained caller has a timer"
+            );
             let result = dispatch.as_mut().poll(&mut task);
             if hold {
                 assert!(matches!(
@@ -31336,10 +31509,9 @@ mod lib_unit_tests {
                     .test_http_endpoint("http://notification.test")
                     .unwrap();
                 let mut session = endpoint.open_session(&caller).unwrap();
-                let mut pending = Box::pin(session.handle_async(
-                    &caller,
-                    http_extension_notification_request(41, 0, true),
-                ));
+                let mut pending = Box::pin(
+                    session.handle_async(&caller, http_extension_notification_request(41, 0, true)),
+                );
                 std::future::poll_fn(|task| {
                     assert!(pending.as_mut().poll(task).is_pending());
                     if probe.started.load(Ordering::Acquire) == 1 {
@@ -31362,7 +31534,10 @@ mod lib_unit_tests {
                     Poll::Ready(())
                 })
                 .await;
-                assert!(observed.lock().unwrap().is_empty(), "the wait owns the waker");
+                assert!(
+                    observed.lock().unwrap().is_empty(),
+                    "the wait owns the waker"
+                );
                 assert!(Cx::current().unwrap().capabilities().io);
                 drop(pending);
                 assert_eq!(
@@ -31416,10 +31591,9 @@ mod lib_unit_tests {
             // The inline path refuses a pending callback without a timer
             // driver. Its destruction still belongs to the narrower caller,
             // even after polling has returned to the unrestricted host.
-            let mut request = Box::pin(session.handle_async(
-                &caller,
-                http_extension_notification_request(41, 0, true),
-            ));
+            let mut request = Box::pin(
+                session.handle_async(&caller, http_extension_notification_request(41, 0, true)),
+            );
             let mut task = Context::from_waker(std::task::Waker::noop());
             let Poll::Ready(Ok(ServerHttpEndpointResponse::Immediate(response))) =
                 request.as_mut().poll(&mut task)
@@ -31880,9 +32054,7 @@ mod lib_unit_tests {
             .unwrap();
         let invoke = |negotiated: &_, request: &_| {
             if asynchronous {
-                block_on(server.dispatch_negotiated_extension_async(
-                    &context, negotiated, request,
-                ))
+                block_on(server.dispatch_negotiated_extension_async(&context, negotiated, request))
             } else {
                 server.dispatch_negotiated_extension(&context, negotiated, request)
             }
@@ -31896,15 +32068,19 @@ mod lib_unit_tests {
         // receipt cannot replace an omitted or differently negotiated setting.
         let changed = request_binding_extension_request(2);
         let mut omitted = original.clone();
-        omitted.params.as_mut().unwrap()["_meta"]
-            ["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({});
+        omitted.params.as_mut().unwrap()["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
+            serde_json::json!({});
         for rejected in [&omitted, &changed] {
             let before = serde_json::to_value(rejected).unwrap();
             assert_eq!(
                 invoke(&negotiated, rejected).unwrap_err().code,
                 McpErrorCode::InvalidParams
             );
-            assert_eq!(calls.load(Ordering::SeqCst), 1, "no rejected handler effect");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "no rejected handler effect"
+            );
             assert_eq!(serde_json::to_value(rejected).unwrap(), before);
         }
 
@@ -33007,8 +33183,7 @@ mod lib_unit_tests {
                     "Server final task test store is missing its creation generation",
                 )
             })?;
-        Ok(FinalTaskSnapshot::new(task, generation)
-            .with_creation_generation(creation_generation))
+        Ok(FinalTaskSnapshot::new(task, generation).with_creation_generation(creation_generation))
     }
 
     #[cfg(feature = "tasks")]
@@ -33499,7 +33674,11 @@ mod lib_unit_tests {
                     let generation = state.generations.get(task_id).copied().ok_or_else(|| {
                         McpError::internal_error("Server final task expiry lost its generation")
                     })?;
-                    return Ok(Some(server_final_task_snapshot(&state, task.clone(), generation)?));
+                    return Ok(Some(server_final_task_snapshot(
+                        &state,
+                        task.clone(),
+                        generation,
+                    )?));
                 }
             }
             Ok(None)
@@ -33528,7 +33707,9 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
-            state.creation_generations.insert(task_id.clone(), generation);
+            state
+                .creation_generations
+                .insert(task_id.clone(), generation);
             state
                 .execution_budgets
                 .insert(task_id.clone(), execution_budget);
@@ -33568,7 +33749,9 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
-            state.creation_generations.insert(task_id.clone(), generation);
+            state
+                .creation_generations
+                .insert(task_id.clone(), generation);
             state
                 .execution_budgets
                 .insert(task_id.clone(), execution_budget);
@@ -33577,7 +33760,8 @@ mod lib_unit_tests {
                 .insert(task_id.clone(), work_descriptor.clone());
             state.initial_work.insert(task_id.clone(), work_descriptor);
             state.notifications.push(notification);
-            let committed = server_final_task_snapshot(&state, state.tasks[&task_id].clone(), generation)?;
+            let committed =
+                server_final_task_snapshot(&state, state.tasks[&task_id].clone(), generation)?;
             if let Some(expires_at) = expires_at {
                 state.expires_at.insert(task_id, expires_at);
             }
@@ -33736,7 +33920,8 @@ mod lib_unit_tests {
                 .insert(task_id.clone(), execution_budget);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
-            let committed = server_final_task_snapshot(&state, state.tasks[&task_id].clone(), generation)?;
+            let committed =
+                server_final_task_snapshot(&state, state.tasks[&task_id].clone(), generation)?;
             if !input_responses.is_empty() {
                 state
                     .accepted_inputs
@@ -34357,7 +34542,11 @@ mod lib_unit_tests {
             state.handoff_leases.remove(task_id);
             state.cancellation_requests.remove(task_id);
             state.notifications.push(cancelled_notification);
-            Ok(Some(server_final_task_snapshot(&state, cancelled_task, generation)?))
+            Ok(Some(server_final_task_snapshot(
+                &state,
+                cancelled_task,
+                generation,
+            )?))
         }
 
         fn is_cancellation_requested(
@@ -34405,182 +34594,187 @@ mod lib_unit_tests {
     #[test]
     fn server_final_task_store_execution_budget_survives_renewal_and_reclaim() {
         with_final_tasks_test_runtime(async {
-        let start = Instant::now();
-        let clock_now = Arc::new(Mutex::new(start));
-        let clock = {
-            let clock_now = Arc::clone(&clock_now);
-            Arc::new(move || {
-                *clock_now
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            })
-        };
-        let mut backend = ServerFinalTaskStore::with_clock(clock);
-        backend.execution_limits = crate::tasks::FinalTaskExecutionLimits::new(
-            Duration::from_secs(120),
-            Duration::from_secs(60),
-            2,
-        )
-        .expect("finite backend execution policy");
-        let store = Arc::new(backend);
-        let runtime = server_final_task_store_runtime(Arc::clone(&store));
-        let mut service = start_final_tasks_test_service(&runtime);
-
-        let healthy = runtime
-            .create_task_with_work(final_tasks_test_work_descriptor(), None)
-            .expect("public admission accepts a bounded backend");
-        drive_final_tasks_test_service_until(service.as_mut(), || {
-            runtime.get_task(&healthy.task.base().task_id).is_ok_and(|result| {
-                matches!(result.task, fastmcp_protocol::Task::Completed { .. })
-            })
-        }).await;
-        assert!(matches!(
-            runtime
-                .get_task(&healthy.task.base().task_id)
-                .expect("read service completion")
-                .task,
-            fastmcp_protocol::Task::Completed { .. }
-        ));
-
-        let created = runtime
-            .create_task_with_work(final_tasks_test_work_descriptor(), None)
-            .expect("public admission stamps execution accounting");
-        let task_id = created.task.base().task_id.clone();
-        let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
-        let original = store
-            .task_execution_budget_if_current(&snapshot)
-            .unwrap()
-            .unwrap();
-        assert_eq!(original.total_deadline(), start + Duration::from_secs(120));
-        assert_eq!(original.attempt_deadline(), None);
-        assert_eq!(original.attempts(), 0);
-
-        let work = store
-            .take_initial_work_for_owner_if_current(&snapshot, "first-owner")
-            .unwrap()
-            .unwrap();
-        let claimed = store
-            .task_execution_budget_if_current(&snapshot)
-            .unwrap()
-            .unwrap();
-        assert_eq!(claimed.attempts(), 1);
-        assert_eq!(
-            claimed.attempt_deadline(),
-            Some(start + Duration::from_secs(60))
-        );
-        assert!(
-            store
-                .take_initial_work_for_owner_if_current(&snapshot, "other-owner")
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            store.task_execution_budget_if_current(&snapshot).unwrap(),
-            Some(claimed)
-        );
-        let fence = store
-            .begin_handoff_dispatch_for_owner_if_current(
-                &task_id,
-                snapshot.generation(),
-                "first-owner",
+            let start = Instant::now();
+            let clock_now = Arc::new(Mutex::new(start));
+            let clock = {
+                let clock_now = Arc::clone(&clock_now);
+                Arc::new(move || {
+                    *clock_now
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                })
+            };
+            let mut backend = ServerFinalTaskStore::with_clock(clock);
+            backend.execution_limits = crate::tasks::FinalTaskExecutionLimits::new(
+                Duration::from_secs(120),
+                Duration::from_secs(60),
+                2,
             )
-            .unwrap()
-            .unwrap();
+            .expect("finite backend execution policy");
+            let store = Arc::new(backend);
+            let runtime = server_final_task_store_runtime(Arc::clone(&store));
+            let mut service = start_final_tasks_test_service(&runtime);
 
-        *clock_now
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = start + Duration::from_secs(10);
-        assert!(
-            store
-                .renew_handoff_dispatch_if_current(
-                    &task_id,
-                    snapshot.generation(),
-                    "first-owner",
-                    fence,
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            store.task_execution_budget_if_current(&snapshot).unwrap(),
-            Some(claimed)
-        );
+            let healthy = runtime
+                .create_task_with_work(final_tasks_test_work_descriptor(), None)
+                .expect("public admission accepts a bounded backend");
+            drive_final_tasks_test_service_until(service.as_mut(), || {
+                runtime
+                    .get_task(&healthy.task.base().task_id)
+                    .is_ok_and(|result| {
+                        matches!(result.task, fastmcp_protocol::Task::Completed { .. })
+                    })
+            })
+            .await;
+            assert!(matches!(
+                runtime
+                    .get_task(&healthy.task.base().task_id)
+                    .expect("read service completion")
+                    .task,
+                fastmcp_protocol::Task::Completed { .. }
+            ));
 
-        *clock_now
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = start + Duration::from_secs(40);
-        let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
-        assert!(recovered.generation() > snapshot.generation());
-        assert!(
-            store
+            let created = runtime
+                .create_task_with_work(final_tasks_test_work_descriptor(), None)
+                .expect("public admission stamps execution accounting");
+            let task_id = created.task.base().task_id.clone();
+            let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            let original = store
                 .task_execution_budget_if_current(&snapshot)
                 .unwrap()
-                .is_none()
-        );
-        let released = store
-            .task_execution_budget_if_current(&recovered)
-            .unwrap()
-            .unwrap();
-        assert_eq!(released.total_deadline(), original.total_deadline());
-        assert_eq!(released.attempt_deadline(), None);
-        assert_eq!(released.attempts(), 1);
-        assert!(
-            !store
-                .restore_initial_work_for_owner_if_current(
+                .unwrap();
+            assert_eq!(original.total_deadline(), start + Duration::from_secs(120));
+            assert_eq!(original.attempt_deadline(), None);
+            assert_eq!(original.attempts(), 0);
+
+            let work = store
+                .take_initial_work_for_owner_if_current(&snapshot, "first-owner")
+                .unwrap()
+                .unwrap();
+            let claimed = store
+                .task_execution_budget_if_current(&snapshot)
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.attempts(), 1);
+            assert_eq!(
+                claimed.attempt_deadline(),
+                Some(start + Duration::from_secs(60))
+            );
+            assert!(
+                store
+                    .take_initial_work_for_owner_if_current(&snapshot, "other-owner")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store.task_execution_budget_if_current(&snapshot).unwrap(),
+                Some(claimed)
+            );
+            let fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
                     &task_id,
                     snapshot.generation(),
                     "first-owner",
-                    Some(fence),
-                    work.clone(),
                 )
                 .unwrap()
-        );
-        assert_eq!(
-            store.task_execution_budget_if_current(&recovered).unwrap(),
-            Some(released)
-        );
+                .unwrap();
 
-        assert!(
-            store
-                .take_initial_work_for_owner_if_current(&recovered, "second-owner")
+            *clock_now
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                start + Duration::from_secs(10);
+            assert!(
+                store
+                    .renew_handoff_dispatch_if_current(
+                        &task_id,
+                        snapshot.generation(),
+                        "first-owner",
+                        fence,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                store.task_execution_budget_if_current(&snapshot).unwrap(),
+                Some(claimed)
+            );
+
+            *clock_now
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                start + Duration::from_secs(40);
+            let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert!(recovered.generation() > snapshot.generation());
+            assert!(
+                store
+                    .task_execution_budget_if_current(&snapshot)
+                    .unwrap()
+                    .is_none()
+            );
+            let released = store
+                .task_execution_budget_if_current(&recovered)
                 .unwrap()
-                .is_some()
-        );
-        let retried = store
-            .task_execution_budget_if_current(&recovered)
-            .unwrap()
-            .unwrap();
-        assert_eq!(retried.total_deadline(), original.total_deadline());
-        assert_eq!(
-            retried.attempt_deadline(),
-            Some(start + Duration::from_secs(100))
-        );
-        assert_eq!(retried.attempts(), 2);
-        assert!(
-            store
-                .restore_initial_work_for_owner_if_current(
-                    &task_id,
-                    recovered.generation(),
-                    "second-owner",
-                    None,
-                    work,
-                )
+                .unwrap();
+            assert_eq!(released.total_deadline(), original.total_deadline());
+            assert_eq!(released.attempt_deadline(), None);
+            assert_eq!(released.attempts(), 1);
+            assert!(
+                !store
+                    .restore_initial_work_for_owner_if_current(
+                        &task_id,
+                        snapshot.generation(),
+                        "first-owner",
+                        Some(fence),
+                        work.clone(),
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                store.task_execution_budget_if_current(&recovered).unwrap(),
+                Some(released)
+            );
+
+            assert!(
+                store
+                    .take_initial_work_for_owner_if_current(&recovered, "second-owner")
+                    .unwrap()
+                    .is_some()
+            );
+            let retried = store
+                .task_execution_budget_if_current(&recovered)
                 .unwrap()
-        );
-        assert!(
-            store
-                .take_initial_work_for_owner_if_current(&recovered, "third-owner")
-                .unwrap()
-                .is_none()
-        );
-        let fastmcp_protocol::Task::Failed { error, .. } = runtime
-            .get_task(&task_id)
-            .expect("public read retires exhausted claims")
-            .task
-        else {
-            panic!("claim exhaustion must retain a failed task");
-        };
-        assert_eq!(error.message, "Task execution attempt limit exceeded");
-        drop(service);
+                .unwrap();
+            assert_eq!(retried.total_deadline(), original.total_deadline());
+            assert_eq!(
+                retried.attempt_deadline(),
+                Some(start + Duration::from_secs(100))
+            );
+            assert_eq!(retried.attempts(), 2);
+            assert!(
+                store
+                    .restore_initial_work_for_owner_if_current(
+                        &task_id,
+                        recovered.generation(),
+                        "second-owner",
+                        None,
+                        work,
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .take_initial_work_for_owner_if_current(&recovered, "third-owner")
+                    .unwrap()
+                    .is_none()
+            );
+            let fastmcp_protocol::Task::Failed { error, .. } = runtime
+                .get_task(&task_id)
+                .expect("public read retires exhausted claims")
+                .task
+            else {
+                panic!("claim exhaustion must retain a failed task");
+            };
+            assert_eq!(error.message, "Task execution attempt limit exceeded");
+            drop(service);
         });
     }
 
@@ -34838,19 +35032,26 @@ mod lib_unit_tests {
     ) {
         let cx = Cx::current().expect("application execution uses the caller test runtime");
         let mut observation = Box::pin(asupersync::time::sleep(cx.now(), Duration::from_millis(1)));
-        asupersync::time::timeout(cx.now(), Duration::from_secs(5), std::future::poll_fn(|context| {
-            if let std::task::Poll::Ready(result) = service.as_mut().poll(context) {
-                panic!("Task service exited before caller shutdown: {result:?}");
-            }
-            if condition() {
-                return std::task::Poll::Ready(());
-            }
-            if observation.as_mut().poll(context).is_ready() {
-                observation = Box::pin(asupersync::time::sleep(cx.now(), Duration::from_millis(1)));
-                context.waker().wake_by_ref();
-            }
-            std::task::Poll::Pending
-        })).await.expect("Task application reaches its expected state within the caller runtime");
+        asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(5),
+            std::future::poll_fn(|context| {
+                if let std::task::Poll::Ready(result) = service.as_mut().poll(context) {
+                    panic!("Task service exited before caller shutdown: {result:?}");
+                }
+                if condition() {
+                    return std::task::Poll::Ready(());
+                }
+                if observation.as_mut().poll(context).is_ready() {
+                    observation =
+                        Box::pin(asupersync::time::sleep(cx.now(), Duration::from_millis(1)));
+                    context.waker().wake_by_ref();
+                }
+                std::task::Poll::Pending
+            }),
+        )
+        .await
+        .expect("Task application reaches its expected state within the caller runtime");
     }
 
     #[cfg(feature = "tasks")]
@@ -34917,51 +35118,54 @@ mod lib_unit_tests {
     #[test]
     fn server_final_task_store_service_consumes_durable_initial_work() {
         with_final_tasks_test_runtime(async {
-        let store = Arc::new(ServerFinalTaskStore::default());
-        let runtime = server_final_task_store_runtime(Arc::clone(&store));
-        let started = Arc::new(Mutex::new(Vec::new()));
-        let runner = runtime
-            .install_task_service(
-                1,
-                Arc::new(RecordingServerFinalTaskSupervisor {
-                    started: Arc::clone(&started),
-                }),
-            )
-            .expect("test task service installs");
-        let service_cx = Cx::current().unwrap();
-        let mut service = Box::pin(runner.run(&service_cx));
+            let store = Arc::new(ServerFinalTaskStore::default());
+            let runtime = server_final_task_store_runtime(Arc::clone(&store));
+            let started = Arc::new(Mutex::new(Vec::new()));
+            let runner = runtime
+                .install_task_service(
+                    1,
+                    Arc::new(RecordingServerFinalTaskSupervisor {
+                        started: Arc::clone(&started),
+                    }),
+                )
+                .expect("test task service installs");
+            let service_cx = Cx::current().unwrap();
+            let mut service = Box::pin(runner.run(&service_cx));
 
-        assert!(matches!(
-            poll_final_task_service_once(service.as_mut()),
-            std::task::Poll::Pending
-        ));
-        let created = runtime
-            .create_task_with_work(final_tasks_test_work_descriptor(), None)
-            .expect("ready service admits durable initial work");
-        let task_id = created.task.base().task_id.clone();
+            assert!(matches!(
+                poll_final_task_service_once(service.as_mut()),
+                std::task::Poll::Pending
+            ));
+            let created = runtime
+                .create_task_with_work(final_tasks_test_work_descriptor(), None)
+                .expect("ready service admits durable initial work");
+            let task_id = created.task.base().task_id.clone();
 
-        drive_final_tasks_test_service_until(service.as_mut(), || {
-            runtime.get_task(&task_id).is_ok_and(|result| {
-                matches!(result.task, fastmcp_protocol::Task::Completed { .. })
+            drive_final_tasks_test_service_until(service.as_mut(), || {
+                runtime.get_task(&task_id).is_ok_and(|result| {
+                    matches!(result.task, fastmcp_protocol::Task::Completed { .. })
+                })
             })
-        }).await;
-        assert_eq!(
-            started
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_slice(),
-            &[task_id],
-            "the service consumes exactly the initial descriptor retained with task creation"
-        );
-        assert!(
-            FinalTaskStore::next_initial_work_snapshot(&*store)
-                .expect("completed initial-work scan is valid")
-                .is_none(),
-            "successful owner-fenced dispatch consumes the initial handoff"
-        );
-        service_cx.cancel_with(asupersync::CancelKind::User, None);
-        asupersync::time::timeout(service_cx.now(), Duration::from_secs(5), service.as_mut())
-            .await.unwrap().unwrap();
+            .await;
+            assert_eq!(
+                started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_slice(),
+                &[task_id],
+                "the service consumes exactly the initial descriptor retained with task creation"
+            );
+            assert!(
+                FinalTaskStore::next_initial_work_snapshot(&*store)
+                    .expect("completed initial-work scan is valid")
+                    .is_none(),
+                "successful owner-fenced dispatch consumes the initial handoff"
+            );
+            service_cx.cancel_with(asupersync::CancelKind::User, None);
+            asupersync::time::timeout(service_cx.now(), Duration::from_secs(5), service.as_mut())
+                .await
+                .unwrap()
+                .unwrap();
         });
     }
 
@@ -35438,41 +35642,42 @@ mod lib_unit_tests {
     #[test]
     fn final_tasks_test_server_drives_retained_service_after_task_creation() {
         with_final_tasks_test_runtime(async {
-        let delivered = Arc::new(Mutex::new(Vec::new()));
-        let (server, mut service) = final_tasks_test_server(Arc::clone(&delivered));
-        let runtime = server
-            .final_task_runtime()
-            .expect("configured final Tasks runtime must be retained");
-        let task_id = runtime
-            .create_task_with_work(final_tasks_test_work_descriptor(), None)
-            .expect("ready service accepts durable task creation")
-            .task
-            .base()
-            .task_id
-            .clone();
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let (server, mut service) = final_tasks_test_server(Arc::clone(&delivered));
+            let runtime = server
+                .final_task_runtime()
+                .expect("configured final Tasks runtime must be retained");
+            let task_id = runtime
+                .create_task_with_work(final_tasks_test_work_descriptor(), None)
+                .expect("ready service accepts durable task creation")
+                .task
+                .base()
+                .task_id
+                .clone();
 
-        drive_final_tasks_test_service_until(service.as_mut(), || {
-            runtime.get_task(&task_id).is_ok_and(|result| {
-                matches!(result.task, fastmcp_protocol::Task::Completed { .. })
+            drive_final_tasks_test_service_until(service.as_mut(), || {
+                runtime.get_task(&task_id).is_ok_and(|result| {
+                    matches!(result.task, fastmcp_protocol::Task::Completed { .. })
+                })
             })
-        }).await;
+            .await;
 
-        assert!(matches!(
-            runtime
-                .get_task(&task_id)
-                .expect("completed task remains readable")
-                .task,
-            fastmcp_protocol::Task::Completed { .. }
-        ));
-        assert_eq!(
-            delivered
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            2,
-            "task creation and the fenced terminal completion each emit one notification",
-        );
-        drop(service);
+            assert!(matches!(
+                runtime
+                    .get_task(&task_id)
+                    .expect("completed task remains readable")
+                    .task,
+                fastmcp_protocol::Task::Completed { .. }
+            ));
+            assert_eq!(
+                delivered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                2,
+                "task creation and the fenced terminal completion each emit one notification",
+            );
+            drop(service);
         });
     }
 
@@ -35531,13 +35736,10 @@ mod lib_unit_tests {
                 .task_id
                 .clone();
             runtime
-                .complete_task(
-                    &task_id,
-                    serde_json::from_str(RESULT_SOURCE).unwrap(),
-                    None,
-                )
+                .complete_task(&task_id, serde_json::from_str(RESULT_SOURCE).unwrap(), None)
                 .unwrap();
-            let stored_before = serde_json::to_string(&runtime.get_task(&task_id).unwrap()).unwrap();
+            let stored_before =
+                serde_json::to_string(&runtime.get_task(&task_id).unwrap()).unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
             let mut builder = Server::new("completed-task-wire", "1.0.0")
                 .final_tasks(runtime.clone())
@@ -35607,7 +35809,10 @@ mod lib_unit_tests {
                 );
             } else {
                 assert!(response.error.is_none(), "{dispatch}: {response:?}");
-                assert_eq!(response.result.as_ref().unwrap()["taskId"], task_id.as_str());
+                assert_eq!(
+                    response.result.as_ref().unwrap()["taskId"],
+                    task_id.as_str()
+                );
                 let envelope: BTreeMap<String, Box<serde_json::value::RawValue>> =
                     serde_json::from_slice(&encoded).unwrap();
                 let task: BTreeMap<String, Box<serde_json::value::RawValue>> =
@@ -35621,7 +35826,10 @@ mod lib_unit_tests {
                 } else {
                     let redacted: serde_json::Value =
                         serde_json::from_str(task["result"].get()).unwrap();
-                    assert_eq!(redacted, serde_json::json!({"content": [], "redacted": true}));
+                    assert_eq!(
+                        redacted,
+                        serde_json::json!({"content": [], "redacted": true})
+                    );
                 }
             }
             if probe != CompletedTaskWireProbe::Preserve {
@@ -49035,10 +49243,8 @@ mod lib_unit_tests {
         );
         let owner_basic =
             native_oauth_basic_header("introspection-token-client:token-owner-secret");
-        let reader_basic =
-            native_oauth_basic_header("native-resource-reader:native-reader-secret");
-        let routes =
-            OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth").unwrap();
+        let reader_basic = native_oauth_basic_header("native-resource-reader:native-reader-secret");
+        let routes = OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth").unwrap();
         (routes, form, owner_basic, reader_basic)
     }
 
@@ -49055,10 +49261,17 @@ mod lib_unit_tests {
         let access = issued["access_token"].as_str().unwrap();
         let refresh = issued["refresh_token"].as_str().unwrap();
         let path = routes.introspection_path().unwrap();
-        for hint in ["", "&token_type_hint=access_token", "&token_type_hint=refresh_token",
-            "&token_type_hint=unrecognized"] {
-            let request =
-                native_oauth_form_request(path, &format!("token={access}{hint}"), Some(&reader_basic));
+        for hint in [
+            "",
+            "&token_type_hint=access_token",
+            "&token_type_hint=refresh_token",
+            "&token_type_hint=unrecognized",
+        ] {
+            let request = native_oauth_form_request(
+                path,
+                &format!("token={access}{hint}"),
+                Some(&reader_basic),
+            );
             let response = dispatch_oauth_h1_request(&routes, &request, path, "");
             assert_eq!(response.status, HttpStatus::OK);
             assert_eq!(
@@ -49073,8 +49286,14 @@ mod lib_unit_tests {
                     "iss": "https://fastmcp.invalid/"
                 })
             );
-            assert_eq!(response.headers.get("cache-control").map(String::as_str), Some("no-store"));
-            assert_eq!(response.headers.get("pragma").map(String::as_str), Some("no-cache"));
+            assert_eq!(
+                response.headers.get("cache-control").map(String::as_str),
+                Some("no-store")
+            );
+            assert_eq!(
+                response.headers.get("pragma").map(String::as_str),
+                Some("no-cache")
+            );
             let body = std::str::from_utf8(&response.body).unwrap();
             assert!(!body.contains(access));
             assert!(!body.contains(refresh));
@@ -49082,8 +49301,16 @@ mod lib_unit_tests {
         }
         let other_basic = native_oauth_basic_header("native-other-reader:native-reader-secret");
         for (token, basic, suffix) in [
-            (access, other_basic.as_str(), "&resource=https%3A%2F%2Fresource.example%2Fapi"),
-            (refresh, reader_basic.as_str(), "&token_type_hint=access_token"),
+            (
+                access,
+                other_basic.as_str(),
+                "&resource=https%3A%2F%2Fresource.example%2Fapi",
+            ),
+            (
+                refresh,
+                reader_basic.as_str(),
+                "&token_type_hint=access_token",
+            ),
             ("unknown-token", reader_basic.as_str(), ""),
         ] {
             let request =
@@ -49127,9 +49354,8 @@ mod lib_unit_tests {
                 Some("Basic realm=\"oauth\""),
             );
         }
-        let body_credentials = format!(
-            "{form}&client_id=native-resource-reader&client_secret=native-reader-secret"
-        );
+        let body_credentials =
+            format!("{form}&client_id=native-resource-reader&client_secret=native-reader-secret");
         let request = native_oauth_form_request(path, &body_credentials, None);
         assert_native_oauth_error(
             &dispatch_oauth_h1_request(&routes, &request, path, ""),
@@ -49153,7 +49379,9 @@ mod lib_unit_tests {
             }
         }
         let mut duplicate = native_oauth_form_request(path, &form, Some(&reader_basic));
-        duplicate.headers.push(("authorization".to_owned(), reader_basic.clone()));
+        duplicate
+            .headers
+            .push(("authorization".to_owned(), reader_basic.clone()));
         assert_native_oauth_error(
             &dispatch_oauth_h1_request(&routes, &duplicate, path, ""),
             HttpStatus::BAD_REQUEST,
@@ -49200,21 +49428,23 @@ mod lib_unit_tests {
         );
         let mut source = BytesMut::from(header.as_bytes());
         let original = source.clone();
-        let mut codec = NativeHttp1Codec::new(
-            4 * oauth::MAX_OAUTH_FORM_BODY_BYTES,
-            Some(&routes),
-        );
-        assert!(matches!(codec.decode(&mut source), Err(Http1DecodeError::BodyTooLarge)));
+        let mut codec = NativeHttp1Codec::new(4 * oauth::MAX_OAUTH_FORM_BODY_BYTES, Some(&routes));
+        assert!(matches!(
+            codec.decode(&mut source),
+            Err(Http1DecodeError::BodyTooLarge)
+        ));
         assert_eq!(source, original, "body was neither requested nor consumed");
         let exact_header = format!(
             "POST /oauth/introspect HTTP/1.1\r\nHost: loopback\r\nContent-Length: {}\r\n\r\n",
             oauth::MAX_OAUTH_FORM_BODY_BYTES
         );
-        let mut codec = NativeHttp1Codec::new(
-            4 * oauth::MAX_OAUTH_FORM_BODY_BYTES,
-            Some(&routes),
+        let mut codec = NativeHttp1Codec::new(4 * oauth::MAX_OAUTH_FORM_BODY_BYTES, Some(&routes));
+        assert!(
+            codec
+                .decode(&mut BytesMut::from(exact_header.as_bytes()))
+                .unwrap()
+                .is_none()
         );
-        assert!(codec.decode(&mut BytesMut::from(exact_header.as_bytes())).unwrap().is_none());
         let (disabled, _, _, _) = native_development_introspection_fixture(false);
         assert_eq!(
             OAuthNativeH1RouteLimits::from_routes(&disabled)
@@ -49400,7 +49630,9 @@ mod lib_unit_tests {
                 })
                 .map_err(|error| format!("introspection client spawn failed: {error}"))?;
             let serve = bound.serve(&cx).await;
-            client.join(&cx).await
+            client
+                .join(&cx)
+                .await
                 .map_err(|error| format!("introspection client failed: {error:?}"))??;
             let shutdown =
                 serve.map_err(|error| format!("introspection server failed: {error}"))?;
@@ -49497,7 +49729,10 @@ mod lib_unit_tests {
                 ("grant_type", "client_credentials"),
                 ("resource", RESOURCE),
                 ("scope", scope),
-                ("client_assertion_type", oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE),
+                (
+                    "client_assertion_type",
+                    oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE,
+                ),
                 ("client_assertion", assertion),
             ])
         }
@@ -49505,7 +49740,10 @@ mod lib_unit_tests {
         fn revocation_form(assertion: &str, token: &str) -> String {
             form(&[
                 ("token", token),
-                ("client_assertion_type", oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE),
+                (
+                    "client_assertion_type",
+                    oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE,
+                ),
                 ("client_assertion", assertion),
             ])
         }
@@ -49564,21 +49802,24 @@ mod lib_unit_tests {
             );
             assert_eq!(routes.server().stats().access_tokens, 1);
 
-            let mut metadata_request =
-                native_oauth_form_request(routes.metadata_path(), "", None);
+            let mut metadata_request = native_oauth_form_request(routes.metadata_path(), "", None);
             metadata_request.method = Http1Method::Get;
             metadata_request.headers.clear();
-            let response = dispatch_oauth_h1_request(
-                &routes, &metadata_request, routes.metadata_path(), "",
-            );
+            let response =
+                dispatch_oauth_h1_request(&routes, &metadata_request, routes.metadata_path(), "");
             assert_eq!(response.status, HttpStatus::OK);
             let metadata: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
             for field in [
                 "token_endpoint_auth_methods_supported",
                 "revocation_endpoint_auth_methods_supported",
             ] {
-                assert!(metadata[field].as_array().unwrap().iter()
-                    .any(|method| method == "private_key_jwt"));
+                assert!(
+                    metadata[field]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|method| method == "private_key_jwt")
+                );
             }
             for field in [
                 "token_endpoint_auth_signing_alg_values_supported",
@@ -49600,10 +49841,7 @@ mod lib_unit_tests {
                 None,
             );
             assert!(authentication().is_ok());
-            let revoke = revocation_form(
-                &assertion(REVOCATION_ENDPOINT, "native-revoke"),
-                token,
-            );
+            let revoke = revocation_form(&assertion(REVOCATION_ENDPOINT, "native-revoke"), token);
             let response = dispatch(&routes, routes.revocation_path(), &revoke);
             assert_eq!(response.status, HttpStatus::OK);
             assert_eq!(
@@ -49622,9 +49860,8 @@ mod lib_unit_tests {
 
             // Public OIDC discovery describes the same token/revocation handlers.
             // Pending ID-token signing remains a separate capability.
-            let oidc = native_pending_oidc_provider(
-                routes.server(), "https://fastmcp.invalid/oidc/jwks",
-            );
+            let oidc =
+                native_pending_oidc_provider(routes.server(), "https://fastmcp.invalid/oidc/jwks");
             let routes = routes.with_oidc(oidc).unwrap();
             let path = routes.oidc_routes().unwrap().discovery_path();
             let mut request = native_oauth_form_request(path, "", None);
@@ -49643,11 +49880,22 @@ mod lib_unit_tests {
                 "token_endpoint_auth_methods_supported",
                 "revocation_endpoint_auth_methods_supported",
             ] {
-                assert!(discovery[field].as_array().unwrap().iter()
-                    .any(|method| method == "private_key_jwt"));
+                assert!(
+                    discovery[field]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|method| method == "private_key_jwt")
+                );
             }
-            assert_eq!(discovery["id_token_signing_alg_values_supported"], serde_json::json!([]));
-            assert_eq!(discovery["grant_types_supported"], metadata["grant_types_supported"]);
+            assert_eq!(
+                discovery["id_token_signing_alg_values_supported"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                discovery["grant_types_supported"],
+                metadata["grant_types_supported"]
+            );
         }
 
         #[test]
@@ -49661,25 +49909,40 @@ mod lib_unit_tests {
                 rejected.push((valid.clone(), Some(authorization), "invalid_request"));
             }
             for extra in [
-                "client_id=native-signed-machine", "client_id=",
-                "client_secret=unused", "client_secret=", "client%5Fsecret=",
-                "code=", "redirect_uri=", "code_verifier=", "refresh_token=",
-                "client_assertion=", "client%5Fassertion=duplicate",
+                "client_id=native-signed-machine",
+                "client_id=",
+                "client_secret=unused",
+                "client_secret=",
+                "client%5Fsecret=",
+                "code=",
+                "redirect_uri=",
+                "code_verifier=",
+                "refresh_token=",
+                "client_assertion=",
+                "client%5Fassertion=duplicate",
                 "client_assertion_type=",
             ] {
                 rejected.push((format!("{valid}&{extra}"), None, "invalid_request"));
             }
-            for scope in ["", " machine:read", "machine:read ", "machine:read  machine:read"] {
+            for scope in [
+                "",
+                " machine:read",
+                "machine:read ",
+                "machine:read  machine:read",
+            ] {
                 rejected.push((token_form(&signed, scope), None, "invalid_scope"));
             }
             rejected.push((
-                token_form(&signed, "machine:read\tmachine:read"), None, "invalid_request",
+                token_form(&signed, "machine:read\tmachine:read"),
+                None,
+                "invalid_request",
             ));
+            rejected.push((token_form(&signed, "browser:admin"), None, "invalid_scope"));
             rejected.push((
-                token_form(&signed, "browser:admin"), None, "invalid_scope",
-            ));
-            rejected.push((
-                valid.replace("grant_type=client_credentials", "grant_type=authorization_code"),
+                valid.replace(
+                    "grant_type=client_credentials",
+                    "grant_type=authorization_code",
+                ),
                 None,
                 "unsupported_grant_type",
             ));
@@ -49690,18 +49953,26 @@ mod lib_unit_tests {
             ));
             for parameters in [
                 vec![
-                    ("grant_type", "client_credentials"), ("resource", RESOURCE),
-                    ("scope", "machine:read"), ("client_assertion_type", "wrong"),
+                    ("grant_type", "client_credentials"),
+                    ("resource", RESOURCE),
+                    ("scope", "machine:read"),
+                    ("client_assertion_type", "wrong"),
                     ("client_assertion", signed.as_str()),
                 ],
                 vec![
-                    ("grant_type", "client_credentials"), ("resource", RESOURCE),
-                    ("scope", "machine:read"), ("client_assertion", signed.as_str()),
+                    ("grant_type", "client_credentials"),
+                    ("resource", RESOURCE),
+                    ("scope", "machine:read"),
+                    ("client_assertion", signed.as_str()),
                 ],
                 vec![
-                    ("grant_type", "client_credentials"), ("resource", RESOURCE),
+                    ("grant_type", "client_credentials"),
+                    ("resource", RESOURCE),
                     ("scope", "machine:read"),
-                    ("client_assertion_type", oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE),
+                    (
+                        "client_assertion_type",
+                        oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE,
+                    ),
                     ("client_assertion", ""),
                 ],
             ] {
@@ -49729,11 +50000,13 @@ mod lib_unit_tests {
         fn native_signed_machine_audience_uses_the_trusted_public_route() {
             let routes = fixture();
             let alternate = OAuthHttpRoutes::new(
-                Arc::clone(routes.server()), "https://different.example/oauth",
+                Arc::clone(routes.server()),
+                "https://different.example/oauth",
             )
             .unwrap();
             let body = token_form(
-                &assertion(TOKEN_ENDPOINT, "native-trusted-public-route"), "machine:read",
+                &assertion(TOKEN_ENDPOINT, "native-trusted-public-route"),
+                "machine:read",
             );
             let mut request = native_oauth_form_request(alternate.token_path(), &body, None);
             request.headers.extend([
@@ -49749,7 +50022,8 @@ mod lib_unit_tests {
             );
             assert_eq!(routes.server().stats().access_tokens, 0);
             request.headers.push((
-                "Forwarded".to_owned(), "host=untrusted.example;proto=http".to_owned(),
+                "Forwarded".to_owned(),
+                "host=untrusted.example;proto=http".to_owned(),
             ));
             assert_eq!(
                 dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "").status,
@@ -49775,7 +50049,8 @@ mod lib_unit_tests {
                     .bind_http(&cx, "127.0.0.1:0")
                     .await
                     .map_err(|error| format!("signed OAuth listener failed: {error}"))?;
-                let address = bound.local_addr()
+                let address = bound
+                    .local_addr()
                     .map_err(|error| format!("signed OAuth address failed: {error}"))?;
                 let caller_cx = cx.clone();
                 let mut client = cx
@@ -49881,7 +50156,9 @@ mod lib_unit_tests {
                     })
                     .map_err(|error| format!("signed OAuth client spawn failed: {error}"))?;
                 let serve = bound.serve(&cx).await;
-                client.join(&cx).await
+                client
+                    .join(&cx)
+                    .await
                     .map_err(|error| format!("signed OAuth client failed: {error:?}"))??;
                 require_quiescent_http_shutdown(
                     serve.map_err(|error| format!("signed OAuth listener failed: {error}"))?,
@@ -49897,12 +50174,16 @@ mod lib_unit_tests {
     fn native_basic_rejects_assertion_parameters_before_spending_authorization_code() {
         let (routes, form, basic) = native_oauth_basic_fixture();
         for extra in [
-            "client_assertion=", "client_assertion=ignored",
-            "client_assertion_type=", "client_assertion_type=ignored",
+            "client_assertion=",
+            "client_assertion=ignored",
+            "client_assertion_type=",
+            "client_assertion_type=ignored",
             "client%5Fassertion=",
         ] {
             let request = native_oauth_form_request(
-                routes.token_path(), &format!("{form}&{extra}"), Some(&basic),
+                routes.token_path(),
+                &format!("{form}&{extra}"),
+                Some(&basic),
             );
             assert_native_oauth_error(
                 &dispatch_oauth_h1_request(&routes, &request, routes.token_path(), ""),
@@ -51984,7 +52265,9 @@ mod lib_unit_tests {
             {
                 Ok(())
             } else {
-                Err(McpError::invalid_request("Unexpected Task execution owner or operation"))
+                Err(McpError::invalid_request(
+                    "Unexpected Task execution owner or operation",
+                ))
             }
         }
     }
@@ -52093,7 +52376,8 @@ mod lib_unit_tests {
             // ingress credentials and request contexts are not its authority.
             let execution_owner = FinalTaskAccessMetadata::principal_for_auth(
                 &AuthContext::with_subject(subject.clone()).with_session_owner(owner),
-            ).map_err(|error| error.to_string())?;
+            )
+            .map_err(|error| error.to_string())?;
             let mut refreshed =
                 AuthContext::with_subject(subject.clone()).with_session_owner(owner);
             refreshed.scopes = vec!["tasks".to_owned()];
@@ -52141,14 +52425,37 @@ mod lib_unit_tests {
                 .final_tasks(task_runtime.clone())
                 .unwrap()
                 .task_access_authorizer(Arc::new({
-                    use crate::http_admission::security::scope_policy::{RequiredScopes, ScopeImplicationPolicy};
                     use crate::http_admission::security::scope_policy::request::ScopeRequestPolicy;
-                    use crate::http_admission::security::scope_policy::request::operation::{OperationScopePolicy, ScopedOperation};
-                    let methods = ScopeRequestPolicy::new(1, ScopeImplicationPolicy::new(1, vec![]).unwrap(),
-                        ["tools/call", "tasks/get", "tasks/update", "tasks/cancel", "subscriptions/listen"]
-                            .into_iter().map(|method| (method.to_owned(), RequiredScopes::new(vec![]).unwrap())).collect(),
-                    ).unwrap();
-                    OperationScopePolicy::new(1, methods, vec![(ScopedOperation::ToolCall("durable_final_task".to_owned()), RequiredScopes::new(vec![]).unwrap())]).unwrap()
+                    use crate::http_admission::security::scope_policy::request::operation::{
+                        OperationScopePolicy, ScopedOperation,
+                    };
+                    use crate::http_admission::security::scope_policy::{
+                        RequiredScopes, ScopeImplicationPolicy,
+                    };
+                    let methods = ScopeRequestPolicy::new(
+                        1,
+                        ScopeImplicationPolicy::new(1, vec![]).unwrap(),
+                        [
+                            "tools/call",
+                            "tasks/get",
+                            "tasks/update",
+                            "tasks/cancel",
+                            "subscriptions/listen",
+                        ]
+                        .into_iter()
+                        .map(|method| (method.to_owned(), RequiredScopes::new(vec![]).unwrap()))
+                        .collect(),
+                    )
+                    .unwrap();
+                    OperationScopePolicy::new(
+                        1,
+                        methods,
+                        vec![(
+                            ScopedOperation::ToolCall("durable_final_task".to_owned()),
+                            RequiredScopes::new(vec![]).unwrap(),
+                        )],
+                    )
+                    .unwrap()
                 }))
                 .task_execution_authorizer(Arc::new(AuthTaskExecutionPolicy {
                     owner: execution_owner,
@@ -54894,8 +55201,12 @@ mod lib_unit_tests {
                 .filter(|message| subscription_cancellation_for(message, 937))
                 .count()
                 != 1
-                || messages.iter().any(|message| matches!(message, JsonRpcMessage::Response(_)))
-                || !messages.last().is_some_and(|message| subscription_cancellation_for(message, 937))
+                || messages
+                    .iter()
+                    .any(|message| matches!(message, JsonRpcMessage::Response(_)))
+                || !messages
+                    .last()
+                    .is_some_and(|message| subscription_cancellation_for(message, 937))
             {
                 return Err(
                     "subscription ordering must end in one correlated cancellation and no response"
@@ -55655,10 +55966,8 @@ mod lib_unit_tests {
 
                 impl Drop for CancelServerOnDrop {
                     fn drop(&mut self) {
-                        self.0.cancel_with(
-                            CancelKind::User,
-                            Some("reset SSE controller finished"),
-                        );
+                        self.0
+                            .cancel_with(CancelKind::User, Some("reset SSE controller finished"));
                     }
                 }
 
@@ -55676,8 +55985,9 @@ mod lib_unit_tests {
                         })),
                         request_id as i64,
                     );
-                    let body = serde_json::to_vec(&request)
-                        .map_err(|error| format!("reset SSE request serialization failed: {error}"))?;
+                    let body = serde_json::to_vec(&request).map_err(|error| {
+                        format!("reset SSE request serialization failed: {error}")
+                    })?;
                     let request = live_http_post(
                         "/mcp",
                         &body,
@@ -55744,21 +56054,26 @@ mod lib_unit_tests {
                 std::io::Read::read_to_end(&mut sibling, &mut response)
                     .map_err(|error| format!("reset SSE sibling response read failed: {error}"))?;
                 if !response.starts_with(b"HTTP/1.1 200") {
-                    return Err(format!("reset SSE sibling response was unexpected: {response:?}"));
+                    return Err(format!(
+                        "reset SSE sibling response was unexpected: {response:?}"
+                    ));
                 }
                 let expected_text = format!("modern request {SIBLING_ID}");
-                if !live_http_chunked_sse_messages(&response)?.iter().any(|message| {
-                    matches!(
-                        message,
-                        JsonRpcMessage::Response(response)
-                            if response.id == Some((SIBLING_ID as i64).into())
-                                && response.error.is_none()
-                                && response.result.as_ref().is_some_and(|result| {
-                                    result["resultType"] == "complete"
-                                        && result["content"][0]["text"] == expected_text
-                                })
-                    )
-                }) {
+                if !live_http_chunked_sse_messages(&response)?
+                    .iter()
+                    .any(|message| {
+                        matches!(
+                            message,
+                            JsonRpcMessage::Response(response)
+                                if response.id == Some((SIBLING_ID as i64).into())
+                                    && response.error.is_none()
+                                    && response.result.as_ref().is_some_and(|result| {
+                                        result["resultType"] == "complete"
+                                            && result["content"][0]["text"] == expected_text
+                                    })
+                        )
+                    })
+                {
                     return Err("reset SSE sibling omitted its terminal response".to_owned());
                 }
                 Ok(())
@@ -56181,7 +56496,9 @@ mod lib_unit_tests {
                 let messages = live_http_chunked_sse_messages(&received)?;
                 if messages.len() != 2
                     || !subscription_cancellation_for(&messages[1], 871)
-                    || messages.iter().any(|message| matches!(message, JsonRpcMessage::Response(_)))
+                    || messages
+                        .iter()
+                        .any(|message| matches!(message, JsonRpcMessage::Response(_)))
                 {
                     return Err(format!(
                         "server teardown must send acknowledgement then one cancellation only: {messages:?}"
@@ -57125,8 +57442,7 @@ mod lib_unit_tests {
                     .acquire(&caller_cx, Instant::now() + Duration::from_secs(5))
                     .map_err(|error| error.to_string())?;
                 let sat_raw = native_http_write_probe_exchange(address, ready_req.as_bytes())?;
-                let sat_text =
-                    std::str::from_utf8(&sat_raw).map_err(|error| error.to_string())?;
+                let sat_text = std::str::from_utf8(&sat_raw).map_err(|error| error.to_string())?;
                 if !sat_text.starts_with("HTTP/1.1 503 ") {
                     return Err(format!("expected 503 on saturated /ready, got: {sat_text}"));
                 }
@@ -57139,11 +57455,9 @@ mod lib_unit_tests {
                 assert_eq!(sat_json["connections"]["reserved"], 1);
                 assert_eq!(sat_json["connections"]["limit"], 2);
                 assert!(
-                    sat_json["reasons"]
-                        .as_array()
-                        .is_some_and(|reasons| reasons
-                            .iter()
-                            .any(|r| r == "connection_capacity_saturated")),
+                    sat_json["reasons"].as_array().is_some_and(|reasons| reasons
+                        .iter()
+                        .any(|r| r == "connection_capacity_saturated")),
                     "saturated readiness must report connection_capacity_saturated: {sat_json}"
                 );
 
@@ -58097,7 +58411,10 @@ mod lib_unit_tests {
                     return std::task::Poll::Ready(Err(()));
                 }
                 let poll = polls.fetch_add(1, Ordering::AcqRel);
-                bytes.lock().unwrap().extend_from_slice(if poll == 0 { b"pre" } else { b"end" });
+                bytes
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(if poll == 0 { b"pre" } else { b"end" });
                 if poll == 0 {
                     std::task::Poll::Pending
                 } else {
@@ -58105,7 +58422,10 @@ mod lib_unit_tests {
                 }
             });
             let mut write = Box::pin(bounded_native_http_response_write(
-                &cx, &shutdown, Some(&delivery), operation,
+                &cx,
+                &shutdown,
+                Some(&delivery),
+                operation,
             ));
             {
                 let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -58113,23 +58433,36 @@ mod lib_unit_tests {
             }
             assert_eq!(polls.load(Ordering::Acquire), 1);
             shutdown.request();
-            cx.cancel_with(CancelKind::Shutdown, Some("subscription writer election gap"));
+            cx.cancel_with(
+                CancelKind::Shutdown,
+                Some("subscription writer election gap"),
+            );
             {
                 let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
                 assert!(write.as_mut().poll(&mut task_cx).is_pending());
             }
-            assert_eq!(polls.load(Ordering::Acquire), 1, "unelected output must not be polled");
+            assert_eq!(
+                polls.load(Ordering::Acquire),
+                1,
+                "unelected output must not be polled"
+            );
             let deadline = delivery.native_shutdown_deadline.lock().unwrap().unwrap();
             // The two election stores are distinct. Observing that no result
             // is required does not yet authorize a cancellation frame.
-            delivery.completion_state.store(FINAL_TERMINAL_DRAINED, Ordering::Release);
+            delivery
+                .completion_state
+                .store(FINAL_TERMINAL_DRAINED, Ordering::Release);
             {
                 let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
                 assert!(write.as_mut().poll(&mut task_cx).is_pending());
             }
             assert_eq!(polls.load(Ordering::Acquire), 1);
-            delivery.state.store(FINAL_TERMINAL_ENQUEUED, Ordering::Release);
-            write.await.map_err(|()| "elected control lost its partial output".to_owned())?;
+            delivery
+                .state
+                .store(FINAL_TERMINAL_ENQUEUED, Ordering::Release);
+            write
+                .await
+                .map_err(|()| "elected control lost its partial output".to_owned())?;
             assert_eq!(polls.load(Ordering::Acquire), 2);
             assert_eq!(bytes.lock().unwrap().as_slice(), b"preend");
             delivery.mark_drained();
@@ -58137,16 +58470,28 @@ mod lib_unit_tests {
                 cx.checkpoint().map_err(|_| ())?;
                 bytes.lock().unwrap().extend_from_slice(b"0\r\n\r\n");
                 Ok(())
-            }).await.map_err(|()| "the elected body could not close its HTTP framing".to_owned())?;
-            assert_eq!(*delivery.native_shutdown_deadline.lock().unwrap(), Some(deadline));
+            })
+            .await
+            .map_err(|()| "the elected body could not close its HTTP framing".to_owned())?;
+            assert_eq!(
+                *delivery.native_shutdown_deadline.lock().unwrap(),
+                Some(deadline)
+            );
             assert_eq!(bytes.lock().unwrap().as_slice(), b"preend0\r\n\r\n");
             *delivery.native_shutdown_deadline.lock().unwrap() = Some(Instant::now());
             let mut forbidden_polls = 0;
-            assert!(bounded_native_http_response_write(&cx, &shutdown, Some(&delivery), async {
-                forbidden_polls += 1;
-                Ok(())
-            }).await.is_err());
-            assert_eq!(forbidden_polls, 0, "a new frame cannot reset the whole drain deadline");
+            assert!(
+                bounded_native_http_response_write(&cx, &shutdown, Some(&delivery), async {
+                    forbidden_polls += 1;
+                    Ok(())
+                })
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                forbidden_polls, 0,
+                "a new frame cannot reset the whole drain deadline"
+            );
             Ok(())
         });
     }
@@ -58171,13 +58516,19 @@ mod lib_unit_tests {
             }
             let polls = AtomicUsize::new(0);
             let mut write = Box::pin(bounded_native_http_response_write(
-                &cx, &shutdown, Some(&delivery), async {
+                &cx,
+                &shutdown,
+                Some(&delivery),
+                async {
                     polls.fetch_add(1, Ordering::AcqRel);
                     Ok(())
                 },
             ));
             let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
-            assert!(matches!(write.as_mut().poll(&mut task_cx), std::task::Poll::Ready(Err(()))));
+            assert!(matches!(
+                write.as_mut().poll(&mut task_cx),
+                std::task::Poll::Ready(Err(()))
+            ));
             assert_eq!(polls.load(Ordering::Acquire), 0);
             assert!(listener_cx.checkpoint().is_ok());
         }
@@ -58189,8 +58540,11 @@ mod lib_unit_tests {
             let clock = Arc::new(asupersync::time::VirtualClock::new());
             let runtime = RuntimeBuilder::current_thread()
                 .blocking_threads(0, 0)
-                .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock)))
-                .build().unwrap();
+                .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                    Arc::clone(&clock),
+                ))
+                .build()
+                .unwrap();
             let cx = runtime.request_cx_with_budget(
                 Budget::INFINITE.with_deadline(asupersync::Time::from_secs(1)),
             );
@@ -58214,8 +58568,15 @@ mod lib_unit_tests {
                 },
             ));
             let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
-            assert!(matches!(write.as_mut().poll(&mut task_cx), std::task::Poll::Ready(Err(()))));
-            assert_eq!(polls.load(Ordering::Acquire), 1, "a completed write must never be restarted");
+            assert!(matches!(
+                write.as_mut().poll(&mut task_cx),
+                std::task::Poll::Ready(Err(()))
+            ));
+            assert_eq!(
+                polls.load(Ordering::Acquire),
+                1,
+                "a completed write must never be restarted"
+            );
             drop(write);
             assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
         }
@@ -64162,9 +64523,14 @@ mod lib_unit_tests {
                 _ => None,
             })
             .collect();
-        assert!(completions.is_empty(), "neither cancellation path emits a response");
+        assert!(
+            completions.is_empty(),
+            "neither cancellation path emits a response"
+        );
         assert_eq!(
-            sent.iter().filter(|message| subscription_cancellation_for(message, 908)).count(),
+            sent.iter()
+                .filter(|message| subscription_cancellation_for(message, 908))
+                .count(),
             usize::from(!matching),
             "only a server-owned EOF teardown emits the correlated cancellation"
         );
@@ -64781,9 +65147,14 @@ mod lib_unit_tests {
             !cancelled_during_callback.load(Ordering::Acquire),
             "shutdown cancelled the request while its won election was still pending"
         );
-        assert!(responses.is_empty(), "cancellation has no trailing response: {responses:?}");
+        assert!(
+            responses.is_empty(),
+            "cancellation has no trailing response: {responses:?}"
+        );
         assert_eq!(
-            sent.iter().filter(|message| subscription_cancellation_for(message, 910)).count(),
+            sent.iter()
+                .filter(|message| subscription_cancellation_for(message, 910))
+                .count(),
             1,
             "the forced election must commit exactly one cancellation"
         );
@@ -66920,14 +67291,25 @@ mod lib_unit_tests {
             ..SubscriptionFilter::default()
         };
         set_task_subscription_ids(&mut requested, vec![task.clone()]).unwrap();
-        for change in ["task", "missing-core", "extra-core", "resource", "malformed"] {
+        for change in [
+            "task",
+            "missing-core",
+            "extra-core",
+            "resource",
+            "malformed",
+        ] {
             let mut acknowledged = requested.clone();
             match change {
                 "task" => {
-                    acknowledged.additional.remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
+                    acknowledged
+                        .additional
+                        .remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
                     set_task_subscription_ids(
                         &mut acknowledged,
-                        vec![task.clone(), fastmcp_protocol::FinalTaskId::parse("foreign-task").unwrap()],
+                        vec![
+                            task.clone(),
+                            fastmcp_protocol::FinalTaskId::parse("foreign-task").unwrap(),
+                        ],
                     )
                     .unwrap();
                 }
@@ -67159,7 +67541,10 @@ mod lib_unit_tests {
         }
 
         fn assert_capacity(error: McpError) {
-            assert_eq!(error.code, McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE));
+            assert_eq!(
+                error.code,
+                McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE)
+            );
         }
 
         fn wire_listen(
@@ -67199,22 +67584,49 @@ mod lib_unit_tests {
             let seen = Arc::new(AtomicUsize::new(0));
             let mut handles = Vec::new();
             for id in 1..=2 {
-                handles.push(server.open_subscription_listen_in_context(
-                    &alice, RequestId::Number(id), filter(), capture(&seen),
-                ).unwrap());
+                handles.push(
+                    server
+                        .open_subscription_listen_in_context(
+                            &alice,
+                            RequestId::Number(id),
+                            filter(),
+                            capture(&seen),
+                        )
+                        .unwrap(),
+                );
             }
-            let error = server.open_subscription_listen_in_context(
-                &alice, RequestId::Number(3), filter(), capture(&seen),
-            ).err().expect("a principal cannot occupy the remaining deployment capacity");
+            let error = server
+                .open_subscription_listen_in_context(
+                    &alice,
+                    RequestId::Number(3),
+                    filter(),
+                    capture(&seen),
+                )
+                .err()
+                .expect("a principal cannot occupy the remaining deployment capacity");
             assert_capacity(error);
-            assert_eq!(seen.load(Ordering::SeqCst), 2, "refusal must precede acknowledgement");
+            assert_eq!(
+                seen.load(Ordering::SeqCst),
+                2,
+                "refusal must precede acknowledgement"
+            );
 
-            handles.push(server.open_subscription_listen_in_context(
-                &bob, RequestId::Number(3), filter(), capture(&seen),
-            ).expect("changing only the verified principal leaves capacity for a sibling"));
-            assert_eq!(server.publish_subscription_notification(
-                ServerNotification::ToolsListChanged(None),
-            ).unwrap(), 3);
+            handles.push(
+                server
+                    .open_subscription_listen_in_context(
+                        &bob,
+                        RequestId::Number(3),
+                        filter(),
+                        capture(&seen),
+                    )
+                    .expect("changing only the verified principal leaves capacity for a sibling"),
+            );
+            assert_eq!(
+                server
+                    .publish_subscription_notification(ServerNotification::ToolsListChanged(None),)
+                    .unwrap(),
+                3
+            );
             assert_eq!(seen.load(Ordering::SeqCst), 6);
             drop(handles);
             let admission = server.final_subscriptions.admission.lock().unwrap();
@@ -67228,28 +67640,53 @@ mod lib_unit_tests {
                 .subscription_capacity(3, 1)
                 .unwrap()
                 .build();
-            let owner = auth::principal_fingerprint(Some(&AuthContext::with_subject("provider-owner"))).unwrap();
+            let owner =
+                auth::principal_fingerprint(Some(&AuthContext::with_subject("provider-owner")))
+                    .unwrap();
             let first_auth = AuthContext::with_subject("display-before").with_session_owner(owner);
-            let mut rotated_auth = AuthContext::with_subject("display-after").with_session_owner(owner);
+            let mut rotated_auth =
+                AuthContext::with_subject("display-after").with_session_owner(owner);
             rotated_auth.scopes = vec!["new-scope".to_owned()];
             rotated_auth.claims = Some(serde_json::json!({"jti": "rotated-instance", "iat": 42}));
             let seen = Arc::new(AtomicUsize::new(0));
-            let first = server.open_subscription_listen_in_context(
-                &context(Some(first_auth)), RequestId::Number(1), filter(), capture(&seen),
-            ).unwrap();
-            assert_capacity(server.open_subscription_listen_in_context(
-                &context(Some(rotated_auth.clone())), RequestId::String("rotated-id".to_owned()),
-                SubscriptionFilter::default(), capture(&seen),
-            ).err().expect("rotating facts and filters must not mint another owner"));
+            let first = server
+                .open_subscription_listen_in_context(
+                    &context(Some(first_auth)),
+                    RequestId::Number(1),
+                    filter(),
+                    capture(&seen),
+                )
+                .unwrap();
+            assert_capacity(
+                server
+                    .open_subscription_listen_in_context(
+                        &context(Some(rotated_auth.clone())),
+                        RequestId::String("rotated-id".to_owned()),
+                        SubscriptionFilter::default(),
+                        capture(&seen),
+                    )
+                    .err()
+                    .expect("rotating facts and filters must not mint another owner"),
+            );
             assert_eq!(seen.load(Ordering::SeqCst), 1);
 
-            let other_owner = auth::principal_fingerprint(Some(&AuthContext::with_subject("other-provider-owner"))).unwrap();
-            let second = server.open_subscription_listen_in_context(
-                &context(Some(rotated_auth.with_session_owner(other_owner))),
-                RequestId::Number(2), filter(), capture(&seen),
-            ).expect("another verified provider owner is an independent admission partition");
+            let other_owner = auth::principal_fingerprint(Some(&AuthContext::with_subject(
+                "other-provider-owner",
+            )))
+            .unwrap();
+            let second = server
+                .open_subscription_listen_in_context(
+                    &context(Some(rotated_auth.with_session_owner(other_owner))),
+                    RequestId::Number(2),
+                    filter(),
+                    capture(&seen),
+                )
+                .expect("another verified provider owner is an independent admission partition");
             drop((first, second));
-            assert_eq!(server.final_subscriptions.admission.lock().unwrap().total, 0);
+            assert_eq!(
+                server.final_subscriptions.admission.lock().unwrap().total,
+                0
+            );
         }
 
         #[test]
@@ -67259,25 +67696,49 @@ mod lib_unit_tests {
                 .unwrap()
                 .build();
             let seen = Arc::new(AtomicUsize::new(0));
-            let first = server.open_subscription_listen(
-                RequestId::Number(1), SubscriptionFilter::default(), capture(&seen),
-            ).unwrap();
+            let first = server
+                .open_subscription_listen(
+                    RequestId::Number(1),
+                    SubscriptionFilter::default(),
+                    capture(&seen),
+                )
+                .unwrap();
             for anonymous in [None, Some(AuthContext::anonymous())] {
-                assert_capacity(server.open_subscription_listen_in_context(
-                    &context(anonymous), RequestId::Number(2), filter(), capture(&seen),
-                ).err().expect("anonymous forms cannot split the shared quota"));
+                assert_capacity(
+                    server
+                        .open_subscription_listen_in_context(
+                            &context(anonymous),
+                            RequestId::Number(2),
+                            filter(),
+                            capture(&seen),
+                        )
+                        .err()
+                        .expect("anonymous forms cannot split the shared quota"),
+                );
             }
             assert_eq!(seen.load(Ordering::SeqCst), 1);
-            let authenticated = server.open_subscription_listen_in_context(
-                &context(Some(AuthContext::with_subject("reader"))),
-                RequestId::Number(2), filter(), capture(&seen),
-            ).unwrap();
+            let authenticated = server
+                .open_subscription_listen_in_context(
+                    &context(Some(AuthContext::with_subject("reader"))),
+                    RequestId::Number(2),
+                    filter(),
+                    capture(&seen),
+                )
+                .unwrap();
             drop(first);
-            let replacement = server.open_subscription_listen(
-                RequestId::Number(3), filter(), capture(&seen),
-            ).expect("dropping the sole anonymous owner releases its slot");
+            let replacement = server
+                .open_subscription_listen(RequestId::Number(3), filter(), capture(&seen))
+                .expect("dropping the sole anonymous owner releases its slot");
             drop((authenticated, replacement));
-            assert!(server.final_subscriptions.admission.lock().unwrap().principals.is_empty());
+            assert!(
+                server
+                    .final_subscriptions
+                    .admission
+                    .lock()
+                    .unwrap()
+                    .principals
+                    .is_empty()
+            );
         }
 
         #[test]
@@ -67287,26 +67748,50 @@ mod lib_unit_tests {
                 .unwrap()
                 .build();
             let seen = Arc::new(AtomicUsize::new(0));
-            let alice = server.open_subscription_listen_in_context(
-                &context(Some(AuthContext::with_subject("alice"))),
-                RequestId::Number(1), filter(), capture(&seen),
-            ).unwrap();
-            let bob = server.open_subscription_listen_in_context(
-                &context(Some(AuthContext::with_subject("bob"))),
-                RequestId::Number(2), filter(), capture(&seen),
-            ).unwrap();
+            let alice = server
+                .open_subscription_listen_in_context(
+                    &context(Some(AuthContext::with_subject("alice"))),
+                    RequestId::Number(1),
+                    filter(),
+                    capture(&seen),
+                )
+                .unwrap();
+            let bob = server
+                .open_subscription_listen_in_context(
+                    &context(Some(AuthContext::with_subject("bob"))),
+                    RequestId::Number(2),
+                    filter(),
+                    capture(&seen),
+                )
+                .unwrap();
             let carol = context(Some(AuthContext::with_subject("carol")));
-            assert_capacity(server.open_subscription_listen_in_context(
-                &carol, RequestId::Number(3), filter(), capture(&seen),
-            ).err().expect("new identities remain subject to the aggregate ceiling"));
+            assert_capacity(
+                server
+                    .open_subscription_listen_in_context(
+                        &carol,
+                        RequestId::Number(3),
+                        filter(),
+                        capture(&seen),
+                    )
+                    .err()
+                    .expect("new identities remain subject to the aggregate ceiling"),
+            );
             assert_eq!(seen.load(Ordering::SeqCst), 2);
             drop(alice);
-            let third = server.open_subscription_listen_in_context(
-                &carol, RequestId::Number(3), filter(), capture(&seen),
-            ).unwrap();
-            assert_eq!(server.publish_subscription_notification(
-                ServerNotification::ToolsListChanged(None),
-            ).unwrap(), 2);
+            let third = server
+                .open_subscription_listen_in_context(
+                    &carol,
+                    RequestId::Number(3),
+                    filter(),
+                    capture(&seen),
+                )
+                .unwrap();
+            assert_eq!(
+                server
+                    .publish_subscription_notification(ServerNotification::ToolsListChanged(None),)
+                    .unwrap(),
+                2
+            );
             drop((bob, third));
             let admission = server.final_subscriptions.admission.lock().unwrap();
             assert_eq!(admission.total, 0);
@@ -67315,32 +67800,71 @@ mod lib_unit_tests {
 
         #[test]
         fn acknowledgement_reservation_precedes_reentrant_admission_and_panic_releases_it() {
-            let server = Arc::new(Server::new("subscription-opening", "1")
-                .subscription_capacity(2, 1).unwrap().build());
+            let server = Arc::new(
+                Server::new("subscription-opening", "1")
+                    .subscription_capacity(2, 1)
+                    .unwrap()
+                    .build(),
+            );
             let alice = context(Some(AuthContext::with_subject("alice")));
             let nested_error = Arc::new(Mutex::new(None));
             let sender_server = Arc::clone(&server);
             let sender_context = alice.clone();
             let sender_error = Arc::clone(&nested_error);
-            let first = server.open_subscription_listen_in_context(
-                &alice, RequestId::Number(1), filter(), Arc::new(move |_| {
-                    *sender_error.lock().unwrap() = sender_server.open_subscription_listen_in_context(
-                        &sender_context, RequestId::Number(2), filter(), Arc::new(|_| {}),
-                    ).err();
-                }),
-            ).unwrap();
-            assert_capacity(nested_error.lock().unwrap().take().expect("opening must already own a slot"));
+            let first = server
+                .open_subscription_listen_in_context(
+                    &alice,
+                    RequestId::Number(1),
+                    filter(),
+                    Arc::new(move |_| {
+                        *sender_error.lock().unwrap() = sender_server
+                            .open_subscription_listen_in_context(
+                                &sender_context,
+                                RequestId::Number(2),
+                                filter(),
+                                Arc::new(|_| {}),
+                            )
+                            .err();
+                    }),
+                )
+                .unwrap();
+            assert_capacity(
+                nested_error
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("opening must already own a slot"),
+            );
             drop(first);
             let refused = server.open_subscription_listen_in_context(
-                &alice, RequestId::Number(3), filter(), Arc::new(|_| panic!("held ack failure")),
+                &alice,
+                RequestId::Number(3),
+                filter(),
+                Arc::new(|_| panic!("held ack failure")),
             );
             assert!(refused.is_err());
-            assert_eq!(server.final_subscriptions.admission.lock().unwrap().total, 0);
-            let recovered = server.open_subscription_listen_in_context(
-                &alice, RequestId::Number(4), filter(), Arc::new(|_| {}),
-            ).expect("a failed acknowledgement must release its complete admission");
+            assert_eq!(
+                server.final_subscriptions.admission.lock().unwrap().total,
+                0
+            );
+            let recovered = server
+                .open_subscription_listen_in_context(
+                    &alice,
+                    RequestId::Number(4),
+                    filter(),
+                    Arc::new(|_| {}),
+                )
+                .expect("a failed acknowledgement must release its complete admission");
             drop(recovered);
-            assert!(server.final_subscriptions.admission.lock().unwrap().principals.is_empty());
+            assert!(
+                server
+                    .final_subscriptions
+                    .admission
+                    .lock()
+                    .unwrap()
+                    .principals
+                    .is_empty()
+            );
         }
 
         #[test]
@@ -67353,12 +67877,17 @@ mod lib_unit_tests {
             let release_rx = Mutex::new(release_rx);
             let opener_registry = Arc::clone(&registry);
             let opener_context = alice.clone();
-            let opener = thread::spawn(move || wire_listen(
-                &opener_registry, opener_context, 10, Arc::new(move |_| {
-                    entered_tx.send(()).unwrap();
-                    release_rx.lock().unwrap().recv().unwrap();
-                }),
-            ));
+            let opener = thread::spawn(move || {
+                wire_listen(
+                    &opener_registry,
+                    opener_context,
+                    10,
+                    Arc::new(move |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().unwrap().recv().unwrap();
+                    }),
+                )
+            });
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let cancelled = registry.cancel_modern_http_owner(10);
             let same_owner = wire_listen(&registry, alice.clone(), 11, Arc::new(|_| {}));
@@ -67368,8 +67897,13 @@ mod lib_unit_tests {
             let opened = opener.join().unwrap();
             assert!(cancelled);
             assert!(opened.is_err());
-            assert_capacity(same_owner.err().expect("removed opening is still retained by its callback"));
-            let sibling = sibling.expect("a different owner can use the other slot while acknowledgement drains");
+            assert_capacity(
+                same_owner
+                    .err()
+                    .expect("removed opening is still retained by its callback"),
+            );
+            let sibling = sibling
+                .expect("a different owner can use the other slot while acknowledgement drains");
             let replacement = wire_listen(&registry, alice, 13, Arc::new(|_| {}))
                 .expect("the callback return releases the cancelled opening slot");
             drop((sibling, replacement));
@@ -67385,16 +67919,22 @@ mod lib_unit_tests {
             let (entered_tx, entered_rx) = sync_channel(1);
             let (release_tx, release_rx) = sync_channel(1);
             let release_rx = Mutex::new(release_rx);
-            let first = wire_listen(&registry, alice.clone(), 20, Arc::new(move |notification| {
-                if notification.method == "notifications/tools/list_changed" {
-                    entered_tx.send(()).unwrap();
-                    release_rx.lock().unwrap().recv().unwrap();
-                }
-            })).unwrap();
+            let first = wire_listen(
+                &registry,
+                alice.clone(),
+                20,
+                Arc::new(move |notification| {
+                    if notification.method == "notifications/tools/list_changed" {
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().unwrap().recv().unwrap();
+                    }
+                }),
+            )
+            .unwrap();
             let publishing_registry = Arc::clone(&registry);
-            let publishing = thread::spawn(move || publishing_registry.publish(
-                ServerNotification::ToolsListChanged(None),
-            ));
+            let publishing = thread::spawn(move || {
+                publishing_registry.publish(ServerNotification::ToolsListChanged(None))
+            });
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let cancelled = registry.cancel_modern_http_owner(20);
             drop(first);
@@ -67403,8 +67943,15 @@ mod lib_unit_tests {
             release_tx.send(()).unwrap();
             let published = publishing.join().unwrap().unwrap();
             assert!(cancelled);
-            assert_eq!(published, 0, "peer cancellation wins the held event callback");
-            assert_capacity(same_owner.err().expect("callback snapshots must retain their admission"));
+            assert_eq!(
+                published, 0,
+                "peer cancellation wins the held event callback"
+            );
+            assert_capacity(
+                same_owner
+                    .err()
+                    .expect("callback snapshots must retain their admission"),
+            );
             let sibling = sibling.expect("another owner does not wait for the held callback");
             let replacement = wire_listen(&registry, alice, 23, Arc::new(|_| {}))
                 .expect("settling the last callback releases its one reservation");
@@ -67454,7 +68001,14 @@ mod lib_unit_tests {
             assert_eq!(*observed.lock().unwrap(), [2 * event_bytes, event_bytes]);
             assert_eq!(registry.inner.lock().unwrap().entries.len(), 2);
             assert_eq!(registry.admission.lock().unwrap().event_bytes, 0);
-            assert!(registry.admission.lock().unwrap().principal_event_bytes.is_empty());
+            assert!(
+                registry
+                    .admission
+                    .lock()
+                    .unwrap()
+                    .principal_event_bytes
+                    .is_empty()
+            );
             drop(leases);
             assert_eq!(registry.admission.lock().unwrap().total, 0);
         }
@@ -67522,13 +68076,26 @@ mod lib_unit_tests {
             // callback cannot retain a test worker indefinitely.
             release_tx.send(()).unwrap();
             assert_eq!(publishing.join().unwrap().unwrap(), 0);
-            assert_eq!(refused, 0, "a second stream cannot evade its principal byte cap");
-            assert_eq!(sibling_published, 1, "another principal retains its allowance");
+            assert_eq!(
+                refused, 0,
+                "a second stream cannot evade its principal byte cap"
+            );
+            assert_eq!(
+                sibling_published, 1,
+                "another principal retains its allowance"
+            );
             assert!(cancelled);
             assert_eq!(retained_after_removal, event_bytes);
             assert_eq!(principal_partitions, 1);
             assert_eq!(registry.admission.lock().unwrap().event_bytes, 0);
-            assert!(registry.admission.lock().unwrap().principal_event_bytes.is_empty());
+            assert!(
+                registry
+                    .admission
+                    .lock()
+                    .unwrap()
+                    .principal_event_bytes
+                    .is_empty()
+            );
             let replacement = wire_listen(&registry, alice, 113, Arc::new(|_| {})).unwrap();
             assert_eq!(
                 registry
@@ -67585,7 +68152,12 @@ mod lib_unit_tests {
                 // A writer clones this guard before rechecking provider
                 // authority. It must retain the charge even if cancellation
                 // concurrently drops the response and its delivery receipt.
-                let guard = delivery.subscription_admission.lock().unwrap().clone().unwrap();
+                let guard = delivery
+                    .subscription_admission
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap();
                 if fail_delivery {
                     delivery.mark_failed();
                 } else {
@@ -68552,7 +69124,13 @@ mod lib_unit_tests {
             "capacity must be released while the failed callback and public handle remain live"
         );
         assert!(
-            server.final_subscriptions.admission.lock().unwrap().event_bytes > 0,
+            server
+                .final_subscriptions
+                .admission
+                .lock()
+                .unwrap()
+                .event_bytes
+                > 0,
             "retiring the queue must not release the still-active callback's bytes"
         );
         assert_eq!(
@@ -68656,7 +69234,10 @@ mod lib_unit_tests {
                 };
                 let with_payload = fastmcp_protocol::FinalEmptyNotificationParams {
                     meta: metadata.clone(),
-                    additional: BTreeMap::from([("payload".to_owned(), serde_json::json!("value"))]),
+                    additional: BTreeMap::from([(
+                        "payload".to_owned(),
+                        serde_json::json!("value"),
+                    )]),
                 };
                 for notification in [
                     ServerNotification::ToolsListChanged(Some(params.clone())),
@@ -68664,8 +69245,10 @@ mod lib_unit_tests {
                     ServerNotification::PromptsListChanged(Some(params)),
                     ServerNotification::ResourceUpdated(
                         fastmcp_protocol::FinalResourceUpdatedNotificationParams {
-                            uri: fastmcp_protocol::common_types::AbsoluteUri::parse("file:///budget")
-                                .unwrap(),
+                            uri: fastmcp_protocol::common_types::AbsoluteUri::parse(
+                                "file:///budget",
+                            )
+                            .unwrap(),
                             meta: metadata,
                             additional: BTreeMap::new(),
                         },
@@ -68706,7 +69289,14 @@ mod lib_unit_tests {
                 );
                 assert_eq!(delivered.load(Ordering::Acquire), 17);
                 assert_eq!(registry.admission.lock().unwrap().event_bytes, 0);
-                assert!(registry.inner.lock().unwrap().entries.contains_key(&lease.key));
+                assert!(
+                    registry
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .contains_key(&lease.key)
+                );
             }
         }
     }
@@ -68718,15 +69308,17 @@ mod lib_unit_tests {
             let held = HeldFinalSubscription::open(&server, 733);
             let first_server = Arc::clone(&server);
             let first = thread::spawn(move || {
-                first_server.publish_subscription_notification(ServerNotification::ToolsListChanged(
-                    Some(fastmcp_protocol::FinalEmptyNotificationParams {
-                        meta: None,
-                        additional: BTreeMap::from([(
-                            "payload".to_owned(),
-                            serde_json::json!("x".repeat(2 * 1024 * 1024)),
-                        )]),
-                    }),
-                ))
+                first_server.publish_subscription_notification(
+                    ServerNotification::ToolsListChanged(Some(
+                        fastmcp_protocol::FinalEmptyNotificationParams {
+                            meta: None,
+                            additional: BTreeMap::from([(
+                                "payload".to_owned(),
+                                serde_json::json!("x".repeat(2 * 1024 * 1024)),
+                            )]),
+                        },
+                    )),
+                )
             });
             held.entered
                 .recv_timeout(Duration::from_secs(2))
@@ -69322,7 +69914,10 @@ mod lib_unit_tests {
             ServerNotification::decode(&acknowledgement),
             Ok(ServerNotification::SubscriptionsAcknowledged(_))
         ));
-        assert!(response.is_none(), "server cancellation must not fabricate a completion");
+        assert!(
+            response.is_none(),
+            "server cancellation must not fabricate a completion"
+        );
         let wire = wire
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -69361,7 +69956,11 @@ mod lib_unit_tests {
             "the acknowledgement and correlated cancellation control are exact",
         );
         assert_eq!(terminal_position, 1);
-        assert!(!wire.iter().any(|message| matches!(message, JsonRpcMessage::Response(_))));
+        assert!(
+            !wire
+                .iter()
+                .any(|message| matches!(message, JsonRpcMessage::Response(_)))
+        );
     }
 
     #[test]
@@ -71491,7 +72090,10 @@ mod lib_unit_tests {
         );
 
         terminal_delivery.mark_drained();
-        assert!(receipt.is_settled(), "cancellation consumption settles without a final response");
+        assert!(
+            receipt.is_settled(),
+            "cancellation consumption settles without a final response"
+        );
         assert_eq!(
             terminal_delivery.completion_state.load(Ordering::Acquire),
             FINAL_TERMINAL_DRAINED,
@@ -71518,7 +72120,10 @@ mod lib_unit_tests {
         failed.mark_failed();
         failed.mark_drained();
         assert!(failed.is_settled());
-        assert!(!failed.is_drained(), "failed control delivery must never become successful");
+        assert!(
+            !failed.is_drained(),
+            "failed control delivery must never become successful"
+        );
     }
 
     #[test]
@@ -71678,7 +72283,9 @@ mod lib_unit_tests {
         assert_eq!(wire.lock().unwrap().len(), 1);
         let registry = Arc::clone(&server.final_subscriptions);
         let terminator = thread::spawn(move || registry.terminate_with_receipt());
-        consumed_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        consumed_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
         assert!(cancellation.is_cancel_requested());
         let pending = dispatch.as_mut().poll(&mut task_cx).is_pending();
         let receipt_state = delivery.state.load(Ordering::Acquire);
@@ -71688,8 +72295,14 @@ mod lib_unit_tests {
             ready.notify_all();
         }
         let receipt = terminator.join().unwrap();
-        assert!(pending, "consumption must not retire dispatch before the terminal callback publishes its outcome");
-        assert_eq!(receipt_state, FINAL_TERMINAL_ENQUEUED, "consumption must not poison an unflushed winning control");
+        assert!(
+            pending,
+            "consumption must not retire dispatch before the terminal callback publishes its outcome"
+        );
+        assert_eq!(
+            receipt_state, FINAL_TERMINAL_ENQUEUED,
+            "consumption must not poison an unflushed winning control"
+        );
         assert!(block_on(dispatch).is_none());
         assert_eq!(receipt.terminated, 1);
         assert!(receipt.elections_settled());
@@ -71708,13 +72321,17 @@ mod lib_unit_tests {
             let wire = Arc::new(Mutex::new(Vec::new()));
             let wire_for_sender = Arc::clone(&wire);
             let sender: NotificationSender = Arc::new(move |notification| {
-                wire_for_sender.lock().unwrap().push(JsonRpcMessage::Request(notification));
+                wire_for_sender
+                    .lock()
+                    .unwrap()
+                    .push(JsonRpcMessage::Request(notification));
             });
             let JsonRpcMessage::Request(request) = modern_subscriptions_listen_request(893) else {
                 unreachable!();
             };
             let cx = Cx::for_testing();
-            let inbound = InboundRequestContext::new(cx.clone(), 893, InboundRequestTransport::Stdio);
+            let inbound =
+                InboundRequestContext::new(cx.clone(), 893, InboundRequestTransport::Stdio);
             let mut dispatch = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
                 ProtocolPolicy::ModernOnly,
                 &inbound,
@@ -71732,20 +72349,46 @@ mod lib_unit_tests {
             assert_eq!(wire.lock().unwrap().len(), 1);
             if peer_wins {
                 cancellation.cancel();
-                assert!(matches!(dispatch.as_mut().poll(&mut task_cx), std::task::Poll::Ready(None)));
-                assert!(server.final_subscriptions.inner.lock().unwrap().entries.is_empty());
+                assert!(matches!(
+                    dispatch.as_mut().poll(&mut task_cx),
+                    std::task::Poll::Ready(None)
+                ));
+                assert!(
+                    server
+                        .final_subscriptions
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .is_empty()
+                );
                 assert_eq!(server.terminate_subscription_streams(), 0);
                 assert_eq!(wire.lock().unwrap().len(), 1);
             } else {
-                cx.cancel_with(CancelKind::User, Some("listener shutdown before global election"));
+                cx.cancel_with(
+                    CancelKind::User,
+                    Some("listener shutdown before global election"),
+                );
                 assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
-                assert_eq!(server.final_subscriptions.inner.lock().unwrap().entries.len(), 1);
+                assert_eq!(
+                    server
+                        .final_subscriptions
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .len(),
+                    1
+                );
                 assert_eq!(server.terminate_subscription_streams(), 1);
                 assert!(block_on(dispatch).is_none());
                 let wire = wire.lock().unwrap();
                 assert_eq!(wire.len(), 2);
                 assert!(subscription_cancellation_for(&wire[1], 893));
-                assert_eq!(delivery.state.load(Ordering::Acquire), FINAL_TERMINAL_ENQUEUED);
+                assert_eq!(
+                    delivery.state.load(Ordering::Acquire),
+                    FINAL_TERMINAL_ENQUEUED
+                );
             }
         }
     }
@@ -71769,7 +72412,10 @@ mod lib_unit_tests {
         let wire = Arc::new(Mutex::new(Vec::new()));
         let wire_for_sender = Arc::clone(&wire);
         let sender: NotificationSender = Arc::new(move |notification| {
-            wire_for_sender.lock().unwrap().push(JsonRpcMessage::Request(notification));
+            wire_for_sender
+                .lock()
+                .unwrap()
+                .push(JsonRpcMessage::Request(notification));
         });
         let JsonRpcMessage::Request(request) = modern_subscriptions_listen_request(894) else {
             unreachable!();
@@ -71791,13 +72437,27 @@ mod lib_unit_tests {
         assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
         assert_eq!(wire.lock().unwrap().len(), 1);
         clock.advance_to(asupersync::Time::from_secs(1));
-        assert!(matches!(dispatch.as_mut().poll(&mut task_cx), std::task::Poll::Ready(None)));
+        assert!(matches!(
+            dispatch.as_mut().poll(&mut task_cx),
+            std::task::Poll::Ready(None)
+        ));
         drop(dispatch);
         assert!(cancellation.is_cancel_requested());
-        assert!(server.final_subscriptions.inner.lock().unwrap().entries.is_empty());
+        assert!(
+            server
+                .final_subscriptions
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         assert_eq!(server.terminate_subscription_streams(), 0);
         assert_eq!(wire.lock().unwrap().len(), 1);
-        assert_eq!(delivery.state.load(Ordering::Acquire), FINAL_TERMINAL_FAILED);
+        assert_eq!(
+            delivery.state.load(Ordering::Acquire),
+            FINAL_TERMINAL_FAILED
+        );
         assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
@@ -72379,18 +73039,20 @@ mod lib_unit_tests {
             let first_cancellation = McpRequestCancellation::new();
             let second_cancellation = McpRequestCancellation::new();
             let open = |owner, cancellation: McpRequestCancellation, wire: Arc<Mutex<Vec<_>>>| {
-                registry.open(
-                    RequestId::Number(881),
-                    SubscriptionFilter {
-                        tools_list_changed: Some(true),
-                        ..SubscriptionFilter::default()
-                    },
-                    false,
-                    Some(owner),
-                    cancellation,
-                    None,
-                    Arc::new(move |notification| wire.lock().unwrap().push(notification)),
-                ).unwrap()
+                registry
+                    .open(
+                        RequestId::Number(881),
+                        SubscriptionFilter {
+                            tools_list_changed: Some(true),
+                            ..SubscriptionFilter::default()
+                        },
+                        false,
+                        Some(owner),
+                        cancellation,
+                        None,
+                        Arc::new(move |notification| wire.lock().unwrap().push(notification)),
+                    )
+                    .unwrap()
             };
             // Identical JSON-RPC IDs on separate HTTP bodies still have
             // distinct registry ownership and terminal elections.
@@ -72399,20 +73061,40 @@ mod lib_unit_tests {
             if peer_wins {
                 first_cancellation.cancel();
             }
-            assert_eq!(block_on(first.terminate(&Cx::for_testing(), &first_cancellation)).is_ok(), !peer_wins);
+            assert_eq!(
+                block_on(first.terminate(&Cx::for_testing(), &first_cancellation)).is_ok(),
+                !peer_wins
+            );
             assert!(first_cancellation.is_cancel_requested());
             assert!(!second_cancellation.is_cancel_requested());
             assert!(!registry.is_terminating());
             assert_eq!(registry.inner.lock().unwrap().entries.len(), 1);
-            assert_eq!(first_wire.lock().unwrap().len(), if peer_wins { 1 } else { 2 });
+            assert_eq!(
+                first_wire.lock().unwrap().len(),
+                if peer_wins { 1 } else { 2 }
+            );
             if !peer_wins {
                 let wire = first_wire.lock().unwrap();
-                assert!(subscription_cancellation_for(&JsonRpcMessage::Request(wire[1].clone()), 881));
+                assert!(subscription_cancellation_for(
+                    &JsonRpcMessage::Request(wire[1].clone()),
+                    881
+                ));
             }
-            assert_eq!(registry.publish(ServerNotification::ToolsListChanged(None)).unwrap(), 1);
+            assert_eq!(
+                registry
+                    .publish(ServerNotification::ToolsListChanged(None))
+                    .unwrap(),
+                1
+            );
             assert_eq!(second_wire.lock().unwrap().len(), 2);
-            assert_eq!(block_on(first.terminate(&Cx::for_testing(), &first_cancellation)).is_ok(), !peer_wins);
-            assert_eq!(first_wire.lock().unwrap().len(), if peer_wins { 1 } else { 2 });
+            assert_eq!(
+                block_on(first.terminate(&Cx::for_testing(), &first_cancellation)).is_ok(),
+                !peer_wins
+            );
+            assert_eq!(
+                first_wire.lock().unwrap().len(),
+                if peer_wins { 1 } else { 2 }
+            );
             assert!(!second_cancellation.is_cancel_requested());
         }
     }
@@ -72428,36 +73110,43 @@ mod lib_unit_tests {
             let (entered_sender, entered_receiver) = sync_channel(1);
             let release = Arc::new((Mutex::new(false), Condvar::new()));
             let release_sender = Arc::clone(&release);
-            let lease = registry.open(
-                RequestId::Number(892),
-                SubscriptionFilter {
-                    tools_list_changed: Some(true),
-                    ..SubscriptionFilter::default()
-                },
-                false,
-                Some(892),
-                cancellation.clone(),
-                None,
-                Arc::new(move |notification| {
-                    let event = notification.method == "notifications/tools/list_changed";
-                    wire_for_sender.lock().unwrap().push(notification);
-                    if event {
-                        entered_sender.send(()).unwrap();
-                        let (lock, ready) = &*release_sender;
-                        let mut released = lock.lock().unwrap();
-                        while !*released {
-                            released = ready.wait(released).unwrap();
+            let lease = registry
+                .open(
+                    RequestId::Number(892),
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                    false,
+                    Some(892),
+                    cancellation.clone(),
+                    None,
+                    Arc::new(move |notification| {
+                        let event = notification.method == "notifications/tools/list_changed";
+                        wire_for_sender.lock().unwrap().push(notification);
+                        if event {
+                            entered_sender.send(()).unwrap();
+                            let (lock, ready) = &*release_sender;
+                            let mut released = lock.lock().unwrap();
+                            while !*released {
+                                released = ready.wait(released).unwrap();
+                            }
                         }
-                    }
-                }),
-            ).unwrap();
+                    }),
+                )
+                .unwrap();
             let publisher_registry = Arc::clone(&registry);
             let key = lease.key;
             let election = Arc::clone(&lease.election);
-            let publisher = thread::spawn(move || publisher_registry.publish_selected(
-                ServerNotification::ToolsListChanged(None), Some((key, &election)),
-            ));
-            entered_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            let publisher = thread::spawn(move || {
+                publisher_registry.publish_selected(
+                    ServerNotification::ToolsListChanged(None),
+                    Some((key, &election)),
+                )
+            });
+            entered_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
             let cx = Cx::for_testing();
             let mut terminal = Box::pin(lease.terminate(&cx, &cancellation));
             let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -72473,14 +73162,20 @@ mod lib_unit_tests {
                 ready.notify_all();
             }
             publisher.join().unwrap().unwrap();
-            assert!(pending, "an in-flight event callback owns terminal ordering");
+            assert!(
+                pending,
+                "an in-flight event callback owns terminal ordering"
+            );
             assert_eq!(phase, FinalSubscriptionPhase::ServerTerminationPending(1));
             assert!(!prematurely_cancelled);
             assert_eq!(block_on(terminal).is_ok(), !peer_wins);
             let wire = wire.lock().unwrap();
             assert_eq!(wire.len(), if peer_wins { 2 } else { 3 });
             if !peer_wins {
-                assert!(subscription_cancellation_for(&JsonRpcMessage::Request(wire[2].clone()), 892));
+                assert!(subscription_cancellation_for(
+                    &JsonRpcMessage::Request(wire[2].clone()),
+                    892
+                ));
             }
             assert!(registry.inner.lock().unwrap().entries.is_empty());
         }

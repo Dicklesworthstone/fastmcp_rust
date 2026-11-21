@@ -12,9 +12,7 @@ use termination::TerminalDecoder;
 
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
-use fastmcp_protocol::{
-    CoreResult, FinalSubscriptionsListenParams, RequestId, ServerNotification,
-};
+use fastmcp_protocol::{CoreResult, FinalSubscriptionsListenParams, RequestId, ServerNotification};
 
 use super::{
     DpopCredential, DpopHttpClient, DpopStreamError, DpopStreamLimits, Idle, Lifetime,
@@ -89,7 +87,11 @@ impl DpopHttpClient {
     where
         N: FnMut(&ServerNotification) -> bool,
     {
-        let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
+        let bounds = WaitBounds::new(
+            cx,
+            self.policy.timeout.min(limits.core.timeout()),
+            credential,
+        )?;
         let lifetime = Lifetime {
             cx,
             cancellation,
@@ -142,8 +144,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::super::{
-        CoreDecoder, DpopCoreError, DpopHttpError, DpopSession, ManagedCoreError, ManagedCoreLimits,
-        ModernHttpResponseKind, Reader,
+        CoreDecoder, DpopCoreError, DpopHttpError, DpopSession, ManagedCoreError,
+        ManagedCoreLimits, ModernHttpResponseKind, Reader,
     };
 
     mod termination;
@@ -197,7 +199,11 @@ mod tests {
     }
 
     fn updated(uri: &str) -> String {
-        notification(json!(7), "notifications/resources/updated", json!({"uri":uri}))
+        notification(
+            json!(7),
+            "notifications/resources/updated",
+            json!({"uri":uri}),
+        )
     }
 
     fn event(payload: &str) -> String {
@@ -210,10 +216,20 @@ mod tests {
         limits: DpopStreamLimits,
     ) -> Reader<TerminalDecoder> {
         let (_, decoder) = prepare_bounded(
-            TARGET, params(requested), RequestId::Number(7), limits.core, 8192,
+            TARGET,
+            params(requested),
+            RequestId::Number(7),
+            limits.core,
+            8192,
         )
         .unwrap();
-        Reader::new(kind, TerminalDecoder::new(decoder, RequestId::Number(7), limits.core), limits, 32768).unwrap()
+        Reader::new(
+            kind,
+            TerminalDecoder::new(decoder, RequestId::Number(7), limits.core),
+            limits,
+            32768,
+        )
+        .unwrap()
     }
 
     fn fixture(f: impl FnOnce(&Lifetime<'_>, &Arc<VirtualClock>)) {
@@ -227,19 +243,28 @@ mod tests {
         let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
         let session = DpopSession::new(
-            DpopKey::generate().unwrap(), issuer.clone(), CanonicalHttpUrl::parse(TARGET).unwrap(),
+            DpopKey::generate().unwrap(),
+            issuer.clone(),
+            CanonicalHttpUrl::parse(TARGET).unwrap(),
         )
         .unwrap();
-        let credential = session.admit_token_response(
-            &issuer, 200,
-            br#"{"access_token":"subscription-token","token_type":"DPoP","expires_in":300}"#,
-            Instant::now(), Duration::from_secs(300),
-        )
-        .unwrap();
+        let credential = session
+            .admit_token_response(
+                &issuer,
+                200,
+                br#"{"access_token":"subscription-token","token_type":"DPoP","expires_in":300}"#,
+                Instant::now(),
+                Duration::from_secs(300),
+            )
+            .unwrap();
         let cancellation = McpRequestCancellation::new();
         let bounds = WaitBounds::new(&cx, Duration::from_secs(60), &credential).unwrap();
         let lifetime = Lifetime {
-            cx: &cx, cancellation: &cancellation, session: &session, credential: &credential, bounds,
+            cx: &cx,
+            cancellation: &cancellation,
+            session: &session,
+            credential: &credential,
+            bounds,
         };
         with_caller(&cx, || f(&lifetime, &clock));
         assert_eq!(timer.pending_count(), 0);
@@ -250,28 +275,45 @@ mod tests {
     #[test]
     fn subscription_preparation_preserves_identity_and_both_exact_request_caps() {
         let (wire, _) = prepare_bounded(
-            TARGET, params(filter()), RequestId::Number(7), limits().core, 8192,
+            TARGET,
+            params(filter()),
+            RequestId::Number(7),
+            limits().core,
+            8192,
         )
         .unwrap();
         let encoded: Value = serde_json::from_slice(wire.body()).unwrap();
         assert_eq!(encoded["id"], 7);
         assert_eq!(encoded["method"], "subscriptions/listen");
         assert_eq!(encoded["params"]["notifications"], filter());
-        assert!(wire.headers().iter().any(|(name, value)|
-            name == "Mcp-Method" && value == "subscriptions/listen"));
-        assert!(!wire.headers().iter().any(|(name, _)|
-            name == "Authorization" || name == "DPoP" || name == "Mcp-Name"));
+        assert!(
+            wire.headers()
+                .iter()
+                .any(|(name, value)| name == "Mcp-Method" && value == "subscriptions/listen")
+        );
+        assert!(
+            !wire
+                .headers()
+                .iter()
+                .any(|(name, _)| name == "Authorization" || name == "DPoP" || name == "Mcp-Name")
+        );
         let length = wire.body().len();
         for native_bound in [false, true] {
             for exact in [false, true] {
                 let cap = length - usize::from(!exact);
                 let core = ManagedCoreLimits::new(
                     if native_bound { 8192 } else { cap },
-                    8192, 32768, 16, Duration::from_secs(60),
+                    8192,
+                    32768,
+                    16,
+                    Duration::from_secs(60),
                 )
                 .unwrap();
                 let result = prepare_bounded(
-                    TARGET, params(filter()), RequestId::Number(7), core,
+                    TARGET,
+                    params(filter()),
+                    RequestId::Number(7),
+                    core,
                     if native_bound { cap } else { 8192 },
                 );
                 if exact {
@@ -285,7 +327,8 @@ mod tests {
         assert!(matches!(
             CoreDecoder::for_request(
                 CoreRequest::Final(FinalCoreRequest::SubscriptionsListen(params(filter()))),
-                RequestId::Number(7), limits().core,
+                RequestId::Number(7),
+                limits().core,
             ),
             Err(ManagedCoreError::UnsupportedRequest)
         ));
@@ -297,9 +340,16 @@ mod tests {
             json!({"taskIds":["task-private"]}),
             json!({"resourceSubscriptions":[RESOURCE,RESOURCE]}),
         ] {
-            assert!(prepare_bounded(
-                TARGET, params(forbidden), RequestId::Number(7), limits().core, 8192,
-            ).is_err());
+            assert!(
+                prepare_bounded(
+                    TARGET,
+                    params(forbidden),
+                    RequestId::Number(7),
+                    limits().core,
+                    8192,
+                )
+                .is_err()
+            );
         }
         let mut source = json!({
             "_meta":FinalRequestMeta::new(ClientCapabilities::default()),
@@ -309,16 +359,24 @@ mod tests {
             json!({"io.modelcontextprotocol/tasks":{}});
         assert!(matches!(
             prepare_bounded(
-                TARGET, serde_json::from_value(source).unwrap(), RequestId::Number(7),
-                limits().core, 8192,
+                TARGET,
+                serde_json::from_value(source).unwrap(),
+                RequestId::Number(7),
+                limits().core,
+                8192,
             ),
             Err(ManagedCoreError::UnsupportedRequest)
         ));
-        let no_events = ManagedCoreLimits::new(
-            8192, 8192, 32768, 0, Duration::from_secs(60),
-        ).unwrap();
+        let no_events =
+            ManagedCoreLimits::new(8192, 8192, 32768, 0, Duration::from_secs(60)).unwrap();
         assert!(matches!(
-            prepare_bounded(TARGET, params(filter()), RequestId::Number(7), no_events, 8192),
+            prepare_bounded(
+                TARGET,
+                params(filter()),
+                RequestId::Number(7),
+                no_events,
+                8192
+            ),
             Err(ManagedCoreError::InvalidLimits)
         ));
     }
@@ -329,21 +387,43 @@ mod tests {
             let acknowledgement = ack(json!(7), filter());
             let changed = change(json!(7));
             let resource = updated(RESOURCE);
-            let wire = format!("{}{}{}{}", event(&acknowledgement), event(&changed), event(&resource), event(COMPLETE));
+            let wire = format!(
+                "{}{}{}{}",
+                event(&acknowledgement),
+                event(&changed),
+                event(&resource),
+                event(COMPLETE)
+            );
             for split in 0..=wire.len() {
                 let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
                 let mut observations = Vec::new();
                 let mut observe = |notification: &ServerNotification| {
-                    observations.push(matches!(notification, ServerNotification::SubscriptionsAcknowledged(_)));
+                    observations.push(matches!(
+                        notification,
+                        ServerNotification::SubscriptionsAcknowledged(_)
+                    ));
                     true
                 };
-                reader.push(&wire.as_bytes()[..split], life, &mut idle, &mut observe).unwrap();
-                reader.push(&wire.as_bytes()[split..], life, &mut idle, &mut observe).unwrap();
+                reader
+                    .push(&wire.as_bytes()[..split], life, &mut idle, &mut observe)
+                    .unwrap();
+                reader
+                    .push(&wire.as_bytes()[split..], life, &mut idle, &mut observe)
+                    .unwrap();
                 assert_eq!(observations, [true, false, false]);
-                assert_eq!(reader.decoder.usage(), (acknowledgement.len() + changed.len() + resource.len() + COMPLETE.len(), 3));
+                assert_eq!(
+                    reader.decoder.usage(),
+                    (
+                        acknowledgement.len() + changed.len() + resource.len() + COMPLETE.len(),
+                        3
+                    )
+                );
                 let result = reader.finish(life, &idle).unwrap().result.unwrap();
-                assert!(matches!(&result, CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })));
+                assert!(matches!(
+                    &result,
+                    CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })
+                ));
                 let encoded = result.encode().unwrap();
                 assert!(encoded.contains("900719925474099312345"));
                 assert!(encoded.contains("1.20e+4"));
@@ -351,10 +431,21 @@ mod tests {
             let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
             let mut idle = Idle::new(life.cx.now(), limits().idle);
             let mut calls = 0;
-            reader.push(event(&acknowledgement).as_bytes(), life, &mut idle, &mut |_| {
-                calls += 1; true
-            }).unwrap();
-            assert_eq!(calls, 1, "acknowledgement is delivered before final bytes exist");
+            reader
+                .push(
+                    event(&acknowledgement).as_bytes(),
+                    life,
+                    &mut idle,
+                    &mut |_| {
+                        calls += 1;
+                        true
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                calls, 1,
+                "acknowledgement is delivered before final bytes exist"
+            );
             assert!(reader.terminal.is_none());
         });
     }
@@ -370,18 +461,33 @@ mod tests {
                 (true, change(json!(8))),
                 (true, updated("file:///a/b?scope=one")),
                 (true, ack(json!(7), filter())),
-                (true, notification(json!(7), "notifications/prompts/list_changed", json!({}))),
+                (
+                    true,
+                    notification(json!(7), "notifications/prompts/list_changed", json!({})),
+                ),
             ] {
                 let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
                 if established {
-                    reader.push(event(&ack(json!(7), filter())).as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+                    reader
+                        .push(
+                            event(&ack(json!(7), filter())).as_bytes(),
+                            life,
+                            &mut idle,
+                            &mut |_| true,
+                        )
+                        .unwrap();
                 }
                 let before = reader.decoder.usage();
                 let mut calls = 0;
-                assert!(reader.push(event(&invalid).as_bytes(), life, &mut idle, &mut |_| {
-                    calls += 1; true
-                }).is_err());
+                assert!(
+                    reader
+                        .push(event(&invalid).as_bytes(), life, &mut idle, &mut |_| {
+                            calls += 1;
+                            true
+                        })
+                        .is_err()
+                );
                 assert_eq!(calls, 0);
                 assert_eq!(reader.decoder.usage(), before);
                 assert!(reader.terminal.is_none());
@@ -392,20 +498,39 @@ mod tests {
     #[test]
     fn subscription_acknowledgement_spends_quota_without_extending_deadlines() {
         fixture(|life, clock| {
-            let core = ManagedCoreLimits::new(8192, 8192, 32768, 1, Duration::from_secs(60)).unwrap();
+            let core =
+                ManagedCoreLimits::new(8192, 8192, 32768, 1, Duration::from_secs(60)).unwrap();
             let bounded = DpopStreamLimits::new(core, Duration::from_secs(10)).unwrap();
             let mut reader = reader(ModernHttpResponseKind::Sse, filter(), bounded);
             let mut idle = Idle::new(life.cx.now(), bounded.idle);
             let original = idle.deadline;
             clock.advance(9_000_000_000);
-            reader.push(event(&ack(json!(7), filter())).as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+            reader
+                .push(
+                    event(&ack(json!(7), filter())).as_bytes(),
+                    life,
+                    &mut idle,
+                    &mut |_| true,
+                )
+                .unwrap();
             assert_eq!(reader.decoder.usage().1, 1);
             assert_eq!(idle.deadline, original);
             let mut calls = 0;
-            let error = reader.push(event(&change(json!(7))).as_bytes(), life, &mut idle, &mut |_| {
-                calls += 1; true
-            }).unwrap_err();
-            assert!(matches!(error, DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::NotificationLimit))));
+            let error = reader
+                .push(
+                    event(&change(json!(7))).as_bytes(),
+                    life,
+                    &mut idle,
+                    &mut |_| {
+                        calls += 1;
+                        true
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::NotificationLimit))
+            ));
             assert_eq!(calls, 0);
             assert_eq!(idle.deadline, original);
             clock.advance(1_000_000_000);
@@ -417,7 +542,12 @@ mod tests {
     fn subscription_observer_stop_and_same_poll_cancellation_withhold_completion() {
         for action in 0..4 {
             fixture(|life, _| {
-                let wire = format!("{}{}{}", event(&ack(json!(7), filter())), event(&change(json!(7))), event(COMPLETE));
+                let wire = format!(
+                    "{}{}{}",
+                    event(&ack(json!(7), filter())),
+                    event(&change(json!(7))),
+                    event(COMPLETE)
+                );
                 let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
                 let mut calls = 0;
@@ -425,7 +555,9 @@ mod tests {
                     calls += 1;
                     match action {
                         0 => return false,
-                        1 => { life.cancellation.cancel(); }
+                        1 => {
+                            life.cancellation.cancel();
+                        }
                         2 => life.credential.revoke(),
                         _ => panic!("subscription-observer-private-canary"),
                     }
@@ -434,13 +566,21 @@ mod tests {
                 let error = result.unwrap_err();
                 assert_eq!(calls, 1);
                 assert!(reader.terminal.is_none());
-                assert!(!format!("{error:?} {error}").contains("subscription-observer-private-canary"));
+                assert!(
+                    !format!("{error:?} {error}").contains("subscription-observer-private-canary")
+                );
                 match action {
                     0 => assert!(matches!(error, DpopStreamError::ObserverStopped)),
                     3 => assert!(matches!(error, DpopStreamError::ObserverPanicked)),
-                    _ => assert!(matches!(error, DpopStreamError::Core(DpopCoreError::Transport(_)))),
+                    _ => assert!(matches!(
+                        error,
+                        DpopStreamError::Core(DpopCoreError::Transport(_))
+                    )),
                 }
-                assert!(!life.cx.is_cancel_requested(), "request-local retirement preserves the caller");
+                assert!(
+                    !life.cx.is_cancel_requested(),
+                    "request-local retirement preserves the caller"
+                );
             });
         }
     }
@@ -453,10 +593,23 @@ mod tests {
                 let mut reader = reader(ModernHttpResponseKind::Json, filter(), limits());
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
                 let mut calls = 0;
-                reader.push(frame.as_bytes(), life, &mut idle, &mut |_| { calls += 1; true }).unwrap();
+                reader
+                    .push(frame.as_bytes(), life, &mut idle, &mut |_| {
+                        calls += 1;
+                        true
+                    })
+                    .unwrap();
                 let error = reader.finish(life, &idle).err().unwrap();
                 assert_eq!(calls, 0);
-                assert_eq!(matches!(&error, DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::Remote { .. }))), remote);
+                assert_eq!(
+                    matches!(
+                        &error,
+                        DpopStreamError::Core(DpopCoreError::Protocol(
+                            ManagedCoreError::Remote { .. }
+                        ))
+                    ),
+                    remote
+                );
                 assert!(!format!("{error:?} {error}").contains("private-peer-canary"));
                 assert!(!format!("{error:?} {error}").contains("private-data-canary"));
             }
@@ -464,9 +617,16 @@ mod tests {
                 let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
                 let wire = format!("{}{tail}", event(&ack(json!(7), filter())));
-                reader.push(wire.as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+                reader
+                    .push(wire.as_bytes(), life, &mut idle, &mut |_| true)
+                    .unwrap();
                 assert!(reader.terminal.is_none());
-                assert!(matches!(reader.finish(life, &idle), Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)))));
+                assert!(matches!(
+                    reader.finish(life, &idle),
+                    Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::InvalidResponse
+                    )))
+                ));
             }
         });
     }

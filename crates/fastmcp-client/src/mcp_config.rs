@@ -158,10 +158,8 @@ impl Serialize for ServerConfig {
                 "HTTP-only server configuration contains stdio settings",
             ));
         }
-        let mut state = serializer.serialize_struct(
-            "ServerConfig",
-            if self.stdio_configured { 6 } else { 2 },
-        )?;
+        let mut state = serializer
+            .serialize_struct("ServerConfig", if self.stdio_configured { 6 } else { 2 })?;
         if self.stdio_configured {
             state.serialize_field("command", &self.command)?;
             state.serialize_field("args", &self.args)?;
@@ -449,7 +447,9 @@ impl HttpEndpointConfig {
             route: HttpRouteKind::ModernMcpPost,
         };
         if url.contains("${")
-            || url.chars().any(|character| character.is_control() || character.is_whitespace())
+            || url
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
         {
             return Err(invalid());
         }
@@ -1235,7 +1235,6 @@ mod tests {
         runtime.block_on(test);
     }
 
-
     fn literal_http_config(registry: &str, url: &str, disabled: bool) -> McpConfig {
         McpConfig::from_json(
             &serde_json::json!({
@@ -1248,9 +1247,7 @@ mod tests {
         .expect("literal HTTP registry entry")
     }
 
-    fn read_literal_http_request(
-        stream: &mut std::net::TcpStream,
-    ) -> (String, serde_json::Value) {
+    fn read_literal_http_request(stream: &mut std::net::TcpStream) -> (String, serde_json::Value) {
         use std::io::Read as _;
 
         stream
@@ -1260,7 +1257,10 @@ mod tests {
         let mut buffer = [0_u8; 4096];
         let end = loop {
             let count = stream.read(&mut buffer).unwrap();
-            assert!(count > 0, "configured HTTP request ended before its headers");
+            assert!(
+                count > 0,
+                "configured HTTP request ended before its headers"
+            );
             bytes.extend_from_slice(&buffer[..count]);
             assert!(bytes.len() <= 128 * 1024);
             if let Some(at) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
@@ -1290,9 +1290,7 @@ mod tests {
         (head, body)
     }
 
-    fn literal_http_peer(
-        route: &str,
-    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+    fn literal_http_peer(route: &str) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
         use std::io::Write as _;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1326,7 +1324,8 @@ mod tests {
                     head.lines()
                         .filter_map(|line| {
                             let (key, value) = line.split_once(':')?;
-                            key.eq_ignore_ascii_case(name).then(|| value.trim().to_owned())
+                            key.eq_ignore_ascii_case(name)
+                                .then(|| value.trim().to_owned())
                         })
                         .collect::<Vec<_>>()
                 };
@@ -1427,7 +1426,11 @@ mod tests {
                 assert_eq!(config.to_json(), before);
             });
             let observed = peer.join().unwrap();
-            assert_eq!(observed.len(), 2, "one discovery and one application request");
+            assert_eq!(
+                observed.len(),
+                2,
+                "one discovery and one application request"
+            );
         }
     }
 
@@ -1436,7 +1439,10 @@ mod tests {
         for registry in ["mcpServers", "servers"] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
-            let url = format!("http://{}/mcp?tenant=private", listener.local_addr().unwrap());
+            let url = format!(
+                "http://{}/mcp?tenant=private",
+                listener.local_addr().unwrap()
+            );
             let active = literal_http_config(registry, &url, false);
             let disabled = literal_http_config(registry, &url, true);
             let before = active.to_json();
@@ -1485,7 +1491,10 @@ mod tests {
 
             for (field, value) in [
                 ("command", serde_json::json!("server")),
-                ("headers", serde_json::json!({"Authorization":"Bearer rejected-secret"})),
+                (
+                    "headers",
+                    serde_json::json!({"Authorization":"Bearer rejected-secret"}),
+                ),
             ] {
                 let mut entry = serde_json::json!({"type":"http", "url":url});
                 entry[field] = value;

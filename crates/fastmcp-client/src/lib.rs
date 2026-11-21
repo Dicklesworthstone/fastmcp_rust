@@ -180,10 +180,9 @@ use fastmcp_protocol::{
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, ModernHttpClient,
     ModernHttpClientError, ModernHttpExtensionEvent, ModernHttpExtensionExecution,
-    ModernHttpRequestControl, ModernHttpRequestExecution,
-    ModernHttpResponseStream, ModernHttpSubscriptionListenCollector,
-    ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
-    ModernHttpSubscriptionTermination,
+    ModernHttpRequestControl, ModernHttpRequestExecution, ModernHttpResponseStream,
+    ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenEvent,
+    ModernHttpSubscriptionListener, ModernHttpSubscriptionTermination,
 };
 #[cfg(feature = "legacy-2024-11-05")]
 pub use http_executor::{
@@ -3598,7 +3597,9 @@ fn invoke_shared_reverse_request_handler<P, R>(
         )
     })
     .unwrap_or_else(|_| {
-        Err(McpError::internal_error("Client reverse request handler failed"))
+        Err(McpError::internal_error(
+            "Client reverse request handler failed",
+        ))
     })
     .and_then(|result| {
         check()?;
@@ -3617,7 +3618,9 @@ fn invoke_shared_reverse_request_handler<P, R>(
     });
     if cleanup.is_err() {
         owner.0.cancel();
-        return Err(McpError::internal_error("Client reverse request handler failed"));
+        return Err(McpError::internal_error(
+            "Client reverse request handler failed",
+        ));
     }
     let result = outcome?;
     check()?;
@@ -3730,7 +3733,10 @@ async fn invoke_mrtr_request_handler_async<P, R>(
                 // register only on its admitted caller's timer, never Sleep's
                 // out-of-runtime fallback or an unrelated ambient driver.
                 let wake = wake.get_or_insert_with(|| {
-                    Box::pin(asupersync::time::sleep(cx.now(), REVERSE_CALLBACK_POLL_SLICE))
+                    Box::pin(asupersync::time::sleep(
+                        cx.now(),
+                        REVERSE_CALLBACK_POLL_SLICE,
+                    ))
                 });
                 if wake.as_mut().poll(task_cx).is_ready() {
                     wake.set(asupersync::time::sleep(
@@ -6598,7 +6604,9 @@ where
                 )
                 .await
                 .map(WebSocketInitialization::Legacy),
-                ProtocolPolicy::Auto => unreachable!("Auto was rejected before transport ownership"),
+                ProtocolPolicy::Auto => {
+                    unreachable!("Auto was rejected before transport ownership")
+                }
             };
             let initialization = match handshake {
                 Ok(initialization) => initialization,
@@ -6635,7 +6643,8 @@ where
             };
 
             if matches!(initialization, WebSocketInitialization::Legacy(_)) {
-                let initialized = JsonRpcMessage::Request(JsonRpcRequest::initialized_notification());
+                let initialized =
+                    JsonRpcMessage::Request(JsonRpcRequest::initialized_notification());
                 match deadline.wait(cx, None, sender.send(cx, &initialized)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => return Err(transport_error_to_mcp(error)),
@@ -6687,7 +6696,9 @@ where
                 };
                 session.set_mcp_apps_activation_receipt(apps_activation_receipt);
                 session.try_with_protocol_plan(protocol_plan).map_err(|_| {
-                    McpError::internal_error("Configured protocol policy rejects the negotiated era")
+                    McpError::internal_error(
+                        "Configured protocol policy rejects the negotiated era",
+                    )
                 })
             })();
             let session = deadline.check(cx, None).and(session);
@@ -6848,7 +6859,8 @@ where
                 {
                     deadline.check(cx, None)?;
                     let fresh_legacy = with_caller_context(cx, || {
-                        let factory_cx = Cx::current().expect("WebSocket factory caller is installed");
+                        let factory_cx =
+                            Cx::current().expect("WebSocket factory caller is installed");
                         fresh_transport(&factory_cx)
                     });
                     let fresh_legacy = deadline.wait(cx, None, fresh_legacy).await??;
@@ -7392,12 +7404,13 @@ where
                     // No catalog or subscription notification enters this path.
                     let admitted = (|| -> McpResult<FinalLogMessageParams> {
                         let raw = raw_notification_params_from_frame(frame.source())?;
-                        let decoded = decode_final_server_notification(notification, raw.as_deref())
-                            .map_err(|error| {
-                                McpError::invalid_request(format!(
-                                    "WebSocket final server notification is invalid: {error}"
-                                ))
-                            })?;
+                        let decoded =
+                            decode_final_server_notification(notification, raw.as_deref())
+                                .map_err(|error| {
+                                    McpError::invalid_request(format!(
+                                        "WebSocket final server notification is invalid: {error}"
+                                    ))
+                                })?;
                         let ServerNotification::Message(message) = decoded else {
                             unreachable!("notifications/message selects only the log branch");
                         };
@@ -7420,12 +7433,17 @@ where
                     {
                         on_log
                             .as_deref_mut()
-                            .expect("live log callback was selected")(message);
+                            .expect("live log callback was selected")(
+                            message
+                        );
                     }
                     continue;
                 }
                 let retained_progress = self.final_progress_notifications.len();
-                if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame, received_at).await {
+                if let Err(error) = self
+                    .handle_unsolicited_websocket_request(cx, &frame, received_at)
+                    .await
+                {
                     return Err(self.terminal_callback_error(cx, error).await);
                 }
                 if timeout_policy.resets_idle_on_matching_progress()
@@ -7475,9 +7493,9 @@ where
                     && let Some(expected_key) = expected_progress_key.as_ref()
                     && let JsonRpcMessage::Request(notification) = frame.message()
                     && let Some(params) = notification.params.as_ref()
-                    && !["total", "message", "_meta"].iter().any(|member| {
-                        params.get(*member).is_some_and(serde_json::Value::is_null)
-                    })
+                    && !["total", "message", "_meta"]
+                        .iter()
+                        .any(|member| params.get(*member).is_some_and(serde_json::Value::is_null))
                     && let Some(progress) = self.final_progress_notifications.back()
                     && execution::progress_marker_key(&progress.progress_token).as_ref()
                         == Some(expected_key)
@@ -7838,7 +7856,8 @@ where
         }
         // A valid event that raced cancellation can still make retained data
         // stale. It never transfers notification ownership to a new listener.
-        self.final_result_cache.invalidate_notification(&notification);
+        self.final_result_cache
+            .invalidate_notification(&notification);
         Ok(true)
     }
 
@@ -7907,7 +7926,8 @@ where
             )
         {
             if subscription.terminal_response.is_some() || subscription.terminal_error.is_some() {
-                self.final_result_cache.invalidate_notification(notification);
+                self.final_result_cache
+                    .invalidate_notification(notification);
                 return Ok(true);
             }
             match notification {
@@ -7952,7 +7972,8 @@ where
                 _ => return Ok(false),
             }
             subscription.lifetime.observe_activity(received_at);
-            self.final_result_cache.invalidate_notification(notification);
+            self.final_result_cache
+                .invalidate_notification(notification);
             match notification {
                 ServerNotification::ToolsListChanged(_) => {
                     self.record_websocket_catalog_change("notifications/tools/list_changed");
@@ -8016,7 +8037,10 @@ where
             let CancellationWireMessage::Modern2026 { params, .. } = cancellation else {
                 unreachable!("the selected cancellation codec is modern");
             };
-            if self.select_websocket_subscription_error(&params.request_id, McpError::request_cancelled()) {
+            if self.select_websocket_subscription_error(
+                &params.request_id,
+                McpError::request_cancelled(),
+            ) {
                 // A server teardown is already terminal; do not echo it.
                 // Keep exact-ID custody if the server also sends a late final.
                 self.retire_websocket_subscription_without_control(&params.request_id)?;
@@ -8039,7 +8063,8 @@ where
                     FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
                 ));
             }
-            self.final_result_cache.invalidate_notification(&notification);
+            self.final_result_cache
+                .invalidate_notification(&notification);
             self.final_server_notifications.push_back(notification);
             self.record_websocket_catalog_change(&request.method);
             return Ok(true);
@@ -8744,8 +8769,8 @@ where
                 }
                 let changed_catalog = self.websocket_catalog_generation(method) != generation;
                 let cache_page = self.last_final_cache_page.take();
-                let cached_prefix = next_cursor.is_some()
-                    && cache_page.is_some_and(|page| page.miss.is_none());
+                let cached_prefix =
+                    next_cursor.is_some() && cache_page.is_some_and(|page| page.miss.is_none());
                 let invalidated_fill = cache_page.is_some_and(|page| {
                     let result_set = match method {
                         "tools/list" => FinalCacheResultSet::Tools,
@@ -9311,7 +9336,10 @@ where
     ) -> McpResult<()> {
         if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
             || cx.checkpoint().is_err()
-            || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+            || cx
+                .budget()
+                .deadline
+                .is_some_and(|deadline| cx.now() >= deadline)
         {
             return Err(McpError::request_cancelled());
         }
@@ -9321,7 +9349,9 @@ where
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
-        self.reverse_callback_pool.terminal_error().map_or(Ok(()), Err)
+        self.reverse_callback_pool
+            .terminal_error()
+            .map_or(Ok(()), Err)
     }
 
     fn websocket_final_cache_key(
@@ -9335,11 +9365,13 @@ where
         let object = projection.as_object_mut().ok_or_else(|| {
             McpError::invalid_params("WebSocket cache parameters must be an object")
         })?;
-        let cursor = object.remove("cursor")
+        let cursor = object
+            .remove("cursor")
             .and_then(|cursor| cursor.as_str().map(str::to_owned));
         // list_catalog_page also admits caller-owned open metadata. Preserve
         // it in the projection instead of assuming it is observational only.
-        let capabilities = parameters.get("_meta")
+        let capabilities = parameters
+            .get("_meta")
             .and_then(|meta| meta.get(FINAL_CLIENT_CAPABILITIES_META_KEY));
         Ok(FinalCacheKey::new(
             "websocket",
@@ -9347,9 +9379,9 @@ where
             serde_json::to_string(&capabilities).map_err(|_| {
                 McpError::internal_error("WebSocket cache capabilities could not serialize")
             })?,
-            serde_json::to_string(&self.session.client_extension_wire_settings()).map_err(|_| {
-                McpError::internal_error("WebSocket cache extensions could not serialize")
-            })?,
+            serde_json::to_string(&self.session.client_extension_wire_settings()).map_err(
+                |_| McpError::internal_error("WebSocket cache extensions could not serialize"),
+            )?,
             method,
             serde_json::to_string(&projection).map_err(|_| {
                 McpError::internal_error("WebSocket cache parameters could not serialize")
@@ -9402,10 +9434,14 @@ where
                 }
             };
             let received_at = cx.now();
-            self.expire_live_websocket_subscriptions_at(received_at).await?;
+            self.expire_live_websocket_subscriptions_at(received_at)
+                .await?;
             match frame.message() {
                 JsonRpcMessage::Request(_) => {
-                    if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame, received_at).await {
+                    if let Err(error) = self
+                        .handle_unsolicited_websocket_request(cx, &frame, received_at)
+                        .await
+                    {
                         return Err(self.terminal_callback_error(cx, error).await);
                     }
                 }
@@ -9418,10 +9454,12 @@ where
                     match self.park_websocket_listen_terminal(response, raw) {
                         Ok(true) => {}
                         Ok(false) => {
-                            return Err(self.close_after_protocol_error(
-                                cx,
-                                "WebSocket cache drain received an unowned response",
-                            ).await);
+                            return Err(self
+                                .close_after_protocol_error(
+                                    cx,
+                                    "WebSocket cache drain received an unowned response",
+                                )
+                                .await);
                         }
                         Err(error) => return Err(self.terminal_callback_error(cx, error).await),
                     }
@@ -9505,8 +9543,14 @@ where
             .and_then(|key| self.final_result_cache.capture_cursor_origin(key));
         let mut miss = Some(FinalCacheMiss::Disabled);
         if read_cache && let Some(key) = key.as_ref() {
-            let candidate = self.final_result_cache.has_fresh_entry_at(key, Instant::now());
-            if !candidate || self.drain_ready_websocket_cache_frames(cx, cancellation, deadline).await? {
+            let candidate = self
+                .final_result_cache
+                .has_fresh_entry_at(key, Instant::now());
+            if !candidate
+                || self
+                    .drain_ready_websocket_cache_frames(cx, cancellation, deadline)
+                    .await?
+            {
                 match self.final_result_cache.lookup_page_at(key, Instant::now()) {
                     FinalCachePageLookup::Fresh(page) => {
                         self.check_websocket_cache_lifetime(cx, cancellation, deadline)?;
@@ -9536,7 +9580,9 @@ where
         let receipt = Instant::now();
         if let Some(error) = received.response.error {
             let error = json_rpc_error_to_mcp(error);
-            if error.code == McpErrorCode::InvalidParams && let Some(origin) = origin {
+            if error.code == McpErrorCode::InvalidParams
+                && let Some(origin) = origin
+            {
                 self.final_result_cache.invalidate_rejected_cursor(origin);
             }
             return Err(error);
@@ -9551,7 +9597,8 @@ where
         if let (Some(key), Some(generation)) = (key, generation) {
             self.check_websocket_cache_lifetime(cx, cancellation, deadline)?;
             let scope = final_cache_hints(&result).map(|(_, scope)| scope);
-            self.final_result_cache.insert_if_current_at(key, generation, result.clone(), receipt);
+            self.final_result_cache
+                .insert_if_current_at(key, generation, result.clone(), receipt);
             self.last_final_cache_page = scope.map(|scope| FinalCachePageState {
                 generation,
                 scope,
@@ -10301,7 +10348,12 @@ where
             let frame = match received {
                 Ok(frame) => frame,
                 Err(TransportError::Cancelled) if cx.checkpoint().is_err() => {
-                    return Err(self.retire_collected_websocket_subscription(request_id, McpError::request_cancelled()).await);
+                    return Err(self
+                        .retire_collected_websocket_subscription(
+                            request_id,
+                            McpError::request_cancelled(),
+                        )
+                        .await);
                 }
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
@@ -10400,16 +10452,28 @@ where
                     }
                     if request.id.is_none() && request.method == "notifications/cancelled" {
                         let cancellation = match CancellationWireMessage::decode(
-                            ProtocolEra::Modern2026, CancellationSender::Server, request,
+                            ProtocolEra::Modern2026,
+                            CancellationSender::Server,
+                            request,
                         ) {
                             Ok(cancellation) => cancellation,
-                            Err(_) => return Err(self.close_after_protocol_error(cx, "WebSocket server cancellation is invalid").await),
+                            Err(_) => {
+                                return Err(self
+                                    .close_after_protocol_error(
+                                        cx,
+                                        "WebSocket server cancellation is invalid",
+                                    )
+                                    .await);
+                            }
                         };
-                        let CancellationWireMessage::Modern2026 { params, .. } = cancellation else {
+                        let CancellationWireMessage::Modern2026 { params, .. } = cancellation
+                        else {
                             unreachable!("the selected cancellation codec is modern");
                         };
                         if params.request_id.correlates_with(&request_id) {
-                            if let Err(error) = self.retire_websocket_subscription_without_control(&request_id) {
+                            if let Err(error) =
+                                self.retire_websocket_subscription_without_control(&request_id)
+                            {
                                 return Err(self.terminal_callback_error(cx, error).await);
                             }
                             return Err(McpError::request_cancelled());
@@ -10467,7 +10531,12 @@ where
                             ).await);
                         }
                         if retained_event_count >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
-                            return Err(self.close_after_protocol_error(cx, FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR).await);
+                            return Err(self
+                                .close_after_protocol_error(
+                                    cx,
+                                    FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                                )
+                                .await);
                         }
                         task_notifications.push(task_notification);
                         retained_event_count += 1;
@@ -10478,11 +10547,17 @@ where
                         Ok(params) => params,
                         Err(error) => return Err(self.terminal_callback_error(cx, error).await),
                     };
-                    let notification = match decode_final_server_notification(request, raw_params.as_deref()) {
+                    let notification = match decode_final_server_notification(
+                        request,
+                        raw_params.as_deref(),
+                    ) {
                         Ok(notification) => notification,
-                        Err(_) => return Err(self.close_after_protocol_error(cx,
-                            "WebSocket subscription received an invalid server notification",
-                        ).await),
+                        Err(_) => return Err(self
+                            .close_after_protocol_error(
+                                cx,
+                                "WebSocket subscription received an invalid server notification",
+                            )
+                            .await),
                     };
                     match notification {
                         ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
@@ -10509,8 +10584,14 @@ where
                             lifetime.observe_activity(received_at);
                         }
                         notification => {
-                            if !Self::websocket_notification_belongs_to_subscription(&notification, &request_id) {
-                                if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame, received_at).await {
+                            if !Self::websocket_notification_belongs_to_subscription(
+                                &notification,
+                                &request_id,
+                            ) {
+                                if let Err(error) = self
+                                    .handle_unsolicited_websocket_request(cx, &frame, received_at)
+                                    .await
+                                {
                                     return Err(self.terminal_callback_error(cx, error).await);
                                 }
                                 continue;
@@ -10528,7 +10609,12 @@ where
                                 return Err(self.terminal_callback_error(cx, error).await);
                             }
                             if retained_event_count >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
-                                return Err(self.close_after_protocol_error(cx, FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR).await);
+                                return Err(self
+                                    .close_after_protocol_error(
+                                        cx,
+                                        FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                                    )
+                                    .await);
                             }
                             retained_notifications.push(notification);
                             retained_event_count += 1;
@@ -10770,7 +10856,9 @@ where
                     }
                 }
                 JsonRpcMessage::Request(_) => {
-                    if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame, received_at).await
+                    if let Err(error) = self
+                        .handle_unsolicited_websocket_request(cx, &frame, received_at)
+                        .await
                     {
                         return Err(self.terminal_callback_error(cx, error).await);
                     }
@@ -11193,7 +11281,9 @@ where
                     }
                 }
                 JsonRpcMessage::Request(_) => {
-                    if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame, received_at).await
+                    if let Err(error) = self
+                        .handle_unsolicited_websocket_request(cx, &frame, received_at)
+                        .await
                     {
                         return Err(self.terminal_callback_error(cx, error).await);
                     }
@@ -12701,9 +12791,7 @@ where
         .wait(cx, None, sender.send(cx, &request))
         .await
         .map_err(WebSocketHandshakeError::UncommittedSend)?
-        .map_err(|error| {
-            WebSocketHandshakeError::UncommittedSend(transport_error_to_mcp(error))
-        })?;
+        .map_err(|error| WebSocketHandshakeError::UncommittedSend(transport_error_to_mcp(error)))?;
     let idle = cx.now() + deadline.policy.idle_timeout();
     let frame = match deadline
         .wait(cx, Some(idle), receiver.recv_with_source(cx))
@@ -15169,13 +15257,15 @@ impl FinalTaskWatch<'_, '_> {
                 }
                 Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => {
                     let accepted_task_ids = task_subscription_ids(&accepted_filter)
-                    .map_err(|_| {
-                        HttpClientError::CoreResult(McpError::invalid_request(
-                            "final task subscription acknowledgement has invalid task IDs",
-                        ))
-                    })?
-                    .unwrap_or_default();
-                    if accepted_task_ids.iter().any(|id| id != self.handle.task_id())
+                        .map_err(|_| {
+                            HttpClientError::CoreResult(McpError::invalid_request(
+                                "final task subscription acknowledgement has invalid task IDs",
+                            ))
+                        })?
+                        .unwrap_or_default();
+                    if accepted_task_ids
+                        .iter()
+                        .any(|id| id != self.handle.task_id())
                     {
                         return Err(HttpClientError::CoreResult(McpError::invalid_request(
                             "final task subscription acknowledgement widened the requested task filter",
@@ -15191,7 +15281,10 @@ impl FinalTaskWatch<'_, '_> {
                 Some(ModernHttpSubscriptionListenEvent::TaskNotification(notification)) => {
                     task_wait::admit_identity(self.handle.task(), &notification.params.task)
                         .map_err(HttpClientError::CoreResult)?;
-                    if self.handle.snapshot_is_identical(&notification.params.task)? {
+                    if self
+                        .handle
+                        .snapshot_is_identical(&notification.params.task)?
+                    {
                         continue;
                     }
                     if self
@@ -15202,7 +15295,8 @@ impl FinalTaskWatch<'_, '_> {
                         // read: cancellation/drop cannot forget the conflict
                         // and silently resume the old notification stream.
                         let listener = self.listener.take();
-                        let task = self.client
+                        let task = self
+                            .client
                             .get_final_task_snapshot(cx, self.handle.task_id().clone())
                             .await?;
                         self.handle.admit_snapshot(task)?;
@@ -15214,7 +15308,8 @@ impl FinalTaskWatch<'_, '_> {
                             authoritative: self.handle.task().clone(),
                         }));
                     }
-                    self.handle.admit_snapshot(notification.params.task.clone())?;
+                    self.handle
+                        .admit_snapshot(notification.params.task.clone())?;
                     if self.handle.is_terminal()
                         && let Some(mut listener) = self.listener.take()
                     {
@@ -18827,7 +18922,10 @@ impl StdioRequestExecutor {
         }
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
-            || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+            || cx
+                .budget()
+                .deadline
+                .is_some_and(|deadline| cx.now() >= deadline)
         {
             return Err(McpError::request_cancelled());
         }
@@ -18852,7 +18950,9 @@ impl StdioRequestExecutor {
                 request,
                 timeout_policy,
             ),
-            None => self.executor.execute_with_timeout_policy(cx, request, timeout_policy),
+            None => self
+                .executor
+                .execute_with_timeout_policy(cx, request, timeout_policy),
         }?;
         Ok(StdioRequestExecution {
             execution,
@@ -18980,7 +19080,10 @@ impl StdioRequestExecutor {
         }
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
-            || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+            || cx
+                .budget()
+                .deadline
+                .is_some_and(|deadline| cx.now() >= deadline)
         {
             return Err(McpError::request_cancelled());
         }
@@ -19130,7 +19233,9 @@ impl StdioRequestExecutor {
         let bounded = RequestTimeoutPolicy::new(policy.idle_timeout(), policy.absolute_timeout())?;
         RequestTimeoutPolicy::new(
             bounded.idle_timeout().min(configured.idle_timeout()),
-            bounded.absolute_timeout().min(configured.absolute_timeout()),
+            bounded
+                .absolute_timeout()
+                .min(configured.absolute_timeout()),
         )
         .map(|selected| {
             selected.reset_idle_on_matching_progress(
@@ -19148,10 +19253,8 @@ impl StdioRequestExecutor {
         timeout_policy: SubscriptionTimeoutPolicy,
     ) -> McpResult<StdioRequestExecution> {
         timeout_policy.validate()?;
-        let parameters = self.decorate_modern_request_parameters(
-            Some(parameters),
-            StdioRequestMetadata::Prepared,
-        )?;
+        let parameters = self
+            .decorate_modern_request_parameters(Some(parameters), StdioRequestMetadata::Prepared)?;
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
         let request = JsonRpcRequest::new("subscriptions/listen", parameters, id);
@@ -21115,7 +21218,7 @@ impl Client {
         self.legacy_server_notifications.pop_front()
     }
 
-/// Drains exact-2024 server notifications retained by the stdio receive
+    /// Drains exact-2024 server notifications retained by the stdio receive
     /// pump. Modern sessions never retain values here.
     #[must_use]
     pub fn take_legacy_notifications(&mut self) -> Vec<JsonRpcRequest> {
@@ -21472,7 +21575,10 @@ impl Client {
             return Err(error);
         }
         if cx.checkpoint().is_err()
-            || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+            || cx
+                .budget()
+                .deadline
+                .is_some_and(|deadline| cx.now() >= deadline)
         {
             return Err(McpError::request_cancelled());
         }
@@ -21781,9 +21887,7 @@ impl Client {
         parameters: serde_json::Value,
         task: Option<&FinalTask>,
     ) -> McpResult<StdioFinalTaskExecution> {
-        self.start_yielding_final_task_request_with_cancellation(
-            cx, None, method, parameters, task,
-        )
+        self.start_yielding_final_task_request_with_cancellation(cx, None, method, parameters, task)
     }
 
     #[cfg(feature = "tasks")]
@@ -23309,7 +23413,8 @@ impl Client {
             return Err(McpError::request_cancelled());
         }
         executor.service(&connection_cx)?;
-        let mut execution = executor.execute_prepared(&connection_cx, method, Some(params_value))?;
+        let mut execution =
+            executor.execute_prepared(&connection_cx, method, Some(params_value))?;
         loop {
             if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
                 executor.cancel(&connection_cx, &mut execution)?;
@@ -26236,7 +26341,11 @@ impl Client {
         mut respond: F,
     ) -> McpResult<CoreResult>
     where
-        F: FnMut(&InputRequiredResult, &serde_json::Value, Instant) -> McpResult<MrtrInputResponses>,
+        F: FnMut(
+            &InputRequiredResult,
+            &serde_json::Value,
+            Instant,
+        ) -> McpResult<MrtrInputResponses>,
     {
         self.ensure_initialized()?;
         let cx = self.cx.clone();
@@ -28372,8 +28481,7 @@ impl Client {
                         &notification,
                         accepted_filter,
                         &subscription.resource_relations,
-                    )
-                    {
+                    ) {
                         harvest_error = Some(error);
                         continue;
                     }
@@ -28405,7 +28513,7 @@ impl Client {
         Ok(())
     }
 
-/// Drives the sole stdio ingress reader until one live catalog listener
+    /// Drives the sole stdio ingress reader until one live catalog listener
     /// event is available.
     ///
     /// Catalog and resource-update events admitted while another sequential
@@ -28503,10 +28611,13 @@ impl Client {
                 // connection. Raw observation and explicit cancellation still
                 // retire it, so they cannot resurrect a consumed listener.
                 if !preserve_connection_loss
-                    || self.live_catalog_subscription.as_ref().is_none_or(|subscription| {
-                        subscription.execution.execution.terminal_reason()
-                            != Some(ExecutionTerminalReason::ConnectionLost)
-                    })
+                    || self
+                        .live_catalog_subscription
+                        .as_ref()
+                        .is_none_or(|subscription| {
+                            subscription.execution.execution.terminal_reason()
+                                != Some(ExecutionTerminalReason::ConnectionLost)
+                        })
                 {
                     self.live_catalog_subscription = None;
                 }
@@ -28963,8 +29074,13 @@ impl Client {
             request: self.final_task_request_meta()?,
             task_id: task_id.clone(),
         };
-        let result: FinalGetTaskResult =
-            self.send_final_task_request_with_cancellation(cx, cancellation, TASK_GET, params, None)?;
+        let result: FinalGetTaskResult = self.send_final_task_request_with_cancellation(
+            cx,
+            cancellation,
+            TASK_GET,
+            params,
+            None,
+        )?;
         if result.task.base().task_id != task_id {
             return Err(self.terminate_connection(McpError::invalid_request(
                 "tasks/get response taskId does not match the requested final task",
@@ -29380,12 +29496,8 @@ impl Client {
         result_set: FinalCacheResultSet,
         deadline: Instant,
     ) -> McpResult<CoreResult> {
-        self.ensure_initialized_with_cancellation_until(
-            cx,
-            Some(cancellation),
-            Some(deadline),
-        )
-        .await?;
+        self.ensure_initialized_with_cancellation_until(cx, Some(cancellation), Some(deadline))
+            .await?;
         self.check_stdio_cache_lifetime(cx, cancellation, deadline)?;
         self.last_final_cache_page = None;
         let mut parameters = semantic_parameters.clone();
@@ -29404,13 +29516,19 @@ impl Client {
             .prepared_core_request(method, &prepared)?
             .ok_or_else(|| McpError::invalid_params("Unsupported selected-era core request"))?;
         if final_cache_result_set(&request).as_ref() != Some(&result_set) {
-            return Err(McpError::invalid_params("Method is not a cacheable final core request"));
+            return Err(McpError::invalid_params(
+                "Method is not a cacheable final core request",
+            ));
         }
         let key = self.final_cache_key(method, semantic_parameters, cursor, result_set)?;
         let cursor_origin = self.final_result_cache.capture_cursor_origin(&key);
-        let candidate = self.final_result_cache.has_fresh_entry_at(&key, Instant::now());
+        let candidate = self
+            .final_result_cache
+            .has_fresh_entry_at(&key, Instant::now());
         let lookup = if !candidate
-            || self.drain_ready_stdio_cache_frames(cx, cancellation, deadline).await?
+            || self
+                .drain_ready_stdio_cache_frames(cx, cancellation, deadline)
+                .await?
         {
             self.check_stdio_cache_lifetime(cx, cancellation, deadline)?;
             Some(self.final_result_cache.lookup_page_at(&key, Instant::now()))
@@ -29455,9 +29573,9 @@ impl Client {
             .take()
             .map_or(fetch_started, |receipt| receipt.min(fetch_started));
         let page_result_set = key.result_set().clone();
-        let _ = self.final_result_cache.insert_if_current_at(
-            key, generation, result.clone(), receipt,
-        );
+        let _ =
+            self.final_result_cache
+                .insert_if_current_at(key, generation, result.clone(), receipt);
         let current_generation = self.final_result_cache.begin_fetch(&page_result_set);
         if let Some(scope) = scope {
             self.last_final_cache_page = Some(FinalCachePageState {
@@ -29904,9 +30022,11 @@ impl Client {
             };
             for notification in notifications {
                 if let Some(callback) = on_progress.as_deref_mut() {
-                    let stopped = if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                    let stopped = if cancellation.is_cancel_requested() || cx.checkpoint().is_err()
+                    {
                         Some(McpError::request_cancelled())
-                    } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    {
                         Some(request_timeout_error(RequestTimeoutSource::Absolute))
                     } else {
                         None
@@ -29931,8 +30051,8 @@ impl Client {
                             return Err(error);
                         }
                     }
-                    let decoded = decode_final_server_notification(&notification, None)
-                        .map_err(|error| {
+                    let decoded =
+                        decode_final_server_notification(&notification, None).map_err(|error| {
                             self.terminate_connection(McpError::invalid_request(format!(
                                 "Invalid final server notification: {error}"
                             )))
@@ -30374,9 +30494,7 @@ mod tests {
 
         fn io_is_permitted() -> bool {
             let socket = asupersync::net::TcpSocket::new_v4().unwrap();
-            socket
-                .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .unwrap();
+            socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
             match socket.listen(1) {
                 Ok(listener) => {
                     assert!(listener.local_addr().unwrap().ip().is_loopback());
@@ -30470,11 +30588,9 @@ mod tests {
                         let caller = with_effects(&Cx::for_testing(), caller_io, time);
                         let host = with_effects(&ambient, host_io, time);
                         let installed = Cx::set_current(Some(host.clone()));
-                        let deadline = WebSocketConnectDeadline::new(
-                            &caller,
-                            RequestTimeoutPolicy::default(),
-                        )
-                        .unwrap();
+                        let deadline =
+                            WebSocketConnectDeadline::new(&caller, RequestTimeoutPolicy::default())
+                                .unwrap();
                         let probe = Arc::new(Probe::default());
                         let mut waiting = Box::pin(deadline.wait(
                             &caller,
@@ -30551,7 +30667,8 @@ mod tests {
             for complete in [true, false] {
                 let probe = Arc::new(Probe::default());
                 let deadline =
-                    WebSocketConnectDeadline::new(&caller, RequestTimeoutPolicy::default()).unwrap();
+                    WebSocketConnectDeadline::new(&caller, RequestTimeoutPolicy::default())
+                        .unwrap();
                 let mut waiting = Box::pin(deadline.wait(
                     &caller,
                     None,
@@ -30644,8 +30761,7 @@ mod tests {
                 caller: caller.clone(),
                 drops: Arc::clone(&drops),
             }));
-            let restriction =
-                Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+            let restriction = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
             {
                 let mut task = Context::from_waker(&waker);
                 assert!(waiting.as_mut().poll(&mut task).is_pending());
@@ -30693,7 +30809,8 @@ mod tests {
                 let host = with_effects(&full_host, true, case != 2);
                 let installed = Cx::set_current(Some(host));
                 let deadline =
-                    WebSocketConnectDeadline::new(&caller, RequestTimeoutPolicy::default()).unwrap();
+                    WebSocketConnectDeadline::new(&caller, RequestTimeoutPolicy::default())
+                        .unwrap();
                 let mut ready = Box::pin(deadline.wait(&caller, None, std::future::ready(42)));
                 assert!(matches!(
                     ready.as_mut().poll(&mut task),
@@ -30845,11 +30962,17 @@ mod tests {
                     Pin::new(&mut this.inner).poll_write(task, bytes)
                 }
 
-                fn poll_flush(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<io::Result<()>> {
+                fn poll_flush(
+                    self: Pin<&mut Self>,
+                    task: &mut Context<'_>,
+                ) -> Poll<io::Result<()>> {
                     Pin::new(&mut self.get_mut().inner).poll_flush(task)
                 }
 
-                fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<io::Result<()>> {
+                fn poll_shutdown(
+                    self: Pin<&mut Self>,
+                    task: &mut Context<'_>,
+                ) -> Poll<io::Result<()>> {
                     Pin::new(&mut self.get_mut().inner).poll_shutdown(task)
                 }
             }
@@ -30892,13 +31015,17 @@ mod tests {
                 let mut connecting: Pin<
                     Box<dyn Future<Output = McpResult<WebSocketClient<ObservedIo>>> + '_>,
                 > = if policy == ProtocolPolicy::Auto {
-                    Box::pin(builder.connect_websocket_auto_with_cx(&caller, move |factory_cx| {
-                        let allowed = io_is_permitted();
-                        assert_eq!(factory_cx.capabilities().io, allowed);
-                        factory_observations.lock().unwrap().push(allowed);
-                        let io = transports.pop_front().expect("at most two fresh transports");
-                        std::future::ready(Ok(AsyncWsClientTransport::from_upgraded(io)))
-                    }))
+                    Box::pin(
+                        builder.connect_websocket_auto_with_cx(&caller, move |factory_cx| {
+                            let allowed = io_is_permitted();
+                            assert_eq!(factory_cx.capabilities().io, allowed);
+                            factory_observations.lock().unwrap().push(allowed);
+                            let io = transports
+                                .pop_front()
+                                .expect("at most two fresh transports");
+                            std::future::ready(Ok(AsyncWsClientTransport::from_upgraded(io)))
+                        }),
+                    )
                 } else {
                     Box::pin(builder.connect_websocket_with_cx(
                         &caller,
@@ -30925,10 +31052,7 @@ mod tests {
                     serde_json::from_slice(&websocket_test_modern_discovery_frame(1)).unwrap()
                 };
                 let mut send = Box::pin(modern_peer.send(&host, &response));
-                assert!(matches!(
-                    send.as_mut().poll(&mut task),
-                    Poll::Ready(Ok(()))
-                ));
+                assert!(matches!(send.as_mut().poll(&mut task), Poll::Ready(Ok(()))));
                 drop(send);
                 if policy == ProtocolPolicy::Auto {
                     let initialized: JsonRpcMessage = serde_json::from_str(
@@ -30936,10 +31060,7 @@ mod tests {
                     )
                     .unwrap();
                     let mut send = Box::pin(legacy_peer.send(&host, &initialized));
-                    assert!(matches!(
-                        send.as_mut().poll(&mut task),
-                        Poll::Ready(Ok(()))
-                    ));
+                    assert!(matches!(send.as_mut().poll(&mut task), Poll::Ready(Ok(()))));
                     drop(send);
                 }
                 let Poll::Ready(result) = connecting.as_mut().poll(&mut task) else {
@@ -31003,17 +31124,16 @@ mod tests {
                     let discovery: JsonRpcMessage =
                         serde_json::from_slice(&websocket_test_modern_discovery_frame(1)).unwrap();
                     let mut send = Box::pin(peer.send(&host, &discovery));
-                    assert!(matches!(
-                        send.as_mut().poll(&mut task),
-                        Poll::Ready(Ok(()))
-                    ));
+                    assert!(matches!(send.as_mut().poll(&mut task), Poll::Ready(Ok(()))));
                     drop(send);
                     let restriction = (!host_io).then(|| {
                         Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
                     });
                     let mut connecting = Box::pin(
                         ClientBuilder::new()
-                            .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                            .protocol_plan(ClientProtocolPlan::websocket(
+                                ProtocolPolicy::ModernOnly,
+                            ))
                             .connect_websocket_with_cx(
                                 &caller,
                                 AsyncWsClientTransport::from_upgraded(client_io),
@@ -31705,12 +31825,11 @@ mod tests {
             }
             if missing != Some(2) {
                 let calls = Arc::clone(calls);
-                handlers = handlers.with_modern_elicitation_create(
-                    move |_cx, _cancellation, _params| {
+                handlers =
+                    handlers.with_modern_elicitation_create(move |_cx, _cancellation, _params| {
                         calls[2].fetch_add(1, Ordering::SeqCst);
                         Box::pin(async { Ok(ElicitResult::decline()) })
-                    },
-                );
+                    });
             }
             handlers
         }
@@ -31737,9 +31856,8 @@ mod tests {
                 assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
                 result
             } else {
-                handlers.respond_to_input_required(&Cx::for_testing(), capabilities, input, || {
-                    Ok(())
-                })
+                handlers
+                    .respond_to_input_required(&Cx::for_testing(), capabilities, input, || Ok(()))
             }
         }
 
@@ -31778,20 +31896,25 @@ mod tests {
             let retained_inputs = input.input_requests().cloned();
             let calls = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
             let handlers = handlers(None, &calls);
-            let (responses, diagnostics) = observe_diagnostics(|| {
-                dispatch(asynchronous, &handlers, &capabilities(), &input)
-            });
+            let (responses, diagnostics) =
+                observe_diagnostics(|| dispatch(asynchronous, &handlers, &capabilities(), &input));
             let responses = responses.unwrap();
             for count in calls.iter() {
                 assert_eq!(count.load(Ordering::SeqCst), 1);
             }
-            assert_eq!(diagnostics, 1, "the admitted context hint is diagnosed once");
+            assert_eq!(
+                diagnostics, 1,
+                "the admitted context hint is diagnosed once"
+            );
             let expected_responses = serde_json::json!({
                 "input-0": {"roots": []},
                 "input-1": sampling_response(),
                 "input-2": {"action": "decline"},
             });
-            assert_eq!(serde_json::to_value(&responses).unwrap(), expected_responses);
+            assert_eq!(
+                serde_json::to_value(&responses).unwrap(),
+                expected_responses
+            );
             let original = serde_json::json!({
                 "name": "preflight-tool",
                 "arguments": {"untouched": ["semantic argument", 7]},
@@ -31821,9 +31944,8 @@ mod tests {
                 let calls = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
                 // A missing first handler must not hide a later peer violation.
                 let handlers = handlers(Some(0), &calls);
-                let (result, diagnostics) = observe_diagnostics(|| {
-                    dispatch(asynchronous, &handlers, &advertised, &input)
-                });
+                let (result, diagnostics) =
+                    observe_diagnostics(|| dispatch(asynchronous, &handlers, &advertised, &input));
                 let error = result.unwrap_err();
                 assert_eq!(error.code, McpErrorCode::InvalidRequest);
                 assert_eq!(error.message, expected_message);
@@ -32025,7 +32147,11 @@ mod tests {
                     observed.calls.fetch_add(1, Ordering::SeqCst);
                     observed.tokens.lock().unwrap().push(cancellation.clone());
                     if Cx::current().is_some() {
-                        observed.effects_at_factory.lock().unwrap().push(current_effects());
+                        observed
+                            .effects_at_factory
+                            .lock()
+                            .unwrap()
+                            .push(current_effects());
                     }
                     if matches!(&mode, CallbackMode::PanicOnCreate) {
                         assert!(REDACT_CLIENT_CALLBACK_PANIC.with(|redacted| redacted.get()));
@@ -32112,13 +32238,7 @@ mod tests {
             };
             let handlers = roots_handler(&observed, mode);
             let deadline = Instant::now() + Duration::from_secs(60);
-            let result = dispatch(
-                asynchronous,
-                &cx,
-                &handlers,
-                &inputs(true),
-                deadline,
-            );
+            let result = dispatch(asynchronous, &cx, &handlers, &inputs(true), deadline);
             if cancel {
                 assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
                 assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
@@ -32147,7 +32267,10 @@ mod tests {
                 cx.checkpoint().unwrap();
             }
             let completed = if cancel { 1 } else { 2 };
-            assert_eq!(*observed.redacted_at_drop.lock().unwrap(), vec![true; completed]);
+            assert_eq!(
+                *observed.redacted_at_drop.lock().unwrap(),
+                vec![true; completed]
+            );
             assert_eq!(
                 *observed.context_at_drop.lock().unwrap(),
                 vec![Some(CALLBACK_CONTEXT.to_owned()); completed],
@@ -32160,8 +32283,8 @@ mod tests {
             cancelled_before_drop: bool,
         ) {
             let cancelled_by_drop = matches!(&mode, CallbackMode::CancelOnDrop);
-            let caller_cancelled = cancelled_by_drop
-                || matches!(&mode, CallbackMode::CancelOnReadyAndDropPanic);
+            let caller_cancelled =
+                cancelled_by_drop || matches!(&mode, CallbackMode::CancelOnReadyAndDropPanic);
             let poll_panics = matches!(&mode, CallbackMode::PanicOnPollAndDrop);
             let cx = Cx::for_testing();
             cx.set_task_type(CALLBACK_CONTEXT);
@@ -32191,7 +32314,10 @@ mod tests {
             );
             assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
             assert_eq!(cx.checkpoint().is_err(), caller_cancelled);
-            assert_eq!(observed.poll_panic_redacted.load(Ordering::SeqCst), poll_panics);
+            assert_eq!(
+                observed.poll_panic_redacted.load(Ordering::SeqCst),
+                poll_panics
+            );
         }
 
         fn pending_callback_probe(asynchronous: bool, expire: bool) {
@@ -32215,13 +32341,7 @@ mod tests {
                 },
             );
             let deadline = Instant::now() + Duration::from_secs(60);
-            let result = dispatch(
-                asynchronous,
-                &cx,
-                &handlers,
-                &inputs(false),
-                deadline,
-            );
+            let result = dispatch(asynchronous, &cx, &handlers, &inputs(false), deadline);
             assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
             if expire {
                 assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
@@ -32426,8 +32546,7 @@ mod tests {
             let observed = Arc::new(Observed::default());
             let handlers = roots_handler(&observed, CallbackMode::Ready);
             let _host = Cx::set_current(Some(Cx::for_testing()));
-            let _restriction =
-                Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+            let _restriction = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
             let responses = dispatch(
                 true,
                 &cx,
@@ -32519,13 +32638,19 @@ mod tests {
                     panic!("a resumed wait cannot use revoked time authority");
                 };
                 assert_eq!(error.code, McpErrorCode::InternalError);
-                assert_eq!(error.message, "MRTR callback wait requires caller time capability");
+                assert_eq!(
+                    error.message,
+                    "MRTR callback wait requires caller time capability"
+                );
             }
             drop(operation);
             assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
             assert_eq!(observed.polls.load(Ordering::SeqCst), 2);
             assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [true]);
-            assert_eq!(*observed.effects_at_drop.lock().unwrap(), [[true, false, true, true, true]]);
+            assert_eq!(
+                *observed.effects_at_drop.lock().unwrap(),
+                [[true, false, true, true, true]]
+            );
             assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
             cx.checkpoint().unwrap();
             drop(cx);
@@ -32568,7 +32693,10 @@ mod tests {
                 let _restriction =
                     Cx::push_restriction(CapSet::<false, true, false, false, false>::MASK);
                 assert!(operation.as_mut().poll(&mut task_cx).is_pending());
-                assert_eq!(Cx::current().unwrap().task_type().as_deref(), Some("unrelated-callback-host"));
+                assert_eq!(
+                    Cx::current().unwrap().task_type().as_deref(),
+                    Some("unrelated-callback-host")
+                );
                 assert_eq!(current_effects(), [false, true, false, false, false]);
             }
             {
@@ -32577,7 +32705,10 @@ mod tests {
                 let _host = Cx::set_current(Some(host.clone()));
                 assert_eq!(current_effects(), [true; 5]);
                 drop(operation);
-                assert_eq!(Cx::current().unwrap().task_type().as_deref(), Some("unrelated-callback-host"));
+                assert_eq!(
+                    Cx::current().unwrap().task_type().as_deref(),
+                    Some("unrelated-callback-host")
+                );
                 assert_eq!(current_effects(), [true; 5]);
             }
             let expected = [false, true, false, false, false];
@@ -32586,7 +32717,10 @@ mod tests {
             assert_eq!(*observed.effects_at_drop.lock().unwrap(), [expected]);
             assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [true]);
             assert_eq!(*observed.redacted_at_drop.lock().unwrap(), [true]);
-            assert_eq!(*observed.context_at_drop.lock().unwrap(), [Some(CALLBACK_CONTEXT.to_owned())]);
+            assert_eq!(
+                *observed.context_at_drop.lock().unwrap(),
+                [Some(CALLBACK_CONTEXT.to_owned())]
+            );
             assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
             assert_eq!(observed.polls.load(Ordering::SeqCst), 1);
             assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
@@ -33165,7 +33299,11 @@ exec sleep 2
                 .unwrap()
                 .extend(replacement.as_object().unwrap().clone());
             let mut execution = executor
-                .execute(&cx, "tools/list", Some(serde_json::json!({"_meta": metadata})))
+                .execute(
+                    &cx,
+                    "tools/list",
+                    Some(serde_json::json!({"_meta": metadata})),
+                )
                 .unwrap();
             client.drive_multiplexed_stdio(&cx).unwrap();
             let response = executor.try_take_response(&mut execution).unwrap().unwrap();
@@ -33292,7 +33430,8 @@ exec sleep 2
         let response = executor.try_take_response(&mut execution).unwrap().unwrap();
         let result = response.result.unwrap();
         assert_eq!(result["resultType"], "complete");
-        let capabilities = &result["observed"]["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY];
+        let capabilities =
+            &result["observed"]["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY];
         assert!(
             capabilities
                 .get("extensions")
@@ -35539,7 +35678,10 @@ exec sleep 2
                 );
                 assert!(client.list_tools(&cx, None).await.is_err());
                 assert_eq!(client.next_id, 3);
-                assert_eq!(client.close(&cx).await.unwrap_err().message, "WebSocket cancellation control did not commit");
+                assert_eq!(
+                    client.close(&cx).await.unwrap_err().message,
+                    "WebSocket cancellation control did not commit"
+                );
                 let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
                 for expected in [SERVER_DISCOVER_METHOD, "tools/list"] {
                     let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
@@ -35676,7 +35818,10 @@ exec sleep 2
                     client.retired_requests.is_empty(),
                     "an uncommitted frame cannot authorize a cancellation frame"
                 );
-                assert_eq!(client.close(&cx).await.unwrap_err().message, "WebSocket request send was dropped before commitment");
+                assert_eq!(
+                    client.close(&cx).await.unwrap_err().message,
+                    "WebSocket request send was dropped before commitment"
+                );
                 let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
                 let JsonRpcMessage::Request(discovery) = server.recv(&cx).await.unwrap() else {
                     panic!("discovery request");
@@ -36355,16 +36500,32 @@ exec sleep 2
         macro_rules! collect {
             ($params:ident, $ordinary:ident, $cancellable:ident) => {
                 match cancellation {
-                                    Some(cancellation) => client.$cancellable(
-                                        cx,
-                                        cancellation,
-                                        $params { cursor, include_tags, exclude_tags },
-                                    ).await,
-                                    None => client.$ordinary(
-                                        cx,
-                                        $params { cursor, include_tags, exclude_tags },
-                                    ).await,
-                                }
+                    Some(cancellation) => {
+                        client
+                            .$cancellable(
+                                cx,
+                                cancellation,
+                                $params {
+                                    cursor,
+                                    include_tags,
+                                    exclude_tags,
+                                },
+                            )
+                            .await
+                    }
+                    None => {
+                        client
+                            .$ordinary(
+                                cx,
+                                $params {
+                                    cursor,
+                                    include_tags,
+                                    exclude_tags,
+                                },
+                            )
+                            .await
+                    }
+                }
             };
         }
         match method {
@@ -36471,19 +36632,35 @@ exec sleep 2
     fn cache_03_websocket_all_catalogs_replay_exact_results_and_partition_query_identity() {
         run_test(|| async {
             let cx = Cx::current().unwrap();
-            for method in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+            for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+            ] {
                 for scope in ["private", "public"] {
-                    let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+                    let (mut client, mut peer_io) =
+                        websocket_catalog_test_fixture(&cx, false).await;
                     let parameters = serde_json::json!({"includeTags":["visible"]});
-                    write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                        2, method, "first", Some(""), scope,
-                    )).await;
-                    let first = client.list_catalog_page(&cx, method, parameters.clone()).await.unwrap();
-                    let replay = client.list_catalog_page(&cx, method, parameters.clone()).await.unwrap();
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &websocket_cache_test_response(2, method, "first", Some(""), scope),
+                    )
+                    .await;
+                    let first = client
+                        .list_catalog_page(&cx, method, parameters.clone())
+                        .await
+                        .unwrap();
+                    let replay = client
+                        .list_catalog_page(&cx, method, parameters.clone())
+                        .await
+                        .unwrap();
                     assert_eq!(client.next_id, 3, "a cache hit allocates no request");
                     assert_eq!(client.final_result_cache_stats().hits, 1);
                     let encoded = replay.encode().unwrap();
-                    assert!(encoded.contains("\"vendorExact\":922337203685477580812345678901234567890"));
+                    assert!(
+                        encoded.contains("\"vendorExact\":922337203685477580812345678901234567890")
+                    );
                     assert!(encoded.contains("\"vendorDecimal\":1.2300e+42"));
                     let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
                     assert_eq!(value["_meta"]["com.example/page"], "first");
@@ -36519,37 +36696,75 @@ exec sleep 2
             let cx = Cx::current().unwrap();
             let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
             assert!(client.final_result_cache_enabled());
-            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                2, "tools/list", "first", None, "public",
-            )).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_cache_test_response(2, "tools/list", "first", None, "public"),
+            )
+            .await;
             client.list_tools(&cx, None).await.unwrap();
             let cancellation = McpRequestCancellation::new();
             cancellation.cancel();
-            assert_eq!(client.list_tools_with_cancellation(&cx, &cancellation, None).await
-                .unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(
+                client
+                    .list_tools_with_cancellation(&cx, &cancellation, None)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
             assert_eq!(client.next_id, 3);
             assert_eq!(client.final_result_cache_stats().hits, 0);
 
             client.set_final_result_cache_enabled(false);
-            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                3, "tools/list", "uncached", None, "public",
-            )).await;
-            assert!(client.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("uncached"));
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_cache_test_response(3, "tools/list", "uncached", None, "public"),
+            )
+            .await;
+            assert!(
+                client
+                    .list_tools(&cx, None)
+                    .await
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                    .contains("uncached")
+            );
             assert_eq!(client.final_result_cache_stats().fills, 1);
             client.set_final_result_cache_enabled(true);
-            assert!(client.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("first"));
+            assert!(
+                client
+                    .list_tools(&cx, None)
+                    .await
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                    .contains("first")
+            );
             client.clear_final_result_cache();
-            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                4, "tools/list", "after-clear", None, "public",
-            )).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_cache_test_response(4, "tools/list", "after-clear", None, "public"),
+            )
+            .await;
             client.list_tools(&cx, None).await.unwrap();
             assert_eq!(client.next_id, 5);
 
             let (mut other, mut other_peer) = websocket_catalog_test_fixture(&cx, false).await;
-            write_server_text_frame(&mut other_peer, &websocket_cache_test_response(
-                2, "tools/list", "other-connection", None, "public",
-            )).await;
-            assert!(other.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("other-connection"));
+            write_server_text_frame(
+                &mut other_peer,
+                &websocket_cache_test_response(2, "tools/list", "other-connection", None, "public"),
+            )
+            .await;
+            assert!(
+                other
+                    .list_tools(&cx, None)
+                    .await
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                    .contains("other-connection")
+            );
             assert_eq!(other.final_result_cache_stats().hits, 0);
             assert_eq!(other.final_result_cache_stats().fills, 1);
             client.close(&cx).await.unwrap();
@@ -36564,26 +36779,38 @@ exec sleep 2
         run_test(|| async {
             let cx = Cx::current().unwrap();
             let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
-            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                2, "tools/list", "stale", None, "private",
-            )).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_cache_test_response(2, "tools/list", "stale", None, "private"),
+            )
+            .await;
             client.list_tools(&cx, None).await.unwrap();
-            write_server_text_frame(&mut peer_io,
+            write_server_text_frame(
+                &mut peer_io,
                 r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}"#,
-            ).await;
+            )
+            .await;
             let fresh = {
                 let mut waiting = Box::pin(client.list_tools(&cx, None));
-                assert!(std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
-                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                    3, "tools/list", "fresh", None, "private",
-                )).await;
+                assert!(
+                    std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task)))
+                        .await
+                        .is_pending()
+                );
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_cache_test_response(3, "tools/list", "fresh", None, "private"),
+                )
+                .await;
                 waiting.await.unwrap()
             };
             assert!(fresh.encode().unwrap().contains("fresh"));
             assert_eq!(client.final_result_cache_stats().hits, 0);
             assert_eq!(client.final_result_cache_stats().invalidations, 1);
-            assert!(matches!(client.take_final_server_notifications().as_slice(),
-                [ServerNotification::ToolsListChanged(_)]));
+            assert!(matches!(
+                client.take_final_server_notifications().as_slice(),
+                [ServerNotification::ToolsListChanged(_)]
+            ));
             client.list_tools(&cx, None).await.unwrap();
             assert_eq!(client.final_result_cache_stats().hits, 1);
             client.close(&cx).await.unwrap();
@@ -36602,17 +36829,30 @@ exec sleep 2
                         r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}"#,
                     ).await;
                 }
-                let first = websocket_cache_test_response(2, "tools/list", "first", None, "private");
-                let first = if invalidated { first } else {
+                let first =
+                    websocket_cache_test_response(2, "tools/list", "first", None, "private");
+                let first = if invalidated {
+                    first
+                } else {
                     first.replacen("\"ttlMs\":60000", "\"ttlMs\":0", 1)
                 };
                 write_server_text_frame(&mut peer_io, &first).await;
                 client.list_tools(&cx, None).await.unwrap();
                 assert_eq!(client.final_result_cache_stats().fills, 0);
-                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                    3, "tools/list", "fresh", None, "private",
-                )).await;
-                assert!(client.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("fresh"));
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_cache_test_response(3, "tools/list", "fresh", None, "private"),
+                )
+                .await;
+                assert!(
+                    client
+                        .list_tools(&cx, None)
+                        .await
+                        .unwrap()
+                        .encode()
+                        .unwrap()
+                        .contains("fresh")
+                );
                 assert_eq!(client.next_id, 4);
                 assert_eq!(client.final_result_cache_stats().hits, 0);
                 assert_eq!(client.final_result_cache_stats().fills, 1);
@@ -36628,12 +36868,17 @@ exec sleep 2
             let cx = Cx::current().unwrap();
             let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
             for (id, uri) in [(2, "file:///a"), (3, "file:///b")] {
-                write_server_text_frame(&mut peer_io, &serde_json::json!({
-                    "jsonrpc":"2.0", "id":id, "result":{
-                        "resultType":"complete", "contents":[{"uri":uri,"text":"original"}],
-                        "ttlMs":60000, "cacheScope":"private"
-                    }
-                }).to_string()).await;
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::json!({
+                        "jsonrpc":"2.0", "id":id, "result":{
+                            "resultType":"complete", "contents":[{"uri":uri,"text":"original"}],
+                            "ttlMs":60000, "cacheScope":"private"
+                        }
+                    })
+                    .to_string(),
+                )
+                .await;
                 client.read_resource(&cx, uri).await.unwrap();
             }
             write_server_text_frame(&mut peer_io,
@@ -36641,22 +36886,46 @@ exec sleep 2
             ).await;
             {
                 let mut waiting = Box::pin(client.read_resource(&cx, "file:///b"));
-                assert!(std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
+                assert!(
+                    std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task)))
+                        .await
+                        .is_pending()
+                );
                 write_server_text_frame(&mut peer_io,
                     r#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","contents":[{"uri":"file:///b","text":"refetched"}],"ttlMs":60000,"cacheScope":"private"}}"#,
                 ).await;
-                assert!(waiting.await.unwrap().encode().unwrap().contains("refetched"));
+                assert!(
+                    waiting
+                        .await
+                        .unwrap()
+                        .encode()
+                        .unwrap()
+                        .contains("refetched")
+                );
             }
-            assert_eq!(client.next_id, 5, "the resource generation conservatively invalidates both reads");
+            assert_eq!(
+                client.next_id, 5,
+                "the resource generation conservatively invalidates both reads"
+            );
             write_server_text_frame(&mut peer_io,
                 r#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","contents":[{"uri":"file:///a","text":"updated"}],"ttlMs":60000,"cacheScope":"private"}}"#,
             ).await;
-            assert!(client.read_resource(&cx, "file:///a").await.unwrap().encode().unwrap().contains("updated"));
+            assert!(
+                client
+                    .read_resource(&cx, "file:///a")
+                    .await
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                    .contains("updated")
+            );
             client.read_resource(&cx, "file:///b").await.unwrap();
             assert_eq!(client.final_result_cache_stats().hits, 1);
             assert_eq!(client.final_result_cache_stats().fills, 4);
-            assert!(matches!(client.take_final_server_notifications().as_slice(),
-                [ServerNotification::ResourceUpdated(_)]));
+            assert!(matches!(
+                client.take_final_server_notifications().as_slice(),
+                [ServerNotification::ResourceUpdated(_)]
+            ));
             client.close(&cx).await.unwrap();
         });
     }
@@ -36668,42 +36937,72 @@ exec sleep 2
             let cx = Cx::current().unwrap();
             for changed in [false, true] {
                 let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
-                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                    2, "tools/list", "first", None, "private",
-                )).await;
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_cache_test_response(2, "tools/list", "first", None, "private"),
+                )
+                .await;
                 client.list_tools(&cx, None).await.unwrap();
-                client.open_subscriptions_listener(&cx, websocket_catalog_test_filter()).await.unwrap();
-                write_server_text_frame(&mut peer_io, &websocket_subscription_test_ack(
-                    3, serde_json::json!({"toolsListChanged":true}),
-                )).await;
+                client
+                    .open_subscriptions_listener(&cx, websocket_catalog_test_filter())
+                    .await
+                    .unwrap();
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_subscription_test_ack(
+                        3,
+                        serde_json::json!({"toolsListChanged":true}),
+                    ),
+                )
+                .await;
                 if changed {
                     write_server_text_frame(&mut peer_io,
                         r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#,
                     ).await;
                 }
-                write_server_text_frame(&mut peer_io, &websocket_subscription_test_terminal(3)).await;
+                write_server_text_frame(&mut peer_io, &websocket_subscription_test_terminal(3))
+                    .await;
                 let result = if changed {
                     let mut waiting = Box::pin(client.list_tools(&cx, None));
-                    assert!(std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
-                    write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                        4, "tools/list", "fresh", None, "private",
-                    )).await;
+                    assert!(
+                        std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task)))
+                            .await
+                            .is_pending()
+                    );
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &websocket_cache_test_response(4, "tools/list", "fresh", None, "private"),
+                    )
+                    .await;
                     waiting.await.unwrap()
                 } else {
                     client.list_tools(&cx, None).await.unwrap()
                 };
-                assert!(result.encode().unwrap().contains(if changed { "fresh" } else { "first" }));
+                assert!(
+                    result
+                        .encode()
+                        .unwrap()
+                        .contains(if changed { "fresh" } else { "first" })
+                );
                 assert_eq!(client.final_result_cache_stats().hits, u64::from(!changed));
                 assert!(client.take_final_server_notifications().is_empty());
                 let live = McpRequestCancellation::new();
-                assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(),
-                    StdioSubscriptionEvent::Acknowledged(_)));
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &live).await.unwrap(),
+                    StdioSubscriptionEvent::Acknowledged(_)
+                ));
                 if changed {
-                    assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(),
-                        StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(_))));
+                    assert!(matches!(
+                        client.next_subscription_event(&cx, &live).await.unwrap(),
+                        StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(
+                            _
+                        ))
+                    ));
                 }
-                assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(),
-                    StdioSubscriptionEvent::Terminal));
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &live).await.unwrap(),
+                    StdioSubscriptionEvent::Terminal
+                ));
                 client.close(&cx).await.unwrap();
             }
         });
@@ -36762,20 +37061,38 @@ exec sleep 2
                 write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
                 let mut client = ClientBuilder::new()
                     .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
-                    .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(
-                        CancelOnReadyReadIo { inner: client_io, cancel_next: Arc::clone(&cancel_next) },
-                    )).await.unwrap();
-                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                    2, "tools/list", "first", None, "private",
-                )).await;
+                    .connect_websocket_with_cx(
+                        &cx,
+                        AsyncWsClientTransport::from_upgraded(CancelOnReadyReadIo {
+                            inner: client_io,
+                            cancel_next: Arc::clone(&cancel_next),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_cache_test_response(2, "tools/list", "first", None, "private"),
+                )
+                .await;
                 client.list_tools(&cx, None).await.unwrap();
-                client.open_subscriptions_listener(&cx, websocket_catalog_test_filter()).await.unwrap();
-                write_server_text_frame(&mut peer_io, &websocket_subscription_test_ack(
-                    3, serde_json::json!({"toolsListChanged":true}),
-                )).await;
+                client
+                    .open_subscriptions_listener(&cx, websocket_catalog_test_filter())
+                    .await
+                    .unwrap();
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_subscription_test_ack(
+                        3,
+                        serde_json::json!({"toolsListChanged":true}),
+                    ),
+                )
+                .await;
                 let live = McpRequestCancellation::new();
-                assert!(matches!(client.next_subscription_event(&cx, &live).await.unwrap(),
-                    StdioSubscriptionEvent::Acknowledged(_)));
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &live).await.unwrap(),
+                    StdioSubscriptionEvent::Acknowledged(_)
+                ));
                 let cancellation = McpRequestCancellation::new();
                 *cancel_next.lock().unwrap() = Some(cancellation.clone());
                 let incoming = if terminal {
@@ -36784,17 +37101,33 @@ exec sleep 2
                     r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#.to_owned()
                 };
                 write_server_text_frame(&mut peer_io, &incoming).await;
-                assert_eq!(client.list_tools_with_cancellation(&cx, &cancellation, None).await
-                    .unwrap_err().code, McpErrorCode::RequestCancelled);
-                assert!(cancellation.is_cancel_requested(), "the actual native read elected cancellation");
-                assert_eq!(client.next_id, 4, "cancelled lookup does not allocate an RPC");
+                assert_eq!(
+                    client
+                        .list_tools_with_cancellation(&cx, &cancellation, None)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert!(
+                    cancellation.is_cancel_requested(),
+                    "the actual native read elected cancellation"
+                );
+                assert_eq!(
+                    client.next_id, 4,
+                    "cancelled lookup does not allocate an RPC"
+                );
                 assert_eq!(client.final_result_cache_stats().hits, 0);
                 let event = client.next_subscription_event(&cx, &live).await.unwrap();
                 if terminal {
                     assert!(matches!(event, StdioSubscriptionEvent::Terminal));
                 } else {
-                    assert!(matches!(event,
-                        StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(_))));
+                    assert!(matches!(
+                        event,
+                        StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(
+                            _
+                        ))
+                    ));
                 }
                 assert!(!live.is_cancel_requested());
                 assert!(client.take_final_server_notifications().is_empty());
@@ -36809,25 +37142,42 @@ exec sleep 2
         run_test(|| async {
             let cx = Cx::current().unwrap();
             let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
-            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                2, "tools/list", "first", None, "private",
-            )).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_cache_test_response(2, "tools/list", "first", None, "private"),
+            )
+            .await;
             client.list_tools(&cx, None).await.unwrap();
-            client.open_subscriptions_listener(&cx, websocket_catalog_test_filter()).await.unwrap();
+            client
+                .open_subscriptions_listener(&cx, websocket_catalog_test_filter())
+                .await
+                .unwrap();
             let cancelled = McpRequestCancellation::new();
             cancelled.cancel();
-            assert_eq!(client.next_subscription_event(&cx, &cancelled).await.unwrap_err().code,
-                McpErrorCode::RequestCancelled);
+            assert_eq!(
+                client
+                    .next_subscription_event(&cx, &cancelled)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
             write_server_text_frame(&mut peer_io,
                 r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#,
             ).await;
             write_server_text_frame(&mut peer_io, &websocket_subscription_test_terminal(3)).await;
             {
                 let mut waiting = Box::pin(client.list_tools(&cx, None));
-                assert!(std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
-                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                    4, "tools/list", "fresh", None, "private",
-                )).await;
+                assert!(
+                    std::future::poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task)))
+                        .await
+                        .is_pending()
+                );
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_cache_test_response(4, "tools/list", "fresh", None, "private"),
+                )
+                .await;
                 assert!(waiting.await.unwrap().encode().unwrap().contains("fresh"));
             }
             assert_eq!(client.final_result_cache_stats().hits, 0);
@@ -36844,20 +37194,37 @@ exec sleep 2
         run_test(|| async {
             let cx = Cx::current().unwrap();
             let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
-            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                2, "tools/list", "typed", None, "private",
-            )).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_cache_test_response(2, "tools/list", "typed", None, "private"),
+            )
+            .await;
             client.list_tools(&cx, None).await.unwrap();
-            write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                3, "tools/list", "raw", None, "private",
-            )).await;
-            let parameters = client.with_modern_request_metadata(serde_json::json!({})).unwrap();
-            let raw = client.request_with_raw_result(&cx, "tools/list", Some(parameters)).await.unwrap();
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_cache_test_response(3, "tools/list", "raw", None, "private"),
+            )
+            .await;
+            let parameters = client
+                .with_modern_request_metadata(serde_json::json!({}))
+                .unwrap();
+            let raw = client
+                .request_with_raw_result(&cx, "tools/list", Some(parameters))
+                .await
+                .unwrap();
             assert!(raw.raw_result.unwrap().contains("raw"));
             assert_eq!(client.next_id, 4);
             assert_eq!(client.final_result_cache_stats().hits, 0);
             assert_eq!(client.final_result_cache_stats().fills, 1);
-            assert!(client.list_tools(&cx, None).await.unwrap().encode().unwrap().contains("typed"));
+            assert!(
+                client
+                    .list_tools(&cx, None)
+                    .await
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                    .contains("typed")
+            );
             assert_eq!(client.next_id, 4);
             assert_eq!(client.final_result_cache_stats().hits, 1);
             client.close(&cx).await.unwrap();
@@ -36877,7 +37244,9 @@ exec sleep 2
                 async_websocket_client_info(),
                 serde_json::from_value(serde_json::json!({"roots":{}})).unwrap(),
                 AsyncWsClientTransport::from_upgraded(client_io),
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             write_server_text_frame(&mut peer_io,
                 r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"one-use"}}"#,
             ).await;
@@ -36885,12 +37254,21 @@ exec sleep 2
                 r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","contents":[{"uri":"file:///a","text":"continuation"}],"ttlMs":60000,"cacheScope":"private"}}"#,
             ).await;
             let mut callbacks = 0;
-            let result = client.read_resource_with_mrtr_retry(
-                &cx, Instant::now() + Duration::from_secs(1), "file:///a", |_| {
-                    callbacks += 1;
-                    Ok(BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots":[]}))]))
-                },
-            ).await.unwrap();
+            let result = client
+                .read_resource_with_mrtr_retry(
+                    &cx,
+                    Instant::now() + Duration::from_secs(1),
+                    "file:///a",
+                    |_| {
+                        callbacks += 1;
+                        Ok(BTreeMap::from([(
+                            "roots".to_owned(),
+                            serde_json::json!({"roots":[]}),
+                        )]))
+                    },
+                )
+                .await
+                .unwrap();
             assert!(matches!(result, FinalCoreResult::ResourcesRead { .. }));
             assert_eq!(callbacks, 1);
             assert_eq!(client.next_id, 4);
@@ -36898,9 +37276,25 @@ exec sleep 2
             write_server_text_frame(&mut peer_io,
                 r#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","contents":[{"uri":"file:///a","text":"initial"}],"ttlMs":60000,"cacheScope":"private"}}"#,
             ).await;
-            assert!(client.read_resource(&cx, "file:///a").await.unwrap().encode().unwrap().contains("initial"));
+            assert!(
+                client
+                    .read_resource(&cx, "file:///a")
+                    .await
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                    .contains("initial")
+            );
             assert_eq!(client.final_result_cache_stats().fills, 1);
-            assert!(client.read_resource(&cx, "file:///a").await.unwrap().encode().unwrap().contains("initial"));
+            assert!(
+                client
+                    .read_resource(&cx, "file:///a")
+                    .await
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                    .contains("initial")
+            );
             assert_eq!(client.final_result_cache_stats().hits, 1);
             assert_eq!(client.next_id, 5);
             client.close(&cx).await.unwrap();
@@ -36914,24 +37308,56 @@ exec sleep 2
             let cx = Cx::current().unwrap();
             for max_pages in [2, 3] {
                 let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
-                write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                    2, "tools/list", "old", Some("old-cursor"), "private",
-                )).await;
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_cache_test_response(
+                        2,
+                        "tools/list",
+                        "old",
+                        Some("old-cursor"),
+                        "private",
+                    ),
+                )
+                .await;
                 client.list_tools(&cx, None).await.unwrap();
                 let mut limits = PaginationLimits::DEFAULT;
                 limits.pages = max_pages;
                 let result = {
                     let mut traversal = Box::pin(client.collect_websocket_catalog_with_budget(
-                        &cx, None, "tools/list", serde_json::json!({}), PaginationBudget::with_limits(limits),
+                        &cx,
+                        None,
+                        "tools/list",
+                        serde_json::json!({}),
+                        PaginationBudget::with_limits(limits),
                     ));
-                    assert!(std::future::poll_fn(|task| Poll::Ready(traversal.as_mut().poll(task))).await.is_pending());
-                    write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                        3, "tools/list", "fresh-first", Some("fresh-cursor"), "private",
-                    )).await;
+                    assert!(
+                        std::future::poll_fn(|task| Poll::Ready(traversal.as_mut().poll(task)))
+                            .await
+                            .is_pending()
+                    );
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &websocket_cache_test_response(
+                            3,
+                            "tools/list",
+                            "fresh-first",
+                            Some("fresh-cursor"),
+                            "private",
+                        ),
+                    )
+                    .await;
                     if max_pages == 3 {
-                        write_server_text_frame(&mut peer_io, &websocket_cache_test_response(
-                            4, "tools/list", "fresh-last", None, "private",
-                        )).await;
+                        write_server_text_frame(
+                            &mut peer_io,
+                            &websocket_cache_test_response(
+                                4,
+                                "tools/list",
+                                "fresh-last",
+                                None,
+                                "private",
+                            ),
+                        )
+                        .await;
                     }
                     traversal.await
                 };
@@ -36939,12 +37365,25 @@ exec sleep 2
                     let collection = result.unwrap();
                     assert_eq!(collection.pages().len(), 2);
                     assert_eq!(collection.item_count(), 2);
-                    assert!(collection.pages()[0].encode().unwrap().contains("fresh-first"));
-                    assert!(collection.pages()[1].encode().unwrap().contains("fresh-last"));
+                    assert!(
+                        collection.pages()[0]
+                            .encode()
+                            .unwrap()
+                            .contains("fresh-first")
+                    );
+                    assert!(
+                        collection.pages()[1]
+                            .encode()
+                            .unwrap()
+                            .contains("fresh-last")
+                    );
                     assert_eq!(client.next_id, 5);
                 } else {
                     assert_eq!(result.unwrap_err().message, PAGINATION_PAGE_LIMIT_ERROR);
-                    assert_eq!(client.next_id, 4, "the discarded cached page consumes the same budget");
+                    assert_eq!(
+                        client.next_id, 4,
+                        "the discarded cached page consumes the same budget"
+                    );
                 }
                 assert_eq!(client.final_result_cache_stats().hits, 1);
                 client.close(&cx).await.unwrap();
@@ -38908,7 +39347,10 @@ exec sleep 2
                         );
                     }
                     if stalled {
-                        assert_eq!(client.close(&cx).await.unwrap_err().message, "WebSocket cancellation control did not commit");
+                        assert_eq!(
+                            client.close(&cx).await.unwrap_err().message,
+                            "WebSocket cancellation control did not commit"
+                        );
                     } else {
                         client.close(&cx).await.unwrap();
                     }
@@ -38961,8 +39403,14 @@ exec sleep 2
                 response.response.result,
                 Some(serde_json::json!({"ready_response_kept": true}))
             );
-            assert!(client.transient_request.is_none(), "the admitted final disarms Drop custody before unrelated cleanup");
-            assert!(client.retired_requests.is_empty(), "the ready RPC never acquires a cancellation tombstone");
+            assert!(
+                client.transient_request.is_none(),
+                "the admitted final disarms Drop custody before unrelated cleanup"
+            );
+            assert!(
+                client.retired_requests.is_empty(),
+                "the ready RPC never acquires a cancellation tombstone"
+            );
             assert!(
                 listener_cx.is_cancel_requested(),
                 "the read boundary elected listener cancellation"
@@ -39003,7 +39451,10 @@ exec sleep 2
                 assert_eq!(request.method, method);
             }
             assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
-            assert_eq!(client.close(&cx).await.unwrap_err().message, "WebSocket cancellation control did not commit");
+            assert_eq!(
+                client.close(&cx).await.unwrap_err().message,
+                "WebSocket cancellation control did not commit"
+            );
             listener_region.close().await.unwrap();
         });
     }
@@ -39852,10 +40303,9 @@ exec sleep 2
                 client.next_id, next_id,
                 "terminal refusal makes no new request"
             );
-            client
-                .close(&cx)
-                .await
-                .expect_err("explicit close retires both halves and retains the uncommitted control failure");
+            client.close(&cx).await.expect_err(
+                "explicit close retires both halves and retains the uncommitted control failure",
+            );
             assert!(client.close_settled);
             let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
             for expected_method in [SERVER_DISCOVER_METHOD, "subscriptions/listen"] {
@@ -40954,7 +41404,14 @@ exec sleep 2
                     .await;
                 if field == "ttlMs" {
                     assert_eq!(
-                        result.unwrap().base().ttl_ms.as_ref().unwrap().try_as_millis().unwrap(),
+                        result
+                            .unwrap()
+                            .base()
+                            .ttl_ms
+                            .as_ref()
+                            .unwrap()
+                            .try_as_millis()
+                            .unwrap(),
                         u64::MAX
                     );
                 } else {
@@ -42048,9 +42505,13 @@ exec sleep 2
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
             }
             let error = asupersync::time::timeout(
-                cx.now(), Duration::from_secs(2), client.list_tools(&cx, None),
-            ).await.expect("Auto modern direction refusal must settle promptly")
-                .expect_err("installed handlers cannot admit independent modern server requests");
+                cx.now(),
+                Duration::from_secs(2),
+                client.list_tools(&cx, None),
+            )
+            .await
+            .expect("Auto modern direction refusal must settle promptly")
+            .expect_err("installed handlers cannot admit independent modern server requests");
             assert_eq!(error.code, McpErrorCode::InvalidRequest);
             for calls in modern_calls.iter() {
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -42062,7 +42523,11 @@ exec sleep 2
             let next_id = client.next_id;
             assert!(client.list_tools(&cx, None).await.is_err());
             assert_eq!(client.next_id, next_id);
-            assert_eq!(factory_calls.load(Ordering::SeqCst), 1, "an ordinary refusal cannot retry another protocol era");
+            assert_eq!(
+                factory_calls.load(Ordering::SeqCst),
+                1,
+                "an ordinary refusal cannot retry another protocol era"
+            );
             client.close(&cx).await.expect("close Auto modern client");
             assert!(matches!(peer.join(&cx).await, Ok(())));
         });
@@ -42376,7 +42841,8 @@ exec sleep 2
             let cx = Cx::current().expect("test runtime installs caller context");
             for policy in [ProtocolPolicy::ModernOnly, ProtocolPolicy::LegacyOnly] {
                 for answer in [true, false] {
-                    let (client_io, server_io, close_frames) = close_counting_async_websocket_pair();
+                    let (client_io, server_io, close_frames) =
+                        close_counting_async_websocket_pair();
                     let mut peer = cx
                         .spawn(move |peer_cx| async move {
                             let mut server = AsyncWsServerTransport::from_upgraded(server_io);
@@ -42444,9 +42910,10 @@ exec sleep 2
                             &cx,
                             AsyncWsClientTransport::from_upgraded(client_io),
                         );
-                    let result = asupersync::time::timeout(cx.now(), Duration::from_secs(3), connect)
-                        .await
-                        .expect("configured handshake bound precedes the test watchdog");
+                    let result =
+                        asupersync::time::timeout(cx.now(), Duration::from_secs(3), connect)
+                            .await
+                            .expect("configured handshake bound precedes the test watchdog");
                     if answer {
                         let mut client = result.expect("responsive peer negotiates successfully");
                         assert_eq!(
@@ -42459,7 +42926,8 @@ exec sleep 2
                         );
                         client.close(&cx).await.expect("close established client");
                     } else {
-                        let error = result.expect_err("silence alone reaches the configured idle bound");
+                        let error =
+                            result.expect_err("silence alone reaches the configured idle bound");
                         assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "idle");
                         assert!(!is_cleanup_unverified(&error));
                     }
@@ -42480,11 +42948,8 @@ exec sleep 2
             let connect = ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
                 .request_timeout_policy(
-                    RequestTimeoutPolicy::new(
-                        Duration::from_millis(10),
-                        Duration::from_millis(50),
-                    )
-                    .unwrap(),
+                    RequestTimeoutPolicy::new(Duration::from_millis(10), Duration::from_millis(50))
+                        .unwrap(),
                 )
                 .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io));
             let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), connect)
@@ -42494,8 +42959,11 @@ exec sleep 2
             assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
             assert!(probe.started.load(Ordering::Acquire));
             assert!(probe.dropped.load(Ordering::Acquire));
-            assert_eq!(probe.accepted.lock().unwrap().len(), 3,
-                "cleanup must not flush the abandoned text frame or append Close");
+            assert_eq!(
+                probe.accepted.lock().unwrap().len(),
+                3,
+                "cleanup must not flush the abandoned text frame or append Close"
+            );
         });
     }
 
@@ -42530,18 +42998,17 @@ exec sleep 2
                         )
                         .await
                         .expect("initialize result commits before blocking initialized");
-                    assert!(server.recv(&peer_cx).await.is_err(),
-                        "partial initialized frame is retired without completing it");
+                    assert!(
+                        server.recv(&peer_cx).await.is_err(),
+                        "partial initialized frame is retired without completing it"
+                    );
                 })
                 .expect("spawn initialized-notification peer");
             let connect = ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly))
                 .request_timeout_policy(
-                    RequestTimeoutPolicy::new(
-                        Duration::from_secs(1),
-                        Duration::from_millis(200),
-                    )
-                    .unwrap(),
+                    RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_millis(200))
+                        .unwrap(),
                 )
                 .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io));
             let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), connect)
@@ -42576,7 +43043,9 @@ exec sleep 2
                     )
                     .connect_websocket_auto_with_cx(&cx, move |_| {
                         factory_calls.fetch_add(1, Ordering::SeqCst);
-                        let io = first.take().expect("timeout must never open a fallback transport");
+                        let io = first
+                            .take()
+                            .expect("timeout must never open a fallback transport");
                         async move {
                             if stall_factory {
                                 std::future::pending::<()>().await;
@@ -42588,10 +43057,15 @@ exec sleep 2
                     .await
                     .expect("Auto factory and discovery each have a bounded lifetime")
                     .expect_err("silent Auto connection times out");
-                assert_eq!(error.data.as_ref().unwrap()["timeoutSource"],
-                    if stall_factory { "absolute" } else { "idle" });
+                assert_eq!(
+                    error.data.as_ref().unwrap()["timeoutSource"],
+                    if stall_factory { "absolute" } else { "idle" }
+                );
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
-                assert_eq!(close_frames.load(Ordering::SeqCst), usize::from(!stall_factory));
+                assert_eq!(
+                    close_frames.load(Ordering::SeqCst),
+                    usize::from(!stall_factory)
+                );
             }
         });
     }
@@ -42615,9 +43089,12 @@ exec sleep 2
                         AsyncWsClientTransport::from_upgraded(client_io),
                     ),
             );
-            assert!(std::future::poll_fn(|task_cx| Poll::Ready(connect.as_mut().poll(task_cx)))
-                .await
-                .is_pending(), "discovery is committed and awaits its silent peer");
+            assert!(
+                std::future::poll_fn(|task_cx| Poll::Ready(connect.as_mut().poll(task_cx)))
+                    .await
+                    .is_pending(),
+                "discovery is committed and awaits its silent peer"
+            );
             caller.set_cancel_requested(true);
             let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), connect)
                 .await
@@ -42660,8 +43137,10 @@ exec sleep 2
                         )
                         .await
                         .expect("peer sends otherwise eligible fallback refusal");
-                    assert!(server.recv(&peer_cx).await.is_err(),
-                        "bounded close retires its partial control frame");
+                    assert!(
+                        server.recv(&peer_cx).await.is_err(),
+                        "bounded close retires its partial control frame"
+                    );
                 })
                 .expect("spawn peer that cannot accept a complete Close");
             let calls = Arc::new(AtomicUsize::new(0));
@@ -42671,7 +43150,9 @@ exec sleep 2
                 .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::Auto))
                 .connect_websocket_auto_with_cx(&cx, move |_| {
                     factory_calls.fetch_add(1, Ordering::SeqCst);
-                    let io = first.take().expect("unverified teardown cannot authorize fallback");
+                    let io = first
+                        .take()
+                        .expect("unverified teardown cannot authorize fallback");
                     async move { Ok(AsyncWsClientTransport::from_upgraded(io)) }
                 });
             let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), connect)
@@ -42685,7 +43166,9 @@ exec sleep 2
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert!(probe.dropped.load(Ordering::Acquire));
             assert_eq!(probe.accepted.lock().unwrap().len(), 1);
-            peer.join(&cx).await.expect("peer observes owned stream retirement");
+            peer.join(&cx)
+                .await
+                .expect("peer observes owned stream retirement");
         });
     }
 
@@ -43161,7 +43644,10 @@ exec sleep 2
                             .await
                             .unwrap();
                     }
-                    assert!(matches!(server.recv(&peer_cx).await, Err(TransportError::Closed)));
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
                 })
                 .unwrap();
             let (id, registry, discovery) = extension_result_pair_configuration();
@@ -44694,19 +45180,19 @@ exec sleep 2
                         Box::pin(async move {
                             assert_eq!(params.max_tokens.to_string(), "8");
                             Ok(FinalCreateMessageResult {
-                            content: fastmcp_protocol::FinalSamplingMessageContent::Block(
-                                fastmcp_protocol::common_types::SamplingContentBlock::Text {
-                                    text: "sampled".to_owned(),
-                                    annotations: None,
-                                    meta: None,
-                                    additional: BTreeMap::new(),
-                                },
-                            ),
-                            model: "modern-ws-model".to_owned(),
-                            role: fastmcp_protocol::Role::Assistant,
-                            stop_reason: None,
-                            meta: None,
-                        })
+                                content: fastmcp_protocol::FinalSamplingMessageContent::Block(
+                                    fastmcp_protocol::common_types::SamplingContentBlock::Text {
+                                        text: "sampled".to_owned(),
+                                        annotations: None,
+                                        meta: None,
+                                        additional: BTreeMap::new(),
+                                    },
+                                ),
+                                model: "modern-ws-model".to_owned(),
+                                role: fastmcp_protocol::Role::Assistant,
+                                stop_reason: None,
+                                meta: None,
+                            })
                         })
                     },
                 )
@@ -46453,7 +46939,10 @@ exec sleep 2
             let mut request = accept_raw_extension_http_peer(&listener);
             let body = read_http_cache_test_request(&mut request);
             assert_eq!(body["method"], "example/echo");
-            assert_eq!(body["id"], 2, "refused requests cannot consume an ID or post");
+            assert_eq!(
+                body["id"], 2,
+                "refused requests cannot consume an ID or post"
+            );
             assert_eq!(body["params"]["input"], "owner-check");
             write_http_cache_test_response(
                 &mut request,
@@ -46621,7 +47110,10 @@ exec sleep 2
                 let mut followup = accept_raw_extension_http_peer(&listener);
                 let body = read_http_cache_test_request(&mut followup);
                 assert_eq!(body["method"], "example/echo");
-                assert_eq!(body["id"], 4, "no replacement POST or rediscovery is allowed");
+                assert_eq!(
+                    body["id"], 4,
+                    "no replacement POST or rediscovery is allowed"
+                );
                 assert_eq!(body["params"]["input"], "after-cancel");
                 write_http_cache_test_response(
                     &mut followup,
@@ -46664,15 +47156,18 @@ exec sleep 2
                     // Poll the now-delivered partial head/body once more before
                     // cancelling; no phase supplies a terminal response.
                     assert!(
-                        std::future::poll_fn(|task| std::task::Poll::Ready(request.as_mut().poll(task)))
-                            .await
-                            .is_pending()
+                        std::future::poll_fn(|task| std::task::Poll::Ready(
+                            request.as_mut().poll(task)
+                        ))
+                        .await
+                        .is_pending()
                     );
                     cancellation.cancel();
-                    let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), request)
-                        .await
-                        .expect("cancellation must not wait for withheld response bytes")
-                        .unwrap_err();
+                    let error =
+                        asupersync::time::timeout(cx.now(), Duration::from_secs(2), request)
+                            .await
+                            .expect("cancellation must not wait for withheld response bytes")
+                            .unwrap_err();
                     assert!(
                         matches!(
                             error,
@@ -46788,11 +47283,7 @@ exec sleep 2
     }
 
     #[cfg(unix)]
-    fn http_owned_extension_fixture() -> (
-        HttpClient,
-        TcpListener,
-        fastmcp_protocol::ExtensionId,
-    ) {
+    fn http_owned_extension_fixture() -> (HttpClient, TcpListener, fastmcp_protocol::ExtensionId) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let target = format!("http://{}/mcp", listener.local_addr().unwrap());
@@ -47405,14 +47896,29 @@ exec sleep 2
         // finite JSON responses and the terminal frame of an SSE response.
         for use_sse in [false, true] {
             let cases = [
-                (r#"{"resultType":"com.example/raw-result","value":7.30e-2}"#, true),
-                (r#"{"resultType":"com.example/other-result","value":7.30e-2}"#, false),
-                (r#"{"resultType":"com.example/unknown-result","value":7.30e-2}"#, false),
+                (
+                    r#"{"resultType":"com.example/raw-result","value":7.30e-2}"#,
+                    true,
+                ),
+                (
+                    r#"{"resultType":"com.example/other-result","value":7.30e-2}"#,
+                    false,
+                ),
+                (
+                    r#"{"resultType":"com.example/unknown-result","value":7.30e-2}"#,
+                    false,
+                ),
                 (r#"{"resultType":"task","value":7.30e-2}"#, false),
-                (r#"{"resultType":"com.example/raw-result","_meta":null,"value":21}"#, false),
+                (
+                    r#"{"resultType":"com.example/raw-result","_meta":null,"value":21}"#,
+                    false,
+                ),
                 (r#"{"resultType":"complete","value":21}"#, true),
                 (r#"{"value":21}"#, true),
-                (r#"{"resultType":"com.example/raw-result","value":1.20e+4}"#, true),
+                (
+                    r#"{"resultType":"com.example/raw-result","value":1.20e+4}"#,
+                    true,
+                ),
             ];
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let modern_target = format!("http://{}/mcp", listener.local_addr().unwrap());
@@ -47432,8 +47938,8 @@ exec sleep 2
                     assert_eq!(request["method"], "example/echo");
                     assert_eq!(request["id"], index + 2);
                     assert_eq!(
-                        request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]
-                            ["extensions"]["com.example/raw"],
+                        request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                            ["com.example/raw"],
                         serde_json::json!({"mode": "raw"})
                     );
                     let response = format!(
@@ -47442,9 +47948,17 @@ exec sleep 2
                     );
                     if use_sse {
                         let event = format!("event: message\ndata: {response}\n\n");
-                        write_http_cache_test_response(&mut stream, "text/event-stream", event.as_bytes());
+                        write_http_cache_test_response(
+                            &mut stream,
+                            "text/event-stream",
+                            event.as_bytes(),
+                        );
                     } else {
-                        write_http_cache_test_response(&mut stream, "application/json", response.as_bytes());
+                        write_http_cache_test_response(
+                            &mut stream,
+                            "application/json",
+                            response.as_bytes(),
+                        );
                     }
                 }
             });
@@ -47483,7 +47997,10 @@ exec sleep 2
                     );
                 }
             }
-            assert_eq!(client.next_id.load(Ordering::SeqCst), cases.len() as u64 + 2);
+            assert_eq!(
+                client.next_id.load(Ordering::SeqCst),
+                cases.len() as u64 + 2
+            );
             server.join().unwrap();
         }
     }
@@ -47937,16 +48454,17 @@ exec sleep 2
             .build()
             .expect("legacy completion refusal test runtime must build");
         let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
-        let mut client = runtime.block_on(HttpClient::connect(
-            &cx,
-            legacy_completion_http_plan(&sse_target, &message_target),
-            ClientInfo {
-                name: "legacy-completion-client".to_owned(),
-                version: "1.0.0".to_owned(),
-            },
-            ClientCapabilities::default(),
-        ))
-        .expect("legacy HTTP completion client completes its lifecycle");
+        let mut client = runtime
+            .block_on(HttpClient::connect(
+                &cx,
+                legacy_completion_http_plan(&sse_target, &message_target),
+                ClientInfo {
+                    name: "legacy-completion-client".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                ClientCapabilities::default(),
+            ))
+            .expect("legacy HTTP completion client completes its lifecycle");
         ready_receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("legacy completion peer reaches the zero-contact gate");
@@ -49715,8 +50233,8 @@ exec sleep 2
                 )
                 .await;
             }
-            let rejected =
-                first_round_count + second_round_count.unwrap_or(0) > MAX_MRTR_TOTAL_INPUT_RESPONSES;
+            let rejected = first_round_count + second_round_count.unwrap_or(0)
+                > MAX_MRTR_TOTAL_INPUT_RESPONSES;
             let result = if rejected {
                 serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"})
             } else {
@@ -49760,7 +50278,12 @@ exec sleep 2
                     .await
                     .map(CoreResult::Final),
                 Some("resources/read") => client
-                    .read_resource_with_mrtr_retry(&cx, deadline, "file:///budget-resource", respond)
+                    .read_resource_with_mrtr_retry(
+                        &cx,
+                        deadline,
+                        "file:///budget-resource",
+                        respond,
+                    )
                     .await
                     .map(CoreResult::Final),
                 Some("prompts/get") => client
@@ -51124,23 +51647,28 @@ exec sleep 2
                 sent.send(()).unwrap();
                 finished.recv_timeout(Duration::from_secs(2)).unwrap();
                 listener.set_nonblocking(true).unwrap();
-                assert!(matches!(
-                    listener.accept(),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-                ), "watch termination must not poll or cancel the durable Task automatically");
+                assert!(
+                    matches!(
+                        listener.accept(),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    ),
+                    "watch termination must not poll or cancel the durable Task automatically"
+                );
             });
             let cx = Cx::for_request();
             let mut client = http_test_runtime_block_on(HttpClient::connect(
                 &cx,
                 http_cache_test_plan(&target),
-                ClientInfo { name: "task-cancellation-client".to_owned(), version: "1".to_owned() },
+                ClientInfo {
+                    name: "task-cancellation-client".to_owned(),
+                    version: "1".to_owned(),
+                },
                 ClientCapabilities::default(),
             ))
             .unwrap();
-            let mut handle = http_test_runtime_block_on(client.attach_final_task(
-                &cx,
-                FinalTaskId::parse("task-watch").unwrap(),
-            ))
+            let mut handle = http_test_runtime_block_on(
+                client.attach_final_task(&cx, FinalTaskId::parse("task-watch").unwrap()),
+            )
             .unwrap();
             let before = serde_json::to_vec(handle.task()).unwrap();
             let mut watch = http_test_runtime_block_on(handle.watch(
@@ -51158,9 +51686,11 @@ exec sleep 2
             if foreign_control {
                 assert!(matches!(
                     terminal,
-                    Err(HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(
-                        http_executor::ModernHttpSubscriptionListenError::EventIdMismatch { .. }
-                    )))
+                    Err(HttpClientError::Connection(
+                        ClientHttpConnectionError::SubscriptionsListen(
+                            http_executor::ModernHttpSubscriptionListenError::EventIdMismatch { .. }
+                        )
+                    ))
                 ));
             } else {
                 assert!(matches!(
@@ -51170,7 +51700,11 @@ exec sleep 2
                             && params.reason.as_deref() == Some("watch closed")
                 ));
             }
-            assert!(http_test_runtime_block_on(watch.next_event(&cx)).unwrap().is_none());
+            assert!(
+                http_test_runtime_block_on(watch.next_event(&cx))
+                    .unwrap()
+                    .is_none()
+            );
             drop(watch);
             assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
             assert!(matches!(handle.task(), FinalTask::Working(_)));
@@ -51539,7 +52073,9 @@ exec sleep 2
                         assert_eq!(request["method"], "tasks/get");
                         assert_eq!(request["params"]["taskId"], "terminal-task");
                         let response = [
-                            format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","#),
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","#
+                            ),
                             snapshot[1..].to_owned(),
                             "}".to_owned(),
                         ]
@@ -51595,8 +52131,10 @@ exec sleep 2
             // InputRequired snapshot are skipped. Same-time and earlier-time
             // conflicts remain visible only after authoritative reconciliation.
             for expected_message in [None, Some("changed input")] {
-                let Some(FinalTaskWatchEvent::TaskReconciled { observed, authoritative }) =
-                    http_test_runtime_block_on(watch.next_event(&cx)).unwrap()
+                let Some(FinalTaskWatchEvent::TaskReconciled {
+                    observed,
+                    authoritative,
+                }) = http_test_runtime_block_on(watch.next_event(&cx)).unwrap()
                 else {
                     panic!("changed input snapshot");
                 };
@@ -51614,8 +52152,10 @@ exec sleep 2
                     "2026-07-28T12:00:00Z"
                 );
             }
-            let Some(FinalTaskWatchEvent::TaskReconciled { observed, authoritative }) =
-                http_test_runtime_block_on(watch.next_event(&cx)).unwrap()
+            let Some(FinalTaskWatchEvent::TaskReconciled {
+                observed,
+                authoritative,
+            }) = http_test_runtime_block_on(watch.next_event(&cx)).unwrap()
             else {
                 panic!("changed nonterminal snapshot");
             };
@@ -52433,8 +52973,8 @@ exec sleep 2
                     std::future::poll_fn(|task_cx| {
                         std::task::Poll::Ready(pending.as_mut().poll(task_cx))
                     })
-                        .await
-                        .is_pending(),
+                    .await
+                    .is_pending(),
                     "the peer withholds the authoritative result"
                 );
                 match committed_receiver.try_recv() {
@@ -62077,7 +62617,8 @@ IFS= read -r second || exit 91
                     serde_json::to_string(cursor).unwrap(),
                 )),
                 None => {
-                    script.push_str("case \"$request\" in *'\"cursor\":'*) exit 11 ;; *) ;; esac\n");
+                    script
+                        .push_str("case \"$request\" in *'\"cursor\":'*) exit 11 ;; *) ;; esac\n");
                 }
             }
             script.push_str(&format!(
@@ -64195,8 +64736,12 @@ while IFS= read -r unexpected; do exit 20; done
         }))
         .unwrap();
         let negotiated = runtime.negotiate(&discovery).unwrap();
-        let admission = runtime.admit_request(&negotiated, &id, "tasks/get").unwrap();
-        admission.decode_result(r#"{"resultType":"complete"}"#).unwrap();
+        let admission = runtime
+            .admit_request(&negotiated, &id, "tasks/get")
+            .unwrap();
+        admission
+            .decode_result(r#"{"resultType":"complete"}"#)
+            .unwrap();
         let error = admission
             .decode_result(r#"{"resultType":"task"}"#)
             .expect_err("even the official Tasks owner cannot return a task from tasks/get");
@@ -65328,9 +65873,8 @@ while IFS= read -r ignored; do :; done
             let (extension_id, registry, client_discovery) = extension_result_pair_configuration();
             let other_id = fastmcp_protocol::ExtensionId::parse("com.example/other").unwrap();
             let discovery = extension_result_pair_discovery_response();
-            let rejected_source = format!(
-                r#"{{"resultType":"{rejected_discriminator}","owner":"first"}}"#
-            );
+            let rejected_source =
+                format!(r#"{{"resultType":"{rejected_discriminator}","owner":"first"}}"#);
             let accepted_source =
                 r#"{"resultType":"com.example/other-result","owner":"second","exact":1.20e+4}"#;
             let script = format!(
@@ -65346,7 +65890,9 @@ while IFS= read -r ignored; do :; done
             let cx = Cx::for_request();
             let mut client = block_on(
                 ClientBuilder::new()
-                    .extension_registry(registry, client_discovery, || accept_raw_extension_settings)
+                    .extension_registry(registry, client_discovery, || {
+                        accept_raw_extension_settings
+                    })
                     .unwrap()
                     .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
             )
@@ -65403,12 +65949,14 @@ while IFS= read -r ignored; do :; done
                 .is_err()
         );
         let executor = client.multiplexed_stdio_executor().unwrap();
-        let error = match executor.executor.execute_final_extension_with_timeout_policy(
-            &cx,
-            JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 500),
-            RequestTimeoutPolicy::default(),
-            admission,
-        ) {
+        let error = match executor
+            .executor
+            .execute_final_extension_with_timeout_policy(
+                &cx,
+                JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 500),
+                RequestTimeoutPolicy::default(),
+                admission,
+            ) {
             Ok(_) => panic!("a valid extension receipt cannot authorize a core request"),
             Err(error) => error,
         };
@@ -65470,10 +66018,19 @@ while IFS= read -r ignored; do :; done
     #[test]
     fn clt_ext_sequential_result_preserves_payload_and_rejects_unknown_marker() {
         for (source, accepted) in [
-            (r#"{"resultType":"com.example/raw-result","value":21}"#, true),
+            (
+                r#"{"resultType":"com.example/raw-result","value":21}"#,
+                true,
+            ),
             (r#"{"value":21}"#, true),
-            (r#"{"resultType":"com.example/unknown-result","value":21}"#, false),
-            (r#"{"resultType":"com.example/raw-result","_meta":null,"value":21}"#, false),
+            (
+                r#"{"resultType":"com.example/unknown-result","value":21}"#,
+                false,
+            ),
+            (
+                r#"{"resultType":"com.example/raw-result","_meta":null,"value":21}"#,
+                false,
+            ),
         ] {
             let (extension_id, registry, discovery) = extension_result_configuration(
                 ExtensionDirection::ClientToServer,
@@ -65495,7 +66052,10 @@ while IFS= read -r ignored; do :; done
                 serde_json::json!({"input": "ok"}),
             );
             if accepted {
-                assert_eq!(result.unwrap(), serde_json::from_str::<serde_json::Value>(source).unwrap());
+                assert_eq!(
+                    result.unwrap(),
+                    serde_json::from_str::<serde_json::Value>(source).unwrap()
+                );
             } else {
                 assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
             }
@@ -65773,7 +66333,6 @@ while IFS= read -r unexpected; do exit 15; done
             }
         });
     }
-
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn raw_async_caller_lifetime_probe(legacy: bool, typed: bool) {
@@ -70258,7 +70817,12 @@ exec sleep 5
             assert_eq!(roots_calls.load(Ordering::SeqCst), 1);
             assert_eq!(dropped.load(Ordering::SeqCst), 1);
             assert_eq!(
-                token.lock().unwrap().as_ref().unwrap().is_cancel_requested(),
+                token
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_cancel_requested(),
                 panic_on_drop,
             );
             if panic_on_drop {
@@ -70274,7 +70838,10 @@ exec sleep 5
                     CoreResult::Final(FinalCoreResult::ToolsCall { .. }),
                 ));
                 assert_eq!(sampling_calls.load(Ordering::SeqCst), 1);
-                assert_eq!(next_id, 4, "the complete batch makes exactly one continuation");
+                assert_eq!(
+                    next_id, 4,
+                    "the complete batch makes exactly one continuation"
+                );
             }
             caller.checkpoint().unwrap();
             connection_cx.checkpoint().unwrap();
@@ -72784,8 +73351,7 @@ exec sleep 2
                 if id == 3 {
                     script.push_str("printf '%s\\n' '}'\n");
                 }
-                let result =
-                    http_catalog_test_result("tools/list", name, None, 60_000, "private");
+                let result = http_catalog_test_result("tools/list", name, None, 60_000, "private");
                 script.push_str(&format!(
                     "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}'\n"
                 ));
@@ -72988,7 +73554,8 @@ exec sleep 2
                      case \"$request\" in *'\"id\":3,'*|*'\"id\":3}'*) ;; *) exit 27 ;; esac\n",
                 );
                 if fragmented {
-                    script.push_str("printf '%s\\n' '\"params\":{\"uri\":\"file:///changing\"}}'\n");
+                    script
+                        .push_str("printf '%s\\n' '\"params\":{\"uri\":\"file:///changing\"}}'\n");
                 } else {
                     // This second invalidation arrives after request 3 starts.
                     script.push_str(&format!("printf '%s\\n' '{notification}'\n"));
@@ -72996,7 +73563,11 @@ exec sleep 2
                 script.push_str(&format!(
                     "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{intermediate}}}'\n"
                 ));
-                script.push_str(&stdio_cache_resource_exchange(4, "file:///changing", stable));
+                script.push_str(&stdio_cache_resource_exchange(
+                    4,
+                    "file:///changing",
+                    stable,
+                ));
                 script.push_str("while IFS= read -r unexpected; do exit 28; done\n");
                 let mut client = ClientBuilder::new()
                     .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
@@ -73032,7 +73603,12 @@ exec sleep 2
                     .read_resource_with_cx(&cx, &cancellation, "file:///changing")
                     .await
                     .unwrap();
-                assert!(second.encode().unwrap().contains("\"text\":\"intermediate\""));
+                assert!(
+                    second
+                        .encode()
+                        .unwrap()
+                        .contains("\"text\":\"intermediate\"")
+                );
                 assert_eq!(client.final_result_cache_stats().fills, 1);
                 let third = client
                     .read_resource_with_cx(&cx, &cancellation, "file:///changing")
@@ -73051,7 +73627,10 @@ exec sleep 2
                 assert_eq!(client.peek_next_request_id(), 5);
                 assert_eq!(client.final_result_cache_stats().fills, 2);
                 assert_eq!(client.final_result_cache_stats().hits, 1);
-                assert_eq!(client.take_final_server_notifications().len(), if fragmented { 1 } else { 2 });
+                assert_eq!(
+                    client.take_final_server_notifications().len(),
+                    if fragmented { 1 } else { 2 }
+                );
                 client.close().unwrap();
             }
         });
@@ -73121,7 +73700,11 @@ while IFS= read -r unexpected; do exit 37; done
             let expired = r#"{"resultType":"complete","contents":[{"uri":"file:///delayed","text":"expired"}],"ttlMs":20,"cacheScope":"private"}"#;
             let fresh = r#"{"resultType":"complete","contents":[{"uri":"file:///delayed","text":"fresh"}],"ttlMs":60000,"cacheScope":"private"}"#;
             let mut script = stdio_catalog_test_discovery_script();
-            script.push_str(&stdio_cache_resource_exchange(2, "file:///delayed", expired));
+            script.push_str(&stdio_cache_resource_exchange(
+                2,
+                "file:///delayed",
+                expired,
+            ));
             script.push_str(&stdio_cache_resource_exchange(3, "file:///delayed", fresh));
             script.push_str("while IFS= read -r unexpected; do exit 38; done\n");
             let mut client = ClientBuilder::new()
@@ -73134,11 +73717,8 @@ while IFS= read -r unexpected; do exit 37; done
             let cancellation = McpRequestCancellation::new();
             let executor = client.multiplexed_stdio_executor().unwrap();
             assert!(executor.executor.terminal_records().is_empty());
-            let mut pending = Box::pin(client.read_resource_with_cx(
-                &cx,
-                &cancellation,
-                "file:///delayed",
-            ));
+            let mut pending =
+                Box::pin(client.read_resource_with_cx(&cx, &cancellation, "file:///delayed"));
             let fixture_deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let poll = std::future::poll_fn(|task_cx| {

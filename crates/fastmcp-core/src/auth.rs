@@ -664,7 +664,10 @@ impl fmt::Debug for AuthContext {
             .field("scope_count", &self.scopes.len())
             .field("has_claims", &self.claims.is_some())
             .field("has_session_owner", &self.session_owner.is_some())
-            .field("has_verification_deadline", &self.verification_valid_until.is_some())
+            .field(
+                "has_verification_deadline",
+                &self.verification_valid_until.is_some(),
+            )
             .finish()
     }
 }
@@ -713,7 +716,8 @@ impl AuthContext {
     #[must_use]
     pub fn with_verification_valid_until(mut self, deadline: std::time::Instant) -> Self {
         self.verification_valid_until = Some(
-            self.verification_valid_until.map_or(deadline, |current| current.min(deadline)),
+            self.verification_valid_until
+                .map_or(deadline, |current| current.min(deadline)),
         );
         self
     }

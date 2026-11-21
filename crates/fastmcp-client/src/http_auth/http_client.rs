@@ -242,7 +242,8 @@ impl ManagedHttpClient {
             .budget()
             .deadline
             .map_or(lease.deadline, |parent| parent.min(lease.deadline));
-        let boundary = CallbackBoundary::new(&self.session, cancellation, deadline, &lease.snapshot);
+        let boundary =
+            CallbackBoundary::new(&self.session, cancellation, deadline, &lease.snapshot);
         let result = guarded(
             cx,
             cancellation,
@@ -286,7 +287,8 @@ impl ManagedHttpClient {
             .budget()
             .deadline
             .map_or(lease.deadline, |parent| parent.min(lease.deadline));
-        let boundary = CallbackBoundary::new(&self.session, cancellation, deadline, &lease.snapshot);
+        let boundary =
+            CallbackBoundary::new(&self.session, cancellation, deadline, &lease.snapshot);
         let result = guarded(
             cx,
             cancellation,

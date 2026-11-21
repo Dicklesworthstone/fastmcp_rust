@@ -5,8 +5,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::{DpopStreamError, ManagedCoreError, ManagedCoreLimits, StreamDecoder,
-    StreamEvent, StreamNotification};
+use super::{
+    DpopStreamError, ManagedCoreError, ManagedCoreLimits, StreamDecoder, StreamEvent,
+    StreamNotification,
+};
 
 #[derive(Clone)]
 pub(in crate::http_auth::dpop::native::core) struct SharedStreamBudget {
@@ -20,7 +22,8 @@ struct BudgetState {
 
 impl SharedStreamBudget {
     pub(in crate::http_auth::dpop::native::core) fn new(
-        limits: ManagedCoreLimits, used: (usize, usize),
+        limits: ManagedCoreLimits,
+        used: (usize, usize),
     ) -> Result<Self, DpopStreamError> {
         let budget = Self {
             state: Arc::new(Mutex::new(BudgetState {
@@ -35,17 +38,31 @@ impl SharedStreamBudget {
     pub(in crate::http_auth::dpop::native::core) fn usage(
         &self,
     ) -> Result<(usize, usize), DpopStreamError> {
-        Ok(self.state.lock().map_err(|_| ManagedCoreError::InvalidResponse)?.used)
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| ManagedCoreError::InvalidResponse)?
+            .used)
     }
 
     pub(in crate::http_auth::dpop::native::core) fn charge(
-        &self, delta: (usize, usize),
+        &self,
+        delta: (usize, usize),
     ) -> Result<(), DpopStreamError> {
-        let mut state = self.state.lock().map_err(|_| ManagedCoreError::InvalidResponse)?;
-        let bytes = state.used.0.checked_add(delta.0)
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ManagedCoreError::InvalidResponse)?;
+        let bytes = state
+            .used
+            .0
+            .checked_add(delta.0)
             .filter(|value| *value <= state.maximum.0)
             .ok_or(ManagedCoreError::ResponseByteLimit)?;
-        let events = state.used.1.checked_add(delta.1)
+        let events = state
+            .used
+            .1
+            .checked_add(delta.1)
             .filter(|value| *value <= state.maximum.1)
             .ok_or(ManagedCoreError::NotificationLimit)?;
         state.used = (bytes, events);
@@ -53,7 +70,10 @@ impl SharedStreamBudget {
     }
 
     fn preflight(&self, bytes: usize) -> Result<(), DpopStreamError> {
-        let state = self.state.lock().map_err(|_| ManagedCoreError::InvalidResponse)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ManagedCoreError::InvalidResponse)?;
         if bytes > state.maximum.0.saturating_sub(state.used.0) {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
@@ -71,17 +91,26 @@ pub(in crate::http_auth::dpop::native::core) struct Budgeted<D> {
 
 impl<D> Budgeted<D> {
     pub(in crate::http_auth::dpop::native::core) fn new(
-        inner: D, budget: Option<SharedStreamBudget>,
+        inner: D,
+        budget: Option<SharedStreamBudget>,
     ) -> Self {
         Self { inner, budget }
     }
 
     fn charge_delta(
-        &self, before: (usize, usize), after: (usize, usize),
+        &self,
+        before: (usize, usize),
+        after: (usize, usize),
     ) -> Result<(), DpopStreamError> {
         if let Some(budget) = &self.budget {
-            let bytes = after.0.checked_sub(before.0).ok_or(ManagedCoreError::InvalidResponse)?;
-            let events = after.1.checked_sub(before.1).ok_or(ManagedCoreError::InvalidResponse)?;
+            let bytes = after
+                .0
+                .checked_sub(before.0)
+                .ok_or(ManagedCoreError::InvalidResponse)?;
+            let events = after
+                .1
+                .checked_sub(before.1)
+                .ok_or(ManagedCoreError::InvalidResponse)?;
             budget.charge((bytes, events))?;
         }
         Ok(())
@@ -96,9 +125,13 @@ where
     type Terminal = D::Terminal;
 
     fn admit(
-        &mut self, frame: &[u8], allow_notification: bool,
+        &mut self,
+        frame: &[u8],
+        allow_notification: bool,
     ) -> Result<StreamEvent<Self::Terminal, E>, DpopStreamError> {
-        if let Some(budget) = &self.budget { budget.preflight(frame.len())?; }
+        if let Some(budget) = &self.budget {
+            budget.preflight(frame.len())?;
+        }
         let before = self.inner.usage();
         let event = self.inner.admit(frame, allow_notification)?;
         self.charge_delta(before, self.inner.usage())?;
@@ -106,15 +139,21 @@ where
     }
 
     fn admit_terminal_tail(&mut self, frame: &[u8]) -> Result<(), DpopStreamError> {
-        if let Some(budget) = &self.budget { budget.preflight(frame.len())?; }
+        if let Some(budget) = &self.budget {
+            budget.preflight(frame.len())?;
+        }
         let before = self.inner.usage();
         self.inner.admit_terminal_tail(frame)?;
         self.charge_delta(before, self.inner.usage())
     }
 
-    fn usage(&self) -> (usize, usize) { self.inner.usage() }
+    fn usage(&self) -> (usize, usize) {
+        self.inner.usage()
+    }
 
-    fn completes_on_terminal(&self) -> bool { self.inner.completes_on_terminal() }
+    fn completes_on_terminal(&self) -> bool {
+        self.inner.completes_on_terminal()
+    }
 }
 
 #[cfg(test)]

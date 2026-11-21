@@ -567,9 +567,8 @@ fn repeated_tokens_terminate_only_on_absence_or_the_unchanged_page_budget() {
                     let mut client = peer.client(session.clone(), Duration::from_secs(30));
                     let cancellation = McpRequestCancellation::new();
                     let limits = CatalogLimits::new(3, 4, 4096).unwrap();
-                    let (outcome, ()) = pair(
-                        kind.all(&mut client, &cx, &cancellation, limits),
-                        async {
+                    let (outcome, ()) =
+                        pair(kind.all(&mut client, &cx, &cancellation, limits), async {
                             peer.discovery().await;
                             let first = peer.page(kind, None, &["first"], Some(cursor)).await;
                             let second = peer.page(kind, Some(cursor), &[], Some(cursor)).await;
@@ -584,9 +583,8 @@ fn repeated_tokens_terminate_only_on_absence_or_the_unchanged_page_budget() {
                             assert_ne!(first, second);
                             assert_ne!(first, third);
                             assert_ne!(second, third);
-                        },
-                    )
-                    .await;
+                        })
+                        .await;
                     if terminal {
                         assert_eq!(outcome.unwrap(), (vec!["first".into(), "second".into()], 3));
                         assert_eq!(client.cached_credential_generation(), Some(1));

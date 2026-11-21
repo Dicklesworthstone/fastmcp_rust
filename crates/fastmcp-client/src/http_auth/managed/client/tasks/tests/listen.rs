@@ -161,20 +161,22 @@ fn managed_core_and_task_listens_preserve_peer_cancellation_without_replay() {
                 };
                 let operation = async {
                     if tasks {
-                        client.listen_task_events(
-                            &cx, vec![id()], 1, PAYLOAD_BYTES, &mut observer,
-                        ).await
+                        client
+                            .listen_task_events(&cx, vec![id()], 1, PAYLOAD_BYTES, &mut observer)
+                            .await
                     } else {
-                        client.listen_core_events(
-                            &cx,
-                            fastmcp_protocol::SubscriptionFilter {
-                                tools_list_changed: Some(true),
-                                ..fastmcp_protocol::SubscriptionFilter::default()
-                            },
-                            1,
-                            PAYLOAD_BYTES,
-                            &mut observer,
-                        ).await
+                        client
+                            .listen_core_events(
+                                &cx,
+                                fastmcp_protocol::SubscriptionFilter {
+                                    tools_list_changed: Some(true),
+                                    ..fastmcp_protocol::SubscriptionFilter::default()
+                                },
+                                1,
+                                PAYLOAD_BYTES,
+                                &mut observer,
+                            )
+                            .await
                     }
                 };
                 let (result, ()) = pair(operation, async {
@@ -226,7 +228,10 @@ fn managed_core_and_task_listens_preserve_peer_cancellation_without_replay() {
                             if params.reason.as_deref() == Some("subscription maintenance")
                     ));
                 }
-                assert_eq!(observations, 1, "terminal control is not an observer notification");
+                assert_eq!(
+                    observations, 1,
+                    "terminal control is not an observer notification"
+                );
                 assert!(cx.checkpoint().is_ok());
                 peer.no_more(&cx).await;
             });

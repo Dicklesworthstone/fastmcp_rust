@@ -2,12 +2,12 @@
 //! Certificates are the existing public, TEST ONLY oauth-core fixture identity.
 
 use super::*;
+use crate::http_auth::dpop::native::DpopHttpPolicy;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use asupersync::net::TcpListener;
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptorBuilder};
 use fastmcp_protocol::dpop::DpopNonce;
-use crate::http_auth::dpop::native::DpopHttpPolicy;
 
 // Inlined rather than included: `*.pem` is transfer-excluded, so an
 // `include_bytes!` of this fixture makes the target UNBUILDABLE on a remote
@@ -23,17 +23,22 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let (mut one, mut two) = (None, None);
     poll_fn(|task| {
         if one.is_none() {
-            if let Poll::Ready(value) = left.as_mut().poll(task) { one = Some(value); }
+            if let Poll::Ready(value) = left.as_mut().poll(task) {
+                one = Some(value);
+            }
         }
         if two.is_none() {
-            if let Poll::Ready(value) = right.as_mut().poll(task) { two = Some(value); }
+            if let Poll::Ready(value) = right.as_mut().poll(task) {
+                two = Some(value);
+            }
         }
         if one.is_some() && two.is_some() {
             Poll::Ready((one.take().unwrap(), two.take().unwrap()))
         } else {
             Poll::Pending
         }
-    }).await
+    })
+    .await
 }
 
 async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, serde_json::Value) {
@@ -48,10 +53,14 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, serde_json
         }
     };
     let headers = std::str::from_utf8(&bytes[..end]).unwrap().to_owned();
-    let length = headers.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-    }).unwrap();
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
     assert!(end + length <= 32 * 1024);
     while bytes.len() < end + length {
         let count = io.read(&mut buffer).await.unwrap();
@@ -63,11 +72,25 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, serde_json
 }
 
 #[derive(Clone, Copy)]
-enum Case { Sse, Json, RevokeInObserver, IncompleteTail, ForeignId, NonceChallenge }
+enum Case {
+    Sse,
+    Json,
+    RevokeInObserver,
+    IncompleteTail,
+    ForeignId,
+    NonceChallenge,
+}
 
 #[test]
 fn public_https_stream_delivers_before_terminal_and_never_replays_failed_calls() {
-    for case in [Case::Sse, Case::Json, Case::RevokeInObserver, Case::IncompleteTail, Case::ForeignId, Case::NonceChallenge] {
+    for case in [
+        Case::Sse,
+        Case::Json,
+        Case::RevokeInObserver,
+        Case::IncompleteTail,
+        Case::ForeignId,
+        Case::NonceChallenge,
+    ] {
         RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().unwrap())
             .build().unwrap().block_on(async {
@@ -170,7 +193,11 @@ fn public_https_stream_delivers_before_terminal_and_never_replays_failed_calls()
 #[test]
 fn public_https_large_image_result_matches_json_and_sse_and_preserves_tighter_limits() {
     #[derive(Clone, Copy)]
-    enum ImageCase { Json, Sse, TightSse }
+    enum ImageCase {
+        Json,
+        Sse,
+        TightSse,
+    }
     let cases = [ImageCase::Json, ImageCase::Sse, ImageCase::TightSse];
     RuntimeBuilder::current_thread()
         .with_reactor(create_reactor().unwrap())

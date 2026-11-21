@@ -51,20 +51,29 @@ impl DpopTaskWatchDriverPolicy {
     // namespace, before a tool can create remote work. Conversation successor
     // IDs use colons and are disjoint from these dot-separated watch IDs.
     pub(in crate::http_auth::dpop::native::core) fn admit_creation_ids(
-        self, prefix: &str, ids: [&RequestId; 2],
+        self,
+        prefix: &str,
+        ids: [&RequestId; 2],
     ) -> Result<(), DpopTaskWatchError> {
         let check = |candidate: String| {
             let candidate = RequestId::String(candidate);
             if ids.iter().any(|id| id.correlates_with(&candidate)) {
-                Err(DpopTaskWatchError::from(ManagedTaskDriverError::RepeatedRequestId))
-            } else { Ok(()) }
+                Err(DpopTaskWatchError::from(
+                    ManagedTaskDriverError::RepeatedRequestId,
+                ))
+            } else {
+                Ok(())
+            }
         };
         check(format!("{prefix}.listen.discover"))?;
         check(format!("{prefix}.listen"))?;
         // A creating call may not borrow an identity that will be used only
         // after a later clean rollover. Reserve the whole configured namespace
         // before creation, not when the already-created Task reconnects.
-        let reconnects = self.watch.reconnect.map_or(0, |policy| policy.maximum_reconnects);
+        let reconnects = self
+            .watch
+            .reconnect
+            .map_or(0, |policy| policy.maximum_reconnects);
         for index in 1..=reconnects {
             check(format!("{prefix}.listen.{index}.discover"))?;
             check(format!("{prefix}.listen.{index}"))?;
@@ -96,9 +105,14 @@ impl DpopTaskWatchDriverPolicy {
         // Reuse the shared input-ledger policy admission. Its interval and
         // polling counter are unused; WatchState owns snapshot scheduling.
         let input = ManagedTaskDriverPolicy::new(
-            Duration::from_secs(1), timeout, maximum_snapshots, maximum_updates,
-            maximum_input_keys, maximum_state_bytes,
-        ).map_err(|_| DpopTaskWatchError::InvalidPolicy)?;
+            Duration::from_secs(1),
+            timeout,
+            maximum_snapshots,
+            maximum_updates,
+            maximum_input_keys,
+            maximum_state_bytes,
+        )
+        .map_err(|_| DpopTaskWatchError::InvalidPolicy)?;
         Ok(Self { watch, input })
     }
 
@@ -113,7 +127,9 @@ impl DpopTaskWatchDriverPolicy {
         maximum_reconnects: usize,
         minimum_delay: Duration,
     ) -> Result<Self, DpopTaskWatchError> {
-        self.watch = self.watch.with_reconnects(maximum_reconnects, minimum_delay)?;
+        self.watch = self
+            .watch
+            .with_reconnects(maximum_reconnects, minimum_delay)?;
         Ok(self)
     }
 
@@ -125,15 +141,17 @@ impl DpopTaskWatchDriverPolicy {
         maximum_polls: usize,
         minimum_poll_interval: Duration,
     ) -> Result<Self, DpopTaskWatchError> {
-        self.watch = self.watch.with_polling_fallback(
-            maximum_polls, minimum_poll_interval,
-        )?;
+        self.watch = self
+            .watch
+            .with_polling_fallback(maximum_polls, minimum_poll_interval)?;
         Ok(self)
     }
 }
 
 impl From<ManagedTaskDriverError> for DpopTaskWatchError {
-    fn from(error: ManagedTaskDriverError) -> Self { Self::Driver(error) }
+    fn from(error: ManagedTaskDriverError) -> Self {
+        Self::Driver(error)
+    }
 }
 
 // Concrete generic callbacks keep Send conditional on the host's own types,
@@ -168,15 +186,19 @@ pub(super) struct InputDriver<R, O> {
 }
 
 fn check(life: &Lifetime<'_>) -> Result<(), DpopTaskWatchError> {
-    check_live(life.cx, life.cancellation, life.session, life.credential, life.bounds)?;
+    check_live(
+        life.cx,
+        life.cancellation,
+        life.session,
+        life.credential,
+        life.bounds,
+    )?;
     Ok(())
 }
 
 // Catch host panics without retaining their payload. Check lifetime after the
 // callback even when it refuses or panics; cancellation/revocation still wins.
-fn callback<T>(life: &Lifetime<'_>, call: impl FnOnce() -> T)
-    -> Result<T, DpopTaskWatchError>
-{
+fn callback<T>(life: &Lifetime<'_>, call: impl FnOnce() -> T) -> Result<T, DpopTaskWatchError> {
     check(life)?;
     let result = with_caller(life.cx, || catch_unwind(AssertUnwindSafe(call)));
     check(life)?;
@@ -185,18 +207,28 @@ fn callback<T>(life: &Lifetime<'_>, call: impl FnOnce() -> T)
 
 impl<R, O> InputDriver<R, O> {
     fn new(
-        policy: ManagedTaskDriverPolicy, metadata: &FinalRequestMeta, resolve: R, observe: O,
+        policy: ManagedTaskDriverPolicy,
+        metadata: &FinalRequestMeta,
+        resolve: R,
+        observe: O,
     ) -> Result<Self, DpopTaskWatchError> {
         Ok(Self {
-            policy, ledger: DriverState::default(), updates: 0, pending: None,
-            metadata: serde_json::to_value(metadata).map_err(|_| ManagedCoreError::InvalidRequest)?,
-            resolve, observe,
+            policy,
+            ledger: DriverState::default(),
+            updates: 0,
+            pending: None,
+            metadata: serde_json::to_value(metadata)
+                .map_err(|_| ManagedCoreError::InvalidRequest)?,
+            resolve,
+            observe,
         })
     }
 
     fn stage(
-        &mut self, requests: &TaskInputRequests,
-        fingerprints: BTreeMap<String, Sha256Digest>, responses: &TaskInputResponses,
+        &mut self,
+        requests: &TaskInputRequests,
+        fingerprints: BTreeMap<String, Sha256Digest>,
+        responses: &TaskInputResponses,
     ) -> Result<(), DpopTaskWatchError> {
         if self.pending.is_some() {
             return Err(ManagedTaskDriverError::UnexpectedResponse.into());
@@ -204,8 +236,13 @@ impl<R, O> InputDriver<R, O> {
         validate_answers(requests, responses)?;
         let keys: Vec<_> = responses.keys().cloned().collect();
         // Never send answers which cannot be remembered after acknowledgement.
-        self.ledger.answer_bytes(&keys, &fingerprints, self.policy.maximum_state_bytes)?;
-        self.pending = Some(PendingAnswers { keys, fingerprints, issued: false });
+        self.ledger
+            .answer_bytes(&keys, &fingerprints, self.policy.maximum_state_bytes)?;
+        self.pending = Some(PendingAnswers {
+            keys,
+            fingerprints,
+            issued: false,
+        });
         Ok(())
     }
 
@@ -221,7 +258,10 @@ impl<R, O> InputDriver<R, O> {
     }
 
     pub(super) fn update_request(
-        &mut self, watch: &WatchState, task: Task, responses: TaskInputResponses,
+        &mut self,
+        watch: &WatchState,
+        task: Task,
+        responses: TaskInputResponses,
     ) -> Result<(DpopTaskOperation, DpopStreamLimits), DpopTaskWatchError> {
         if self.pending.as_ref().is_none_or(|pending| pending.issued) {
             return Err(ManagedTaskDriverError::UnexpectedResponse.into());
@@ -236,25 +276,40 @@ impl<R, O> InputDriver<R, O> {
         let operation = DpopTaskOperation::new(
             RequestId::String(format!("{}.input.{}.discover", watch.prefix, self.updates)),
             RequestId::String(format!("{}.input.{}.update", watch.prefix, self.updates)),
-            ManagedTaskRequest::Update { task: Box::new(task), input_responses: responses },
+            ManagedTaskRequest::Update {
+                task: Box::new(task),
+                input_responses: responses,
+            },
         )?;
-        let pending = self.pending.as_mut().ok_or(ManagedTaskDriverError::UnexpectedResponse)?;
+        let pending = self
+            .pending
+            .as_mut()
+            .ok_or(ManagedTaskDriverError::UnexpectedResponse)?;
         pending.issued = true;
         self.updates += 1;
         Ok((operation, limits))
     }
 
     pub(super) fn acknowledged(&mut self) -> Result<(), DpopTaskWatchError> {
-        let pending = self.pending.as_ref().ok_or(ManagedTaskDriverError::UnexpectedResponse)?;
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or(ManagedTaskDriverError::UnexpectedResponse)?;
         self.ledger.record_answers(
-            &pending.keys, &pending.fingerprints, self.policy.maximum_state_bytes,
+            &pending.keys,
+            &pending.fingerprints,
+            self.policy.maximum_state_bytes,
         )?;
         self.pending = None;
         Ok(())
     }
 
     pub(super) async fn on_snapshot<F>(
-        &mut self, life: &Lifetime<'_>, watch: &WatchState, task: &Task, may_update: bool,
+        &mut self,
+        life: &Lifetime<'_>,
+        watch: &WatchState,
+        task: &Task,
+        may_update: bool,
     ) -> Result<InputDecision, DpopTaskWatchError>
     where
         R: FnMut(TaskInputRequests) -> F,
@@ -265,7 +320,9 @@ impl<R, O> InputDriver<R, O> {
         let Task::InputRequired { input_requests, .. } = task else {
             return Ok(if matches!(task, Task::Working(_)) {
                 InputDecision::Wait
-            } else { InputDecision::Return });
+            } else {
+                InputDecision::Return
+            });
         };
         // A finished listen cannot grant a new mutation or resolver invocation.
         // Preserve the complete final snapshot for explicit host handling.
@@ -273,7 +330,9 @@ impl<R, O> InputDriver<R, O> {
             return Ok(InputDecision::Return);
         }
         let (pending, fingerprints) = self.ledger.unanswered(input_requests, self.policy)?;
-        if pending.is_empty() { return Ok(InputDecision::Wait); }
+        if pending.is_empty() {
+            return Ok(InputDecision::Wait);
+        }
         if self.updates >= self.policy.maximum_updates {
             return Err(ManagedTaskDriverError::UpdateLimit.into());
         }
@@ -285,16 +344,25 @@ impl<R, O> InputDriver<R, O> {
         let resolution = callback(life, || (self.resolve)(inputs))?;
         let mut resolution = std::pin::pin!(resolution);
         let action = within(
-            life.cx, life.cancellation, life.session, life.credential, life.bounds, async {
+            life.cx,
+            life.cancellation,
+            life.session,
+            life.credential,
+            life.bounds,
+            async {
                 Ok(poll_fn(|context| {
                     match catch_unwind(AssertUnwindSafe(|| resolution.as_mut().poll(context))) {
                         Ok(Poll::Pending) => Poll::Pending,
-                        Ok(Poll::Ready(result)) => Poll::Ready(result.map_err(DpopTaskWatchError::from)),
+                        Ok(Poll::Ready(result)) => {
+                            Poll::Ready(result.map_err(DpopTaskWatchError::from))
+                        }
                         Err(_) => Poll::Ready(Err(DpopStreamError::ObserverPanicked.into())),
                     }
-                }).await)
+                })
+                .await)
             },
-        ).await??;
+        )
+        .await??;
         check(life)?;
         match action {
             ManagedTaskInputAction::ReturnToCaller => Ok(InputDecision::Return),
@@ -312,11 +380,24 @@ impl DpopHttpClient {
     // its Task ID before any successor POST, then preserve the exact original
     // bounds and charges; this method is not a public restart capability.
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::http_auth::dpop::native::core) async fn drive_created_task_with_subscription<R, F, O>(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        credential: &DpopCredential, metadata: FinalRequestMeta, task: Task,
-        id_prefix: &str, policy: DpopTaskWatchDriverPolicy, limits: DpopStreamLimits,
-        bounds: WaitBounds, initial_usage: (usize, usize), resolve: R, observe: O,
+    pub(in crate::http_auth::dpop::native::core) async fn drive_created_task_with_subscription<
+        R,
+        F,
+        O,
+    >(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        task: Task,
+        id_prefix: &str,
+        policy: DpopTaskWatchDriverPolicy,
+        limits: DpopStreamLimits,
+        bounds: WaitBounds,
+        initial_usage: (usize, usize),
+        resolve: R,
+        observe: O,
     ) -> Result<Option<DpopTaskWaitOutcome>, DpopTaskWatchError>
     where
         R: FnMut(TaskInputRequests) -> F,
@@ -325,16 +406,36 @@ impl DpopHttpClient {
     {
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let mut input = InputDriver::new(policy.input, &metadata, resolve, observe)?;
-        let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+        let life = Lifetime {
+            cx,
+            cancellation,
+            session: &self.session,
+            credential,
+            bounds,
+        };
         callback(&life, || (input.observe)(&task))??;
-        if matches!(&task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
+        if matches!(
+            &task,
+            Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)
+        ) {
             return Ok(None);
         }
         let task_id = task.base().task_id.clone();
         self.watch_task_using(
-            cx, cancellation, credential, metadata, task_id, id_prefix,
-            policy.watch, limits, bounds, initial_usage, Some(input),
-        ).await.map(Some)
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task_id,
+            id_prefix,
+            policy.watch,
+            limits,
+            bounds,
+            initial_usage,
+            Some(input),
+        )
+        .await
+        .map(Some)
     }
 
     /// Drive an existing Task using subscriptions and explicit, typed host input.
@@ -383,10 +484,17 @@ impl DpopHttpClient {
     /// promise or a checkpoint containing reusable input-answer authority.
     #[allow(clippy::too_many_arguments)]
     pub async fn drive_task_with_subscription<R, F, O>(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        credential: &DpopCredential, metadata: FinalRequestMeta, task: TaskId,
-        id_prefix: &str, policy: DpopTaskWatchDriverPolicy, limits: DpopStreamLimits,
-        resolve: R, observe: O,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        task: TaskId,
+        id_prefix: &str,
+        policy: DpopTaskWatchDriverPolicy,
+        limits: DpopStreamLimits,
+        resolve: R,
+        observe: O,
     ) -> Result<DpopTaskWaitOutcome, DpopTaskWatchError>
     where
         R: FnMut(TaskInputRequests) -> F,
@@ -396,15 +504,29 @@ impl DpopHttpClient {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(DpopHttpError::Cancelled.into());
         }
-        let timeout = self.policy.timeout.min(limits.core.timeout()).min(policy.input.timeout);
+        let timeout = self
+            .policy
+            .timeout
+            .min(limits.core.timeout())
+            .min(policy.input.timeout);
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let input = InputDriver::new(policy.input, &metadata, resolve, observe)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         self.watch_task_using(
-            cx, cancellation, credential, metadata, task, id_prefix,
-            policy.watch, limits, bounds, (0, 0), Some(input),
-        ).await
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task,
+            id_prefix,
+            policy.watch,
+            limits,
+            bounds,
+            (0, 0),
+            Some(input),
+        )
+        .await
     }
 }
 
@@ -420,42 +542,90 @@ mod reconnect_admission_tests {
 
     #[test]
     fn creating_ids_are_checked_against_every_configured_successor_before_creation() {
-        let ordinary = DpopTaskWatchDriverPolicy::new(8, 2, 16, 4096, Duration::from_secs(60)).unwrap();
-        let reconnecting = ordinary.with_reconnects(64, Duration::from_millis(1)).unwrap();
+        let ordinary =
+            DpopTaskWatchDriverPolicy::new(8, 2, 16, 4096, Duration::from_secs(60)).unwrap();
+        let reconnecting = ordinary
+            .with_reconnects(64, Duration::from_millis(1))
+            .unwrap();
         let unrelated = RequestId::String("creating-call".to_owned());
         for index in [1, 2, 63, 64] {
             for suffix in ["", ".discover"] {
                 let reserved = RequestId::String(format!("watch.listen.{index}{suffix}"));
-                assert!(ordinary.admit_creation_ids("watch", [&unrelated, &reserved]).is_ok());
+                assert!(
+                    ordinary
+                        .admit_creation_ids("watch", [&unrelated, &reserved])
+                        .is_ok()
+                );
                 for ids in [[&reserved, &unrelated], [&unrelated, &reserved]] {
-                    assert!(matches!(reconnecting.admit_creation_ids("watch", ids),
-                        Err(DpopTaskWatchError::Driver(ManagedTaskDriverError::RepeatedRequestId))));
+                    assert!(matches!(
+                        reconnecting.admit_creation_ids("watch", ids),
+                        Err(DpopTaskWatchError::Driver(
+                            ManagedTaskDriverError::RepeatedRequestId
+                        ))
+                    ));
                 }
-                assert!(reconnecting.admit_creation_ids("other", [&unrelated, &reserved]).is_ok());
+                assert!(
+                    reconnecting
+                        .admit_creation_ids("other", [&unrelated, &reserved])
+                        .is_ok()
+                );
             }
         }
         let outside = RequestId::String("watch.listen.65".to_owned());
-        assert!(reconnecting.admit_creation_ids("watch", [&unrelated, &outside]).is_ok());
-        for reserved in ["watch.listen", "watch.listen.discover", "watch.0.get", "watch.input.0.update"] {
+        assert!(
+            reconnecting
+                .admit_creation_ids("watch", [&unrelated, &outside])
+                .is_ok()
+        );
+        for reserved in [
+            "watch.listen",
+            "watch.listen.discover",
+            "watch.0.get",
+            "watch.input.0.update",
+        ] {
             let reserved = RequestId::String(reserved.to_owned());
-            assert!(reconnecting.admit_creation_ids("watch", [&unrelated, &reserved]).is_err());
+            assert!(
+                reconnecting
+                    .admit_creation_ids("watch", [&unrelated, &reserved])
+                    .is_err()
+            );
         }
     }
 
     #[test]
     fn reconnect_configuration_preserves_driver_limits_and_composes_with_polling() {
-        let original = DpopTaskWatchDriverPolicy::new(9, 3, 16, 4096, Duration::from_secs(27)).unwrap();
-        let selected = original.with_reconnects(2, Duration::from_millis(7)).unwrap()
-            .with_polling_fallback(4, Duration::from_millis(11)).unwrap();
-        assert_eq!(selected.watch.maximum_snapshots, original.watch.maximum_snapshots);
-        assert_eq!(selected.input.maximum_updates, original.input.maximum_updates);
-        assert_eq!(selected.input.maximum_input_keys, original.input.maximum_input_keys);
-        assert_eq!(selected.input.maximum_state_bytes, original.input.maximum_state_bytes);
+        let original =
+            DpopTaskWatchDriverPolicy::new(9, 3, 16, 4096, Duration::from_secs(27)).unwrap();
+        let selected = original
+            .with_reconnects(2, Duration::from_millis(7))
+            .unwrap()
+            .with_polling_fallback(4, Duration::from_millis(11))
+            .unwrap();
+        assert_eq!(
+            selected.watch.maximum_snapshots,
+            original.watch.maximum_snapshots
+        );
+        assert_eq!(
+            selected.input.maximum_updates,
+            original.input.maximum_updates
+        );
+        assert_eq!(
+            selected.input.maximum_input_keys,
+            original.input.maximum_input_keys
+        );
+        assert_eq!(
+            selected.input.maximum_state_bytes,
+            original.input.maximum_state_bytes
+        );
         assert_eq!(selected.timeout(), original.timeout());
         assert_eq!(selected.watch.reconnect.unwrap().maximum_reconnects, 2);
         assert_eq!(selected.watch.fallback.unwrap().maximum_polls, 4);
         assert!(original.watch.reconnect.is_none());
-        assert!(original.with_reconnects(0, Duration::from_millis(1)).is_err());
+        assert!(
+            original
+                .with_reconnects(0, Duration::from_millis(1))
+                .is_err()
+        );
         assert!(original.with_reconnects(1, Duration::ZERO).is_err());
     }
 }
@@ -466,7 +636,8 @@ mod invalidation_tests {
     use serde_json::json;
 
     fn requests() -> TaskInputRequests {
-        serde_json::from_value(json!({"one":{"method":"roots/list"},"two":{"method":"roots/list"}})).unwrap()
+        serde_json::from_value(json!({"one":{"method":"roots/list"},"two":{"method":"roots/list"}}))
+            .unwrap()
     }
 
     fn answers(key: &str) -> TaskInputResponses {
@@ -481,7 +652,8 @@ mod invalidation_tests {
     fn task() -> Task {
         serde_json::from_value(json!({"taskId":"task-one","status":"input_required",
             "createdAt":"2020-01-01T00:00:00Z","lastUpdatedAt":"2020-01-01T00:00:01Z",
-            "ttlMs":null,"inputRequests":requests()})).unwrap()
+            "ttlMs":null,"inputRequests":requests()}))
+        .unwrap()
     }
 
     #[test]
@@ -489,21 +661,46 @@ mod invalidation_tests {
         let mut driver = driver();
         let requests = requests();
         let (pending, fingerprints) = driver.ledger.unanswered(&requests, driver.policy).unwrap();
-        driver.stage(&pending, fingerprints, &answers("one")).unwrap();
-        let watch = WatchState::new("watch", DpopTaskWatchPolicy::new(8).unwrap(), DpopStreamLimits::default()).unwrap();
-        driver.update_request(&watch, task(), answers("one")).unwrap();
+        driver
+            .stage(&pending, fingerprints, &answers("one"))
+            .unwrap();
+        let watch = WatchState::new(
+            "watch",
+            DpopTaskWatchPolicy::new(8).unwrap(),
+            DpopStreamLimits::default(),
+        )
+        .unwrap();
+        driver
+            .update_request(&watch, task(), answers("one"))
+            .unwrap();
         driver.acknowledged().unwrap();
         let (pending, fingerprints) = driver.ledger.unanswered(&requests, driver.policy).unwrap();
-        driver.stage(&pending, fingerprints, &answers("two")).unwrap();
+        driver
+            .stage(&pending, fingerprints, &answers("two"))
+            .unwrap();
         driver.discard_unissued_resolution().unwrap();
         assert!(driver.pending.is_none());
         assert_eq!(driver.updates, 1);
         let (pending, fingerprints) = driver.ledger.unanswered(&requests, driver.policy).unwrap();
-        assert_eq!(pending.keys().map(String::as_str).collect::<Vec<_>>(), ["two"]);
-        driver.stage(&pending, fingerprints, &answers("two")).unwrap();
-        driver.update_request(&watch, task(), answers("two")).unwrap();
+        assert_eq!(
+            pending.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["two"]
+        );
+        driver
+            .stage(&pending, fingerprints, &answers("two"))
+            .unwrap();
+        driver
+            .update_request(&watch, task(), answers("two"))
+            .unwrap();
         driver.acknowledged().unwrap();
-        assert!(driver.ledger.unanswered(&requests, driver.policy).unwrap().0.is_empty());
+        assert!(
+            driver
+                .ledger
+                .unanswered(&requests, driver.policy)
+                .unwrap()
+                .0
+                .is_empty()
+        );
     }
 
     #[test]
@@ -512,17 +709,46 @@ mod invalidation_tests {
         driver.discard_unissued_resolution().unwrap();
         let requests = requests();
         let (pending, fingerprints) = driver.ledger.unanswered(&requests, driver.policy).unwrap();
-        driver.stage(&pending, fingerprints, &answers("one")).unwrap();
-        let watch = WatchState::new("watch", DpopTaskWatchPolicy::new(8).unwrap(), DpopStreamLimits::default()).unwrap();
-        driver.update_request(&watch, task(), answers("one")).unwrap();
+        driver
+            .stage(&pending, fingerprints, &answers("one"))
+            .unwrap();
+        let watch = WatchState::new(
+            "watch",
+            DpopTaskWatchPolicy::new(8).unwrap(),
+            DpopStreamLimits::default(),
+        )
+        .unwrap();
+        driver
+            .update_request(&watch, task(), answers("one"))
+            .unwrap();
         let saved = driver.pending.as_ref().unwrap().fingerprints.clone();
         assert!(driver.discard_unissued_resolution().is_err());
-        assert!(driver.update_request(&watch, task(), answers("one")).is_err());
+        assert!(
+            driver
+                .update_request(&watch, task(), answers("one"))
+                .is_err()
+        );
         assert_eq!(driver.pending.as_ref().unwrap().fingerprints, saved);
         assert!(driver.pending.as_ref().unwrap().issued);
         assert_eq!(driver.updates, 1);
-        assert_eq!(driver.ledger.unanswered(&requests, driver.policy).unwrap().0.len(), 2);
+        assert_eq!(
+            driver
+                .ledger
+                .unanswered(&requests, driver.policy)
+                .unwrap()
+                .0
+                .len(),
+            2
+        );
         driver.acknowledged().unwrap();
-        assert_eq!(driver.ledger.unanswered(&requests, driver.policy).unwrap().0.len(), 1);
+        assert_eq!(
+            driver
+                .ledger
+                .unanswered(&requests, driver.policy)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
     }
 }

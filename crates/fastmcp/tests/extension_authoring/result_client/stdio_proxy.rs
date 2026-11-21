@@ -145,12 +145,8 @@ while IFS= read -r ignored; do :; done
 "#,
             discovery = discovery_response(3),
         );
-        let upstream = connect_upstream(
-            &cx,
-            &script,
-            registration(Arc::clone(&declaration_calls)),
-        )
-        .await;
+        let upstream =
+            connect_upstream(&cx, &script, registration(Arc::clone(&declaration_calls))).await;
         assert_eq!(upstream.descriptor().id(), EXTENSION);
         assert_eq!(declaration_calls.load(Ordering::SeqCst), 0);
         assert!(
@@ -185,11 +181,7 @@ while IFS= read -r ignored; do :; done
                     upstream.clone(),
                 )
                 .unwrap()
-                .typed_request_notification::<ScaleResponse>(
-                    EVENT,
-                    "request-scaled-v1",
-                    OWNER,
-                )
+                .typed_request_notification::<ScaleResponse>(EVENT, "request-scaled-v1", OWNER,)
                 .unwrap()
                 .build()
                 .is_err(),
@@ -247,12 +239,17 @@ fn builder_with_multiplier(
         1,
         "typed-math-client-v1",
         "typed-math-server-v1",
-        ServerSettings { version: 1, multiplier },
+        ServerSettings {
+            version: 1,
+            multiplier,
+        },
         |client: ClientSettings, server: ServerSettings| {
             if client.version != server.version {
                 return Err(McpError::invalid_params("incompatible math version"));
             }
-            Ok(Settings { multiplier: server.multiplier })
+            Ok(Settings {
+                multiplier: server.multiplier,
+            })
         },
     )
     .unwrap()
@@ -314,7 +311,9 @@ fn notification_producer() -> ExtensionRegistration {
             METHOD,
             "scale-params-v1",
             "scale-result-v1",
-            |_context: ExtensionContext<'_, Settings>, _request: ScaleRequest| -> McpResult<ScaleResponse> {
+            |_context: ExtensionContext<'_, Settings>,
+             _request: ScaleRequest|
+             -> McpResult<ScaleResponse> {
                 panic!("upstream declaration handlers must never execute")
             },
         )
@@ -347,7 +346,10 @@ while IFS= read -r ignored; do :; done
         assert!(
             builder()
                 .typed_stdio_proxy_request::<ScaleRequest, ScaleResponse>(
-                    METHOD, "scale-params-v1", "scale-result-v1", upstream.clone(),
+                    METHOD,
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
                 )
                 .is_err(),
             "request-owned events require the explicit notification route"
@@ -473,7 +475,12 @@ while IFS= read -r ignored; do :; done
             .connect_extension_stdio_upstream_with_cx(
                 &cx,
                 "sh",
-                &["-c", &script, "typed-stdio-retirement", marker.0.to_str().unwrap()],
+                &[
+                    "-c",
+                    &script,
+                    "typed-stdio-retirement",
+                    marker.0.to_str().unwrap(),
+                ],
                 registration(Arc::new(AtomicUsize::new(0))),
                 &ClientSettings { version: 1 },
             )
@@ -481,34 +488,38 @@ while IFS= read -r ignored; do :; done
             .unwrap();
         let request_cx = cx.clone();
         let observations = marker.0.clone();
-        with_gateway_owned(&cx, gateway(upstream.clone()), move |mut peer, server_cx| async move {
-            peer.send_async(
-                &request_cx,
-                &request(41, Some(json!({"version": 1})), json!(7)),
-            )
-            .await
-            .unwrap();
-            wait_for_marker(&request_cx, &observations, "request").await;
-            if cancel_explicitly {
+        with_gateway_owned(
+            &cx,
+            gateway(upstream.clone()),
+            move |mut peer, server_cx| async move {
                 peer.send_async(
                     &request_cx,
-                    &JsonRpcMessage::Request(JsonRpcRequest::notification(
-                        "notifications/cancelled",
-                        Some(json!({"requestId": 41})),
-                    )),
+                    &request(41, Some(json!({"version": 1})), json!(7)),
                 )
                 .await
                 .unwrap();
-                wait_for_marker(&request_cx, &observations, "cancel").await;
-            } else {
-                server_cx.cancel_with(
-                    asupersync::types::CancelKind::Shutdown,
-                    Some("drop the downstream request scope"),
-                );
-                drop(peer);
-                wait_for_marker(&request_cx, &observations, "cancel").await;
-            }
-        })
+                wait_for_marker(&request_cx, &observations, "request").await;
+                if cancel_explicitly {
+                    peer.send_async(
+                        &request_cx,
+                        &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/cancelled",
+                            Some(json!({"requestId": 41})),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                    wait_for_marker(&request_cx, &observations, "cancel").await;
+                } else {
+                    server_cx.cancel_with(
+                        asupersync::types::CancelKind::Shutdown,
+                        Some("drop the downstream request scope"),
+                    );
+                    drop(peer);
+                    wait_for_marker(&request_cx, &observations, "cancel").await;
+                }
+            },
+        )
         .await;
 
         let request_cx = cx.clone();
@@ -544,9 +555,14 @@ fn relaxed_builder() -> ExtensionBuilder<ClientSettings, ServerSettings, Setting
         1,
         "typed-math-client-v1",
         "typed-math-server-v1",
-        ServerSettings { version: 1, multiplier: 3 },
+        ServerSettings {
+            version: 1,
+            multiplier: 3,
+        },
         |_client: ClientSettings, server: ServerSettings| {
-            Ok(Settings { multiplier: server.multiplier })
+            Ok(Settings {
+                multiplier: server.multiplier,
+            })
         },
     )
     .unwrap()
@@ -559,7 +575,9 @@ fn client_notification_declaration() -> ExtensionRegistration {
             "scale-params-v1",
             "scale-result-v1",
             |_context: ExtensionContext<'_, Settings>, request: ScaleRequest| {
-                Ok(ScaleResponse { value: request.value * 3 })
+                Ok(ScaleResponse {
+                    value: request.value * 3,
+                })
             },
         )
         .unwrap()
@@ -614,7 +632,10 @@ while IFS= read -r ignored; do :; done
         let policy_calls = Arc::clone(&authorized);
         let registration = relaxed_builder()
             .typed_stdio_proxy_request::<ScaleRequest, ScaleResponse>(
-                METHOD, "scale-params-v1", "scale-result-v1", upstream.clone(),
+                METHOD,
+                "scale-params-v1",
+                "scale-result-v1",
+                upstream.clone(),
             )
             .unwrap()
             .typed_stdio_proxy_notification(

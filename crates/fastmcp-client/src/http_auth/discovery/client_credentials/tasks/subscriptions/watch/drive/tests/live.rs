@@ -557,8 +557,7 @@ fn run_large_completion(bound: CompletionFrameBound) {
                     assert_eq!(request["params"]["taskId"], "one");
                     let mut result = completed_task("one", &fresh_text);
                     result["resultType"] = json!("complete");
-                    let response =
-                        json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                    let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
                     assert!(
                         serde_json::to_vec(&response).unwrap().len() < notification_bytes,
                         "the fresh result must fit the same exact frame budget"
@@ -587,7 +586,9 @@ fn run_large_completion(bound: CompletionFrameBound) {
                     assert!(matches!(
                         watch.next_snapshot(&cx).await,
                         Err(ClientCredentialsTaskWatchError::Task(
-                            ClientCredentialsTasksError::Protocol(ManagedTasksError::InvalidResponse)
+                            ClientCredentialsTasksError::Protocol(
+                                ManagedTasksError::InvalidResponse
+                            )
                         ))
                     ));
                     assert!(matches!(

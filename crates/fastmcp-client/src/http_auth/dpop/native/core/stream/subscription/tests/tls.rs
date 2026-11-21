@@ -54,11 +54,14 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, Value) {
         }
     };
     let headers = std::str::from_utf8(&bytes[..end]).unwrap().to_owned();
-    let length = headers.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse::<usize>().unwrap())
-    }).unwrap();
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
     assert!(end + length <= 32 * 1024);
     while bytes.len() < end + length {
         let count = io.read(&mut buffer).await.unwrap();
@@ -70,14 +73,27 @@ async fn read_request<IO: AsyncRead + Unpin>(io: &mut IO) -> (String, Value) {
 }
 
 fn proof_claims(head: &str) -> Value {
-    let headers: Vec<_> = head.lines().filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim())).collect();
+    let headers: Vec<_> = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim()))
+        .collect();
     assert_eq!(headers.iter().filter(|(name, _)| name == "dpop").count(), 1);
-    assert!(headers.iter().any(|(name, value)|
-        name == "authorization" && *value == "DPoP subscription-access"));
-    assert!(headers.iter().any(|(name, value)|
-        name == "accept" && *value == MODERN_MCP_ACCEPT));
-    assert!(!headers.iter().any(|(name, _)| name == "mcp-session-id" || name == "last-event-id"));
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name == "authorization" && *value == "DPoP subscription-access")
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name == "accept" && *value == MODERN_MCP_ACCEPT)
+    );
+    assert!(
+        !headers
+            .iter()
+            .any(|(name, _)| name == "mcp-session-id" || name == "last-event-id")
+    );
     let proof = headers.iter().find(|(name, _)| name == "dpop").unwrap().1;
     let parts: Vec<_> = proof.split('.').collect();
     assert_eq!(parts.len(), 3);
@@ -138,9 +154,18 @@ enum Case {
 #[test]
 fn public_https_subscriptions_deliver_live_changes_and_refuse_invalid_or_retired_streams() {
     for case in [
-        Case::Complete, Case::ForeignEventId, Case::ExpandedAck, Case::UnselectedUri,
-        Case::NoAck, Case::CancelAfterAck, Case::RevokeAfterAck, Case::ObserverStop,
-        Case::IncompleteTail, Case::JsonError, Case::JsonSuccess, Case::NonceChallenge,
+        Case::Complete,
+        Case::ForeignEventId,
+        Case::ExpandedAck,
+        Case::UnselectedUri,
+        Case::NoAck,
+        Case::CancelAfterAck,
+        Case::RevokeAfterAck,
+        Case::ObserverStop,
+        Case::IncompleteTail,
+        Case::JsonError,
+        Case::JsonSuccess,
+        Case::NonceChallenge,
         Case::NotificationLimit,
     ] {
         RuntimeBuilder::current_thread()

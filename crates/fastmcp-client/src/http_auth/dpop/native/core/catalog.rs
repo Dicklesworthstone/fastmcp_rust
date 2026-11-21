@@ -14,12 +14,12 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{CoreRequest, CoreResult, RequestId, ServerNotification};
 use serde_json::Value;
 
-use super::{
-    CoreDecoder, DpopCoreError, DpopCredential, DpopHttpClient, DpopHttpError,
-    ManagedCoreError, ManagedCoreLimits, ModernHttpRequest, WaitBounds,
-    admit_core_metadata, check_live, decode_response, prepare,
-};
 use super::stream::{DpopStreamError, DpopStreamLimits, Idle, PreparedStream};
+use super::{
+    CoreDecoder, DpopCoreError, DpopCredential, DpopHttpClient, DpopHttpError, ManagedCoreError,
+    ManagedCoreLimits, ModernHttpRequest, WaitBounds, admit_core_metadata, check_live,
+    decode_response, prepare,
+};
 use crate::http_auth::managed::client::CatalogCollector;
 pub use crate::http_auth::managed::client::{
     CatalogCollection, CatalogError, CatalogLimits, ManagedCatalog,
@@ -45,7 +45,9 @@ pub enum DpopCatalogError {
 impl fmt::Display for DpopCatalogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRequest => f.write_str("DPoP catalog requires an initial core list request"),
+            Self::InvalidRequest => {
+                f.write_str("DPoP catalog requires an initial core list request")
+            }
             Self::InvalidIdPrefix => f.write_str("invalid DPoP catalog request identity prefix"),
             Self::IdentityExhausted => f.write_str("DPoP catalog request identities exhausted"),
             Self::Catalog(error) => error.fmt(f),
@@ -113,7 +115,9 @@ impl Traversal {
     ) -> Result<Self, DpopCatalogError> {
         if prefix.is_empty()
             || prefix.len() > 128
-            || !prefix.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            || !prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
         {
             return Err(DpopCatalogError::InvalidIdPrefix);
         }
@@ -168,13 +172,18 @@ impl Traversal {
         if self.complete {
             return Err(DpopCatalogError::InvalidRequest);
         }
-        let next = self.sequence.checked_add(1).ok_or(DpopCatalogError::IdentityExhausted)?;
+        let next = self
+            .sequence
+            .checked_add(1)
+            .ok_or(DpopCatalogError::IdentityExhausted)?;
         let id = RequestId::String(format!("{}.{}", self.prefix, self.sequence));
-        let request = CoreRequest::decode(ProtocolEra::Modern2026, &self.method, Some(&self.params))
-            .map_err(|_| DpopCatalogError::InvalidRequest)?;
+        let request =
+            CoreRequest::decode(ProtocolEra::Modern2026, &self.method, Some(&self.params))
+                .map_err(|_| DpopCatalogError::InvalidRequest)?;
         let (wire, mut decoder) = prepare(target, request, id, self.limits, self.native_limit)?;
         if let Some((bytes, notifications)) = usage {
-            let charged = bytes.checked_add(wire.body().len())
+            let charged = bytes
+                .checked_add(wire.body().len())
                 .ok_or(ManagedCoreError::RequestTooLarge)?;
             // A new page cannot reset stream accounting or spend the final
             // available byte sending a request with no room for any response.
@@ -275,7 +284,11 @@ impl DpopHttpClient {
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let prepared = Traversal::new(
-            request, id_prefix, core_limits, catalog_limits, self.policy.max_body_bytes,
+            request,
+            id_prefix,
+            core_limits,
+            catalog_limits,
+            self.policy.max_body_bytes,
         );
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let mut traversal = prepared?;
@@ -342,22 +355,48 @@ impl DpopHttpClient {
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let prepared = Traversal::new(
-            request, id_prefix, stream_limits.core, catalog_limits, self.policy.max_body_bytes,
+            request,
+            id_prefix,
+            stream_limits.core,
+            catalog_limits,
+            self.policy.max_body_bytes,
         );
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let mut traversal = prepared?;
         let mut usage = (0, 0);
         loop {
             let idle = Idle::new(cx.now(), stream_limits.idle);
-            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+            check_live(
+                cx,
+                cancellation,
+                &self.session,
+                credential,
+                idle.bounds(bounds),
+            )?;
             let prepared = traversal.next_request_with_usage(self.resource().as_str(), Some(usage));
-            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+            check_live(
+                cx,
+                cancellation,
+                &self.session,
+                credential,
+                idle.bounds(bounds),
+            )?;
             let (wire, decoder) = prepared?;
-            let completed = self.execute_prepared_core_stream(
-                cx, cancellation, credential,
-                PreparedStream { wire, decoder, limits: stream_limits, bounds, idle },
-                &mut observer,
-            ).await?;
+            let completed = self
+                .execute_prepared_core_stream(
+                    cx,
+                    cancellation,
+                    credential,
+                    PreparedStream {
+                        wire,
+                        decoder,
+                        limits: stream_limits,
+                        bounds,
+                        idle,
+                    },
+                    &mut observer,
+                )
+                .await?;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             let result = traversal.append(completed.result);
             check_live(cx, cancellation, &self.session, credential, bounds)?;
@@ -449,8 +488,12 @@ mod streaming_tests {
         });
         Traversal::new(
             CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", Some(&params)).unwrap(),
-            "stream", ManagedCoreLimits::default(), CatalogLimits::default(), 8 * 1024 * 1024,
-        ).unwrap()
+            "stream",
+            ManagedCoreLimits::default(),
+            CatalogLimits::default(),
+            8 * 1024 * 1024,
+        )
+        .unwrap()
     }
 
     fn response(wire: &ModernHttpRequest, cursor: Option<&str>) -> Vec<u8> {
@@ -461,7 +504,8 @@ mod streaming_tests {
         if let Some(cursor) = cursor {
             result["nextCursor"] = json!(cursor);
         }
-        serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": request["id"], "result": result})).unwrap()
+        serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+            .unwrap()
     }
 
     #[test]
@@ -496,26 +540,33 @@ mod streaming_tests {
 
         // Change only correlation: a first-page response is not a second page.
         let mut walk = traversal();
-        let (first, mut first_decoder) = walk.next_request_with_usage(TARGET, Some((0, 0))).unwrap();
+        let (first, mut first_decoder) =
+            walk.next_request_with_usage(TARGET, Some((0, 0))).unwrap();
         let bytes = response(&first, Some("opaque-雪%2F"));
         let ManagedCoreEvent::Result(result) = first_decoder.admit(&bytes, true).unwrap() else {
             panic!("expected the first page");
         };
         walk.append(*result).unwrap();
-        let (_, mut second_decoder) = walk.next_request_with_usage(TARGET, Some(first_decoder.usage())).unwrap();
+        let (_, mut second_decoder) = walk
+            .next_request_with_usage(TARGET, Some(first_decoder.usage()))
+            .unwrap();
         assert!(second_decoder.admit(&response(&first, None), true).is_err());
         assert!(walk.finish().is_err());
     }
 
     #[test]
     fn streaming_response_byte_limit_is_cumulative_and_exact() {
-        let (wire, _) = traversal().next_request_with_usage(TARGET, Some((0, 0))).unwrap();
+        let (wire, _) = traversal()
+            .next_request_with_usage(TARGET, Some((0, 0)))
+            .unwrap();
         let bytes = response(&wire, None);
         let total = ManagedCoreLimits::default().total_bytes();
         let prior = total - wire.body().len() - bytes.len();
         for excess in [0, 1] {
             let mut walk = traversal();
-            let (_, mut decoder) = walk.next_request_with_usage(TARGET, Some((prior + excess, 0))).unwrap();
+            let (_, mut decoder) = walk
+                .next_request_with_usage(TARGET, Some((prior + excess, 0)))
+                .unwrap();
             let result = decoder.admit(&bytes, true);
             if excess == 0 {
                 let ManagedCoreEvent::Result(result) = result.unwrap() else {
@@ -538,7 +589,9 @@ mod streaming_tests {
         for bytes in [ManagedCoreLimits::default().total_bytes(), usize::MAX] {
             assert!(matches!(
                 walk.next_request_with_usage(TARGET, Some((bytes, 0))),
-                Err(DpopCatalogError::Core(DpopCoreError::Protocol(ManagedCoreError::RequestTooLarge))),
+                Err(DpopCatalogError::Core(DpopCoreError::Protocol(
+                    ManagedCoreError::RequestTooLarge
+                ))),
             ));
             assert_eq!(walk.sequence, 0);
             assert_eq!(walk.params, original);

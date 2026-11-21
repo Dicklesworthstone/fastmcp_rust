@@ -175,7 +175,9 @@ impl<T> ManagedCatalog<T> {
 
     /// A page's bounded peer diagnostic, when one was emitted by its decoder.
     pub fn page_diagnostic(&self, index: usize) -> Option<&ResultPeerDiagnostic> {
-        self.pages.get(index).and_then(|page| page.diagnostic.as_ref())
+        self.pages
+            .get(index)
+            .and_then(|page| page.diagnostic.as_ref())
     }
 
     /// Cursor presence only: no raw token or reusable pagination handle escapes.
@@ -266,11 +268,7 @@ macro_rules! catalog_result {
 }
 
 catalog_result!(FinalTool, FinalListToolsResult, tools);
-catalog_result!(
-    FinalResource,
-    FinalListResourcesResult,
-    resources
-);
+catalog_result!(FinalResource, FinalListResourcesResult, resources);
 catalog_result!(
     FinalResourceTemplate,
     FinalListResourceTemplatesResult,
@@ -552,27 +550,19 @@ impl Entries {
             (
                 Self::Tools(entries),
                 CoreResult::Final(FinalCoreResult::ToolsList { result, diagnostic }),
-            ) => {
-                entries.append(result, diagnostic, meter, encoded_bytes)
-            }
+            ) => entries.append(result, diagnostic, meter, encoded_bytes),
             (
                 Self::Resources(entries),
                 CoreResult::Final(FinalCoreResult::ResourcesList { result, diagnostic }),
-            ) => {
-                entries.append(result, diagnostic, meter, encoded_bytes)
-            }
+            ) => entries.append(result, diagnostic, meter, encoded_bytes),
             (
                 Self::Templates(entries),
                 CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, diagnostic }),
-            ) => {
-                entries.append(result, diagnostic, meter, encoded_bytes)
-            }
+            ) => entries.append(result, diagnostic, meter, encoded_bytes),
             (
                 Self::Prompts(entries),
                 CoreResult::Final(FinalCoreResult::PromptsList { result, diagnostic }),
-            ) => {
-                entries.append(result, diagnostic, meter, encoded_bytes)
-            }
+            ) => entries.append(result, diagnostic, meter, encoded_bytes),
             _ => Err(CatalogError::UnexpectedResult),
         }
     }
@@ -768,7 +758,9 @@ mod tests {
         for sequence in [["a", "a", "a", "a"], ["a", "b", "c", "a"], ["", "", "", ""]] {
             let mut meter = Meter::new(CatalogLimits::new(4, 4, 4096).unwrap());
             for cursor in &sequence[..3] {
-                meter.admit(&[json!("duplicate entry")], Some(cursor)).unwrap();
+                meter
+                    .admit(&[json!("duplicate entry")], Some(cursor))
+                    .unwrap();
             }
             let before = (meter.pages, meter.entries, meter.remaining_bytes);
             assert_eq!(
@@ -800,7 +792,10 @@ mod tests {
             let result = meter.admit(empty, None);
             if exact {
                 result.unwrap();
-                assert_eq!((meter.pages, meter.entries, meter.remaining_bytes), (4, 0, 0));
+                assert_eq!(
+                    (meter.pages, meter.entries, meter.remaining_bytes),
+                    (4, 0, 0)
+                );
             } else {
                 assert_eq!(result, Err(CatalogError::ByteLimit));
                 assert_eq!((meter.pages, meter.entries, meter.remaining_bytes), before);
@@ -812,7 +807,9 @@ mod tests {
     fn empty_pages_consume_page_budget_and_truncation_is_not_success() {
         for terminal in [false, true] {
             let mut meter = Meter::new(CatalogLimits::new(2, 1, 4096).unwrap());
-            meter.admit::<serde_json::Value>(&[], Some("first")).unwrap();
+            meter
+                .admit::<serde_json::Value>(&[], Some("first"))
+                .unwrap();
             let result =
                 meter.admit::<serde_json::Value>(&[], if terminal { None } else { Some("second") });
             assert_eq!(result.is_ok(), terminal);

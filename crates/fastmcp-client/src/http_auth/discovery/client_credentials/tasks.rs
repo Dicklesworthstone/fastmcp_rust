@@ -38,11 +38,11 @@ use fastmcp_protocol::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::rpc::mcp_sse_limits;
 use super::{
     CLIENT_CREDENTIALS_EXTENSION, ClientCredentialsClient, ClientCredentialsError,
     ClientCredentialsSnapshot, active, admit_resource, authorize, discovery_deadline,
 };
-use super::rpc::mcp_sse_limits;
 use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 use crate::http_auth::managed::tasks::validate_task_input_shapes;
 pub use crate::http_auth::managed::tasks::{
@@ -397,8 +397,8 @@ impl ClientCredentialsTaskCall {
             // Streamable HTTP lets a server answer any request, not only a tool
             // call, with an SSE stream that ends in the correlated result.
             ModernHttpResponseKind::Sse => {
-                let framing = mcp_sse_limits(limits.frame_bytes)
-                    .ok_or(ManagedTasksError::InvalidLimits)?;
+                let framing =
+                    mcp_sse_limits(limits.frame_bytes).ok_or(ManagedTasksError::InvalidLimits)?;
                 Body::Sse(
                     response
                         .into_sse_stream(framing)
@@ -963,7 +963,9 @@ mod tests {
                     defaults.records,
                     defaults.timeout,
                 ),
-                Err(ClientCredentialsTasksError::Protocol(ManagedTasksError::InvalidLimits))
+                Err(ClientCredentialsTasksError::Protocol(
+                    ManagedTasksError::InvalidLimits
+                ))
             ));
         }
     }
@@ -1043,13 +1045,10 @@ mod tests {
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0].as_bytes(), payload);
             for source in [payload.as_slice(), frames[0].as_bytes()] {
-                let ManagedTaskEvent::Snapshot(snapshot) = decode_result(
-                    &Decoder::Get(id()),
-                    source,
-                    &RequestId::Number(2),
-                    maximum,
-                )
-                .unwrap() else {
+                let ManagedTaskEvent::Snapshot(snapshot) =
+                    decode_result(&Decoder::Get(id()), source, &RequestId::Number(2), maximum)
+                        .unwrap()
+                else {
                     panic!("completed Task snapshot must remain observable");
                 };
                 assert_eq!(serde_json::to_value(snapshot).unwrap(), result);

@@ -60,8 +60,7 @@ fn task(status: &str, ttl_ms: Option<u64>, updated_second: u8) -> Value {
 fn live_ttl(remaining: Duration) -> u64 {
     let created = fastmcp_protocol::TaskTimestamp::parse(CREATED).unwrap();
     let elapsed = wall_now_nanos() - timestamp_nanos(&created).unwrap();
-    u64::try_from(elapsed / 1_000_000).unwrap()
-        + u64::try_from(remaining.as_millis()).unwrap()
+    u64::try_from(elapsed / 1_000_000).unwrap() + u64::try_from(remaining.as_millis()).unwrap()
 }
 
 fn response(id: i64, result: Value) -> JsonRpcMessage {
@@ -92,7 +91,10 @@ fn task_notification(id: i64, mut task: Value) -> JsonRpcMessage {
 }
 
 fn tools_response(id: i64) -> JsonRpcMessage {
-    response(id, json!({"resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"}))
+    response(
+        id,
+        json!({"resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"}),
+    )
 }
 
 async fn receive(
@@ -113,7 +115,10 @@ async fn receive_cancel(cx: &Cx, peer: &mut MemoryTransport, id: i64) {
     let request = receive(cx, peer, "notifications/cancelled", None).await;
     let params = request.params.unwrap();
     assert_eq!(params["requestId"], id);
-    assert!(params.get("_meta").is_none(), "client cancellation is id-only");
+    assert!(
+        params.get("_meta").is_none(),
+        "client cancellation is id-only"
+    );
 }
 
 async fn attached(cx: &Cx, initial: Value) -> (MemoryClient, FinalTaskHandle, MemoryTransport) {
@@ -133,12 +138,17 @@ async fn attached_with_handlers(
             ServerBehavior::SubscriptionsListen,
         ]),
         std::collections::BTreeMap::from([(
-            fastmcp_protocol::TASKS_EXTENSION.to_owned(), json!({}),
+            fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+            json!({}),
         )]),
-    ).unwrap();
+    )
+    .unwrap();
     let discovery = ServerDiscoverResult::new(
         capabilities,
-        ServerInfo { name: "memory-watch-peer".to_owned(), version: "1".to_owned() },
+        ServerInfo {
+            name: "memory-watch-peer".to_owned(),
+            version: "1".to_owned(),
+        },
         None,
         DiscoveryCacheHints::private_ttl_ms(0),
     );
@@ -146,13 +156,26 @@ async fn attached_with_handlers(
     discovery["supportedVersions"] = json!([crate::MODERN_PROTOCOL_VERSION]);
     peer.send_async(cx, &response(1, discovery)).await.unwrap();
     let mut client = MemoryClient::builder(ClientInfo {
-        name: "memory-watch-client".to_owned(), version: "1".to_owned(),
-    }).reverse_request_handlers(handlers).with_tasks().connect(cx, transport).await.unwrap();
+        name: "memory-watch-client".to_owned(),
+        version: "1".to_owned(),
+    })
+    .reverse_request_handlers(handlers)
+    .with_tasks()
+    .connect(cx, transport)
+    .await
+    .unwrap();
     receive(cx, &mut peer, "server/discover", Some(1)).await;
-    peer.send_async(cx, &task_response(2, initial)).await.unwrap();
-    let handle = client.attach_final_task(
-        cx, &McpRequestCancellation::new(), FinalTaskId::parse(TASK_ID).unwrap(),
-    ).await.unwrap();
+    peer.send_async(cx, &task_response(2, initial))
+        .await
+        .unwrap();
+    let handle = client
+        .attach_final_task(
+            cx,
+            &McpRequestCancellation::new(),
+            FinalTaskId::parse(TASK_ID).unwrap(),
+        )
+        .await
+        .unwrap();
     let request = receive(cx, &mut peer, "tasks/get", Some(2)).await;
     assert_eq!(request.params.unwrap()["taskId"], TASK_ID);
     (client, handle, peer)
@@ -160,12 +183,18 @@ async fn attached_with_handlers(
 
 async fn listen(cx: &Cx, peer: &mut MemoryTransport, id: i64) {
     let request = receive(cx, peer, "subscriptions/listen", Some(id)).await;
-    assert_eq!(request.params.unwrap()["notifications"]["taskIds"], json!([TASK_ID]));
+    assert_eq!(
+        request.params.unwrap()["notifications"]["taskIds"],
+        json!([TASK_ID])
+    );
 }
 
 async fn assert_tools(cx: &Cx, client: &mut MemoryClient) {
     assert!(matches!(
-        client.list_tools(cx, &McpRequestCancellation::new(), None).await.unwrap(),
+        client
+            .list_tools(cx, &McpRequestCancellation::new(), None)
+            .await
+            .unwrap(),
         CoreResult::Final(FinalCoreResult::ToolsList { .. }),
     ));
 }
@@ -179,25 +208,36 @@ async fn finish(
     cancellations: Vec<i64>,
     next_id: i64,
 ) {
-    let mut server = cx.spawn(move |peer_cx| async move {
-        for id in cancellations {
-            receive_cancel(&peer_cx, &mut peer, id).await;
-        }
-        receive(&peer_cx, &mut peer, "tools/list", Some(next_id)).await;
-        peer.send_async(&peer_cx, &tools_response(next_id)).await.unwrap();
-        peer
-    }).unwrap();
+    let mut server = cx
+        .spawn(move |peer_cx| async move {
+            for id in cancellations {
+                receive_cancel(&peer_cx, &mut peer, id).await;
+            }
+            receive(&peer_cx, &mut peer, "tools/list", Some(next_id)).await;
+            peer.send_async(&peer_cx, &tools_response(next_id))
+                .await
+                .unwrap();
+            peer
+        })
+        .unwrap();
     assert_tools(cx, client).await;
     let mut peer = server.join(cx).await.unwrap();
     client.close(cx).unwrap();
-    assert!(peer.recv_async(cx).await.is_err(), "no implicit effects after observation");
+    assert!(
+        peer.recv_async(cx).await.is_err(),
+        "no implicit effects after observation"
+    );
 }
 
 fn drive_policy() -> FinalTaskDrivePolicy {
     FinalTaskDrivePolicy::new(
         FinalTaskWaitPolicy::new(Duration::from_secs(2), 8, Duration::from_millis(20)).unwrap(),
-        4, 8, 64 * 1024, 64 * 1024,
-    ).unwrap()
+        4,
+        8,
+        64 * 1024,
+        64 * 1024,
+    )
+    .unwrap()
 }
 
 fn input_task(updated_second: u8, later: bool) -> Value {
@@ -211,59 +251,107 @@ fn input_task(updated_second: u8, later: bool) -> Value {
 
 #[test]
 fn memory_task_watch_driver_resolves_notified_inputs_and_reconciles_partial_updates() {
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     run(|cx| async move {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
-        let handlers = crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
-            observed.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] }) })
-        });
+        let handlers =
+            crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] }) })
+            });
         let (mut client, handle, mut peer) =
             attached_with_handlers(&cx, task("working", None, 1), handlers).await;
-        let mut server = cx.spawn(move |peer_cx| async move {
-            listen(&peer_cx, &mut peer, 3).await;
-            peer.send_async(&peer_cx, &acknowledgement(3, json!([TASK_ID]))).await.unwrap();
-            // A silent acknowledged stream still receives a bounded read that
-            // closes the attach/listen gap without opening another listener.
-            receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
-            let mut waiting = task("working", None, 1);
-            waiting["pollIntervalMs"] = json!(600_001);
-            peer.send_async(&peer_cx, &task_response(4, waiting)).await.unwrap();
-            peer.send_async(&peer_cx, &task_notification(3, input_task(2, false))).await.unwrap();
-            let update = receive(&peer_cx, &mut peer, "tasks/update", Some(5)).await;
-            assert_eq!(update.params.unwrap()["inputResponses"], json!({"roots":{"roots":[]}}));
-            peer.send_async(&peer_cx, &response(5, json!({"resultType":"complete"}))).await.unwrap();
-            // Neither the repeated key nor a newly notified key may bypass the
-            // mandatory authoritative read following this partial update.
-            peer.send_async(&peer_cx, &task_notification(3, input_task(2, false))).await.unwrap();
-            peer.send_async(&peer_cx, &task_notification(3, input_task(3, true))).await.unwrap();
-            receive(&peer_cx, &mut peer, "tasks/get", Some(6)).await;
-            peer.send_async(&peer_cx, &task_response(6, input_task(3, true))).await.unwrap();
-            let update = receive(&peer_cx, &mut peer, "tasks/update", Some(7)).await;
-            assert_eq!(update.params.unwrap()["inputResponses"], json!({"later":{"roots":[]}}));
-            peer.send_async(&peer_cx, &response(7, json!({"resultType":"complete"}))).await.unwrap();
-            peer.send_async(&peer_cx, &task_notification(3, input_task(3, true))).await.unwrap();
-            receive(&peer_cx, &mut peer, "tasks/get", Some(8)).await;
-            let mut waiting = task("working", None, 4);
-            waiting["pollIntervalMs"] = json!(600_001);
-            peer.send_async(&peer_cx, &task_response(8, waiting)).await.unwrap();
-            peer.send_async(&peer_cx, &task_notification(3, task("completed", None, 5))).await.unwrap();
-            peer
-        }).unwrap();
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                listen(&peer_cx, &mut peer, 3).await;
+                peer.send_async(&peer_cx, &acknowledgement(3, json!([TASK_ID])))
+                    .await
+                    .unwrap();
+                // A silent acknowledged stream still receives a bounded read that
+                // closes the attach/listen gap without opening another listener.
+                receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                let mut waiting = task("working", None, 1);
+                waiting["pollIntervalMs"] = json!(600_001);
+                peer.send_async(&peer_cx, &task_response(4, waiting))
+                    .await
+                    .unwrap();
+                peer.send_async(&peer_cx, &task_notification(3, input_task(2, false)))
+                    .await
+                    .unwrap();
+                let update = receive(&peer_cx, &mut peer, "tasks/update", Some(5)).await;
+                assert_eq!(
+                    update.params.unwrap()["inputResponses"],
+                    json!({"roots":{"roots":[]}})
+                );
+                peer.send_async(&peer_cx, &response(5, json!({"resultType":"complete"})))
+                    .await
+                    .unwrap();
+                // Neither the repeated key nor a newly notified key may bypass the
+                // mandatory authoritative read following this partial update.
+                peer.send_async(&peer_cx, &task_notification(3, input_task(2, false)))
+                    .await
+                    .unwrap();
+                peer.send_async(&peer_cx, &task_notification(3, input_task(3, true)))
+                    .await
+                    .unwrap();
+                receive(&peer_cx, &mut peer, "tasks/get", Some(6)).await;
+                peer.send_async(&peer_cx, &task_response(6, input_task(3, true)))
+                    .await
+                    .unwrap();
+                let update = receive(&peer_cx, &mut peer, "tasks/update", Some(7)).await;
+                assert_eq!(
+                    update.params.unwrap()["inputResponses"],
+                    json!({"later":{"roots":[]}})
+                );
+                peer.send_async(&peer_cx, &response(7, json!({"resultType":"complete"})))
+                    .await
+                    .unwrap();
+                peer.send_async(&peer_cx, &task_notification(3, input_task(3, true)))
+                    .await
+                    .unwrap();
+                receive(&peer_cx, &mut peer, "tasks/get", Some(8)).await;
+                let mut waiting = task("working", None, 4);
+                waiting["pollIntervalMs"] = json!(600_001);
+                peer.send_async(&peer_cx, &task_response(8, waiting))
+                    .await
+                    .unwrap();
+                peer.send_async(&peer_cx, &task_notification(3, task("completed", None, 5)))
+                    .await
+                    .unwrap();
+                peer
+            })
+            .unwrap();
         let mut driver = handle.into_driver(drive_policy());
         let live = McpRequestCancellation::new();
-        assert_eq!(driver.drive_watching_with_memory(&cx, &mut client, &live).await.unwrap(),
-            FinalTaskWaitOutcome::Completed);
+        assert_eq!(
+            driver
+                .drive_watching_with_memory(&cx, &mut client, &live)
+                .await
+                .unwrap(),
+            FinalTaskWaitOutcome::Completed
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(!driver.input_resolution_interrupted());
         let FinalTask::Completed { result, .. } = driver.task() else {
             panic!("the notified completion must remain on the driver");
         };
-        assert_eq!(serde_json::to_string(result).unwrap(), serde_json::to_string(&opaque_result()).unwrap());
-        assert_eq!(driver.drive_watching_with_memory(&cx, &mut client, &live).await.unwrap(),
-            FinalTaskWaitOutcome::Completed, "terminal data requires no new listener");
+        assert_eq!(
+            serde_json::to_string(result).unwrap(),
+            serde_json::to_string(&opaque_result()).unwrap()
+        );
+        assert_eq!(
+            driver
+                .drive_watching_with_memory(&cx, &mut client, &live)
+                .await
+                .unwrap(),
+            FinalTaskWaitOutcome::Completed,
+            "terminal data requires no new listener"
+        );
         let peer = server.join(&cx).await.unwrap();
         finish(&cx, &mut client, peer, vec![3], 9).await;
     });
@@ -295,9 +383,13 @@ fn memory_task_watch_driver_falls_back_once_after_empty_ack_or_peer_termination(
                 peer
             }).unwrap();
             let mut driver = handle.into_driver(drive_policy());
-            assert_eq!(driver.drive_watching_with_memory(
-                &cx, &mut client, &McpRequestCancellation::new(),
-            ).await.unwrap(), FinalTaskWaitOutcome::Completed);
+            assert_eq!(
+                driver
+                    .drive_watching_with_memory(&cx, &mut client, &McpRequestCancellation::new(),)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::Completed
+            );
             let peer = server.join(&cx).await.unwrap();
             finish(&cx, &mut client, peer, vec![], 5).await;
         }
@@ -310,18 +402,25 @@ fn memory_task_watch_driver_bounds_duplicate_notifications_without_extra_effects
         let mut initial = task("working", None, 1);
         initial["pollIntervalMs"] = json!(600_001);
         let (mut client, handle, mut peer) = attached(&cx, initial.clone()).await;
-        let mut server = cx.spawn(move |peer_cx| async move {
-            listen(&peer_cx, &mut peer, 3).await;
-            peer.send_async(&peer_cx, &acknowledgement(3, json!([TASK_ID]))).await.unwrap();
-            for _ in 0..3 {
-                peer.send_async(&peer_cx, &task_notification(3, initial.clone())).await.unwrap();
-            }
-            peer
-        }).unwrap();
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                listen(&peer_cx, &mut peer, 3).await;
+                peer.send_async(&peer_cx, &acknowledgement(3, json!([TASK_ID])))
+                    .await
+                    .unwrap();
+                for _ in 0..3 {
+                    peer.send_async(&peer_cx, &task_notification(3, initial.clone()))
+                        .await
+                        .unwrap();
+                }
+                peer
+            })
+            .unwrap();
         let mut driver = handle.into_driver(drive_policy().with_maximum_notifications(2).unwrap());
-        let error = driver.drive_watching_with_memory(
-            &cx, &mut client, &McpRequestCancellation::new(),
-        ).await.unwrap_err();
+        let error = driver
+            .drive_watching_with_memory(&cx, &mut client, &McpRequestCancellation::new())
+            .await
+            .unwrap_err();
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(error.message.contains("notification budget"));
         assert!(matches!(driver.task(), FinalTask::Working(_)));
@@ -333,46 +432,80 @@ fn memory_task_watch_driver_bounds_duplicate_notifications_without_extra_effects
 
 #[test]
 fn memory_task_watch_driver_cancels_pending_input_and_never_replays_it() {
-    use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     run(|cx| async move {
         let calls = Arc::new(AtomicUsize::new(0));
         let owned = Arc::new(Mutex::new(None));
         let observed = Arc::clone(&calls);
         let callback_owner = Arc::clone(&owned);
-        let handlers = crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
-            observed.fetch_add(1, Ordering::SeqCst);
-            *callback_owner.lock().unwrap() = Some(local);
-            Box::pin(std::future::pending())
-        });
+        let handlers =
+            crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                *callback_owner.lock().unwrap() = Some(local);
+                Box::pin(std::future::pending())
+            });
         let (mut client, handle, mut peer) =
             attached_with_handlers(&cx, task("working", None, 1), handlers).await;
         let cancellation = McpRequestCancellation::new();
         let cancel = cancellation.clone();
         let observed = Arc::clone(&calls);
-        let mut server = cx.spawn(move |peer_cx| async move {
-            listen(&peer_cx, &mut peer, 3).await;
-            peer.send_async(&peer_cx, &acknowledgement(3, json!([TASK_ID]))).await.unwrap();
-            receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
-            let mut waiting = task("working", None, 1);
-            waiting["pollIntervalMs"] = json!(600_001);
-            peer.send_async(&peer_cx, &task_response(4, waiting)).await.unwrap();
-            peer.send_async(&peer_cx, &task_notification(3, input_task(2, false))).await.unwrap();
-            while observed.load(Ordering::SeqCst) == 0 {
-                asupersync::runtime::yield_now().await;
-            }
-            cancel.cancel();
-            peer
-        }).unwrap();
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                listen(&peer_cx, &mut peer, 3).await;
+                peer.send_async(&peer_cx, &acknowledgement(3, json!([TASK_ID])))
+                    .await
+                    .unwrap();
+                receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                let mut waiting = task("working", None, 1);
+                waiting["pollIntervalMs"] = json!(600_001);
+                peer.send_async(&peer_cx, &task_response(4, waiting))
+                    .await
+                    .unwrap();
+                peer.send_async(&peer_cx, &task_notification(3, input_task(2, false)))
+                    .await
+                    .unwrap();
+                while observed.load(Ordering::SeqCst) == 0 {
+                    asupersync::runtime::yield_now().await;
+                }
+                cancel.cancel();
+                peer
+            })
+            .unwrap();
         let mut driver = handle.into_driver(drive_policy());
-        assert_eq!(driver.drive_watching_with_memory(&cx, &mut client, &cancellation).await.unwrap(),
-            FinalTaskWaitOutcome::ObservationCancelled);
+        assert_eq!(
+            driver
+                .drive_watching_with_memory(&cx, &mut client, &cancellation)
+                .await
+                .unwrap(),
+            FinalTaskWaitOutcome::ObservationCancelled
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(owned.lock().unwrap().as_ref().unwrap().is_cancel_requested());
+        assert!(
+            owned
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_cancel_requested()
+        );
         assert!(driver.input_resolution_interrupted());
         let live = McpRequestCancellation::new();
-        assert!(driver.drive_watching_with_memory(&cx, &mut client, &live).await.is_err());
-        assert!(driver.drive_with_memory(&cx, &mut client, &live).await.is_err());
+        assert!(
+            driver
+                .drive_watching_with_memory(&cx, &mut client, &live)
+                .await
+                .is_err()
+        );
+        assert!(
+            driver
+                .drive_with_memory(&cx, &mut client, &live)
+                .await
+                .is_err()
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let peer = server.join(&cx).await.unwrap();
         finish(&cx, &mut client, peer, vec![3], 5).await;
@@ -385,19 +518,30 @@ fn memory_task_watch_driver_silent_listener_obeys_deadline_and_peer_poll_floor()
         let mut initial = task("working", None, 1);
         initial["pollIntervalMs"] = json!(600_001);
         let (mut client, handle, mut peer) = attached(&cx, initial).await;
-        let mut server = cx.spawn(move |peer_cx| async move {
-            listen(&peer_cx, &mut peer, 3).await;
-            // No acknowledgement, notification or early authoritative poll.
-            peer
-        }).unwrap();
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                listen(&peer_cx, &mut peer, 3).await;
+                // No acknowledgement, notification or early authoritative poll.
+                peer
+            })
+            .unwrap();
         let policy = FinalTaskDrivePolicy::new(
-            FinalTaskWaitPolicy::new(Duration::from_millis(80), 8, Duration::from_millis(1)).unwrap(),
-            1, 1, 1024, 1024,
-        ).unwrap();
+            FinalTaskWaitPolicy::new(Duration::from_millis(80), 8, Duration::from_millis(1))
+                .unwrap(),
+            1,
+            1,
+            1024,
+            1024,
+        )
+        .unwrap();
         let mut driver = handle.into_driver(policy);
-        assert_eq!(driver.drive_watching_with_memory(
-            &cx, &mut client, &McpRequestCancellation::new(),
-        ).await.unwrap(), FinalTaskWaitOutcome::DeadlineElapsed);
+        assert_eq!(
+            driver
+                .drive_watching_with_memory(&cx, &mut client, &McpRequestCancellation::new(),)
+                .await
+                .unwrap(),
+            FinalTaskWaitOutcome::DeadlineElapsed
+        );
         let peer = server.join(&cx).await.unwrap();
         finish(&cx, &mut client, peer, vec![3], 4).await;
     });
@@ -405,15 +549,19 @@ fn memory_task_watch_driver_silent_listener_obeys_deadline_and_peer_poll_floor()
 
 #[test]
 fn memory_task_watch_driver_drop_keeps_the_gap_when_switching_to_polling() {
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     run(|cx| async move {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
-        let handlers = crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
-            observed.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] }) })
-        });
+        let handlers =
+            crate::ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] }) })
+            });
         let (mut client, handle, mut peer) =
             attached_with_handlers(&cx, input_task(1, false), handlers).await;
         let live = McpRequestCancellation::new();
@@ -424,22 +572,39 @@ fn memory_task_watch_driver_drop_keeps_the_gap_when_switching_to_polling() {
             let request = poll_fn(|task_cx| {
                 assert!(driving.as_mut().poll(task_cx).is_pending());
                 incoming.as_mut().poll(task_cx)
-            }).await.unwrap();
-            let JsonRpcMessage::Request(request) = request else { panic!("expected listener open"); };
+            })
+            .await
+            .unwrap();
+            let JsonRpcMessage::Request(request) = request else {
+                panic!("expected listener open");
+            };
             assert_eq!(request.method, "subscriptions/listen");
             assert_eq!(request.id, Some(RequestId::Number(3)));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(!driver.input_resolution_interrupted());
-        let mut server = cx.spawn(move |peer_cx| async move {
-            receive_cancel(&peer_cx, &mut peer, 3).await;
-            receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
-            peer.send_async(&peer_cx, &task_response(4, task("completed", None, 2))).await.unwrap();
-            peer
-        }).unwrap();
-        assert_eq!(driver.drive_with_memory(&cx, &mut client, &live).await.unwrap(),
-            FinalTaskWaitOutcome::Completed);
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "a dropped listen gap cannot disclose stale input");
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                receive_cancel(&peer_cx, &mut peer, 3).await;
+                receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                peer.send_async(&peer_cx, &task_response(4, task("completed", None, 2)))
+                    .await
+                    .unwrap();
+                peer
+            })
+            .unwrap();
+        assert_eq!(
+            driver
+                .drive_with_memory(&cx, &mut client, &live)
+                .await
+                .unwrap(),
+            FinalTaskWaitOutcome::Completed
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a dropped listen gap cannot disclose stale input"
+        );
         let peer = server.join(&cx).await.unwrap();
         finish(&cx, &mut client, peer, vec![], 5).await;
     });
@@ -451,57 +616,91 @@ fn memory_task_watch_renews_skips_duplicates_reconciles_and_retains_exact_comple
         let initial = task("working", Some(live_ttl(Duration::from_secs(30))), 1);
         let (mut client, mut handle, mut peer) = attached(&cx, initial).await;
         let live = McpRequestCancellation::new();
-        let mut watch = handle.watch_with_memory(&cx, &mut client, &live).await.unwrap();
+        let mut watch = handle
+            .watch_with_memory(&cx, &mut client, &live)
+            .await
+            .unwrap();
         listen(&cx, &mut peer, 3).await;
-        let mut server = cx.spawn(move |peer_cx| async move {
-            let renewed = task("working", Some(live_ttl(Duration::from_secs(60))), 2);
-            for event in [
-                acknowledgement(3, json!([TASK_ID, TASK_ID])),
-                task_notification(3, renewed.clone()),
-                task_notification(3, renewed),
-                task_notification(3, task("working", None, 2)),
-            ] {
-                peer.send_async(&peer_cx, &event).await.unwrap();
-            }
-            let read = receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
-            assert_eq!(read.params.unwrap()["taskId"], TASK_ID);
-            let mut authoritative = task("working", None, 1);
-            authoritative["createdAt"] = json!("2026-07-28T00:00:00+00:00");
-            peer.send_async(&peer_cx, &task_response(4, authoritative)).await.unwrap();
-            for _ in 0..2 {
-                peer.send_async(&peer_cx, &task_notification(3, task("completed", None, 3))).await.unwrap();
-            }
-            receive_cancel(&peer_cx, &mut peer, 3).await;
-            receive(&peer_cx, &mut peer, "tools/list", Some(5)).await;
-            peer.send_async(&peer_cx, &tools_response(5)).await.unwrap();
-            peer
-        }).unwrap();
-        assert!(matches!(watch.next_event(&cx, &live).await.unwrap(),
-            Some(FinalTaskWatchEvent::Acknowledged { .. })));
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                let renewed = task("working", Some(live_ttl(Duration::from_secs(60))), 2);
+                for event in [
+                    acknowledgement(3, json!([TASK_ID, TASK_ID])),
+                    task_notification(3, renewed.clone()),
+                    task_notification(3, renewed),
+                    task_notification(3, task("working", None, 2)),
+                ] {
+                    peer.send_async(&peer_cx, &event).await.unwrap();
+                }
+                let read = receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                assert_eq!(read.params.unwrap()["taskId"], TASK_ID);
+                let mut authoritative = task("working", None, 1);
+                authoritative["createdAt"] = json!("2026-07-28T00:00:00+00:00");
+                peer.send_async(&peer_cx, &task_response(4, authoritative))
+                    .await
+                    .unwrap();
+                for _ in 0..2 {
+                    peer.send_async(&peer_cx, &task_notification(3, task("completed", None, 3)))
+                        .await
+                        .unwrap();
+                }
+                receive_cancel(&peer_cx, &mut peer, 3).await;
+                receive(&peer_cx, &mut peer, "tools/list", Some(5)).await;
+                peer.send_async(&peer_cx, &tools_response(5)).await.unwrap();
+                peer
+            })
+            .unwrap();
+        assert!(matches!(
+            watch.next_event(&cx, &live).await.unwrap(),
+            Some(FinalTaskWatchEvent::Acknowledged { .. })
+        ));
         let Some(FinalTaskWatchEvent::TaskUpdated(renewed)) =
             watch.next_event(&cx, &live).await.unwrap()
-        else { panic!("renewal must be a live update"); };
-        assert_eq!(serde_json::to_value(renewed).unwrap()["params"]["diagnostic"], json!({"opaque": true}));
+        else {
+            panic!("renewal must be a live update");
+        };
+        assert_eq!(
+            serde_json::to_value(renewed).unwrap()["params"]["diagnostic"],
+            json!({"opaque": true})
+        );
         assert!(watch.task().base().ttl_ms.is_some());
-        let Some(FinalTaskWatchEvent::TaskReconciled { observed, authoritative }) =
-            watch.next_event(&cx, &live).await.unwrap()
-        else { panic!("duplicate must be skipped before one authoritative read"); };
+        let Some(FinalTaskWatchEvent::TaskReconciled {
+            observed,
+            authoritative,
+        }) = watch.next_event(&cx, &live).await.unwrap()
+        else {
+            panic!("duplicate must be skipped before one authoritative read");
+        };
         assert!(observed.params.task.base().ttl_ms.is_none());
         assert!(authoritative.base().ttl_ms.is_none());
-        assert_eq!(authoritative.base().created_at.as_str(), "2026-07-28T00:00:00+00:00");
-        assert!(matches!(watch.next_event(&cx, &live).await.unwrap(),
-            Some(FinalTaskWatchEvent::TaskUpdated(_))));
+        assert_eq!(
+            authoritative.base().created_at.as_str(),
+            "2026-07-28T00:00:00+00:00"
+        );
+        assert!(matches!(
+            watch.next_event(&cx, &live).await.unwrap(),
+            Some(FinalTaskWatchEvent::TaskUpdated(_))
+        ));
         let FinalTask::Completed { result, .. } = watch.task() else {
             panic!("completion must replace the retained working snapshot");
         };
-        assert_eq!(serde_json::to_string(result).unwrap(), serde_json::to_string(&opaque_result()).unwrap());
+        assert_eq!(
+            serde_json::to_string(result).unwrap(),
+            serde_json::to_string(&opaque_result()).unwrap()
+        );
         assert_eq!(watch.stop_reason(), Some(FinalTaskWaitOutcome::Completed));
         assert!(watch.next_event(&cx, &live).await.unwrap().is_none());
         drop(watch);
         // A terminal handle never creates another subscription, even though a
         // late duplicate completion remains in the bounded inbound channel.
-        let mut terminal = handle.watch_with_memory(&cx, &mut client, &live).await.unwrap();
-        assert_eq!(terminal.stop_reason(), Some(FinalTaskWaitOutcome::Completed));
+        let mut terminal = handle
+            .watch_with_memory(&cx, &mut client, &live)
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal.stop_reason(),
+            Some(FinalTaskWaitOutcome::Completed)
+        );
         assert!(terminal.next_event(&cx, &live).await.unwrap().is_none());
         drop(terminal);
         assert_tools(&cx, &mut client).await;
@@ -518,18 +717,35 @@ fn memory_task_watch_event_drop_and_owner_drop_preserve_catalog_and_sibling_requ
             let (mut client, mut handle, mut peer) = attached(&cx, task("working", None, 1)).await;
             let before = serde_json::to_vec(handle.task()).unwrap();
             let live = McpRequestCancellation::new();
-            let mut catalog = client.subscribe(&cx, &live, SubscriptionFilter {
-                tools_list_changed: Some(true), ..SubscriptionFilter::default()
-            }).await.unwrap();
+            let mut catalog = client
+                .subscribe(
+                    &cx,
+                    &live,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .unwrap();
             receive(&cx, &mut peer, "subscriptions/listen", Some(3)).await;
-            let mut sibling = client.execute_core(&cx, &live, "tools/list", json!({})).await.unwrap();
+            let mut sibling = client
+                .execute_core(&cx, &live, "tools/list", json!({}))
+                .await
+                .unwrap();
             receive(&cx, &mut peer, "tools/list", Some(4)).await;
             let original = McpRequestCancellation::new();
-            let mut watch = handle.watch_with_memory(&cx, &mut client, &original).await.unwrap();
+            let mut watch = handle
+                .watch_with_memory(&cx, &mut client, &original)
+                .await
+                .unwrap();
             listen(&cx, &mut peer, 5).await;
             for event in [
-                notification("notifications/subscriptions/acknowledged", 3,
-                    json!({"notifications":{"toolsListChanged":true}})),
+                notification(
+                    "notifications/subscriptions/acknowledged",
+                    3,
+                    json!({"notifications":{"toolsListChanged":true}}),
+                ),
                 notification("notifications/tools/list_changed", 3, json!({})),
                 tools_response(4),
             ] {
@@ -538,28 +754,51 @@ fn memory_task_watch_event_drop_and_owner_drop_preserve_catalog_and_sibling_requ
                 poll_fn(|task_cx| {
                     assert!(waiting.as_mut().poll(task_cx).is_pending());
                     Poll::Ready(())
-                }).await;
+                })
+                .await;
                 // Each dropped event future retains this watch and every
                 // independently owned event routed during the same poll.
             }
-            peer.send_async(&cx, &acknowledgement(5, json!([TASK_ID]))).await.unwrap();
-            assert!(matches!(watch.next_event(&cx, &original).await.unwrap(),
-                Some(FinalTaskWatchEvent::Acknowledged { .. })));
+            peer.send_async(&cx, &acknowledgement(5, json!([TASK_ID])))
+                .await
+                .unwrap();
+            assert!(matches!(
+                watch.next_event(&cx, &original).await.unwrap(),
+                Some(FinalTaskWatchEvent::Acknowledged { .. })
+            ));
             if cancel {
                 original.cancel();
                 assert!(watch.next_event(&cx, &original).await.unwrap().is_none());
-                assert_eq!(watch.stop_reason(), Some(FinalTaskWaitOutcome::ObservationCancelled));
+                assert_eq!(
+                    watch.stop_reason(),
+                    Some(FinalTaskWaitOutcome::ObservationCancelled)
+                );
             }
             drop(watch);
             assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
-            assert!(matches!(client.next_event(&cx, &live, &mut sibling).await.unwrap(),
+            assert!(
+                matches!(client.next_event(&cx, &live, &mut sibling).await.unwrap(),
                 Some(crate::MemoryRequestEvent::Result(result))
-                    if matches!(*result, CoreResult::Final(FinalCoreResult::ToolsList { .. }))));
-            assert!(matches!(client.next_subscription_event(&cx, &live, &mut catalog).await.unwrap(),
-                Some(MemorySubscriptionEvent::Acknowledged { .. })));
-            assert!(matches!(client.next_subscription_event(&cx, &live, &mut catalog).await.unwrap(),
-                Some(MemorySubscriptionEvent::Notification(_))));
-            assert_eq!(catalog.accepted_filter().unwrap().tools_list_changed, Some(true));
+                    if matches!(*result, CoreResult::Final(FinalCoreResult::ToolsList { .. })))
+            );
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &live, &mut catalog)
+                    .await
+                    .unwrap(),
+                Some(MemorySubscriptionEvent::Acknowledged { .. })
+            ));
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &live, &mut catalog)
+                    .await
+                    .unwrap(),
+                Some(MemorySubscriptionEvent::Notification(_))
+            ));
+            assert_eq!(
+                catalog.accepted_filter().unwrap().tools_list_changed,
+                Some(true)
+            );
             // Holding the independent catalog owner across this ordinary call
             // proves only the Task listener's cancellation is emitted.
             finish(&cx, &mut client, peer, vec![5], 6).await;
@@ -573,33 +812,61 @@ fn memory_task_watch_rejects_changed_identity_in_notifications_and_reconciliatio
     run(|cx| async move {
         for reconcile in [false, true] {
             for field in ["taskId", "createdAt"] {
-                let (mut client, mut handle, mut peer) = attached(&cx, task("working", None, 1)).await;
+                let (mut client, mut handle, mut peer) =
+                    attached(&cx, task("working", None, 1)).await;
                 let before = serde_json::to_vec(handle.task()).unwrap();
                 let live = McpRequestCancellation::new();
-                let mut watch = handle.watch_with_memory(&cx, &mut client, &live).await.unwrap();
+                let mut watch = handle
+                    .watch_with_memory(&cx, &mut client, &live)
+                    .await
+                    .unwrap();
                 listen(&cx, &mut peer, 3).await;
-                peer.send_async(&cx, &acknowledgement(3, json!([TASK_ID]))).await.unwrap();
+                peer.send_async(&cx, &acknowledgement(3, json!([TASK_ID])))
+                    .await
+                    .unwrap();
                 watch.next_event(&cx, &live).await.unwrap();
                 let mut changed = task("completed", None, 2);
-                changed[field] = json!(if field == "taskId" { "another-task" } else { "2026-07-28T00:00:01Z" });
-                let mut server = cx.spawn(move |peer_cx| async move {
-                    if reconcile {
-                        let mut ambiguous = task("working", None, 1);
-                        ambiguous["statusMessage"] = json!("authoritative read required");
-                        peer.send_async(&peer_cx, &task_notification(3, ambiguous)).await.unwrap();
-                        receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
-                        peer.send_async(&peer_cx, &task_response(4, changed)).await.unwrap();
-                    } else {
-                        peer.send_async(&peer_cx, &task_notification(3, changed)).await.unwrap();
-                    }
-                    peer
-                }).unwrap();
-                assert_eq!(watch.next_event(&cx, &live).await.unwrap_err().code, McpErrorCode::InvalidRequest);
+                changed[field] = json!(if field == "taskId" {
+                    "another-task"
+                } else {
+                    "2026-07-28T00:00:01Z"
+                });
+                let mut server = cx
+                    .spawn(move |peer_cx| async move {
+                        if reconcile {
+                            let mut ambiguous = task("working", None, 1);
+                            ambiguous["statusMessage"] = json!("authoritative read required");
+                            peer.send_async(&peer_cx, &task_notification(3, ambiguous))
+                                .await
+                                .unwrap();
+                            receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                            peer.send_async(&peer_cx, &task_response(4, changed))
+                                .await
+                                .unwrap();
+                        } else {
+                            peer.send_async(&peer_cx, &task_notification(3, changed))
+                                .await
+                                .unwrap();
+                        }
+                        peer
+                    })
+                    .unwrap();
+                assert_eq!(
+                    watch.next_event(&cx, &live).await.unwrap_err().code,
+                    McpErrorCode::InvalidRequest
+                );
                 assert!(watch.next_event(&cx, &live).await.unwrap().is_none());
                 drop(watch);
                 assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
                 let peer = server.join(&cx).await.unwrap();
-                finish(&cx, &mut client, peer, vec![3], if reconcile { 5 } else { 4 }).await;
+                finish(
+                    &cx,
+                    &mut client,
+                    peer,
+                    vec![3],
+                    if reconcile { 5 } else { 4 },
+                )
+                .await;
             }
         }
     });
@@ -612,24 +879,53 @@ fn memory_task_watch_empty_acceptance_and_peer_termination_keep_the_task_nonterm
             let (mut client, mut handle, mut peer) = attached(&cx, task("working", None, 1)).await;
             let before = serde_json::to_vec(handle.task()).unwrap();
             let live = McpRequestCancellation::new();
-            let mut watch = handle.watch_with_memory(&cx, &mut client, &live).await.unwrap();
+            let mut watch = handle
+                .watch_with_memory(&cx, &mut client, &live)
+                .await
+                .unwrap();
             listen(&cx, &mut peer, 3).await;
-            peer.send_async(&cx, &acknowledgement(3, if mode == "empty" { json!([]) } else { json!([TASK_ID]) })).await.unwrap();
-            assert!(matches!(watch.next_event(&cx, &live).await.unwrap(),
-                Some(FinalTaskWatchEvent::Acknowledged { .. })));
+            peer.send_async(
+                &cx,
+                &acknowledgement(
+                    3,
+                    if mode == "empty" {
+                        json!([])
+                    } else {
+                        json!([TASK_ID])
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                watch.next_event(&cx, &live).await.unwrap(),
+                Some(FinalTaskWatchEvent::Acknowledged { .. })
+            ));
             if mode == "complete" {
                 peer.send_async(&cx, &response(3, json!({
                     "resultType":"complete", "_meta":{"io.modelcontextprotocol/subscriptionId":3},
                 }))).await.unwrap();
             } else if mode == "peer-cancel" {
-                peer.send_async(&cx, &notification("notifications/cancelled", 3, json!({"requestId":3}))).await.unwrap();
+                peer.send_async(
+                    &cx,
+                    &notification("notifications/cancelled", 3, json!({"requestId":3})),
+                )
+                .await
+                .unwrap();
             }
             assert!(watch.next_event(&cx, &live).await.unwrap().is_none());
             assert_eq!(watch.stop_reason(), None);
             assert!(watch.next_event(&cx, &live).await.unwrap().is_none());
             drop(watch);
             assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
-            finish(&cx, &mut client, peer, if mode == "empty" { vec![3] } else { vec![] }, 4).await;
+            finish(
+                &cx,
+                &mut client,
+                peer,
+                if mode == "empty" { vec![3] } else { vec![] },
+                4,
+            )
+            .await;
         }
     });
 }
@@ -640,23 +936,37 @@ fn memory_task_watch_drop_during_reconciliation_retires_read_and_listen_without_
         let (mut client, mut handle, mut peer) = attached(&cx, task("working", None, 1)).await;
         let before = serde_json::to_vec(handle.task()).unwrap();
         let live = McpRequestCancellation::new();
-        let mut sibling = client.execute_core(&cx, &live, "tools/list", json!({})).await.unwrap();
+        let mut sibling = client
+            .execute_core(&cx, &live, "tools/list", json!({}))
+            .await
+            .unwrap();
         receive(&cx, &mut peer, "tools/list", Some(3)).await;
-        let mut watch = handle.watch_with_memory(&cx, &mut client, &live).await.unwrap();
+        let mut watch = handle
+            .watch_with_memory(&cx, &mut client, &live)
+            .await
+            .unwrap();
         listen(&cx, &mut peer, 4).await;
-        peer.send_async(&cx, &acknowledgement(4, json!([TASK_ID]))).await.unwrap();
+        peer.send_async(&cx, &acknowledgement(4, json!([TASK_ID])))
+            .await
+            .unwrap();
         watch.next_event(&cx, &live).await.unwrap();
         let mut ambiguous = task("working", None, 1);
         ambiguous["statusMessage"] = json!("requires reconciliation");
-        peer.send_async(&cx, &task_notification(4, ambiguous)).await.unwrap();
+        peer.send_async(&cx, &task_notification(4, ambiguous))
+            .await
+            .unwrap();
         {
             let mut waiting = pin!(watch.next_event(&cx, &live));
             let mut read = pin!(peer.recv_async(&cx));
             let sent = poll_fn(|task_cx| {
                 assert!(waiting.as_mut().poll(task_cx).is_pending());
                 read.as_mut().poll(task_cx)
-            }).await.unwrap();
-            let JsonRpcMessage::Request(sent) = sent else { panic!("expected authoritative read"); };
+            })
+            .await
+            .unwrap();
+            let JsonRpcMessage::Request(sent) = sent else {
+                panic!("expected authoritative read");
+            };
             assert_eq!(sent.method, "tasks/get");
             assert_eq!(sent.id, Some(RequestId::Number(5)));
         }
@@ -664,17 +974,27 @@ fn memory_task_watch_drop_during_reconciliation_retires_read_and_listen_without_
         assert_eq!(watch.stop_reason(), None);
         drop(watch);
         assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
-        let mut server = cx.spawn(move |peer_cx| async move {
-            // The dropped get is retired before the remaining listen owner.
-            receive_cancel(&peer_cx, &mut peer, 5).await;
-            receive_cancel(&peer_cx, &mut peer, 4).await;
-            peer.send_async(&peer_cx, &task_response(5, task("completed", None, 2))).await.unwrap();
-            peer.send_async(&peer_cx, &tools_response(3)).await.unwrap();
-            peer
-        }).unwrap();
-        assert!(matches!(client.next_event(&cx, &live, &mut sibling).await.unwrap(),
-            Some(crate::MemoryRequestEvent::Result(_))));
-        assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before, "a late get cannot update the retained handle");
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                // The dropped get is retired before the remaining listen owner.
+                receive_cancel(&peer_cx, &mut peer, 5).await;
+                receive_cancel(&peer_cx, &mut peer, 4).await;
+                peer.send_async(&peer_cx, &task_response(5, task("completed", None, 2)))
+                    .await
+                    .unwrap();
+                peer.send_async(&peer_cx, &tools_response(3)).await.unwrap();
+                peer
+            })
+            .unwrap();
+        assert!(matches!(
+            client.next_event(&cx, &live, &mut sibling).await.unwrap(),
+            Some(crate::MemoryRequestEvent::Result(_))
+        ));
+        assert_eq!(
+            serde_json::to_vec(handle.task()).unwrap(),
+            before,
+            "a late get cannot update the retained handle"
+        );
         let peer = server.join(&cx).await.unwrap();
         finish(&cx, &mut client, peer, vec![], 6).await;
     });
@@ -686,7 +1006,10 @@ fn memory_task_watch_open_drop_under_backpressure_consumes_no_id_or_sibling() {
         for cancel in [false, true] {
             let (mut client, mut handle, mut peer) = attached(&cx, task("working", None, 1)).await;
             let live = McpRequestCancellation::new();
-            let mut sibling = client.execute_core(&cx, &live, "tools/list", json!({})).await.unwrap();
+            let mut sibling = client
+                .execute_core(&cx, &live, "tools/list", json!({}))
+                .await
+                .unwrap();
             // Keep id 3 in the one-slot outbound channel while opening the watch.
             let original = McpRequestCancellation::new();
             {
@@ -694,18 +1017,27 @@ fn memory_task_watch_open_drop_under_backpressure_consumes_no_id_or_sibling() {
                 poll_fn(|task_cx| {
                     assert!(opening.as_mut().poll(task_cx).is_pending());
                     Poll::Ready(())
-                }).await;
+                })
+                .await;
                 if cancel {
                     original.cancel();
                     let stopped = opening.await.unwrap();
-                    assert_eq!(stopped.stop_reason(), Some(FinalTaskWaitOutcome::ObservationCancelled));
+                    assert_eq!(
+                        stopped.stop_reason(),
+                        Some(FinalTaskWaitOutcome::ObservationCancelled)
+                    );
                 }
             }
             receive(&cx, &mut peer, "tools/list", Some(3)).await;
             peer.send_async(&cx, &tools_response(3)).await.unwrap();
-            assert!(matches!(client.next_event(&cx, &live, &mut sibling).await.unwrap(),
-                Some(crate::MemoryRequestEvent::Result(_))));
-            let watch = handle.watch_with_memory(&cx, &mut client, &live).await.unwrap();
+            assert!(matches!(
+                client.next_event(&cx, &live, &mut sibling).await.unwrap(),
+                Some(crate::MemoryRequestEvent::Result(_))
+            ));
+            let watch = handle
+                .watch_with_memory(&cx, &mut client, &live)
+                .await
+                .unwrap();
             listen(&cx, &mut peer, 4).await;
             drop(watch);
             finish(&cx, &mut client, peer, vec![4], 5).await;
@@ -723,10 +1055,21 @@ fn memory_task_watch_terminal_and_expired_admission_never_open_a_listener() {
         ] {
             let (mut client, mut handle, peer) = attached(&cx, task(status, Some(1), 1)).await;
             let cancellation = McpRequestCancellation::new();
-            if cancel { cancellation.cancel(); }
-            let mut watch = handle.watch_with_memory(&cx, &mut client, &cancellation).await.unwrap();
+            if cancel {
+                cancellation.cancel();
+            }
+            let mut watch = handle
+                .watch_with_memory(&cx, &mut client, &cancellation)
+                .await
+                .unwrap();
             assert_eq!(watch.stop_reason(), Some(expected));
-            assert!(watch.next_event(&cx, &cancellation).await.unwrap().is_none());
+            assert!(
+                watch
+                    .next_event(&cx, &cancellation)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             drop(watch);
             finish(&cx, &mut client, peer, vec![], 3).await;
         }
@@ -741,34 +1084,56 @@ fn memory_task_watch_pending_events_obey_original_retention_and_caller_deadline(
             let (mut client, mut handle, mut peer) = attached(&cx, task("working", ttl, 1)).await;
             let before = serde_json::to_vec(handle.task()).unwrap();
             let scope = cx.scope_with_budget(asupersync::Budget::INFINITE.with_deadline(
-                cx.now() + if retention { Duration::from_secs(2) } else { Duration::from_millis(100) },
+                cx.now()
+                    + if retention {
+                        Duration::from_secs(2)
+                    } else {
+                        Duration::from_millis(100)
+                    },
             ));
             // Memory publication requires a registered obligation holder.
             // spawn_in admits a real task with this scope's original budget;
             // a request-only Cx or region principal cannot publish the listen.
-            let mut observer = cx.spawn_in(&scope, move |caller| async move {
-                let live = McpRequestCancellation::new();
-                let mut watch = handle.watch_with_memory(&caller, &mut client, &live).await.unwrap();
-                listen(&caller, &mut peer, 3).await;
-                peer.send_async(&caller, &acknowledgement(3, json!([TASK_ID]))).await.unwrap();
-                assert!(matches!(watch.next_event(&caller, &live).await.unwrap(),
-                    Some(FinalTaskWatchEvent::Acknowledged { .. })));
-                let started = Instant::now();
-                assert!(watch.next_event(&caller, &live).await.unwrap().is_none());
-                assert_eq!(watch.stop_reason(), Some(if retention {
-                    FinalTaskWaitOutcome::TaskExpired
-                } else { FinalTaskWaitOutcome::DeadlineElapsed }));
-                assert!(started.elapsed() < Duration::from_secs(1));
-                assert!(!live.is_cancel_requested());
-                drop(watch);
-                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
-                // Acknowledge any delivered task deadline before returning
-                // the connection through the ordinary spawn join policy.
-                let _ = caller.checkpoint();
-                (client, peer)
-            }).unwrap();
+            let mut observer = cx
+                .spawn_in(&scope, move |caller| async move {
+                    let live = McpRequestCancellation::new();
+                    let mut watch = handle
+                        .watch_with_memory(&caller, &mut client, &live)
+                        .await
+                        .unwrap();
+                    listen(&caller, &mut peer, 3).await;
+                    peer.send_async(&caller, &acknowledgement(3, json!([TASK_ID])))
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        watch.next_event(&caller, &live).await.unwrap(),
+                        Some(FinalTaskWatchEvent::Acknowledged { .. })
+                    ));
+                    let started = Instant::now();
+                    assert!(watch.next_event(&caller, &live).await.unwrap().is_none());
+                    assert_eq!(
+                        watch.stop_reason(),
+                        Some(if retention {
+                            FinalTaskWaitOutcome::TaskExpired
+                        } else {
+                            FinalTaskWaitOutcome::DeadlineElapsed
+                        })
+                    );
+                    assert!(started.elapsed() < Duration::from_secs(1));
+                    assert!(!live.is_cancel_requested());
+                    drop(watch);
+                    assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                    // Acknowledge any delivered task deadline before returning
+                    // the connection through the ordinary spawn join policy.
+                    let _ = caller.checkpoint();
+                    (client, peer)
+                })
+                .unwrap();
             let (mut client, peer) = observer.join(&cx).await.unwrap();
-            assert!(cx.checkpoint().is_ok(), "the observing task cannot cancel its parent");
+            assert!(
+                cx.checkpoint().is_ok(),
+                "the observing task cannot cancel its parent"
+            );
             // The healthy root services the deferred id-only cancellation and
             // proves the same connection can publish the next ordinary call.
             finish(&cx, &mut client, peer, vec![3], 4).await;

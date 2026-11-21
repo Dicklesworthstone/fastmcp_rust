@@ -14,8 +14,8 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{CoreRequest, FinalInputResponses, RequestId};
 
 use super::super::super::{
-    ClientCredentialsError, ClientCredentialsSnapshot, active, admit_resource,
-    authorize, check_token, prepare,
+    ClientCredentialsError, ClientCredentialsSnapshot, active, admit_resource, authorize,
+    check_token, prepare,
 };
 use super::{
     ClientCredentialsCoreError, ClientCredentialsInteraction, ClientCredentialsInteractionError,

@@ -3,8 +3,8 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, Weak};
 
 use fastmcp_protocol::{
     CompleteResult, CorrelationKey, FinalSubscriptionsListenResult, ServerNotification,
@@ -156,7 +156,9 @@ struct SubscriptionState {
 }
 
 fn lock(state: &Mutex<SubscriptionState>) -> MutexGuard<'_, SubscriptionState> {
-    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 enum SubscriptionPoll {
@@ -212,16 +214,17 @@ impl SubscriptionState {
         if self.finished {
             return Ok(SubscriptionPoll::Finished);
         }
-        let peer_cancelled = self.inner.terminal_reason()
-            == Some(ExecutionTerminalReason::PeerSubscriptionTeardown);
-        if !self.inner.is_pending_subscription()
-            && self.inner.terminal_reason().is_none()
-        {
+        let peer_cancelled =
+            self.inner.terminal_reason() == Some(ExecutionTerminalReason::PeerSubscriptionTeardown);
+        if !self.inner.is_pending_subscription() && self.inner.terminal_reason().is_none() {
             self.clear_events();
             self.finished = true;
-            return Err(executor.try_take_response(&mut self.inner).err().unwrap_or_else(|| {
-                McpError::invalid_request("Memory subscription terminal receipt is unavailable")
-            }));
+            return Err(executor
+                .try_take_response(&mut self.inner)
+                .err()
+                .unwrap_or_else(|| {
+                    McpError::invalid_request("Memory subscription terminal receipt is unavailable")
+                }));
         }
         if let Some(error) = self.inner.terminal_error()
             && !peer_cancelled
@@ -406,8 +409,8 @@ impl MemorySubscriptionRegistry {
             .as_ref()
             .and_then(|params| params.get("_meta"))
             .and_then(|meta| meta.get(SUBSCRIPTION_ID));
-        let request_id = metadata_id
-            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok());
+        let request_id =
+            metadata_id.and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok());
         let owner = request_id
             .as_ref()
             .and_then(|id| id.correlation_key().ok())
@@ -499,7 +502,8 @@ fn admit_notification(
             let accepted_ids = fastmcp_protocol::task_subscription_ids(accepted)
                 .map_err(|_| McpError::invalid_request("Invalid accepted Memory Tasks filter"))?;
             if accepted_ids.as_ref().is_none_or(|ids| {
-                !ids.iter().any(|id| id == &notification.params.task.base().task_id)
+                !ids.iter()
+                    .any(|id| id == &notification.params.task.base().task_id)
             }) {
                 return Err(McpError::invalid_request(
                     "Memory subscription received an unaccepted Task ID",
@@ -552,7 +556,10 @@ fn admit_notification(
                     "Memory subscription cancellation preceded acknowledgement",
                 ));
             }
-            if !cancellation.request_id.correlates_with(state.inner.request_id()) {
+            if !cancellation
+                .request_id
+                .correlates_with(state.inner.request_id())
+            {
                 return Err(McpError::invalid_request(
                     "Memory subscription cancellation request ID does not match its owner",
                 ));
@@ -589,7 +596,11 @@ fn active_filter(filter: &SubscriptionFilter) -> SubscriptionFilter {
             *enabled = None;
         }
     }
-    if filter.resource_subscriptions.as_ref().is_some_and(Vec::is_empty) {
+    if filter
+        .resource_subscriptions
+        .as_ref()
+        .is_some_and(Vec::is_empty)
+    {
         filter.resource_subscriptions = None;
     }
     #[cfg(feature = "tasks")]
@@ -599,7 +610,9 @@ fn active_filter(filter: &SubscriptionFilter) -> SubscriptionFilter {
         .and_then(Value::as_array)
         .is_some_and(Vec::is_empty)
     {
-        filter.additional.remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
+        filter
+            .additional
+            .remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
     }
     filter
 }
@@ -609,11 +622,13 @@ fn unsupported_filter(
     requested: &SubscriptionFilter,
     accepted: &SubscriptionFilter,
 ) -> McpResult<SubscriptionFilter> {
-    let missing = |requested, accepted| {
-        (requested == Some(true) && accepted != Some(true)).then_some(true)
-    };
+    let missing =
+        |requested, accepted| (requested == Some(true) && accepted != Some(true)).then_some(true);
     let mut unsupported = SubscriptionFilter {
-        prompts_list_changed: missing(requested.prompts_list_changed, accepted.prompts_list_changed),
+        prompts_list_changed: missing(
+            requested.prompts_list_changed,
+            accepted.prompts_list_changed,
+        ),
         resources_list_changed: missing(
             requested.resources_list_changed,
             accepted.resources_list_changed,
@@ -625,7 +640,10 @@ fn unsupported_filter(
         let missing: Vec<_> = requested_uris
             .iter()
             .filter(|uri| {
-                accepted.resource_subscriptions.as_ref().is_none_or(|accepted| !accepted.contains(uri))
+                accepted
+                    .resource_subscriptions
+                    .as_ref()
+                    .is_none_or(|accepted| !accepted.contains(uri))
             })
             .cloned()
             .collect();
@@ -647,8 +665,9 @@ fn unsupported_filter(
                 .filter(|id| !accepted_ids.contains(id))
                 .collect();
             if !missing.is_empty() {
-                fastmcp_protocol::set_task_subscription_ids(&mut unsupported, missing)
-                    .map_err(|_| McpError::invalid_request("Invalid unsupported Memory Tasks filter"))?;
+                fastmcp_protocol::set_task_subscription_ids(&mut unsupported, missing).map_err(
+                    |_| McpError::invalid_request("Invalid unsupported Memory Tasks filter"),
+                )?;
             }
             continue;
         }
@@ -710,8 +729,9 @@ impl MemoryClient {
         }
         #[cfg(feature = "tasks")]
         if advertise_tasks {
-            fastmcp_protocol::task_subscription_ids(&requested)
-                .map_err(|_| McpError::invalid_params("Invalid Memory Tasks subscription filter"))?;
+            fastmcp_protocol::task_subscription_ids(&requested).map_err(|_| {
+                McpError::invalid_params("Invalid Memory Tasks subscription filter")
+            })?;
             if !self.tasks_active() {
                 return Err(McpError::invalid_params(
                     "Memory Tasks subscription filters require explicit negotiated Tasks",
@@ -732,7 +752,9 @@ impl MemoryClient {
             Some(&parameters),
         )
         .map_err(|_| McpError::invalid_params("Invalid Memory subscription request"))?;
-        let next_id = self.next_id.checked_add(1)
+        let next_id = self
+            .next_id
+            .checked_add(1)
             .ok_or_else(|| McpError::internal_error("Memory request IDs exhausted"))?;
         let wire = JsonRpcRequest::new("subscriptions/listen", Some(parameters), self.next_id);
         fastmcp_transport::Codec::new()
@@ -749,7 +771,8 @@ impl MemoryClient {
                 cx,
                 cancellation,
                 deadline,
-            ).await?;
+            )
+            .await?;
             if let Some(inner) = self.executor.execute_external_subscription(
                 cx,
                 cancellation,
@@ -758,7 +781,9 @@ impl MemoryClient {
                 |message| permit.send(message),
             )? {
                 let request_id = inner.request_id().clone();
-                let key = request_id.correlation_key().expect("executor admitted the request ID");
+                let key = request_id
+                    .correlation_key()
+                    .expect("executor admitted the request ID");
                 let state = Arc::new(Mutex::new(SubscriptionState {
                     inner,
                     request,
@@ -771,7 +796,9 @@ impl MemoryClient {
                     terminal_result: None,
                     finished: false,
                 }));
-                self.subscriptions.owners.insert(key, Arc::downgrade(&state));
+                self.subscriptions
+                    .owners
+                    .insert(key, Arc::downgrade(&state));
                 self.next_id = next_id;
                 return Ok(MemorySubscriptionExecution {
                     owner: Arc::clone(&self.owner),
@@ -886,7 +913,10 @@ mod tests {
     }
 
     fn info() -> ClientInfo {
-        ClientInfo { name: "memory-subscriptions".into(), version: "1".into() }
+        ClientInfo {
+            name: "memory-subscriptions".into(),
+            version: "1".into(),
+        }
     }
 
     fn response(id: i64, result: Value) -> JsonRpcMessage {
@@ -902,11 +932,18 @@ mod tests {
     }
 
     fn acknowledgement(id: i64, filter: Value) -> JsonRpcMessage {
-        notification("notifications/subscriptions/acknowledged", id, json!({"notifications": filter}))
+        notification(
+            "notifications/subscriptions/acknowledged",
+            id,
+            json!({"notifications": filter}),
+        )
     }
 
     fn tools_filter() -> SubscriptionFilter {
-        SubscriptionFilter { tools_list_changed: Some(true), ..SubscriptionFilter::default() }
+        SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        }
     }
 
     async fn receive(cx: &Cx, peer: &mut MemoryTransport, method: &str) -> JsonRpcRequest {
@@ -919,11 +956,22 @@ mod tests {
 
     async fn connected(cx: &Cx) -> (MemoryClient, MemoryTransport) {
         let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
-        peer.send_async(cx, &response(1, json!({
-            "resultType": "complete", "supportedVersions": ["2026-07-28"],
-            "capabilities": {}, "ttlMs": 0, "cacheScope": "private",
-        }))).await.unwrap();
-        let client = MemoryClient::builder(info()).connect(cx, transport).await.unwrap();
+        peer.send_async(
+            cx,
+            &response(
+                1,
+                json!({
+                    "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                    "capabilities": {}, "ttlMs": 0, "cacheScope": "private",
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        let client = MemoryClient::builder(info())
+            .connect(cx, transport)
+            .await
+            .unwrap();
         receive(cx, &mut peer, "server/discover").await;
         (client, peer)
     }
@@ -1032,7 +1080,10 @@ mod tests {
         peer: &mut MemoryTransport,
         cancellation: &McpRequestCancellation,
     ) -> MemorySubscriptionExecution {
-        let owner = client.subscribe(cx, cancellation, tools_filter()).await.unwrap();
+        let owner = client
+            .subscribe(cx, cancellation, tools_filter())
+            .await
+            .unwrap();
         let request = receive(cx, peer, "subscriptions/listen").await;
         assert_eq!(request.id.as_ref(), Some(owner.request_id()));
         owner
@@ -1040,12 +1091,20 @@ mod tests {
 
     async fn ordinary_survives(cx: &Cx, client: &mut MemoryClient, peer: &mut MemoryTransport) {
         let token = McpRequestCancellation::new();
-        let mut request = client.execute_core(cx, &token, "tools/list", json!({})).await.unwrap();
+        let mut request = client
+            .execute_core(cx, &token, "tools/list", json!({}))
+            .await
+            .unwrap();
         let wire = receive(cx, peer, "tools/list").await;
-        peer.send_async(cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
-            wire.id.unwrap(),
-            json!({"resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"}),
-        ))).await.unwrap();
+        peer.send_async(
+            cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                wire.id.unwrap(),
+                json!({"resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"}),
+            )),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             client.next_event(cx, &token, &mut request).await.unwrap(),
             Some(MemoryRequestEvent::Result(result))
@@ -1059,31 +1118,66 @@ mod tests {
             let (mut client, mut peer) = connected(&cx).await;
             let token = McpRequestCancellation::new();
             let requested = SubscriptionFilter {
-                tools_list_changed: Some(true), prompts_list_changed: Some(true),
+                tools_list_changed: Some(true),
+                prompts_list_changed: Some(true),
                 ..SubscriptionFilter::default()
             };
             let mut owner = client.subscribe(&cx, &token, requested).await.unwrap();
             receive(&cx, &mut peer, "subscriptions/listen").await;
-            peer.send_async(&cx, &acknowledgement(2, json!({
-                "toolsListChanged": true, "promptsListChanged": false,
-                "resourcesListChanged": false, "resourceSubscriptions": [],
-            }))).await.unwrap();
-            let Some(MemorySubscriptionEvent::Acknowledged { accepted, unsupported }) =
-                client.next_subscription_event(&cx, &token, &mut owner).await.unwrap()
-            else { panic!("first subscription event is an acknowledgement"); };
+            peer.send_async(
+                &cx,
+                &acknowledgement(
+                    2,
+                    json!({
+                        "toolsListChanged": true, "promptsListChanged": false,
+                        "resourcesListChanged": false, "resourceSubscriptions": [],
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+            let Some(MemorySubscriptionEvent::Acknowledged {
+                accepted,
+                unsupported,
+            }) = client
+                .next_subscription_event(&cx, &token, &mut owner)
+                .await
+                .unwrap()
+            else {
+                panic!("first subscription event is an acknowledgement");
+            };
             assert_eq!(accepted.prompts_list_changed, Some(false));
             assert_eq!(accepted.resources_list_changed, Some(false));
             assert_eq!(accepted.resource_subscriptions, Some(Vec::new()));
             assert_eq!(unsupported.prompts_list_changed, Some(true));
             assert_eq!(unsupported.tools_list_changed, None);
-            peer.send_async(&cx, &response(2, json!({
-                "resultType": "complete", "receipt": "retained",
-                "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
-            }))).await.unwrap();
-            assert!(matches!(client.next_subscription_event(&cx, &token, &mut owner).await.unwrap(),
-                Some(MemorySubscriptionEvent::Terminal)));
+            peer.send_async(
+                &cx,
+                &response(
+                    2,
+                    json!({
+                        "resultType": "complete", "receipt": "retained",
+                        "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &token, &mut owner)
+                    .await
+                    .unwrap(),
+                Some(MemorySubscriptionEvent::Terminal)
+            ));
             assert!(owner.terminal_result().is_some());
-            assert!(client.next_subscription_event(&cx, &token, &mut owner).await.unwrap().is_none());
+            assert!(
+                client
+                    .next_subscription_event(&cx, &token, &mut owner)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             ordinary_survives(&cx, &mut client, &mut peer).await;
         });
     }
@@ -1095,20 +1189,38 @@ mod tests {
             let token = McpRequestCancellation::new();
             let mut first = open(&cx, &mut client, &mut peer, &token).await;
             let mut second = open(&cx, &mut client, &mut peer, &token).await;
-            peer.send_async(&cx, &acknowledgement(3, json!({"toolsListChanged":true}))).await.unwrap();
+            peer.send_async(&cx, &acknowledgement(3, json!({"toolsListChanged":true})))
+                .await
+                .unwrap();
             {
                 let mut waiting = pin!(client.next_subscription_event(&cx, &token, &mut first));
                 poll_fn(|task| {
                     assert!(waiting.as_mut().poll(task).is_pending());
                     Poll::Ready(())
-                }).await;
+                })
+                .await;
             }
-            assert_eq!(second.accepted_filter().unwrap().tools_list_changed, Some(true));
-            assert!(matches!(client.next_subscription_event(&cx, &token, &mut second).await.unwrap(),
-                Some(MemorySubscriptionEvent::Acknowledged { .. })));
-            peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true}))).await.unwrap();
-            assert!(matches!(client.next_subscription_event(&cx, &token, &mut first).await.unwrap(),
-                Some(MemorySubscriptionEvent::Acknowledged { .. })));
+            assert_eq!(
+                second.accepted_filter().unwrap().tools_list_changed,
+                Some(true)
+            );
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &token, &mut second)
+                    .await
+                    .unwrap(),
+                Some(MemorySubscriptionEvent::Acknowledged { .. })
+            ));
+            peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true})))
+                .await
+                .unwrap();
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &token, &mut first)
+                    .await
+                    .unwrap(),
+                Some(MemorySubscriptionEvent::Acknowledged { .. })
+            ));
             assert!(!client.executor.has_external_controls(&cx).unwrap());
             ordinary_survives(&cx, &mut client, &mut peer).await;
         });
@@ -1117,41 +1229,79 @@ mod tests {
     #[test]
     fn memory_subscription_protocol_refusals_retire_only_the_named_owner() {
         run(|cx| async move {
-            for invalid in ["widened_ack", "duplicate_ack", "event_before_ack", "wrong_cancel", "missing_cancel_id"] {
+            for invalid in [
+                "widened_ack",
+                "duplicate_ack",
+                "event_before_ack",
+                "wrong_cancel",
+                "missing_cancel_id",
+            ] {
                 let (mut client, mut peer) = connected(&cx).await;
                 let token = McpRequestCancellation::new();
                 let mut rejected = open(&cx, &mut client, &mut peer, &token).await;
                 let mut sibling = open(&cx, &mut client, &mut peer, &token).await;
                 for owner in [&mut rejected, &mut sibling] {
-                    if invalid == "event_before_ack" && owner.request_id() == &RequestId::Number(2) {
+                    if invalid == "event_before_ack" && owner.request_id() == &RequestId::Number(2)
+                    {
                         continue;
                     }
                     if invalid == "widened_ack" && owner.request_id() == &RequestId::Number(2) {
                         continue;
                     }
-                    let id = if owner.request_id() == &RequestId::Number(2) { 2 } else { 3 };
-                    peer.send_async(&cx, &acknowledgement(id, json!({"toolsListChanged":true}))).await.unwrap();
-                    client.next_subscription_event(&cx, &token, owner).await.unwrap();
+                    let id = if owner.request_id() == &RequestId::Number(2) {
+                        2
+                    } else {
+                        3
+                    };
+                    peer.send_async(&cx, &acknowledgement(id, json!({"toolsListChanged":true})))
+                        .await
+                        .unwrap();
+                    client
+                        .next_subscription_event(&cx, &token, owner)
+                        .await
+                        .unwrap();
                 }
                 let bad = match invalid {
                     "widened_ack" => acknowledgement(2, json!({"promptsListChanged":true})),
                     "duplicate_ack" => acknowledgement(2, json!({"toolsListChanged":true})),
-                    "event_before_ack" => notification("notifications/tools/list_changed", 2, json!({})),
-                    "wrong_cancel" => notification("notifications/cancelled", 2, json!({"requestId":3})),
+                    "event_before_ack" => {
+                        notification("notifications/tools/list_changed", 2, json!({}))
+                    }
+                    "wrong_cancel" => {
+                        notification("notifications/cancelled", 2, json!({"requestId":3}))
+                    }
                     _ => JsonRpcMessage::Request(JsonRpcRequest::notification(
-                        "notifications/cancelled", Some(json!({"requestId":2})),
+                        "notifications/cancelled",
+                        Some(json!({"requestId":2})),
                     )),
                 };
                 peer.send_async(&cx, &bad).await.unwrap();
-                assert_eq!(client.next_subscription_event(&cx, &token, &mut rejected).await.unwrap_err().code,
-                    McpErrorCode::InvalidRequest, "{invalid}");
+                assert_eq!(
+                    client
+                        .next_subscription_event(&cx, &token, &mut rejected)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidRequest,
+                    "{invalid}"
+                );
                 client.drive_once(&cx, &token).await.unwrap();
                 let cancelled = receive(&cx, &mut peer, "notifications/cancelled").await;
                 assert_eq!(cancelled.params.as_ref().unwrap()["requestId"], 2);
                 assert!(cancelled.params.as_ref().unwrap().get("_meta").is_none());
-                peer.send_async(&cx, &notification("notifications/tools/list_changed", 3, json!({}))).await.unwrap();
-                assert!(matches!(client.next_subscription_event(&cx, &token, &mut sibling).await.unwrap(),
-                    Some(MemorySubscriptionEvent::Notification(_))));
+                peer.send_async(
+                    &cx,
+                    &notification("notifications/tools/list_changed", 3, json!({})),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    client
+                        .next_subscription_event(&cx, &token, &mut sibling)
+                        .await
+                        .unwrap(),
+                    Some(MemorySubscriptionEvent::Notification(_))
+                ));
                 ordinary_survives(&cx, &mut client, &mut peer).await;
             }
         });
@@ -1163,18 +1313,39 @@ mod tests {
             let (mut client, mut peer) = connected(&cx).await;
             let token = McpRequestCancellation::new();
             let mut owner = open(&cx, &mut client, &mut peer, &token).await;
-            peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true}))).await.unwrap();
-            client.next_subscription_event(&cx, &token, &mut owner).await.unwrap();
-            peer.send_async(&cx, &notification("notifications/cancelled", 2, json!({"requestId":2}))).await.unwrap();
-            assert!(matches!(client.next_subscription_event(&cx, &token, &mut owner).await.unwrap(),
-                Some(MemorySubscriptionEvent::Terminal)));
+            peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true})))
+                .await
+                .unwrap();
+            client
+                .next_subscription_event(&cx, &token, &mut owner)
+                .await
+                .unwrap();
+            peer.send_async(
+                &cx,
+                &notification("notifications/cancelled", 2, json!({"requestId":2})),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &token, &mut owner)
+                    .await
+                    .unwrap(),
+                Some(MemorySubscriptionEvent::Terminal)
+            ));
             assert!(owner.terminal_result().is_none());
             assert!(!client.executor.has_external_controls(&cx).unwrap());
             peer.send_async(&cx, &response(2, json!({
                 "resultType":"complete", "_meta":{"io.modelcontextprotocol/subscriptionId":2},
             }))).await.unwrap();
             client.drive_once(&cx, &token).await.unwrap();
-            assert!(client.next_subscription_event(&cx, &token, &mut owner).await.unwrap().is_none());
+            assert!(
+                client
+                    .next_subscription_event(&cx, &token, &mut owner)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert!(owner.terminal_result().is_none());
             ordinary_survives(&cx, &mut client, &mut peer).await;
         });
@@ -1187,17 +1358,48 @@ mod tests {
                 let (mut client, mut peer) = connected(&cx).await;
                 let token = McpRequestCancellation::new();
                 let mut owner = open(&cx, &mut client, &mut peer, &token).await;
-                peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true}))).await.unwrap();
-                client.next_subscription_event(&cx, &token, &mut owner).await.unwrap();
-                let count = if oversized_event { 1 } else { MAX_QUEUED_EVENTS + 1 };
+                peer.send_async(&cx, &acknowledgement(2, json!({"toolsListChanged":true})))
+                    .await
+                    .unwrap();
+                client
+                    .next_subscription_event(&cx, &token, &mut owner)
+                    .await
+                    .unwrap();
+                let count = if oversized_event {
+                    1
+                } else {
+                    MAX_QUEUED_EVENTS + 1
+                };
                 for _ in 0..count {
-                    let params = if oversized_event { json!({"padding": "x".repeat(MAX_EVENT_SOURCE_BYTES)}) } else { json!({}) };
-                    peer.send_async(&cx, &notification("notifications/tools/list_changed", 2, params)).await.unwrap();
+                    let params = if oversized_event {
+                        json!({"padding": "x".repeat(MAX_EVENT_SOURCE_BYTES)})
+                    } else {
+                        json!({})
+                    };
+                    peer.send_async(
+                        &cx,
+                        &notification("notifications/tools/list_changed", 2, params),
+                    )
+                    .await
+                    .unwrap();
                     client.drive_once(&cx, &token).await.unwrap();
                 }
-                assert_eq!(client.next_subscription_event(&cx, &token, &mut owner).await.unwrap_err().code,
-                    McpErrorCode::InvalidRequest);
-                assert_eq!(client.subscriptions.queue_budget.bytes.load(Ordering::Acquire), 0);
+                assert_eq!(
+                    client
+                        .next_subscription_event(&cx, &token, &mut owner)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidRequest
+                );
+                assert_eq!(
+                    client
+                        .subscriptions
+                        .queue_budget
+                        .bytes
+                        .load(Ordering::Acquire),
+                    0
+                );
                 client.drive_once(&cx, &token).await.unwrap();
                 receive(&cx, &mut peer, "notifications/cancelled").await;
                 ordinary_survives(&cx, &mut client, &mut peer).await;
@@ -1274,8 +1476,14 @@ mod tests {
                 owners.push(open(&cx, &mut client, &mut peer, &token).await);
             }
             let next_id = client.next_id;
-            assert_eq!(client.subscribe(&cx, &token, tools_filter()).await.unwrap_err().code,
-                McpErrorCode::InvalidParams);
+            assert_eq!(
+                client
+                    .subscribe(&cx, &token, tools_filter())
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidParams
+            );
             assert_eq!(client.next_id, next_id);
             drop(owners.remove(0));
             client.drive_once(&cx, &token).await.unwrap();
@@ -1371,7 +1579,6 @@ mod tests {
             }
         });
     }
-
 
     #[test]
     fn memory_subscription_current_waiter_cancellation_preserves_elected_completion() {
@@ -1598,7 +1805,10 @@ mod tests {
                 for _ in 0..crate::execution::DEFAULT_MAX_IN_FLIGHT_EXECUTIONS {
                     client
                         .executor
-                        .drive_frame(&cx, ReceivedTransportFrame::admit(rejected.clone()).unwrap())
+                        .drive_frame(
+                            &cx,
+                            ReceivedTransportFrame::admit(rejected.clone()).unwrap(),
+                        )
                         .unwrap();
                 }
                 assert!(client.executor.terminal_error().is_none());
@@ -1644,8 +1854,17 @@ mod tests {
         run(|cx| async move {
             let (mut client, mut peer) = connected(&cx).await;
             let token = McpRequestCancellation::new();
-            let filter = serde_json::from_value::<SubscriptionFilter>(json!({"taskIds":["task-a"]})).unwrap();
-            assert_eq!(client.subscribe(&cx, &token, filter).await.unwrap_err().code, McpErrorCode::InvalidParams);
+            let filter =
+                serde_json::from_value::<SubscriptionFilter>(json!({"taskIds":["task-a"]}))
+                    .unwrap();
+            assert_eq!(
+                client
+                    .subscribe(&cx, &token, filter)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidParams
+            );
             assert_eq!(client.next_id, 2);
             assert!(client.executor.pending_records().is_empty());
             ordinary_survives(&cx, &mut client, &mut peer).await;
@@ -1679,8 +1898,7 @@ mod tests {
             else {
                 panic!("a legal large completed Task must be delivered");
             };
-            let crate::FinalTask::Completed { result, .. } = &notification.params.task
-            else {
+            let crate::FinalTask::Completed { result, .. } = &notification.params.task else {
                 panic!("the admitted event must retain its completed result");
             };
             assert!(matches!(result.result.content.as_slice(),
@@ -1934,26 +2152,61 @@ mod tests {
     fn memory_subscription_task_events_keep_exact_result_source_and_accepted_ids() {
         run(|cx| async move {
             let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
-            peer.send_async(&cx, &response(1, json!({
-                "resultType":"complete", "supportedVersions":["2026-07-28"],
-                "capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},
-                "ttlMs":0, "cacheScope":"private",
-            }))).await.unwrap();
-            let mut client = MemoryClient::builder(info()).with_tasks().connect(&cx, transport).await.unwrap();
+            peer.send_async(
+                &cx,
+                &response(
+                    1,
+                    json!({
+                        "resultType":"complete", "supportedVersions":["2026-07-28"],
+                        "capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},
+                        "ttlMs":0, "cacheScope":"private",
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+            let mut client = MemoryClient::builder(info())
+                .with_tasks()
+                .connect(&cx, transport)
+                .await
+                .unwrap();
             receive(&cx, &mut peer, "server/discover").await;
             let token = McpRequestCancellation::new();
-            let filter = serde_json::from_value::<SubscriptionFilter>(json!({"taskIds":["task-a","task-b"]})).unwrap();
+            let filter = serde_json::from_value::<SubscriptionFilter>(
+                json!({"taskIds":["task-a","task-b"]}),
+            )
+            .unwrap();
             let mut owner = client.subscribe(&cx, &token, filter).await.unwrap();
             let request = receive(&cx, &mut peer, "subscriptions/listen").await;
-            assert_eq!(request.params.unwrap()["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]["io.modelcontextprotocol/tasks"], json!({}));
-            peer.send_async(&cx, &acknowledgement(2, json!({"taskIds":["task-a"]}))).await.unwrap();
-            let Some(MemorySubscriptionEvent::Acknowledged { unsupported, .. }) = client.next_subscription_event(&cx, &token, &mut owner).await.unwrap() else {
+            assert_eq!(
+                request.params.unwrap()["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    ["io.modelcontextprotocol/tasks"],
+                json!({})
+            );
+            peer.send_async(&cx, &acknowledgement(2, json!({"taskIds":["task-a"]})))
+                .await
+                .unwrap();
+            let Some(MemorySubscriptionEvent::Acknowledged { unsupported, .. }) = client
+                .next_subscription_event(&cx, &token, &mut owner)
+                .await
+                .unwrap()
+            else {
                 panic!("expected Tasks acknowledgement");
             };
             assert_eq!(unsupported.additional["taskIds"], json!(["task-b"]));
             let source = br#"{"jsonrpc":"2.0","method":"notifications/tasks","params":{"taskId":"task-a","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:01.000Z","ttlMs":60000,"result":{"content":[],"precise":7.30e-2,"huge":18446744073709551617},"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#;
-            admit_frame(&client.executor, &mut client.subscriptions, &cx, ReceivedTransportFrame::admit(source.to_vec()).unwrap()).unwrap();
-            let Some(MemorySubscriptionEvent::Task(notification)) = client.next_subscription_event(&cx, &token, &mut owner).await.unwrap() else {
+            admit_frame(
+                &client.executor,
+                &mut client.subscriptions,
+                &cx,
+                ReceivedTransportFrame::admit(source.to_vec()).unwrap(),
+            )
+            .unwrap();
+            let Some(MemorySubscriptionEvent::Task(notification)) = client
+                .next_subscription_event(&cx, &token, &mut owner)
+                .await
+                .unwrap()
+            else {
                 panic!("expected exact-source Task notification");
             };
             let retained = serde_json::to_string(&notification).unwrap();
@@ -1961,9 +2214,17 @@ mod tests {
             assert!(retained.contains("18446744073709551617"));
             let mut foreign = serde_json::from_slice::<Value>(source).unwrap();
             foreign["params"]["taskId"] = json!("task-b");
-            let frame = ReceivedTransportFrame::admit(serde_json::to_vec(&foreign).unwrap()).unwrap();
+            let frame =
+                ReceivedTransportFrame::admit(serde_json::to_vec(&foreign).unwrap()).unwrap();
             admit_frame(&client.executor, &mut client.subscriptions, &cx, frame).unwrap();
-            assert_eq!(client.next_subscription_event(&cx, &token, &mut owner).await.unwrap_err().code, McpErrorCode::InvalidRequest);
+            assert_eq!(
+                client
+                    .next_subscription_event(&cx, &token, &mut owner)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidRequest
+            );
             client.drive_once(&cx, &token).await.unwrap();
             receive(&cx, &mut peer, "notifications/cancelled").await;
             ordinary_survives(&cx, &mut client, &mut peer).await;

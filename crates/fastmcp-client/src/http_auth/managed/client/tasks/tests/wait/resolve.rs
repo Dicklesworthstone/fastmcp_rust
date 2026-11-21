@@ -362,7 +362,10 @@ fn resolve_admits_the_entire_batch_before_the_first_callback() {
             ))
             .await;
             assert_eq!(result.is_err(), unsupported_later);
-            assert_eq!(count.load(Ordering::SeqCst), usize::from(!unsupported_later));
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                usize::from(!unsupported_later)
+            );
             assert_eq!(
                 client.cached_credential_generation(),
                 (!unsupported_later).then_some(1)
@@ -488,8 +491,13 @@ fn resolve_failed_update_is_not_replayed_and_next_explicit_call_rediscovers() {
         assert_eq!(client.cached_credential_generation(), None);
         let (next, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {
             peer.discovery("access-one", true).await;
-            peer.rpc("tasks/get", "access-one", task("working", "complete"), false)
-                .await;
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            )
+            .await;
         }))
         .await;
         assert!(matches!(next.unwrap().task, FinalTask::Working(_)));
@@ -615,8 +623,13 @@ fn resolve_deadline_interrupts_a_silent_host_callback_and_retires_its_owner() {
         // Do not charge TLS discovery latency to the short timer assertion.
         let (primed, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {
             peer.discovery("access-one", true).await;
-            peer.rpc("tasks/get", "access-one", task("working", "complete"), false)
-                .await;
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            )
+            .await;
         }))
         .await;
         primed.unwrap();
@@ -706,8 +719,12 @@ fn parallel_inputs_overlap_keep_exact_keys_and_never_replay_an_uncertain_update(
     let typed: TaskInputRequests = serde_json::from_value(inputs.clone()).unwrap();
     let root_answer = FinalEmbeddedRootsListResult { roots: vec![] };
     let exact = serde_json::to_vec(&typed).unwrap().len()
-        + serde_json::to_vec(&("a-sample", sample_answer())).unwrap().len()
-        + serde_json::to_vec(&("b-roots", &root_answer)).unwrap().len();
+        + serde_json::to_vec(&("a-sample", sample_answer()))
+            .unwrap()
+            .len()
+        + serde_json::to_vec(&("b-roots", &root_answer))
+            .unwrap()
+            .len();
     // Change only the byte allowance or whether the one update is acknowledged.
     // Every row still requires both input futures to overlap and retain keys.
     for case in 0..3 {
@@ -780,14 +797,22 @@ fn parallel_inputs_overlap_keep_exact_keys_and_never_replay_an_uncertain_update(
                         .all(|token| token.is_cancel_requested() == (case != 2))
                 );
             }
-            assert_eq!(client.cached_credential_generation(), (case == 2).then_some(1));
+            assert_eq!(
+                client.cached_credential_generation(),
+                (case == 2).then_some(1)
+            );
             assert!(session.check(&cx, &McpRequestCancellation::new()).is_ok());
             let (next, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {
                 if case != 2 {
                     peer.discovery("access-one", true).await;
                 }
-                peer.rpc("tasks/get", "access-one", task("working", "complete"), false)
-                    .await;
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("working", "complete"),
+                    false,
+                )
+                .await;
             }))
             .await;
             assert!(matches!(next.unwrap().task, FinalTask::Working(_)));
@@ -815,33 +840,36 @@ fn a_ready_parallel_sibling_cannot_update_after_cancellation_logout_or_revocatio
             let disposed = Arc::clone(&drops);
             let tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed = Arc::clone(&tokens);
-            let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
-                observed.lock().unwrap().push(local);
-                match counted.fetch_add(1, Ordering::SeqCst) {
-                    0 => {
-                        let owner = Dropped(Arc::clone(&disposed));
-                        Box::pin(async move {
-                            let _owner = owner;
-                            std::future::pending().await
-                        })
-                    }
-                    1 => {
-                        match cause {
-                            0 => {
-                                cancel.cancel();
-                            }
-                            1 => {
-                                login.close();
-                            }
-                            _ => {
-                                credential.revoke();
-                            }
+            let handlers =
+                ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
+                    observed.lock().unwrap().push(local);
+                    match counted.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            let owner = Dropped(Arc::clone(&disposed));
+                            Box::pin(async move {
+                                let _owner = owner;
+                                std::future::pending().await
+                            })
                         }
-                        Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) })
+                        1 => {
+                            match cause {
+                                0 => {
+                                    cancel.cancel();
+                                }
+                                1 => {
+                                    login.close();
+                                }
+                                _ => {
+                                    credential.revoke();
+                                }
+                            }
+                            Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) })
+                        }
+                        _ => {
+                            panic!("no callback may start after its sibling revokes the operation")
+                        }
                     }
-                    _ => panic!("no callback may start after its sibling revokes the operation"),
-                }
-            });
+                });
             let mut client = client(&peer, session.clone(), handlers);
             let (result, ()) = Box::pin(pair(
                 client.resolve_task_inputs_final_with_cancellation(
@@ -869,7 +897,9 @@ fn a_ready_parallel_sibling_cannot_update_after_cancellation_logout_or_revocatio
             match cause {
                 0 => assert!(matches!(
                     result,
-                    Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))
+                    Err(ManagedHttpClientError::Session(
+                        OAuthSessionError::Cancelled
+                    ))
                 )),
                 1 => assert!(matches!(
                     result,
@@ -910,28 +940,34 @@ fn a_parallel_batch_retains_one_deadline_and_disposes_all_futures_on_abandonment
             let observed = Arc::clone(&tokens);
             let (entered, mut receipt) = asupersync::channel::oneshot::channel::<()>();
             let entered = std::sync::Mutex::new(Some(entered));
-            let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
-                observed.lock().unwrap().push(local);
-                let owner = Dropped(Arc::clone(&disposed));
-                if counted.fetch_add(1, Ordering::SeqCst) == 1 {
-                    entered
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .unwrap()
-                        .send_blocking(())
-                        .unwrap();
-                }
-                Box::pin(async move {
-                    let _owner = owner;
-                    std::future::pending().await
-                })
-            });
+            let handlers =
+                ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
+                    observed.lock().unwrap().push(local);
+                    let owner = Dropped(Arc::clone(&disposed));
+                    if counted.fetch_add(1, Ordering::SeqCst) == 1 {
+                        entered
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .send_blocking(())
+                            .unwrap();
+                    }
+                    Box::pin(async move {
+                        let _owner = owner;
+                        std::future::pending().await
+                    })
+                });
             let mut client = client(&peer, session.clone(), handlers);
             let (primed, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {
                 peer.discovery("access-one", true).await;
-                peer.rpc("tasks/get", "access-one", task("working", "complete"), false)
-                    .await;
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("working", "complete"),
+                    false,
+                )
+                .await;
             }))
             .await;
             primed.unwrap();

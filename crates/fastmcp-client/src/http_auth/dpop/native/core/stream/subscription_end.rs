@@ -31,14 +31,18 @@ pub(super) fn admit_cancelled(
     struct RawNotification {
         params: Box<serde_json::value::RawValue>,
     }
-    let raw: RawNotification = serde_json::from_slice(frame)
-        .map_err(|_| ManagedCoreError::InvalidResponse)?;
+    let raw: RawNotification =
+        serde_json::from_slice(frame).map_err(|_| ManagedCoreError::InvalidResponse)?;
     // Discard the typed payload immediately: reason/unknown fields are not
     // diagnostic authority and must never escape through the terminal error.
     ServerNotification::decode_with_raw_params(&request, raw.params.get())
         .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
-    let params = request.params.as_ref().ok_or(ManagedCoreError::InvalidResponse)?;
-    let target = params.get("requestId")
+    let params = request
+        .params
+        .as_ref()
+        .ok_or(ManagedCoreError::InvalidResponse)?;
+    let target = params
+        .get("requestId")
         .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
         .ok_or(ManagedCoreError::ResponseIdMismatch)?;
     if !target.correlates_with(id) {
@@ -48,7 +52,8 @@ pub(super) fn admit_cancelled(
 }
 
 fn check_subscription_marker(value: &Value, id: &RequestId) -> Result<(), DpopStreamError> {
-    let marker = value.get("_meta")
+    let marker = value
+        .get("_meta")
         .and_then(Value::as_object)
         .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
         .and_then(|marker| serde_json::from_value::<RequestId>(marker.clone()).ok())

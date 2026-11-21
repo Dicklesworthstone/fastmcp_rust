@@ -119,14 +119,16 @@ fn operation_ids_require_distinct_exact_correlation_keys() {
             Err(ManagedCoreError::InvalidRequest)
         ));
     }
-    assert!(DpopExtensionOperation::new(
-        RequestId::Number(1),
-        RequestId::String("1".to_owned()),
-        extension_id(),
-        METHOD,
-        json!({}),
-    )
-    .is_ok());
+    assert!(
+        DpopExtensionOperation::new(
+            RequestId::Number(1),
+            RequestId::String("1".to_owned()),
+            extension_id(),
+            METHOD,
+            json!({}),
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -143,14 +145,16 @@ fn operation_parameters_require_an_object_with_object_metadata() {
             Err(ManagedCoreError::InvalidRequest)
         ));
     }
-    assert!(DpopExtensionOperation::new(
-        RequestId::Number(1),
-        RequestId::Number(2),
-        extension_id(),
-        METHOD,
-        json!({"_meta":{"progressToken":"owned", "com.example/note":"retained"}}),
-    )
-    .is_ok());
+    assert!(
+        DpopExtensionOperation::new(
+            RequestId::Number(1),
+            RequestId::Number(2),
+            extension_id(),
+            METHOD,
+            json!({"_meta":{"progressToken":"owned", "com.example/note":"retained"}}),
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -164,10 +168,10 @@ fn configuration_requires_a_registered_owner_without_running_discovery() {
             ExtensionSettings::new(json!({"format":"echo-v1"})).unwrap(),
         )]),
     };
-    assert!(DpopExtensionConfiguration::new(
-        ExtensionDescriptorRegistry::new(),
-        discovery,
-        || compatible,
-    )
-    .is_err());
+    assert!(
+        DpopExtensionConfiguration::new(ExtensionDescriptorRegistry::new(), discovery, || {
+            compatible
+        },)
+        .is_err()
+    );
 }

@@ -456,9 +456,8 @@ mod subscriptions {
     use std::task::Poll;
 
     use fastmcp_rust::{
-        ClientInfo, CoreResult, FinalCoreResult, McpError, McpErrorCode,
-        McpRequestCancellation, MemorySubscriptionEvent, ServerNotification,
-        SubscriptionFilter, resource, serde_json,
+        ClientInfo, CoreResult, FinalCoreResult, McpError, McpErrorCode, McpRequestCancellation,
+        MemorySubscriptionEvent, ServerNotification, SubscriptionFilter, resource, serde_json,
     };
 
     const RESOURCE: &str = "memory://subscriptions/observed";
@@ -485,7 +484,10 @@ mod subscriptions {
     async fn emit(cx: &Cx, client: &mut modern::MemoryClient, category: &str) {
         let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = client
             .call_tool(
-                cx, &McpRequestCancellation::new(), "memory_emit", json!({"category": category}),
+                cx,
+                &McpRequestCancellation::new(),
+                "memory_emit",
+                json!({"category": category}),
             )
             .await
             .unwrap()
@@ -493,7 +495,10 @@ mod subscriptions {
             panic!("publishing a change must not consume a listener's result");
         };
         assert!(!result.payload.is_error);
-        assert_eq!(serde_json::to_value(result.payload).unwrap()["content"][0]["text"], "true");
+        assert_eq!(
+            serde_json::to_value(result.payload).unwrap()["content"][0]["text"],
+            "true"
+        );
     }
 
     #[test]
@@ -651,9 +656,9 @@ mod interactions {
     use fastmcp_rust::{
         ClientCapabilities, ClientInfo, CompleteResult, CoreResult, FinalCoreResult,
         FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalGetPromptResult,
-        FinalReadResourceResult, FinalRootsContextExt, FinalSamplingContextExt,
-        FinalToolOutcome, McpError, McpRequestCancellation, MrtrCompletedInputs, ResultMeta,
-        prompt, resource, serde_json,
+        FinalReadResourceResult, FinalRootsContextExt, FinalSamplingContextExt, FinalToolOutcome,
+        McpError, McpRequestCancellation, MrtrCompletedInputs, ResultMeta, prompt, resource,
+        serde_json,
     };
     // The facade scopes these two under `modern::` rather than re-exporting them
     // at the root; the root carries `FinalToolOutcome` but not these. Naming the
@@ -1112,7 +1117,9 @@ mod typed_tasks {
         }
 
         fn call(&self, _ctx: &McpContext, _arguments: JsonValue) -> McpResult<Vec<Content>> {
-            Err(McpError::invalid_request("This operation requires modern Tasks"))
+            Err(McpError::invalid_request(
+                "This operation requires modern Tasks",
+            ))
         }
 
         fn declares_final_tasks(&self) -> bool {
@@ -1185,22 +1192,22 @@ mod typed_tasks {
                                     self.0.cancelled.fetch_add(1, Ordering::AcqRel);
                                     break;
                                 }
-                                cx.checkpoint()
-                                    .map_err(|_| McpError::request_cancelled())?;
+                                cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
                                 asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                             }
                         }
                     }
                     FinalTaskSupervisorHandoff::Resumed(accepted) => {
-                        let expected = if accepted.work_descriptor().as_value()["mode"] == "input-batch" {
-                            json!({
-                                "a-prior": {"roots": []},
-                                "b-first": {"roots": []},
-                                "c-second": {"roots": []},
-                            })
-                        } else {
-                            json!({"roots": {"roots": []}})
-                        };
+                        let expected =
+                            if accepted.work_descriptor().as_value()["mode"] == "input-batch" {
+                                json!({
+                                    "a-prior": {"roots": []},
+                                    "b-first": {"roots": []},
+                                    "c-second": {"roots": []},
+                                })
+                            } else {
+                                json!({"roots": {"roots": []}})
+                            };
                         assert_eq!(
                             serde_json::to_value(accepted.input_responses()).unwrap(),
                             expected,
@@ -1511,12 +1518,9 @@ mod typed_tasks {
                 .attach_final_task(&cx, &cancellation, id.clone())
                 .await
                 .unwrap();
-            let wait_policy = FinalTaskWaitPolicy::new(
-                Duration::from_secs(2),
-                256,
-                Duration::from_millis(5),
-            )
-            .unwrap();
+            let wait_policy =
+                FinalTaskWaitPolicy::new(Duration::from_secs(2), 256, Duration::from_millis(5))
+                    .unwrap();
             assert_eq!(
                 handle
                     .wait_with_memory(&cx, &mut client, &cancellation, wait_policy)
@@ -1530,7 +1534,10 @@ mod typed_tasks {
             }))
             .unwrap();
             let mut observation = client.subscribe(&cx, &cancellation, filter).await.unwrap();
-            let Some(MemorySubscriptionEvent::Acknowledged { accepted, unsupported }) = client
+            let Some(MemorySubscriptionEvent::Acknowledged {
+                accepted,
+                unsupported,
+            }) = client
                 .next_subscription_event(&cx, &cancellation, &mut observation)
                 .await
                 .unwrap()
@@ -1822,7 +1829,11 @@ mod typed_tasks {
                 .unwrap();
             assert_eq!(echo.request_id(), &RequestId::Number(2));
             loop {
-                match client.next_event(&cx, &cancellation, &mut echo).await.unwrap() {
+                match client
+                    .next_event(&cx, &cancellation, &mut echo)
+                    .await
+                    .unwrap()
+                {
                     Some(fastmcp_rust::MemoryRequestEvent::Result(_)) => break,
                     Some(fastmcp_rust::MemoryRequestEvent::Notification(_)) => {}
                     None => panic!("the surviving core request must complete"),

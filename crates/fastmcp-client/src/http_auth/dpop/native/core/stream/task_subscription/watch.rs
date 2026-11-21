@@ -23,19 +23,17 @@ use asupersync::http::h1::Method;
 use asupersync::time::Sleep;
 use fastmcp_protocol::tasks_extension::{GetTaskResult, Task, TaskInputRequests};
 
-use super::*;
-use input::{InputDecision, InputDriver, ManagedTaskDriverError, ManagedTaskInputAction, NoInput};
 use super::super::Reader;
+use super::*;
 use crate::http_auth::dpop::native::core::stream::budget::SharedStreamBudget;
-use live::{Follow, LiveListen, LiveStep, ReadOwner};
-use crate::http_auth::dpop::native::{
-    DpopHttpError, check_live, resource_headers, within,
-};
+use crate::http_auth::dpop::native::core::tasks::wait::DpopTaskWaitOutcome;
 use crate::http_auth::dpop::native::core::tasks::{
     DpopTaskOperation, ManagedTaskEvent, ManagedTaskRequest,
 };
-use crate::http_auth::dpop::native::core::tasks::wait::DpopTaskWaitOutcome;
+use crate::http_auth::dpop::native::{DpopHttpError, check_live, resource_headers, within};
 use crate::http_executor::{MODERN_MCP_ACCEPT, validate_response_head};
+use input::{InputDecision, InputDriver, ManagedTaskDriverError, ManagedTaskInputAction, NoInput};
+use live::{Follow, LiveListen, LiveStep, ReadOwner};
 
 /// Limits the initial snapshot and all event-triggered reconciliations.
 /// No interval is needed: a quiet acknowledged subscription is never polled.
@@ -59,7 +57,10 @@ impl DpopTaskPollingFallback {
         {
             return Err(DpopTaskWatchError::InvalidPolicy);
         }
-        Ok(Self { maximum_polls, minimum_poll_interval })
+        Ok(Self {
+            maximum_polls,
+            minimum_poll_interval,
+        })
     }
 }
 
@@ -86,7 +87,10 @@ impl DpopTaskReconnectPolicy {
         {
             return Err(DpopTaskWatchError::InvalidPolicy);
         }
-        Ok(Self { maximum_reconnects, minimum_delay })
+        Ok(Self {
+            maximum_reconnects,
+            minimum_delay,
+        })
     }
 }
 
@@ -99,7 +103,11 @@ pub struct DpopTaskWatchPolicy {
 
 impl Default for DpopTaskWatchPolicy {
     fn default() -> Self {
-        Self { maximum_snapshots: 64, fallback: None, reconnect: None }
+        Self {
+            maximum_snapshots: 64,
+            fallback: None,
+            reconnect: None,
+        }
     }
 }
 
@@ -111,7 +119,11 @@ impl DpopTaskWatchPolicy {
         if !(1..=1024).contains(&maximum_snapshots) {
             return Err(DpopTaskWatchError::InvalidPolicy);
         }
-        Ok(Self { maximum_snapshots, fallback: None, reconnect: None })
+        Ok(Self {
+            maximum_snapshots,
+            fallback: None,
+            reconnect: None,
+        })
     }
 
     /// Opt into bounded observation-only polling if an acknowledged subscription
@@ -124,7 +136,8 @@ impl DpopTaskWatchPolicy {
         minimum_poll_interval: Duration,
     ) -> Result<Self, DpopTaskWatchError> {
         self.fallback = Some(DpopTaskPollingFallback::new(
-            maximum_polls, minimum_poll_interval,
+            maximum_polls,
+            minimum_poll_interval,
         )?);
         Ok(self)
     }
@@ -141,7 +154,10 @@ impl DpopTaskWatchPolicy {
         maximum_reconnects: usize,
         minimum_delay: Duration,
     ) -> Result<Self, DpopTaskWatchError> {
-        self.reconnect = Some(DpopTaskReconnectPolicy::new(maximum_reconnects, minimum_delay)?);
+        self.reconnect = Some(DpopTaskReconnectPolicy::new(
+            maximum_reconnects,
+            minimum_delay,
+        )?);
         Ok(self)
     }
 }
@@ -173,8 +189,12 @@ impl fmt::Display for DpopTaskWatchError {
             Self::InvalidIdPrefix => "invalid DPoP Task watch identity prefix",
             Self::SnapshotLimit => "DPoP Task watch snapshot limit reached",
             Self::TaskNotAcknowledged => "DPoP Task watch selection was not acknowledged",
-            Self::SubscriptionEndedWhileWorking => "DPoP Task subscription ended while work remains",
-            Self::SubscriptionEndedDuringUpdate => "DPoP Task subscription ended during an input update",
+            Self::SubscriptionEndedWhileWorking => {
+                "DPoP Task subscription ended while work remains"
+            }
+            Self::SubscriptionEndedDuringUpdate => {
+                "DPoP Task subscription ended during an input update"
+            }
             Self::ReconnectLimit => "DPoP Task subscription reconnect limit reached",
             Self::FallbackLimit => "DPoP Task polling fallback limit reached",
             Self::InvalidPollInterval => "DPoP Task polling interval cannot be represented",
@@ -188,15 +208,21 @@ impl fmt::Display for DpopTaskWatchError {
 impl std::error::Error for DpopTaskWatchError {}
 
 impl From<DpopStreamError> for DpopTaskWatchError {
-    fn from(error: DpopStreamError) -> Self { Self::Stream(error) }
+    fn from(error: DpopStreamError) -> Self {
+        Self::Stream(error)
+    }
 }
 
 impl From<DpopHttpError> for DpopTaskWatchError {
-    fn from(error: DpopHttpError) -> Self { Self::Stream(error.into()) }
+    fn from(error: DpopHttpError) -> Self {
+        Self::Stream(error.into())
+    }
 }
 
 impl From<ManagedCoreError> for DpopTaskWatchError {
-    fn from(error: ManagedCoreError) -> Self { Self::Stream(error.into()) }
+    fn from(error: ManagedCoreError) -> Self {
+        Self::Stream(error.into())
+    }
 }
 
 impl From<ManagedTasksError> for DpopTaskWatchError {
@@ -217,11 +243,16 @@ struct WatchState {
 }
 
 impl WatchState {
-    fn new(prefix: &str, policy: DpopTaskWatchPolicy, limits: DpopStreamLimits)
-        -> Result<Self, DpopTaskWatchError>
-    {
-        if prefix.is_empty() || prefix.len() > 128
-            || !prefix.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    fn new(
+        prefix: &str,
+        policy: DpopTaskWatchPolicy,
+        limits: DpopStreamLimits,
+    ) -> Result<Self, DpopTaskWatchError> {
+        if prefix.is_empty()
+            || prefix.len() > 128
+            || !prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
         {
             return Err(DpopTaskWatchError::InvalidIdPrefix);
         }
@@ -246,23 +277,37 @@ impl WatchState {
 
     fn remaining_limits(&self) -> Result<DpopStreamLimits, DpopTaskWatchError> {
         let core = self.limits.core;
-        let bytes = core.total_bytes().checked_sub(self.usage.0)
-            .filter(|bytes| *bytes > 0).ok_or(ManagedCoreError::ResponseByteLimit)?;
-        let notifications = core.notifications().checked_sub(self.usage.1)
+        let bytes = core
+            .total_bytes()
+            .checked_sub(self.usage.0)
+            .filter(|bytes| *bytes > 0)
+            .ok_or(ManagedCoreError::ResponseByteLimit)?;
+        let notifications = core
+            .notifications()
+            .checked_sub(self.usage.1)
             .ok_or(ManagedCoreError::NotificationLimit)?;
         let mut limits = self.limits;
         limits.core = ManagedCoreLimits::new(
-            core.request_bytes(), core.frame_bytes().min(bytes), bytes,
-            notifications, core.timeout(),
+            core.request_bytes(),
+            core.frame_bytes().min(bytes),
+            bytes,
+            notifications,
+            core.timeout(),
         )?;
         Ok(limits)
     }
 
     fn charge(&mut self, delta: (usize, usize)) -> Result<(), DpopTaskWatchError> {
-        let bytes = self.usage.0.checked_add(delta.0)
+        let bytes = self
+            .usage
+            .0
+            .checked_add(delta.0)
             .filter(|bytes| *bytes <= self.limits.core.total_bytes())
             .ok_or(ManagedCoreError::ResponseByteLimit)?;
-        let notifications = self.usage.1.checked_add(delta.1)
+        let notifications = self
+            .usage
+            .1
+            .checked_add(delta.1)
             .filter(|count| *count <= self.limits.core.notifications())
             .ok_or(ManagedCoreError::NotificationLimit)?;
         // A rejected admission cannot partially spend the other allowance.
@@ -270,9 +315,10 @@ impl WatchState {
         Ok(())
     }
 
-    fn snapshot_request(&mut self, task: &TaskId)
-        -> Result<(DpopTaskOperation, DpopStreamLimits), DpopTaskWatchError>
-    {
+    fn snapshot_request(
+        &mut self,
+        task: &TaskId,
+    ) -> Result<(DpopTaskOperation, DpopStreamLimits), DpopTaskWatchError> {
         self.require_snapshot()?;
         let limits = self.remaining_limits()?;
         let operation = DpopTaskOperation::new(
@@ -293,25 +339,32 @@ impl WatchState {
             self.fallback_due = None;
             return Ok(());
         }
-        let peer = task.base().poll_interval_ms.as_ref()
+        let peer = task
+            .base()
+            .poll_interval_ms
+            .as_ref()
             .map(|hint| hint.try_as_millis())
             .transpose()
             .map_err(|_| DpopTaskWatchError::InvalidPollInterval)?
             .map(Duration::from_millis)
             .unwrap_or(fallback.minimum_poll_interval);
-        let nanos = u64::try_from(peer.max(fallback.minimum_poll_interval).as_nanos())
-            .unwrap_or(u64::MAX);
+        let nanos =
+            u64::try_from(peer.max(fallback.minimum_poll_interval).as_nanos()).unwrap_or(u64::MAX);
         self.fallback_due = Some(now.saturating_add_nanos(nanos));
         Ok(())
     }
 
     fn begin_fallback_poll(&mut self) -> Result<Option<Time>, DpopTaskWatchError> {
-        let Some(fallback) = self.policy.fallback else { return Ok(None); };
+        let Some(fallback) = self.policy.fallback else {
+            return Ok(None);
+        };
         if self.fallback_polls >= fallback.maximum_polls {
             return Err(DpopTaskWatchError::FallbackLimit);
         }
         self.require_snapshot()?;
-        let due = self.fallback_due.ok_or(DpopTaskWatchError::UnexpectedResponse)?;
+        let due = self
+            .fallback_due
+            .ok_or(DpopTaskWatchError::UnexpectedResponse)?;
         self.fallback_polls += 1;
         Ok(Some(due))
     }
@@ -319,7 +372,9 @@ impl WatchState {
     // Called only after validated terminal framing AND the final get says
     // Working. Errors, provisional results and incomplete EOF never reach it.
     fn begin_reconnect(&mut self, now: Time) -> Result<Option<Time>, DpopTaskWatchError> {
-        let Some(policy) = self.policy.reconnect else { return Ok(None); };
+        let Some(policy) = self.policy.reconnect else {
+            return Ok(None);
+        };
         if self.reconnects >= policy.maximum_reconnects {
             return if self.policy.fallback.is_some() {
                 Ok(None)
@@ -339,9 +394,11 @@ impl WatchState {
         Ok(Some(now.saturating_add_nanos(delay)))
     }
 
-    fn selection(&self, metadata: FinalRequestMeta, task: &TaskId)
-        -> Result<DpopTaskSubscription, DpopTaskWatchError>
-    {
+    fn selection(
+        &self,
+        metadata: FinalRequestMeta,
+        task: &TaskId,
+    ) -> Result<DpopTaskSubscription, DpopTaskWatchError> {
         let id = if self.reconnects == 0 {
             format!("{}.listen", self.prefix)
         } else {
@@ -350,14 +407,20 @@ impl WatchState {
         Ok(DpopTaskSubscription::new(
             RequestId::String(format!("{id}.discover")),
             RequestId::String(id),
-            metadata, vec![task.clone()],
+            metadata,
+            vec![task.clone()],
         )?)
     }
 
-    fn require_acknowledged(decoder: &TaskSubscriptionDecoder, task: &TaskId)
-        -> Result<(), DpopTaskWatchError>
-    {
-        if !decoder.accepted.as_ref().is_some_and(|ids| ids.contains(task)) {
+    fn require_acknowledged(
+        decoder: &TaskSubscriptionDecoder,
+        task: &TaskId,
+    ) -> Result<(), DpopTaskWatchError> {
+        if !decoder
+            .accepted
+            .as_ref()
+            .is_some_and(|ids| ids.contains(task))
+        {
             return Err(DpopTaskWatchError::TaskNotAcknowledged);
         }
         Ok(())
@@ -377,10 +440,16 @@ fn outcome(snapshot: GetTaskResult) -> Option<DpopTaskWaitOutcome> {
 impl DpopHttpClient {
     #[allow(clippy::too_many_arguments)]
     async fn watch_snapshot<R, F, O>(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        credential: &DpopCredential, metadata: &FinalRequestMeta, task: &TaskId,
-        state: &mut WatchState, bounds: WaitBounds,
-        input: &mut Option<InputDriver<R, O>>, may_update: bool,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: &FinalRequestMeta,
+        task: &TaskId,
+        state: &mut WatchState,
+        bounds: WaitBounds,
+        input: &mut Option<InputDriver<R, O>>,
+        may_update: bool,
     ) -> Result<Option<DpopTaskWaitOutcome>, DpopTaskWatchError>
     where
         R: FnMut(TaskInputRequests) -> F,
@@ -390,9 +459,18 @@ impl DpopHttpClient {
         loop {
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             let (operation, limits) = state.snapshot_request(task)?;
-            let completed = self.request_task_stream_with_bounds(
-                cx, cancellation, credential, metadata.clone(), operation, limits, bounds, &mut |_| true,
-            ).await?;
+            let completed = self
+                .request_task_stream_with_bounds(
+                    cx,
+                    cancellation,
+                    credential,
+                    metadata.clone(),
+                    operation,
+                    limits,
+                    bounds,
+                    &mut |_| true,
+                )
+                .await?;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             state.charge(completed.usage)?;
             let ManagedTaskEvent::Snapshot(snapshot) = completed.result else {
@@ -400,19 +478,38 @@ impl DpopHttpClient {
             };
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             state.note_snapshot(cx.now(), &snapshot.task)?;
-            let Some(input) = input.as_mut() else { return Ok(outcome(*snapshot)); };
-            let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
-            let decision = input.on_snapshot(&life, state, &snapshot.task, may_update).await?;
+            let Some(input) = input.as_mut() else {
+                return Ok(outcome(*snapshot));
+            };
+            let life = Lifetime {
+                cx,
+                cancellation,
+                session: &self.session,
+                credential,
+                bounds,
+            };
+            let decision = input
+                .on_snapshot(&life, state, &snapshot.task, may_update)
+                .await?;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             match decision {
                 InputDecision::Return => return Ok(outcome(*snapshot)),
                 InputDecision::Wait => return Ok(None),
                 InputDecision::Update(responses) => {
-                    let (operation, limits) = input.update_request(state, snapshot.task, responses)?;
-                    let completed = self.request_task_stream_with_bounds(
-                        cx, cancellation, credential, metadata.clone(), operation, limits,
-                        bounds, &mut |_| true,
-                    ).await?;
+                    let (operation, limits) =
+                        input.update_request(state, snapshot.task, responses)?;
+                    let completed = self
+                        .request_task_stream_with_bounds(
+                            cx,
+                            cancellation,
+                            credential,
+                            metadata.clone(),
+                            operation,
+                            limits,
+                            bounds,
+                            &mut |_| true,
+                        )
+                        .await?;
                     check_live(cx, cancellation, &self.session, credential, bounds)?;
                     state.charge(completed.usage)?;
                     if !matches!(completed.result, ManagedTaskEvent::Updated(_)) {
@@ -435,9 +532,14 @@ impl DpopHttpClient {
     // uncertain: it may not silently enter the read-only reconnect path.
     #[allow(clippy::too_many_arguments)]
     async fn watch_live_snapshot<R, F, O, B>(
-        &mut self, metadata: &FinalRequestMeta, task: &TaskId,
-        state: &mut WatchState, input: &mut Option<InputDriver<R, O>>, may_update: bool,
-        live: &mut LiveListen<B>, owner: &ReadOwner<'_>,
+        &mut self,
+        metadata: &FinalRequestMeta,
+        task: &TaskId,
+        state: &mut WatchState,
+        input: &mut Option<InputDriver<R, O>>,
+        may_update: bool,
+        live: &mut LiveListen<B>,
+        owner: &ReadOwner<'_>,
     ) -> Result<Option<DpopTaskWaitOutcome>, DpopTaskWatchError>
     where
         R: FnMut(TaskInputRequests) -> F,
@@ -456,14 +558,27 @@ impl DpopHttpClient {
             let (operation, limits) = state.snapshot_request(task)?;
             live.clear_hint();
             let budget = live.budget.clone();
-            let completed = live.follow(owner, async {
-                Ok(self.request_task_stream_with_budget(
-                    cx, cancellation, credential, metadata.clone(), operation, limits,
-                    bounds, &mut |_| true, Some(budget),
-                ).await?)
-            }).await?;
+            let completed = live
+                .follow(owner, async {
+                    Ok(self
+                        .request_task_stream_with_budget(
+                            cx,
+                            cancellation,
+                            credential,
+                            metadata.clone(),
+                            operation,
+                            limits,
+                            bounds,
+                            &mut |_| true,
+                            Some(budget),
+                        )
+                        .await?)
+                })
+                .await?;
             state.usage = live.budget.usage()?;
-            let Follow::Completed(completed) = completed else { return Ok(None); };
+            let Follow::Completed(completed) = completed else {
+                return Ok(None);
+            };
             let ManagedTaskEvent::Snapshot(snapshot) = completed.result else {
                 return Err(DpopTaskWatchError::UnexpectedResponse);
             };
@@ -471,11 +586,24 @@ impl DpopHttpClient {
             state.note_snapshot(cx.now(), &snapshot.task)?;
             // A hint admitted during this get may represent a later transition.
             // Coalesce it into one successor get, never into a fabricated Task.
-            if live.has_hint() && matches!(&snapshot.task, Task::Working(_) | Task::InputRequired { .. }) {
+            if live.has_hint()
+                && matches!(
+                    &snapshot.task,
+                    Task::Working(_) | Task::InputRequired { .. }
+                )
+            {
                 continue;
             }
-            let Some(input) = input.as_mut() else { return Ok(outcome(*snapshot)); };
-            let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+            let Some(input) = input.as_mut() else {
+                return Ok(outcome(*snapshot));
+            };
+            let life = Lifetime {
+                cx,
+                cancellation,
+                session: &self.session,
+                credential,
+                bounds,
+            };
             let resolution = input.on_snapshot(&life, state, &snapshot.task, may_update);
             let decision = if may_update && matches!(&snapshot.task, Task::InputRequired { .. }) {
                 live.follow_input(owner, resolution).await?
@@ -500,18 +628,32 @@ impl DpopHttpClient {
             match decision {
                 InputDecision::Return => return Ok(outcome(*snapshot)),
                 InputDecision::Wait => {
-                    if live.has_hint() { continue; }
+                    if live.has_hint() {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 InputDecision::Update(responses) => {
-                    let (operation, limits) = input.update_request(state, snapshot.task, responses)?;
+                    let (operation, limits) =
+                        input.update_request(state, snapshot.task, responses)?;
                     let budget = live.budget.clone();
-                    let completed = live.follow(owner, async {
-                        Ok(self.request_task_stream_with_budget(
-                            cx, cancellation, credential, metadata.clone(), operation, limits,
-                            bounds, &mut |_| true, Some(budget),
-                        ).await?)
-                    }).await?;
+                    let completed = live
+                        .follow(owner, async {
+                            Ok(self
+                                .request_task_stream_with_budget(
+                                    cx,
+                                    cancellation,
+                                    credential,
+                                    metadata.clone(),
+                                    operation,
+                                    limits,
+                                    bounds,
+                                    &mut |_| true,
+                                    Some(budget),
+                                )
+                                .await?)
+                        })
+                        .await?;
                     state.usage = live.budget.usage()?;
                     let Follow::Completed(completed) = completed else {
                         return Err(DpopTaskWatchError::SubscriptionEndedDuringUpdate);
@@ -530,9 +672,14 @@ impl DpopHttpClient {
 
     #[allow(clippy::too_many_arguments)]
     async fn poll_after_subscription<R, F, O>(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        credential: &DpopCredential, metadata: &FinalRequestMeta, task: &TaskId,
-        state: &mut WatchState, bounds: WaitBounds,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: &FinalRequestMeta,
+        task: &TaskId,
+        state: &mut WatchState,
+        bounds: WaitBounds,
         input: &mut Option<InputDriver<R, O>>,
     ) -> Result<DpopTaskWaitOutcome, DpopTaskWatchError>
     where
@@ -545,13 +692,27 @@ impl DpopHttpClient {
                 return Err(DpopTaskWatchError::SubscriptionEndedWhileWorking);
             };
             within(cx, cancellation, &self.session, credential, bounds, async {
-                if cx.now() < due { Sleep::new(due).await; }
+                if cx.now() < due {
+                    Sleep::new(due).await;
+                }
                 Ok(())
-            }).await?;
+            })
+            .await?;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
-            if let Some(result) = self.watch_snapshot(
-                cx, cancellation, credential, metadata, task, state, bounds, input, false,
-            ).await? {
+            if let Some(result) = self
+                .watch_snapshot(
+                    cx,
+                    cancellation,
+                    credential,
+                    metadata,
+                    task,
+                    state,
+                    bounds,
+                    input,
+                    false,
+                )
+                .await?
+            {
                 return Ok(result);
             }
         }
@@ -615,18 +776,38 @@ impl DpopHttpClient {
     /// each explicit run. Generated IDs are not idempotency or restart tokens.
     #[allow(clippy::too_many_arguments)]
     pub async fn watch_task_with_cancellation(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        credential: &DpopCredential, metadata: FinalRequestMeta, task: TaskId,
-        id_prefix: &str, policy: DpopTaskWatchPolicy, limits: DpopStreamLimits,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        task: TaskId,
+        id_prefix: &str,
+        policy: DpopTaskWatchPolicy,
+        limits: DpopStreamLimits,
     ) -> Result<DpopTaskWaitOutcome, DpopTaskWatchError> {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(DpopHttpError::Cancelled.into());
         }
-        let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
+        let bounds = WaitBounds::new(
+            cx,
+            self.policy.timeout.min(limits.core.timeout()),
+            credential,
+        )?;
         Box::pin(self.watch_task_using(
-            cx, cancellation, credential, metadata, task, id_prefix,
-            policy, limits, bounds, (0, 0), None::<NoInput>,
-        )).await
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            task,
+            id_prefix,
+            policy,
+            limits,
+            bounds,
+            (0, 0),
+            None::<NoInput>,
+        ))
+        .await
     }
 
     // Observation and input driving share the same live response owner. Only
@@ -634,10 +815,18 @@ impl DpopHttpClient {
     // observation-only and never retain input answers or an update capability.
     #[allow(clippy::too_many_arguments)]
     async fn watch_task_using<R, F, O>(
-        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
-        credential: &DpopCredential, metadata: FinalRequestMeta, task: TaskId,
-        id_prefix: &str, policy: DpopTaskWatchPolicy, limits: DpopStreamLimits,
-        bounds: WaitBounds, prior_usage: (usize, usize), mut input: Option<InputDriver<R, O>>,
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        task: TaskId,
+        id_prefix: &str,
+        policy: DpopTaskWatchPolicy,
+        limits: DpopStreamLimits,
+        bounds: WaitBounds,
+        prior_usage: (usize, usize),
+        mut input: Option<InputDriver<R, O>>,
     ) -> Result<DpopTaskWaitOutcome, DpopTaskWatchError>
     where
         R: FnMut(TaskInputRequests) -> F,
@@ -649,9 +838,20 @@ impl DpopHttpClient {
         // Only the private creating-call adapter supplies nonzero usage. A
         // creation-to-watch handoff cannot replenish either response quota.
         state.charge(prior_usage)?;
-        if let Some(result) = self.watch_snapshot(
-            cx, cancellation, credential, &metadata, &task, &mut state, bounds, &mut input, true,
-        ).await? {
+        if let Some(result) = self
+            .watch_snapshot(
+                cx,
+                cancellation,
+                credential,
+                &metadata,
+                &task,
+                &mut state,
+                bounds,
+                &mut input,
+                true,
+            )
+            .await?
+        {
             return Ok(result);
         }
         'subscriptions: loop {
@@ -667,14 +867,30 @@ impl DpopHttpClient {
             let may_update = state.reconnects == 0;
             let idle = Idle::new(cx.now(), limits.idle);
             let selection = state.selection(metadata.clone(), &task)?;
-            let prepared = with_caller(cx, || Prepared::new(
-                self.resource().as_str(), selection,
-                remaining.core, self.policy.max_body_bytes,
-            ))?;
-            let response = self.post_resource_with_bounds(
-                cx, cancellation, credential, &prepared.discovery_wire, idle.bounds(bounds),
-            ).await?;
-            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+            let prepared = with_caller(cx, || {
+                Prepared::new(
+                    self.resource().as_str(),
+                    selection,
+                    remaining.core,
+                    self.policy.max_body_bytes,
+                )
+            })?;
+            let response = self
+                .post_resource_with_bounds(
+                    cx,
+                    cancellation,
+                    credential,
+                    &prepared.discovery_wire,
+                    idle.bounds(bounds),
+                )
+                .await?;
+            check_live(
+                cx,
+                cancellation,
+                &self.session,
+                credential,
+                idle.bounds(bounds),
+            )?;
             let (wire, mut decoder) = with_caller(cx, || prepared.admit(response))?;
             state.charge(decoder.usage())?;
             // From this point the decoder holds cumulative watch-wide usage.
@@ -683,59 +899,134 @@ impl DpopHttpClient {
             decoder.bytes = state.usage.0;
             decoder.notifications = state.usage.1;
 
-            let response = within(cx, cancellation, &self.session, credential, idle.bounds(bounds), async {
-                let mut headers = resource_headers(&self.session, credential, &wire, &self.policy)?;
-                for (name, value) in &mut headers {
-                    if name.eq_ignore_ascii_case("Accept") { *value = MODERN_MCP_ACCEPT.to_owned(); }
-                }
-                check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-                self.transport.request_streaming(
-                    cx, Method::Post, self.session.resource.as_str(), headers, wire.body().to_vec(),
-                ).await.map_err(|_| DpopHttpError::TransportFailed)
-            }).await?;
+            let response = within(
+                cx,
+                cancellation,
+                &self.session,
+                credential,
+                idle.bounds(bounds),
+                async {
+                    let mut headers =
+                        resource_headers(&self.session, credential, &wire, &self.policy)?;
+                    for (name, value) in &mut headers {
+                        if name.eq_ignore_ascii_case("Accept") {
+                            *value = MODERN_MCP_ACCEPT.to_owned();
+                        }
+                    }
+                    check_live(
+                        cx,
+                        cancellation,
+                        &self.session,
+                        credential,
+                        idle.bounds(bounds),
+                    )?;
+                    self.transport
+                        .request_streaming(
+                            cx,
+                            Method::Post,
+                            self.session.resource.as_str(),
+                            headers,
+                            wire.body().to_vec(),
+                        )
+                        .await
+                        .map_err(|_| DpopHttpError::TransportFailed)
+                },
+            )
+            .await?;
             let kind = with_caller(cx, || -> Result<_, DpopTaskWatchError> {
-                check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-                Ok(validate_response_head(response.head.status, &response.head.headers)
-                    .map_err(|_| DpopHttpError::InvalidResponseHeaders)?.kind())
+                check_live(
+                    cx,
+                    cancellation,
+                    &self.session,
+                    credential,
+                    idle.bounds(bounds),
+                )?;
+                Ok(
+                    validate_response_head(response.head.status, &response.head.headers)
+                        .map_err(|_| DpopHttpError::InvalidResponseHeaders)?
+                        .kind(),
+                )
             })?;
             let source = self.session.resource.clone();
-            self.session.observe_resource_nonce(&source, &response.head.headers)
+            self.session
+                .observe_resource_nonce(&source, &response.head.headers)
                 .map_err(DpopHttpError::from)?;
-            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+            check_live(
+                cx,
+                cancellation,
+                &self.session,
+                credential,
+                idle.bounds(bounds),
+            )?;
             if response.head.status != 200 {
-                return Err(ManagedCoreError::HttpStatus { status: response.head.status }.into());
+                return Err(ManagedCoreError::HttpStatus {
+                    status: response.head.status,
+                }
+                .into());
             }
             let budget = SharedStreamBudget::new(limits.core, state.usage)?;
-            let mut live = LiveListen::new(response.body, kind, decoder, idle, task.clone(),
-                limits, self.policy.max_body_bytes, budget)?;
+            let mut live = LiveListen::new(
+                response.body,
+                kind,
+                decoder,
+                idle,
+                task.clone(),
+                limits,
+                self.policy.max_body_bytes,
+                budget,
+            )?;
             let owner = ReadOwner::new(cx, cancellation, &self.session, credential, bounds);
             while let LiveStep::Hint = live.next(&owner).await? {
-                if let Some(result) = self.watch_live_snapshot(
-                    &metadata, &task, &mut state, &mut input, may_update, &mut live, &owner,
-                ).await? {
+                if let Some(result) = self
+                    .watch_live_snapshot(
+                        &metadata, &task, &mut state, &mut input, may_update, &mut live, &owner,
+                    )
+                    .await?
+                {
                     return Ok(result);
                 }
             }
             state.usage = live.budget.usage()?;
             drop(live);
-            if let Some(result) = self.watch_snapshot(
-                cx, cancellation, credential, &metadata, &task, &mut state, bounds,
-                &mut input, false,
-            ).await? {
+            if let Some(result) = self
+                .watch_snapshot(
+                    cx,
+                    cancellation,
+                    credential,
+                    &metadata,
+                    &task,
+                    &mut state,
+                    bounds,
+                    &mut input,
+                    false,
+                )
+                .await?
+            {
                 return Ok(result);
             }
             if let Some(due) = state.begin_reconnect(cx.now())? {
                 within(cx, cancellation, &self.session, credential, bounds, async {
-                    if cx.now() < due { Sleep::new(due).await; }
+                    if cx.now() < due {
+                        Sleep::new(due).await;
+                    }
                     Ok(())
-                }).await?;
+                })
+                .await?;
                 check_live(cx, cancellation, &self.session, credential, bounds)?;
                 continue 'subscriptions;
             }
-            return self.poll_after_subscription(
-                cx, cancellation, credential, &metadata, &task, &mut state, bounds,
-                &mut input,
-            ).await;
+            return self
+                .poll_after_subscription(
+                    cx,
+                    cancellation,
+                    credential,
+                    &metadata,
+                    &task,
+                    &mut state,
+                    bounds,
+                    &mut input,
+                )
+                .await;
         }
     }
 }

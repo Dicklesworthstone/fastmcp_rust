@@ -17,20 +17,21 @@ use fastmcp_protocol::tasks_extension::{
     UpdateTaskParams,
 };
 use fastmcp_protocol::{
-    CoreRequest, CoreResult, ExtensionDirection, FinalCoreResult, FinalRequestMeta,
-    RequestId, decode_strict_jsonrpc_response,
+    CoreRequest, CoreResult, ExtensionDirection, FinalCoreResult, FinalRequestMeta, RequestId,
+    decode_strict_jsonrpc_response,
 };
 use serde_json::{Value, json};
 
 use super::{
-    BoundedWriter, CoreDecoder, DpopCoreError, DpopCredential, DpopHttpClient,
-    DpopHttpError, DpopHttpResponse, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_PROTOCOL_VERSION, ManagedCoreError, ManagedCoreLimits, ModernHttpRequest,
-    WaitBounds, check_live, decode_response,
+    BoundedWriter, CoreDecoder, DpopCoreError, DpopCredential, DpopHttpClient, DpopHttpError,
+    DpopHttpResponse, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION, ManagedCoreError,
+    ManagedCoreLimits, ModernHttpRequest, WaitBounds, check_live, decode_response,
 };
 use crate::http_auth::managed::tasks::validate_task_input_shapes;
+pub use crate::http_auth::managed::tasks::{
+    ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError,
+};
 use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
-pub use crate::http_auth::managed::tasks::{ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError};
 
 /// Bounded polling and explicit host input under one original credential.
 pub mod driver;
@@ -69,12 +70,21 @@ impl DpopTaskOperation {
         operation_id: RequestId,
         request: ManagedTaskRequest,
     ) -> Result<Self, ManagedTasksError> {
-        discovery_id.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
-        operation_id.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
+        discovery_id
+            .validate()
+            .map_err(|_| ManagedTasksError::InvalidRequest)?;
+        operation_id
+            .validate()
+            .map_err(|_| ManagedTasksError::InvalidRequest)?;
         if discovery_id.correlates_with(&operation_id) {
             return Err(ManagedTasksError::InvalidRequest);
         }
-        Ok(Self { discovery_id, operation_id, request, reviewed_headers: None })
+        Ok(Self {
+            discovery_id,
+            operation_id,
+            request,
+            reviewed_headers: None,
+        })
     }
 
     /// Selects one already-reviewed tool-argument disclosure plan.
@@ -126,19 +136,29 @@ impl fmt::Display for DpopTasksError {
 }
 impl std::error::Error for DpopTasksError {}
 impl From<DpopCoreError> for DpopTasksError {
-    fn from(error: DpopCoreError) -> Self { Self::Core(error) }
+    fn from(error: DpopCoreError) -> Self {
+        Self::Core(error)
+    }
 }
 impl From<DpopHttpError> for DpopTasksError {
-    fn from(error: DpopHttpError) -> Self { Self::Core(error.into()) }
+    fn from(error: DpopHttpError) -> Self {
+        Self::Core(error.into())
+    }
 }
 impl From<ManagedCoreError> for DpopTasksError {
-    fn from(error: ManagedCoreError) -> Self { Self::Core(error.into()) }
+    fn from(error: ManagedCoreError) -> Self {
+        Self::Core(error.into())
+    }
 }
 impl From<ManagedTasksError> for DpopTasksError {
-    fn from(error: ManagedTasksError) -> Self { Self::Task(error) }
+    fn from(error: ManagedTasksError) -> Self {
+        Self::Task(error)
+    }
 }
 impl From<ToolHeaderDispatchError> for DpopTasksError {
-    fn from(error: ToolHeaderDispatchError) -> Self { Self::Header(error) }
+    fn from(error: ToolHeaderDispatchError) -> Self {
+        Self::Header(error)
+    }
 }
 
 // Method-owned reply state. No response discriminator alone can choose a
@@ -182,17 +202,27 @@ fn wire(
     // Derive the mandatory mirror from the same typed params we serialize;
     // a caller-supplied mirror cannot disagree with the actual operation.
     if matches!(method, TASK_GET | TASK_UPDATE | TASK_CANCEL) {
-        let task_id = params.get("taskId").and_then(Value::as_str)
-            .filter(|value| !value.is_empty()).ok_or(ManagedTasksError::InvalidRequest)?;
+        let task_id = params
+            .get("taskId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(ManagedTasksError::InvalidRequest)?;
         if name.as_deref().is_some_and(|value| value != task_id) {
             return Err(ManagedTasksError::InvalidRequest.into());
         }
         name = Some(task_id.to_owned());
     }
-    let mut writer = BoundedWriter { bytes: Vec::new(), maximum };
-    serde_json::to_writer(&mut writer, &json!({
-        "jsonrpc":"2.0", "id":id, "method":method, "params":params,
-    })).map_err(|_| ManagedTasksError::RequestTooLarge)?;
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        maximum,
+    };
+    serde_json::to_writer(
+        &mut writer,
+        &json!({
+            "jsonrpc":"2.0", "id":id, "method":method, "params":params,
+        }),
+    )
+    .map_err(|_| ManagedTasksError::RequestTooLarge)?;
     ModernHttpRequest::new(target, writer.bytes, FINAL_PROTOCOL_VERSION, method, name)
         .map_err(|_| ManagedTasksError::InvalidRequest.into())
 }
@@ -206,27 +236,41 @@ impl Prepared {
         native_maximum: usize,
     ) -> Result<Self, DpopTasksError> {
         let maximum = limits.request_bytes().min(native_maximum);
-        let mut metadata = serde_json::to_value(metadata)
-            .map_err(|_| ManagedTasksError::InvalidRequest)?;
-        let capabilities = metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
-            .and_then(Value::as_object_mut).ok_or(ManagedTasksError::InvalidRequest)?;
+        let mut metadata =
+            serde_json::to_value(metadata).map_err(|_| ManagedTasksError::InvalidRequest)?;
+        let capabilities = metadata
+            .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+            .and_then(Value::as_object_mut)
+            .ok_or(ManagedTasksError::InvalidRequest)?;
         // Like the existing managed Tasks view, this explicit selection adds
         // only Tasks. It cannot silently replace another extension's settings.
-        if capabilities.get("extensions")
+        if capabilities
+            .get("extensions")
             .is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
         {
             return Err(ManagedTasksError::Negotiation.into());
         }
         capabilities.insert("extensions".to_owned(), json!({TASKS_EXTENSION:{}}));
         let discovery = CoreRequest::decode(
-            ProtocolEra::Modern2026, "server/discover", Some(&json!({"_meta":metadata})),
-        ).map_err(|_| ManagedTasksError::InvalidRequest)?;
-        let discovery_params = discovery.encode_params()
+            ProtocolEra::Modern2026,
+            "server/discover",
+            Some(&json!({"_meta":metadata})),
+        )
+        .map_err(|_| ManagedTasksError::InvalidRequest)?;
+        let discovery_params = discovery
+            .encode_params()
             .map_err(|_| ManagedTasksError::InvalidRequest)?
             .ok_or(ManagedTasksError::InvalidRequest)?;
-        let discovery_wire = wire(target, "server/discover", &operation.discovery_id,
-            discovery_params, None, maximum)?;
-        let discovery_decoder = CoreDecoder::for_request(discovery, operation.discovery_id, limits)?;
+        let discovery_wire = wire(
+            target,
+            "server/discover",
+            &operation.discovery_id,
+            discovery_params,
+            None,
+            maximum,
+        )?;
+        let discovery_decoder =
+            CoreDecoder::for_request(discovery, operation.discovery_id, limits)?;
         let request_meta = TaskRequestMeta {
             meta: serde_json::from_value(metadata.clone())
                 .map_err(|_| ManagedTasksError::InvalidRequest)?,
@@ -235,45 +279,98 @@ impl Prepared {
         let (method, params, name, reply) = match operation.request {
             ManagedTaskRequest::CallTool { name, arguments } => {
                 let mut params = json!({"_meta":metadata,"name":name});
-                if let Some(arguments) = arguments { params["arguments"] = arguments; }
-                let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params))
-                    .map_err(|_| ManagedTasksError::InvalidRequest)?;
-                ("tools/call", params, Some(name), Reply::Tool(Box::new(request)))
+                if let Some(arguments) = arguments {
+                    params["arguments"] = arguments;
+                }
+                let request =
+                    CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params))
+                        .map_err(|_| ManagedTasksError::InvalidRequest)?;
+                (
+                    "tools/call",
+                    params,
+                    Some(name),
+                    Reply::Tool(Box::new(request)),
+                )
             }
             ManagedTaskRequest::Get(task_id) => {
-                let request = TaskMethodRequest::new(id.clone(), TASK_GET,
-                    GetTaskParams { request: request_meta, task_id: task_id.clone() });
-                let request = TaskMethodRequest::decode(serde_json::to_value(request)
-                    .map_err(|_| ManagedTasksError::InvalidRequest)?)
-                    .map_err(|_| ManagedTasksError::InvalidRequest)?;
-                (TASK_GET, serde_json::to_value(request.params)
-                    .map_err(|_| ManagedTasksError::InvalidRequest)?, None, Reply::Get(task_id))
+                let request = TaskMethodRequest::new(
+                    id.clone(),
+                    TASK_GET,
+                    GetTaskParams {
+                        request: request_meta,
+                        task_id: task_id.clone(),
+                    },
+                );
+                let request = TaskMethodRequest::decode(
+                    serde_json::to_value(request).map_err(|_| ManagedTasksError::InvalidRequest)?,
+                )
+                .map_err(|_| ManagedTasksError::InvalidRequest)?;
+                (
+                    TASK_GET,
+                    serde_json::to_value(request.params)
+                        .map_err(|_| ManagedTasksError::InvalidRequest)?,
+                    None,
+                    Reply::Get(task_id),
+                )
             }
-            ManagedTaskRequest::Update { task, input_responses } => {
-                let Task::InputRequired { base, input_requests } = *task else {
+            ManagedTaskRequest::Update {
+                task,
+                input_responses,
+            } => {
+                let Task::InputRequired {
+                    base,
+                    input_requests,
+                } = *task
+                else {
                     return Err(ManagedTasksError::UpdateRequiresInput.into());
                 };
                 let ledger = TaskInputLedger::from_requests(&input_requests)
                     .map_err(|_| ManagedTasksError::InvalidInputResponses)?;
-                ledger.validate_responses(&input_responses)
+                ledger
+                    .validate_responses(&input_responses)
                     .map_err(|_| ManagedTasksError::InvalidInputResponses)?;
-                let request = TaskMethodRequest::new(id.clone(), TASK_UPDATE, UpdateTaskParams {
-                    request: request_meta, task_id: base.task_id, input_responses,
-                });
-                let request = TaskMethodRequest::decode_update(serde_json::to_value(request)
-                    .map_err(|_| ManagedTasksError::InvalidRequest)?, &ledger)
-                    .map_err(|_| ManagedTasksError::InvalidInputResponses)?;
-                (TASK_UPDATE, serde_json::to_value(request.params)
-                    .map_err(|_| ManagedTasksError::InvalidRequest)?, None, Reply::Update)
+                let request = TaskMethodRequest::new(
+                    id.clone(),
+                    TASK_UPDATE,
+                    UpdateTaskParams {
+                        request: request_meta,
+                        task_id: base.task_id,
+                        input_responses,
+                    },
+                );
+                let request = TaskMethodRequest::decode_update(
+                    serde_json::to_value(request).map_err(|_| ManagedTasksError::InvalidRequest)?,
+                    &ledger,
+                )
+                .map_err(|_| ManagedTasksError::InvalidInputResponses)?;
+                (
+                    TASK_UPDATE,
+                    serde_json::to_value(request.params)
+                        .map_err(|_| ManagedTasksError::InvalidRequest)?,
+                    None,
+                    Reply::Update,
+                )
             }
             ManagedTaskRequest::Cancel(task_id) => {
-                let request = TaskMethodRequest::new(id.clone(), TASK_CANCEL,
-                    CancelTaskParams { request: request_meta, task_id });
-                let request = TaskMethodRequest::decode_cancel(serde_json::to_value(request)
-                    .map_err(|_| ManagedTasksError::InvalidRequest)?)
-                    .map_err(|_| ManagedTasksError::InvalidRequest)?;
-                (TASK_CANCEL, serde_json::to_value(request.params)
-                    .map_err(|_| ManagedTasksError::InvalidRequest)?, None, Reply::Cancel)
+                let request = TaskMethodRequest::new(
+                    id.clone(),
+                    TASK_CANCEL,
+                    CancelTaskParams {
+                        request: request_meta,
+                        task_id,
+                    },
+                );
+                let request = TaskMethodRequest::decode_cancel(
+                    serde_json::to_value(request).map_err(|_| ManagedTasksError::InvalidRequest)?,
+                )
+                .map_err(|_| ManagedTasksError::InvalidRequest)?;
+                (
+                    TASK_CANCEL,
+                    serde_json::to_value(request.params)
+                        .map_err(|_| ManagedTasksError::InvalidRequest)?,
+                    None,
+                    Reply::Cancel,
+                )
             }
         };
         let operation_wire = wire(target, method, &id, params, name, maximum)?;
@@ -283,8 +380,14 @@ impl Prepared {
             Some(reviewed) => operation_wire.with_reviewed_tool_headers(&reviewed)?,
             None => operation_wire,
         };
-        Ok(Self { discovery_wire, discovery_decoder, operation_wire,
-            operation_id: id, reply, limits })
+        Ok(Self {
+            discovery_wire,
+            discovery_decoder,
+            operation_wire,
+            operation_id: id,
+            reply,
+            limits,
+        })
     }
 
     fn admit(mut self, response: DpopHttpResponse) -> Result<Admitted, DpopTasksError> {
@@ -292,7 +395,11 @@ impl Prepared {
         let CoreResult::Final(FinalCoreResult::Discover(discovery)) = result else {
             return Err(ManagedTasksError::InvalidResponse.into());
         };
-        if !discovery.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
+        if !discovery
+            .supported_versions()
+            .iter()
+            .any(|version| version == FINAL_PROTOCOL_VERSION)
+        {
             return Err(ManagedTasksError::Negotiation.into());
         }
         // These are the same official descriptor/negotiation admission gates
@@ -300,25 +407,44 @@ impl Prepared {
         match &self.reply {
             Reply::Tool(_) => crate::admit_final_tasks_result_discriminator(&discovery, "task"),
             Reply::Get(_) => crate::admit_final_tasks_discovery_surface(
-                &discovery, TASK_GET, ExtensionDirection::ClientToServer),
+                &discovery,
+                TASK_GET,
+                ExtensionDirection::ClientToServer,
+            ),
             Reply::Update => crate::admit_final_tasks_discovery_surface(
-                &discovery, TASK_UPDATE, ExtensionDirection::ClientToServer),
+                &discovery,
+                TASK_UPDATE,
+                ExtensionDirection::ClientToServer,
+            ),
             Reply::Cancel => crate::admit_final_tasks_discovery_surface(
-                &discovery, TASK_CANCEL, ExtensionDirection::ClientToServer),
-        }.map_err(|_| ManagedTasksError::Negotiation)?;
-        let remaining = self.limits.total_bytes()
+                &discovery,
+                TASK_CANCEL,
+                ExtensionDirection::ClientToServer,
+            ),
+        }
+        .map_err(|_| ManagedTasksError::Negotiation)?;
+        let remaining = self
+            .limits
+            .total_bytes()
             .checked_sub(self.discovery_decoder.usage().0)
             .filter(|remaining| *remaining > 0)
             .ok_or(ManagedCoreError::ResponseByteLimit)?;
-        Ok(Admitted { wire: self.operation_wire, id: self.operation_id,
-            reply: self.reply, maximum: self.limits.frame_bytes().min(remaining) })
+        Ok(Admitted {
+            wire: self.operation_wire,
+            id: self.operation_id,
+            reply: self.reply,
+            maximum: self.limits.frame_bytes().min(remaining),
+        })
     }
 }
 
 impl Admitted {
     fn finish(self, response: DpopHttpResponse) -> Result<ManagedTaskEvent, DpopTasksError> {
         if response.status() != 200 {
-            return Err(ManagedTasksError::HttpStatus { status: response.status() }.into());
+            return Err(ManagedTasksError::HttpStatus {
+                status: response.status(),
+            }
+            .into());
         }
         self.reply.decode(&self.id, response.body(), self.maximum)
     }
@@ -340,28 +466,40 @@ impl Reply {
         let admitted = decode_strict_jsonrpc_response(body, maximum)
             .map_err(|_| ManagedTasksError::InvalidResponse)?;
         let (response, source) = admitted.into_parts();
-        if !response.id.as_ref().is_some_and(|actual| actual.correlates_with(id)) {
+        if !response
+            .id
+            .as_ref()
+            .is_some_and(|actual| actual.correlates_with(id))
+        {
             return Err(ManagedTasksError::ResponseIdMismatch.into());
         }
         if let Some(error) = &response.error {
-            return Err(ManagedTasksError::Remote { code: error.code.clone() }.into());
+            return Err(ManagedTasksError::Remote {
+                code: error.code.clone(),
+            }
+            .into());
         }
         let source = source.ok_or(ManagedTasksError::InvalidResponse)?;
         let result = match self {
             Self::Tool(request) => {
-                if response.result.as_ref().and_then(|result| result.get("resultType"))
-                    .and_then(Value::as_str) == Some("task")
+                if response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType"))
+                    .and_then(Value::as_str)
+                    == Some("task")
                 {
                     validate_task_input_shapes(&response)?;
                 }
-                match request.decode_response_result(&response, &source)
+                match request
+                    .decode_response_result(&response, &source)
                     .map_err(|_| ManagedTasksError::InvalidResponse)?
                 {
-                    CoreResult::Final(result @ (FinalCoreResult::ToolsCall { .. }
+                    CoreResult::Final(
+                        result @ (FinalCoreResult::ToolsCall { .. }
                         | FinalCoreResult::ToolsCallTask { .. }
-                        | FinalCoreResult::ToolsCallInputRequired { .. })) => {
-                        ManagedTaskEvent::ToolResult(Box::new(result))
-                    }
+                        | FinalCoreResult::ToolsCallInputRequired { .. }),
+                    ) => ManagedTaskEvent::ToolResult(Box::new(result)),
                     _ => return Err(ManagedTasksError::InvalidResponse.into()),
                 }
             }
@@ -374,10 +512,12 @@ impl Reply {
                 }
                 ManagedTaskEvent::Snapshot(Box::new(result))
             }
-            Self::Update => ManagedTaskEvent::Updated(serde_json::from_str(&source)
-                .map_err(|_| ManagedTasksError::InvalidResponse)?),
-            Self::Cancel => ManagedTaskEvent::Cancelled(serde_json::from_str(&source)
-                .map_err(|_| ManagedTasksError::InvalidResponse)?),
+            Self::Update => ManagedTaskEvent::Updated(
+                serde_json::from_str(&source).map_err(|_| ManagedTasksError::InvalidResponse)?,
+            ),
+            Self::Cancel => ManagedTaskEvent::Cancelled(
+                serde_json::from_str(&source).map_err(|_| ManagedTasksError::InvalidResponse)?,
+            ),
         };
         Ok(result)
     }
@@ -414,8 +554,15 @@ impl DpopHttpClient {
         operation: DpopTaskOperation,
         limits: ManagedCoreLimits,
     ) -> Result<ManagedTaskEvent, DpopTasksError> {
-        self.request_task_with_cancellation(cx, &McpRequestCancellation::new(),
-            credential, metadata, operation, limits).await
+        self.request_task_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            credential,
+            metadata,
+            operation,
+            limits,
+        )
+        .await
     }
 
     /// Local cancellation stops discovery/dispatch/reading without cancelling
@@ -431,8 +578,17 @@ impl DpopHttpClient {
         limits: ManagedCoreLimits,
     ) -> Result<ManagedTaskEvent, DpopTasksError> {
         let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.timeout()), credential)?;
-        self.request_task_with_bounds(cx, cancellation, credential, metadata, operation,
-            limits, bounds).await.map(|(event, _)| event)
+        self.request_task_with_bounds(
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            operation,
+            limits,
+            bounds,
+        )
+        .await
+        .map(|(event, _)| event)
     }
 
     // Shared by a single explicit operation and the observation-only waiter.
@@ -450,21 +606,35 @@ impl DpopHttpClient {
         bounds: WaitBounds,
     ) -> Result<(ManagedTaskEvent, usize), DpopTasksError> {
         check_live(cx, cancellation, &self.session, credential, bounds)?;
-        let prepared = Prepared::new(self.resource().as_str(), metadata, operation,
-            limits, self.policy.max_body_bytes);
+        let prepared = Prepared::new(
+            self.resource().as_str(),
+            metadata,
+            operation,
+            limits,
+            self.policy.max_body_bytes,
+        );
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let prepared = prepared?;
-        let response = self.post_resource_with_bounds(cx, cancellation, credential,
-            &prepared.discovery_wire, bounds).await?;
+        let response = self
+            .post_resource_with_bounds(
+                cx,
+                cancellation,
+                credential,
+                &prepared.discovery_wire,
+                bounds,
+            )
+            .await?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let discovery_bytes = response.body().len();
         let admitted = prepared.admit(response);
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let admitted = admitted?;
-        let response = self.post_resource_with_bounds(cx, cancellation, credential,
-            &admitted.wire, bounds).await?;
+        let response = self
+            .post_resource_with_bounds(cx, cancellation, credential, &admitted.wire, bounds)
+            .await?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
-        let payload_bytes = discovery_bytes.checked_add(response.body().len())
+        let payload_bytes = discovery_bytes
+            .checked_add(response.body().len())
             .ok_or(ManagedCoreError::ResponseByteLimit)?;
         let result = admitted.finish(response);
         // Failed decoding and remote errors cannot bypass the final lifetime
@@ -480,11 +650,15 @@ mod tests;
 #[cfg(test)]
 mod routing_tests {
     use super::*;
-    use fastmcp_protocol::{ClientCapabilities, FinalHttpRequestMetadata, RequestVersionMetadata,
-        admit_final_http_request};
+    use fastmcp_protocol::{
+        ClientCapabilities, FinalHttpRequestMetadata, RequestVersionMetadata,
+        admit_final_http_request,
+    };
 
     fn header<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
-        fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(key))
+        fields
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
             .map(|(_, value)| value.as_str())
     }
 
@@ -496,33 +670,57 @@ mod routing_tests {
             "taskId":"opaque-task-one", "status":"input_required",
             "createdAt":"2026-09-16T00:00:00Z", "lastUpdatedAt":"2026-09-16T00:00:00Z",
             "ttlMs":60000, "inputRequests":{"roots":{"method":"roots/list"}}
-        })).unwrap();
+        }))
+        .unwrap();
         for request in [
             ManagedTaskRequest::Get(task_id.clone()),
             ManagedTaskRequest::Cancel(task_id),
-            ManagedTaskRequest::Update { task: Box::new(task),
-                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap() },
+            ManagedTaskRequest::Update {
+                task: Box::new(task),
+                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap(),
+            },
         ] {
-            let prepared = Prepared::new(target, FinalRequestMeta::new(ClientCapabilities::default()),
-                DpopTaskOperation::new(RequestId::Number(11), RequestId::Number(12), request).unwrap(),
-                ManagedCoreLimits::default(), 8192).unwrap();
+            let prepared = Prepared::new(
+                target,
+                FinalRequestMeta::new(ClientCapabilities::default()),
+                DpopTaskOperation::new(RequestId::Number(11), RequestId::Number(12), request)
+                    .unwrap(),
+                ManagedCoreLimits::default(),
+                8192,
+            )
+            .unwrap();
             let fields = prepared.operation_wire.headers();
             let body: Value = serde_json::from_slice(prepared.operation_wire.body()).unwrap();
             let mirror = header(&fields, "mcp-name").unwrap();
-            assert_eq!(fields.iter().filter(|(key, _)| key.eq_ignore_ascii_case("mcp-name")).count(), 1);
+            assert_eq!(
+                fields
+                    .iter()
+                    .filter(|(key, _)| key.eq_ignore_ascii_case("mcp-name"))
+                    .count(),
+                1
+            );
             assert_eq!(body["params"]["taskId"], "opaque-task-one");
             assert_eq!(body["id"], 12);
             assert_eq!(prepared.operation_wire.target(), target);
-            assert_eq!(fastmcp_protocol::http_headers::decode_mcp_header_value(mirror.as_bytes()).unwrap(),
-                "opaque-task-one");
-            let admit = |name: Option<&str>| admit_final_http_request(FinalHttpRequestMetadata {
-                version: RequestVersionMetadata {
-                    header_version: header(&fields, "mcp-protocol-version"),
-                    body_version: body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str(),
-                },
-                header_method: header(&fields, "mcp-method"), body_method: body["method"].as_str(),
-                header_name: name, body_name: body["params"]["taskId"].as_str(),
-            }).is_ok();
+            assert_eq!(
+                fastmcp_protocol::http_headers::decode_mcp_header_value(mirror.as_bytes()).unwrap(),
+                "opaque-task-one"
+            );
+            let admit = |name: Option<&str>| {
+                admit_final_http_request(FinalHttpRequestMetadata {
+                    version: RequestVersionMetadata {
+                        header_version: header(&fields, "mcp-protocol-version"),
+                        body_version:
+                            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+                                .as_str(),
+                    },
+                    header_method: header(&fields, "mcp-method"),
+                    body_method: body["method"].as_str(),
+                    header_name: name,
+                    body_name: body["params"]["taskId"].as_str(),
+                })
+                .is_ok()
+            };
             assert!(admit(Some(mirror)));
             assert!(!admit(None));
             assert!(!admit(Some("another-task")));
@@ -537,19 +735,54 @@ mod routing_tests {
         for method in [TASK_GET, TASK_UPDATE, TASK_CANCEL] {
             for id in ["opaque%2Fone", "=?base64?YWJj?=", "task 雪"] {
                 let params = json!({"taskId":id});
-                let request = wire("https://mcp.example/mcp", method, &RequestId::Number(2),
-                    params.clone(), None, 8192).unwrap();
+                let request = wire(
+                    "https://mcp.example/mcp",
+                    method,
+                    &RequestId::Number(2),
+                    params.clone(),
+                    None,
+                    8192,
+                )
+                .unwrap();
                 let fields = request.headers();
-                assert_eq!(fastmcp_protocol::http_headers::decode_mcp_header_value(
-                    header(&fields, "mcp-name").unwrap().as_bytes()).unwrap(), id);
+                assert_eq!(
+                    fastmcp_protocol::http_headers::decode_mcp_header_value(
+                        header(&fields, "mcp-name").unwrap().as_bytes()
+                    )
+                    .unwrap(),
+                    id
+                );
                 let body: Value = serde_json::from_slice(request.body()).unwrap();
                 assert_eq!(body["params"], params);
-                assert!(wire("https://mcp.example/mcp", method, &RequestId::Number(2),
-                    params, Some("different".to_owned()), 8192).is_err());
+                assert!(
+                    wire(
+                        "https://mcp.example/mcp",
+                        method,
+                        &RequestId::Number(2),
+                        params,
+                        Some("different".to_owned()),
+                        8192
+                    )
+                    .is_err()
+                );
             }
-            for params in [json!({}), json!({"taskId":null}), json!({"taskId":2}), json!({"taskId":""})] {
-                assert!(wire("https://mcp.example/mcp", method, &RequestId::Number(2),
-                    params, None, 8192).is_err());
+            for params in [
+                json!({}),
+                json!({"taskId":null}),
+                json!({"taskId":2}),
+                json!({"taskId":""}),
+            ] {
+                assert!(
+                    wire(
+                        "https://mcp.example/mcp",
+                        method,
+                        &RequestId::Number(2),
+                        params,
+                        None,
+                        8192
+                    )
+                    .is_err()
+                );
             }
         }
     }
@@ -565,30 +798,48 @@ mod header_tests {
     const TARGET: &str = "https://mcp.example/mcp?tenant=one";
 
     fn review(target: &str, tool: &str) -> Arc<ReviewedToolHeaders> {
-        Arc::new(ReviewedToolHeaders::new(
-            CanonicalHttpUrl::parse(target).unwrap(),
-            tool,
-            json!({"type":"object","properties":{
-                "region":{"type":"string","x-mcp-header":"Region"},
-                "private":{"type":"string","writeOnly":true}
-            }}),
-            |_| true,
-        ).unwrap())
+        Arc::new(
+            ReviewedToolHeaders::new(
+                CanonicalHttpUrl::parse(target).unwrap(),
+                tool,
+                json!({"type":"object","properties":{
+                    "region":{"type":"string","x-mcp-header":"Region"},
+                    "private":{"type":"string","writeOnly":true}
+                }}),
+                |_| true,
+            )
+            .unwrap(),
+        )
     }
 
     fn call(arguments: Value) -> DpopTaskOperation {
-        DpopTaskOperation::new(RequestId::Number(1), RequestId::Number(2),
-            ManagedTaskRequest::CallTool { name: "echo".to_owned(), arguments: Some(arguments) })
-            .unwrap()
+        DpopTaskOperation::new(
+            RequestId::Number(1),
+            RequestId::Number(2),
+            ManagedTaskRequest::CallTool {
+                name: "echo".to_owned(),
+                arguments: Some(arguments),
+            },
+        )
+        .unwrap()
     }
 
-    fn prepare_call(operation: DpopTaskOperation, maximum: usize) -> Result<Prepared, DpopTasksError> {
-        Prepared::new(TARGET, FinalRequestMeta::new(ClientCapabilities::default()),
-            operation, ManagedCoreLimits::default(), maximum)
+    fn prepare_call(
+        operation: DpopTaskOperation,
+        maximum: usize,
+    ) -> Result<Prepared, DpopTasksError> {
+        Prepared::new(
+            TARGET,
+            FinalRequestMeta::new(ClientCapabilities::default()),
+            operation,
+            ManagedCoreLimits::default(),
+            maximum,
+        )
     }
 
     fn fields(wire: &ModernHttpRequest) -> Vec<(String, String)> {
-        wire.headers().into_iter()
+        wire.headers()
+            .into_iter()
             .filter(|(name, _)| name.starts_with("Mcp-Param-"))
             .collect()
     }
@@ -599,7 +850,8 @@ mod header_tests {
         for region in ["eu", " 雪 ", "=?base64?YWJj?="] {
             let arguments = json!({"region":region,"private":"body-only-canary"});
             let plain = prepare_call(call(arguments.clone()), 8192).unwrap();
-            let selected = call(arguments.clone()).with_reviewed_tool_headers(Arc::clone(&reviewed))
+            let selected = call(arguments.clone())
+                .with_reviewed_tool_headers(Arc::clone(&reviewed))
                 .unwrap();
             let selected = prepare_call(selected, 8192).unwrap();
             assert_eq!(selected.operation_wire.body(), plain.operation_wire.body());
@@ -610,14 +862,25 @@ mod header_tests {
             let projected = fields(&selected.operation_wire);
             assert_eq!(projected.len(), 1);
             assert_eq!(projected[0].0, "Mcp-Param-Region");
-            assert_eq!(decode_mcp_header_value(projected[0].1.as_bytes()).unwrap(), region);
+            assert_eq!(
+                decode_mcp_header_value(projected[0].1.as_bytes()).unwrap(),
+                region
+            );
             let body: Value = serde_json::from_slice(selected.operation_wire.body()).unwrap();
             assert_eq!(body["params"]["arguments"], arguments);
-            assert_eq!(body["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
-                json!({TASKS_EXTENSION:{}}));
-            assert!(!selected.operation_wire.headers().iter().any(|(name, value)|
-                name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("dpop")
-                    || value.contains("body-only-canary")));
+            assert_eq!(
+                body["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+                json!({TASKS_EXTENSION:{}})
+            );
+            assert!(
+                !selected
+                    .operation_wire
+                    .headers()
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("dpop")
+                        || value.contains("body-only-canary"))
+            );
         }
     }
 
@@ -628,41 +891,66 @@ mod header_tests {
             "taskId":"task-one","status":"input_required",
             "createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z",
             "ttlMs":60000,"inputRequests":{"roots":{"method":"roots/list"}}
-        })).unwrap();
+        }))
+        .unwrap();
         for request in [
             ManagedTaskRequest::Get(TaskId::parse("task-one").unwrap()),
             ManagedTaskRequest::Cancel(TaskId::parse("task-one").unwrap()),
-            ManagedTaskRequest::Update { task: Box::new(task),
-                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap() },
+            ManagedTaskRequest::Update {
+                task: Box::new(task),
+                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap(),
+            },
         ] {
-            let operation = DpopTaskOperation::new(RequestId::Number(1), RequestId::Number(2), request)
-                .unwrap();
-            assert!(matches!(operation.with_reviewed_tool_headers(Arc::clone(&reviewed)),
-                Err(ToolHeaderDispatchError::OperationMismatch)));
+            let operation =
+                DpopTaskOperation::new(RequestId::Number(1), RequestId::Number(2), request)
+                    .unwrap();
+            assert!(matches!(
+                operation.with_reviewed_tool_headers(Arc::clone(&reviewed)),
+                Err(ToolHeaderDispatchError::OperationMismatch)
+            ));
         }
-        assert!(matches!(call(json!({})).with_reviewed_tool_headers(review(TARGET, "other")),
-            Err(ToolHeaderDispatchError::OperationMismatch)));
-        let operation = call(json!({})).with_reviewed_tool_headers(Arc::clone(&reviewed)).unwrap();
-        assert!(matches!(operation.with_reviewed_tool_headers(reviewed),
-            Err(ToolHeaderDispatchError::AlreadyProjected)));
+        assert!(matches!(
+            call(json!({})).with_reviewed_tool_headers(review(TARGET, "other")),
+            Err(ToolHeaderDispatchError::OperationMismatch)
+        ));
+        let operation = call(json!({}))
+            .with_reviewed_tool_headers(Arc::clone(&reviewed))
+            .unwrap();
+        assert!(matches!(
+            operation.with_reviewed_tool_headers(reviewed),
+            Err(ToolHeaderDispatchError::AlreadyProjected)
+        ));
     }
 
     #[test]
     fn reviewed_task_preflight_refuses_foreign_resources_and_never_drops_a_bad_plan() {
-        for target in ["https://other.example/mcp", "https://mcp.example/other?tenant=one",
-            "https://mcp.example/mcp?tenant=two"]
-        {
+        for target in [
+            "https://other.example/mcp",
+            "https://mcp.example/other?tenant=one",
+            "https://mcp.example/mcp?tenant=two",
+        ] {
             let operation = call(json!({"region":"eu"}))
-                .with_reviewed_tool_headers(review(target, "echo")).unwrap();
-            assert!(matches!(prepare_call(operation, 8192),
-                Err(DpopTasksError::Header(ToolHeaderDispatchError::TargetMismatch))));
+                .with_reviewed_tool_headers(review(target, "echo"))
+                .unwrap();
+            assert!(matches!(
+                prepare_call(operation, 8192),
+                Err(DpopTasksError::Header(
+                    ToolHeaderDispatchError::TargetMismatch
+                ))
+            ));
         }
         let arguments = json!({"region":7,"private":"body-only-canary"});
         assert!(prepare_call(call(arguments.clone()), 8192).is_ok());
-        let operation = call(arguments).with_reviewed_tool_headers(review(TARGET, "echo")).unwrap();
+        let operation = call(arguments)
+            .with_reviewed_tool_headers(review(TARGET, "echo"))
+            .unwrap();
         let error = prepare_call(operation, 8192).err().unwrap();
-        assert!(matches!(&error, DpopTasksError::Header(ToolHeaderDispatchError::Projection(
-            McpHeaderError::InvalidParameter))));
+        assert!(matches!(
+            &error,
+            DpopTasksError::Header(ToolHeaderDispatchError::Projection(
+                McpHeaderError::InvalidParameter
+            ))
+        ));
         assert!(!format!("{error:?} {error}").contains("body-only-canary"));
     }
 
@@ -670,18 +958,27 @@ mod header_tests {
     fn header_selection_does_not_relax_the_original_request_byte_limits() {
         let arguments = json!({"region":"eu","private":"body-only-canary"});
         let plain = prepare_call(call(arguments.clone()), 8192).unwrap();
-        let needed = plain.discovery_wire.body().len().max(plain.operation_wire.body().len());
+        let needed = plain
+            .discovery_wire
+            .body()
+            .len()
+            .max(plain.operation_wire.body().len());
         for selected in [false, true] {
             for exact in [false, true] {
                 let mut operation = call(arguments.clone());
                 if selected {
-                    operation = operation.with_reviewed_tool_headers(review(TARGET, "echo")).unwrap();
+                    operation = operation
+                        .with_reviewed_tool_headers(review(TARGET, "echo"))
+                        .unwrap();
                 }
                 let result = prepare_call(operation, needed - usize::from(!exact));
                 if exact {
                     assert!(result.is_ok());
                 } else {
-                    assert!(matches!(result, Err(DpopTasksError::Task(ManagedTasksError::RequestTooLarge))));
+                    assert!(matches!(
+                        result,
+                        Err(DpopTasksError::Task(ManagedTasksError::RequestTooLarge))
+                    ));
                 }
             }
         }

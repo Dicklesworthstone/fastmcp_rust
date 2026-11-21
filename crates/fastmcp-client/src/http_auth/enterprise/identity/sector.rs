@@ -12,20 +12,19 @@ use std::future::{Future, poll_fn};
 use std::task::Poll;
 
 use asupersync::Cx;
-use fastmcp_core::{AbsoluteUri, CanonicalHttpUrl, Sha256Digest, crypto::sha256_bounded};
 use fastmcp_core::runtime::CallerContextFuture;
+use fastmcp_core::{AbsoluteUri, CanonicalHttpUrl, Sha256Digest, crypto::sha256_bounded};
 use fastmcp_transport::{
-    GuardedHttpFetchError, GuardedHttpFetchPolicy, GuardedHttpFetchResponse,
-    GuardedHttpFetcher, GuardedHttpPeerProvenance, GuardedHttpsUrl,
+    GuardedHttpFetchError, GuardedHttpFetchPolicy, GuardedHttpFetchResponse, GuardedHttpFetcher,
+    GuardedHttpPeerProvenance, GuardedHttpsUrl,
 };
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    EnterpriseIdentityError, EnterpriseOidcRelyingPartyConfiguration,
-    EnterpriseOidcSubjectType, IdentityEncoding, MAX_REDIRECTS, MAX_TENANT_BYTES,
-    MAX_URL_BYTES, OidcSubjectNamespace, admit_client_id, admit_issuer,
-    admit_redirect, admit_text, encode_rp,
+    EnterpriseIdentityError, EnterpriseOidcRelyingPartyConfiguration, EnterpriseOidcSubjectType,
+    IdentityEncoding, MAX_REDIRECTS, MAX_TENANT_BYTES, MAX_URL_BYTES, OidcSubjectNamespace,
+    admit_client_id, admit_issuer, admit_redirect, admit_text, encode_rp,
 };
 
 /// Hard response bound, including all additional document entries.
@@ -62,7 +61,9 @@ impl fmt::Display for OidcSectorReviewError {
             Self::InvalidRegistration => "invalid OIDC sector registration",
             Self::InvalidSectorUri => "invalid OIDC sector document URI",
             Self::InvalidFetchPolicy => "invalid OIDC sector fetch policy",
-            Self::RuntimeUnavailable => "OIDC sector review requires caller I/O, time and spawn authority",
+            Self::RuntimeUnavailable => {
+                "OIDC sector review requires caller I/O, time and spawn authority"
+            }
             Self::Cancelled => "OIDC sector review was cancelled",
             Self::TimedOut => "OIDC sector review exceeded its deadline",
             Self::FetchFailed => "OIDC sector guarded fetch failed",
@@ -116,8 +117,11 @@ impl OidcSectorDocumentReview {
         fetch_policy_generation: u64,
     ) -> Result<Self, OidcSectorReviewError> {
         let prepared = PreparedSectorReview::new(
-            role, registration, sector_identifier_uri,
-            fetcher.policy(), fetch_policy_generation,
+            role,
+            registration,
+            sector_identifier_uri,
+            fetcher.policy(),
+            fetch_policy_generation,
         )?;
         // Cx::spawn inherits its held Cx, so ambient poll restrictions alone
         // cannot constrain the guarded fetcher's resolver and transport children.
@@ -133,8 +137,10 @@ impl OidcSectorDocumentReview {
                     return Poll::Ready(Err(error));
                 }
                 result.map(|result| result.map_err(fetch_error))
-            }).await
-        }).await?;
+            })
+            .await
+        })
+        .await?;
         crate::http_auth::caller::with_caller(&admitted_cx, || {
             review_checkpoint(&admitted_cx)?;
             let review = prepared.admit_response(response)?;
@@ -144,24 +150,40 @@ impl OidcSectorDocumentReview {
     }
 
     #[must_use]
-    pub const fn role(&self) -> OidcSectorRegistrationRole { self.role }
+    pub const fn role(&self) -> OidcSectorRegistrationRole {
+        self.role
+    }
     /// Exact requested and final URL; a redirect can never produce this review.
     #[must_use]
-    pub fn sector_identifier_uri(&self) -> &str { &self.sector_identifier_uri }
+    pub fn sector_identifier_uri(&self) -> &str {
+        &self.sector_identifier_uri
+    }
     #[must_use]
-    pub fn sector_host(&self) -> &str { &self.sector_host }
+    pub fn sector_host(&self) -> &str {
+        &self.sector_host
+    }
     /// Digest of the exact response bytes, including additional valid entries.
     #[must_use]
-    pub const fn document_digest(&self) -> Sha256Digest { self.document_digest }
+    pub const fn document_digest(&self) -> Sha256Digest {
+        self.document_digest
+    }
     /// Digest of registration, role, URL, document and concrete fetch evidence.
     #[must_use]
-    pub const fn binding_digest(&self) -> Sha256Digest { self.binding_digest }
+    pub const fn binding_digest(&self) -> Sha256Digest {
+        self.binding_digest
+    }
     #[must_use]
-    pub const fn fetch_policy_generation(&self) -> u64 { self.fetch_policy_generation }
+    pub const fn fetch_policy_generation(&self) -> u64 {
+        self.fetch_policy_generation
+    }
     #[must_use]
-    pub fn fetch_policy(&self) -> &GuardedHttpFetchPolicy { &self.fetch_policy }
+    pub fn fetch_policy(&self) -> &GuardedHttpFetchPolicy {
+        &self.fetch_policy
+    }
     #[must_use]
-    pub fn provenance(&self) -> &GuardedHttpPeerProvenance { &self.provenance }
+    pub fn provenance(&self) -> &GuardedHttpPeerProvenance {
+        &self.provenance
+    }
 
     pub(super) fn namespace_for(
         &self,
@@ -170,7 +192,8 @@ impl OidcSectorDocumentReview {
     ) -> Result<OidcSubjectNamespace, EnterpriseIdentityError> {
         let redirects = admit_registration(registration)
             .map_err(|_| EnterpriseIdentityError::RegistrationMismatch)?;
-        if self.role != role || self.registration.issuer != registration.issuer
+        if self.role != role
+            || self.registration.issuer != registration.issuer
             || self.registration.tenant != registration.tenant
             || self.registration.client_id != registration.client_id
             || self.registration.registration_generation != registration.registration_generation
@@ -190,7 +213,9 @@ impl OidcSectorDocumentReview {
 
 impl fmt::Debug for OidcSectorDocumentReview {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("OidcSectorDocumentReview").finish_non_exhaustive()
+        formatter
+            .debug_struct("OidcSectorDocumentReview")
+            .finish_non_exhaustive()
     }
 }
 
@@ -213,16 +238,15 @@ impl PreparedSectorReview {
         policy_generation: u64,
     ) -> Result<Self, OidcSectorReviewError> {
         let registered_redirects = admit_registration(registration)?;
-        if policy_generation == 0
-            || policy.response_body_bytes() > MAX_OIDC_SECTOR_DOCUMENT_BYTES
-        {
+        if policy_generation == 0 || policy.response_body_bytes() > MAX_OIDC_SECTOR_DOCUMENT_BYTES {
             return Err(OidcSectorReviewError::InvalidFetchPolicy);
         }
-        let parsed = CanonicalHttpUrl::parse_with_max_bytes(
-            sector_identifier_uri, MAX_URL_BYTES,
-        ).map_err(|_| OidcSectorReviewError::InvalidSectorUri)?;
-        if parsed.scheme() != "https" || parsed.as_str() != sector_identifier_uri
-            || parsed.has_syntax_violation() || parsed.has_userinfo()
+        let parsed = CanonicalHttpUrl::parse_with_max_bytes(sector_identifier_uri, MAX_URL_BYTES)
+            .map_err(|_| OidcSectorReviewError::InvalidSectorUri)?;
+        if parsed.scheme() != "https"
+            || parsed.as_str() != sector_identifier_uri
+            || parsed.has_syntax_violation()
+            || parsed.has_userinfo()
             || parsed.fragment().is_some()
         {
             return Err(OidcSectorReviewError::InvalidSectorUri);
@@ -230,9 +254,13 @@ impl PreparedSectorReview {
         let url = GuardedHttpsUrl::parse(sector_identifier_uri)
             .map_err(|_| OidcSectorReviewError::InvalidSectorUri)?;
         Ok(Self {
-            registration: registration.clone(), role, registered_redirects,
-            sector_identifier_uri: sector_identifier_uri.to_owned(), url,
-            policy: policy.clone(), policy_generation,
+            registration: registration.clone(),
+            role,
+            registered_redirects,
+            sector_identifier_uri: sector_identifier_uri.to_owned(),
+            url,
+            policy: policy.clone(),
+            policy_generation,
         })
     }
 
@@ -242,7 +270,8 @@ impl PreparedSectorReview {
         self,
         response: GuardedHttpFetchResponse,
     ) -> Result<OidcSectorDocumentReview, OidcSectorReviewError> {
-        if response.status != 200 || response.redirect.is_some()
+        if response.status != 200
+            || response.redirect.is_some()
             || response.body.is_empty()
             || response.body.len() > self.policy.response_body_bytes()
             || response.body.len() > MAX_OIDC_SECTOR_DOCUMENT_BYTES
@@ -256,7 +285,9 @@ impl PreparedSectorReview {
             || peer.root_policy_revision != self.policy.root_policy_revision()
             || peer.alpn.as_deref().is_some_and(|alpn| alpn != b"http/1.1")
             || peer.tls_protocol.as_deref().is_some_and(|protocol| {
-                protocol.is_empty() || protocol.len() > 64 || !protocol.is_ascii()
+                protocol.is_empty()
+                    || protocol.len() > 64
+                    || !protocol.is_ascii()
                     || protocol.chars().any(char::is_control)
             })
         {
@@ -267,19 +298,22 @@ impl PreparedSectorReview {
         if !self.registered_redirects.is_subset(&document.0) {
             return Err(OidcSectorReviewError::MissingRegisteredRedirect);
         }
-        let document_digest = sha256_bounded(
-            &response.body, MAX_OIDC_SECTOR_DOCUMENT_BYTES,
-        ).map_err(|_| OidcSectorReviewError::InvalidDocument)?;
-        let binding_digest = self.binding_digest(document_digest, peer)
+        let document_digest = sha256_bounded(&response.body, MAX_OIDC_SECTOR_DOCUMENT_BYTES)
+            .map_err(|_| OidcSectorReviewError::InvalidDocument)?;
+        let binding_digest = self
+            .binding_digest(document_digest, peer)
             .map_err(|_| OidcSectorReviewError::InvalidDocument)?;
         Ok(OidcSectorDocumentReview {
-            registration: self.registration, role: self.role,
+            registration: self.registration,
+            role: self.role,
             registered_redirects: self.registered_redirects,
             sector_identifier_uri: self.sector_identifier_uri,
             sector_host: self.url.host().to_owned(),
-            document_digest, fetch_policy: self.policy,
+            document_digest,
+            fetch_policy: self.policy,
             fetch_policy_generation: self.policy_generation,
-            provenance: response.provenance, binding_digest,
+            provenance: response.provenance,
+            binding_digest,
         })
     }
 
@@ -308,7 +342,9 @@ impl PreparedSectorReview {
         encoded.text(&peer.selected_address.to_string())?;
         encoded.field(&peer.leaf_certificate_sha256)?;
         encoded.field(&[u8::from(peer.alpn.is_some())])?;
-        if let Some(alpn) = &peer.alpn { encoded.field(alpn)?; }
+        if let Some(alpn) = &peer.alpn {
+            encoded.field(alpn)?;
+        }
         encoded.optional(peer.tls_protocol.as_deref())?;
         encoded.finish()
     }
@@ -343,12 +379,18 @@ fn admit_registration(
 
 fn admit_caller() -> Result<Cx, OidcSectorReviewError> {
     let active = Cx::current().ok_or(OidcSectorReviewError::RuntimeUnavailable)?;
-    if active.checkpoint().is_err() { return Err(OidcSectorReviewError::Cancelled); }
+    if active.checkpoint().is_err() {
+        return Err(OidcSectorReviewError::Cancelled);
+    }
     let capabilities = active.capabilities();
     if !capabilities.io || !capabilities.time || !capabilities.spawn {
         return Err(OidcSectorReviewError::RuntimeUnavailable);
     }
-    if active.budget().deadline.is_some_and(|deadline| active.now() >= deadline) {
+    if active
+        .budget()
+        .deadline
+        .is_some_and(|deadline| active.now() >= deadline)
+    {
         return Err(OidcSectorReviewError::TimedOut);
     }
     Ok(active)
@@ -389,13 +431,19 @@ fn admit_headers(headers: &[(String, String)]) -> Result<(), OidcSectorReviewErr
             content_encoding = true;
         }
     }
-    let mut parts = content_type.ok_or(OidcSectorReviewError::InvalidResponse)?
-        .split(';').map(str::trim);
-    if !parts.next().is_some_and(|kind| kind.eq_ignore_ascii_case("application/json")) {
+    let mut parts = content_type
+        .ok_or(OidcSectorReviewError::InvalidResponse)?
+        .split(';')
+        .map(str::trim);
+    if !parts
+        .next()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("application/json"))
+    {
         return Err(OidcSectorReviewError::InvalidResponse);
     }
     if let Some(parameter) = parts.next() {
-        let (name, value) = parameter.split_once('=')
+        let (name, value) = parameter
+            .split_once('=')
             .ok_or(OidcSectorReviewError::InvalidResponse)?;
         if !name.trim().eq_ignore_ascii_case("charset")
             || !(value.trim().eq_ignore_ascii_case("utf-8")
@@ -417,7 +465,10 @@ impl<'de> Deserialize<'de> for SectorRedirects {
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("a bounded array of unique absolute redirect URIs")
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
                 let mut redirects = BTreeSet::new();
                 while let Some(redirect) = sequence.next_element::<String>()? {
                     if redirects.len() >= MAX_OIDC_SECTOR_DOCUMENT_REDIRECTS

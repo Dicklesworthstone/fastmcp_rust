@@ -13,12 +13,12 @@ use std::sync::Arc;
 use asupersync::Cx;
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 
+use super::super::super::client::creation::TaskResumeInsert;
+use super::super::super::client::lifecycle::TaskResumeChange;
 use super::{
     AsyncTaskResumeStore, CredentialIoError, CredentialSlotTask, TaskResumeBinding,
     TaskResumeCompletion, TaskResumeProtector, TaskResumeStoreError,
 };
-use super::super::super::client::creation::TaskResumeInsert;
-use super::super::super::client::lifecycle::TaskResumeChange;
 
 /// Non-secret custody state, not evidence about the remote Task's lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,7 +276,9 @@ impl<P: TaskResumeProtector + 'static> TaskResumePersistence<P> {
     }
 }
 
-fn take_ready<P>(state: &mut State<P>) -> Result<AsyncTaskResumeStore<P>, TaskResumePersistenceError> {
+fn take_ready<P>(
+    state: &mut State<P>,
+) -> Result<AsyncTaskResumeStore<P>, TaskResumePersistenceError> {
     match std::mem::replace(&mut state.phase, Phase::Unavailable) {
         Phase::Ready(store) => Ok(*store),
         other => {

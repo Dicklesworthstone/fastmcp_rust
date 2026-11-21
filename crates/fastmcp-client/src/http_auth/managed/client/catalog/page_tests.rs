@@ -32,11 +32,7 @@ fn page(kind: CatalogKind, count: usize, cursor: Option<&str>, fields: &str) -> 
             "resourceTemplates",
             json!({"name":"private-entry", "uriTemplate":"note:///{id}"}),
         ),
-        CatalogKind::Prompts => (
-            "prompts/list",
-            "prompts",
-            json!({"name":"private-entry"}),
-        ),
+        CatalogKind::Prompts => ("prompts/list", "prompts", json!({"name":"private-entry"})),
     };
     let entries = serde_json::to_string(&vec![entry; count]).unwrap();
     let cursor = cursor.map_or_else(String::new, |cursor| {
@@ -201,9 +197,8 @@ fn a_full_nonterminal_page_cannot_consume_the_entire_remaining_byte_budget() {
         let first = page(kind, 0, Some(""), HINTS);
         let size = first.encode().unwrap().len();
         for spare_byte in [false, true] {
-            let mut meter = Meter::new(
-                CatalogLimits::new(2, 1, size + usize::from(spare_byte)).unwrap(),
-            );
+            let mut meter =
+                Meter::new(CatalogLimits::new(2, 1, size + usize::from(spare_byte)).unwrap());
             let mut entries = Entries::new(kind);
             let before = usage(&meter);
             let outcome = entries.append(first.clone(), &mut meter);
@@ -300,10 +295,17 @@ fn catalog_debug_redacts_retained_metadata_extras_entries_and_cursors() {
         catalog.page_metadata(0).unwrap().metadata().get("private"),
         Some(&ExactJsonValue::String("private-meta".to_owned()))
     );
-    assert!(catalog.page_extras(0).unwrap().members().iter().any(|member| {
-        member.name == "x-extra"
-            && member.value == ExactJsonValue::String("private-extra".to_owned())
-    }));
+    assert!(
+        catalog
+            .page_extras(0)
+            .unwrap()
+            .members()
+            .iter()
+            .any(|member| {
+                member.name == "x-extra"
+                    && member.value == ExactJsonValue::String("private-extra".to_owned())
+            })
+    );
     assert_eq!(catalog.page_has_continuation(0), Some(true));
     assert_eq!(catalog.page_has_continuation(1), Some(false));
 }

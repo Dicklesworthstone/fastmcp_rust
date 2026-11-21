@@ -335,8 +335,7 @@ fn typed_machine_tool_resource_and_prompt_streams_work_without_auth_advertisemen
 fn typed_machine_discovery_keeps_large_payloads_inside_the_callers_frame_bound() {
     for post in [false, true] {
         run_machine(post, |cx, peer, client| async move {
-            let mut document: Value =
-                serde_json::from_str(&discovery_document(json!({}))).unwrap();
+            let mut document: Value = serde_json::from_str(&discovery_document(json!({}))).unwrap();
             document["com.example/document"] = json!("x".repeat(2 * 1024 * 1024));
             let document = document.to_string();
             for index in 0..3 {
@@ -414,8 +413,7 @@ fn typed_machine_discovery_keeps_large_payloads_inside_the_callers_frame_bound()
                     core("tools/call"),
                     RequestId::Number(7),
                     RequestId::Number(8),
-                    ManagedCoreLimits::new(4096, 4096, 8192, 4, Duration::from_secs(10))
-                        .unwrap(),
+                    ManagedCoreLimits::new(4096, 4096, 8192, 4, Duration::from_secs(10)).unwrap(),
                 ),
             )
             .await;

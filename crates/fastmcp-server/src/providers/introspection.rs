@@ -1816,19 +1816,29 @@ mod tests {
         let called = Arc::new(AtomicBool::new(false));
         let fetcher = GuardedHttpFetcher::with_resolver(
             fetch_policy(),
-            Arc::new(PrivateAddressResolver { called: Arc::clone(&called) }),
-        ).unwrap();
+            Arc::new(PrivateAddressResolver {
+                called: Arc::clone(&called),
+            }),
+        )
+        .unwrap();
         let verifier = IntrospectionVerifier::new(
-            policy("one", 1, &[RESOURCE]), fetcher, "resource-server",
-            SecretString::from_string("secret".to_owned()), IntrospectionAdmissionPool::default(),
-        ).unwrap();
+            policy("one", 1, &[RESOURCE]),
+            fetcher,
+            "resource-server",
+            SecretString::from_string("secret".to_owned()),
+            IntrospectionAdmissionPool::default(),
+        )
+        .unwrap();
         let context = ctx();
         assert!(context.cx().timer_driver().is_none());
         assert_eq!(
             ready(verifier.verify_access_token_async(&context, &token())).unwrap_err(),
             IntrospectionError::EndpointUnavailable,
         );
-        assert!(!called.load(Ordering::SeqCst), "no DNS or credential dispatch before timer admission");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "no DNS or credential dispatch before timer admission"
+        );
         assert_eq!(verifier.admission.state.lock().unwrap().total, 0);
     }
 
@@ -1865,9 +1875,9 @@ mod tests {
         use crate::oauth::{
             AuthorizationApprovalBackend, AuthorizationApprovalDisposition,
             AuthorizationApprovalGeneration, AuthorizationApprovalRequest, AuthorizationRequest,
-            CodeChallengeMethod, DevelopmentClientCredentialsGrant, DevelopmentIntrospectionProfile,
-            DevelopmentTokenIntrospectionGrant, OAuthClient, OAuthHttpRoutes, OAuthServer,
-            OAuthServerConfig,
+            CodeChallengeMethod, DevelopmentClientCredentialsGrant,
+            DevelopmentIntrospectionProfile, DevelopmentTokenIntrospectionGrant, OAuthClient,
+            OAuthHttpRoutes, OAuthServer, OAuthServerConfig,
         };
         use crate::{Server, ServerHttpEndpoint, ServerHttpEndpointResponse, TestHttpEndpoint};
         use fastmcp_protocol::{Content, JsonRpcRequest, JsonRpcResponse, Tool};
@@ -1880,11 +1890,20 @@ mod tests {
                 AuthorizationApprovalGeneration::from_bytes([0x47; 32])
             }
 
-            fn approve(&self, request: &AuthorizationApprovalRequest) -> AuthorizationApprovalDisposition {
-                AuthorizationApprovalDisposition::Approved(request.approve(
-                    "integration-client".to_owned(), request.scopes().to_vec(),
-                    request.resource().map(str::to_owned), self.generation(),
-                ).unwrap())
+            fn approve(
+                &self,
+                request: &AuthorizationApprovalRequest,
+            ) -> AuthorizationApprovalDisposition {
+                AuthorizationApprovalDisposition::Approved(
+                    request
+                        .approve(
+                            "integration-client".to_owned(),
+                            request.scopes().to_vec(),
+                            request.resource().map(str::to_owned),
+                            self.generation(),
+                        )
+                        .unwrap(),
+                )
             }
         }
 
@@ -1903,19 +1922,32 @@ mod tests {
                 _: &'a McpContext,
                 url: &'a GuardedHttpsUrl,
                 request: &'a GuardedHttpRequest,
-            ) -> Pin<Box<dyn Future<Output = Result<GuardedHttpFetchResponse, IntrospectionError>> + Send + 'a>> {
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<GuardedHttpFetchResponse, IntrospectionError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
                 Box::pin(async move {
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     let wire = guarded_encode_post_request(url, request).unwrap();
-                    let head_end = wire.windows(4).position(|window| window == b"\r\n\r\n").unwrap();
-                    let mut head = std::str::from_utf8(&wire[..head_end]).unwrap().split("\r\n");
+                    let head_end = wire
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .unwrap();
+                    let mut head = std::str::from_utf8(&wire[..head_end])
+                        .unwrap()
+                        .split("\r\n");
                     let request_line = head.next().unwrap();
                     let path = request_line.split_ascii_whitespace().nth(1).unwrap();
                     assert_eq!(path, self.routes.introspection_path().unwrap());
-                    let headers = head.map(|line| {
-                        let (name, value) = line.split_once(':').unwrap();
-                        (name.to_owned(), value.trim().to_owned())
-                    }).collect();
+                    let headers = head
+                        .map(|line| {
+                            let (name, value) = line.split_once(':').unwrap();
+                            (name.to_owned(), value.trim().to_owned())
+                        })
+                        .collect();
                     let native = asupersync::http::h1::Request {
                         method: asupersync::http::h1::Method::Post,
                         uri: path.to_owned(),
@@ -1926,7 +1958,10 @@ mod tests {
                         peer_addr: None,
                     };
                     let actual = crate::dispatch_oauth_h1_request(&self.routes, &native, path, "");
-                    assert_eq!(actual.headers.get("cache-control").map(String::as_str), Some("no-store"));
+                    assert_eq!(
+                        actual.headers.get("cache-control").map(String::as_str),
+                        Some("no-store")
+                    );
                     let mut admitted = response(&Value::Null);
                     admitted.status = actual.status.0;
                     admitted.headers = actual.headers.into_iter().collect();
@@ -1938,7 +1973,12 @@ mod tests {
 
         fn resource(uri: &str) -> CanonicalResourceId {
             let endpoint = CanonicalHttpUrl::parse(uri).unwrap();
-            CanonicalResourceId::parse_for_endpoint(uri, &endpoint, CanonicalResourceIdPolicy::DEFAULT).unwrap()
+            CanonicalResourceId::parse_for_endpoint(
+                uri,
+                &endpoint,
+                CanonicalResourceIdPolicy::DEFAULT,
+            )
+            .unwrap()
         }
 
         fn client() -> OAuthClient {
@@ -1946,33 +1986,51 @@ mod tests {
                 .secret("client-secret")
                 .redirect_uri("https://client.example/callback")
                 .scope("read")
-                .development_client_credentials(DevelopmentClientCredentialsGrant::new(resource(RESOURCE), ["read"]).unwrap())
-                .build().unwrap()
+                .development_client_credentials(
+                    DevelopmentClientCredentialsGrant::new(resource(RESOURCE), ["read"]).unwrap(),
+                )
+                .build()
+                .unwrap()
         }
 
         fn fixture(
             profile: DevelopmentIntrospectionProfile,
             reader_resource: &str,
         ) -> (Arc<OAuthServer>, Arc<NativeIssuerExchange>) {
-            let issuer = Arc::new(OAuthServer::try_with_approval_backend(
-                OAuthServerConfig {
-                    issuer: ISSUER.to_owned(),
-                    allow_development_client_credentials: true,
-                    allow_development_token_introspection: true,
-                    development_introspection_profile: profile,
-                    ..Default::default()
-                },
-                Arc::new(ExplicitConsent),
-            ).unwrap());
+            let issuer = Arc::new(
+                OAuthServer::try_with_approval_backend(
+                    OAuthServerConfig {
+                        issuer: ISSUER.to_owned(),
+                        allow_development_client_credentials: true,
+                        allow_development_token_introspection: true,
+                        development_introspection_profile: profile,
+                        ..Default::default()
+                    },
+                    Arc::new(ExplicitConsent),
+                )
+                .unwrap(),
+            );
             issuer.register_client(client()).unwrap();
-            issuer.register_client(
-                OAuthClient::builder("resource-server")
-                    .secret("endpoint-secret")
-                    .development_token_introspection(DevelopmentTokenIntrospectionGrant::new(resource(reader_resource)).unwrap())
-                    .build().unwrap(),
-            ).unwrap();
+            issuer
+                .register_client(
+                    OAuthClient::builder("resource-server")
+                        .secret("endpoint-secret")
+                        .development_token_introspection(
+                            DevelopmentTokenIntrospectionGrant::new(resource(reader_resource))
+                                .unwrap(),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
             let routes = OAuthHttpRoutes::new(Arc::clone(&issuer), ISSUER).unwrap();
-            (issuer, Arc::new(NativeIssuerExchange { routes, calls: AtomicUsize::new(0) }))
+            (
+                issuer,
+                Arc::new(NativeIssuerExchange {
+                    routes,
+                    calls: AtomicUsize::new(0),
+                }),
+            )
         }
 
         fn form(exchange: &NativeIssuerExchange, path: &str, body: &str) -> HttpResponse {
@@ -1981,8 +2039,17 @@ mod tests {
                 uri: path.to_owned(),
                 version: asupersync::http::h1::Version::Http11,
                 headers: vec![
-                    ("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
-                    ("Authorization".to_owned(), format!("Basic {}", STANDARD.encode("integration-client:client-secret"))),
+                    (
+                        "Content-Type".to_owned(),
+                        "application/x-www-form-urlencoded".to_owned(),
+                    ),
+                    (
+                        "Authorization".to_owned(),
+                        format!(
+                            "Basic {}",
+                            STANDARD.encode("integration-client:client-secret")
+                        ),
+                    ),
                 ],
                 body: body.as_bytes().to_vec(),
                 trailers: Vec::new(),
@@ -1992,8 +2059,11 @@ mod tests {
         }
 
         fn issue_machine(exchange: &NativeIssuerExchange) -> Value {
-            let response = form(exchange, exchange.routes.token_path(),
-                "grant_type=client_credentials&resource=https%3A%2F%2Ftools.example%2Fmcp&scope=read");
+            let response = form(
+                exchange,
+                exchange.routes.token_path(),
+                "grant_type=client_credentials&resource=https%3A%2F%2Ftools.example%2Fmcp&scope=read",
+            );
             assert_eq!(response.status, HttpStatus::OK);
             let token: Value = serde_json::from_slice(&response.body).unwrap();
             assert!(token.get("refresh_token").is_none());
@@ -2018,22 +2088,31 @@ mod tests {
 
             fn call(&self, context: &McpContext, _: Value) -> McpResult<Vec<Content>> {
                 context.checkpoint()?;
-                let facts = context.auth().expect("native authentication committed issuer evidence");
+                let facts = context
+                    .auth()
+                    .expect("native authentication committed issuer evidence");
                 assert_eq!(facts.subject.as_ref().unwrap().len(), 43);
                 assert_eq!(facts.scopes, ["read"]);
                 assert!(facts.session_owner().is_some());
                 assert!(facts.verification_valid_until().unwrap() > Instant::now());
-                assert_eq!(facts.claims, Some(json!({
-                    "iss":ISSUER, "aud":RESOURCE, "client_id":"integration-client",
-                })));
+                assert_eq!(
+                    facts.claims,
+                    Some(json!({
+                        "iss":ISSUER, "aud":RESOURCE, "client_id":"integration-client",
+                    }))
+                );
                 self.0.lock().unwrap().push(facts);
                 Ok(vec![Content::text("issuer evidence reached the handler")])
             }
         }
 
-        fn endpoint(exchange: Arc<NativeIssuerExchange>, observations: Arc<Mutex<Vec<AuthContext>>>) -> ServerHttpEndpoint {
+        fn endpoint(
+            exchange: Arc<NativeIssuerExchange>,
+            observations: Arc<Mutex<Vec<AuthContext>>>,
+        ) -> ServerHttpEndpoint {
             Server::new("issuer-resource-composition", "1")
-                .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly).unwrap()
+                .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly)
+                .unwrap()
                 .request_timeout(0)
                 .auth_provider(TokenAuthProvider::new(with_exchange(verifier(), exchange)))
                 .tool(ObservedTool(observations))
@@ -2043,25 +2122,37 @@ mod tests {
         }
 
         async fn call(cx: &Cx, endpoint: &ServerHttpEndpoint, token: &str) -> HttpResponse {
-            let rpc = JsonRpcRequest::new("tools/call", Some(json!({
-                "name":"issuer_evidence", "arguments":{},
-                "_meta":{
-                    "io.modelcontextprotocol/protocolVersion":fastmcp_protocol::FINAL_PROTOCOL_VERSION,
-                    "io.modelcontextprotocol/clientCapabilities":{}
-                }
-            })), 1);
+            let rpc = JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "name":"issuer_evidence", "arguments":{},
+                    "_meta":{
+                        "io.modelcontextprotocol/protocolVersion":fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities":{}
+                    }
+                })),
+                1,
+            );
             let request = HttpRequest::new(HttpMethod::Post, "/mcp")
                 .with_header("content-type", "application/json")
                 .with_header("accept", "application/json")
-                .with_header("mcp-protocol-version", fastmcp_protocol::FINAL_PROTOCOL_VERSION)
+                .with_header(
+                    "mcp-protocol-version",
+                    fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+                )
                 .with_header("mcp-method", "tools/call")
                 .with_header("mcp-name", "issuer_evidence")
                 .with_header("authorization", format!("Bearer {token}"))
                 .with_body(serde_json::to_vec(&rpc).unwrap());
             let mut session = endpoint.open_session(cx).unwrap();
             let response = asupersync::time::timeout(
-                cx.now(), Duration::from_secs(5), Box::pin(session.handle_async(cx, request)),
-            ).await.expect("issuer composition exceeded watchdog").unwrap();
+                cx.now(),
+                Duration::from_secs(5),
+                Box::pin(session.handle_async(cx, request)),
+            )
+            .await
+            .expect("issuer composition exceeded watchdog")
+            .unwrap();
             session.close(cx).await;
             let ServerHttpEndpointResponse::Immediate(response) = response else {
                 panic!("ordinary evidence tool must produce an immediate response");
@@ -2078,7 +2169,8 @@ mod tests {
             asupersync::runtime::RuntimeBuilder::current_thread()
                 .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
                 .blocking_threads(1, 4)
-                .build().unwrap()
+                .build()
+                .unwrap()
                 .block_on(async move {
                     let cx = Cx::current().unwrap();
                     let mut task = cx.spawn(scenario).unwrap();
@@ -2089,7 +2181,8 @@ mod tests {
         #[test]
         fn native_issuer_machine_evidence_reaches_handler_and_revocation_stops_dispatch() {
             run(|cx| async move {
-                let (issuer, exchange) = fixture(DevelopmentIntrospectionProfile::ResourceEvidence, RESOURCE);
+                let (issuer, exchange) =
+                    fixture(DevelopmentIntrospectionProfile::ResourceEvidence, RESOURCE);
                 let issued = issue_machine(&exchange);
                 let token = issued["access_token"].as_str().unwrap();
                 let observations = Arc::new(Mutex::new(Vec::new()));
@@ -2100,18 +2193,44 @@ mod tests {
                 assert!(rpc.error.is_none());
                 let first_owner = observations.lock().unwrap()[0].session_owner();
                 assert_eq!(observations.lock().unwrap().len(), 1);
-                let revoked = form(&exchange, exchange.routes.revocation_path(), &format!("token={token}"));
+                let revoked = form(
+                    &exchange,
+                    exchange.routes.revocation_path(),
+                    &format!("token={token}"),
+                );
                 assert_eq!(revoked.status, HttpStatus::OK);
-                assert_eq!(call(&cx, &endpoint, token).await.status, HttpStatus::UNAUTHORIZED);
+                assert_eq!(
+                    call(&cx, &endpoint, token).await.status,
+                    HttpStatus::UNAUTHORIZED
+                );
                 assert_eq!(observations.lock().unwrap().len(), 1);
 
                 let next = issue_machine(&exchange);
-                assert_eq!(call(&cx, &endpoint, next["access_token"].as_str().unwrap()).await.status, HttpStatus::OK);
+                assert_eq!(
+                    call(&cx, &endpoint, next["access_token"].as_str().unwrap())
+                        .await
+                        .status,
+                    HttpStatus::OK
+                );
                 assert_eq!(observations.lock().unwrap()[1].session_owner(), first_owner);
                 issuer.register_client(client()).unwrap();
-                assert_eq!(call(&cx, &endpoint, next["access_token"].as_str().unwrap()).await.status, HttpStatus::UNAUTHORIZED);
+                assert_eq!(
+                    call(&cx, &endpoint, next["access_token"].as_str().unwrap())
+                        .await
+                        .status,
+                    HttpStatus::UNAUTHORIZED
+                );
                 let replacement = issue_machine(&exchange);
-                assert_eq!(call(&cx, &endpoint, replacement["access_token"].as_str().unwrap()).await.status, HttpStatus::OK);
+                assert_eq!(
+                    call(
+                        &cx,
+                        &endpoint,
+                        replacement["access_token"].as_str().unwrap()
+                    )
+                    .await
+                    .status,
+                    HttpStatus::OK
+                );
                 assert_eq!(observations.lock().unwrap().len(), 3);
                 assert_ne!(observations.lock().unwrap()[2].session_owner(), first_owner);
                 assert_eq!(exchange.calls.load(Ordering::SeqCst), 5);
@@ -2121,30 +2240,50 @@ mod tests {
         #[test]
         fn native_issuer_code_refresh_evidence_preserves_owner_and_reuse_stops_dispatch() {
             run(|cx| async move {
-                let (issuer, exchange) = fixture(DevelopmentIntrospectionProfile::ResourceEvidence, RESOURCE);
-                let (code, _) = issuer.authorize(&AuthorizationRequest {
-                    response_type: "code".to_owned(),
-                    client_id: "integration-client".to_owned(),
-                    redirect_uri: "https://client.example/callback".to_owned(),
-                    scopes: vec!["read".to_owned()],
-                    resource: Some(RESOURCE.to_owned()),
-                    state: None,
-                    code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                }).unwrap();
-                let exchanged = form(&exchange, exchange.routes.token_path(), &format!(
-                    "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&resource=https%3A%2F%2Ftools.example%2Fmcp"
-                ));
+                let (issuer, exchange) =
+                    fixture(DevelopmentIntrospectionProfile::ResourceEvidence, RESOURCE);
+                let (code, _) = issuer
+                    .authorize(&AuthorizationRequest {
+                        response_type: "code".to_owned(),
+                        client_id: "integration-client".to_owned(),
+                        redirect_uri: "https://client.example/callback".to_owned(),
+                        scopes: vec!["read".to_owned()],
+                        resource: Some(RESOURCE.to_owned()),
+                        state: None,
+                        code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+                        code_challenge_method: CodeChallengeMethod::S256,
+                    })
+                    .unwrap();
+                let exchanged = form(
+                    &exchange,
+                    exchange.routes.token_path(),
+                    &format!(
+                        "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&resource=https%3A%2F%2Ftools.example%2Fmcp"
+                    ),
+                );
                 assert_eq!(exchanged.status, HttpStatus::OK);
                 let initial: Value = serde_json::from_slice(&exchanged.body).unwrap();
                 let observations = Arc::new(Mutex::new(Vec::new()));
                 let endpoint = endpoint(exchange.clone(), observations.clone());
-                assert_eq!(call(&cx, &endpoint, initial["access_token"].as_str().unwrap()).await.status, HttpStatus::OK);
-                let renewal = format!("grant_type=refresh_token&refresh_token={}&resource=https%3A%2F%2Ftools.example%2Fmcp", initial["refresh_token"].as_str().unwrap());
+                assert_eq!(
+                    call(&cx, &endpoint, initial["access_token"].as_str().unwrap())
+                        .await
+                        .status,
+                    HttpStatus::OK
+                );
+                let renewal = format!(
+                    "grant_type=refresh_token&refresh_token={}&resource=https%3A%2F%2Ftools.example%2Fmcp",
+                    initial["refresh_token"].as_str().unwrap()
+                );
                 let refreshed = form(&exchange, exchange.routes.token_path(), &renewal);
                 assert_eq!(refreshed.status, HttpStatus::OK);
                 let refreshed: Value = serde_json::from_slice(&refreshed.body).unwrap();
-                assert_eq!(call(&cx, &endpoint, refreshed["access_token"].as_str().unwrap()).await.status, HttpStatus::OK);
+                assert_eq!(
+                    call(&cx, &endpoint, refreshed["access_token"].as_str().unwrap())
+                        .await
+                        .status,
+                    HttpStatus::OK
+                );
                 {
                     let observed = observations.lock().unwrap();
                     assert_eq!(observed.len(), 2);
@@ -2152,18 +2291,37 @@ mod tests {
                     assert_eq!(observed[0].subject, observed[1].subject);
                 }
                 let machine = issue_machine(&exchange);
-                assert_eq!(call(&cx, &endpoint, machine["access_token"].as_str().unwrap()).await.status, HttpStatus::OK);
+                assert_eq!(
+                    call(&cx, &endpoint, machine["access_token"].as_str().unwrap())
+                        .await
+                        .status,
+                    HttpStatus::OK
+                );
                 {
                     let observed = observations.lock().unwrap();
                     assert_ne!(observed[0].session_owner(), observed[2].session_owner());
                     assert_ne!(observed[0].subject, observed[2].subject);
                 }
-                assert_eq!(form(&exchange, exchange.routes.token_path(), &renewal).status, HttpStatus::BAD_REQUEST);
-                for access in [initial["access_token"].as_str().unwrap(), refreshed["access_token"].as_str().unwrap()] {
-                    assert_eq!(call(&cx, &endpoint, access).await.status, HttpStatus::UNAUTHORIZED);
+                assert_eq!(
+                    form(&exchange, exchange.routes.token_path(), &renewal).status,
+                    HttpStatus::BAD_REQUEST
+                );
+                for access in [
+                    initial["access_token"].as_str().unwrap(),
+                    refreshed["access_token"].as_str().unwrap(),
+                ] {
+                    assert_eq!(
+                        call(&cx, &endpoint, access).await.status,
+                        HttpStatus::UNAUTHORIZED
+                    );
                 }
                 assert_eq!(observations.lock().unwrap().len(), 3);
-                assert_eq!(call(&cx, &endpoint, machine["access_token"].as_str().unwrap()).await.status, HttpStatus::OK);
+                assert_eq!(
+                    call(&cx, &endpoint, machine["access_token"].as_str().unwrap())
+                        .await
+                        .status,
+                    HttpStatus::OK
+                );
                 assert_eq!(observations.lock().unwrap().len(), 4);
                 assert_eq!(exchange.calls.load(Ordering::SeqCst), 6);
             });
@@ -2174,14 +2332,22 @@ mod tests {
             run(|cx| async move {
                 for (profile, reader_resource) in [
                     (DevelopmentIntrospectionProfile::MetadataOnly, RESOURCE),
-                    (DevelopmentIntrospectionProfile::ResourceEvidence, "https://other.example/mcp"),
+                    (
+                        DevelopmentIntrospectionProfile::ResourceEvidence,
+                        "https://other.example/mcp",
+                    ),
                 ] {
                     let (issuer, exchange) = fixture(profile, reader_resource);
                     let issued = issue_machine(&exchange);
                     let observations = Arc::new(Mutex::new(Vec::new()));
                     let endpoint = endpoint(exchange.clone(), observations.clone());
                     let before = issuer.stats();
-                    assert_eq!(call(&cx, &endpoint, issued["access_token"].as_str().unwrap()).await.status, HttpStatus::UNAUTHORIZED);
+                    assert_eq!(
+                        call(&cx, &endpoint, issued["access_token"].as_str().unwrap())
+                            .await
+                            .status,
+                        HttpStatus::UNAUTHORIZED
+                    );
                     assert!(observations.lock().unwrap().is_empty());
                     assert_eq!(issuer.stats().access_tokens, before.access_tokens);
                     assert_eq!(issuer.stats().refresh_tokens, before.refresh_tokens);

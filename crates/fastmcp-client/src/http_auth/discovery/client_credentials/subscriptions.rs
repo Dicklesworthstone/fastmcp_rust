@@ -21,18 +21,18 @@ use fastmcp_protocol::{
 };
 use serde_json::json;
 
+use super::rpc::mcp_sse_limits;
 use super::{
     ClientCredentialsClient, ClientCredentialsError, ClientCredentialsSnapshot, active,
     admit_resource, authorize, discovery_deadline, prepare,
 };
+use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 #[cfg(test)]
 use crate::http_executor::ModernHttpExecutor;
 use crate::http_executor::{
     ModernHttpRequest, ModernHttpResponseKind, ModernHttpSubscriptionListenError,
     ModernHttpSubscriptionListener,
 };
-use super::rpc::mcp_sse_limits;
-use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 
 // Re-export the existing event vocabulary rather than inventing a second
 // representation of protocol acknowledgments, notifications and terminal data.
@@ -578,9 +578,19 @@ mod tests {
     fn limit_construction_rejects_unbounded_or_unusable_values() {
         for (request, frame, records, timeout) in [
             (0, 1024, 2, Duration::from_secs(1)),
-            (MAX_MANAGED_MCP_MESSAGE_BYTES + 1, 1024, 2, Duration::from_secs(1)),
+            (
+                MAX_MANAGED_MCP_MESSAGE_BYTES + 1,
+                1024,
+                2,
+                Duration::from_secs(1),
+            ),
             (1024, 0, 2, Duration::from_secs(1)),
-            (1024, MAX_MANAGED_MCP_MESSAGE_BYTES + 1, 2, Duration::from_secs(1)),
+            (
+                1024,
+                MAX_MANAGED_MCP_MESSAGE_BYTES + 1,
+                2,
+                Duration::from_secs(1),
+            ),
             (1024, 1024, 0, Duration::from_secs(1)),
             (1024, 1024, 1, Duration::from_secs(1)),
             (1024, 1024, 4097, Duration::from_secs(1)),
@@ -957,8 +967,7 @@ mod tests {
                 )
                 .unwrap();
                 let body = format!("\u{feff}{}{framed}{TERMINAL}", ack(SUBSCRIPTION_ID));
-                let (mut subscription, peer) =
-                    native_subscription(&cx, body, false, limits).await;
+                let (mut subscription, peer) = native_subscription(&cx, body, false, limits).await;
                 assert!(matches!(
                     subscription.next_event(&cx).await.unwrap(),
                     Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })

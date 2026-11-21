@@ -117,7 +117,10 @@ impl SecuredHttpSseResponse {
                     Ok(None) => return Err(SecuredHttpEndpointError::BodyClosed),
                     Err(_) => return Err(SecuredHttpEndpointError::BodyFailed),
                 }
-                if Cx::current().and_then(|active| active.timer_driver()).is_none() {
+                if Cx::current()
+                    .and_then(|active| active.timer_driver())
+                    .is_none()
+                {
                     return Err(SecuredHttpEndpointError::TimerUnavailable);
                 }
                 asupersync::time::sleep(cx.now(), Duration::from_millis(10)).await;
@@ -140,7 +143,8 @@ impl SecuredHttpSseResponse {
                             if params.request_id.correlates_with(stream.cancellation().request_id())
                     )
                 });
-        self.finished = terminal_control || crate::final_subscription_terminal_response_event(&event);
+        self.finished =
+            terminal_control || crate::final_subscription_terminal_response_event(&event);
         self.stream = Some(stream);
         self.authorization = authorization;
         Ok(Some(event))
@@ -329,33 +333,48 @@ async fn guard_response<T>(
             .check_async(cx)
             .await
             .map_err(SecuredHttpEndpointError::Revalidation)?;
-        let result = poll_fn(|task| -> Poll<Result<Option<T>, SecuredHttpEndpointError>> {
-            let ceiling = crate::auth::ambient_auth_capability_ceiling();
-            let _current = Cx::set_current(Some(cx.clone()));
-            let _restriction = Cx::push_restriction(ceiling);
-            if !lease.check_cached(cx).map_err(SecuredHttpEndpointError::Revalidation)? {
-                return Poll::Ready(Ok(None));
-            }
-            let result = future.as_mut().poll(task);
-            // Return custody of a ready value to the outer loop, which awaits
-            // any check that became due during this poll before delivering it.
-            if let Poll::Ready(value) = result {
-                return Poll::Ready(Ok(Some(value)));
-            }
-            if !lease.check_cached(cx).map_err(SecuredHttpEndpointError::Revalidation)? {
-                return Poll::Ready(Ok(None));
-            }
-            if Cx::current().and_then(|active| active.timer_driver()).is_none() {
-                return Poll::Ready(Err(SecuredHttpEndpointError::TimerUnavailable));
-            }
-            if wake.as_mut().poll(task).is_ready() {
-                wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
-                return Poll::Ready(Ok(None));
-            }
-            Poll::Pending
-        }).await?;
+        let result = poll_fn(
+            |task| -> Poll<Result<Option<T>, SecuredHttpEndpointError>> {
+                let ceiling = crate::auth::ambient_auth_capability_ceiling();
+                let _current = Cx::set_current(Some(cx.clone()));
+                let _restriction = Cx::push_restriction(ceiling);
+                if !lease
+                    .check_cached(cx)
+                    .map_err(SecuredHttpEndpointError::Revalidation)?
+                {
+                    return Poll::Ready(Ok(None));
+                }
+                let result = future.as_mut().poll(task);
+                // Return custody of a ready value to the outer loop, which awaits
+                // any check that became due during this poll before delivering it.
+                if let Poll::Ready(value) = result {
+                    return Poll::Ready(Ok(Some(value)));
+                }
+                if !lease
+                    .check_cached(cx)
+                    .map_err(SecuredHttpEndpointError::Revalidation)?
+                {
+                    return Poll::Ready(Ok(None));
+                }
+                if Cx::current()
+                    .and_then(|active| active.timer_driver())
+                    .is_none()
+                {
+                    return Poll::Ready(Err(SecuredHttpEndpointError::TimerUnavailable));
+                }
+                if wake.as_mut().poll(task).is_ready() {
+                    wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
+                    return Poll::Ready(Ok(None));
+                }
+                Poll::Pending
+            },
+        )
+        .await?;
         if let Some(value) = result {
-            lease.check_async(cx).await.map_err(SecuredHttpEndpointError::Revalidation)?;
+            lease
+                .check_async(cx)
+                .await
+                .map_err(SecuredHttpEndpointError::Revalidation)?;
             return Ok(value);
         }
     }
@@ -448,7 +467,9 @@ async fn await_dispatch<T>(
             return Poll::Ready(Err(SecuredHttpEndpointError::Cancelled));
         }
         if timeout.is_some()
-            && Cx::current().and_then(|active| active.timer_driver()).is_none()
+            && Cx::current()
+                .and_then(|active| active.timer_driver())
+                .is_none()
         {
             return Poll::Ready(Err(SecuredHttpEndpointError::TimerUnavailable));
         }
@@ -573,7 +594,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.response().status.0, 200);
         let mut stream = response.into_parts().1.unwrap();
-        assert!(stream.stream().is_none(), "revalidation must retain raw body custody");
+        assert!(
+            stream.stream().is_none(),
+            "revalidation must retain raw body custody"
+        );
         let acknowledgement = next_secured_event(cx, &mut stream).await.unwrap().unwrap();
         let acknowledgement: serde_json::Value =
             serde_json::from_str(&acknowledgement.data).unwrap();
@@ -637,7 +661,12 @@ mod tests {
                 assert!(request_id.correlates_with(&fastmcp_protocol::RequestId::Number(7)));
                 assert!(subscription_id.correlates_with(&request_id));
                 assert!(stream.finished);
-                assert!(next_secured_event(&cx, &mut stream).await.unwrap().is_none());
+                assert!(
+                    next_secured_event(&cx, &mut stream)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
                 stream.close(&cx).await;
                 assert!(cx.checkpoint().is_ok());
             }
@@ -785,9 +814,22 @@ mod tests {
                 generic["params"]["reason"],
                 "generic control queued before termination"
             );
-            assert!(!stream.finished, "only the following committed control ends the body");
-            assert!(next_secured_event(&cx, &mut stream).await.unwrap().is_some());
-            assert!(next_secured_event(&cx, &mut stream).await.unwrap().is_none());
+            assert!(
+                !stream.finished,
+                "only the following committed control ends the body"
+            );
+            assert!(
+                next_secured_event(&cx, &mut stream)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                next_secured_event(&cx, &mut stream)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             stream.close(&cx).await;
             assert!(cx.checkpoint().is_ok());
         });
@@ -826,7 +868,10 @@ mod tests {
                         SseAuthorizationError::Rejected
                     ))
                 ));
-                assert!(!stream.finished, "a withheld terminal cannot authorize clean EOF");
+                assert!(
+                    !stream.finished,
+                    "a withheld terminal cannot authorize clean EOF"
+                );
                 assert!(matches!(
                     next_secured_event(&cx, &mut stream).await,
                     Err(SecuredHttpEndpointError::BodyClosed)

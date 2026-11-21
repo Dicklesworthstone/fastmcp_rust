@@ -547,10 +547,6 @@ pub use asupersync::{LabConfig, LabRuntime};
 
 // Re-export core types
 pub use fastmcp_core::{
-    OperatorCorrelationCapacity, OperatorExecutorCapacity, OperatorExecutorSnapshot,
-    OperatorExecutorState, OperatorHttpConnections, OperatorRequestCapacity,
-};
-pub use fastmcp_core::{
     AccessToken, AuthContext, Budget, CancelledError, CatalogChangePublisher, ClientCapabilityInfo,
     ClientImplementationInfo, ClientRoot, Cx, ElicitationAction, ElicitationMode,
     ElicitationRequest, ElicitationResponse, ElicitationSender, IntoOutcome, MAX_PROMPT_GET_DEPTH,
@@ -561,8 +557,7 @@ pub use fastmcp_core::{
     RegionId, ResourceContentItem, ResourceReadResult, ResourceReader, ResultExt, RootsProvider,
     SamplingIncludeContext, SamplingMessageContent, SamplingModelHint, SamplingModelPreferences,
     SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
-    SamplingStopReason,
-    Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller,
+    SamplingStopReason, Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller,
     ToolContentItem, cancelled, err, ok,
 };
 pub use fastmcp_core::{
@@ -582,6 +577,10 @@ pub use fastmcp_core::{
     PROTOCOL_LIMITS_INITIAL_GENERATION, ParseDurationError, PreAuthSourceBucketKey, ProtocolLimit,
     ProtocolLimits, ProtocolLimitsBuilder, ProtocolLimitsError, QuotaPartitionKey,
     SealedAdmissionKeyError, SessionState, parse_duration,
+};
+pub use fastmcp_core::{
+    OperatorCorrelationCapacity, OperatorExecutorCapacity, OperatorExecutorSnapshot,
+    OperatorExecutorState, OperatorHttpConnections, OperatorRequestCapacity,
 };
 // The established root `NotificationSender` is the server router callback;
 // expose the McpContext progress capability without changing that legacy name.
@@ -980,24 +979,24 @@ pub use fastmcp_transport::{NativePipeReader, NativePipeWriter, create_native_pi
 // unconditionally, so the feature equation in Cargo.toml is the whole wiring.
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
-    BoundHttpServer, BoundStdioServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,
-    FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalRoots,
+    BoundHttpServer, BoundStdioServer, BoxFuture, CompletionHandler, ConsoleConfig,
+    FinalElicitation, FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalRoots,
     FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
     FinalToolSchemaAuthority, HttpConnectionAdmissionError, HttpConnectionAdmissionPermit,
     HttpConnectionAdmissionProbe, HttpNonquiescentShutdown, HttpOperatorHandle, HttpServerConfig,
     HttpServerShutdown, HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport,
     Middleware, MiddlewareDecision, ModernConnection, MountResult, NotificationSender,
-    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorOutputCapacity,
-    OperatorOutputCounters, OperatorProfile, OperatorReadiness, OperatorReason, OperatorSnapshot,
-    OperatorSnapshotError, OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot,
-    PendingRequests, ProgressNotificationSender, PromptHandler,
-    RequestSender, ResourceHandler, Router, ServerHttpEndpoint, ServerHttpEndpointError,
-    ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
-    ServerHttpSseResponse, ServerStats, Session, StaticTokenVerifier, StatsSnapshot, StdioOperatorHandle,
-    SubscriptionListenHandle, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind,
-    ToolExecutionMode, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-    TransportRootsProvider, TransportSamplingSender, UriParams, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle,
+    OperatorOutputCapacity, OperatorOutputCounters, OperatorProfile, OperatorReadiness,
+    OperatorReason, OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource,
+    OperatorStdioOutput, OperatorStdioSnapshot, PendingRequests, ProgressNotificationSender,
+    PromptHandler, RequestSender, ResourceHandler, Router, ServerHttpEndpoint,
+    ServerHttpEndpointError, ServerHttpEndpointResponse, ServerHttpRequestCancellation,
+    ServerHttpSession, ServerHttpSseResponse, ServerStats, Session, StaticTokenVerifier,
+    StatsSnapshot, StdioOperatorHandle, SubscriptionListenHandle, TagFilters, TokenAuthProvider,
+    TokenVerifier, ToolErrorKind, ToolExecutionMode, ToolHandler, TrafficVerbosity,
+    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender, UriParams,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_server::{
@@ -1008,16 +1007,15 @@ pub use fastmcp_server::{
 #[cfg(feature = "tasks")]
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-    FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
-    TaskExecutionAuthorizer,
-    FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskExecutionBudget,
-    FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskInitialWorkClaim,
-    FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
-    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
-    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    InMemoryFinalTaskStore, TaskRetentionAdministrator, TaskRetentionAuditPage,
-    TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
-    TaskRetentionReclamation, TaskRetentionTarget,
+    FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskAccessMetadata,
+    FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
+    FinalTaskInitialWorkClaim, FinalTaskNotificationEmitter, FinalTaskOperation,
+    FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskAccessAction,
+    TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskRetentionAdministrator,
+    TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
+    TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
 };
 
 /// Proxy APIs are available only with the proxy profile.
@@ -1163,11 +1161,9 @@ pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
 pub use fastmcp_client::FinalTaskStreamWatch;
 #[cfg(feature = "tasks")]
 pub use fastmcp_client::{
-    FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle,
-    FinalTaskInputResponses, FinalTaskStatusNotification,
-    FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch, FinalTaskWatchEvent,
-    FinalToolCallOutcome, FinalUpdateTaskResult,
-    StdioTaskSubscriptionEvent,
+    FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle, FinalTaskInputResponses,
+    FinalTaskStatusNotification, FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch,
+    FinalTaskWatchEvent, FinalToolCallOutcome, FinalUpdateTaskResult, StdioTaskSubscriptionEvent,
 };
 
 #[cfg(all(feature = "apps", feature = "tasks"))]
@@ -1225,9 +1221,9 @@ pub use fastmcp_client::http_executor::{
     MODERN_MCP_CONTENT_TYPE, ModernHttpClient, ModernHttpClientError, ModernHttpConnectOutcome,
     ModernHttpExecutor, ModernHttpExecutorError, ModernHttpExtensionEvent,
     ModernHttpExtensionExecution, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
-    ModernHttpRequest, ModernHttpRequestControl,
-    ModernHttpRequestExecution, ModernHttpResponseKind, ModernHttpResponseMetadata,
-    ModernHttpResponseStream, ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
+    ModernHttpRequest, ModernHttpRequestControl, ModernHttpRequestExecution,
+    ModernHttpResponseKind, ModernHttpResponseMetadata, ModernHttpResponseStream,
+    ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
     ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
     ModernHttpSubscriptionListener, ModernHttpSubscriptionTermination, validate_response_head,
 };
@@ -1240,9 +1236,9 @@ pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
 pub use fastmcp_client::{http_executor, mcp_config};
 
 // Re-export macros
-pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 #[cfg(feature = "extension-authoring")]
 pub use fastmcp_derive::extension;
+pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 
 /// Auto-policy composition helpers.
 ///
@@ -1263,9 +1259,9 @@ pub mod auto {
     pub use fastmcp_client::http_executor::{
         ModernHttpExtensionEvent, ModernHttpExtensionExecution, ModernHttpFinalCoreEvent,
         ModernHttpFinalCoreListenError, ModernHttpRequestControl, ModernHttpRequestExecution,
-        ModernHttpSubscriptionListenCollector,
-        ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
-        ModernHttpSubscriptionListener, ModernHttpSubscriptionTermination,
+        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
+        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
+        ModernHttpSubscriptionTermination,
     };
     pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
     pub use fastmcp_client::{
@@ -1302,23 +1298,21 @@ pub mod auto {
 
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::FinalTaskStreamWatch;
-    #[cfg(feature = "tasks")]
-    pub use fastmcp_client::{
-        FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle,
-        FinalTaskInputResponses, FinalTaskStatusNotification,
-        FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalToolCallOutcome, FinalUpdateTaskResult,
-    };
     #[cfg(all(feature = "apps", feature = "tasks"))]
     pub use fastmcp_client::McpAppsServerTaskPolicy;
+    #[cfg(feature = "tasks")]
+    pub use fastmcp_client::{
+        FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle, FinalTaskInputResponses,
+        FinalTaskStatusNotification, FinalTaskWaitOutcome, FinalTaskWaitPolicy,
+        FinalToolCallOutcome, FinalUpdateTaskResult,
+    };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
         McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHostError,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
         McpAppsMemoryClientWirePolicy, McpAppsWireBridgeTransport, McpAppsWireHost,
-        McpAppsWireHostCleanup,
-        McpAppsWireHostConfiguration,
-        McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostWithEffects,
-        mcp_apps_in_memory_wire_pair,
+        McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
+        McpAppsWireHostPolicy, McpAppsWireHostWithEffects, mcp_apps_in_memory_wire_pair,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_protocol::extensions::McpAppsClientSettings;
@@ -2514,7 +2508,9 @@ pub mod auto {
             self,
             registration: crate::extensions::authoring::ExtensionRegistration,
         ) -> Result<Self, crate::ServerExtensionConfigurationError> {
-            self.inner.extension(registration).map(|inner| Self { inner })
+            self.inner
+                .extension(registration)
+                .map(|inner| Self { inner })
         }
 
         pub fn extension_registry<R>(
@@ -2552,7 +2548,9 @@ pub mod auto {
             self,
             authorizer: std::sync::Arc<dyn crate::TaskAccessAuthorizer>,
         ) -> Self {
-            Self { inner: self.inner.task_access_authorizer(authorizer) }
+            Self {
+                inner: self.inner.task_access_authorizer(authorizer),
+            }
         }
 
         /// Authorizes process-local Task work against current application grants.
@@ -3373,10 +3371,9 @@ pub mod modern {
     pub use fastmcp_client::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::{
-        FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle,
-        FinalTaskInputResponses, FinalTaskStatusNotification,
-        FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch, FinalTaskWatchEvent,
-        FinalToolCallOutcome, FinalUpdateTaskResult,
+        FinalTask, FinalTaskDrivePolicy, FinalTaskDriver, FinalTaskHandle, FinalTaskInputResponses,
+        FinalTaskStatusNotification, FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch,
+        FinalTaskWatchEvent, FinalToolCallOutcome, FinalUpdateTaskResult,
     };
     #[cfg(feature = "tasks")]
     pub use fastmcp_protocol::extensions::{
@@ -3405,21 +3402,27 @@ pub mod modern {
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
-        TaskExecutionAuthorizer,
-        FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
-        FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
-        FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskRetentionAdministrator,
-        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy,
-        TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskExecutionBudget,
+        FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+        FinalTaskOperation, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
+        FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+        InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
+        TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
+        TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
+        TaskRetentionTarget,
     };
 
     #[cfg(all(feature = "apps", feature = "tasks"))]
     pub use fastmcp_client::McpAppsServerTaskPolicy;
     #[cfg(all(feature = "apps", feature = "websocket-experimental"))]
     pub use fastmcp_client::McpAppsWebSocketClientWirePolicy;
+    #[cfg(feature = "apps")]
+    pub use fastmcp_client::{
+        MAX_MCP_APPS_VIEW_HTML_BYTES, MAX_MCP_APPS_VIEW_HTML_TOKENS, McpAppsHostRequestOutcome,
+        McpAppsViewCallToolResult, McpAppsViewHtmlError, McpAppsViewTool, McpAppsViewToolsPage,
+        McpAppsWireHostResponse, admit_mcp_apps_view_html, validate_mcp_apps_view_html,
+    };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
         McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
@@ -3430,12 +3433,6 @@ pub mod modern {
         McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
         McpAppsWireHostPolicy, McpAppsWireHostWithEffects, mcp_apps_in_memory_pair,
         mcp_apps_in_memory_wire_pair,
-    };
-    #[cfg(feature = "apps")]
-    pub use fastmcp_client::{
-        MAX_MCP_APPS_VIEW_HTML_BYTES, MAX_MCP_APPS_VIEW_HTML_TOKENS, McpAppsHostRequestOutcome,
-        McpAppsViewCallToolResult, McpAppsViewHtmlError, McpAppsViewTool, McpAppsViewToolsPage,
-        McpAppsWireHostResponse, admit_mcp_apps_view_html, validate_mcp_apps_view_html,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_protocol::extensions::{
@@ -5224,13 +5221,7 @@ pub mod modern {
             parameters: JsonValue,
         ) -> McpResult<JsonValue> {
             self.inner
-                .request_final_extension_with_cx(
-                    cx,
-                    cancellation,
-                    extension_id,
-                    method,
-                    parameters,
-                )
+                .request_final_extension_with_cx(cx, cancellation, extension_id, method, parameters)
                 .await
         }
 
@@ -5540,7 +5531,11 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             params: crate::ListToolsParams,
         ) -> McpResult<FinalListToolsResult> {
-            match self.inner.list_tools_with_cx(cx, cancellation, params).await? {
+            match self
+                .inner
+                .list_tools_with_cx(cx, cancellation, params)
+                .await?
+            {
                 fastmcp_protocol::CoreResult::Final(FinalCoreResult::ToolsList {
                     result, ..
                 }) => Ok(result.payload),
@@ -5565,7 +5560,8 @@ pub mod modern {
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(FinalCoreResult::ResourcesList {
-                    result, ..
+                    result,
+                    ..
                 }) => Ok(result.payload),
                 _ => Err(McpError::internal_error(
                     "Modern client received a non-final resources/list result",
@@ -5588,7 +5584,8 @@ pub mod modern {
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
-                    result, ..
+                    result,
+                    ..
                 }) => Ok(result.payload),
                 _ => Err(McpError::internal_error(
                     "Modern client received a non-final resources/templates/list result",
@@ -5605,9 +5602,14 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             params: crate::ListPromptsParams,
         ) -> McpResult<FinalListPromptsResult> {
-            match self.inner.list_prompts_with_cx(cx, cancellation, params).await? {
+            match self
+                .inner
+                .list_prompts_with_cx(cx, cancellation, params)
+                .await?
+            {
                 fastmcp_protocol::CoreResult::Final(FinalCoreResult::PromptsList {
-                    result, ..
+                    result,
+                    ..
                 }) => Ok(result.payload),
                 _ => Err(McpError::internal_error(
                     "Modern client received a non-final prompts/list result",
@@ -6606,11 +6608,7 @@ pub mod modern {
             notifications: SubscriptionFilter,
         ) -> McpResult<()> {
             self.inner
-                .open_final_task_subscription_listener_with_cx(
-                    cx,
-                    cancellation,
-                    notifications,
-                )
+                .open_final_task_subscription_listener_with_cx(cx, cancellation, notifications)
                 .await
         }
 
@@ -8772,7 +8770,9 @@ pub mod modern {
             self,
             registration: extensions::authoring::ExtensionRegistration,
         ) -> Result<Self, ServerExtensionConfigurationError> {
-            self.inner.extension(registration).map(|inner| Self { inner })
+            self.inner
+                .extension(registration)
+                .map(|inner| Self { inner })
         }
 
         /// Installs final-only extension handlers and discovery settings.
@@ -8812,7 +8812,9 @@ pub mod modern {
             self,
             authorizer: std::sync::Arc<dyn crate::TaskAccessAuthorizer>,
         ) -> Self {
-            Self { inner: self.inner.task_access_authorizer(authorizer) }
+            Self {
+                inner: self.inner.task_access_authorizer(authorizer),
+            }
         }
 
         /// Authorizes process-local Task work against current application grants.
@@ -10383,7 +10385,11 @@ pub mod legacy_2024 {
             cancellation: &McpRequestCancellation,
             params: ListToolsParams,
         ) -> McpResult<ListToolsResult> {
-            match self.inner.list_tools_with_cx(cx, cancellation, params).await? {
+            match self
+                .inner
+                .list_tools_with_cx(cx, cancellation, params)
+                .await?
+            {
                 fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
                     Ok(result)
                 }
@@ -10448,7 +10454,11 @@ pub mod legacy_2024 {
             cancellation: &McpRequestCancellation,
             params: ListPromptsParams,
         ) -> McpResult<ListPromptsResult> {
-            match self.inner.list_prompts_with_cx(cx, cancellation, params).await? {
+            match self
+                .inner
+                .list_prompts_with_cx(cx, cancellation, params)
+                .await?
+            {
                 fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
                     Ok(result)
                 }
@@ -11301,7 +11311,6 @@ pub mod legacy_2024 {
             self.inner.close_with_cx(cx).await
         }
     }
-
 
     #[cfg(unix)]
     impl Client {
@@ -13593,16 +13602,19 @@ mod tests {
     #[cfg(feature = "tasks")]
     #[test]
     fn facade_builders_expose_current_task_access_policy() {
-        let _: fn(super::modern::ServerBuilder, std::sync::Arc<dyn super::TaskAccessAuthorizer>)
-            -> super::modern::ServerBuilder = super::modern::ServerBuilder::task_access_authorizer;
+        let _: fn(
+            super::modern::ServerBuilder,
+            std::sync::Arc<dyn super::TaskAccessAuthorizer>,
+        ) -> super::modern::ServerBuilder = super::modern::ServerBuilder::task_access_authorizer;
         #[cfg(feature = "legacy-2024-11-05")]
-        let _: fn(super::auto::ServerBuilder, std::sync::Arc<dyn super::TaskAccessAuthorizer>)
-            -> super::auto::ServerBuilder = super::auto::ServerBuilder::task_access_authorizer;
+        let _: fn(
+            super::auto::ServerBuilder,
+            std::sync::Arc<dyn super::TaskAccessAuthorizer>,
+        ) -> super::auto::ServerBuilder = super::auto::ServerBuilder::task_access_authorizer;
         let _: fn(
             super::modern::ServerBuilder,
             std::sync::Arc<dyn super::TaskExecutionAuthorizer>,
-        ) -> super::modern::ServerBuilder =
-            super::modern::ServerBuilder::task_execution_authorizer;
+        ) -> super::modern::ServerBuilder = super::modern::ServerBuilder::task_execution_authorizer;
         #[cfg(feature = "legacy-2024-11-05")]
         let _: fn(
             super::auto::ServerBuilder,
@@ -16593,8 +16605,8 @@ mod tests {
     fn facade_reexports_final_proxy_listener_and_modern_progress_binding_surface() {
         use super::{
             FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyFinalTaskListener,
-            ProxyFinalTaskListenerEvent, ProxyTaskLimits, ProxyUpstreamAdapter, ProxyUpstreamBinding,
-            ProxyUpstreamBindingRegistry, modern, prelude,
+            ProxyFinalTaskListenerEvent, ProxyTaskLimits, ProxyUpstreamAdapter,
+            ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, modern, prelude,
         };
 
         let _: Option<FinalProgressCallback<'_>> = None;

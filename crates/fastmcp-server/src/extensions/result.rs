@@ -16,8 +16,8 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 // though every item on it is public, so naming the path is E0603 while naming
 // the root is fine. All nine items below resolve at the root.
 use fastmcp_protocol::{
-    DecodedResult, DeferringResultDiscriminatorPolicy, ExactJsonValue, ExtensionId,
-    JsonRpcRequest, MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
+    DecodedResult, DeferringResultDiscriminatorPolicy, ExactJsonValue, ExtensionId, JsonRpcRequest,
+    MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
     decode_peer_result_for_era,
 };
 use serde_json::Value;

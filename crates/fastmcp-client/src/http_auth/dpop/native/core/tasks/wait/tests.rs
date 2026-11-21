@@ -17,7 +17,9 @@ use fastmcp_protocol::ClientCapabilities;
 use fastmcp_protocol::dpop::DpopKey;
 use serde_json::{Value, json};
 
-use super::super::{DpopCoreError, DpopHttpResponse, FINAL_PROTOCOL_VERSION, Prepared, TASKS_EXTENSION};
+use super::super::{
+    DpopCoreError, DpopHttpResponse, FINAL_PROTOCOL_VERSION, Prepared, TASKS_EXTENSION,
+};
 use crate::http_auth::dpop::native::DpopHttpPolicy;
 
 fn id() -> TaskId {
@@ -33,9 +35,12 @@ fn working(hint: Option<&str>) -> Task {
 }
 
 fn byte_error(error: &DpopTaskWaitError) -> bool {
-    matches!(error, DpopTaskWaitError::Task(DpopTasksError::Core(
-        DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit)
-    )))
+    matches!(
+        error,
+        DpopTaskWaitError::Task(DpopTasksError::Core(DpopCoreError::Protocol(
+            ManagedCoreError::ResponseByteLimit
+        )))
+    )
 }
 
 #[test]
@@ -55,13 +60,24 @@ fn policy_and_prefix_bounds_are_explicit_and_refused_not_clamped() {
         ));
     }
     for prefix in ["", "private id", "line\nbreak", "雪", &"a".repeat(129)] {
-        let error = PollState::new(prefix, DpopTaskWaitPolicy::default(), ManagedCoreLimits::default())
-            .err().unwrap();
+        let error = PollState::new(
+            prefix,
+            DpopTaskWaitPolicy::default(),
+            ManagedCoreLimits::default(),
+        )
+        .err()
+        .unwrap();
         assert!(matches!(error, DpopTaskWaitError::InvalidIdPrefix));
         assert!(!format!("{error:?} {error}").contains("private id"));
     }
-    assert!(PollState::new(&"a".repeat(128), DpopTaskWaitPolicy::default(),
-        ManagedCoreLimits::default()).is_ok());
+    assert!(
+        PollState::new(
+            &"a".repeat(128),
+            DpopTaskWaitPolicy::default(),
+            ManagedCoreLimits::default()
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -70,7 +86,8 @@ fn poll_identities_are_unique_and_every_operation_is_observation_only() {
         "selected.namespace",
         DpopTaskWaitPolicy::new(1024, Duration::from_secs(1)).unwrap(),
         ManagedCoreLimits::default(),
-    ).unwrap();
+    )
+    .unwrap();
     let mut ids = HashSet::new();
     for index in 0..1024 {
         let (operation, _) = state.begin(&id()).unwrap();
@@ -78,12 +95,21 @@ fn poll_identities_are_unique_and_every_operation_is_observation_only() {
             request_id.validate().unwrap();
             assert!(ids.insert(serde_json::to_string(request_id).unwrap()));
         }
-        assert_eq!(operation.discovery_id, RequestId::String(format!("selected.namespace.{index}.discover")));
-        assert_eq!(operation.operation_id, RequestId::String(format!("selected.namespace.{index}.get")));
+        assert_eq!(
+            operation.discovery_id,
+            RequestId::String(format!("selected.namespace.{index}.discover"))
+        );
+        assert_eq!(
+            operation.operation_id,
+            RequestId::String(format!("selected.namespace.{index}.get"))
+        );
         assert!(matches!(operation.request, ManagedTaskRequest::Get(actual) if actual == id()));
     }
     let before = state.started;
-    assert!(matches!(state.begin(&id()), Err(DpopTaskWaitError::PollLimit)));
+    assert!(matches!(
+        state.begin(&id()),
+        Err(DpopTaskWaitError::PollLimit)
+    ));
     assert_eq!(state.started, before);
     assert_eq!(ids.len(), 2048);
 }
@@ -131,22 +157,39 @@ fn shared_discovery_and_get_admission_enforce_the_remaining_aggregate_byte() {
     let last_size = response(&last_id, snapshot.clone()).body.len();
     for exact in [false, true] {
         let total = first_size + last_size - usize::from(!exact);
-        let limits = ManagedCoreLimits::new(4096, first_size.max(last_size), total, 0,
-            Duration::from_secs(10)).unwrap();
+        let limits = ManagedCoreLimits::new(
+            4096,
+            first_size.max(last_size),
+            total,
+            0,
+            Duration::from_secs(10),
+        )
+        .unwrap();
         let mut state = PollState::new("poll", DpopTaskWaitPolicy::default(), limits).unwrap();
         let (operation, narrowed) = state.begin(&id()).unwrap();
-        let prepared = Prepared::new("https://mcp.example/mcp",
-            FinalRequestMeta::new(ClientCapabilities::default()), operation, narrowed, 4096).unwrap();
-        let admitted = prepared.admit(response(&first_id, discovery.clone())).unwrap();
+        let prepared = Prepared::new(
+            "https://mcp.example/mcp",
+            FinalRequestMeta::new(ClientCapabilities::default()),
+            operation,
+            narrowed,
+            4096,
+        )
+        .unwrap();
+        let admitted = prepared
+            .admit(response(&first_id, discovery.clone()))
+            .unwrap();
         let result = admitted.finish(response(&last_id, snapshot.clone()));
         if exact {
             assert!(matches!(result, Ok(ManagedTaskEvent::Snapshot(_))));
             state.record(first_size + last_size).unwrap();
             assert!(byte_error(&state.begin(&id()).err().unwrap()));
         } else {
-            assert!(matches!(result, Err(DpopTasksError::Core(DpopCoreError::Protocol(
-                ManagedCoreError::ResponseByteLimit
-            )))));
+            assert!(matches!(
+                result,
+                Err(DpopTasksError::Core(DpopCoreError::Protocol(
+                    ManagedCoreError::ResponseByteLimit
+                )))
+            ));
             // Failed pairs do not produce a snapshot or authorize another poll.
             assert_eq!(state.remaining_bytes, total);
         }
@@ -194,18 +237,38 @@ fn opaque_peer_intervals_lengthen_local_minimum_without_overflow_or_shortening()
     );
 }
 
-fn environment() -> (Runtime, Cx, TimerDriverHandle, Arc<VirtualClock>, DpopHttpClient, DpopCredential) {
+fn environment() -> (
+    Runtime,
+    Cx,
+    TimerDriverHandle,
+    Arc<VirtualClock>,
+    DpopHttpClient,
+    DpopCredential,
+) {
     let clock = Arc::new(VirtualClock::new());
     let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
-    let runtime = RuntimeBuilder::current_thread().blocking_threads(0, 0)
-        .with_timer_driver(timer.clone()).build().unwrap();
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .with_timer_driver(timer.clone())
+        .build()
+        .unwrap();
     let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
-    let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(),
-        CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap()).unwrap();
-    let credential = session.admit_token_response(&issuer, 200,
-        br#"{"access_token":"private-token","token_type":"DPoP","expires_in":300}"#,
-        Instant::now(), Duration::from_secs(300)).unwrap();
+    let session = DpopSession::new(
+        DpopKey::generate().unwrap(),
+        issuer.clone(),
+        CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap(),
+    )
+    .unwrap();
+    let credential = session
+        .admit_token_response(
+            &issuer,
+            200,
+            br#"{"access_token":"private-token","token_type":"DPoP","expires_in":300}"#,
+            Instant::now(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
     let client = DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap();
     (runtime, cx, timer, clock, client, credential)
 }
@@ -213,8 +276,12 @@ fn environment() -> (Runtime, Cx, TimerDriverHandle, Arc<VirtualClock>, DpopHttp
 #[derive(Default)]
 struct Wakes(AtomicUsize);
 impl Wake for Wakes {
-    fn wake(self: Arc<Self>) { self.wake_by_ref(); }
-    fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 fn poll<T>(future: Pin<&mut impl Future<Output = T>>, waker: &Waker) -> Poll<T> {
     future.poll(&mut Context::from_waker(waker))
@@ -228,19 +295,39 @@ fn silent_poll_interval_wakes_on_each_owner_stop_without_advancing_the_clock() {
         let bounds = WaitBounds::new(&cx, Duration::from_secs(30), &credential).unwrap();
         let wakes = Arc::new(Wakes::default());
         let waker = Waker::from(Arc::clone(&wakes));
-        let mut interval = Box::pin(pause(&cx, &cancellation, &client.session, &credential,
-            bounds, Time::from_nanos(20_000_000_000)));
+        let mut interval = Box::pin(pause(
+            &cx,
+            &cancellation,
+            &client.session,
+            &credential,
+            bounds,
+            Time::from_nanos(20_000_000_000),
+        ));
         assert!(poll(interval.as_mut(), &waker).is_pending());
         assert!(timer.pending_count() > 0);
         let before = wakes.0.load(Ordering::SeqCst);
         match action {
-            0 => { cancellation.cancel(); }
-            1 => { credential.revoke(); }
-            2 => { client.close(); }
-            _ => { cx.set_cancel_requested(true); }
+            0 => {
+                cancellation.cancel();
+            }
+            1 => {
+                credential.revoke();
+            }
+            2 => {
+                client.close();
+            }
+            _ => {
+                cx.set_cancel_requested(true);
+            }
         }
-        assert!(wakes.0.load(Ordering::SeqCst) > before, "stop must wake a silent timer wait");
-        assert!(matches!(poll(interval.as_mut(), &waker), Poll::Ready(Err(_))));
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > before,
+            "stop must wake a silent timer wait"
+        );
+        assert!(matches!(
+            poll(interval.as_mut(), &waker),
+            Poll::Ready(Err(_))
+        ));
         assert_eq!(timer.pending_count(), 0);
         assert_eq!(cx.now(), Time::ZERO);
         assert_eq!(cx.is_cancel_requested(), action == 3);
@@ -305,14 +392,22 @@ fn interval_abandonment_or_lost_time_authority_retires_both_timer_and_stop_waker
         let bounds = WaitBounds::new(&cx, Duration::from_secs(30), &credential).unwrap();
         let wakes = Arc::new(Wakes::default());
         let waker = Waker::from(Arc::clone(&wakes));
-        let mut interval = Box::pin(pause(&cx, &cancellation, &client.session, &credential,
-            bounds, Time::from_nanos(20_000_000_000)));
+        let mut interval = Box::pin(pause(
+            &cx,
+            &cancellation,
+            &client.session,
+            &credential,
+            bounds,
+            Time::from_nanos(20_000_000_000),
+        ));
         assert!(poll(interval.as_mut(), &waker).is_pending());
         if narrowed {
             let _caller = Cx::set_current(Some(cx.clone()));
             let _denied = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
-            assert!(matches!(poll(interval.as_mut(), &waker),
-                Poll::Ready(Err(DpopHttpError::RuntimeUnavailable))));
+            assert!(matches!(
+                poll(interval.as_mut(), &waker),
+                Poll::Ready(Err(DpopHttpError::RuntimeUnavailable))
+            ));
             assert_eq!(timer.pending_count(), 0);
         }
         drop(interval);
@@ -335,13 +430,22 @@ fn precancelled_public_wait_never_polls_the_network_and_keeps_the_session_live()
     let (runtime, cx, _, _, mut client, credential) = environment();
     let cancellation = McpRequestCancellation::new();
     cancellation.cancel();
-    let mut call = Box::pin(client.wait_task_with_cancellation(&cx, &cancellation, &credential,
-        FinalRequestMeta::new(ClientCapabilities::default()), id(), "wait", DpopTaskWaitPolicy::default(),
-        ManagedCoreLimits::default()));
-    assert!(matches!(poll(call.as_mut(), Waker::noop()),
+    let mut call = Box::pin(client.wait_task_with_cancellation(
+        &cx,
+        &cancellation,
+        &credential,
+        FinalRequestMeta::new(ClientCapabilities::default()),
+        id(),
+        "wait",
+        DpopTaskWaitPolicy::default(),
+        ManagedCoreLimits::default(),
+    ));
+    assert!(matches!(
+        poll(call.as_mut(), Waker::noop()),
         Poll::Ready(Err(DpopTaskWaitError::Task(DpopTasksError::Core(
             DpopCoreError::Transport(DpopHttpError::Cancelled)
-        ))))));
+        ))))
+    ));
     drop(call);
     assert!(!client.revocation_handle().is_revoked());
     assert!(cx.checkpoint().is_ok());

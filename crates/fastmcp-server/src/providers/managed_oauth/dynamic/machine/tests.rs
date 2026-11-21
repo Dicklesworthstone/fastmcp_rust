@@ -9,14 +9,14 @@ use crate::providers::managed_oauth::interaction::{
     ManagedOAuthInputCapabilities, ManagedOAuthInputHandler, ManagedOAuthInputPolicy,
     ManagedOAuthInputResponseMode,
 };
+use crate::providers::managed_oauth::subscriptions::{
+    ManagedOAuthResourceRelayEnd, ManagedOAuthResourceRelayOutcome,
+};
 use fastmcp_core::{McpErrorCode, McpRequestCancellation};
 use fastmcp_protocol::{
     FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, FinalCompletionParams,
     FinalInputResponses, FinalResourceUpdatedNotificationParams, InputRequiredResult,
     ServerNotification,
-};
-use crate::providers::managed_oauth::subscriptions::{
-    ManagedOAuthResourceRelayEnd, ManagedOAuthResourceRelayOutcome,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -774,7 +774,6 @@ fn configured_inputs_reach_all_execution_routes_but_not_old_handlers_or_completi
     }
 }
 
-
 // These fixtures replace only the already-authorized native stream. The public
 // provider path, selector origin, shared ID allocator, acknowledgment handling,
 // resource projection and real downstream publisher are production code. Native
@@ -861,21 +860,27 @@ fn resource_ack(uris: &[&str]) -> ResourceStreamStep {
 
 fn resource_update_record(uri: &str) -> ResourceStreamStep {
     let mut additional = std::collections::BTreeMap::new();
-    additional.insert("upstreamPrivate".to_owned(), json!("private extension value"));
-    let notification = ServerNotification::ResourceUpdated(FinalResourceUpdatedNotificationParams {
-        uri: fastmcp_protocol::common_types::AbsoluteUri::parse(uri).unwrap(),
-        meta: Some(
-            serde_json::from_value(json!({
-                FINAL_SUBSCRIPTION_ID_META_KEY: "machine-upstream-id",
-                "com.example/private": "upstream private authority"
-            }))
-            .unwrap(),
-        ),
-        additional,
-    });
+    additional.insert(
+        "upstreamPrivate".to_owned(),
+        json!("private extension value"),
+    );
+    let notification =
+        ServerNotification::ResourceUpdated(FinalResourceUpdatedNotificationParams {
+            uri: fastmcp_protocol::common_types::AbsoluteUri::parse(uri).unwrap(),
+            meta: Some(
+                serde_json::from_value(json!({
+                    FINAL_SUBSCRIPTION_ID_META_KEY: "machine-upstream-id",
+                    "com.example/private": "upstream private authority"
+                }))
+                .unwrap(),
+            ),
+            additional,
+        });
     ResourceStreamStep::Record(
-        machine_subscription_event(ModernHttpSubscriptionListenEvent::Notification(notification))
-            .unwrap(),
+        machine_subscription_event(ModernHttpSubscriptionListenEvent::Notification(
+            notification,
+        ))
+        .unwrap(),
     )
 }
 
@@ -899,7 +904,8 @@ fn resource_terminal(cancelled: bool) -> ResourceStreamStep {
             "subscriptions/listen",
             json!({"notifications": {}}),
             r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":73}}"#,
-        ) else {
+        )
+        else {
             panic!("the authoritative protocol decoder must admit a listen terminal");
         };
         ModernHttpSubscriptionListenEvent::Terminal {
@@ -929,20 +935,30 @@ fn machine_resource_updates_preserve_exact_uris_and_shared_ids() {
         .unwrap();
     let cx = Cx::for_testing();
     let concrete = selected_resource(&provider, &cx);
-    let template = ready(provider.resource_templates(&cx)).unwrap().pop().unwrap();
+    let template = ready(provider.resource_templates(&cx))
+        .unwrap()
+        .pop()
+        .unwrap();
     let exact = "note://documents/a%2Fb";
     let selected = vec![concrete, template.update_subscription(exact).unwrap()];
     let probe = queue_resource_stream(
         &source,
-        vec![resource_ack(&["note://documents/one", exact]), resource_terminal(false)],
+        vec![
+            resource_ack(&["note://documents/one", exact]),
+            resource_terminal(false),
+        ],
     );
     let clone = provider.clone().with_namespace("another").unwrap();
     let limits = ClientCredentialsCoreSubscriptionLimits::new(
-        32 * 1024, 32 * 1024, 4, Duration::from_secs(19),
-    ).unwrap();
-    let updates = ready(clone.open_resource_updates(
-        &cx, &McpRequestCancellation::new(), &selected, limits,
-    )).unwrap();
+        32 * 1024,
+        32 * 1024,
+        4,
+        Duration::from_secs(19),
+    )
+    .unwrap();
+    let updates =
+        ready(clone.open_resource_updates(&cx, &McpRequestCancellation::new(), &selected, limits))
+            .unwrap();
     assert_eq!(updates.credential_generation(), 23);
     assert_eq!(
         updates.accepted_resources(),
@@ -965,17 +981,25 @@ fn machine_resource_updates_preserve_exact_uris_and_shared_ids() {
     let ids = source.ids.lock().unwrap();
     assert_eq!(ids.len(), 6, "two catalog pairs and one subscription pair");
     for (index, id) in ids.iter().enumerate() {
-        assert!(ids[..index].iter().all(|previous| !id.correlates_with(previous)));
+        assert!(
+            ids[..index]
+                .iter()
+                .all(|previous| !id.correlates_with(previous))
+        );
     }
     drop(ids);
     let outcome = ready(updates.relay(&cx, |_| {
         panic!("an ACK and terminal must never be relayed as resource updates")
-    })).unwrap();
-    assert_eq!(outcome, ManagedOAuthResourceRelayOutcome {
-        end: ManagedOAuthResourceRelayEnd::Complete,
-        forwarded_updates: 0,
-        downstream_deliveries: 0,
-    });
+    }))
+    .unwrap();
+    assert_eq!(
+        outcome,
+        ManagedOAuthResourceRelayOutcome {
+            end: ManagedOAuthResourceRelayEnd::Complete,
+            forwarded_updates: 0,
+            downstream_deliveries: 0,
+        }
+    );
     assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
 }
 
@@ -988,11 +1012,16 @@ fn machine_resource_updates_reject_foreign_and_invalid_selectors_before_io() {
     let foreign_source = self::source(vec![]);
     let foreign = ClientCredentialsProvider::from_source(foreign_source);
     let foreign_selection = selected_resource(&foreign, &cx);
-    let template = ready(provider.resource_templates(&cx)).unwrap().pop().unwrap();
+    let template = ready(provider.resource_templates(&cx))
+        .unwrap()
+        .pop()
+        .unwrap();
     let oversized = (0..20)
-        .map(|index| template.update_subscription(
-            &format!("note://documents/{index}{}", "a".repeat(15_000)),
-        ).unwrap())
+        .map(|index| {
+            template
+                .update_subscription(&format!("note://documents/{index}{}", "a".repeat(15_000)))
+                .unwrap()
+        })
         .collect::<Vec<_>>();
     let ids_before = source.ids.lock().unwrap().len();
     for selection in [
@@ -1002,29 +1031,44 @@ fn machine_resource_updates_reject_foreign_and_invalid_selectors_before_io() {
         vec![selected.clone(); fastmcp_protocol::MAX_RESOURCE_SUBSCRIPTIONS + 1],
         oversized,
     ] {
-        assert!(ready(provider.open_resource_updates(
-            &cx, &McpRequestCancellation::new(), &selection,
-            ClientCredentialsCoreSubscriptionLimits::default(),
-        )).is_err());
+        assert!(
+            ready(provider.open_resource_updates(
+                &cx,
+                &McpRequestCancellation::new(),
+                &selection,
+                ClientCredentialsCoreSubscriptionLimits::default(),
+            ))
+            .is_err()
+        );
         assert!(source.subscription_filters.lock().unwrap().is_empty());
         assert_eq!(source.ids.lock().unwrap().len(), ids_before);
     }
     let cancellation = McpRequestCancellation::new();
     cancellation.cancel();
     let error = ready(provider.open_resource_updates(
-        &cx, &cancellation, std::slice::from_ref(&selected),
+        &cx,
+        &cancellation,
+        std::slice::from_ref(&selected),
         ClientCredentialsCoreSubscriptionLimits::default(),
-    )).err().unwrap();
+    ))
+    .err()
+    .unwrap();
     assert_eq!(error.code, McpErrorCode::RequestCancelled);
     assert_eq!(source.ids.lock().unwrap().len(), ids_before);
     let probe = queue_resource_stream(
         &source,
-        vec![resource_ack(&["note://documents/one"]), resource_terminal(false)],
+        vec![
+            resource_ack(&["note://documents/one"]),
+            resource_terminal(false),
+        ],
     );
     let updates = ready(provider.open_resource_updates(
-        &cx, &McpRequestCancellation::new(), &[selected],
+        &cx,
+        &McpRequestCancellation::new(),
+        &[selected],
         ClientCredentialsCoreSubscriptionLimits::default(),
-    )).unwrap();
+    ))
+    .unwrap();
     assert!(ready(updates.relay(&cx, |_| Ok(0))).is_ok());
     assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
 }
@@ -1035,15 +1079,23 @@ fn machine_resource_updates_require_ack_and_honor_narrowing() {
     let provider = ClientCredentialsProvider::from_source(source.clone());
     let cx = Cx::for_testing();
     let concrete = selected_resource(&provider, &cx);
-    let template = ready(provider.resource_templates(&cx)).unwrap().pop().unwrap();
+    let template = ready(provider.resource_templates(&cx))
+        .unwrap()
+        .pop()
+        .unwrap();
     let other_uri = "note://documents/two";
     let selected = vec![concrete, template.update_subscription(other_uri).unwrap()];
     for opening in [vec![], vec![resource_update_record("note://documents/one")]] {
         let probe = queue_resource_stream(&source, opening);
-        assert!(ready(provider.open_resource_updates(
-            &cx, &McpRequestCancellation::new(), &selected,
-            ClientCredentialsCoreSubscriptionLimits::default(),
-        )).is_err());
+        assert!(
+            ready(provider.open_resource_updates(
+                &cx,
+                &McpRequestCancellation::new(),
+                &selected,
+                ClientCredentialsCoreSubscriptionLimits::default(),
+            ))
+            .is_err()
+        );
         assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
     }
     for accepted in [vec!["note://documents/one"], vec![]] {
@@ -1052,11 +1104,18 @@ fn machine_resource_updates_require_ack_and_honor_narrowing() {
             vec![resource_ack(&accepted), resource_terminal(false)],
         );
         let updates = ready(provider.open_resource_updates(
-            &cx, &McpRequestCancellation::new(), &selected,
+            &cx,
+            &McpRequestCancellation::new(),
+            &selected,
             ClientCredentialsCoreSubscriptionLimits::default(),
-        )).unwrap();
+        ))
+        .unwrap();
         assert_eq!(
-            updates.accepted_resources().iter().map(String::as_str).collect::<Vec<_>>(),
+            updates
+                .accepted_resources()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             accepted,
         );
         assert!(ready(updates.relay(&cx, |_| Ok(0))).is_ok());
@@ -1064,15 +1123,30 @@ fn machine_resource_updates_require_ack_and_honor_narrowing() {
     }
     let probe = queue_resource_stream(
         &source,
-        vec![resource_ack(&["note://documents/one"]), resource_update_record(other_uri)],
+        vec![
+            resource_ack(&["note://documents/one"]),
+            resource_update_record(other_uri),
+        ],
     );
     let updates = ready(provider.open_resource_updates(
-        &cx, &McpRequestCancellation::new(), &selected,
+        &cx,
+        &McpRequestCancellation::new(),
+        &selected,
         ClientCredentialsCoreSubscriptionLimits::default(),
-    )).unwrap();
+    ))
+    .unwrap();
     let mut published = 0;
-    assert!(ready(updates.relay(&cx, |_| { published += 1; Ok(1) })).is_err());
-    assert_eq!(published, 0, "a requested but unaccepted URI is never published");
+    assert!(
+        ready(updates.relay(&cx, |_| {
+            published += 1;
+            Ok(1)
+        }))
+        .is_err()
+    );
+    assert_eq!(
+        published, 0,
+        "a requested but unaccepted URI is never published"
+    );
     assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
 }
 
@@ -1081,39 +1155,51 @@ fn machine_resource_updates_strip_authority_and_use_downstream_publisher() {
     let source = source(vec![]);
     let provider = ClientCredentialsProvider::from_source(source.clone());
     let cx = Cx::for_testing();
-    let template = ready(provider.resource_templates(&cx)).unwrap().pop().unwrap();
+    let template = ready(provider.resource_templates(&cx))
+        .unwrap()
+        .pop()
+        .unwrap();
     let uri = "note://documents/a%2Fb";
     let selected = template.update_subscription(uri).unwrap();
     let probe = queue_resource_stream(
         &source,
-        vec![resource_ack(&[uri]), resource_update_record(uri), resource_terminal(false)],
+        vec![
+            resource_ack(&[uri]),
+            resource_update_record(uri),
+            resource_terminal(false),
+        ],
     );
     let server = crate::Server::new("machine-resource-relay", "1").build();
     let publisher = server.subscription_publisher();
     let events = Arc::new(Mutex::new(Vec::new()));
     let delivered = Arc::clone(&events);
-    let registration = server.open_subscription_listen(
-        RequestId::String("downstream-selected".to_owned()),
-        SubscriptionFilter {
-            resource_subscriptions: Some(vec![uri.to_owned()]),
-            ..Default::default()
-        },
-        Arc::new(move |event| delivered.lock().unwrap().push(event)),
-    ).unwrap();
-    let unrelated = server.open_subscription_listen(
-        RequestId::String("downstream-unrelated".to_owned()),
-        SubscriptionFilter {
-            resource_subscriptions: Some(vec!["note://documents/a/b".to_owned()]),
-            ..Default::default()
-        },
-        Arc::new(|event| assert_eq!(
-            event.method, "notifications/subscriptions/acknowledged",
-        )),
-    ).unwrap();
+    let registration = server
+        .open_subscription_listen(
+            RequestId::String("downstream-selected".to_owned()),
+            SubscriptionFilter {
+                resource_subscriptions: Some(vec![uri.to_owned()]),
+                ..Default::default()
+            },
+            Arc::new(move |event| delivered.lock().unwrap().push(event)),
+        )
+        .unwrap();
+    let unrelated = server
+        .open_subscription_listen(
+            RequestId::String("downstream-unrelated".to_owned()),
+            SubscriptionFilter {
+                resource_subscriptions: Some(vec!["note://documents/a/b".to_owned()]),
+                ..Default::default()
+            },
+            Arc::new(|event| assert_eq!(event.method, "notifications/subscriptions/acknowledged",)),
+        )
+        .unwrap();
     let updates = ready(provider.open_resource_updates(
-        &cx, &McpRequestCancellation::new(), &[selected],
+        &cx,
+        &McpRequestCancellation::new(),
+        &[selected],
         ClientCredentialsCoreSubscriptionLimits::default(),
-    )).unwrap();
+    ))
+    .unwrap();
     let outcome = ready(updates.relay(&cx, |event| publisher.publish(event))).unwrap();
     assert_eq!(outcome.forwarded_updates, 1);
     assert_eq!(outcome.downstream_deliveries, 1);
@@ -1149,15 +1235,21 @@ fn machine_resource_updates_distinguish_terminals_and_refuse_incomplete_streams(
             ],
         );
         let updates = ready(provider.open_resource_updates(
-            &cx, &cancellation, std::slice::from_ref(&selected),
+            &cx,
+            &cancellation,
+            std::slice::from_ref(&selected),
             ClientCredentialsCoreSubscriptionLimits::default(),
-        )).unwrap();
+        ))
+        .unwrap();
         let outcome = ready(updates.relay(&cx, |_| Ok(2))).unwrap();
-        assert_eq!(outcome.end, if cancelled {
-            ManagedOAuthResourceRelayEnd::Cancelled
-        } else {
-            ManagedOAuthResourceRelayEnd::Complete
-        });
+        assert_eq!(
+            outcome.end,
+            if cancelled {
+                ManagedOAuthResourceRelayEnd::Cancelled
+            } else {
+                ManagedOAuthResourceRelayEnd::Complete
+            }
+        );
         assert_eq!(outcome.forwarded_updates, 1);
         assert_eq!(outcome.downstream_deliveries, 2);
         assert!(!cancellation.is_cancel_requested());
@@ -1173,11 +1265,20 @@ fn machine_resource_updates_distinguish_terminals_and_refuse_incomplete_streams(
         steps.extend(tail);
         let probe = queue_resource_stream(&source, steps);
         let updates = ready(provider.open_resource_updates(
-            &cx, &McpRequestCancellation::new(), std::slice::from_ref(&selected),
+            &cx,
+            &McpRequestCancellation::new(),
+            std::slice::from_ref(&selected),
             ClientCredentialsCoreSubscriptionLimits::default(),
-        )).unwrap();
+        ))
+        .unwrap();
         let mut published = 0;
-        assert!(ready(updates.relay(&cx, |_| { published += 1; Ok(1) })).is_err());
+        assert!(
+            ready(updates.relay(&cx, |_| {
+                published += 1;
+                Ok(1)
+            }))
+            .is_err()
+        );
         assert_eq!(published, 0);
         assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
     }
@@ -1206,53 +1307,84 @@ fn machine_resource_updates_cancel_drop_and_sink_failure_preserve_siblings() {
         if mode == 0 {
             source.cancel.store(true, Ordering::SeqCst);
             let error = ready(provider.open_resource_updates(
-                &cx, &cancellation, std::slice::from_ref(&selected),
+                &cx,
+                &cancellation,
+                std::slice::from_ref(&selected),
                 ClientCredentialsCoreSubscriptionLimits::default(),
-            )).err().unwrap();
+            ))
+            .err()
+            .unwrap();
             assert_eq!(error.code, McpErrorCode::RequestCancelled);
             assert_eq!(probe.reads.load(Ordering::SeqCst), 0);
             source.cancel.store(false, Ordering::SeqCst);
         } else if mode == 1 {
             let mut opening = Box::pin(provider.open_resource_updates(
-                &cx, &cancellation, std::slice::from_ref(&selected),
+                &cx,
+                &cancellation,
+                std::slice::from_ref(&selected),
                 ClientCredentialsCoreSubscriptionLimits::default(),
             ));
-            assert!(opening.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                opening
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             drop(opening);
         } else {
             let mut updates = ready(provider.open_resource_updates(
-                &cx, &cancellation, std::slice::from_ref(&selected),
+                &cx,
+                &cancellation,
+                std::slice::from_ref(&selected),
                 ClientCredentialsCoreSubscriptionLimits::default(),
-            )).unwrap();
+            ))
+            .unwrap();
             if mode == 2 {
                 let mut relay = Box::pin(updates.relay(&cx, |_| Ok(0)));
-                assert!(relay.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                assert!(
+                    relay
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
                 drop(relay);
             } else if mode == 3 {
                 let mut called = 0;
-                assert!(ready(updates.relay(&cx, |_| {
-                    called += 1;
-                    Err(McpError::invalid_request("downstream publisher closed"))
-                })).is_err());
+                assert!(
+                    ready(updates.relay(&cx, |_| {
+                        called += 1;
+                        Err(McpError::invalid_request("downstream publisher closed"))
+                    }))
+                    .is_err()
+                );
                 assert_eq!(called, 1);
             } else {
                 updates.close();
                 assert_eq!(probe.closes.load(Ordering::SeqCst), 1);
-                assert!(ready(updates.relay(&cx, |_| {
-                    panic!("a closed response cannot publish a queued event")
-                })).is_err());
+                assert!(
+                    ready(updates.relay(&cx, |_| {
+                        panic!("a closed response cannot publish a queued event")
+                    }))
+                    .is_err()
+                );
             }
         }
         assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
         assert!(!cx.is_cancel_requested());
         let sibling_probe = queue_resource_stream(
             &source,
-            vec![resource_ack(&["note://documents/one"]), resource_terminal(false)],
+            vec![
+                resource_ack(&["note://documents/one"]),
+                resource_terminal(false),
+            ],
         );
         let sibling = ready(provider.open_resource_updates(
-            &cx, &McpRequestCancellation::new(), &[selected],
+            &cx,
+            &McpRequestCancellation::new(),
+            &[selected],
             ClientCredentialsCoreSubscriptionLimits::default(),
-        )).unwrap();
+        ))
+        .unwrap();
         assert!(ready(sibling.relay(&cx, |_| Ok(0))).is_ok());
         assert_eq!(sibling_probe.drops.load(Ordering::SeqCst), 1);
     }

@@ -523,11 +523,26 @@ mod tests {
             [
                 (CapMask::all(), [true; 5]),
                 (CapMask::none(), [false; 5]),
-                (CapSet::<false, true, true, true, true>::MASK, [false, true, true, true, true]),
-                (CapSet::<true, false, true, true, true>::MASK, [true, false, true, true, true]),
-                (CapSet::<true, true, false, true, true>::MASK, [true, true, false, true, true]),
-                (CapSet::<true, true, true, false, true>::MASK, [true, true, true, false, true]),
-                (CapSet::<true, true, true, true, false>::MASK, [true, true, true, true, false]),
+                (
+                    CapSet::<false, true, true, true, true>::MASK,
+                    [false, true, true, true, true],
+                ),
+                (
+                    CapSet::<true, false, true, true, true>::MASK,
+                    [true, false, true, true, true],
+                ),
+                (
+                    CapSet::<true, true, false, true, true>::MASK,
+                    [true, true, false, true, true],
+                ),
+                (
+                    CapSet::<true, true, true, false, true>::MASK,
+                    [true, true, true, false, true],
+                ),
+                (
+                    CapSet::<true, true, true, true, false>::MASK,
+                    [true, true, true, true, false],
+                ),
             ]
         }
 
@@ -557,7 +572,8 @@ mod tests {
                     scoped(&host, host_mask, || {
                         let actual = ready(await_channel(&caller, async {
                             Ok(effects(&Cx::current().unwrap()))
-                        })).unwrap();
+                        }))
+                        .unwrap();
                         let expected = std::array::from_fn(|index| {
                             caller_effects[index] && host_effects[index]
                         });
@@ -574,10 +590,13 @@ mod tests {
             let host = Cx::for_testing();
             let observed = std::cell::RefCell::new(Vec::new());
             {
-                let mut waiting = pin!(await_channel(&caller, poll_fn(|_| {
-                    observed.borrow_mut().push(effects(&Cx::current().unwrap()));
-                    Poll::<Result<(), TransportError>>::Pending
-                })));
+                let mut waiting = pin!(await_channel(
+                    &caller,
+                    poll_fn(|_| {
+                        observed.borrow_mut().push(effects(&Cx::current().unwrap()));
+                        Poll::<Result<(), TransportError>>::Pending
+                    })
+                ));
                 for (mask, expected) in rows() {
                     scoped(&host, mask, || {
                         assert!(poll(waiting.as_mut(), Waker::noop()).is_pending());
@@ -601,16 +620,22 @@ mod tests {
                         } else {
                             cx.clone()
                         };
-                        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+                        let (mut client, mut server) =
+                            create_memory_transport_pair_with_capacity(1);
                         let live = Cx::for_testing();
                         if operation != 0 {
                             client.send(&live, &request(61)).unwrap();
                         }
-                        let mask = if held_restriction { CapMask::all() } else { no_time() };
+                        let mask = if held_restriction {
+                            CapMask::all()
+                        } else {
+                            no_time()
+                        };
                         let result = scoped(cx, mask, || match operation {
                             0 => ready(server.recv_async(&caller)).map(|_| ()),
                             1 => ready(client.send_async(&caller, &request(62))),
-                            2 => ready(client.reserve_send_async(&caller)).map(|permit| permit.abort()),
+                            2 => ready(client.reserve_send_async(&caller))
+                                .map(|permit| permit.abort()),
                             _ => unreachable!(),
                         });
                         denied(result);
@@ -623,7 +648,10 @@ mod tests {
                         // keep capacity, publish its rejected frame or poison
                         // the next call made under a live, admitted context.
                         ready(client.send_async(&live, &request(63))).unwrap();
-                        assert_eq!(json(&ready(server.recv_async(&live)).unwrap()), json(&request(63)));
+                        assert_eq!(
+                            json(&ready(server.recv_async(&live)).unwrap()),
+                            json(&request(63))
+                        );
                     });
                 }
             }
@@ -740,7 +768,10 @@ mod tests {
                 assert_eq!(wakes.0.load(Ordering::SeqCst), before);
                 let live = Cx::for_testing();
                 client.send(&live, &request(81)).unwrap();
-                assert_eq!(json(&ready(server.recv_async(&live)).unwrap()), json(&request(81)));
+                assert_eq!(
+                    json(&ready(server.recv_async(&live)).unwrap()),
+                    json(&request(81))
+                );
             });
         }
 

@@ -140,11 +140,16 @@ impl DpopTaskWatchCheckpoint {
         }
         // Serde's derived struct visitor also accepts positional sequences;
         // those are not part of this portable object format.
-        if bytes.iter().copied().find(|byte| !byte.is_ascii_whitespace()) != Some(b'{') {
+        if bytes
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            != Some(b'{')
+        {
             return Err(DpopTaskCheckpointError::InvalidDocument);
         }
-        let wire: CheckpointWire = serde_json::from_slice(bytes)
-            .map_err(|_| DpopTaskCheckpointError::InvalidDocument)?;
+        let wire: CheckpointWire =
+            serde_json::from_slice(bytes).map_err(|_| DpopTaskCheckpointError::InvalidDocument)?;
         if wire.format != CHECKPOINT_FORMAT || wire.version != CHECKPOINT_VERSION {
             return Err(DpopTaskCheckpointError::UnsupportedFormat);
         }
@@ -173,8 +178,7 @@ impl DpopTaskWatchCheckpoint {
             bytes: Vec::new(),
             maximum: MAX_DPOP_TASK_CHECKPOINT_BYTES,
         };
-        serde_json::to_writer(&mut writer, &wire)
-            .map_err(|_| DpopTaskCheckpointError::TooLarge)?;
+        serde_json::to_writer(&mut writer, &wire).map_err(|_| DpopTaskCheckpointError::TooLarge)?;
         Ok(writer.bytes)
     }
 
@@ -229,9 +233,16 @@ impl DpopHttpClient {
         limits: DpopStreamLimits,
     ) -> Result<DpopTaskWaitOutcome, DpopTaskCheckpointError> {
         self.resume_task_watch_with_cancellation(
-            cx, &McpRequestCancellation::new(), credential, metadata, checkpoint,
-            id_prefix, policy, limits,
-        ).await
+            cx,
+            &McpRequestCancellation::new(),
+            credential,
+            metadata,
+            checkpoint,
+            id_prefix,
+            policy,
+            limits,
+        )
+        .await
     }
 
     /// Cancellation is observation-local. Resource equality is checked before
@@ -253,26 +264,34 @@ impl DpopHttpClient {
             return Err(DpopTaskWatchError::from(DpopHttpError::Cancelled).into());
         }
         checkpoint.admit_resource(self.resource())?;
-        Ok(self.watch_task_with_cancellation(
-            cx, cancellation, credential, metadata, checkpoint.task_id.clone(),
-            id_prefix, policy, limits,
-        ).await?)
+        Ok(self
+            .watch_task_with_cancellation(
+                cx,
+                cancellation,
+                credential,
+                metadata,
+                checkpoint.task_id.clone(),
+                id_prefix,
+                policy,
+                limits,
+            )
+            .await?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::task::{Context, Poll, Waker};
-    use std::time::{Duration, Instant};
-    use fastmcp_protocol::ClientCapabilities;
-    use fastmcp_protocol::dpop::DpopKey;
-    use serde_json::json;
     use crate::http_auth::dpop::DpopSession;
     use crate::http_auth::dpop::native::DpopHttpPolicy;
     use crate::http_auth::dpop::native::core::DpopCoreError;
     use crate::http_auth::dpop::native::core::stream::DpopStreamError;
+    use fastmcp_protocol::ClientCapabilities;
+    use fastmcp_protocol::dpop::DpopKey;
+    use serde_json::json;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use std::time::{Duration, Instant};
 
     fn resource() -> CanonicalHttpUrl {
         CanonicalHttpUrl::parse("https://mcp.example/mcp?tenant=one").unwrap()
@@ -288,13 +307,21 @@ mod tests {
 
     pub(super) fn client() -> (DpopHttpClient, DpopCredential) {
         let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
-        let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(), resource()).unwrap();
-        let credential = session.admit_token_response(
-            &issuer, 200,
-            br#"{"access_token":"checkpoint-test-token","token_type":"DPoP","expires_in":60}"#,
-            Instant::now(), Duration::from_secs(60),
-        ).unwrap();
-        (DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap(), credential)
+        let session =
+            DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(), resource()).unwrap();
+        let credential = session
+            .admit_token_response(
+                &issuer,
+                200,
+                br#"{"access_token":"checkpoint-test-token","token_type":"DPoP","expires_in":60}"#,
+                Instant::now(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        (
+            DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap(),
+            credential,
+        )
     }
 
     #[test]
@@ -307,7 +334,14 @@ mod tests {
         assert_eq!(restored.encode().unwrap(), bytes);
         let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(document.as_object().unwrap().len(), 5);
-        for field in ["access_token", "privateKey", "requestState", "inputResponses", "status", "result"] {
+        for field in [
+            "access_token",
+            "privateKey",
+            "requestState",
+            "inputResponses",
+            "status",
+            "result",
+        ] {
             assert!(document.get(field).is_none());
         }
         let debug = format!("{restored:?}");
@@ -328,15 +362,28 @@ mod tests {
             r#", "inputResponses":[]}"#,
         ] {
             let bytes = format!("{prefix}{suffix}");
-            assert!(matches!(DpopTaskWatchCheckpoint::decode(bytes.as_bytes()),
-                Err(DpopTaskCheckpointError::InvalidDocument)));
+            assert!(matches!(
+                DpopTaskWatchCheckpoint::decode(bytes.as_bytes()),
+                Err(DpopTaskCheckpointError::InvalidDocument)
+            ));
         }
-        let tuple = json!([CHECKPOINT_FORMAT, 1, FINAL_PROTOCOL_VERSION,
-            resource().as_str(), "task-secret"]);
-        for bytes in [serde_json::to_vec(&tuple).unwrap(), b"null".to_vec(),
-            [good.as_slice(), b" {}"].concat(), Vec::new()] {
-            assert!(matches!(DpopTaskWatchCheckpoint::decode(&bytes),
-                Err(DpopTaskCheckpointError::InvalidDocument)));
+        let tuple = json!([
+            CHECKPOINT_FORMAT,
+            1,
+            FINAL_PROTOCOL_VERSION,
+            resource().as_str(),
+            "task-secret"
+        ]);
+        for bytes in [
+            serde_json::to_vec(&tuple).unwrap(),
+            b"null".to_vec(),
+            [good.as_slice(), b" {}"].concat(),
+            Vec::new(),
+        ] {
+            assert!(matches!(
+                DpopTaskWatchCheckpoint::decode(&bytes),
+                Err(DpopTaskCheckpointError::InvalidDocument)
+            ));
         }
         assert!(DpopTaskWatchCheckpoint::decode(&good).is_ok());
     }
@@ -355,14 +402,19 @@ mod tests {
         ] {
             let mut document = wire();
             document[field] = value;
-            assert!(DpopTaskWatchCheckpoint::decode(&serde_json::to_vec(&document).unwrap()).is_err(),
-                "changed {field} must be refused");
+            assert!(
+                DpopTaskWatchCheckpoint::decode(&serde_json::to_vec(&document).unwrap()).is_err(),
+                "changed {field} must be refused"
+            );
         }
         assert!(DpopTaskWatchCheckpoint::decode(&serde_json::to_vec(&wire()).unwrap()).is_ok());
-        assert!(matches!(DpopTaskWatchCheckpoint::new(
-            &CanonicalHttpUrl::parse("http://mcp.example/mcp").unwrap(),
-            TaskId::parse("task-secret").unwrap(),
-        ), Err(DpopTaskCheckpointError::InvalidResource)));
+        assert!(matches!(
+            DpopTaskWatchCheckpoint::new(
+                &CanonicalHttpUrl::parse("http://mcp.example/mcp").unwrap(),
+                TaskId::parse("task-secret").unwrap(),
+            ),
+            Err(DpopTaskCheckpointError::InvalidResource)
+        ));
     }
 
     #[test]
@@ -371,19 +423,30 @@ mod tests {
         bytes.resize(MAX_DPOP_TASK_CHECKPOINT_BYTES, b' ');
         assert!(DpopTaskWatchCheckpoint::decode(&bytes).is_ok());
         bytes.push(b' ');
-        assert!(matches!(DpopTaskWatchCheckpoint::decode(&bytes),
-            Err(DpopTaskCheckpointError::TooLarge)));
-        assert!(matches!(DpopTaskWatchCheckpoint::decode(&vec![b'x'; MAX_DPOP_TASK_CHECKPOINT_BYTES + 1]),
-            Err(DpopTaskCheckpointError::TooLarge)));
+        assert!(matches!(
+            DpopTaskWatchCheckpoint::decode(&bytes),
+            Err(DpopTaskCheckpointError::TooLarge)
+        ));
+        assert!(matches!(
+            DpopTaskWatchCheckpoint::decode(&vec![b'x'; MAX_DPOP_TASK_CHECKPOINT_BYTES + 1]),
+            Err(DpopTaskCheckpointError::TooLarge)
+        ));
     }
 
     #[test]
     fn resource_admission_matches_the_entire_endpoint_not_just_origin() {
         let saved = checkpoint();
-        for url in ["https://other.example/mcp?tenant=one", "https://mcp.example/other?tenant=one",
-            "https://mcp.example/mcp?tenant=two", "https://mcp.example:8443/mcp?tenant=one"] {
+        for url in [
+            "https://other.example/mcp?tenant=one",
+            "https://mcp.example/other?tenant=one",
+            "https://mcp.example/mcp?tenant=two",
+            "https://mcp.example:8443/mcp?tenant=one",
+        ] {
             let other = CanonicalHttpUrl::parse(url).unwrap();
-            assert!(matches!(saved.admit_resource(&other), Err(DpopTaskCheckpointError::ResourceMismatch)));
+            assert!(matches!(
+                saved.admit_resource(&other),
+                Err(DpopTaskCheckpointError::ResourceMismatch)
+            ));
         }
         assert!(saved.admit_resource(&resource()).is_ok());
         assert_eq!(saved.task_id(), &TaskId::parse("task-secret").unwrap());
@@ -395,21 +458,41 @@ mod tests {
         let cx = Cx::for_testing();
         let cancellation = McpRequestCancellation::new();
         for matches in [false, true] {
-            let endpoint = if matches { resource() } else {
+            let endpoint = if matches {
+                resource()
+            } else {
                 CanonicalHttpUrl::parse("https://mcp.example/mcp?tenant=two").unwrap()
             };
-            let saved = DpopTaskWatchCheckpoint::new(&endpoint, TaskId::parse("task-secret").unwrap()).unwrap();
+            let saved =
+                DpopTaskWatchCheckpoint::new(&endpoint, TaskId::parse("task-secret").unwrap())
+                    .unwrap();
             let mut future = Box::pin(client.resume_task_watch_with_cancellation(
-                &cx, &cancellation, &credential, FinalRequestMeta::new(ClientCapabilities::default()),
-                &saved, "restored", DpopTaskWatchPolicy::default(), DpopStreamLimits::default(),
+                &cx,
+                &cancellation,
+                &credential,
+                FinalRequestMeta::new(ClientCapabilities::default()),
+                &saved,
+                "restored",
+                DpopTaskWatchPolicy::default(),
+                DpopStreamLimits::default(),
             ));
-            let result = future.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            let result = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
             if matches {
-                assert!(matches!(result, Poll::Ready(Err(DpopTaskCheckpointError::Watch(
-                    DpopTaskWatchError::Stream(DpopStreamError::Core(DpopCoreError::Transport(
-                        DpopHttpError::RuntimeUnavailable))))))));
+                assert!(matches!(
+                    result,
+                    Poll::Ready(Err(DpopTaskCheckpointError::Watch(
+                        DpopTaskWatchError::Stream(DpopStreamError::Core(
+                            DpopCoreError::Transport(DpopHttpError::RuntimeUnavailable)
+                        ))
+                    )))
+                ));
             } else {
-                assert!(matches!(result, Poll::Ready(Err(DpopTaskCheckpointError::ResourceMismatch))));
+                assert!(matches!(
+                    result,
+                    Poll::Ready(Err(DpopTaskCheckpointError::ResourceMismatch))
+                ));
             }
             drop(future);
             assert!(!client.revocation_handle().is_revoked());
@@ -420,26 +503,57 @@ mod tests {
     fn both_restore_entrypoints_preserve_precancellation_and_reusable_login() {
         for cancel_caller in [false, true] {
             let (mut client, credential) = client();
-            let saved = client.task_watch_checkpoint(TaskId::parse("task-secret").unwrap()).unwrap();
+            let saved = client
+                .task_watch_checkpoint(TaskId::parse("task-secret").unwrap())
+                .unwrap();
             let cx = Cx::for_testing();
             let cancellation = McpRequestCancellation::new();
-            if cancel_caller { cx.set_cancel_requested(true); } else { cancellation.cancel(); }
+            if cancel_caller {
+                cx.set_cancel_requested(true);
+            } else {
+                cancellation.cancel();
+            }
             let mut future = Box::pin(client.resume_task_watch_with_cancellation(
-                &cx, &cancellation, &credential, FinalRequestMeta::new(ClientCapabilities::default()),
-                &saved, "", DpopTaskWatchPolicy::default(), DpopStreamLimits::default(),
+                &cx,
+                &cancellation,
+                &credential,
+                FinalRequestMeta::new(ClientCapabilities::default()),
+                &saved,
+                "",
+                DpopTaskWatchPolicy::default(),
+                DpopStreamLimits::default(),
             ));
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-                Poll::Ready(Err(DpopTaskCheckpointError::Watch(DpopTaskWatchError::Stream(
-                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled))))))));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(DpopTaskCheckpointError::Watch(
+                    DpopTaskWatchError::Stream(DpopStreamError::Core(DpopCoreError::Transport(
+                        DpopHttpError::Cancelled
+                    )))
+                )))
+            ));
             drop(future);
             cx.set_cancel_requested(true);
             let mut future = Box::pin(client.resume_task_watch(
-                &cx, &credential, FinalRequestMeta::new(ClientCapabilities::default()), &saved,
-                "", DpopTaskWatchPolicy::default(), DpopStreamLimits::default(),
+                &cx,
+                &credential,
+                FinalRequestMeta::new(ClientCapabilities::default()),
+                &saved,
+                "",
+                DpopTaskWatchPolicy::default(),
+                DpopStreamLimits::default(),
             ));
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-                Poll::Ready(Err(DpopTaskCheckpointError::Watch(DpopTaskWatchError::Stream(
-                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled))))))));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(DpopTaskCheckpointError::Watch(
+                    DpopTaskWatchError::Stream(DpopStreamError::Core(DpopCoreError::Transport(
+                        DpopHttpError::Cancelled
+                    )))
+                )))
+            ));
             drop(future);
             assert!(!client.revocation_handle().is_revoked());
             assert!(saved.admit_resource(client.resource()).is_ok());

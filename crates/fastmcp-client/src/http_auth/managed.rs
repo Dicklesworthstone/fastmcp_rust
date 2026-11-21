@@ -1249,7 +1249,7 @@ mod tests {
                         Duration::from_secs(30)
                     };
                     let response =
-                        open_response(&cx, &listener,&session, &cancellation, lifetime).await;
+                        open_response(&cx, &listener, &session, &cancellation, lifetime).await;
                     let mut reading = Box::pin(response.read_to_end(&cx, 4096));
                     poll_pending(reading.as_mut()).await;
                     match action {

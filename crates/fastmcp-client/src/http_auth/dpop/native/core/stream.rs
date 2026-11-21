@@ -6,6 +6,8 @@
 //! alone release their response after the first admitted terminal signal.
 //! No response owner, proof, raw cursor or credential escapes to the observer.
 
+#[cfg(feature = "tasks")]
+pub(super) mod budget;
 /// Streaming multi-round operations with an explicitly supplied typed input host.
 pub mod interaction;
 /// Acknowledged and filter-bound core subscriptions over explicit DPoP HTTPS.
@@ -14,8 +16,6 @@ mod subscription_end;
 /// Authenticated Tasks discovery and exact-ID status subscriptions.
 #[cfg(feature = "tasks")]
 pub mod task_subscription;
-#[cfg(feature = "tasks")]
-pub(super) mod budget;
 
 use std::fmt;
 use std::future::poll_fn;
@@ -155,7 +155,9 @@ impl fmt::Display for DpopStreamError {
             Self::InvalidLimits => f.write_str("invalid DPoP core stream limits"),
             Self::ObserverStopped => f.write_str("DPoP core stream stopped by observer"),
             Self::ObserverPanicked => f.write_str("DPoP core stream observer panicked"),
-            Self::SubscriptionCancelled => f.write_str("DPoP subscription ended by peer cancellation"),
+            Self::SubscriptionCancelled => {
+                f.write_str("DPoP subscription ended by peer cancellation")
+            }
         }
     }
 }
@@ -240,7 +242,9 @@ pub(super) trait StreamDecoder<E: StreamNotification = ServerNotification> {
 
     // Only acknowledged subscription decoders may end an indefinitely open
     // response at their terminal. Ordinary RPCs keep the clean-EOF requirement.
-    fn completes_on_terminal(&self) -> bool { false }
+    fn completes_on_terminal(&self) -> bool {
+        false
+    }
 
     fn usage(&self) -> (usize, usize);
 }
@@ -311,17 +315,42 @@ impl DpopHttpClient {
     where
         N: FnMut(&ServerNotification) -> bool,
     {
-        let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
-        let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+        let bounds = WaitBounds::new(
+            cx,
+            self.policy.timeout.min(limits.core.timeout()),
+            credential,
+        )?;
+        let lifetime = Lifetime {
+            cx,
+            cancellation,
+            session: &self.session,
+            credential,
+            bounds,
+        };
         let idle = Idle::new(cx.now(), limits.idle);
         with_caller(cx, || lifetime.check(&idle))?;
         let (wire, decoder) = prepare(
-            self.resource().as_str(), request, request_id, limits.core, self.policy.max_body_bytes,
+            self.resource().as_str(),
+            request,
+            request_id,
+            limits.core,
+            self.policy.max_body_bytes,
         )?;
         self.execute_prepared_core_stream(
-            cx, cancellation, credential,
-            PreparedStream { wire, decoder, limits, bounds, idle }, &mut observer,
-        ).await.map(|completed| completed.result)
+            cx,
+            cancellation,
+            credential,
+            PreparedStream {
+                wire,
+                decoder,
+                limits,
+                bounds,
+                idle,
+            },
+            &mut observer,
+        )
+        .await
+        .map(|completed| completed.result)
     }
 
     // Ordinary, host-driven, subscription and Tasks calls execute here. A new
@@ -339,13 +368,29 @@ impl DpopHttpClient {
         E: StreamNotification,
         N: FnMut(&E) -> bool,
     {
-        let PreparedStream { wire, decoder, limits, bounds, idle } = prepared;
-        let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+        let PreparedStream {
+            wire,
+            decoder,
+            limits,
+            bounds,
+            idle,
+        } = prepared;
+        let lifetime = Lifetime {
+            cx,
+            cancellation,
+            session: &self.session,
+            credential,
+            bounds,
+        };
         with_caller(cx, || lifetime.check(&idle))?;
         // Signing and header construction occur only after effective runtime
         // admission, inside the same guard as the first transport poll.
         let response = within(
-            cx, cancellation, &self.session, credential, idle.bounds(bounds),
+            cx,
+            cancellation,
+            &self.session,
+            credential,
+            idle.bounds(bounds),
             async {
                 let mut headers = resource_headers(&self.session, credential, &wire, &self.policy)?;
                 for (name, value) in &mut headers {
@@ -354,12 +399,26 @@ impl DpopHttpClient {
                     }
                 }
                 let body = wire.body().to_vec();
-                check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-                self.transport.request_streaming(
-                    cx, Method::Post, self.session.resource.as_str(), headers, body,
-                ).await.map_err(|_| DpopHttpError::TransportFailed)
+                check_live(
+                    cx,
+                    cancellation,
+                    &self.session,
+                    credential,
+                    idle.bounds(bounds),
+                )?;
+                self.transport
+                    .request_streaming(
+                        cx,
+                        Method::Post,
+                        self.session.resource.as_str(),
+                        headers,
+                        body,
+                    )
+                    .await
+                    .map_err(|_| DpopHttpError::TransportFailed)
             },
-        ).await?;
+        )
+        .await?;
 
         // Use the same media, encoding and forbidden-header admission as the
         // native MCP executor. No sniffing or independently invented SSE type.
@@ -373,12 +432,22 @@ impl DpopHttpClient {
         // Header nonce admission needs a short mutable session borrow, outside
         // the immutable lifetime guard. No await, callback or I/O occurs here.
         let source = self.session.resource.clone();
-        self.session.observe_resource_nonce(&source, &response.head.headers)
+        self.session
+            .observe_resource_nonce(&source, &response.head.headers)
             .map_err(DpopHttpError::from)?;
-        let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+        let lifetime = Lifetime {
+            cx,
+            cancellation,
+            session: &self.session,
+            credential,
+            bounds,
+        };
         with_caller(cx, || lifetime.check(&idle))?;
         if response.head.status != 200 {
-            return Err(ManagedCoreError::HttpStatus { status: response.head.status }.into());
+            return Err(ManagedCoreError::HttpStatus {
+                status: response.head.status,
+            }
+            .into());
         }
         let state = Reader::<D, E>::new(kind, decoder, limits, self.policy.max_body_bytes)?;
         consume(response.body, &lifetime, idle, state, observer).await
@@ -396,7 +465,11 @@ struct Lifetime<'a> {
 impl Lifetime<'_> {
     fn check(&self, idle: &Idle) -> Result<(), DpopHttpError> {
         check_live(
-            self.cx, self.cancellation, self.session, self.credential, idle.bounds(self.bounds),
+            self.cx,
+            self.cancellation,
+            self.session,
+            self.credential,
+            idle.bounds(self.bounds),
         )?;
         require_runtime(self.cx)
     }
@@ -410,23 +483,26 @@ pub(super) struct Idle {
 impl Idle {
     pub(super) fn new(now: Time, timeout: Duration) -> Self {
         Self {
-            deadline: now.saturating_add_nanos(u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX)),
+            deadline: now
+                .saturating_add_nanos(u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX)),
             timeout,
         }
     }
 
     pub(super) fn bounds(&self, absolute: WaitBounds) -> WaitBounds {
         if self.deadline < absolute.deadline {
-            WaitBounds { deadline: self.deadline, terminal: DpopHttpError::TimedOut }
+            WaitBounds {
+                deadline: self.deadline,
+                terminal: DpopHttpError::TimedOut,
+            }
         } else {
             absolute
         }
     }
 
     fn progress(&mut self, now: Time) {
-        self.deadline = now.saturating_add_nanos(
-            u64::try_from(self.timeout.as_nanos()).unwrap_or(u64::MAX),
-        );
+        self.deadline =
+            now.saturating_add_nanos(u64::try_from(self.timeout.as_nanos()).unwrap_or(u64::MAX));
     }
 }
 
@@ -467,9 +543,10 @@ where
         };
         // A resumed conversation can have less budget left than one frame.
         // Refuse JSON growth at that remaining budget, not only at EOF.
-        let frame_limit = limits.core.frame_bytes().min(
-            limits.core.total_bytes().saturating_sub(decoder.usage().0),
-        );
+        let frame_limit = limits
+            .core
+            .frame_bytes()
+            .min(limits.core.total_bytes().saturating_sub(decoder.usage().0));
         Ok(Self {
             body,
             decoder,
@@ -482,16 +559,27 @@ where
     }
 
     fn push<N: FnMut(&E) -> bool>(
-        &mut self, bytes: &[u8], lifetime: &Lifetime<'_>, idle: &mut Idle, observer: &mut N,
+        &mut self,
+        bytes: &[u8],
+        lifetime: &Lifetime<'_>,
+        idle: &mut Idle,
+        observer: &mut N,
     ) -> Result<(), DpopStreamError> {
-        self.push_with_check(bytes, lifetime.cx, idle, observer, |idle| lifetime.check(idle))
+        self.push_with_check(bytes, lifetime.cx, idle, observer, |idle| {
+            lifetime.check(idle)
+        })
     }
 
     // Private receive-side seam. The watch supplies the same caller, token,
     // owner revocation and deadline checks without borrowing the mutable nonce
     // owner. Grammar, byte limits, terminal custody and observers stay here.
     fn push_with_check<N, C>(
-        &mut self, bytes: &[u8], cx: &Cx, idle: &mut Idle, observer: &mut N, mut check: C,
+        &mut self,
+        bytes: &[u8],
+        cx: &Cx,
+        idle: &mut Idle,
+        observer: &mut N,
+        mut check: C,
     ) -> Result<(), DpopStreamError>
     where
         N: FnMut(&E) -> bool,
@@ -522,45 +610,49 @@ where
                 // `None` is private control flow: the winning terminal stops
                 // the parser before it can inspect a buffered successor. The
                 // retired parser is never reused or required to reach EOF.
-                let pushed = parser.push_with(bytes, |frame| -> Result<(), Option<DpopStreamError>> {
-                    let accepted = (|| -> Result<(), DpopStreamError> {
-                        check(idle)?;
-                        if terminal.is_some() {
-                            decoder.admit_terminal_tail(frame.as_bytes())?;
+                let pushed =
+                    parser.push_with(bytes, |frame| -> Result<(), Option<DpopStreamError>> {
+                        let accepted = (|| -> Result<(), DpopStreamError> {
                             check(idle)?;
-                            return Ok(());
-                        }
-                        let event = decoder.admit(frame.as_bytes(), true)?;
-                        // Decoder work cannot revive a deadline it exhausted.
-                        check(idle)?;
-                        match event {
-                            StreamEvent::Result(result) => *terminal = Some(result),
-                            StreamEvent::Notification(notification) => {
-                                if reset_idle_on_progress && notification.is_progress() {
-                                    idle.progress(cx.now());
-                                }
-                                let observed = catch_unwind(AssertUnwindSafe(|| observer(&notification)));
-                                // Same-poll cancellation/revocation wins over a
-                                // ready observer, its decline or captured panic.
+                            if terminal.is_some() {
+                                decoder.admit_terminal_tail(frame.as_bytes())?;
                                 check(idle)?;
-                                match observed {
-                                    Ok(true) => {}
-                                    Ok(false) => return Err(DpopStreamError::ObserverStopped),
-                                    Err(_) => return Err(DpopStreamError::ObserverPanicked),
+                                return Ok(());
+                            }
+                            let event = decoder.admit(frame.as_bytes(), true)?;
+                            // Decoder work cannot revive a deadline it exhausted.
+                            check(idle)?;
+                            match event {
+                                StreamEvent::Result(result) => *terminal = Some(result),
+                                StreamEvent::Notification(notification) => {
+                                    if reset_idle_on_progress && notification.is_progress() {
+                                        idle.progress(cx.now());
+                                    }
+                                    let observed =
+                                        catch_unwind(AssertUnwindSafe(|| observer(&notification)));
+                                    // Same-poll cancellation/revocation wins over a
+                                    // ready observer, its decline or captured panic.
+                                    check(idle)?;
+                                    match observed {
+                                        Ok(true) => {}
+                                        Ok(false) => return Err(DpopStreamError::ObserverStopped),
+                                        Err(_) => return Err(DpopStreamError::ObserverPanicked),
+                                    }
                                 }
                             }
+                            Ok(())
+                        })();
+                        accepted.map_err(Some)?;
+                        if terminal.is_some() && decoder.completes_on_terminal() {
+                            return Err(None);
                         }
                         Ok(())
-                    })();
-                    accepted.map_err(Some)?;
-                    if terminal.is_some() && decoder.completes_on_terminal() {
-                        return Err(None);
-                    }
-                    Ok(())
-                });
+                    });
                 match pushed {
                     Ok(_) | Err(SsePushError::Consumer(None)) => {}
-                    Err(SsePushError::Parse(_)) => return Err(ManagedCoreError::InvalidResponse.into()),
+                    Err(SsePushError::Parse(_)) => {
+                        return Err(ManagedCoreError::InvalidResponse.into());
+                    }
                     Err(SsePushError::Consumer(Some(error))) => return Err(error),
                 }
             }
@@ -576,19 +668,27 @@ where
         self.terminal.is_some() && self.decoder.completes_on_terminal()
     }
 
-    fn finish(self, lifetime: &Lifetime<'_>, idle: &Idle) -> Result<CompletedStream<D::Terminal>, DpopStreamError> {
+    fn finish(
+        self,
+        lifetime: &Lifetime<'_>,
+        idle: &Idle,
+    ) -> Result<CompletedStream<D::Terminal>, DpopStreamError> {
         self.finish_with_check(idle, |idle| lifetime.check(idle))
     }
 
     fn finish_with_check<C>(
-        mut self, idle: &Idle, mut check: C,
+        mut self,
+        idle: &Idle,
+        mut check: C,
     ) -> Result<CompletedStream<D::Terminal>, DpopStreamError>
     where
         C: FnMut(&Idle) -> Result<(), DpopHttpError>,
     {
         check(idle)?;
         let result = if self.complete() {
-            self.terminal.take().ok_or(ManagedCoreError::MissingTerminal)?
+            self.terminal
+                .take()
+                .ok_or(ManagedCoreError::MissingTerminal)?
         } else {
             match self.body {
                 WireBody::Json(bytes) => match self.decoder.admit(&bytes, false)? {
@@ -598,7 +698,9 @@ where
                     }
                 },
                 WireBody::Sse(parser) => {
-                    let end = parser.finish().map_err(|_| ManagedCoreError::InvalidResponse)?;
+                    let end = parser
+                        .finish()
+                        .map_err(|_| ManagedCoreError::InvalidResponse)?;
                     if end.discarded_pending_event || end.discarded_partial_line {
                         return Err(ManagedCoreError::InvalidResponse.into());
                     }
@@ -607,12 +709,19 @@ where
             }
         };
         check(idle)?;
-        Ok(CompletedStream { result, usage: self.decoder.usage() })
+        Ok(CompletedStream {
+            result,
+            usage: self.decoder.usage(),
+        })
     }
 }
 
 async fn consume<B, N, D, E>(
-    mut body: B, lifetime: &Lifetime<'_>, mut idle: Idle, mut reader: Reader<D, E>, observer: &mut N,
+    mut body: B,
+    lifetime: &Lifetime<'_>,
+    mut idle: Idle,
+    mut reader: Reader<D, E>,
+    observer: &mut N,
 ) -> Result<CompletedStream<D::Terminal>, DpopStreamError>
 where
     B: Body + Unpin,
@@ -630,20 +739,28 @@ where
             frames_left = FRAMES_PER_TURN;
         }
         let frame = within(
-            lifetime.cx, lifetime.cancellation, lifetime.session, lifetime.credential,
+            lifetime.cx,
+            lifetime.cancellation,
+            lifetime.session,
+            lifetime.credential,
             idle.bounds(lifetime.bounds),
             async {
-                poll_fn(|task| Pin::new(&mut body).poll_frame(task)).await
-                    .transpose().map_err(|_| DpopHttpError::TransportFailed)
+                poll_fn(|task| Pin::new(&mut body).poll_frame(task))
+                    .await
+                    .transpose()
+                    .map_err(|_| DpopHttpError::TransportFailed)
             },
-        ).await?;
+        )
+        .await?;
         let Some(frame) = frame else {
             return with_caller(lifetime.cx, || reader.finish(lifetime, &idle));
         };
         // Empty data and trailer frames consume scheduling budget too, even
         // though they cannot consume the raw-body byte budget.
         frames_left -= 1;
-        let Some(mut data) = frame.into_data() else { continue };
+        let Some(mut data) = frame.into_data() else {
+            continue;
+        };
         while data.has_remaining() {
             if bytes_left == 0 {
                 cooperate(lifetime, &idle).await?;

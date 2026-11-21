@@ -15,15 +15,13 @@ use fastmcp_protocol::extensions::ExtensionSettings;
 use fastmcp_protocol::{ExtensionId, FinalRequestMeta, JsonRpcRequest, RequestId};
 use serde_json::Value;
 
-use super::{DpopExtensionConfiguration, PreparedDiscovery};
 use super::super::{
     DpopCoreError, DpopCredential, DpopHttpClient, DpopHttpError, DpopHttpResponse,
     ManagedCoreError, ManagedCoreLimits, WaitBounds, check_live,
 };
+use super::{DpopExtensionConfiguration, PreparedDiscovery};
 use crate::http_auth::caller::with_caller;
-use crate::http_executor::{
-    ModernHttpRequest, ModernHttpResponseKind, validate_response_head,
-};
+use crate::http_executor::{ModernHttpRequest, ModernHttpResponseKind, validate_response_head};
 use crate::session::ClientExtensionRuntime;
 
 /// One notification with an identity for its preceding discovery only.
@@ -50,9 +48,13 @@ impl DpopExtensionNotification {
         method: impl Into<String>,
         parameters: Value,
     ) -> Result<Self, ManagedCoreError> {
-        discovery_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
+        discovery_id
+            .validate()
+            .map_err(|_| ManagedCoreError::InvalidRequest)?;
         if !parameters.is_object()
-            || parameters.get("_meta").is_some_and(|value| !value.is_object())
+            || parameters
+                .get("_meta")
+                .is_some_and(|value| !value.is_object())
         {
             return Err(ManagedCoreError::InvalidRequest);
         }
@@ -85,12 +87,15 @@ impl Prepared {
         limits: ManagedCoreLimits,
         native_maximum: usize,
     ) -> Result<Self, ManagedCoreError> {
-        let (parameters, current) = configuration.runtime.prepare_local_notification(
-            &notification.extension_id, &notification.method, notification.parameters,
-        ).map_err(|_| ManagedCoreError::UnsupportedRequest)?;
-        let message = JsonRpcRequest::notification(
-            notification.method.as_str(), Some(parameters),
-        );
+        let (parameters, current) = configuration
+            .runtime
+            .prepare_local_notification(
+                &notification.extension_id,
+                &notification.method,
+                notification.parameters,
+            )
+            .map_err(|_| ManagedCoreError::UnsupportedRequest)?;
+        let message = JsonRpcRequest::notification(notification.method.as_str(), Some(parameters));
         // Measure through the bounded writer before allocating an encoded body.
         // The same typed envelope is consumed by the shared wire constructor.
         crate::measure_serialized_bytes(&message, limits.request_bytes().min(native_maximum))
@@ -99,9 +104,15 @@ impl Prepared {
             target,
             &notification.method,
             message.params.ok_or(ManagedCoreError::InvalidRequest)?,
-        ).map_err(|_| ManagedCoreError::InvalidRequest)?;
+        )
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
         let (discovery, _) = PreparedDiscovery::new(
-            target, configuration, metadata, notification.discovery_id, limits, native_maximum,
+            target,
+            configuration,
+            metadata,
+            notification.discovery_id,
+            limits,
+            native_maximum,
         )?;
         Ok(Self {
             runtime: Arc::clone(&configuration.runtime),
@@ -118,9 +129,9 @@ impl Prepared {
         // These settings came from the exact encoded message, not a prior
         // request or connection. Only this owner participates in negotiation;
         // another configured extension's one-sided fallback cannot veto it.
-        self.runtime.admit_notification_settings(
-            &discovery, &self.extension_id, &self.method, self.current,
-        ).map_err(|_| ManagedCoreError::UnsupportedRequest)?;
+        self.runtime
+            .admit_notification_settings(&discovery, &self.extension_id, &self.method, self.current)
+            .map_err(|_| ManagedCoreError::UnsupportedRequest)?;
         // Discovery may consume the entire payload allowance. A valid
         // acknowledgement has no body and requires no residual result budget.
         Ok(self.wire)
@@ -134,7 +145,10 @@ fn admit_acknowledgement(response: DpopHttpResponse) -> Result<(), DpopCoreError
     let metadata = validate_response_head(response.status(), response.headers())
         .map_err(|_| DpopHttpError::InvalidResponseHeaders)?;
     if response.status() != 202 {
-        return Err(ManagedCoreError::HttpStatus { status: response.status() }.into());
+        return Err(ManagedCoreError::HttpStatus {
+            status: response.status(),
+        }
+        .into());
     }
     if metadata.kind() != ModernHttpResponseKind::EmptyAcknowledgement
         || !response.body().is_empty()
@@ -187,14 +201,24 @@ impl DpopHttpClient {
         let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.timeout()), credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let prepared = Prepared::new(
-            self.resource().as_str(), configuration, metadata, notification,
-            limits, self.policy.max_body_bytes,
+            self.resource().as_str(),
+            configuration,
+            metadata,
+            notification,
+            limits,
+            self.policy.max_body_bytes,
         );
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let prepared = prepared?;
-        let response = self.post_resource_with_bounds(
-            cx, cancellation, credential, &prepared.discovery.wire, bounds,
-        ).await;
+        let response = self
+            .post_resource_with_bounds(
+                cx,
+                cancellation,
+                credential,
+                &prepared.discovery.wire,
+                bounds,
+            )
+            .await;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let response = response?;
         let admitted = with_caller(cx, || {
@@ -202,9 +226,9 @@ impl DpopHttpClient {
         });
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let wire = admitted.map_err(|_| ManagedCoreError::UnsupportedRequest)??;
-        let response = self.post_resource_with_bounds(
-            cx, cancellation, credential, &wire, bounds,
-        ).await;
+        let response = self
+            .post_resource_with_bounds(cx, cancellation, credential, &wire, bounds)
+            .await;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let outcome = admit_acknowledgement(response?);
         check_live(cx, cancellation, &self.session, credential, bounds)?;

@@ -208,12 +208,7 @@ mod tests {
         })
     }
 
-    async fn receive(
-        cx: &Cx,
-        peer: &mut MemoryTransport,
-        method: &str,
-        id: i64,
-    ) -> JsonRpcRequest {
+    async fn receive(cx: &Cx, peer: &mut MemoryTransport, method: &str, id: i64) -> JsonRpcRequest {
         let JsonRpcMessage::Request(request) = peer.recv_async(cx).await.unwrap() else {
             panic!("expected one client request");
         };
@@ -230,18 +225,23 @@ mod tests {
         let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
         peer.send_async(
             cx,
-            &response(1, json!({
-                "resultType":"complete", "supportedVersions":["2026-07-28"],
-                "capabilities":{"extensions":extensions}, "ttlMs":0, "cacheScope":"private",
-            })),
+            &response(
+                1,
+                json!({
+                    "resultType":"complete", "supportedVersions":["2026-07-28"],
+                    "capabilities":{"extensions":extensions}, "ttlMs":0, "cacheScope":"private",
+                }),
+            ),
         )
         .await
         .unwrap();
         let client = builder.connect(cx, transport).await.unwrap();
         let discovery = receive(cx, &mut peer, "server/discover", 1).await;
-        assert!(discovery.params.unwrap()["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]
-            .get("roots")
-            .is_some());
+        assert!(
+            discovery.params.unwrap()["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]
+                .get("roots")
+                .is_some()
+        );
         (client, peer)
     }
 
@@ -318,20 +318,31 @@ mod tests {
             cancellation: &McpRequestCancellation,
         ) -> McpResult<CoreResult> {
             match self {
-                Self::Tool => client
-                    .call_tool(cx, cancellation, "interactive", json!({"value":"résumé 東京"}))
-                    .await,
-                Self::Resource => client
-                    .read_resource(cx, cancellation, "file:///interaction-resource")
-                    .await,
-                Self::Prompt => client
-                    .get_prompt(
-                        cx,
-                        cancellation,
-                        "interactive",
-                        HashMap::from([("value".to_owned(), "résumé 東京".to_owned())]),
-                    )
-                    .await,
+                Self::Tool => {
+                    client
+                        .call_tool(
+                            cx,
+                            cancellation,
+                            "interactive",
+                            json!({"value":"résumé 東京"}),
+                        )
+                        .await
+                }
+                Self::Resource => {
+                    client
+                        .read_resource(cx, cancellation, "file:///interaction-resource")
+                        .await
+                }
+                Self::Prompt => {
+                    client
+                        .get_prompt(
+                            cx,
+                            cancellation,
+                            "interactive",
+                            HashMap::from([("value".to_owned(), "résumé 東京".to_owned())]),
+                        )
+                        .await
+                }
             }
         }
 
@@ -360,12 +371,16 @@ mod tests {
                 .expect("a decoded complete result re-encodes")
             }
             let source = match (self, result) {
-                (Self::Tool, CoreResult::Final(FinalCoreResult::ToolsCall { result, .. })) =>
-                    encode(&result),
-                (Self::Resource, CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. })) =>
-                    encode(&result),
-                (Self::Prompt, CoreResult::Final(FinalCoreResult::PromptsGet { result, .. })) =>
-                    encode(&result),
+                (Self::Tool, CoreResult::Final(FinalCoreResult::ToolsCall { result, .. })) => {
+                    encode(&result)
+                }
+                (
+                    Self::Resource,
+                    CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }),
+                ) => encode(&result),
+                (Self::Prompt, CoreResult::Final(FinalCoreResult::PromptsGet { result, .. })) => {
+                    encode(&result)
+                }
                 _ => panic!("MRTR must preserve its exact method result family"),
             };
             let result: Value = serde_json::from_str(&source).unwrap();
@@ -562,42 +577,54 @@ mod tests {
                     json!({}),
                 )
                 .await;
-                let mut serving = cx.spawn(move |peer_cx| async move {
-                    let original = receive(&peer_cx, &mut peer, verb.method(), 2).await;
-                    let original = original.params.unwrap();
-                    let mut plain = original.clone();
-                    plain.as_object_mut().unwrap().remove("_meta");
-                    assert_eq!(plain, verb.original());
-                    assert_eq!(
-                        original["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
-                        "memory-interaction-client",
-                    );
-                    peer.send_async(&peer_cx, &response(2, input("first-state")))
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        let original = receive(&peer_cx, &mut peer, verb.method(), 2).await;
+                        let original = original.params.unwrap();
+                        let mut plain = original.clone();
+                        plain.as_object_mut().unwrap().remove("_meta");
+                        assert_eq!(plain, verb.original());
+                        assert_eq!(
+                            original["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
+                            "memory-interaction-client",
+                        );
+                        peer.send_async(&peer_cx, &response(2, input("first-state")))
+                            .await
+                            .unwrap();
+
+                        let first = receive(&peer_cx, &mut peer, verb.method(), 3).await;
+                        let mut expected = original.clone();
+                        expected["requestState"] = json!("first-state");
+                        expected["inputResponses"] = json!({"roots":{"roots":[]}});
+                        assert_eq!(first.params.unwrap(), expected);
+                        peer.send_async(
+                            &peer_cx,
+                            &response(
+                                3,
+                                json!({
+                                    "resultType":"input_required", "requestState":"second-state",
+                                }),
+                            ),
+                        )
                         .await
                         .unwrap();
 
-                    let first = receive(&peer_cx, &mut peer, verb.method(), 3).await;
-                    let mut expected = original.clone();
-                    expected["requestState"] = json!("first-state");
-                    expected["inputResponses"] = json!({"roots":{"roots":[]}});
-                    assert_eq!(first.params.unwrap(), expected);
-                    peer.send_async(&peer_cx, &response(3, json!({
-                        "resultType":"input_required", "requestState":"second-state",
-                    })))
-                    .await
+                        let second = receive(&peer_cx, &mut peer, verb.method(), 4).await;
+                        let mut expected = original;
+                        expected["requestState"] = json!("second-state");
+                        assert_eq!(
+                            second.params.unwrap(),
+                            expected,
+                            "a state-only round must not replay old input responses"
+                        );
+                        peer.send_async(&peer_cx, &response(4, verb.completed()))
+                            .await
+                            .unwrap();
+                        peer
+                    })
                     .unwrap();
-
-                    let second = receive(&peer_cx, &mut peer, verb.method(), 4).await;
-                    let mut expected = original;
-                    expected["requestState"] = json!("second-state");
-                    assert_eq!(second.params.unwrap(), expected,
-                        "a state-only round must not replay old input responses");
-                    peer.send_async(&peer_cx, &response(4, verb.completed()))
-                        .await
-                        .unwrap();
-                    peer
-                }).unwrap();
-                let result = verb.call(&cx, &mut client, &McpRequestCancellation::new())
+                let result = verb
+                    .call(&cx, &mut client, &McpRequestCancellation::new())
                     .await
                     .unwrap();
                 verb.assert_completed(result);
@@ -615,23 +642,43 @@ mod tests {
         run(|cx| async move {
             for verb in [Verb::Tool, Verb::Resource, Verb::Prompt] {
                 let capabilities = serde_json::from_value(json!({"roots":{}})).unwrap();
-                let (mut client, mut peer) = connected(
-                    &cx, builder().capabilities(capabilities), json!({}),
-                ).await;
-                let mut serving = cx.spawn(move |peer_cx| async move {
-                    receive(&peer_cx, &mut peer, verb.method(), 2).await;
-                    peer.send_async(&peer_cx, &response(2, input("manual-state")))
-                        .await.unwrap();
-                    receive(&peer_cx, &mut peer, "tools/list", 3).await;
-                    peer.send_async(&peer_cx, &response(3, tools())).await.unwrap();
-                    peer
-                }).unwrap();
+                let (mut client, mut peer) =
+                    connected(&cx, builder().capabilities(capabilities), json!({})).await;
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        receive(&peer_cx, &mut peer, verb.method(), 2).await;
+                        peer.send_async(&peer_cx, &response(2, input("manual-state")))
+                            .await
+                            .unwrap();
+                        receive(&peer_cx, &mut peer, "tools/list", 3).await;
+                        peer.send_async(&peer_cx, &response(3, tools()))
+                            .await
+                            .unwrap();
+                        peer
+                    })
+                    .unwrap();
                 let cancellation = McpRequestCancellation::new();
                 let result = verb.call(&cx, &mut client, &cancellation).await.unwrap();
                 let required = match (verb, result) {
-                    (Verb::Tool, CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }))
-                    | (Verb::Resource, CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }))
-                    | (Verb::Prompt, CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. })) => result,
+                    (
+                        Verb::Tool,
+                        CoreResult::Final(FinalCoreResult::ToolsCallInputRequired {
+                            result, ..
+                        }),
+                    )
+                    | (
+                        Verb::Resource,
+                        CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired {
+                            result,
+                            ..
+                        }),
+                    )
+                    | (
+                        Verb::Prompt,
+                        CoreResult::Final(FinalCoreResult::PromptsGetInputRequired {
+                            result, ..
+                        }),
+                    ) => result,
                     _ => panic!("unconfigured clients retain the typed input-required result"),
                 };
                 assert_eq!(required.request_state(), Some("manual-state"));
@@ -651,18 +698,26 @@ mod tests {
             // Neither may invoke the otherwise valid roots sibling first.
             for advertise_sampling in [false, true] {
                 let calls = Arc::new(AtomicUsize::new(0));
-                let capabilities: ClientCapabilities = serde_json::from_value(
-                    if advertise_sampling { json!({"sampling":{}}) } else { json!({}) },
-                ).unwrap();
+                let capabilities: ClientCapabilities =
+                    serde_json::from_value(if advertise_sampling {
+                        json!({"sampling":{}})
+                    } else {
+                        json!({})
+                    })
+                    .unwrap();
                 let (mut client, mut peer) = connected(
                     &cx,
-                    builder().capabilities(capabilities)
+                    builder()
+                        .capabilities(capabilities)
                         .reverse_request_handlers(roots_handler(&calls)),
                     json!({}),
-                ).await;
+                )
+                .await;
                 let cancellation = McpRequestCancellation::new();
-                let mut sibling = client.execute_core(&cx, &cancellation, "tools/list", json!({}))
-                    .await.unwrap();
+                let mut sibling = client
+                    .execute_core(&cx, &cancellation, "tools/list", json!({}))
+                    .await
+                    .unwrap();
                 receive(&cx, &mut peer, "tools/list", 2).await;
                 let mut serving = cx.spawn(move |peer_cx| async move {
                     receive(&peer_cx, &mut peer, "tools/call", 3).await;
@@ -681,19 +736,31 @@ mod tests {
                     peer.send_async(&peer_cx, &response(4, tools())).await.unwrap();
                     peer
                 }).unwrap();
-                let error = client.call_tool(&cx, &cancellation, "interactive", json!({}))
-                    .await.unwrap_err();
-                assert_eq!(error.code, if advertise_sampling {
-                    McpErrorCode::InvalidParams
-                } else {
-                    McpErrorCode::InvalidRequest
-                });
+                let error = client
+                    .call_tool(&cx, &cancellation, "interactive", json!({}))
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    if advertise_sampling {
+                        McpErrorCode::InvalidParams
+                    } else {
+                        McpErrorCode::InvalidRequest
+                    }
+                );
                 assert_eq!(calls.load(Ordering::Acquire), 0);
-                assert!(matches!(finish(&cx, &mut client, &mut sibling).await,
-                    CoreResult::Final(FinalCoreResult::ToolsList { .. })));
-                assert!(matches!(client.list_tools(&cx, &cancellation, None).await.unwrap(),
-                    CoreResult::Final(FinalCoreResult::ToolsList { .. })));
-                assert_eq!(client.next_id, 5, "refusal must allocate no continuation ID");
+                assert!(matches!(
+                    finish(&cx, &mut client, &mut sibling).await,
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+                assert!(matches!(
+                    client.list_tools(&cx, &cancellation, None).await.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+                assert_eq!(
+                    client.next_id, 5,
+                    "refusal must allocate no continuation ID"
+                );
                 let _peer = serving.join(&cx).await.unwrap();
                 client.close(&cx).unwrap();
             }
@@ -710,40 +777,55 @@ mod tests {
             PollPanic,
         }
         run(|cx| async move {
-            for stop in [Stop::ConstructorCancel, Stop::PollCancel, Stop::ConstructorPanic, Stop::PollPanic] {
+            for stop in [
+                Stop::ConstructorCancel,
+                Stop::PollCancel,
+                Stop::ConstructorPanic,
+                Stop::PollPanic,
+            ] {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let observed = Arc::clone(&calls);
                 let cancellation = McpRequestCancellation::new();
                 let stop_request = cancellation.clone();
-                let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
-                    observed.fetch_add(1, Ordering::AcqRel);
-                    if matches!(stop, Stop::ConstructorCancel) {
-                        stop_request.cancel();
-                    }
-                    assert!(!matches!(stop, Stop::ConstructorPanic), "private constructor failure");
-                    let stop_request = stop_request.clone();
-                    Box::pin(async move {
-                        if matches!(stop, Stop::PollCancel) {
+                let handlers =
+                    ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                        observed.fetch_add(1, Ordering::AcqRel);
+                        if matches!(stop, Stop::ConstructorCancel) {
                             stop_request.cancel();
                         }
-                        assert!(!matches!(stop, Stop::PollPanic), "private poll failure");
-                        Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                        assert!(
+                            !matches!(stop, Stop::ConstructorPanic),
+                            "private constructor failure"
+                        );
+                        let stop_request = stop_request.clone();
+                        Box::pin(async move {
+                            if matches!(stop, Stop::PollCancel) {
+                                stop_request.cancel();
+                            }
+                            assert!(!matches!(stop, Stop::PollPanic), "private poll failure");
+                            Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                        })
+                    });
+                let (mut client, mut peer) =
+                    connected(&cx, builder().reverse_request_handlers(handlers), json!({})).await;
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        receive(&peer_cx, &mut peer, "tools/call", 2).await;
+                        peer.send_async(&peer_cx, &response(2, input("private-state")))
+                            .await
+                            .unwrap();
+                        let reused = receive(&peer_cx, &mut peer, "tools/list", 3).await;
+                        assert!(reused.params.unwrap().get("requestState").is_none());
+                        peer.send_async(&peer_cx, &response(3, tools()))
+                            .await
+                            .unwrap();
+                        peer
                     })
-                });
-                let (mut client, mut peer) = connected(
-                    &cx, builder().reverse_request_handlers(handlers), json!({}),
-                ).await;
-                let mut serving = cx.spawn(move |peer_cx| async move {
-                    receive(&peer_cx, &mut peer, "tools/call", 2).await;
-                    peer.send_async(&peer_cx, &response(2, input("private-state")))
-                        .await.unwrap();
-                    let reused = receive(&peer_cx, &mut peer, "tools/list", 3).await;
-                    assert!(reused.params.unwrap().get("requestState").is_none());
-                    peer.send_async(&peer_cx, &response(3, tools())).await.unwrap();
-                    peer
-                }).unwrap();
-                let error = client.call_tool(&cx, &cancellation, "interactive", json!({}))
-                    .await.unwrap_err();
+                    .unwrap();
+                let error = client
+                    .call_tool(&cx, &cancellation, "interactive", json!({}))
+                    .await
+                    .unwrap_err();
                 if matches!(stop, Stop::ConstructorCancel | Stop::PollCancel) {
                     assert_eq!(error.code, McpErrorCode::RequestCancelled);
                 } else {
@@ -754,7 +836,10 @@ mod tests {
                 assert_eq!(calls.load(Ordering::Acquire), 1);
                 assert_eq!(client.next_id, 3);
                 assert!(cx.checkpoint().is_ok());
-                client.list_tools(&cx, &McpRequestCancellation::new(), None).await.unwrap();
+                client
+                    .list_tools(&cx, &McpRequestCancellation::new(), None)
+                    .await
+                    .unwrap();
                 let _peer = serving.join(&cx).await.unwrap();
                 client.close(&cx).unwrap();
             }
@@ -792,43 +877,54 @@ mod tests {
                 let observed_entered = Arc::clone(&entered);
                 let observed_dropped = Arc::clone(&dropped);
                 let observed_cancelled = Arc::clone(&cancelled);
-                let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, token, _| {
-                    let guard = CallbackDrop {
-                        dropped: Arc::clone(&observed_dropped),
-                        cancelled: Arc::clone(&observed_cancelled),
-                        token,
-                    };
-                    let entered = Arc::clone(&observed_entered);
-                    Box::pin(async move {
-                        let _guard = guard;
-                        entered.fetch_add(1, Ordering::AcqRel);
-                        // No self-wake: the enclosing operation must retain
-                        // its own cancellation and deadline observation.
-                        std::future::pending::<McpResult<FinalEmbeddedRootsListResult>>().await
-                    })
-                });
+                let handlers =
+                    ReverseRequestHandlers::new().with_modern_roots_list(move |_, token, _| {
+                        let guard = CallbackDrop {
+                            dropped: Arc::clone(&observed_dropped),
+                            cancelled: Arc::clone(&observed_cancelled),
+                            token,
+                        };
+                        let entered = Arc::clone(&observed_entered);
+                        Box::pin(async move {
+                            let _guard = guard;
+                            entered.fetch_add(1, Ordering::AcqRel);
+                            // No self-wake: the enclosing operation must retain
+                            // its own cancellation and deadline observation.
+                            std::future::pending::<McpResult<FinalEmbeddedRootsListResult>>().await
+                        })
+                    });
                 let builder = builder().reverse_request_handlers(handlers);
                 let builder = if matches!(stop, Stop::Deadline) {
-                    builder.timeout_policy(RequestTimeoutPolicy::new(
-                        Duration::from_millis(300), Duration::from_millis(300),
-                    ).unwrap()).unwrap()
+                    builder
+                        .timeout_policy(
+                            RequestTimeoutPolicy::new(
+                                Duration::from_millis(300),
+                                Duration::from_millis(300),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap()
                 } else {
                     builder
                 };
                 let (mut client, mut peer) = connected(&cx, builder, json!({})).await;
-                let mut serving = cx.spawn(move |peer_cx| async move {
-                    receive(&peer_cx, &mut peer, "tools/call", 2).await;
-                    peer.send_async(&peer_cx, &response(2, input("not-replayed")))
-                        .await.unwrap();
-                    receive(&peer_cx, &mut peer, "tools/list", 3).await;
-                    peer.send_async(&peer_cx, &response(3, tools())).await.unwrap();
-                    peer
-                }).unwrap();
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        receive(&peer_cx, &mut peer, "tools/call", 2).await;
+                        peer.send_async(&peer_cx, &response(2, input("not-replayed")))
+                            .await
+                            .unwrap();
+                        receive(&peer_cx, &mut peer, "tools/list", 3).await;
+                        peer.send_async(&peer_cx, &response(3, tools()))
+                            .await
+                            .unwrap();
+                        peer
+                    })
+                    .unwrap();
                 let cancellation = McpRequestCancellation::new();
                 {
-                    let mut operation = pin!(client.call_tool(
-                        &cx, &cancellation, "interactive", json!({}),
-                    ));
+                    let mut operation =
+                        pin!(client.call_tool(&cx, &cancellation, "interactive", json!({}),));
                     poll_fn(|task| {
                         assert!(operation.as_mut().poll(task).is_pending());
                         if entered.load(Ordering::Acquire) == 1 {
@@ -836,12 +932,16 @@ mod tests {
                         } else {
                             Poll::Pending
                         }
-                    }).await;
+                    })
+                    .await;
                     match stop {
                         Stop::Drop => {}
                         Stop::Cancel => {
                             cancellation.cancel();
-                            assert_eq!(operation.await.unwrap_err().code, McpErrorCode::RequestCancelled);
+                            assert_eq!(
+                                operation.await.unwrap_err().code,
+                                McpErrorCode::RequestCancelled
+                            );
                         }
                         Stop::Deadline => {
                             let error = operation.await.unwrap_err();
@@ -851,11 +951,17 @@ mod tests {
                     }
                 }
                 assert_eq!(dropped.load(Ordering::Acquire), 1);
-                assert_eq!(cancelled.load(Ordering::Acquire), 1,
-                    "the handler sees cancellation before its future is destroyed");
+                assert_eq!(
+                    cancelled.load(Ordering::Acquire),
+                    1,
+                    "the handler sees cancellation before its future is destroyed"
+                );
                 assert_eq!(client.next_id, 3);
                 assert!(cx.checkpoint().is_ok());
-                client.list_tools(&cx, &McpRequestCancellation::new(), None).await.unwrap();
+                client
+                    .list_tools(&cx, &McpRequestCancellation::new(), None)
+                    .await
+                    .unwrap();
                 let _peer = serving.join(&cx).await.unwrap();
                 client.close(&cx).unwrap();
             }
@@ -867,27 +973,40 @@ mod tests {
         run(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
             let (mut client, mut peer) = connected(
-                &cx, builder().reverse_request_handlers(roots_handler(&calls)), json!({}),
-            ).await;
-            let mut serving = cx.spawn(move |peer_cx| async move {
-                for round in 0..=MAX_MRTR_CONTINUATION_ROUNDS {
-                    let id = i64::try_from(round).unwrap() + 2;
-                    receive(&peer_cx, &mut peer, "tools/call", id).await;
-                    peer.send_async(&peer_cx, &response(id, input(&format!("round-{round}"))))
-                        .await.unwrap();
-                }
-                let id = i64::try_from(MAX_MRTR_CONTINUATION_ROUNDS).unwrap() + 3;
-                receive(&peer_cx, &mut peer, "tools/list", id).await;
-                peer.send_async(&peer_cx, &response(id, tools())).await.unwrap();
-                peer
-            }).unwrap();
+                &cx,
+                builder().reverse_request_handlers(roots_handler(&calls)),
+                json!({}),
+            )
+            .await;
+            let mut serving = cx
+                .spawn(move |peer_cx| async move {
+                    for round in 0..=MAX_MRTR_CONTINUATION_ROUNDS {
+                        let id = i64::try_from(round).unwrap() + 2;
+                        receive(&peer_cx, &mut peer, "tools/call", id).await;
+                        peer.send_async(&peer_cx, &response(id, input(&format!("round-{round}"))))
+                            .await
+                            .unwrap();
+                    }
+                    let id = i64::try_from(MAX_MRTR_CONTINUATION_ROUNDS).unwrap() + 3;
+                    receive(&peer_cx, &mut peer, "tools/list", id).await;
+                    peer.send_async(&peer_cx, &response(id, tools()))
+                        .await
+                        .unwrap();
+                    peer
+                })
+                .unwrap();
             let cancellation = McpRequestCancellation::new();
-            let error = client.call_tool(&cx, &cancellation, "interactive", json!({}))
-                .await.unwrap_err();
+            let error = client
+                .call_tool(&cx, &cancellation, "interactive", json!({}))
+                .await
+                .unwrap_err();
             assert_eq!(error.code, McpErrorCode::InvalidParams);
             assert!(error.message.contains("continuation-round limit"));
             assert_eq!(calls.load(Ordering::Acquire), MAX_MRTR_CONTINUATION_ROUNDS);
-            assert_eq!(client.next_id, i64::try_from(MAX_MRTR_CONTINUATION_ROUNDS).unwrap() + 3);
+            assert_eq!(
+                client.next_id,
+                i64::try_from(MAX_MRTR_CONTINUATION_ROUNDS).unwrap() + 3
+            );
             client.list_tools(&cx, &cancellation, None).await.unwrap();
             let _peer = serving.join(&cx).await.unwrap();
             client.close(&cx).unwrap();
@@ -903,9 +1022,12 @@ mod tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let (mut client, mut peer) = connected(
                 &cx,
-                builder().reverse_request_handlers(roots_handler(&calls)).with_tasks(),
+                builder()
+                    .reverse_request_handlers(roots_handler(&calls))
+                    .with_tasks(),
                 json!({"io.modelcontextprotocol/tasks":{}}),
-            ).await;
+            )
+            .await;
             let mut serving = cx.spawn(move |peer_cx| async move {
                 let request = receive(&peer_cx, &mut peer, "tools/call", 2).await;
                 assert_eq!(
@@ -921,11 +1043,15 @@ mod tests {
             let cancellation = McpRequestCancellation::new();
             let FinalToolCallOutcome::InputRequired(input) = client
                 .call_tool_final_outcome(&cx, &cancellation, "interactive-task", json!({}))
-                .await.unwrap()
+                .await
+                .unwrap()
             else {
                 panic!("explicit Tasks calls retain their manual continuation boundary");
             };
-            assert_eq!(input.request_state(), Some("caller-owned-task-continuation"));
+            assert_eq!(
+                input.request_state(),
+                Some("caller-owned-task-continuation")
+            );
             assert_eq!(calls.load(Ordering::Acquire), 0);
             assert_eq!(client.next_id, 3);
             client.list_tools(&cx, &cancellation, None).await.unwrap();

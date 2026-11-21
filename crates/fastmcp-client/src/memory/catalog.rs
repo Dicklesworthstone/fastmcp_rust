@@ -5,7 +5,8 @@ use std::pin::pin;
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation, McpResult};
 use fastmcp_protocol::{
-    CoreResult, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams, ListToolsParams,
+    CoreResult, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
+    ListToolsParams,
 };
 use serde_json::Value;
 
@@ -420,7 +421,10 @@ mod tests {
 
     fn page(method: &str, name: Option<&str>, cursor: Option<&str>, scope: &str) -> Value {
         let (field, item) = match method {
-            "tools/list" => ("tools", json!({"name":name,"inputSchema":{"type":"object"}})),
+            "tools/list" => (
+                "tools",
+                json!({"name":name,"inputSchema":{"type":"object"}}),
+            ),
             "resources/list" => ("resources", json!({"name":name,"uri":"file:///catalog"})),
             "resources/templates/list" => (
                 "resourceTemplates",
@@ -434,7 +438,11 @@ mod tests {
             "_meta":{"com.example/page":name},
             "vendorHints":{"nextCursor":"inert", "ttlMs":999},
         });
-        result[field] = if name.is_some() { json!([item]) } else { json!([]) };
+        result[field] = if name.is_some() {
+            json!([item])
+        } else {
+            json!([])
+        };
         if let Some(cursor) = cursor {
             result["nextCursor"] = json!(cursor);
         }
@@ -442,7 +450,8 @@ mod tests {
             ("vendorDecimal", "7.30e-2"),
             ("vendorHuge", "18446744073709551617"),
         ] {
-            result[key] = Value::Number(serde_json::Number::from_string_unchecked(exact.to_owned()));
+            result[key] =
+                Value::Number(serde_json::Number::from_string_unchecked(exact.to_owned()));
         }
         result
     }
@@ -463,24 +472,45 @@ mod tests {
 
     async fn connected(cx: &Cx) -> (MemoryClient, MemoryTransport) {
         let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
-        peer.send_async(cx, &response(1, json!({
-            "resultType":"complete", "supportedVersions":["2026-07-28"],
-            "capabilities":{}, "ttlMs":0, "cacheScope":"private",
-        }))).await.unwrap();
+        peer.send_async(
+            cx,
+            &response(
+                1,
+                json!({
+                    "resultType":"complete", "supportedVersions":["2026-07-28"],
+                    "capabilities":{}, "ttlMs":0, "cacheScope":"private",
+                }),
+            ),
+        )
+        .await
+        .unwrap();
         let client = MemoryClient::builder(ClientInfo {
-            name: "memory-catalog".into(), version: "7".into(),
-        }).connect(cx, transport).await.unwrap();
+            name: "memory-catalog".into(),
+            version: "7".into(),
+        })
+        .connect(cx, transport)
+        .await
+        .unwrap();
         receive(cx, &mut peer, "server/discover", Some(1)).await;
         (client, peer)
     }
 
     fn assert_parameters(request: JsonRpcRequest, cursor: Option<&str>) {
         let parameters = request.params.unwrap();
-        assert_eq!(parameters.get("cursor"), cursor.map(|value| json!(value)).as_ref());
+        assert_eq!(
+            parameters.get("cursor"),
+            cursor.map(|value| json!(value)).as_ref()
+        );
         assert_eq!(parameters["includeTags"], json!(["visible", " visible "]));
         assert_eq!(parameters["excludeTags"], json!([]));
-        assert_eq!(parameters["_meta"]["io.modelcontextprotocol/clientInfo"]["name"], "memory-catalog");
-        assert_eq!(parameters["_meta"]["io.modelcontextprotocol/clientInfo"]["version"], "7");
+        assert_eq!(
+            parameters["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
+            "memory-catalog"
+        );
+        assert_eq!(
+            parameters["_meta"]["io.modelcontextprotocol/clientInfo"]["version"],
+            "7"
+        );
     }
 
     async fn one_page(
@@ -494,13 +524,25 @@ mod tests {
         let exclude_tags = Some(Vec::new());
         macro_rules! call {
             ($params:ident, $method:ident) => {
-                client.$method(cx, token, $params { cursor, include_tags, exclude_tags }).await
+                client
+                    .$method(
+                        cx,
+                        token,
+                        $params {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
             };
         }
         match method {
             "tools/list" => call!(ListToolsParams, list_tools_with_params),
             "resources/list" => call!(ListResourcesParams, list_resources),
-            "resources/templates/list" => call!(ListResourceTemplatesParams, list_resource_templates),
+            "resources/templates/list" => {
+                call!(ListResourceTemplatesParams, list_resource_templates)
+            }
             "prompts/list" => call!(ListPromptsParams, list_prompts),
             _ => unreachable!(),
         }
@@ -517,13 +559,25 @@ mod tests {
         let exclude_tags = Some(Vec::new());
         macro_rules! call {
             ($params:ident, $method:ident) => {
-                client.$method(cx, token, $params { cursor, include_tags, exclude_tags }).await
+                client
+                    .$method(
+                        cx,
+                        token,
+                        $params {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
             };
         }
         match method {
             "tools/list" => call!(ListToolsParams, list_all_tools),
             "resources/list" => call!(ListResourcesParams, list_all_resources),
-            "resources/templates/list" => call!(ListResourceTemplatesParams, list_all_resource_templates),
+            "resources/templates/list" => {
+                call!(ListResourceTemplatesParams, list_all_resource_templates)
+            }
             "prompts/list" => call!(ListPromptsParams, list_all_prompts),
             _ => unreachable!(),
         }
@@ -1025,8 +1079,12 @@ mod tests {
     async fn ordinary_survives(cx: &Cx, client: &mut MemoryClient, peer: &mut MemoryTransport) {
         let token = McpRequestCancellation::new();
         let id = client.next_id;
-        peer.send_async(cx, &response(id, page("tools/list", Some("healthy"), None, "private")))
-            .await.unwrap();
+        peer.send_async(
+            cx,
+            &response(id, page("tools/list", Some("healthy"), None, "private")),
+        )
+        .await
+        .unwrap();
         let result = client.list_tools(cx, &token, None).await.unwrap();
         receive(cx, peer, "tools/list", Some(id)).await;
         assert_eq!(catalog_page("tools/list", &result).unwrap(), (1, None));
@@ -1039,11 +1097,24 @@ mod tests {
             let token = McpRequestCancellation::new();
             for (index, method) in METHODS.into_iter().enumerate() {
                 let expected = page(method, Some("one"), Some("next"), "private");
-                peer.send_async(&cx, &response(index as i64 + 2, expected.clone())).await.unwrap();
-                let result = one_page(&mut client, &cx, &token, method, Some("".into())).await.unwrap();
-                assert_parameters(receive(&cx, &mut peer, method, Some(index as i64 + 2)).await, Some(""));
-                assert_eq!(serde_json::from_str::<Value>(&result.encode().unwrap()).unwrap(), expected);
-                assert_eq!(catalog_page(method, &result).unwrap(), (1, Some("next".into())));
+                peer.send_async(&cx, &response(index as i64 + 2, expected.clone()))
+                    .await
+                    .unwrap();
+                let result = one_page(&mut client, &cx, &token, method, Some("".into()))
+                    .await
+                    .unwrap();
+                assert_parameters(
+                    receive(&cx, &mut peer, method, Some(index as i64 + 2)).await,
+                    Some(""),
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(&result.encode().unwrap()).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    catalog_page(method, &result).unwrap(),
+                    (1, Some("next".into()))
+                );
             }
             assert_eq!(client.next_id, 6, "one-page APIs never follow nextCursor");
             client.close(&cx).unwrap();
@@ -1055,22 +1126,41 @@ mod tests {
         run(|cx| async move {
             for method in METHODS {
                 let (mut client, mut peer) = connected(&cx).await;
-                let mut server = cx.spawn(move |peer_cx| async move {
-                    for (index, (cursor, next_cursor, name)) in [
-                        (None, Some(""), None),
-                        (Some(""), Some(" opaque "), Some("first")),
-                        (Some(" opaque "), Some(" opaque "), None),
-                        (Some(" opaque "), None, Some("last")),
-                    ].into_iter().enumerate() {
-                        let id = index as i64 + 2;
-                        assert_parameters(receive(&peer_cx, &mut peer, method, Some(id)).await, cursor);
-                        peer.send_async(&peer_cx, &response(id, page(method, name, next_cursor, "private")))
-                            .await.unwrap();
-                    }
-                    peer
-                }).unwrap();
-                let collection = collect(&mut client, &cx, &McpRequestCancellation::new(), method, None)
-                    .await.unwrap();
+                let mut server = cx
+                    .spawn(move |peer_cx| async move {
+                        for (index, (cursor, next_cursor, name)) in [
+                            (None, Some(""), None),
+                            (Some(""), Some(" opaque "), Some("first")),
+                            (Some(" opaque "), Some(" opaque "), None),
+                            (Some(" opaque "), None, Some("last")),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let id = index as i64 + 2;
+                            assert_parameters(
+                                receive(&peer_cx, &mut peer, method, Some(id)).await,
+                                cursor,
+                            );
+                            peer.send_async(
+                                &peer_cx,
+                                &response(id, page(method, name, next_cursor, "private")),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        peer
+                    })
+                    .unwrap();
+                let collection = collect(
+                    &mut client,
+                    &cx,
+                    &McpRequestCancellation::new(),
+                    method,
+                    None,
+                )
+                .await
+                .unwrap();
                 assert_eq!(collection.method(), method);
                 assert_eq!(collection.item_count(), 2);
                 assert_eq!(collection.pages().len(), 4);
@@ -1099,14 +1189,17 @@ mod tests {
             for method in METHODS {
                 for cursor in ["", "opaque"] {
                     let error = collect(&mut client, &cx, &token, method, Some(cursor.into()))
-                        .await.unwrap_err();
+                        .await
+                        .unwrap_err();
                     assert_eq!(error.code, McpErrorCode::InvalidParams);
                     assert_eq!(client.next_id, 2);
                     assert!(client.executor.pending_records().is_empty());
                 }
             }
             peer.send_async(&cx, &rejected_cursor(2)).await.unwrap();
-            let error = collect(&mut client, &cx, &token, "tools/list", None).await.unwrap_err();
+            let error = collect(&mut client, &cx, &token, "tools/list", None)
+                .await
+                .unwrap_err();
             assert_eq!(error.code, McpErrorCode::InvalidParams);
             receive(&cx, &mut peer, "tools/list", Some(2)).await;
             assert_eq!(client.next_id, 3);
@@ -1134,7 +1227,8 @@ mod tests {
                             PAGINATION_ITEM_LIMIT_ERROR
                         }
                         "bytes" => {
-                            limits.serialized_bytes = first.to_string().len() + last.to_string().len()
+                            limits.serialized_bytes = first.to_string().len()
+                                + last.to_string().len()
                                 - usize::from(rejected);
                             PAGINATION_BYTE_LIMIT_ERROR
                         }
@@ -1144,20 +1238,33 @@ mod tests {
                         }
                         _ => unreachable!(),
                     };
-                    let count = if rejected && matches!(dimension, "pages" | "cursor") { 1 } else { 2 };
+                    let count = if rejected && matches!(dimension, "pages" | "cursor") {
+                        1
+                    } else {
+                        2
+                    };
                     let pages = [first.clone(), last.clone()];
-                    let mut server = cx.spawn(move |peer_cx| async move {
-                        for (index, page) in pages.into_iter().take(count).enumerate() {
-                            let id = index as i64 + 2;
-                            receive(&peer_cx, &mut peer, "tools/list", Some(id)).await;
-                            peer.send_async(&peer_cx, &response(id, page)).await.unwrap();
-                        }
-                        peer
-                    }).unwrap();
-                    let result = client.collect_catalog_with_budget(
-                        &cx, &McpRequestCancellation::new(), "tools/list", json!({}),
-                        PaginationBudget::with_limits(limits),
-                    ).await;
+                    let mut server = cx
+                        .spawn(move |peer_cx| async move {
+                            for (index, page) in pages.into_iter().take(count).enumerate() {
+                                let id = index as i64 + 2;
+                                receive(&peer_cx, &mut peer, "tools/list", Some(id)).await;
+                                peer.send_async(&peer_cx, &response(id, page))
+                                    .await
+                                    .unwrap();
+                            }
+                            peer
+                        })
+                        .unwrap();
+                    let result = client
+                        .collect_catalog_with_budget(
+                            &cx,
+                            &McpRequestCancellation::new(),
+                            "tools/list",
+                            json!({}),
+                            PaginationBudget::with_limits(limits),
+                        )
+                        .await;
                     if rejected {
                         let error = result.unwrap_err();
                         assert_eq!(error.code, McpErrorCode::InternalError, "{dimension}");
@@ -1182,40 +1289,81 @@ mod tests {
             for cause in ["scope", "cursor"] {
                 for second_failure in [false, true] {
                     let (mut client, mut peer) = connected(&cx).await;
-                    let mut server = cx.spawn(move |peer_cx| async move {
-                        for (id, cursor) in [(2, None), (3, Some("old")), (4, None)] {
-                            assert_parameters(receive(&peer_cx, &mut peer, "tools/list", Some(id)).await, cursor);
-                            let message = match id {
-                                2 => response(id, page("tools/list", Some("discarded"), Some("old"), "private")),
-                                3 if cause == "cursor" => rejected_cursor(id),
-                                3 => response(id, page("tools/list", Some("discarded"), None, "public")),
-                                _ => response(id, page("tools/list", Some("fresh"), second_failure.then_some("new"), "private")),
-                            };
-                            peer.send_async(&peer_cx, &message).await.unwrap();
-                        }
-                        if second_failure {
-                            assert_parameters(receive(&peer_cx, &mut peer, "tools/list", Some(5)).await, Some("new"));
-                            let message = if cause == "cursor" {
-                                rejected_cursor(5)
-                            } else {
-                                response(5, page("tools/list", Some("unstable"), None, "public"))
-                            };
-                            peer.send_async(&peer_cx, &message).await.unwrap();
-                        }
-                        peer
-                    }).unwrap();
-                    let result = collect(&mut client, &cx, &McpRequestCancellation::new(), "tools/list", None).await;
+                    let mut server = cx
+                        .spawn(move |peer_cx| async move {
+                            for (id, cursor) in [(2, None), (3, Some("old")), (4, None)] {
+                                assert_parameters(
+                                    receive(&peer_cx, &mut peer, "tools/list", Some(id)).await,
+                                    cursor,
+                                );
+                                let message = match id {
+                                    2 => response(
+                                        id,
+                                        page(
+                                            "tools/list",
+                                            Some("discarded"),
+                                            Some("old"),
+                                            "private",
+                                        ),
+                                    ),
+                                    3 if cause == "cursor" => rejected_cursor(id),
+                                    3 => response(
+                                        id,
+                                        page("tools/list", Some("discarded"), None, "public"),
+                                    ),
+                                    _ => response(
+                                        id,
+                                        page(
+                                            "tools/list",
+                                            Some("fresh"),
+                                            second_failure.then_some("new"),
+                                            "private",
+                                        ),
+                                    ),
+                                };
+                                peer.send_async(&peer_cx, &message).await.unwrap();
+                            }
+                            if second_failure {
+                                assert_parameters(
+                                    receive(&peer_cx, &mut peer, "tools/list", Some(5)).await,
+                                    Some("new"),
+                                );
+                                let message = if cause == "cursor" {
+                                    rejected_cursor(5)
+                                } else {
+                                    response(
+                                        5,
+                                        page("tools/list", Some("unstable"), None, "public"),
+                                    )
+                                };
+                                peer.send_async(&peer_cx, &message).await.unwrap();
+                            }
+                            peer
+                        })
+                        .unwrap();
+                    let result = collect(
+                        &mut client,
+                        &cx,
+                        &McpRequestCancellation::new(),
+                        "tools/list",
+                        None,
+                    )
+                    .await;
                     if second_failure {
-                        assert_eq!(result.unwrap_err().code, if cause == "cursor" {
-                            McpErrorCode::InvalidParams
-                        } else {
-                            McpErrorCode::InvalidRequest
-                        });
+                        assert_eq!(
+                            result.unwrap_err().code,
+                            if cause == "cursor" {
+                                McpErrorCode::InvalidParams
+                            } else {
+                                McpErrorCode::InvalidRequest
+                            }
+                        );
                     } else {
                         let collection = result.unwrap();
                         assert_eq!(collection.pages().len(), 1);
                         assert_eq!(collection.item_count(), 1);
-                        let result: Value = serde_json::from_str(&collection.pages()[0].encode().unwrap()).unwrap();
+                        let result: Value =
+                            serde_json::from_str(&collection.pages()[0].encode().unwrap()).unwrap();
                         assert_eq!(result["_meta"]["com.example/page"], "fresh");
                     }
                     assert_eq!(client.next_id, if second_failure { 6 } else { 5 });
@@ -1226,22 +1374,38 @@ mod tests {
             }
 
             let (mut client, mut peer) = connected(&cx).await;
-            let mut server = cx.spawn(move |peer_cx| async move {
-                for id in 2..=4 {
-                    receive(&peer_cx, &mut peer, "tools/list", Some(id)).await;
-                    let message = if id == 3 { rejected_cursor(id) } else {
-                        response(id, page("tools/list", Some("one"), Some("next"), "private"))
-                    };
-                    peer.send_async(&peer_cx, &message).await.unwrap();
-                }
-                peer
-            }).unwrap();
-            let error = client.collect_catalog_with_budget(
-                &cx, &McpRequestCancellation::new(), "tools/list", json!({}),
-                PaginationBudget::with_limits(PaginationLimits { pages: 3, ..PaginationLimits::DEFAULT }),
-            ).await.unwrap_err();
+            let mut server = cx
+                .spawn(move |peer_cx| async move {
+                    for id in 2..=4 {
+                        receive(&peer_cx, &mut peer, "tools/list", Some(id)).await;
+                        let message = if id == 3 {
+                            rejected_cursor(id)
+                        } else {
+                            response(id, page("tools/list", Some("one"), Some("next"), "private"))
+                        };
+                        peer.send_async(&peer_cx, &message).await.unwrap();
+                    }
+                    peer
+                })
+                .unwrap();
+            let error = client
+                .collect_catalog_with_budget(
+                    &cx,
+                    &McpRequestCancellation::new(),
+                    "tools/list",
+                    json!({}),
+                    PaginationBudget::with_limits(PaginationLimits {
+                        pages: 3,
+                        ..PaginationLimits::DEFAULT
+                    }),
+                )
+                .await
+                .unwrap_err();
             assert_eq!(error.message, PAGINATION_PAGE_LIMIT_ERROR);
-            assert_eq!(client.next_id, 5, "the rejected page and abandoned traversal still consume budget");
+            assert_eq!(
+                client.next_id, 5,
+                "the rejected page and abandoned traversal still consume budget"
+            );
             let mut peer = server.join(&cx).await.unwrap();
             ordinary_survives(&cx, &mut client, &mut peer).await;
             client.close(&cx).unwrap();
@@ -1269,10 +1433,19 @@ mod tests {
                         _ => "notifications/resources/list_changed",
                     };
                     let mut listener = if owned {
-                        let listener = client.subscribe(&cx, &token, SubscriptionFilter {
-                            tools_list_changed: Some(true), resources_list_changed: Some(true),
-                            prompts_list_changed: Some(true), ..SubscriptionFilter::default()
-                        }).await.unwrap();
+                        let listener = client
+                            .subscribe(
+                                &cx,
+                                &token,
+                                SubscriptionFilter {
+                                    tools_list_changed: Some(true),
+                                    resources_list_changed: Some(true),
+                                    prompts_list_changed: Some(true),
+                                    ..SubscriptionFilter::default()
+                                },
+                            )
+                            .await
+                            .unwrap();
                         receive(&cx, &mut peer, "subscriptions/listen", Some(2)).await;
                         peer.send_async(&cx, &JsonRpcMessage::Request(JsonRpcRequest::notification(
                             "notifications/subscriptions/acknowledged",
@@ -1282,40 +1455,82 @@ mod tests {
                             })),
                         ))).await.unwrap();
                         Some(listener)
-                    } else { None };
+                    } else {
+                        None
+                    };
                     if let Some(listener) = &mut listener {
-                        assert!(matches!(client.next_subscription_event(&cx, &token, listener).await.unwrap(),
-                            Some(MemorySubscriptionEvent::Acknowledged { .. })));
+                        assert!(matches!(
+                            client
+                                .next_subscription_event(&cx, &token, listener)
+                                .await
+                                .unwrap(),
+                            Some(MemorySubscriptionEvent::Acknowledged { .. })
+                        ));
                     }
                     let first_id = if owned { 3 } else { 2 };
-                    let mut server = cx.spawn(move |peer_cx| async move {
-                        assert_parameters(receive(&peer_cx, &mut peer, method, Some(first_id)).await, None);
-                        peer.send_async(&peer_cx, &catalog_notification(notification_method, owned.then_some(2)))
-                            .await.unwrap();
-                        peer.send_async(&peer_cx, &response(first_id, page(method, Some("stale"), Some("old"), "private")))
-                            .await.unwrap();
-                        assert_parameters(receive(&peer_cx, &mut peer, method, Some(first_id + 1)).await, None);
-                        peer.send_async(&peer_cx, &response(first_id + 1, page(method, Some("fresh"), None, "private")))
-                            .await.unwrap();
-                        peer
-                    }).unwrap();
-                    let collection = collect(&mut client, &cx, &token, method, None).await.unwrap();
+                    let mut server = cx
+                        .spawn(move |peer_cx| async move {
+                            assert_parameters(
+                                receive(&peer_cx, &mut peer, method, Some(first_id)).await,
+                                None,
+                            );
+                            peer.send_async(
+                                &peer_cx,
+                                &catalog_notification(notification_method, owned.then_some(2)),
+                            )
+                            .await
+                            .unwrap();
+                            peer.send_async(
+                                &peer_cx,
+                                &response(
+                                    first_id,
+                                    page(method, Some("stale"), Some("old"), "private"),
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                            assert_parameters(
+                                receive(&peer_cx, &mut peer, method, Some(first_id + 1)).await,
+                                None,
+                            );
+                            peer.send_async(
+                                &peer_cx,
+                                &response(
+                                    first_id + 1,
+                                    page(method, Some("fresh"), None, "private"),
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                            peer
+                        })
+                        .unwrap();
+                    let collection = collect(&mut client, &cx, &token, method, None)
+                        .await
+                        .unwrap();
                     assert_eq!(collection.pages().len(), 1);
-                    let result: Value = serde_json::from_str(&collection.pages()[0].encode().unwrap()).unwrap();
+                    let result: Value =
+                        serde_json::from_str(&collection.pages()[0].encode().unwrap()).unwrap();
                     assert_eq!(result["_meta"]["com.example/page"], "fresh");
                     assert_eq!(client.subscriptions.catalog_generation(method), 1);
                     if let Some(listener) = &mut listener {
                         let Some(MemorySubscriptionEvent::Notification(notification)) = client
-                            .next_subscription_event(&cx, &token, listener).await.unwrap() else {
-                                panic!("catalog traversal must not drain its listener");
-                            };
+                            .next_subscription_event(&cx, &token, listener)
+                            .await
+                            .unwrap()
+                        else {
+                            panic!("catalog traversal must not drain its listener");
+                        };
                         assert_eq!(notification.method(), notification_method);
                         assert!(client.take_server_notifications().is_empty());
                     } else {
                         let events = client.take_server_notifications();
                         assert_eq!(events.len(), 1);
                         assert_eq!(events[0].method, notification_method);
-                        assert_eq!(events[0].params.as_ref().unwrap()["com.example/change"], "retained");
+                        assert_eq!(
+                            events[0].params.as_ref().unwrap()["com.example/change"],
+                            "retained"
+                        );
                     }
                     let _peer = server.join(&cx).await.unwrap();
                     client.close(&cx).unwrap();
@@ -1328,24 +1543,43 @@ mod tests {
     fn memory_catalog_foreign_and_other_catalog_events_do_not_restart() {
         run(|cx| async move {
             let (mut client, mut peer) = connected(&cx).await;
-            let mut server = cx.spawn(move |peer_cx| async move {
-                receive(&peer_cx, &mut peer, "tools/list", Some(2)).await;
-                for notification in [
-                    catalog_notification("notifications/tools/list_changed", Some(999)),
-                    catalog_notification("notifications/resources/list_changed", None),
-                ] {
-                    peer.send_async(&peer_cx, &notification).await.unwrap();
-                }
-                peer.send_async(&peer_cx, &response(2, page("tools/list", Some("kept"), None, "private")))
-                    .await.unwrap();
-                peer
-            }).unwrap();
-            let collection = collect(&mut client, &cx, &McpRequestCancellation::new(), "tools/list", None).await.unwrap();
+            let mut server = cx
+                .spawn(move |peer_cx| async move {
+                    receive(&peer_cx, &mut peer, "tools/list", Some(2)).await;
+                    for notification in [
+                        catalog_notification("notifications/tools/list_changed", Some(999)),
+                        catalog_notification("notifications/resources/list_changed", None),
+                    ] {
+                        peer.send_async(&peer_cx, &notification).await.unwrap();
+                    }
+                    peer.send_async(
+                        &peer_cx,
+                        &response(2, page("tools/list", Some("kept"), None, "private")),
+                    )
+                    .await
+                    .unwrap();
+                    peer
+                })
+                .unwrap();
+            let collection = collect(
+                &mut client,
+                &cx,
+                &McpRequestCancellation::new(),
+                "tools/list",
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(collection.item_count(), 1);
             assert_eq!(client.next_id, 3);
             assert_eq!(client.subscriptions.catalog_generation("tools/list"), 0);
             assert_eq!(client.subscriptions.catalog_generation("resources/list"), 1);
-            assert_eq!(client.subscriptions.catalog_generation("resources/templates/list"), 1);
+            assert_eq!(
+                client
+                    .subscriptions
+                    .catalog_generation("resources/templates/list"),
+                1
+            );
             let events = client.take_server_notifications();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].method, "notifications/resources/list_changed");
@@ -1359,26 +1593,42 @@ mod tests {
         run(|cx| async move {
             let (mut client, mut peer) = connected(&cx).await;
             let live = McpRequestCancellation::new();
-            let mut sibling = client.execute_core(&cx, &live, "tools/list", json!({})).await.unwrap();
+            let mut sibling = client
+                .execute_core(&cx, &live, "tools/list", json!({}))
+                .await
+                .unwrap();
             let original = client.executor.pending_records();
             for mode in ["drop", "cancel", "deadline"] {
                 let token = McpRequestCancellation::new();
                 let mut budget = PaginationBudget::new();
-                if mode == "deadline" { budget.deadline = Instant::now() + Duration::from_millis(25); }
+                if mode == "deadline" {
+                    budget.deadline = Instant::now() + Duration::from_millis(25);
+                }
                 {
                     let mut collection = pin!(client.collect_catalog_with_budget(
-                        &cx, &token, "tools/list", json!({}), budget,
+                        &cx,
+                        &token,
+                        "tools/list",
+                        json!({}),
+                        budget,
                     ));
                     poll_fn(|task| {
                         assert!(collection.as_mut().poll(task).is_pending());
                         Poll::Ready(())
-                    }).await;
+                    })
+                    .await;
                     if mode == "cancel" {
                         token.cancel();
-                        assert_eq!(collection.await.unwrap_err().code, McpErrorCode::RequestCancelled);
+                        assert_eq!(
+                            collection.await.unwrap_err().code,
+                            McpErrorCode::RequestCancelled
+                        );
                     } else if mode == "deadline" {
                         let started = Instant::now();
-                        assert_eq!(collection.await.unwrap_err().message, PAGINATION_DEADLINE_ERROR);
+                        assert_eq!(
+                            collection.await.unwrap_err().message,
+                            PAGINATION_DEADLINE_ERROR
+                        );
                         assert!(started.elapsed() < Duration::from_secs(1));
                     }
                 }
@@ -1387,9 +1637,16 @@ mod tests {
                 assert!(!client.executor.has_external_controls(&cx).unwrap());
             }
             receive(&cx, &mut peer, "tools/list", Some(2)).await;
-            peer.send_async(&cx, &response(2, page("tools/list", Some("sibling"), None, "private"))).await.unwrap();
-            assert!(matches!(client.next_event(&cx, &live, &mut sibling).await.unwrap(),
-                Some(MemoryRequestEvent::Result(_))));
+            peer.send_async(
+                &cx,
+                &response(2, page("tools/list", Some("sibling"), None, "private")),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                client.next_event(&cx, &live, &mut sibling).await.unwrap(),
+                Some(MemoryRequestEvent::Result(_))
+            ));
             ordinary_survives(&cx, &mut client, &mut peer).await;
             client.close(&cx).unwrap();
         });
@@ -1401,39 +1658,75 @@ mod tests {
             for mode in ["drop", "cancel", "deadline"] {
                 let (mut client, mut peer) = connected(&cx).await;
                 let live = McpRequestCancellation::new();
-                let mut sibling = client.execute_core(&cx, &live, "tools/list", json!({})).await.unwrap();
+                let mut sibling = client
+                    .execute_core(&cx, &live, "tools/list", json!({}))
+                    .await
+                    .unwrap();
                 receive(&cx, &mut peer, "tools/list", Some(2)).await;
-                peer.send_async(&cx, &response(2, page("tools/list", Some("sibling"), None, "private"))).await.unwrap();
+                peer.send_async(
+                    &cx,
+                    &response(2, page("tools/list", Some("sibling"), None, "private")),
+                )
+                .await
+                .unwrap();
                 let token = McpRequestCancellation::new();
                 let mut budget = PaginationBudget::new();
-                if mode == "deadline" { budget.deadline = Instant::now() + Duration::from_millis(25); }
+                if mode == "deadline" {
+                    budget.deadline = Instant::now() + Duration::from_millis(25);
+                }
                 {
                     let mut collection = pin!(client.collect_catalog_with_budget(
-                        &cx, &token, "tools/list", json!({}), budget,
+                        &cx,
+                        &token,
+                        "tools/list",
+                        json!({}),
+                        budget,
                     ));
                     poll_fn(|task| {
                         assert!(collection.as_mut().poll(task).is_pending());
                         Poll::Ready(())
-                    }).await;
+                    })
+                    .await;
                     receive(&cx, &mut peer, "tools/list", Some(3)).await;
                     if mode == "cancel" {
                         token.cancel();
-                        assert_eq!(collection.await.unwrap_err().code, McpErrorCode::RequestCancelled);
+                        assert_eq!(
+                            collection.await.unwrap_err().code,
+                            McpErrorCode::RequestCancelled
+                        );
                     } else if mode == "deadline" {
-                        assert_eq!(collection.await.unwrap_err().message, PAGINATION_DEADLINE_ERROR);
+                        assert_eq!(
+                            collection.await.unwrap_err().message,
+                            PAGINATION_DEADLINE_ERROR
+                        );
                     }
                 }
                 assert_eq!(client.next_id, 4);
-                let mut server = cx.spawn(move |peer_cx| async move {
-                    let control = receive(&peer_cx, &mut peer, "notifications/cancelled", None).await;
-                    assert_eq!(control.params.unwrap()["requestId"], 3);
-                    receive(&peer_cx, &mut peer, "tools/list", Some(4)).await;
-                    peer.send_async(&peer_cx, &response(3, page("tools/list", Some("late"), None, "private"))).await.unwrap();
-                    peer.send_async(&peer_cx, &response(4, page("tools/list", Some("healthy"), None, "private"))).await.unwrap();
-                    peer
-                }).unwrap();
-                assert!(matches!(client.next_event(&cx, &live, &mut sibling).await.unwrap(),
-                    Some(MemoryRequestEvent::Result(_))));
+                let mut server = cx
+                    .spawn(move |peer_cx| async move {
+                        let control =
+                            receive(&peer_cx, &mut peer, "notifications/cancelled", None).await;
+                        assert_eq!(control.params.unwrap()["requestId"], 3);
+                        receive(&peer_cx, &mut peer, "tools/list", Some(4)).await;
+                        peer.send_async(
+                            &peer_cx,
+                            &response(3, page("tools/list", Some("late"), None, "private")),
+                        )
+                        .await
+                        .unwrap();
+                        peer.send_async(
+                            &peer_cx,
+                            &response(4, page("tools/list", Some("healthy"), None, "private")),
+                        )
+                        .await
+                        .unwrap();
+                        peer
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    client.next_event(&cx, &live, &mut sibling).await.unwrap(),
+                    Some(MemoryRequestEvent::Result(_))
+                ));
                 let result = client.list_tools(&cx, &live, None).await.unwrap();
                 let value: Value = serde_json::from_str(&result.encode().unwrap()).unwrap();
                 assert_eq!(value["_meta"]["com.example/page"], "healthy");

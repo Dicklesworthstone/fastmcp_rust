@@ -702,13 +702,16 @@ mod tests {
             fn authenticate(&self, _: &McpContext, _: AuthRequest<'_>) -> McpResult<AuthContext> {
                 Err(McpError::internal_error("synchronous path must not run"))
             }
-            fn authenticate_async<'a>(&'a self, _: &'a McpContext, _: AuthRequest<'a>)
-                -> crate::auth::AuthFuture<'a>
-            {
+            fn authenticate_async<'a>(
+                &'a self,
+                _: &'a McpContext,
+                _: AuthRequest<'a>,
+            ) -> crate::auth::AuthFuture<'a> {
                 Box::pin(async {
                     let mut facts = AuthContext::with_subject("async-owner")
-                        .with_verification_valid_until(std::time::Instant::now()
-                            + std::time::Duration::from_secs(30));
+                        .with_verification_valid_until(
+                            std::time::Instant::now() + std::time::Duration::from_secs(30),
+                        );
                     facts.scopes = vec!["admin".to_owned()];
                     Ok(facts)
                 })
@@ -717,13 +720,16 @@ mod tests {
         let provider = ScopePolicyAuthProvider::new(AsyncOnly, policy(&[("admin", "read")]));
         let ctx = McpContext::new(asupersync::Cx::for_testing(), 1);
         let request = AuthRequest {
-            method: "tools/list", params: None, transport_authorization: Some("Bearer opaque"),
+            method: "tools/list",
+            params: None,
+            transport_authorization: Some("Bearer opaque"),
             request_id: 1,
         };
         let mut future = provider.authenticate_async(&ctx, request);
-        let facts = match future.as_mut().poll(
-            &mut std::task::Context::from_waker(std::task::Waker::noop()),
-        ) {
+        let facts = match future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        {
             std::task::Poll::Ready(facts) => facts.unwrap(),
             std::task::Poll::Pending => panic!("in-memory provider unexpectedly pending"),
         };

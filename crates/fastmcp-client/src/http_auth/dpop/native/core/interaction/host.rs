@@ -16,10 +16,10 @@ use super::{
     check_live, within,
 };
 use crate::http_auth::dpop::DpopSession;
-use crate::http_auth::sampling::inputs::mixed::{CoreInputHost, CoreInputLimits};
 use crate::http_auth::sampling::inputs::mixed::session::{
     CoreInputSession, CoreInputSessionError, CoreInputUsage,
 };
+use crate::http_auth::sampling::inputs::mixed::{CoreInputHost, CoreInputLimits};
 
 /// Network and host limits are frozen before the first POST. Input limits
 /// apply cumulatively, not once per challenge. The host-input timeout includes
@@ -229,10 +229,12 @@ async fn resolve_host<H: CoreInputHost + ?Sized>(
     request_id: RequestId,
     host: &mut H,
 ) -> Result<ManagedInputReply, DpopHostError> {
-    Ok(within(cx, cancellation, session, credential, bounds, async {
-        Ok(inputs.resolve(cx, input.clone(), request_id, host).await)
-    })
-    .await??)
+    Ok(
+        within(cx, cancellation, session, credential, bounds, async {
+            Ok(inputs.resolve(cx, input.clone(), request_id, host).await)
+        })
+        .await??,
+    )
 }
 
 #[cfg(test)]
@@ -264,12 +266,12 @@ mod tests {
     #[cfg(feature = "native-tls-roots")]
     use crate::http_auth::dpop::native::core::DpopCoreError;
     use crate::http_auth::rpc::interaction::input_required;
-    use crate::http_auth::sampling::{
-        SamplingHost, SamplingHostError, SamplingHostFuture, SamplingRunLimits,
-    };
     use crate::http_auth::sampling::inputs::SamplingInputLimits;
     use crate::http_auth::sampling::inputs::mixed::{
         CoreInputError, CoreInputHostError, CoreInputHostFuture, CoreInputRequest,
+    };
+    use crate::http_auth::sampling::{
+        SamplingHost, SamplingHostError, SamplingHostFuture, SamplingRunLimits,
     };
 
     const MIXED: &str = r#"{"resultType":"input_required","requestState":" private-state ","inputRequests":{
@@ -452,7 +454,10 @@ mod tests {
     fn ready<T>(future: impl Future<Output = T>) -> T {
         let mut future = pin!(future);
         for _ in 0..32 {
-            if let Poll::Ready(value) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            if let Poll::Ready(value) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
                 return value;
             }
         }
@@ -466,24 +471,40 @@ mod tests {
             let (session, credential) = session();
             let cancel = McpRequestCancellation::new();
             let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
-            let mut inputs = CoreInputSession::new(
-                &cx, &cancel, original(), CoreInputLimits::default(), 4,
-            )
-            .unwrap();
-            let mut host = Host { invalid_form: invalid, ..Host::default() };
+            let mut inputs =
+                CoreInputSession::new(&cx, &cancel, original(), CoreInputLimits::default(), 4)
+                    .unwrap();
+            let mut host = Host {
+                invalid_form: invalid,
+                ..Host::default()
+            };
             let challenge = input(MIXED);
             let outcome = ready(resolve_host(
-                &cx, &cancel, &session, &credential, bounds, &mut inputs,
-                &challenge, RequestId::Number(1), &mut host,
+                &cx,
+                &cancel,
+                &session,
+                &credential,
+                bounds,
+                &mut inputs,
+                &challenge,
+                RequestId::Number(1),
+                &mut host,
             ));
             if invalid {
-                assert!(matches!(outcome, Err(DpopHostError::Input(
-                    CoreInputSessionError::Input(CoreInputError::InvalidFormContent)
-                ))));
+                assert!(matches!(
+                    outcome,
+                    Err(DpopHostError::Input(CoreInputSessionError::Input(
+                        CoreInputError::InvalidFormContent
+                    )))
+                ));
                 assert!(inputs.is_closed());
             } else {
                 let reply = outcome.unwrap();
-                reply.input_responses.unwrap().validate_against_input_required(&challenge).unwrap();
+                reply
+                    .input_responses
+                    .unwrap()
+                    .validate_against_input_required(&challenge)
+                    .unwrap();
                 assert_eq!(inputs.usage().resolutions, 1);
                 assert_eq!(inputs.usage().selected_inputs, 2);
                 assert_eq!(inputs.usage().roots, 1);
@@ -502,21 +523,39 @@ mod tests {
         let (session, credential) = session();
         let cancel = McpRequestCancellation::new();
         let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
-        let mut inputs = CoreInputSession::new(
-            &cx, &cancel, original(), CoreInputLimits::default(), 1,
-        )
-        .unwrap();
+        let mut inputs =
+            CoreInputSession::new(&cx, &cancel, original(), CoreInputLimits::default(), 1).unwrap();
         let mut host = Host::default();
         let challenge = input(MIXED);
-        assert!(ready(resolve_host(
-            &cx, &cancel, &session, &credential, bounds, &mut inputs,
-            &challenge, RequestId::Number(1), &mut host,
-        )).is_ok());
+        assert!(
+            ready(resolve_host(
+                &cx,
+                &cancel,
+                &session,
+                &credential,
+                bounds,
+                &mut inputs,
+                &challenge,
+                RequestId::Number(1),
+                &mut host,
+            ))
+            .is_ok()
+        );
         let before = host.calls.clone();
-        assert!(matches!(ready(resolve_host(
-            &cx, &cancel, &session, &credential, bounds, &mut inputs,
-            &challenge, RequestId::Number(2), &mut host,
-        )), Err(DpopHostError::Input(CoreInputSessionError::ResolutionLimit))));
+        assert!(matches!(
+            ready(resolve_host(
+                &cx,
+                &cancel,
+                &session,
+                &credential,
+                bounds,
+                &mut inputs,
+                &challenge,
+                RequestId::Number(2),
+                &mut host,
+            )),
+            Err(DpopHostError::Input(CoreInputSessionError::ResolutionLimit))
+        ));
         assert_eq!(host.calls, before);
         assert_eq!(inputs.usage().resolutions, 1);
         assert_eq!(timer.pending_count(), 0);
@@ -530,22 +569,40 @@ mod tests {
         let (session, credential) = session();
         let cancel = McpRequestCancellation::new();
         let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
-        let mut inputs = CoreInputSession::new(
-            &cx, &cancel, original(), CoreInputLimits::default(), 4,
-        )
-        .unwrap();
+        let mut inputs =
+            CoreInputSession::new(&cx, &cancel, original(), CoreInputLimits::default(), 4).unwrap();
         let mut host = Host::default();
         for (ordinal, source, present) in [
-            (1, r#"{"resultType":"input_required","requestState":"opaque"}"#, false),
-            (2, r#"{"resultType":"input_required","inputRequests":{}}"#, true),
+            (
+                1,
+                r#"{"resultType":"input_required","requestState":"opaque"}"#,
+                false,
+            ),
+            (
+                2,
+                r#"{"resultType":"input_required","inputRequests":{}}"#,
+                true,
+            ),
         ] {
             let reply = ready(resolve_host(
-                &cx, &cancel, &session, &credential, bounds, &mut inputs,
-                &input(source), RequestId::Number(ordinal), &mut host,
+                &cx,
+                &cancel,
+                &session,
+                &credential,
+                bounds,
+                &mut inputs,
+                &input(source),
+                RequestId::Number(ordinal),
+                &mut host,
             ))
             .unwrap();
             assert_eq!(reply.input_responses.is_some(), present);
-            assert!(reply.input_responses.as_ref().is_none_or(|map| map.is_empty()));
+            assert!(
+                reply
+                    .input_responses
+                    .as_ref()
+                    .is_none_or(|map| map.is_empty())
+            );
         }
         assert!(host.calls.is_empty());
         assert_eq!(inputs.usage().resolutions, 2);
@@ -568,8 +625,8 @@ mod tests {
 
     #[test]
     fn host_deadline_is_frozen_and_never_extends_an_earlier_native_limit() {
-        use asupersync::types::Time;
         use crate::http_auth::dpop::DpopClientError;
+        use asupersync::types::Time;
 
         let (runtime, cx, _, clock) = runtime();
         let cancel = McpRequestCancellation::new();
@@ -694,18 +751,14 @@ mod tests {
                 .is_ok()
             );
             assert_eq!(host_bounds(native, &inputs).deadline, bounds.deadline);
-            let mut operation = Box::pin(within(
-                &cx,
-                &cancel,
-                &session,
-                &credential,
-                bounds,
-                async {
+            let mut operation =
+                Box::pin(within(&cx, &cancel, &session, &credential, bounds, async {
                     clock.advance(bounds.deadline.as_nanos() - u64::from(!expired));
                     Ok(42)
-                },
-            ));
-            let result = operation.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+                }));
+            let result = operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
             assert_eq!(
                 result,
                 if expired {
@@ -730,19 +783,29 @@ mod tests {
             let (session, credential) = session();
             let cancel = McpRequestCancellation::new();
             let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
-            let mut inputs = CoreInputSession::new(
-                &cx, &cancel, original(), CoreInputLimits::default(), 4,
-            )
-            .unwrap();
+            let mut inputs =
+                CoreInputSession::new(&cx, &cancel, original(), CoreInputLimits::default(), 4)
+                    .unwrap();
             let drops = Arc::new(AtomicUsize::new(0));
-            let mut host = Host { hang: true, drops: Arc::clone(&drops), ..Host::default() };
+            let mut host = Host {
+                hang: true,
+                drops: Arc::clone(&drops),
+                ..Host::default()
+            };
             let challenge = input(MIXED);
             let wakes = Arc::new(Wakes::default());
             let waker = Waker::from(Arc::clone(&wakes));
             let mut task = Context::from_waker(&waker);
             let mut waiting = Box::pin(resolve_host(
-                &cx, &cancel, &session, &credential, bounds, &mut inputs,
-                &challenge, RequestId::Number(1), &mut host,
+                &cx,
+                &cancel,
+                &session,
+                &credential,
+                bounds,
+                &mut inputs,
+                &challenge,
+                RequestId::Number(1),
+                &mut host,
             ));
             for _ in 0..8 {
                 assert!(waiting.as_mut().poll(&mut task).is_pending());
@@ -762,7 +825,10 @@ mod tests {
                 }
             }
             assert!(wakes.0.load(Ordering::SeqCst) > before);
-            assert!(matches!(waiting.as_mut().poll(&mut task), Poll::Ready(Err(_))));
+            assert!(matches!(
+                waiting.as_mut().poll(&mut task),
+                Poll::Ready(Err(_))
+            ));
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             drop(waiting);
             assert_eq!(host.calls, ["approve", "roots"]);
@@ -779,19 +845,32 @@ mod tests {
         let (session, credential) = session();
         let cancel = McpRequestCancellation::new();
         let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
-        let mut inputs = CoreInputSession::new(
-            &cx, &cancel, original(), CoreInputLimits::default(), 4,
-        )
-        .unwrap();
-        let mut host = Host { hang: true, ..Host::default() };
+        let mut inputs =
+            CoreInputSession::new(&cx, &cancel, original(), CoreInputLimits::default(), 4).unwrap();
+        let mut host = Host {
+            hang: true,
+            ..Host::default()
+        };
         let drops = Arc::clone(&host.drops);
         let challenge = input(MIXED);
         let mut waiting = Box::pin(resolve_host(
-            &cx, &cancel, &session, &credential, bounds, &mut inputs,
-            &challenge, RequestId::Number(1), &mut host,
+            &cx,
+            &cancel,
+            &session,
+            &credential,
+            bounds,
+            &mut inputs,
+            &challenge,
+            RequestId::Number(1),
+            &mut host,
         ));
         for _ in 0..8 {
-            assert!(waiting.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         }
         drop(waiting);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -806,18 +885,35 @@ mod tests {
     #[test]
     fn correlation_prefix_and_resolution_limits_are_admitted_before_execution() {
         for prefix in ["", "bad\n", &"x".repeat(129)] {
-            assert!(matches!(request_id(prefix, 0), Err(DpopHostError::InvalidIdPrefix)));
+            assert!(matches!(
+                request_id(prefix, 0),
+                Err(DpopHostError::InvalidIdPrefix)
+            ));
         }
         let ids: Vec<_> = (0..65).map(|n| request_id("host", n).unwrap()).collect();
         for (index, id) in ids.iter().enumerate() {
-            assert!(ids[..index].iter().all(|previous| !id.correlates_with(previous)));
+            assert!(
+                ids[..index]
+                    .iter()
+                    .all(|previous| !id.correlates_with(previous))
+            );
         }
-        assert!(DpopHostLimits::new(
-            ManagedInteractionLimits::default(), CoreInputLimits::default(), 64,
-        ).is_ok());
-        assert!(DpopHostLimits::new(
-            ManagedInteractionLimits::default(), CoreInputLimits::default(), 65,
-        ).is_err());
+        assert!(
+            DpopHostLimits::new(
+                ManagedInteractionLimits::default(),
+                CoreInputLimits::default(),
+                64,
+            )
+            .is_ok()
+        );
+        assert!(
+            DpopHostLimits::new(
+                ManagedInteractionLimits::default(),
+                CoreInputLimits::default(),
+                65,
+            )
+            .is_err()
+        );
     }
 
     #[cfg(feature = "native-tls-roots")]
@@ -878,11 +974,14 @@ mod tests {
                 }
             };
             let head = std::str::from_utf8(&wire[..end]).unwrap().to_owned();
-            let length = head.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            }).unwrap();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
             assert!(end + length <= 32 * 1024);
             while wire.len() < end + length {
                 let count = io.read(&mut buffer).await.unwrap();

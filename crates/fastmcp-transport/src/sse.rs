@@ -219,9 +219,9 @@ fn decode_sse_line(raw: &[u8], limit_bytes: usize) -> Option<std::borrow::Cow<'_
                 decoded_bytes = decoded_bytes
                     .saturating_add(error.valid_up_to())
                     .saturating_add('\u{FFFD}'.len_utf8());
-                let consumed = error.error_len().map_or(remaining.len(), |length| {
-                    error.valid_up_to() + length
-                });
+                let consumed = error
+                    .error_len()
+                    .map_or(remaining.len(), |length| error.valid_up_to() + length);
                 remaining = &remaining[consumed..];
             }
         }
@@ -1149,10 +1149,9 @@ impl<R: Read> SseReader<R> {
                 self.bom_window_open = false;
                 raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
             }
-            let Some(line) = decode_sse_line(
-                raw,
-                self.max_line_size.saturating_sub(delimiter_bytes),
-            ) else {
+            let Some(line) =
+                decode_sse_line(raw, self.max_line_size.saturating_sub(delimiter_bytes))
+            else {
                 self.terminal = true;
                 return Err(TransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1973,7 +1972,10 @@ mod decoding_tests {
             decoder.push(b"data: \xFF\n\n"),
             Err(ModernSseParseError::LineTooLong { limit_bytes: 8 })
         );
-        assert_eq!(decoder.push(b"data: ok\n\n"), Err(ModernSseParseError::Poisoned));
+        assert_eq!(
+            decoder.push(b"data: ok\n\n"),
+            Err(ModernSseParseError::Poisoned)
+        );
     }
 }
 
@@ -2301,7 +2303,10 @@ data: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":3}\n\n";
             panic!("expected request");
         };
         assert_eq!(first.method, "bad\u{FFFD}name");
-        assert!(matches!(reader.read_message(&cx), Err(TransportError::Codec(_))));
+        assert!(matches!(
+            reader.read_message(&cx),
+            Err(TransportError::Codec(_))
+        ));
         assert!(!reader.terminal);
         let JsonRpcMessage::Request(next) = reader.read_message(&cx).unwrap().unwrap() else {
             panic!("expected request");
@@ -2323,7 +2328,10 @@ data: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":3}\n\n";
                     Err(TransportError::Io(error))
                         if error.kind() == std::io::ErrorKind::InvalidData
                 ));
-                assert!(matches!(reader.read_event(&cx), Err(TransportError::Closed)));
+                assert!(matches!(
+                    reader.read_event(&cx),
+                    Err(TransportError::Closed)
+                ));
             }
         }
 

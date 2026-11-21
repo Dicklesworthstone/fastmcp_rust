@@ -204,12 +204,7 @@ async fn reopen_after_gap(peer: &Peer, session: &ManagedOAuthSession, cx: &Cx) {
     pair(server, client).await;
 }
 
-async fn large_task_result(
-    peer: &Peer,
-    session: &ManagedOAuthSession,
-    cx: &Cx,
-    case: WatchCase,
-) {
+async fn large_task_result(peer: &Peer, session: &ManagedOAuthSession, cx: &Cx, case: WatchCase) {
     let text = "x".repeat(128 * 1024);
     let content = json!([{"type":"text","text":text}]);
     let completed = task_event(2, "task-one", "completed")
@@ -308,12 +303,7 @@ async fn observed_exchange(peer: &Peer, number: usize, method: &str, result: &st
     .await;
 }
 
-async fn bom_acknowledgement(
-    peer: &Peer,
-    session: &ManagedOAuthSession,
-    cx: &Cx,
-    refused: bool,
-) {
+async fn bom_acknowledgement(peer: &Peer, session: &ManagedOAuthSession, cx: &Cx, refused: bool) {
     let payload = format!("{}{}", ack(2, filter()), " ".repeat(128 * 1024));
     let limits = ManagedSubscriptionLimits::new(
         4096,

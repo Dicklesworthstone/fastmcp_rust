@@ -109,7 +109,10 @@ impl FinalTaskOperation {
         result: &super::FinalTaskCallToolResult,
     ) -> McpResult<()> {
         self.process.verify()?;
-        crate::router::validate_final_tool_output_schema(self.output_schema.as_deref(), &result.result)
+        crate::router::validate_final_tool_output_schema(
+            self.output_schema.as_deref(),
+            &result.result,
+        )
     }
 
     /// Shares the same process-local admission boundary with proxied Tasks.
@@ -131,10 +134,9 @@ impl FinalTaskOperation {
             return Err(task_access_denied());
         }
         for authorizer in authorizers {
-            let allowed = catch_unwind(AssertUnwindSafe(|| {
-                authorizer.authorize(ctx, action, self)
-            }))
-            .is_ok_and(|result| result.is_ok());
+            let allowed =
+                catch_unwind(AssertUnwindSafe(|| authorizer.authorize(ctx, action, self)))
+                    .is_ok_and(|result| result.is_ok());
             self.process.verify().map_err(|_| task_access_denied())?;
             ensure_current_task_authentication(ctx)?;
             if !allowed || !self.is_visible(ctx) {
@@ -146,7 +148,9 @@ impl FinalTaskOperation {
 
     pub(crate) fn admit_access_policy_batch(installed: usize, additional: usize) -> McpResult<()> {
         if additional > MAX_TASK_ACCESS_AUTHORIZERS.saturating_sub(installed) {
-            return Err(McpError::invalid_params("Task access policy capacity reached"));
+            return Err(McpError::invalid_params(
+                "Task access policy capacity reached",
+            ));
         }
         Ok(())
     }
@@ -690,13 +694,13 @@ mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::*;
     use crate::TestHttpEndpoint;
     use crate::http_admission::security::scope_policy::request::ScopeRequestPolicy;
     use crate::http_admission::security::scope_policy::request::operation::{
         OperationScopePolicy, ScopedOperation,
     };
     use crate::http_admission::security::scope_policy::{RequiredScopes, ScopeImplicationPolicy};
+    use crate::tasks::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn context(scopes: &[&str]) -> McpContext {
@@ -872,14 +876,15 @@ mod tests {
                 self.injected_execution_cancellations
                     .fetch_add(1, Ordering::SeqCst);
             }
-            self.inner.replace_task_and_clear_input_for_handoff_if_current(
-                expected,
-                owner_id,
-                dispatch_fence,
-                cancellation_required,
-                task,
-                notification,
-            )
+            self.inner
+                .replace_task_and_clear_input_for_handoff_if_current(
+                    expected,
+                    owner_id,
+                    dispatch_fence,
+                    cancellation_required,
+                    task,
+                    notification,
+                )
         }
         fn request_cancellation(&self, id: &FinalTaskId) -> McpResult<()> {
             self.inner.request_cancellation(id)
@@ -985,7 +990,9 @@ mod tests {
             metadata.authenticated_principal(),
             metadata.original_operation().unwrap().clone(),
         ));
-        runtime.install_execution_authorizer(policy.clone()).unwrap();
+        runtime
+            .install_execution_authorizer(policy.clone())
+            .unwrap();
         policy
     }
 
@@ -1168,8 +1175,8 @@ mod tests {
         let principal = FinalTaskAccessMetadata::principal_for_auth(&authenticated).unwrap();
         let mut refreshed = authenticated.clone();
         refreshed.scopes = vec!["manage".to_owned()];
-        refreshed = refreshed
-            .with_verification_valid_until(Instant::now() + StdDuration::from_secs(60));
+        refreshed =
+            refreshed.with_verification_valid_until(Instant::now() + StdDuration::from_secs(60));
         assert_eq!(
             FinalTaskAccessMetadata::principal_for_auth(&refreshed).unwrap(),
             principal
@@ -1181,9 +1188,11 @@ mod tests {
         );
         let (_store, runtime, id, _registration) = fixture();
         assert_execution_denied(runtime.ensure_execution_policy_available(Some(principal)));
-        assert!(runtime
-            .admit_task_for_request(&context(&["manage"]), &id, TaskAccessAction::Get)
-            .is_err());
+        assert!(
+            runtime
+                .admit_task_for_request(&context(&["manage"]), &id, TaskAccessAction::Get)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1222,9 +1231,9 @@ mod tests {
             runtime.revalidate_task_execution(&metadata).unwrap();
             if remove_during_callback {
                 runtime
-                    .install_execution_authorizer(Arc::new(RemovingRegistrationPolicy(
-                        Mutex::new(Some(registration)),
-                    )))
+                    .install_execution_authorizer(Arc::new(RemovingRegistrationPolicy(Mutex::new(
+                        Some(registration),
+                    ))))
                     .unwrap();
             } else {
                 drop(registration);
@@ -1367,9 +1376,11 @@ mod tests {
             store
                 .cancel_before_execution_failure
                 .store(cancellation_races, Ordering::SeqCst);
-            assert!(runtime
-                .retire_unauthorized_handoff(&metadata, owner, fence)
-                .unwrap());
+            assert!(
+                runtime
+                    .retire_unauthorized_handoff(&metadata, owner, fence)
+                    .unwrap()
+            );
             let retired = store.inner.get_task_snapshot(&id).unwrap().unwrap();
             let expected_status = if cancellation_races {
                 FinalTaskStatus::Cancelled
@@ -1378,26 +1389,39 @@ mod tests {
             };
             assert_eq!(retired.task().base().status, expected_status);
             assert_eq!(
-                store.inner.latest_notification(&id).unwrap().params.task.base().status,
+                store
+                    .inner
+                    .latest_notification(&id)
+                    .unwrap()
+                    .params
+                    .task
+                    .base()
+                    .status,
                 expected_status
             );
             assert_eq!(
-                store.injected_execution_cancellations.load(Ordering::SeqCst),
+                store
+                    .injected_execution_cancellations
+                    .load(Ordering::SeqCst),
                 usize::from(cancellation_races)
             );
-            assert!(!runtime
-                .retire_unauthorized_handoff(&metadata, owner, fence)
-                .unwrap());
-            assert!(runtime
-                .fenced_complete_task(
-                    &id,
-                    metadata.generation(),
-                    owner,
-                    fence,
-                    completed_execution_result(),
-                    None,
-                )
-                .is_err());
+            assert!(
+                !runtime
+                    .retire_unauthorized_handoff(&metadata, owner, fence)
+                    .unwrap()
+            );
+            assert!(
+                runtime
+                    .fenced_complete_task(
+                        &id,
+                        metadata.generation(),
+                        owner,
+                        fence,
+                        completed_execution_result(),
+                        None,
+                    )
+                    .is_err()
+            );
             let after = store.inner.get_task_snapshot(&id).unwrap().unwrap();
             assert_eq!(after.generation(), retired.generation());
             assert!(final_tasks_match_exactly(after.task(), retired.task()).unwrap());
@@ -2554,12 +2578,7 @@ mod tests {
 
         fn create(&self) -> FinalTaskId {
             self.runtime
-                .create_task_for_operation(
-                    &self.caller,
-                    self.operation.clone(),
-                    work(),
-                    None,
-                )
+                .create_task_for_operation(&self.caller, self.operation.clone(), work(), None)
                 .unwrap()
                 .task
                 .base()
@@ -2612,14 +2631,13 @@ mod tests {
         fixture: &ExecutionFixture,
         mut service: asupersync::runtime::TaskHandle<McpResult<()>>,
     ) {
-        service.abort_with_reason(asupersync::CancelReason::user("Task execution test cleanup"));
-        let outcome = asupersync::time::timeout(
-            cx.now(),
-            StdDuration::from_secs(5),
-            service.join(cx),
-        )
-        .await
-        .expect("Task service cancellation settles within the caller runtime");
+        service.abort_with_reason(asupersync::CancelReason::user(
+            "Task execution test cleanup",
+        ));
+        let outcome =
+            asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), service.join(cx))
+                .await
+                .expect("Task service cancellation settles within the caller runtime");
         assert!(
             matches!(
                 outcome,
@@ -2681,8 +2699,7 @@ mod tests {
                 initial: AtomicUsize::new(0),
                 resumed: AtomicUsize::new(0),
             });
-            let service =
-                start_execution_service(&cx, &fixture.runtime, supervisor.clone()).await;
+            let service = start_execution_service(&cx, &fixture.runtime, supervisor.clone()).await;
             let id = fixture.create();
             wait_for_execution(&cx, "authorized initial work requests input", || {
                 fixture.status(&id) == FinalTaskStatus::InputRequired
@@ -2700,12 +2717,10 @@ mod tests {
             assert_eq!(supervisor.initial.load(Ordering::SeqCst), 1);
             assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 1);
             assert!(fixture.policy.calls.load(Ordering::SeqCst) >= 4);
-            assert!(dispatch_final_tasks_get(
-                &fixture.runtime,
-                &fixture.caller,
-                parameters(&id)
-            )
-            .is_ok());
+            assert!(
+                dispatch_final_tasks_get(&fixture.runtime, &fixture.caller, parameters(&id))
+                    .is_ok()
+            );
             assert!(fixture.runtime.is_task_service_ready());
             stop_execution_service(&cx, &fixture, service).await;
         });
@@ -2985,13 +3000,14 @@ mod tests {
                 pending_dropped: AtomicBool::new(false),
                 completed: AtomicUsize::new(0),
             });
-            let service =
-                start_execution_service(&cx, &fixture.runtime, supervisor.clone()).await;
+            let service = start_execution_service(&cx, &fixture.runtime, supervisor.clone()).await;
             let revoked = fixture.create();
             *supervisor.pending.lock().unwrap() = Some(revoked.clone());
-            wait_for_execution(&cx, "application parks without arranging another wake", || {
-                supervisor.pending_polls.load(Ordering::SeqCst) != 0
-            })
+            wait_for_execution(
+                &cx,
+                "application parks without arranging another wake",
+                || supervisor.pending_polls.load(Ordering::SeqCst) != 0,
+            )
             .await;
             // Let admission and first-poll notifications drain before changing
             // policy. The observation timer belongs to this separate test task;
@@ -3000,11 +3016,15 @@ mod tests {
             let polls_before_revocation = supervisor.pending_polls.load(Ordering::SeqCst);
             let checks_before_revocation = fixture.policy.calls.load(Ordering::SeqCst);
             *selective.refused.lock().unwrap() = Some(revoked.clone());
-            wait_for_execution(&cx, "service heartbeat retires and settles revoked work", || {
-                fixture.status(&revoked) == FinalTaskStatus::Failed
-                    && supervisor.pending_dropped.load(Ordering::SeqCst)
-                    && fixture.store.active_task_count() == 0
-            })
+            wait_for_execution(
+                &cx,
+                "service heartbeat retires and settles revoked work",
+                || {
+                    fixture.status(&revoked) == FinalTaskStatus::Failed
+                        && supervisor.pending_dropped.load(Ordering::SeqCst)
+                        && fixture.store.active_task_count() == 0
+                },
+            )
             .await;
             assert_eq!(
                 supervisor.pending_polls.load(Ordering::SeqCst),
@@ -3016,9 +3036,11 @@ mod tests {
             assert!(!cx.is_cancel_requested());
 
             let sibling = fixture.create();
-            wait_for_execution(&cx, "the same service completes an authorized sibling", || {
-                fixture.status(&sibling) == FinalTaskStatus::Completed
-            })
+            wait_for_execution(
+                &cx,
+                "the same service completes an authorized sibling",
+                || fixture.status(&sibling) == FinalTaskStatus::Completed,
+            )
             .await;
             assert_eq!(supervisor.completed.load(Ordering::SeqCst), 1);
             assert_eq!(fixture.status(&revoked), FinalTaskStatus::Failed);
@@ -3156,7 +3178,6 @@ mod tests {
         assert!(store.retained_payload_bytes() >= operation.retained_bytes());
     }
 
-
     #[test]
     fn task_output_schema_identity_is_part_of_its_immutable_operation_binding() {
         let registration = Arc::new(());
@@ -3172,8 +3193,7 @@ mod tests {
         let same = original.clone();
         assert_eq!(original, same);
         let task = task("schema-binding");
-        let snapshot = FinalTaskSnapshot::new(task.clone(), 1)
-            .with_original_operation(Some(same));
+        let snapshot = FinalTaskSnapshot::new(task.clone(), 1).with_original_operation(Some(same));
         let metadata = FinalTaskAccessMetadata::new(
             task.base().task_id.clone(),
             1,
@@ -3192,9 +3212,7 @@ mod tests {
         )
         .unwrap();
         assert_ne!(original, substituted);
-        assert!(!metadata.admits_snapshot(
-            &snapshot.with_original_operation(Some(substituted)),
-        ));
+        assert!(!metadata.admits_snapshot(&snapshot.with_original_operation(Some(substituted)),));
         assert_ne!(
             original,
             FinalTaskOperation::for_tool("schema-task", &registration).unwrap(),

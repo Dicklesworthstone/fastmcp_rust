@@ -24,6 +24,7 @@ use fastmcp_protocol::{
 };
 use serde_json::{Value, json};
 
+use super::super::rpc::mcp_sse_limits;
 use super::super::{
     ClientCredentialsError, ClientCredentialsSnapshot, active, admit_resource, authorize,
     discovery_deadline,
@@ -32,13 +33,12 @@ use super::{
     ClientCredentialsTasksClient, ClientCredentialsTasksError, ManagedTasksError, encode,
     require_success, response_source,
 };
+use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 use crate::http_executor::{
     ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
     ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
     ModernHttpSubscriptionListener,
 };
-use super::super::rpc::mcp_sse_limits;
-use crate::http_auth::managed::MAX_MANAGED_MCP_MESSAGE_BYTES;
 
 /// Bounds the complete acquisition/discovery/listen operation and later reads.
 /// Native transport bounds and the machine client's configured timeout still
@@ -241,8 +241,8 @@ impl ClientCredentialsTasksClient {
                 if response.metadata().kind() != ModernHttpResponseKind::Sse {
                     return Err(ManagedTasksError::InvalidResponse.into());
                 }
-                let framing = mcp_sse_limits(limits.frame_bytes)
-                    .ok_or(ManagedTasksError::InvalidLimits)?;
+                let framing =
+                    mcp_sse_limits(limits.frame_bytes).ok_or(ManagedTasksError::InvalidLimits)?;
                 let listener = response
                     .into_final_subscriptions_listener(request_id.clone(), prepared.filter, framing)
                     .map_err(subscription_error)?
@@ -528,7 +528,9 @@ mod tests {
                     defaults.records,
                     defaults.timeout,
                 ),
-                Err(ClientCredentialsTasksError::Protocol(ManagedTasksError::InvalidLimits))
+                Err(ClientCredentialsTasksError::Protocol(
+                    ManagedTasksError::InvalidLimits
+                ))
             ));
         }
     }

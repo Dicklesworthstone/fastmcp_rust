@@ -1246,7 +1246,6 @@ fn clt_01_b_planted_negative() {
     assert_eq!(probe.sent_len(), 1);
 }
 
-
 #[cfg(all(unix, feature = "legacy-2024-11-05"))]
 mod legacy_async_peer_errors {
     use super::*;
@@ -1306,7 +1305,10 @@ while IFS= read -r line; do :; done
                     assert_eq!(error.message, "request refused");
                     assert_eq!(error.data, Some(data));
                     assert!(client.is_initialized(), "peer errors do not undo selection");
-                    assert!(!client.transport_is_closed(), "peer errors do not close stdio");
+                    assert!(
+                        !client.transport_is_closed(),
+                        "peer errors do not close stdio"
+                    );
 
                     let response = loop {
                         if let Some(response) = executor
@@ -1329,8 +1331,14 @@ while IFS= read -r line; do :; done
                         .expect("a new typed request succeeds on the same connection");
                     assert!(matches!(followup, LegacyCoreResult::Ping(_)));
                 } else {
-                    assert!(!client.is_initialized(), "invalid wire data revokes selection");
-                    assert!(client.transport_is_closed(), "invalid wire data closes stdio");
+                    assert!(
+                        !client.is_initialized(),
+                        "invalid wire data revokes selection"
+                    );
+                    assert!(
+                        client.transport_is_closed(),
+                        "invalid wire data closes stdio"
+                    );
                     assert!(
                         executor.try_take_response(&mut sibling).is_err(),
                         "malformed peer data still fails every outstanding owner"
@@ -1354,7 +1362,10 @@ while IFS= read -r line; do :; done
     fn clt_01_legacy_async_peer_error_preserves_sibling_and_connection() {
         exercise(
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"request refused","data":{"retryable":true}}}"#,
-            Some((McpErrorCode::InvalidParams, serde_json::json!({"retryable": true}))),
+            Some((
+                McpErrorCode::InvalidParams,
+                serde_json::json!({"retryable": true}),
+            )),
         );
     }
 

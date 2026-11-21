@@ -1196,13 +1196,17 @@ mod tests {
                         Ok(())
                     }));
                     assert!(matches!(
-                        guarded.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                        guarded
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop())),
                         Poll::Ready(Err(OAuthDiscoveryError::RuntimeUnavailable))
                     ));
                     assert_eq!(polls.get(), 0);
                     let mut discover = Box::pin(plan.discover(held));
                     assert!(matches!(
-                        discover.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                        discover
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop())),
                         Poll::Ready(Err(OAuthDiscoveryError::RuntimeUnavailable))
                     ));
                     assert!(matches!(listener.accept(), Err(error)
@@ -1241,12 +1245,16 @@ mod tests {
                     let capabilities = active.capabilities();
                     assert!(capabilities.io && capabilities.time);
                     if ambient.is_some() {
-                        assert!(!capabilities.spawn && !capabilities.entropy && !capabilities.remote);
+                        assert!(
+                            !capabilities.spawn && !capabilities.entropy && !capabilities.remote
+                        );
                     }
                     Ok(42)
                 }));
                 assert!(matches!(
-                    guarded.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    guarded
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
                     Poll::Ready(Ok(42))
                 ));
                 assert_eq!(polls.get(), 1);
@@ -1281,7 +1289,12 @@ mod tests {
                 ));
                 {
                     let _host = Cx::set_current(None);
-                    assert!(guarded.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                    assert!(
+                        guarded
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
                 }
                 assert_eq!(polls.get(), 1);
                 assert_eq!(timer.pending_count(), 1);
@@ -1289,7 +1302,9 @@ mod tests {
                     let host = narrowed(&caller, mask);
                     let _host = Cx::set_current(Some(host.clone()));
                     assert!(matches!(
-                        guarded.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                        guarded
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop())),
                         Poll::Ready(Err(OAuthDiscoveryError::RuntimeUnavailable))
                     ));
                     assert_eq!(Cx::current().unwrap().capabilities(), host.capabilities());
@@ -1316,9 +1331,8 @@ mod tests {
         fn discovery_runtime_guard_wakes_for_explicit_cancellation_and_parent_deadline() {
             for cancel in [false, true] {
                 let (runtime, base, clock, timer) = runtime();
-                let caller = runtime.request_cx_with_budget(
-                    Budget::INFINITE.with_deadline(Time::from_secs(1)),
-                );
+                let caller = runtime
+                    .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_secs(1)));
                 let foreign = Cx::for_testing_with_budget(Budget::ZERO);
                 foreign.set_cancel_requested(true);
                 let host_guard = Cx::set_current(Some(foreign));
@@ -1347,10 +1361,12 @@ mod tests {
                 }
                 assert!(wakes.0.load(Ordering::SeqCst) > previous_wakes);
                 let result = guarded.as_mut().poll(&mut task);
-                assert!(matches!(&result,
+                assert!(
+                    matches!(&result,
                     Poll::Ready(Err(OAuthDiscoveryError::Cancelled)) if cancel)
-                    || matches!(&result,
-                        Poll::Ready(Err(OAuthDiscoveryError::TimedOut)) if !cancel));
+                        || matches!(&result,
+                        Poll::Ready(Err(OAuthDiscoveryError::TimedOut)) if !cancel)
+                );
                 assert_eq!(polls.get(), 1);
                 assert!(Cx::current().unwrap().is_cancel_requested());
                 drop(guarded);
@@ -1683,7 +1699,10 @@ mod tests {
         ] {
             let mut exact = br#"{"vendor":{"array":[null,true],"number":1.25e2}}"#.to_vec();
             exact.resize(kind.byte_limit(), b' ');
-            assert!(decode_metadata::<IgnoredMetadata>(kind, &exact).is_ok(), "{kind:?}");
+            assert!(
+                decode_metadata::<IgnoredMetadata>(kind, &exact).is_ok(),
+                "{kind:?}"
+            );
             exact.push(b' ');
             assert!(matches!(
                 decode_metadata::<IgnoredMetadata>(kind, &exact),
@@ -1734,7 +1753,8 @@ mod tests {
                 SecurityDocumentKind::OidcProviderMetadata,
             ] {
                 assert_eq!(
-                    plan.admit_issuer(&plan.issuers[0], kind, issuer.as_bytes()).is_ok(),
+                    plan.admit_issuer(&plan.issuers[0], kind, issuer.as_bytes())
+                        .is_ok(),
                     accepted,
                 );
             }

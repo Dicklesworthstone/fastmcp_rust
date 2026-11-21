@@ -18,15 +18,15 @@ use std::time::{Duration, SystemTime};
 
 use asupersync::Cx;
 use asupersync::security::SecretString;
-use fastmcp_core::{AbsoluteUri, CanonicalHttpUrl};
 use fastmcp_core::crypto::{draw_security_identifier, sha256_bounded};
+use fastmcp_core::{AbsoluteUri, CanonicalHttpUrl};
 use fastmcp_protocol::security_admission::{SecurityDocumentKind, admit_security_document};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use super::identity::{
-    EnterpriseOidcRelyingPartyConfiguration, EnterpriseOidcSubjectType,
-    OidcSectorDocumentReview, OidcSectorRegistrationRole, OidcSubjectNamespace,
+    EnterpriseOidcRelyingPartyConfiguration, EnterpriseOidcSubjectType, OidcSectorDocumentReview,
+    OidcSectorRegistrationRole, OidcSubjectNamespace,
 };
 use super::policy::{EnterpriseProfile, RequestedEnterpriseScopeSet, TOKEN_EXCHANGE_GRANT};
 use super::response::{
@@ -68,14 +68,22 @@ impl fmt::Display for OidcCodeFlowError {
         formatter.write_str(match self {
             Self::InvalidConfiguration => "invalid enterprise OIDC code-flow configuration",
             Self::InvalidMetadata => "enterprise OIDC metadata does not admit this code flow",
-            Self::InvalidRegistration => "enterprise OIDC preregistration does not admit this code flow",
+            Self::InvalidRegistration => {
+                "enterprise OIDC preregistration does not admit this code flow"
+            }
             Self::UnsupportedSubjectNamespace => "enterprise OIDC subject namespace is unsupported",
-            Self::CapabilityUnavailable => "enterprise OIDC requires caller time and entropy authority",
+            Self::CapabilityUnavailable => {
+                "enterprise OIDC requires caller time and entropy authority"
+            }
             Self::Cancelled => "enterprise OIDC code flow was cancelled",
             Self::RandomSourceUnavailable => "enterprise OIDC security randomness is unavailable",
-            Self::InvalidLifetime => "enterprise OIDC code flow is expired or has an invalid lifetime",
+            Self::InvalidLifetime => {
+                "enterprise OIDC code flow is expired or has an invalid lifetime"
+            }
             Self::CallbackRejected => "enterprise OIDC callback was refused",
-            Self::IssuerMismatch => "enterprise OIDC callback issuer does not match its registration",
+            Self::IssuerMismatch => {
+                "enterprise OIDC callback issuer does not match its registration"
+            }
             Self::EncodingFailed => "enterprise OIDC confidential form serialization failed",
             Self::TokenResponseRejected => "enterprise OIDC signed token response was refused",
         })
@@ -135,8 +143,13 @@ impl OidcCodeFlowConfiguration {
         idp_registration: &[u8],
     ) -> Result<Self, OidcCodeFlowError> {
         Self::admit_documents(
-            profile, redirect_uri, subject_type, tenant,
-            idp_metadata, idp_registration, None,
+            profile,
+            redirect_uri,
+            subject_type,
+            tenant,
+            idp_metadata,
+            idp_registration,
+            None,
         )
     }
 
@@ -155,8 +168,13 @@ impl OidcCodeFlowConfiguration {
         sector_review: &OidcSectorDocumentReview,
     ) -> Result<Self, OidcCodeFlowError> {
         Self::admit_documents(
-            profile, redirect_uri, EnterpriseOidcSubjectType::Pairwise, tenant,
-            idp_metadata, idp_registration, Some(sector_review),
+            profile,
+            redirect_uri,
+            EnterpriseOidcSubjectType::Pairwise,
+            tenant,
+            idp_metadata,
+            idp_registration,
+            Some(sector_review),
         )
     }
 
@@ -178,7 +196,10 @@ impl OidcCodeFlowConfiguration {
 
         for (name, expected) in [
             ("issuer", profile.idp_issuer()),
-            ("authorization_endpoint", profile.idp_authorization_endpoint()),
+            (
+                "authorization_endpoint",
+                profile.idp_authorization_endpoint(),
+            ),
             ("token_endpoint", profile.idp_token_endpoint()),
             ("jwks_uri", profile.oidc_jwks_uri()),
         ] {
@@ -197,7 +218,10 @@ impl OidcCodeFlowConfiguration {
             ("scopes_supported", "openid"),
             ("subject_types_supported", subject_name),
             ("id_token_signing_alg_values_supported", "RS256"),
-            ("token_endpoint_auth_methods_supported", profile.idp_authentication().as_str()),
+            (
+                "token_endpoint_auth_methods_supported",
+                profile.idp_authentication().as_str(),
+            ),
         ] {
             if !array(&metadata, name)?.contains(&required) {
                 return Err(OidcCodeFlowError::InvalidMetadata);
@@ -210,18 +234,22 @@ impl OidcCodeFlowConfiguration {
         if !profile.permits_oidc_openid() {
             return Err(OidcCodeFlowError::InvalidConfiguration);
         }
-        let require_callback_issuer = match metadata.get("authorization_response_iss_parameter_supported") {
-            None => false,
-            Some(Value::Bool(value)) => *value,
-            Some(_) => return Err(OidcCodeFlowError::InvalidMetadata),
-        };
+        let require_callback_issuer =
+            match metadata.get("authorization_response_iss_parameter_supported") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err(OidcCodeFlowError::InvalidMetadata),
+            };
         for (name, expected) in [
             ("issuer", profile.idp_issuer()),
             ("token_endpoint", profile.idp_token_endpoint()),
             ("client_id", profile.idp_client_id()),
             ("application_type", "web"),
             ("subject_type", subject_name),
-            ("token_endpoint_auth_method", profile.idp_authentication().as_str()),
+            (
+                "token_endpoint_auth_method",
+                profile.idp_authentication().as_str(),
+            ),
         ] {
             if string(&registration, name)? != expected {
                 return Err(OidcCodeFlowError::InvalidRegistration);
@@ -244,15 +272,19 @@ impl OidcCodeFlowConfiguration {
         if grants != required_grants
             || registration.contains_key("id_token_encrypted_response_alg")
             || registration.contains_key("id_token_encrypted_response_enc")
-            || registration.get("id_token_signed_response_alg")
+            || registration
+                .get("id_token_signed_response_alg")
                 .is_some_and(|value| value.as_str() != Some("RS256"))
         {
             return Err(OidcCodeFlowError::InvalidRegistration);
         }
         if let Some(scope) = registration.get("scope") {
-            let scope = scope.as_str().ok_or(OidcCodeFlowError::InvalidRegistration)?;
-            let admitted = RequestedEnterpriseScopeSet::from_literals(scope.split(' ').map(str::to_owned))
-                .map_err(|_| OidcCodeFlowError::InvalidRegistration)?;
+            let scope = scope
+                .as_str()
+                .ok_or(OidcCodeFlowError::InvalidRegistration)?;
+            let admitted =
+                RequestedEnterpriseScopeSet::from_literals(scope.split(' ').map(str::to_owned))
+                    .map_err(|_| OidcCodeFlowError::InvalidRegistration)?;
             if !admitted.as_slice().iter().any(|scope| scope == "openid") {
                 return Err(OidcCodeFlowError::InvalidRegistration);
             }
@@ -260,7 +292,9 @@ impl OidcCodeFlowConfiguration {
         let tenant = match tenant {
             TenantExpectation::SingleTenant => ConfiguredTenant::SingleTenant,
             TenantExpectation::Exact(value) => {
-                if value.is_empty() || value.len() > 256 || value.trim() != value
+                if value.is_empty()
+                    || value.len() > 256
+                    || value.trim() != value
                     || value.chars().any(char::is_control)
                 {
                     return Err(OidcCodeFlowError::InvalidConfiguration);
@@ -281,25 +315,44 @@ impl OidcCodeFlowConfiguration {
                 client_id: profile.idp_client_id().to_owned(),
                 registration_generation: profile.idp_registration_generation(),
                 subject_type,
-                redirect_uris: registered_redirects.into_iter().map(str::to_owned).collect(),
+                redirect_uris: registered_redirects
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
             };
             OidcSubjectNamespace::from_reviewed_sector(
-                &relying_party, OidcSectorRegistrationRole::Client, review,
-            ).map_err(|_| OidcCodeFlowError::UnsupportedSubjectNamespace)?
+                &relying_party,
+                OidcSectorRegistrationRole::Client,
+                review,
+            )
+            .map_err(|_| OidcCodeFlowError::UnsupportedSubjectNamespace)?
         } else {
             if registration.contains_key("sector_identifier_uri") {
                 return Err(OidcCodeFlowError::UnsupportedSubjectNamespace);
             }
             OidcSubjectNamespace::from_preregistered_redirects(
-                profile.idp_issuer(), subject_type, profile.idp_registration_generation(),
+                profile.idp_issuer(),
+                subject_type,
+                profile.idp_registration_generation(),
                 &[redirect_uri.to_owned()],
-            ).map_err(|_| OidcCodeFlowError::UnsupportedSubjectNamespace)?
+            )
+            .map_err(|_| OidcCodeFlowError::UnsupportedSubjectNamespace)?
         };
         Ok(Self {
-            profile, authorization_endpoint, redirect_uri: redirect_uri.to_owned(),
-            subject_namespace, tenant, require_callback_issuer,
-            metadata_digest: digest(idp_metadata, SecurityDocumentKind::OidcProviderMetadata.byte_limit())?,
-            registration_digest: digest(idp_registration, SecurityDocumentKind::ClientRegistration.byte_limit())?,
+            profile,
+            authorization_endpoint,
+            redirect_uri: redirect_uri.to_owned(),
+            subject_namespace,
+            tenant,
+            require_callback_issuer,
+            metadata_digest: digest(
+                idp_metadata,
+                SecurityDocumentKind::OidcProviderMetadata.byte_limit(),
+            )?,
+            registration_digest: digest(
+                idp_registration,
+                SecurityDocumentKind::ClientRegistration.byte_limit(),
+            )?,
             response_policy: EnterpriseResponsePolicy::default(),
             maximum_authentication_age: None,
         })
@@ -312,9 +365,9 @@ impl OidcCodeFlowConfiguration {
         policy: EnterpriseResponsePolicy,
         maximum_authentication_age: Option<Duration>,
     ) -> Result<Self, OidcCodeFlowError> {
-        if maximum_authentication_age.is_some_and(|age| {
-            age > Duration::from_hours(24) || age.subsec_nanos() != 0
-        }) {
+        if maximum_authentication_age
+            .is_some_and(|age| age > Duration::from_hours(24) || age.subsec_nanos() != 0)
+        {
             return Err(OidcCodeFlowError::InvalidConfiguration);
         }
         self.response_policy = policy;
@@ -322,10 +375,18 @@ impl OidcCodeFlowConfiguration {
         Ok(self)
     }
 
-    pub fn subject_namespace(&self) -> &OidcSubjectNamespace { &self.subject_namespace }
-    pub fn metadata_digest(&self) -> &[u8; 32] { &self.metadata_digest }
-    pub fn registration_digest(&self) -> &[u8; 32] { &self.registration_digest }
-    pub fn requires_callback_issuer(&self) -> bool { self.require_callback_issuer }
+    pub fn subject_namespace(&self) -> &OidcSubjectNamespace {
+        &self.subject_namespace
+    }
+    pub fn metadata_digest(&self) -> &[u8; 32] {
+        &self.metadata_digest
+    }
+    pub fn registration_digest(&self) -> &[u8; 32] {
+        &self.registration_digest
+    }
+    pub fn requires_callback_issuer(&self) -> bool {
+        self.require_callback_issuer
+    }
 
     /// Generates three independent 256-bit OS draws under the caller's effect
     /// ceiling. Lifetime is finite and additionally bounded by its Cx budget.
@@ -339,7 +400,9 @@ impl OidcCodeFlowConfiguration {
     ) -> Result<PreparedOidcAuthorization, OidcCodeFlowError> {
         crate::http_auth::caller::with_caller(cx, || {
             let active = Cx::current().ok_or(OidcCodeFlowError::CapabilityUnavailable)?;
-            if active.checkpoint().is_err() { return Err(OidcCodeFlowError::Cancelled); }
+            if active.checkpoint().is_err() {
+                return Err(OidcCodeFlowError::Cancelled);
+            }
             if !active.capabilities().entropy || !active.capabilities().time {
                 return Err(OidcCodeFlowError::CapabilityUnavailable);
             }
@@ -347,20 +410,39 @@ impl OidcCodeFlowConfiguration {
                 return Err(OidcCodeFlowError::InvalidLifetime);
             }
             let lifetime = if let Some(deadline) = active.budget().deadline {
-                let remaining = deadline.as_nanos().checked_sub(active.now().as_nanos())
+                let remaining = deadline
+                    .as_nanos()
+                    .checked_sub(active.now().as_nanos())
                     .filter(|remaining| *remaining != 0)
                     .ok_or(OidcCodeFlowError::InvalidLifetime)?;
                 lifetime.min(Duration::from_nanos(remaining))
-            } else { lifetime };
-            let expires_at = now.checked_add(lifetime).ok_or(OidcCodeFlowError::InvalidLifetime)?;
-            let state = draw_security_identifier().map_err(|_| OidcCodeFlowError::RandomSourceUnavailable)?;
-            let nonce = draw_security_identifier().map_err(|_| OidcCodeFlowError::RandomSourceUnavailable)?;
-            let verifier = draw_security_identifier().map_err(|_| OidcCodeFlowError::RandomSourceUnavailable)?;
+            } else {
+                lifetime
+            };
+            let expires_at = now
+                .checked_add(lifetime)
+                .ok_or(OidcCodeFlowError::InvalidLifetime)?;
+            let state = draw_security_identifier()
+                .map_err(|_| OidcCodeFlowError::RandomSourceUnavailable)?;
+            let nonce = draw_security_identifier()
+                .map_err(|_| OidcCodeFlowError::RandomSourceUnavailable)?;
+            let verifier = draw_security_identifier()
+                .map_err(|_| OidcCodeFlowError::RandomSourceUnavailable)?;
             let prepared = self.prepare_from_draws(
-                state.as_bytes(), nonce.as_bytes(), verifier.as_bytes(), now, expires_at,
+                state.as_bytes(),
+                nonce.as_bytes(),
+                verifier.as_bytes(),
+                now,
+                expires_at,
             )?;
-            if active.checkpoint().is_err() { return Err(OidcCodeFlowError::Cancelled); }
-            if active.budget().deadline.is_some_and(|deadline| active.now() >= deadline) {
+            if active.checkpoint().is_err() {
+                return Err(OidcCodeFlowError::Cancelled);
+            }
+            if active
+                .budget()
+                .deadline
+                .is_some_and(|deadline| active.now() >= deadline)
+            {
                 return Err(OidcCodeFlowError::InvalidLifetime);
             }
             Ok(prepared)
@@ -379,17 +461,24 @@ impl OidcCodeFlowConfiguration {
         let nonce = base64url32(nonce);
         let verifier = base64url32(verifier);
         let challenge = base64url32(&digest(verifier.as_bytes(), 43)?);
-        let query = form(&[
-            ("response_type", "code"),
-            ("client_id", self.profile.idp_client_id()),
-            ("redirect_uri", &self.redirect_uri),
-            ("scope", "openid"),
-            ("state", state.as_str()),
-            ("nonce", nonce.as_str()),
-            ("code_challenge", challenge.as_str()),
-            ("code_challenge_method", "S256"),
-        ], MAX_LAUNCH_BYTES)?;
-        if self.authorization_endpoint.as_str().len().checked_add(1)
+        let query = form(
+            &[
+                ("response_type", "code"),
+                ("client_id", self.profile.idp_client_id()),
+                ("redirect_uri", &self.redirect_uri),
+                ("scope", "openid"),
+                ("state", state.as_str()),
+                ("nonce", nonce.as_str()),
+                ("code_challenge", challenge.as_str()),
+                ("code_challenge_method", "S256"),
+            ],
+            MAX_LAUNCH_BYTES,
+        )?;
+        if self
+            .authorization_endpoint
+            .as_str()
+            .len()
+            .checked_add(1)
             .and_then(|length| length.checked_add(query.len()))
             .is_none_or(|length| length > MAX_LAUNCH_BYTES)
         {
@@ -399,7 +488,9 @@ impl OidcCodeFlowConfiguration {
         url.push_str(self.authorization_endpoint.as_str());
         url.push('?');
         url.push_str(query.as_str());
-        if url.len() > MAX_LAUNCH_BYTES { return Err(OidcCodeFlowError::EncodingFailed); }
+        if url.len() > MAX_LAUNCH_BYTES {
+            return Err(OidcCodeFlowError::EncodingFailed);
+        }
         let url = url.finish();
         let mut target = ProtectedBuffer::with_capacity(MAX_LAUNCH_BYTES);
         target.push_str(self.authorization_endpoint.path());
@@ -409,8 +500,16 @@ impl OidcCodeFlowConfiguration {
         let url_digest = digest(url.as_bytes(), MAX_LAUNCH_BYTES)?;
         let target_digest = digest(target.as_bytes(), MAX_LAUNCH_BYTES)?;
         Ok(PreparedOidcAuthorization {
-            configuration: self.clone(), url, target, url_digest, target_digest,
-            state, nonce, verifier, created_at, expires_at,
+            configuration: self.clone(),
+            url,
+            target,
+            url_digest,
+            target_digest,
+            state,
+            nonce,
+            verifier,
+            created_at,
+            expires_at,
         })
     }
 }
@@ -434,14 +533,26 @@ pub struct PreparedOidcAuthorization {
 }
 
 impl PreparedOidcAuthorization {
-    pub const fn method(&self) -> &'static str { "GET" }
+    pub const fn method(&self) -> &'static str {
+        "GET"
+    }
     /// Contains state and nonce. The adapter must not log or persist these bytes.
-    pub fn authorization_url(&self) -> &str { self.url.as_str() }
+    pub fn authorization_url(&self) -> &str {
+        self.url.as_str()
+    }
     /// Exact origin-form target derived from that same URL, without re-encoding.
-    pub fn request_target(&self) -> &str { self.target.as_str() }
-    pub fn authorization_url_digest(&self) -> &[u8; 32] { &self.url_digest }
-    pub fn request_target_digest(&self) -> &[u8; 32] { &self.target_digest }
-    pub fn expires_at(&self) -> SystemTime { self.expires_at }
+    pub fn request_target(&self) -> &str {
+        self.target.as_str()
+    }
+    pub fn authorization_url_digest(&self) -> &[u8; 32] {
+        &self.url_digest
+    }
+    pub fn request_target_digest(&self) -> &[u8; 32] {
+        &self.target_digest
+    }
+    pub fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
 
     /// Consumes local challenge custody on success, denial and every malformed
     /// callback. The callback URI is the exact registered absolute route followed
@@ -454,13 +565,19 @@ impl PreparedOidcAuthorization {
     ) -> Result<OidcCallbackOutcome, OidcCodeFlowError> {
         live(self.created_at, self.expires_at, received_at)?;
         if callback_uri.len() > MAX_CALLBACK_BYTES
-            || callback_uri.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+            || callback_uri
+                .bytes()
+                .any(|byte| !(0x21..=0x7e).contains(&byte))
             || callback_uri.contains('#')
         {
             return Err(OidcCodeFlowError::CallbackRejected);
         }
-        let (route, query) = callback_uri.split_once('?').ok_or(OidcCodeFlowError::CallbackRejected)?;
-        if route != self.configuration.redirect_uri { return Err(OidcCodeFlowError::CallbackRejected); }
+        let (route, query) = callback_uri
+            .split_once('?')
+            .ok_or(OidcCodeFlowError::CallbackRejected)?;
+        if route != self.configuration.redirect_uri {
+            return Err(OidcCodeFlowError::CallbackRejected);
+        }
         let mut fields = callback_fields(query)?;
         // An unsolicited iss is still authoritative for mix-up refusal. Check
         // it before interpreting the success or error arm, never only on code.
@@ -472,31 +589,52 @@ impl PreparedOidcAuthorization {
         if fields.get("state") != Some(&self.state) {
             return Err(OidcCodeFlowError::CallbackRejected);
         }
-        for name in ["id_token", "access_token", "refresh_token", "token_type", "expires_in", "response_mode", "response_type"] {
-            if fields.contains_key(name) { return Err(OidcCodeFlowError::CallbackRejected); }
+        for name in [
+            "id_token",
+            "access_token",
+            "refresh_token",
+            "token_type",
+            "expires_in",
+            "response_mode",
+            "response_type",
+        ] {
+            if fields.contains_key(name) {
+                return Err(OidcCodeFlowError::CallbackRejected);
+            }
         }
         match (fields.remove("code"), fields.remove("error")) {
             (Some(code), None) => {
                 if !vschar(code.as_str(), MAX_FIELD_BYTES)
-                    || fields.contains_key("error_description") || fields.contains_key("error_uri")
+                    || fields.contains_key("error_description")
+                    || fields.contains_key("error_uri")
                 {
                     return Err(OidcCodeFlowError::CallbackRejected);
                 }
                 Ok(OidcCallbackOutcome::Code(OidcCodeGrant {
-                    configuration: self.configuration, code, verifier: self.verifier,
-                    nonce: self.nonce, launch_url_digest: self.url_digest,
+                    configuration: self.configuration,
+                    code,
+                    verifier: self.verifier,
+                    nonce: self.nonce,
+                    launch_url_digest: self.url_digest,
                     callback_digest: digest(callback_uri.as_bytes(), MAX_CALLBACK_BYTES)?,
-                    created_at: received_at, expires_at: self.expires_at,
+                    created_at: received_at,
+                    expires_at: self.expires_at,
                 }))
             }
             (None, Some(error)) => {
                 if !error_text(error.as_str(), 256, true)
-                    || fields.get("error_description").is_some_and(|value| !error_text(value.as_str(), 2048, true))
-                    || fields.get("error_uri").is_some_and(|value| !error_uri(value.as_str()))
+                    || fields
+                        .get("error_description")
+                        .is_some_and(|value| !error_text(value.as_str(), 2048, true))
+                    || fields
+                        .get("error_uri")
+                        .is_some_and(|value| !error_uri(value.as_str()))
                 {
                     return Err(OidcCodeFlowError::CallbackRejected);
                 }
-                Ok(OidcCallbackOutcome::Denied(authorization_error(error.as_str())))
+                Ok(OidcCallbackOutcome::Denied(authorization_error(
+                    error.as_str(),
+                )))
             }
             _ => Err(OidcCodeFlowError::CallbackRejected),
         }
@@ -506,11 +644,23 @@ impl PreparedOidcAuthorization {
 /// Redacted terminal authorization errors. None is a retry or fallback command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OidcAuthorizationError {
-    InvalidRequest, UnauthorizedClient, AccessDenied, UnsupportedResponseType,
-    InvalidScope, ServerError, TemporarilyUnavailable, InteractionRequired,
-    LoginRequired, AccountSelectionRequired, ConsentRequired, InvalidRequestUri,
-    InvalidRequestObject, RequestNotSupported, RequestUriNotSupported,
-    RegistrationNotSupported, Extension,
+    InvalidRequest,
+    UnauthorizedClient,
+    AccessDenied,
+    UnsupportedResponseType,
+    InvalidScope,
+    ServerError,
+    TemporarilyUnavailable,
+    InteractionRequired,
+    LoginRequired,
+    AccountSelectionRequired,
+    ConsentRequired,
+    InvalidRequestUri,
+    InvalidRequestObject,
+    RequestNotSupported,
+    RequestUriNotSupported,
+    RegistrationNotSupported,
+    Extension,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -533,8 +683,12 @@ pub struct OidcCodeGrant {
 }
 
 impl OidcCodeGrant {
-    pub fn token_endpoint(&self) -> &str { self.configuration.profile.idp_token_endpoint() }
-    pub fn expires_at(&self) -> SystemTime { self.expires_at }
+    pub fn token_endpoint(&self) -> &str {
+        self.configuration.profile.idp_token_endpoint()
+    }
+    pub fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
 
     /// Serializes the closed unauthenticated code form to a confidential sink.
     ///
@@ -551,18 +705,26 @@ impl OidcCodeGrant {
         now: SystemTime,
     ) -> Result<OidcCodeResponseAdmission, OidcCodeFlowError> {
         live(self.created_at, self.expires_at, now)?;
-        let body = form(&[
-            ("grant_type", "authorization_code"),
-            ("code", self.code.as_str()),
-            ("redirect_uri", &self.configuration.redirect_uri),
-            ("code_verifier", self.verifier.as_str()),
-        ], MAX_CODE_FORM_BYTES)?;
-        writer.write_all(body.as_bytes()).map_err(|_| OidcCodeFlowError::EncodingFailed)?;
+        let body = form(
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", self.code.as_str()),
+                ("redirect_uri", &self.configuration.redirect_uri),
+                ("code_verifier", self.verifier.as_str()),
+            ],
+            MAX_CODE_FORM_BYTES,
+        )?;
+        writer
+            .write_all(body.as_bytes())
+            .map_err(|_| OidcCodeFlowError::EncodingFailed)?;
         Ok(OidcCodeResponseAdmission {
-            configuration: self.configuration, nonce: self.nonce,
-            launch_url_digest: self.launch_url_digest, callback_digest: self.callback_digest,
+            configuration: self.configuration,
+            nonce: self.nonce,
+            launch_url_digest: self.launch_url_digest,
+            callback_digest: self.callback_digest,
             request_digest: digest(body.as_bytes(), MAX_CODE_FORM_BYTES)?,
-            created_at: now, expires_at: self.expires_at,
+            created_at: now,
+            expires_at: self.expires_at,
         })
     }
 }
@@ -580,9 +742,15 @@ pub struct OidcCodeResponseAdmission {
 }
 
 impl OidcCodeResponseAdmission {
-    pub fn launch_url_digest(&self) -> &[u8; 32] { &self.launch_url_digest }
-    pub fn callback_digest(&self) -> &[u8; 32] { &self.callback_digest }
-    pub fn request_digest(&self) -> &[u8; 32] { &self.request_digest }
+    pub fn launch_url_digest(&self) -> &[u8; 32] {
+        &self.launch_url_digest
+    }
+    pub fn callback_digest(&self) -> &[u8; 32] {
+        &self.callback_digest
+    }
+    pub fn request_digest(&self) -> &[u8; 32] {
+        &self.request_digest
+    }
 
     /// Applies the existing distinct OIDC response and real signature checks.
     /// The caller cannot substitute its own nonce, client, issuer or tenant at
@@ -594,15 +762,26 @@ impl OidcCodeResponseAdmission {
         received_at: SystemTime,
     ) -> Result<EnterpriseResponseOutcome<EnterpriseIdentityAssertion>, OidcCodeFlowError> {
         live(self.created_at, self.expires_at, received_at)?;
-        self.configuration.profile.admit_oidc_code_response(
-            response, keys, self.nonce.as_str(), self.configuration.tenant.expectation(),
-            self.configuration.maximum_authentication_age,
-            self.configuration.response_policy, received_at,
-        ).map_err(|_| OidcCodeFlowError::TokenResponseRejected)
+        self.configuration
+            .profile
+            .admit_oidc_code_response(
+                response,
+                keys,
+                self.nonce.as_str(),
+                self.configuration.tenant.expectation(),
+                self.configuration.maximum_authentication_age,
+                self.configuration.response_policy,
+                received_at,
+            )
+            .map_err(|_| OidcCodeFlowError::TokenResponseRejected)
     }
 }
 
-fn live(created_at: SystemTime, expires_at: SystemTime, now: SystemTime) -> Result<(), OidcCodeFlowError> {
+fn live(
+    created_at: SystemTime,
+    expires_at: SystemTime,
+    now: SystemTime,
+) -> Result<(), OidcCodeFlowError> {
     if now < created_at || now >= expires_at || expires_at <= created_at {
         Err(OidcCodeFlowError::InvalidLifetime)
     } else {
@@ -611,19 +790,26 @@ fn live(created_at: SystemTime, expires_at: SystemTime, now: SystemTime) -> Resu
 }
 
 fn digest(bytes: &[u8], bound: usize) -> Result<[u8; 32], OidcCodeFlowError> {
-    sha256_bounded(bytes, bound).map(|hash| hash.into_bytes())
+    sha256_bounded(bytes, bound)
+        .map(|hash| hash.into_bytes())
         .map_err(|_| OidcCodeFlowError::EncodingFailed)
 }
 
 fn https_url(value: &str, query_free: bool) -> Result<CanonicalHttpUrl, OidcCodeFlowError> {
-    if value.is_empty() || value.len() > MAX_URL_BYTES || value.trim() != value
+    if value.is_empty()
+        || value.len() > MAX_URL_BYTES
+        || value.trim() != value
         || value.chars().any(char::is_control)
     {
         return Err(OidcCodeFlowError::InvalidConfiguration);
     }
-    let parsed = CanonicalHttpUrl::parse(value).map_err(|_| OidcCodeFlowError::InvalidConfiguration)?;
-    if parsed.scheme() != "https" || parsed.has_userinfo() || parsed.has_syntax_violation()
-        || parsed.fragment().is_some() || (query_free && parsed.query().is_some())
+    let parsed =
+        CanonicalHttpUrl::parse(value).map_err(|_| OidcCodeFlowError::InvalidConfiguration)?;
+    if parsed.scheme() != "https"
+        || parsed.has_userinfo()
+        || parsed.has_syntax_violation()
+        || parsed.fragment().is_some()
+        || (query_free && parsed.query().is_some())
     {
         return Err(OidcCodeFlowError::InvalidConfiguration);
     }
@@ -650,34 +836,53 @@ struct SecretMetadataOverlay {
     registration_client_uri: ForbiddenMember,
 }
 
-fn document(kind: SecurityDocumentKind, bytes: &[u8]) -> Result<Map<String, Value>, OidcCodeFlowError> {
+fn document(
+    kind: SecurityDocumentKind,
+    bytes: &[u8],
+) -> Result<Map<String, Value>, OidcCodeFlowError> {
     admit_security_document(kind, bytes).map_err(|_| OidcCodeFlowError::InvalidMetadata)?;
     // Reject credential/DCR fields by presence before allocating a JSON Value
     // tree, including null or wrong-type values in those forbidden fields.
     let overlay: SecretMetadataOverlay =
         serde_json::from_slice(bytes).map_err(|_| OidcCodeFlowError::InvalidMetadata)?;
-    if overlay.client_secret.0 || overlay.registration_access_token.0 || overlay.registration_client_uri.0 {
+    if overlay.client_secret.0
+        || overlay.registration_access_token.0
+        || overlay.registration_client_uri.0
+    {
         return Err(OidcCodeFlowError::InvalidRegistration);
     }
     serde_json::from_slice(bytes).map_err(|_| OidcCodeFlowError::InvalidMetadata)
 }
 
 fn string<'a>(document: &'a Map<String, Value>, name: &str) -> Result<&'a str, OidcCodeFlowError> {
-    let value = document.get(name).and_then(Value::as_str).ok_or(OidcCodeFlowError::InvalidMetadata)?;
+    let value = document
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or(OidcCodeFlowError::InvalidMetadata)?;
     if value.is_empty() || value.len() > MAX_FIELD_BYTES || value.chars().any(char::is_control) {
         return Err(OidcCodeFlowError::InvalidMetadata);
     }
     Ok(value)
 }
 
-fn array<'a>(document: &'a Map<String, Value>, name: &str) -> Result<Vec<&'a str>, OidcCodeFlowError> {
-    let values = document.get(name).and_then(Value::as_array).ok_or(OidcCodeFlowError::InvalidMetadata)?;
-    if values.is_empty() || values.len() > 128 { return Err(OidcCodeFlowError::InvalidMetadata); }
+fn array<'a>(
+    document: &'a Map<String, Value>,
+    name: &str,
+) -> Result<Vec<&'a str>, OidcCodeFlowError> {
+    let values = document
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or(OidcCodeFlowError::InvalidMetadata)?;
+    if values.is_empty() || values.len() > 128 {
+        return Err(OidcCodeFlowError::InvalidMetadata);
+    }
     let mut admitted = Vec::with_capacity(values.len());
     let mut seen = BTreeSet::new();
     for value in values {
         let value = value.as_str().ok_or(OidcCodeFlowError::InvalidMetadata)?;
-        if value.is_empty() || value.len() > MAX_FIELD_BYTES || value.chars().any(char::is_control)
+        if value.is_empty()
+            || value.len() > MAX_FIELD_BYTES
+            || value.chars().any(char::is_control)
             || !seen.insert(value)
         {
             return Err(OidcCodeFlowError::InvalidMetadata);
@@ -693,11 +898,21 @@ fn array<'a>(document: &'a Map<String, Value>, name: &str) -> Result<Vec<&'a str
 struct ProtectedBuffer(String);
 
 impl ProtectedBuffer {
-    fn with_capacity(capacity: usize) -> Self { Self(String::with_capacity(capacity)) }
-    fn push(&mut self, value: char) { self.0.push(value); }
-    fn push_str(&mut self, value: &str) { self.0.push_str(value); }
-    fn len(&self) -> usize { self.0.len() }
-    fn finish(mut self) -> SecretString { SecretString::from_string(std::mem::take(&mut self.0)) }
+    fn with_capacity(capacity: usize) -> Self {
+        Self(String::with_capacity(capacity))
+    }
+    fn push(&mut self, value: char) {
+        self.0.push(value);
+    }
+    fn push_str(&mut self, value: &str) {
+        self.0.push_str(value);
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn finish(mut self) -> SecretString {
+        SecretString::from_string(std::mem::take(&mut self.0))
+    }
 }
 
 impl Drop for ProtectedBuffer {
@@ -721,7 +936,9 @@ fn base64url32(bytes: &[u8; 32]) -> SecretString {
         accumulator &= (1 << bits) - 1;
     }
     if bits != 0 {
-        output.push(char::from(ALPHABET[((accumulator << (6 - bits)) & 63) as usize]));
+        output.push(char::from(
+            ALPHABET[((accumulator << (6 - bits)) & 63) as usize],
+        ));
     }
     output.finish()
 }
@@ -733,19 +950,32 @@ fn form_literal(byte: u8) -> bool {
 fn form(fields: &[(&str, &str)], limit: usize) -> Result<SecretString, OidcCodeFlowError> {
     let mut length = fields.len().saturating_sub(1);
     for (name, value) in fields {
-        length = length.checked_add(1).ok_or(OidcCodeFlowError::EncodingFailed)?;
+        length = length
+            .checked_add(1)
+            .ok_or(OidcCodeFlowError::EncodingFailed)?;
         for byte in name.bytes().chain(value.bytes()) {
-            length = length.checked_add(if byte == b' ' || form_literal(byte) { 1 } else { 3 })
+            length = length
+                .checked_add(if byte == b' ' || form_literal(byte) {
+                    1
+                } else {
+                    3
+                })
                 .ok_or(OidcCodeFlowError::EncodingFailed)?;
         }
     }
-    if length > limit { return Err(OidcCodeFlowError::EncodingFailed); }
+    if length > limit {
+        return Err(OidcCodeFlowError::EncodingFailed);
+    }
     let mut output = ProtectedBuffer::with_capacity(length);
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for (index, (name, value)) in fields.iter().enumerate() {
-        if index != 0 { output.push('&'); }
+        if index != 0 {
+            output.push('&');
+        }
         for (part, text) in [*name, *value].into_iter().enumerate() {
-            if part == 1 { output.push('='); }
+            if part == 1 {
+                output.push('=');
+            }
             for byte in text.bytes() {
                 if form_literal(byte) {
                     output.push(char::from(byte));
@@ -768,8 +998,12 @@ fn callback_fields(query: &str) -> Result<BTreeMap<String, SecretString>, OidcCo
     }
     let mut result = BTreeMap::new();
     for (index, field) in query.split('&').enumerate() {
-        if index >= MAX_CALLBACK_FIELDS { return Err(OidcCodeFlowError::CallbackRejected); }
-        let (name, value) = field.split_once('=').ok_or(OidcCodeFlowError::CallbackRejected)?;
+        if index >= MAX_CALLBACK_FIELDS {
+            return Err(OidcCodeFlowError::CallbackRejected);
+        }
+        let (name, value) = field
+            .split_once('=')
+            .ok_or(OidcCodeFlowError::CallbackRejected)?;
         let name = decode_component(name, 128)?;
         let value = decode_component(value, MAX_FIELD_BYTES)?;
         if name.is_empty() || result.insert(name.as_str().to_owned(), value).is_some() {
@@ -798,7 +1032,8 @@ fn decode_component(source: &str, maximum: usize) -> Result<SecretString, OidcCo
             *byte = decoded_octet(source.as_bytes(), &mut at)?
                 .ok_or(OidcCodeFlowError::CallbackRejected)?;
         }
-        let value = std::str::from_utf8(&scalar[..width]).map_err(|_| OidcCodeFlowError::CallbackRejected)?;
+        let value = std::str::from_utf8(&scalar[..width])
+            .map_err(|_| OidcCodeFlowError::CallbackRejected)?;
         if value.chars().any(char::is_control) || output.len() + width > maximum {
             return Err(OidcCodeFlowError::CallbackRejected);
         }
@@ -808,13 +1043,23 @@ fn decode_component(source: &str, maximum: usize) -> Result<SecretString, OidcCo
 }
 
 fn decoded_octet(source: &[u8], at: &mut usize) -> Result<Option<u8>, OidcCodeFlowError> {
-    let Some(byte) = source.get(*at).copied() else { return Ok(None); };
+    let Some(byte) = source.get(*at).copied() else {
+        return Ok(None);
+    };
     *at += 1;
     match byte {
         b'+' => Ok(Some(b' ')),
         b'%' => {
-            let high = source.get(*at).copied().and_then(hex_digit).ok_or(OidcCodeFlowError::CallbackRejected)?;
-            let low = source.get(*at + 1).copied().and_then(hex_digit).ok_or(OidcCodeFlowError::CallbackRejected)?;
+            let high = source
+                .get(*at)
+                .copied()
+                .and_then(hex_digit)
+                .ok_or(OidcCodeFlowError::CallbackRejected)?;
+            let low = source
+                .get(*at + 1)
+                .copied()
+                .and_then(hex_digit)
+                .ok_or(OidcCodeFlowError::CallbackRejected)?;
             *at += 2;
             Ok(Some((high << 4) | low))
         }
@@ -833,13 +1078,20 @@ fn hex_digit(byte: u8) -> Option<u8> {
 }
 
 fn vschar(value: &str, maximum: usize) -> bool {
-    !value.is_empty() && value.len() <= maximum && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
 }
 
 fn error_text(value: &str, maximum: usize, spaces: bool) -> bool {
-    !value.is_empty() && value.len() <= maximum && value.bytes().all(|byte| {
-        (spaces && byte == 0x20) || byte == 0x21 || (0x23..=0x5b).contains(&byte) || (0x5d..=0x7e).contains(&byte)
-    })
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.bytes().all(|byte| {
+            (spaces && byte == 0x20)
+                || byte == 0x21
+                || (0x23..=0x5b).contains(&byte)
+                || (0x5d..=0x7e).contains(&byte)
+        })
 }
 
 // A discarded diagnostic URI-reference: validate RFC3986 syntax without
@@ -848,10 +1100,16 @@ fn error_text(value: &str, maximum: usize, spaces: bool) -> bool {
 // path-noscheme segment, where ':' is forbidden. Adding a fixed scheme after
 // that check lets the existing byte-preserving parser validate every component.
 fn error_uri(value: &str) -> bool {
-    if !error_text(value, 2048, false) { return false; }
-    if AbsoluteUri::parse_with_max_bytes(value, 2048).is_ok() { return true; }
+    if !error_text(value, 2048, false) {
+        return false;
+    }
+    if AbsoluteUri::parse_with_max_bytes(value, 2048).is_ok() {
+        return true;
+    }
     let first_segment = value.split(['/', '?', '#']).next().unwrap_or("");
-    if first_segment.contains(':') { return false; }
+    if first_segment.contains(':') {
+        return false;
+    }
     let with_scheme = format!("oidc-diagnostic:{value}");
     AbsoluteUri::parse_with_max_bytes(&with_scheme, 2048 + 16).is_ok()
 }

@@ -59,12 +59,14 @@ impl Run {
             }
         }
         let ids = ManagedTaskRequestIds::new(
-            operation.discovery_id.clone(), operation.operation_id.clone(),
+            operation.discovery_id.clone(),
+            operation.operation_id.clone(),
         )?;
         // Retain the caller's reviewed headers and both exact request IDs.
         // No state is reserved until actual request/header admission succeeds.
         let prepared = Prepared::new(target, metadata, operation, limits, native_maximum)?;
-        self.state.reserve_ids(&ids, self.policy.maximum_state_bytes)?;
+        self.state
+            .reserve_ids(&ids, self.policy.maximum_state_bytes)?;
         Ok(prepared)
     }
 }
@@ -99,9 +101,19 @@ impl DpopHttpClient {
         O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
     {
         self.start_and_drive_task_with_events(
-            cx, cancellation, credential, metadata, operation, id_prefix, policy,
-            DpopStreamLimits::new(limits, limits.timeout())?, resolve, observe, |_| true,
-        ).await
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            operation,
+            id_prefix,
+            policy,
+            DpopStreamLimits::new(limits, limits.timeout())?,
+            resolve,
+            observe,
+            |_| true,
+        )
+        .await
     }
 
     /// Creates at most one Task, then reuses the ordinary get/input/update driver.
@@ -157,26 +169,39 @@ impl DpopHttpClient {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(DpopHttpError::Cancelled.into());
         }
-        let timeout = policy.timeout.min(limits.core.timeout()).min(self.policy.timeout);
+        let timeout = policy
+            .timeout
+            .min(limits.core.timeout())
+            .min(self.policy.timeout);
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let mut run = Run::new(id_prefix, policy, limits.core)?;
         let prepared = run.prepare_initial(
-            self.resource().as_str(), metadata.clone(), operation,
-            limits.core, self.policy.max_body_bytes,
+            self.resource().as_str(),
+            metadata.clone(),
+            operation,
+            limits.core,
+            self.policy.max_body_bytes,
         )?;
-        let event = self.drive_task_selected_pair(
-            cx, cancellation, credential, bounds, &mut run, prepared,
-            ReplyMode::Stream(limits), &mut notify,
-        ).await?;
+        let event = self
+            .drive_task_selected_pair(
+                cx,
+                cancellation,
+                credential,
+                bounds,
+                &mut run,
+                prepared,
+                ReplyMode::Stream(limits),
+                &mut notify,
+            )
+            .await?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let ManagedTaskEvent::ToolResult(initial) = event else {
             return Err(ManagedTaskDriverError::UnexpectedResponse.into());
         };
         let task = match initial.as_ref() {
             FinalCoreResult::ToolsCallTask { result } => result.task.clone(),
-            FinalCoreResult::ToolsCall { .. }
-            | FinalCoreResult::ToolsCallInputRequired { .. } => {
+            FinalCoreResult::ToolsCall { .. } | FinalCoreResult::ToolsCallInputRequired { .. } => {
                 return Ok(DpopTaskExecutionOutcome::Tool(initial));
             }
             _ => return Err(ManagedTaskDriverError::UnexpectedResponse.into()),
@@ -184,10 +209,23 @@ impl DpopHttpClient {
         let task_id = task.base().task_id.clone();
         // Never call the public driver here: that would create a fresh run,
         // deadline and ID/input ledger, losing the creating pair's accounting.
-        let outcome = self.drive_task_run(
-            cx, cancellation, credential, metadata, task_id, run, bounds,
-            limits.core, ReplyMode::Stream(limits), Some(task), resolve, observe, notify,
-        ).await?;
+        let outcome = self
+            .drive_task_run(
+                cx,
+                cancellation,
+                credential,
+                metadata,
+                task_id,
+                run,
+                bounds,
+                limits.core,
+                ReplyMode::Stream(limits),
+                Some(task),
+                resolve,
+                observe,
+                notify,
+            )
+            .await?;
         Ok(DpopTaskExecutionOutcome::Task { initial, outcome })
     }
 }

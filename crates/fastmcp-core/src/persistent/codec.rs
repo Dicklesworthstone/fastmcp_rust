@@ -23,39 +23,63 @@ pub struct PersistentEnvelopeHeader {
     sealed_bytes: usize,
 }
 impl PersistentEnvelopeHeader {
-    pub fn xc20p(key_id: String, generation: u64, nonce: [u8; NONCE_BYTES])
-        -> Result<Self, PersistentEnvelopeError>
-    {
+    pub fn xc20p(
+        key_id: String,
+        generation: u64,
+        nonce: [u8; NONCE_BYTES],
+    ) -> Result<Self, PersistentEnvelopeError> {
         if !key_identifier(&key_id) || generation == 0 {
             return Err(PersistentEnvelopeError::InvalidEnvelope);
         }
-        Ok(Self { key_id, generation, nonce, sealed_bytes: 0 })
+        Ok(Self {
+            key_id,
+            generation,
+            nonce,
+            sealed_bytes: 0,
+        })
     }
-    pub fn key_id(&self) -> &str { &self.key_id }
-    pub const fn generation(&self) -> u64 { self.generation }
-    pub const fn nonce(&self) -> &[u8; NONCE_BYTES] { &self.nonce }
-    pub const fn algorithm_id(&self) -> &'static str { "XC20P" }
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub const fn nonce(&self) -> &[u8; NONCE_BYTES] {
+        &self.nonce
+    }
+    pub const fn algorithm_id(&self) -> &'static str {
+        "XC20P"
+    }
     /// Parsed ciphertext-plus-tag length; a newly constructed header has zero
     /// until it is encoded into a canonical envelope.
-    pub const fn sealed_bytes(&self) -> usize { self.sealed_bytes }
+    pub const fn sealed_bytes(&self) -> usize {
+        self.sealed_bytes
+    }
 
     /// Encodes bounded ciphertext followed by its full 16-byte Poly1305 tag.
     /// This checks framing, not cryptographic authenticity or nonce uniqueness.
-    pub fn encode(&self, ciphertext_and_tag: &[u8])
-        -> Result<CanonicalEnvelope, PersistentEnvelopeError>
-    {
+    pub fn encode(
+        &self,
+        ciphertext_and_tag: &[u8],
+    ) -> Result<CanonicalEnvelope, PersistentEnvelopeError> {
         if ciphertext_and_tag.len() < TAG_BYTES {
             return Err(PersistentEnvelopeError::InvalidEnvelope);
         }
-        let header_bytes = 55_usize.checked_add(self.key_id.len())
+        let header_bytes = 55_usize
+            .checked_add(self.key_id.len())
             .ok_or(PersistentEnvelopeError::TooLarge)?;
-        let total = header_bytes.checked_add(ciphertext_and_tag.len())
+        let total = header_bytes
+            .checked_add(ciphertext_and_tag.len())
             .ok_or(PersistentEnvelopeError::TooLarge)?;
-        if total > MAX_ENVELOPE { return Err(PersistentEnvelopeError::TooLarge); }
+        if total > MAX_ENVELOPE {
+            return Err(PersistentEnvelopeError::TooLarge);
+        }
         let sealed_length = u32::try_from(ciphertext_and_tag.len())
             .map_err(|_| PersistentEnvelopeError::TooLarge)?;
         let mut bytes = Zeroizing::new(Vec::new());
-        bytes.try_reserve_exact(total).map_err(|_| PersistentEnvelopeError::CapacityExceeded)?;
+        bytes
+            .try_reserve_exact(total)
+            .map_err(|_| PersistentEnvelopeError::CapacityExceeded)?;
         bytes.extend_from_slice(BOX_MAGIC);
         bytes.extend_from_slice(&1_u16.to_be_bytes());
         bytes.push(ALGORITHM.len() as u8);
@@ -80,64 +104,112 @@ pub struct CanonicalEnvelope {
 }
 impl CanonicalEnvelope {
     pub fn from_bytes(bytes: Zeroizing<Vec<u8>>) -> Result<Self, PersistentEnvelopeError> {
-        if bytes.capacity() > MAX_ENVELOPE { return Err(PersistentEnvelopeError::TooLarge); }
+        if bytes.capacity() > MAX_ENVELOPE {
+            return Err(PersistentEnvelopeError::TooLarge);
+        }
         let (_, sealed_offset) = parse(&bytes)?;
-        Ok(Self { bytes, sealed_offset })
+        Ok(Self {
+            bytes,
+            sealed_offset,
+        })
     }
-    pub fn as_bytes(&self) -> &[u8] { &self.bytes }
-    pub fn allocated_bytes(&self) -> usize { self.bytes.capacity() }
-    pub fn ciphertext_and_tag(&self) -> &[u8] { &self.bytes[self.sealed_offset..] }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn allocated_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
+    pub fn ciphertext_and_tag(&self) -> &[u8] {
+        &self.bytes[self.sealed_offset..]
+    }
     pub fn header(&self) -> Result<PersistentEnvelopeHeader, PersistentEnvelopeError> {
         parse(&self.bytes).map(|(header, _)| header)
     }
 }
 
 pub(super) fn key_identifier(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 128
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
 fn parse(bytes: &[u8]) -> Result<(PersistentEnvelopeHeader, usize), PersistentEnvelopeError> {
     let invalid = || PersistentEnvelopeError::InvalidEnvelope;
-    if bytes.len() > MAX_ENVELOPE || bytes.len() < 72
+    if bytes.len() > MAX_ENVELOPE
+        || bytes.len() < 72
         || bytes.get(..8) != Some(BOX_MAGIC.as_slice())
         || bytes.get(8..10) != Some(1_u16.to_be_bytes().as_slice())
         || bytes.get(10) != Some(&5)
         || bytes.get(11..16) != Some(ALGORITHM.as_slice())
-    { return Err(invalid()); }
-    let key_bytes = u16::from_be_bytes(bytes.get(16..18).ok_or_else(invalid)?
-        .try_into().map_err(|_| invalid())?) as usize;
-    if !(1..=128).contains(&key_bytes) { return Err(invalid()); }
+    {
+        return Err(invalid());
+    }
+    let key_bytes = u16::from_be_bytes(
+        bytes
+            .get(16..18)
+            .ok_or_else(invalid)?
+            .try_into()
+            .map_err(|_| invalid())?,
+    ) as usize;
+    if !(1..=128).contains(&key_bytes) {
+        return Err(invalid());
+    }
     let key_end = 18_usize.checked_add(key_bytes).ok_or_else(invalid)?;
-    let key_id = std::str::from_utf8(bytes.get(18..key_end).ok_or_else(invalid)?)
-        .map_err(|_| invalid())?;
-    if !key_identifier(key_id) { return Err(invalid()); }
+    let key_id =
+        std::str::from_utf8(bytes.get(18..key_end).ok_or_else(invalid)?).map_err(|_| invalid())?;
+    if !key_identifier(key_id) {
+        return Err(invalid());
+    }
     let generation_end = key_end.checked_add(8).ok_or_else(invalid)?;
-    let generation = u64::from_be_bytes(bytes.get(key_end..generation_end).ok_or_else(invalid)?
-        .try_into().map_err(|_| invalid())?);
-    if generation == 0 || bytes.get(generation_end) != Some(&24) { return Err(invalid()); }
+    let generation = u64::from_be_bytes(
+        bytes
+            .get(key_end..generation_end)
+            .ok_or_else(invalid)?
+            .try_into()
+            .map_err(|_| invalid())?,
+    );
+    if generation == 0 || bytes.get(generation_end) != Some(&24) {
+        return Err(invalid());
+    }
     let nonce_start = generation_end + 1;
     let nonce_end = nonce_start + NONCE_BYTES;
-    let nonce = bytes.get(nonce_start..nonce_end).ok_or_else(invalid)?
-        .try_into().map_err(|_| invalid())?;
+    let nonce = bytes
+        .get(nonce_start..nonce_end)
+        .ok_or_else(invalid)?
+        .try_into()
+        .map_err(|_| invalid())?;
     let sealed_offset = nonce_end + 4;
-    let sealed_bytes = u32::from_be_bytes(bytes.get(nonce_end..sealed_offset).ok_or_else(invalid)?
-        .try_into().map_err(|_| invalid())?) as usize;
-    if sealed_bytes < TAG_BYTES
-        || sealed_offset.checked_add(sealed_bytes) != Some(bytes.len())
-    { return Err(invalid()); }
-    Ok((PersistentEnvelopeHeader {
-        key_id: key_id.to_owned(), generation, nonce, sealed_bytes,
-    }, sealed_offset))
+    let sealed_bytes = u32::from_be_bytes(
+        bytes
+            .get(nonce_end..sealed_offset)
+            .ok_or_else(invalid)?
+            .try_into()
+            .map_err(|_| invalid())?,
+    ) as usize;
+    if sealed_bytes < TAG_BYTES || sealed_offset.checked_add(sealed_bytes) != Some(bytes.len()) {
+        return Err(invalid());
+    }
+    Ok((
+        PersistentEnvelopeHeader {
+            key_id: key_id.to_owned(),
+            generation,
+            nonce,
+            sealed_bytes,
+        },
+        sealed_offset,
+    ))
 }
 
 /// Compile-time v1 registry. Process lifetime tags 32/33 are deliberately not
 /// admitted here. Persistent binding tags 64/65 are required. Every value is
 /// generated from closed typed framework facts, so no unknown/missing/custom
 /// tag can enter this encoder.
-pub(super) fn aad(context: &ExpectedEnvelopeContext<'_>, header: &PersistentEnvelopeHeader)
-    -> Result<Vec<u8>, PersistentEnvelopeError>
-{
+pub(super) fn aad(
+    context: &ExpectedEnvelopeContext<'_>,
+    header: &PersistentEnvelopeHeader,
+) -> Result<Vec<u8>, PersistentEnvelopeError> {
     let generation = header.generation.to_be_bytes();
     let record_generation = context.index.generation.to_be_bytes();
     let purpose = 1_u64.to_be_bytes(); // ProtectedBlob
@@ -165,7 +237,9 @@ pub(super) fn aad(context: &ExpectedEnvelopeContext<'_>, header: &PersistentEnve
     ];
     let mut total = 12_usize;
     for (_, _, value) in fields {
-        total = total.checked_add(7).and_then(|n| n.checked_add(value.len()))
+        total = total
+            .checked_add(7)
+            .and_then(|n| n.checked_add(value.len()))
             .ok_or(PersistentEnvelopeError::TooLarge)?;
     }
     if context.aad_limit > MAX_AAD || total > context.aad_limit {
@@ -173,7 +247,8 @@ pub(super) fn aad(context: &ExpectedEnvelopeContext<'_>, header: &PersistentEnve
     }
     let mut out = Vec::new();
     // Reserve the complete encoded size before allocation or field copying.
-    out.try_reserve_exact(total).map_err(|_| PersistentEnvelopeError::CapacityExceeded)?;
+    out.try_reserve_exact(total)
+        .map_err(|_| PersistentEnvelopeError::CapacityExceeded)?;
     out.extend_from_slice(AAD_MAGIC);
     out.extend_from_slice(&1_u16.to_be_bytes());
     out.extend_from_slice(&(fields.len() as u16).to_be_bytes());
@@ -186,7 +261,6 @@ pub(super) fn aad(context: &ExpectedEnvelopeContext<'_>, header: &PersistentEnve
     debug_assert_eq!(out.len(), total);
     Ok(out)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -229,7 +303,9 @@ mod tests {
     fn every_truncation_and_any_trailing_byte_is_rejected() {
         let canonical = known_envelope();
         for end in 0..canonical.len() {
-            assert!(CanonicalEnvelope::from_bytes(Zeroizing::new(canonical[..end].to_vec())).is_err());
+            assert!(
+                CanonicalEnvelope::from_bytes(Zeroizing::new(canonical[..end].to_vec())).is_err()
+            );
         }
         let mut trailing = canonical;
         trailing.push(0);
@@ -240,14 +316,24 @@ mod tests {
     fn rejects_unknown_suite_version_and_noncanonical_widths() {
         let canonical = known_envelope();
         for (offset, value) in [
-            (0, b'X'), (9, 2), (10, 4), (11, b'Y'),
-            (16, 1), (17, 0), (18, b'/'), (26, 0), (27, 23),
-            (52, 1), (55, 15),
+            (0, b'X'),
+            (9, 2),
+            (10, 4),
+            (11, b'Y'),
+            (16, 1),
+            (17, 0),
+            (18, b'/'),
+            (26, 0),
+            (27, 23),
+            (52, 1),
+            (55, 15),
         ] {
             let mut mutated = canonical.clone();
             mutated[offset] = value;
-            assert!(CanonicalEnvelope::from_bytes(Zeroizing::new(mutated)).is_err(),
-                "bad frame at {offset} must fail");
+            assert!(
+                CanonicalEnvelope::from_bytes(Zeroizing::new(mutated)).is_err(),
+                "bad frame at {offset} must fail"
+            );
         }
     }
 
@@ -258,7 +344,9 @@ mod tests {
         }
         assert!(PersistentEnvelopeHeader::xc20p("k".repeat(129), 1, [0; 24]).is_err());
         assert!(PersistentEnvelopeHeader::xc20p("k".into(), 0, [0; 24]).is_err());
-        assert!(PersistentEnvelopeHeader::xc20p("Key_9.v2:old-generation".into(), 1, [0; 24]).is_ok());
+        assert!(
+            PersistentEnvelopeHeader::xc20p("Key_9.v2:old-generation".into(), 1, [0; 24]).is_ok()
+        );
         assert!(PersistentEnvelopeHeader::xc20p("k".repeat(128), u64::MAX, [0xff; 24]).is_ok());
     }
 

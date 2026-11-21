@@ -3,7 +3,11 @@
 //! selected client. No process trust, production transport or runtime is mocked.
 //! Run with --features tasks,native-tls-roots --test dpop_task_recovery;
 //! eight discovered tests are expected, never a zero-test acceptance receipt.
-#![cfg(all(feature = "tasks", feature = "native-tls-roots", not(target_arch = "wasm32")))]
+#![cfg(all(
+    feature = "tasks",
+    feature = "native-tls-roots",
+    not(target_arch = "wasm32")
+))]
 
 use std::collections::BTreeSet;
 use std::future::{Future, poll_fn};
@@ -14,18 +18,20 @@ use asupersync::Cx;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
-use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream};
-use fastmcp_client::http_auth::dpop::{DpopCredential, DpopSession};
-use fastmcp_client::http_auth::dpop::native::{DpopHttpClient, DpopHttpError, DpopHttpPolicy};
-use fastmcp_client::http_auth::dpop::native::core::DpopCoreError;
-use fastmcp_client::http_auth::dpop::native::core::stream::{DpopStreamError, DpopStreamLimits};
-use fastmcp_client::http_auth::dpop::native::core::stream::task_subscription::watch::{
-    DpopTaskWatchError, DpopTaskWatchPolicy,
+use asupersync::tls::{
+    Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream,
 };
+use fastmcp_client::http_auth::dpop::native::core::DpopCoreError;
 use fastmcp_client::http_auth::dpop::native::core::stream::task_subscription::watch::checkpoint::{
     DpopTaskCheckpointError, DpopTaskWatchCheckpoint,
 };
+use fastmcp_client::http_auth::dpop::native::core::stream::task_subscription::watch::{
+    DpopTaskWatchError, DpopTaskWatchPolicy,
+};
+use fastmcp_client::http_auth::dpop::native::core::stream::{DpopStreamError, DpopStreamLimits};
 use fastmcp_client::http_auth::dpop::native::core::tasks::wait::DpopTaskWaitOutcome;
+use fastmcp_client::http_auth::dpop::native::{DpopHttpClient, DpopHttpError, DpopHttpPolicy};
+use fastmcp_client::http_auth::dpop::{DpopCredential, DpopSession};
 use fastmcp_client::http_auth::rpc::{ManagedCoreError, ManagedCoreLimits};
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 use fastmcp_protocol::dpop::DpopKey;
@@ -46,45 +52,74 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let (mut one, mut two) = (None, None);
     poll_fn(|cx| {
         if one.is_none() {
-            if let Poll::Ready(value) = left.as_mut().poll(cx) { one = Some(value); }
+            if let Poll::Ready(value) = left.as_mut().poll(cx) {
+                one = Some(value);
+            }
         }
         if two.is_none() {
-            if let Poll::Ready(value) = right.as_mut().poll(cx) { two = Some(value); }
+            if let Poll::Ready(value) = right.as_mut().poll(cx) {
+                two = Some(value);
+            }
         }
         if one.is_some() && two.is_some() {
             Poll::Ready((one.take().unwrap(), two.take().unwrap()))
-        } else { Poll::Pending }
-    }).await
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 fn run(future: impl Future<Output = ()>) {
-    let runtime = RuntimeBuilder::current_thread().blocking_threads(0, 0)
-        .with_reactor(create_reactor().unwrap()).build().unwrap();
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap();
     runtime.block_on(async {
         let cx = Cx::current().unwrap();
         asupersync::time::timeout_at(cx.now().saturating_add_nanos(30_000_000_000), future)
-            .await.expect("recovery must settle without replay or detached work");
+            .await
+            .expect("recovery must settle without replay or detached work");
     });
     assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
 }
 
 fn configured(target: &str) -> (DpopHttpClient, DpopCredential, TlsAcceptor) {
     let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
-    let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(),
-        CanonicalHttpUrl::parse(target).unwrap()).unwrap();
-    let credential = session.admit_token_response(&issuer, 200,
-        br#"{"access_token":"recovery-test-token","token_type":"DPoP","expires_in":120}"#,
-        Instant::now(), Duration::from_secs(120)).unwrap();
+    let session = DpopSession::new(
+        DpopKey::generate().unwrap(),
+        issuer.clone(),
+        CanonicalHttpUrl::parse(target).unwrap(),
+    )
+    .unwrap();
+    let credential = session
+        .admit_token_response(
+            &issuer,
+            200,
+            br#"{"access_token":"recovery-test-token","token_type":"DPoP","expires_in":120}"#,
+            Instant::now(),
+            Duration::from_secs(120),
+        )
+        .unwrap();
     let root = Certificate::from_pem(ROOT).unwrap().remove(0);
-    let policy = DpopHttpPolicy::default().with_resource_root_der(root.as_der().to_vec()).unwrap();
+    let policy = DpopHttpPolicy::default()
+        .with_resource_root_der(root.as_der().to_vec())
+        .unwrap();
     let client = DpopHttpClient::new(session, policy).unwrap();
-    let acceptor = TlsAcceptorBuilder::new(CertificateChain::from_pem(LEAF).unwrap(),
-        PrivateKey::from_pem(KEY).unwrap()).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap();
+    let acceptor = TlsAcceptorBuilder::new(
+        CertificateChain::from_pem(LEAF).unwrap(),
+        PrivateKey::from_pem(KEY).unwrap(),
+    )
+    .alpn_protocols(vec![b"http/1.1".to_vec()])
+    .build()
+    .unwrap();
     (client, credential, acceptor)
 }
 
 fn metadata() -> FinalRequestMeta {
-    let mut value = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+    let mut value =
+        serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
     value["progressToken"] = json!("work");
     let mut meta: FinalRequestMeta = serde_json::from_value(value).unwrap();
     meta.client_capabilities = serde_json::from_value(json!({"roots":{}})).unwrap();
@@ -95,14 +130,19 @@ fn limits() -> DpopStreamLimits {
     DpopStreamLimits::new(
         ManagedCoreLimits::new(8192, 8192, 65536, 16, Duration::from_secs(10)).unwrap(),
         Duration::from_secs(5),
-    ).unwrap()
+    )
+    .unwrap()
 }
 
 fn saved(client: &DpopHttpClient, ids: &[&str]) -> Vec<DpopTaskWatchCheckpoint> {
-    ids.iter().map(|id| {
-        let checkpoint = client.task_watch_checkpoint(TaskId::parse(*id).unwrap()).unwrap();
-        DpopTaskWatchCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap()
-    }).collect()
+    ids.iter()
+        .map(|id| {
+            let checkpoint = client
+                .task_watch_checkpoint(TaskId::parse(*id).unwrap())
+                .unwrap();
+            DpopTaskWatchCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap()
+        })
+        .collect()
 }
 
 fn discovery() -> Value {
@@ -126,19 +166,26 @@ fn snapshot(id: &str, status: &str) -> Value {
 
 fn frame(prefix: &str, round: usize, discovery: bool, result: Value) -> Vec<u8> {
     let suffix = if discovery { "discover" } else { "get" };
-    serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":format!("{prefix}.{round}.{suffix}"),
-        "result":result})).unwrap()
+    serde_json::to_vec(
+        &json!({"jsonrpc":"2.0", "id":format!("{prefix}.{round}.{suffix}"),
+        "result":result}),
+    )
+    .unwrap()
 }
 
 fn progress() -> Vec<u8> {
     serde_json::to_vec(&json!({"jsonrpc":"2.0", "method":"notifications/progress",
-        "params":{"progressToken":"work", "progress":1}})).unwrap()
+        "params":{"progressToken":"work", "progress":1}}))
+    .unwrap()
 }
 
 fn header<'a>(head: &'a str, name: &str) -> &'a str {
-    let values = head.lines().filter_map(|line| line.split_once(':'))
+    let values = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
         .filter(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.trim()).collect::<Vec<_>>();
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
     assert_eq!(values.len(), 1, "exactly one {name} header");
     values[0]
 }
@@ -151,8 +198,11 @@ fn claims(proof: &str) -> Value {
     let mut bytes = Vec::new();
     for byte in parts[1].bytes() {
         let n = match byte {
-            b'A'..=b'Z' => byte - b'A', b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52, b'-' => 62, b'_' => 63,
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
             _ => panic!("invalid base64url proof"),
         };
         acc = (acc << 6) | u32::from(n);
@@ -174,7 +224,9 @@ async fn read(socket: &mut Socket) -> (String, Value) {
         let n = socket.read(&mut block).await.unwrap();
         assert!(n > 0 && bytes.len() + n <= 32768);
         bytes.extend_from_slice(&block[..n]);
-        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
+        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            break index + 4;
+        }
     };
     let head = std::str::from_utf8(&bytes[..end]).unwrap().to_owned();
     let length = header(&head, "content-length").parse::<usize>().unwrap();
@@ -217,9 +269,16 @@ async fn sse_reply(socket: &mut Socket, terminal: &[u8]) {
 async fn closed(socket: &mut Socket) {
     let cx = Cx::current().unwrap();
     let mut byte = [0];
-    let read = asupersync::time::timeout_at(cx.now().saturating_add_nanos(2_000_000_000),
-        socket.read(&mut byte)).await.expect("owned recovery socket must retire promptly");
-    assert!(matches!(read, Ok(0) | Err(_)), "no hidden request on the retired connection");
+    let read = asupersync::time::timeout_at(
+        cx.now().saturating_add_nanos(2_000_000_000),
+        socket.read(&mut byte),
+    )
+    .await
+    .expect("owned recovery socket must retire promptly");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "no hidden request on the retired connection"
+    );
 }
 
 struct Peer {
@@ -234,7 +293,16 @@ impl Peer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = format!("https://{}/mcp?tenant=one", listener.local_addr().unwrap());
         let (client, credential, acceptor) = configured(&target);
-        (Self { listener, acceptor, target, proofs: BTreeSet::new() }, client, credential)
+        (
+            Self {
+                listener,
+                acceptor,
+                target,
+                proofs: BTreeSet::new(),
+            },
+            client,
+            credential,
+        )
     }
 
     async fn receive(&mut self, prefix: &str, round: usize, task: Option<&str>) -> Socket {
@@ -243,30 +311,52 @@ impl Peer {
         let (head, body) = read(&mut socket).await;
         let (method, suffix, accept) = if task.is_some() {
             ("tasks/get", "get", "application/json, text/event-stream")
-        } else { ("server/discover", "discover", "application/json") };
+        } else {
+            ("server/discover", "discover", "application/json")
+        };
         assert!(head.starts_with("POST /mcp?tenant=one HTTP/1.1\r\n"));
         assert_eq!(body["id"], format!("{prefix}.{round}.{suffix}"));
-        assert_eq!(body["method"], method, "recovery cannot mutate or replay work");
+        assert_eq!(
+            body["method"], method,
+            "recovery cannot mutate or replay work"
+        );
         assert_eq!(header(&head, "mcp-method"), method);
-        assert_eq!(header(&head, "mcp-protocol-version"), FINAL_PROTOCOL_VERSION);
+        assert_eq!(
+            header(&head, "mcp-protocol-version"),
+            FINAL_PROTOCOL_VERSION
+        );
         assert_eq!(header(&head, "authorization"), "DPoP recovery-test-token");
         assert_eq!(header(&head, "accept"), accept);
         let proof = claims(header(&head, "dpop"));
         assert_eq!(proof["htm"], "POST");
         assert_eq!(proof["htu"], self.target.split('?').next().unwrap());
         assert!(proof["ath"].as_str().is_some_and(|hash| !hash.is_empty()));
-        if self.proofs.is_empty() { assert!(proof.get("nonce").is_none()); }
-        else { assert_eq!(proof["nonce"], "recovery-next"); }
-        assert!(self.proofs.insert(proof["jti"].as_str().unwrap().to_owned()), "a fresh proof per request");
-        assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
-            json!({TASKS_EXTENSION:{}}));
+        if self.proofs.is_empty() {
+            assert!(proof.get("nonce").is_none());
+        } else {
+            assert_eq!(proof["nonce"], "recovery-next");
+        }
+        assert!(
+            self.proofs
+                .insert(proof["jti"].as_str().unwrap().to_owned()),
+            "a fresh proof per request"
+        );
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+            json!({TASKS_EXTENSION:{}})
+        );
         for field in ["inputResponses", "requestState", "arguments"] {
-            assert!(body["params"].get(field).is_none(), "saved selection cannot replay {field}");
+            assert!(
+                body["params"].get(field).is_none(),
+                "saved selection cannot replay {field}"
+            );
         }
         if let Some(id) = task {
             assert_eq!(body["params"]["taskId"], id);
             assert_eq!(header(&head, "mcp-name"), id);
-        } else { assert!(body["params"].get("taskId").is_none()); }
+        } else {
+            assert!(body["params"].get("taskId").is_none());
+        }
         socket
     }
 
@@ -278,8 +368,12 @@ impl Peer {
 
     fn no_extra(&self, pairs: usize) {
         assert_eq!(self.proofs.len(), pairs * 2);
-        assert!(self.listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending(),
-            "no retry, subscription, recreation or remote cancellation after recovery");
+        assert!(
+            self.listener
+                .poll_accept(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "no retry, subscription, recreation or remote cancellation after recovery"
+        );
     }
 }
 
@@ -295,11 +389,26 @@ async fn followup(peer: &mut Peer, client: &mut DpopHttpClient, credential: &Dpo
     let checkpoints = saved(client, &["task-one"]);
     let cancellation = McpRequestCancellation::new();
     let mut seen = 0;
-    let application = client.reconcile_task_checkpoints(&cx, &cancellation, credential,
-        metadata(), &checkpoints, "followup", limits(), |_| { seen += 1; true });
+    let application = client.reconcile_task_checkpoints(
+        &cx,
+        &cancellation,
+        credential,
+        metadata(),
+        &checkpoints,
+        "followup",
+        limits(),
+        |_| {
+            seen += 1;
+            true
+        },
+    );
     let server = async {
         let mut socket = peer.round("followup", 0, "task-one").await;
-        json_reply(&mut socket, &frame("followup", 0, false, snapshot("task-one", "cancelled"))).await;
+        json_reply(
+            &mut socket,
+            &frame("followup", 0, false, snapshot("task-one", "cancelled")),
+        )
+        .await;
     };
     let (result, ()) = pair(application, server).await;
     assert_eq!(result.unwrap(), 1);
@@ -321,17 +430,31 @@ fn recovery_uses_a_fresh_login_and_publishes_distinct_tasks_incrementally() {
         let notified = McpRequestCancellation::new();
         let (mut snapshots, mut notifications) = (Vec::new(), 0);
         let application = client.reconcile_task_checkpoints_with_events(
-            &cx, &cancellation, &credential, metadata(), &checkpoints, "restart", limits(),
+            &cx,
+            &cancellation,
+            &credential,
+            metadata(),
+            &checkpoints,
+            "restart",
+            limits(),
             |snapshot| {
                 snapshots.push(serde_json::to_value(snapshot).unwrap());
                 first_seen.cancel();
                 true
             },
-            |_| { notifications += 1; notified.cancel(); true },
+            |_| {
+                notifications += 1;
+                notified.cancel();
+                true
+            },
         );
         let server = async {
             let mut first = peer.round("restart", 0, "task-one").await;
-            json_reply(&mut first, &frame("restart", 0, false, snapshot("task-one", "working"))).await;
+            json_reply(
+                &mut first,
+                &frame("restart", 0, false, snapshot("task-one", "working")),
+            )
+            .await;
             // Later replies cannot exist until the first snapshot has reached
             // its host. Buffering the whole selection cannot pass this barrier.
             first_seen.cancelled().await;
@@ -339,18 +462,33 @@ fn recovery_uses_a_fresh_login_and_publishes_distinct_tasks_incrementally() {
             second.write_all(SSE_HEAD).await.unwrap();
             second.write_all(&event_chunk(&progress())).await.unwrap();
             notified.cancelled().await;
-            let mut tail = event_chunk(&frame("restart", 1, false, snapshot("task-two", "input_required")));
+            let mut tail = event_chunk(&frame(
+                "restart",
+                1,
+                false,
+                snapshot("task-two", "input_required"),
+            ));
             tail.extend_from_slice(b"0\r\n\r\n");
             second.write_all(&tail).await.unwrap();
             let _ = second.shutdown().await;
             let mut third = peer.round("restart", 2, "task-three").await;
-            json_reply(&mut third, &frame("restart", 2, false, snapshot("task-three", "cancelled"))).await;
+            json_reply(
+                &mut third,
+                &frame("restart", 2, false, snapshot("task-three", "cancelled")),
+            )
+            .await;
         };
         let (result, ()) = pair(application, server).await;
         assert_eq!(result.unwrap(), 3);
         assert_eq!(notifications, 1);
-        assert_eq!(snapshots, [snapshot("task-one", "working"), snapshot("task-two", "input_required"),
-            snapshot("task-three", "cancelled")]);
+        assert_eq!(
+            snapshots,
+            [
+                snapshot("task-one", "working"),
+                snapshot("task-two", "input_required"),
+                snapshot("task-three", "cancelled")
+            ]
+        );
         peer.no_extra(3);
     });
 }
@@ -366,38 +504,74 @@ fn recovery_preserves_exact_cumulative_bytes_and_notifications_across_tasks() {
             let mut total = 0;
             let mut maximum = 0;
             for (round, id) in [(0, "task-one"), (1, "task-two")] {
-                for bytes in [frame("quota", round, true, discovery()), progress(),
-                    frame("quota", round, false, snapshot(id, "cancelled"))]
-                {
+                for bytes in [
+                    frame("quota", round, true, discovery()),
+                    progress(),
+                    frame("quota", round, false, snapshot(id, "cancelled")),
+                ] {
                     total += bytes.len();
                     maximum = maximum.max(bytes.len());
                 }
             }
-            let core = ManagedCoreLimits::new(8192, maximum, total - usize::from(shortage == 1),
-                if shortage == 2 { 1 } else { 2 }, Duration::from_secs(10)).unwrap();
+            let core = ManagedCoreLimits::new(
+                8192,
+                maximum,
+                total - usize::from(shortage == 1),
+                if shortage == 2 { 1 } else { 2 },
+                Duration::from_secs(10),
+            )
+            .unwrap();
             let selected = DpopStreamLimits::new(core, Duration::from_secs(5)).unwrap();
             let (mut snapshots, mut notifications) = (0, 0);
             let application = client.reconcile_task_checkpoints_with_events(
-                &cx, &cancellation, &credential, metadata(), &checkpoints, "quota", selected,
-                |_| { snapshots += 1; true }, |_| { notifications += 1; true },
+                &cx,
+                &cancellation,
+                &credential,
+                metadata(),
+                &checkpoints,
+                "quota",
+                selected,
+                |_| {
+                    snapshots += 1;
+                    true
+                },
+                |_| {
+                    notifications += 1;
+                    true
+                },
             );
             let server = async {
                 for (round, id) in [(0, "task-one"), (1, "task-two")] {
                     let mut socket = peer.round("quota", round, id).await;
-                    sse_reply(&mut socket, &frame("quota", round, false, snapshot(id, "cancelled"))).await;
+                    sse_reply(
+                        &mut socket,
+                        &frame("quota", round, false, snapshot(id, "cancelled")),
+                    )
+                    .await;
                 }
             };
             let (result, ()) = pair(application, server).await;
             match shortage {
-                0 => { assert_eq!(result.unwrap(), 2); assert_eq!((snapshots, notifications), (2, 2)); }
+                0 => {
+                    assert_eq!(result.unwrap(), 2);
+                    assert_eq!((snapshots, notifications), (2, 2));
+                }
                 1 => {
-                    assert!(matches!(stream_error(result.unwrap_err()), DpopStreamError::Core(
-                        DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit))));
+                    assert!(matches!(
+                        stream_error(result.unwrap_err()),
+                        DpopStreamError::Core(DpopCoreError::Protocol(
+                            ManagedCoreError::ResponseByteLimit
+                        ))
+                    ));
                     assert_eq!((snapshots, notifications), (1, 2));
                 }
                 _ => {
-                    assert!(matches!(stream_error(result.unwrap_err()), DpopStreamError::Core(
-                        DpopCoreError::Protocol(ManagedCoreError::NotificationLimit))));
+                    assert!(matches!(
+                        stream_error(result.unwrap_err()),
+                        DpopStreamError::Core(DpopCoreError::Protocol(
+                            ManagedCoreError::NotificationLimit
+                        ))
+                    ));
                     assert_eq!((snapshots, notifications), (1, 1));
                 }
             }
@@ -407,11 +581,23 @@ fn recovery_preserves_exact_cumulative_bytes_and_notifications_across_tasks() {
 }
 
 #[derive(Clone, Copy)]
-enum Stop { Refuse, Panic, Cancel, Credential, Session }
+enum Stop {
+    Refuse,
+    Panic,
+    Cancel,
+    Credential,
+    Session,
+}
 
 #[test]
 fn recovery_observer_retirement_prevents_successors_and_preserves_reusable_logins() {
-    for stop in [Stop::Refuse, Stop::Panic, Stop::Cancel, Stop::Credential, Stop::Session] {
+    for stop in [
+        Stop::Refuse,
+        Stop::Panic,
+        Stop::Cancel,
+        Stop::Credential,
+        Stop::Session,
+    ] {
         run(async {
             let cx = Cx::current().unwrap();
             let (mut peer, mut client, credential) = Peer::new().await;
@@ -419,30 +605,57 @@ fn recovery_observer_retirement_prevents_successors_and_preserves_reusable_login
             let cancellation = McpRequestCancellation::new();
             let session = client.revocation_handle();
             let mut seen = 0;
-            let application = client.reconcile_task_checkpoints(&cx, &cancellation, &credential,
-                metadata(), &checkpoints, "stop", limits(), |_| {
+            let application = client.reconcile_task_checkpoints(
+                &cx,
+                &cancellation,
+                &credential,
+                metadata(),
+                &checkpoints,
+                "stop",
+                limits(),
+                |_| {
                     seen += 1;
                     match stop {
                         Stop::Refuse => false,
                         Stop::Panic => panic!("private recovery observer payload"),
-                        Stop::Cancel => { cancellation.cancel(); false }
-                        Stop::Credential => { credential.revoke(); false }
-                        Stop::Session => { session.revoke(); false }
+                        Stop::Cancel => {
+                            cancellation.cancel();
+                            false
+                        }
+                        Stop::Credential => {
+                            credential.revoke();
+                            false
+                        }
+                        Stop::Session => {
+                            session.revoke();
+                            false
+                        }
                     }
-                });
+                },
+            );
             let server = async {
                 let mut socket = peer.round("stop", 0, "task-one").await;
-                json_reply(&mut socket, &frame("stop", 0, false, snapshot("task-one", "working"))).await;
+                json_reply(
+                    &mut socket,
+                    &frame("stop", 0, false, snapshot("task-one", "working")),
+                )
+                .await;
             };
             let (result, ()) = pair(application, server).await;
             let error = stream_error(result.unwrap_err());
             match stop {
                 Stop::Refuse => assert!(matches!(error, DpopStreamError::ObserverStopped)),
                 Stop::Panic => assert!(matches!(error, DpopStreamError::ObserverPanicked)),
-                Stop::Cancel => assert!(matches!(error, DpopStreamError::Core(
-                    DpopCoreError::Transport(DpopHttpError::Cancelled)))),
-                Stop::Credential | Stop::Session => assert!(matches!(error, DpopStreamError::Core(
-                    DpopCoreError::Transport(DpopHttpError::Authorization(_))))),
+                Stop::Cancel => assert!(matches!(
+                    error,
+                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Cancelled))
+                )),
+                Stop::Credential | Stop::Session => assert!(matches!(
+                    error,
+                    DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(
+                        _
+                    )))
+                )),
             }
             assert!(!format!("{error:?}").contains("private recovery observer payload"));
             assert_eq!(seen, 1);
@@ -465,18 +678,40 @@ fn recovery_never_publishes_a_late_corrupt_or_unfinished_snapshot() {
             let checkpoints = saved(&client, &["task-one", "task-two"]);
             let cancellation = McpRequestCancellation::new();
             let mut seen = Vec::new();
-            let application = client.reconcile_task_checkpoints(&cx, &cancellation, &credential,
-                metadata(), &checkpoints, "corrupt", limits(), |snapshot| {
-                    seen.push(snapshot.task.base().task_id.as_str().to_owned()); true
-                });
+            let application = client.reconcile_task_checkpoints(
+                &cx,
+                &cancellation,
+                &credential,
+                metadata(),
+                &checkpoints,
+                "corrupt",
+                limits(),
+                |snapshot| {
+                    seen.push(snapshot.task.base().task_id.as_str().to_owned());
+                    true
+                },
+            );
             let server = async {
                 let mut first = peer.round("corrupt", 0, "task-one").await;
-                json_reply(&mut first, &frame("corrupt", 0, false, snapshot("task-one", "working"))).await;
+                json_reply(
+                    &mut first,
+                    &frame("corrupt", 0, false, snapshot("task-one", "working")),
+                )
+                .await;
                 let mut second = peer.round("corrupt", 1, "task-two").await;
-                let mut value: Value = serde_json::from_slice(&frame("corrupt", 1, false,
-                    snapshot("task-two", "cancelled"))).unwrap();
-                if corruption == 0 { value["result"]["taskId"] = json!("foreign-task"); }
-                if corruption == 1 { value["id"] = json!("unrelated.get"); }
+                let mut value: Value = serde_json::from_slice(&frame(
+                    "corrupt",
+                    1,
+                    false,
+                    snapshot("task-two", "cancelled"),
+                ))
+                .unwrap();
+                if corruption == 0 {
+                    value["result"]["taskId"] = json!("foreign-task");
+                }
+                if corruption == 1 {
+                    value["id"] = json!("unrelated.get");
+                }
                 if corruption == 4 {
                     value.as_object_mut().unwrap().remove("result");
                     value["error"] = json!({"code":-32001, "message":"Task is unavailable"});
@@ -484,13 +719,20 @@ fn recovery_never_publishes_a_late_corrupt_or_unfinished_snapshot() {
                 let terminal = serde_json::to_vec(&value).unwrap();
                 let mut wire = SSE_HEAD.to_vec();
                 wire.extend_from_slice(&event_chunk(&terminal));
-                if corruption == 2 { wire.extend_from_slice(&event_chunk(&terminal)); }
-                if corruption != 3 { wire.extend_from_slice(b"0\r\n\r\n"); }
+                if corruption == 2 {
+                    wire.extend_from_slice(&event_chunk(&terminal));
+                }
+                if corruption != 3 {
+                    wire.extend_from_slice(b"0\r\n\r\n");
+                }
                 second.write_all(&wire).await.unwrap();
                 let _ = second.shutdown().await;
             };
             let (result, ()) = pair(application, server).await;
-            assert!(result.is_err(), "corruption case {corruption} cannot complete recovery");
+            assert!(
+                result.is_err(),
+                "corruption case {corruption} cannot complete recovery"
+            );
             assert_eq!(seen, ["task-one"]);
             peer.no_extra(2);
             followup(&mut peer, &mut client, &credential).await;
@@ -511,37 +753,67 @@ fn recovery_cancellation_and_abandonment_retire_a_stalled_later_task() {
             let session = client.revocation_handle();
             let mut seen = 0;
             let application = async {
-                let mut recovery = Box::pin(client.reconcile_task_checkpoints(&cx, &cancellation,
-                    &credential, metadata(), &checkpoints, "retire", limits(), |_| { seen += 1; true }));
+                let mut recovery = Box::pin(client.reconcile_task_checkpoints(
+                    &cx,
+                    &cancellation,
+                    &credential,
+                    metadata(),
+                    &checkpoints,
+                    "retire",
+                    limits(),
+                    |_| {
+                        seen += 1;
+                        true
+                    },
+                ));
                 if retirement == 3 {
                     let mut ready = std::pin::pin!(reached.cancelled());
                     poll_fn(|context| {
                         assert!(recovery.as_mut().poll(context).is_pending());
                         ready.as_mut().poll(context)
-                    }).await;
+                    })
+                    .await;
                     drop(recovery);
                 } else {
                     let error = stream_error(recovery.await.unwrap_err());
                     if retirement == 0 {
-                        assert!(matches!(error, DpopStreamError::Core(
-                            DpopCoreError::Transport(DpopHttpError::Cancelled))));
+                        assert!(matches!(
+                            error,
+                            DpopStreamError::Core(DpopCoreError::Transport(
+                                DpopHttpError::Cancelled
+                            ))
+                        ));
                     } else {
-                        assert!(matches!(error, DpopStreamError::Core(
-                            DpopCoreError::Transport(DpopHttpError::Authorization(_)))));
+                        assert!(matches!(
+                            error,
+                            DpopStreamError::Core(DpopCoreError::Transport(
+                                DpopHttpError::Authorization(_)
+                            ))
+                        ));
                     }
                 }
             };
             let server = async {
                 let mut first = peer.round("retire", 0, "task-one").await;
-                json_reply(&mut first, &frame("retire", 0, false, snapshot("task-one", "working"))).await;
+                json_reply(
+                    &mut first,
+                    &frame("retire", 0, false, snapshot("task-one", "working")),
+                )
+                .await;
                 let mut second = peer.round("retire", 1, "task-two").await;
                 second.write_all(SSE_HEAD).await.unwrap();
                 second.write_all(&event_chunk(&progress())).await.unwrap();
                 reached.cancel();
                 match retirement {
-                    0 => { cancellation.cancel(); }
-                    1 => { credential.revoke(); }
-                    2 => { session.revoke(); }
+                    0 => {
+                        cancellation.cancel();
+                    }
+                    1 => {
+                        credential.revoke();
+                    }
+                    2 => {
+                        session.revoke();
+                    }
                     _ => {}
                 }
                 closed(&mut second).await;
@@ -567,15 +839,27 @@ fn recovery_admits_the_entire_selection_before_any_https_request() {
         let foreign = DpopTaskWatchCheckpoint::new(
             &CanonicalHttpUrl::parse(&peer.target.replace("tenant=one", "tenant=two")).unwrap(),
             TaskId::parse("task-two").unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let cancellation = McpRequestCancellation::new();
-        for (selection, prefix) in [(vec![valid[0].clone(), foreign], "admit"),
-            (vec![valid[0].clone(), valid[0].clone()], "admit"), (valid.clone(), "bad prefix")]
-        {
-            let result = client.reconcile_task_checkpoints_with_events(&cx, &cancellation,
-                &credential, metadata(), &selection, prefix, limits(),
-                |_| panic!("no snapshot before whole-selection admission"),
-                |_| panic!("no notification before whole-selection admission")).await;
+        for (selection, prefix) in [
+            (vec![valid[0].clone(), foreign], "admit"),
+            (vec![valid[0].clone(), valid[0].clone()], "admit"),
+            (valid.clone(), "bad prefix"),
+        ] {
+            let result = client
+                .reconcile_task_checkpoints_with_events(
+                    &cx,
+                    &cancellation,
+                    &credential,
+                    metadata(),
+                    &selection,
+                    prefix,
+                    limits(),
+                    |_| panic!("no snapshot before whole-selection admission"),
+                    |_| panic!("no notification before whole-selection admission"),
+                )
+                .await;
             assert!(result.is_err());
             peer.no_extra(0);
         }
@@ -593,22 +877,40 @@ fn restored_single_task_watch_reads_fresh_state_without_recreating_work() {
                 let (mut peer, mut client, credential) = Peer::new().await;
                 let checkpoints = saved(&client, &["task-one"]);
                 let cancellation = McpRequestCancellation::new();
-                let application = client.resume_task_watch_with_cancellation(&cx, &cancellation,
-                    &credential, metadata(), &checkpoints[0], "resume", DpopTaskWatchPolicy::new(1).unwrap(), limits());
+                let application = client.resume_task_watch_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    &credential,
+                    metadata(),
+                    &checkpoints[0],
+                    "resume",
+                    DpopTaskWatchPolicy::new(1).unwrap(),
+                    limits(),
+                );
                 let server = async {
                     let mut socket = peer.round("resume", 0, "task-one").await;
                     let terminal = frame("resume", 0, false, snapshot("task-one", status));
-                    if sse { sse_reply(&mut socket, &terminal).await; }
-                    else { json_reply(&mut socket, &terminal).await; }
+                    if sse {
+                        sse_reply(&mut socket, &terminal).await;
+                    } else {
+                        json_reply(&mut socket, &terminal).await;
+                    }
                 };
                 let (result, ()) = pair(application, server).await;
                 let result = match result.unwrap() {
                     DpopTaskWaitOutcome::InputRequired(value) => {
-                        assert_eq!(status, "input_required"); value
+                        assert_eq!(status, "input_required");
+                        value
                     }
-                    DpopTaskWaitOutcome::Terminal(value) => { assert_eq!(status, "cancelled"); value }
+                    DpopTaskWaitOutcome::Terminal(value) => {
+                        assert_eq!(status, "cancelled");
+                        value
+                    }
                 };
-                assert_eq!(serde_json::to_value(&*result).unwrap(), snapshot("task-one", status));
+                assert_eq!(
+                    serde_json::to_value(&*result).unwrap(),
+                    snapshot("task-one", status)
+                );
                 peer.no_extra(1);
             });
         }
@@ -625,23 +927,53 @@ fn recovery_does_not_reset_the_absolute_deadline_for_a_later_task() {
         let selected = DpopStreamLimits::new(
             ManagedCoreLimits::new(8192, 8192, 65536, 16, Duration::from_secs(3)).unwrap(),
             Duration::from_secs(3),
-        ).unwrap();
+        )
+        .unwrap();
         let start = cx.now();
         let mut seen = 0;
         let application = async {
-            let recovery = client.reconcile_task_checkpoints(&cx, &cancellation, &credential,
-                metadata(), &checkpoints, "deadline", selected, |_| { seen += 1; true });
-            let result = asupersync::time::timeout_at(start.saturating_add_nanos(4_000_000_000), recovery)
-                .await.expect("the original three-second deadline must win over a reset five-second deadline");
-            assert!(matches!(stream_error(result.unwrap_err()), DpopStreamError::Core(
-                DpopCoreError::Transport(DpopHttpError::TimedOut))));
+            let recovery = client.reconcile_task_checkpoints(
+                &cx,
+                &cancellation,
+                &credential,
+                metadata(),
+                &checkpoints,
+                "deadline",
+                selected,
+                |_| {
+                    seen += 1;
+                    true
+                },
+            );
+            let result = asupersync::time::timeout_at(
+                start.saturating_add_nanos(4_000_000_000),
+                recovery,
+            )
+            .await
+            .expect(
+                "the original three-second deadline must win over a reset five-second deadline",
+            );
+            assert!(matches!(
+                stream_error(result.unwrap_err()),
+                DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::TimedOut))
+            ));
         };
         let server = async {
             let mut first = peer.round("deadline", 0, "task-one").await;
             // Spend most of the original allowance before the next Task starts.
-            assert!(asupersync::time::timeout_at(start.saturating_add_nanos(2_000_000_000),
-                std::future::pending::<()>()).await.is_err());
-            json_reply(&mut first, &frame("deadline", 0, false, snapshot("task-one", "working"))).await;
+            assert!(
+                asupersync::time::timeout_at(
+                    start.saturating_add_nanos(2_000_000_000),
+                    std::future::pending::<()>()
+                )
+                .await
+                .is_err()
+            );
+            json_reply(
+                &mut first,
+                &frame("deadline", 0, false, snapshot("task-one", "working")),
+            )
+            .await;
             let mut second = peer.round("deadline", 1, "task-two").await;
             closed(&mut second).await;
         };

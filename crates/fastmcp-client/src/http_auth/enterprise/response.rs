@@ -6,9 +6,9 @@
 //! their caller-owned bounded CPU lane. Callers must erase confidential transport
 //! buffers; admitted compact tokens have private zeroizing custody.
 
-mod wire;
 #[cfg(test)]
 mod tests;
+mod wire;
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -17,13 +17,12 @@ use asupersync::security::SecretString;
 use fastmcp_core::AccessToken;
 
 use super::policy::{EnterpriseClientAuthentication, EnterpriseProfile, IdJagGrantedScopeSet};
+use super::verification::disclosure::{IdJagDisclosureFacts, IdJagDisclosurePolicy};
 use super::verification::{
     IdJagExpectations, IdJagVerificationKeys, JwtTimePolicy, OidcIdTokenExpectations,
-    OidcVerificationKeys, ResourceTenantExpectation, TenantExpectation,
-    VerifiedIdJag, VerifiedOidcIdToken, verify_id_jag, verify_id_jag_with_disclosure,
-    verify_oidc_id_token,
+    OidcVerificationKeys, ResourceTenantExpectation, TenantExpectation, VerifiedIdJag,
+    VerifiedOidcIdToken, verify_id_jag, verify_id_jag_with_disclosure, verify_oidc_id_token,
 };
-use super::verification::disclosure::{IdJagDisclosureFacts, IdJagDisclosurePolicy};
 
 /// Fixed diagnostics retain no tokens, claims, scopes, issuer text or peer body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,7 +46,9 @@ impl fmt::Display for EnterpriseResponseError {
             Self::InvalidHeaders => "enterprise token response headers rejected",
             Self::InvalidCachePolicy => "enterprise token response cache policy rejected",
             Self::UnexpectedStatus => "enterprise token response status does not match its body",
-            Self::PolicyBindingMismatch => "enterprise assertion key authority differs from the selected profile",
+            Self::PolicyBindingMismatch => {
+                "enterprise assertion key authority differs from the selected profile"
+            }
             Self::AssertionRejected => "enterprise signed assertion rejected",
             Self::ScopeRejected => "enterprise scope grants are inconsistent",
             Self::InvalidLifetime => "enterprise token lifetime rejected",
@@ -116,10 +117,16 @@ pub struct EnterpriseOAuthDenial {
     basic_challenge: bool,
 }
 impl EnterpriseOAuthDenial {
-    pub const fn code(self) -> EnterpriseOAuthErrorCode { self.code }
-    pub const fn status(self) -> u16 { self.status }
+    pub const fn code(self) -> EnterpriseOAuthErrorCode {
+        self.code
+    }
+    pub const fn status(self) -> u16 {
+        self.status
+    }
     /// Distinguishes the matching Basic/401 rule from the OIDC/400 variant.
-    pub const fn matched_basic_challenge(self) -> bool { self.basic_challenge }
+    pub const fn matched_basic_challenge(self) -> bool {
+        self.basic_challenge
+    }
 }
 
 /// This indication never restarts a flow. A caller must explicitly begin a new
@@ -137,9 +144,18 @@ impl EnterpriseStepUpRequired {
 /// A stage-specific success, typed denial or first-stage step-up. Success owners
 /// need not implement Clone or Debug and never expose their compact tokens.
 pub enum EnterpriseResponseOutcome<T> {
-    Success { value: T, cache: EnterpriseCacheDiagnostics },
-    Denied { denial: EnterpriseOAuthDenial, cache: EnterpriseCacheDiagnostics },
-    StepUpRequired { requirement: EnterpriseStepUpRequired, cache: EnterpriseCacheDiagnostics },
+    Success {
+        value: T,
+        cache: EnterpriseCacheDiagnostics,
+    },
+    Denied {
+        denial: EnterpriseOAuthDenial,
+        cache: EnterpriseCacheDiagnostics,
+    },
+    StepUpRequired {
+        requirement: EnterpriseStepUpRequired,
+        cache: EnterpriseCacheDiagnostics,
+    },
 }
 
 /// Immutable finite bounds for local response validation.
@@ -170,9 +186,12 @@ impl EnterpriseResponsePolicy {
         clock_skew: Duration,
         maximum_step_up_age: Duration,
     ) -> Result<Self, EnterpriseResponseError> {
-        if id_token_lifetime.is_zero() || id_token_lifetime > Duration::from_hours(24)
-            || id_jag_lifetime.is_zero() || id_jag_lifetime > Duration::from_mins(15)
-            || access_token_lifetime.is_zero() || access_token_lifetime > Duration::from_hours(24)
+        if id_token_lifetime.is_zero()
+            || id_token_lifetime > Duration::from_hours(24)
+            || id_jag_lifetime.is_zero()
+            || id_jag_lifetime > Duration::from_mins(15)
+            || access_token_lifetime.is_zero()
+            || access_token_lifetime > Duration::from_hours(24)
             || clock_skew > Duration::from_secs(300)
             || maximum_step_up_age > Duration::from_hours(24)
             || maximum_step_up_age.subsec_nanos() != 0
@@ -184,8 +203,11 @@ impl EnterpriseResponsePolicy {
         JwtTimePolicy::new(id_jag_lifetime, clock_skew)
             .map_err(|_| EnterpriseResponseError::InvalidPolicy)?;
         Ok(Self {
-            id_token_lifetime, id_jag_lifetime, access_token_lifetime,
-            clock_skew, maximum_step_up_age,
+            id_token_lifetime,
+            id_jag_lifetime,
+            access_token_lifetime,
+            clock_skew,
+            maximum_step_up_age,
         })
     }
 }
@@ -198,7 +220,9 @@ pub struct EnterpriseIdentityAssertion {
     identity: VerifiedOidcIdToken,
 }
 impl EnterpriseIdentityAssertion {
-    pub fn identity(&self) -> &VerifiedOidcIdToken { &self.identity }
+    pub fn identity(&self) -> &VerifiedOidcIdToken {
+        &self.identity
+    }
 }
 
 /// The signed ID-JAG, original request, IdP scope grant and earliest effective
@@ -215,10 +239,18 @@ pub struct EnterpriseIdJagResponse {
     used_basic: bool,
 }
 impl EnterpriseIdJagResponse {
-    pub fn assertion(&self) -> &VerifiedIdJag { &self.assertion }
-    pub fn requested_scopes(&self) -> &[String] { &self.requested_scopes }
-    pub fn granted_scopes(&self) -> &[String] { self.granted_scopes.as_slice() }
-    pub fn effective_expires_at(&self) -> SystemTime { self.effective_expires_at }
+    pub fn assertion(&self) -> &VerifiedIdJag {
+        &self.assertion
+    }
+    pub fn requested_scopes(&self) -> &[String] {
+        &self.requested_scopes
+    }
+    pub fn granted_scopes(&self) -> &[String] {
+        self.granted_scopes.as_slice()
+    }
+    pub fn effective_expires_at(&self) -> SystemTime {
+        self.effective_expires_at
+    }
 
     /// Consumes this local owner while admitting one final token response.
     ///
@@ -231,13 +263,16 @@ impl EnterpriseIdJagResponse {
         self,
         response: EnterpriseTokenResponse<'_>,
         received_at: SystemTime,
-    ) -> Result<EnterpriseResponseOutcome<EnterpriseAccessTokenResponse>, EnterpriseResponseError> {
+    ) -> Result<EnterpriseResponseOutcome<EnterpriseAccessTokenResponse>, EnterpriseResponseError>
+    {
         if received_at < self.received_at || received_at >= self.effective_expires_at {
             return Err(EnterpriseResponseError::InvalidLifetime);
         }
         let (body, cache) = wire::admit(
-            &response, EnterpriseTokenResponseStage::AccessToken,
-            self.used_basic, self.policy.maximum_step_up_age.as_secs(),
+            &response,
+            EnterpriseTokenResponseStage::AccessToken,
+            self.used_basic,
+            self.policy.maximum_step_up_age.as_secs(),
         )?;
         let wire::AdmittedBody::Success(body) = body else {
             return terminal(body, cache);
@@ -245,25 +280,36 @@ impl EnterpriseIdJagResponse {
         if body.resource.as_deref() != Some(self.resource.as_str()) {
             return Err(EnterpriseResponseError::PolicyBindingMismatch);
         }
-        let granted_scopes = self.granted_scopes.admit_access_grant(body.scope.as_deref())
+        let granted_scopes = self
+            .granted_scopes
+            .admit_access_grant(body.scope.as_deref())
             .map_err(|_| EnterpriseResponseError::ScopeRejected)?;
         let mut expires_at = bounded_expiry(
-            received_at, body.expires_in, 86_400, self.policy.access_token_lifetime, None,
+            received_at,
+            body.expires_in,
+            86_400,
+            self.policy.access_token_lifetime,
+            None,
         )?;
         let id_jag_disclosure = self.assertion.disclosure().cloned();
         if let Some(disclosure) = &id_jag_disclosure {
             expires_at = expires_at.min(disclosure.review_expires_at());
         }
-        let token = body.access_token.ok_or(EnterpriseResponseError::InvalidResponse)?;
+        let token = body
+            .access_token
+            .ok_or(EnterpriseResponseError::InvalidResponse)?;
         if !AccessToken::is_valid_token68(token.as_str()) {
             return Err(EnterpriseResponseError::InvalidResponse);
         }
         Ok(EnterpriseResponseOutcome::Success {
             value: EnterpriseAccessTokenResponse {
-                _access_token: token, resource: self.resource,
+                _access_token: token,
+                resource: self.resource,
                 requested_scopes: self.requested_scopes,
                 idp_granted_scopes: self.granted_scopes.as_slice().to_vec(),
-                granted_scopes, expires_at, id_jag_disclosure,
+                granted_scopes,
+                expires_at,
+                id_jag_disclosure,
             },
             cache,
         })
@@ -286,11 +332,21 @@ pub struct EnterpriseAccessTokenResponse {
     id_jag_disclosure: Option<IdJagDisclosureFacts>,
 }
 impl EnterpriseAccessTokenResponse {
-    pub fn resource(&self) -> &str { &self.resource }
-    pub fn requested_scopes(&self) -> &[String] { &self.requested_scopes }
-    pub fn idp_granted_scopes(&self) -> &[String] { &self.idp_granted_scopes }
-    pub fn granted_scopes(&self) -> &[String] { &self.granted_scopes }
-    pub fn expires_at(&self) -> SystemTime { self.expires_at }
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+    pub fn requested_scopes(&self) -> &[String] {
+        &self.requested_scopes
+    }
+    pub fn idp_granted_scopes(&self) -> &[String] {
+        &self.idp_granted_scopes
+    }
+    pub fn granted_scopes(&self) -> &[String] {
+        &self.granted_scopes
+    }
+    pub fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
     /// Reviewed policy and admitted optional claim names, never claim values.
     pub fn id_jag_disclosure(&self) -> Option<&IdJagDisclosureFacts> {
         self.id_jag_disclosure.as_ref()
@@ -311,12 +367,14 @@ impl EnterpriseProfile {
         maximum_authentication_age: Option<Duration>,
         policy: EnterpriseResponsePolicy,
         received_at: SystemTime,
-    ) -> Result<EnterpriseResponseOutcome<EnterpriseIdentityAssertion>, EnterpriseResponseError> {
+    ) -> Result<EnterpriseResponseOutcome<EnterpriseIdentityAssertion>, EnterpriseResponseError>
+    {
         if keys.issuer() != self.idp_issuer() || keys.generation() != self.oidc_key_generation() {
             return Err(EnterpriseResponseError::PolicyBindingMismatch);
         }
         let (body, cache) = wire::admit(
-            &response, EnterpriseTokenResponseStage::OidcCode,
+            &response,
+            EnterpriseTokenResponseStage::OidcCode,
             self.idp_authentication() == EnterpriseClientAuthentication::ClientSecretBasic,
             policy.maximum_step_up_age.as_secs(),
         )?;
@@ -328,13 +386,20 @@ impl EnterpriseProfile {
         {
             return Err(EnterpriseResponseError::InvalidResponse);
         }
-        let access = body.access_token.ok_or(EnterpriseResponseError::InvalidResponse)?;
+        let access = body
+            .access_token
+            .ok_or(EnterpriseResponseError::InvalidResponse)?;
         if !AccessToken::is_valid_token68(access.as_str()) {
             return Err(EnterpriseResponseError::InvalidResponse);
         }
-        let assertion = body.id_token.ok_or(EnterpriseResponseError::InvalidResponse)?;
+        let assertion = body
+            .id_token
+            .ok_or(EnterpriseResponseError::InvalidResponse)?;
         let expected = OidcIdTokenExpectations {
-            client_id: self.idp_client_id(), nonce, access_token: Some(access.as_str()), tenant,
+            client_id: self.idp_client_id(),
+            nonce,
+            access_token: Some(access.as_str()),
+            tenant,
             max_authentication_age: maximum_authentication_age,
             time: JwtTimePolicy::new(policy.id_token_lifetime, policy.clock_skew)
                 .map_err(|_| EnterpriseResponseError::InvalidPolicy)?,
@@ -347,7 +412,11 @@ impl EnterpriseProfile {
         // This temporary token never enters a bearer, refresh, cache or result owner.
         drop(access);
         Ok(EnterpriseResponseOutcome::Success {
-            value: EnterpriseIdentityAssertion { _assertion: assertion, identity }, cache,
+            value: EnterpriseIdentityAssertion {
+                _assertion: assertion,
+                identity,
+            },
+            cache,
         })
     }
 
@@ -366,7 +435,13 @@ impl EnterpriseProfile {
         received_at: SystemTime,
     ) -> Result<EnterpriseResponseOutcome<EnterpriseIdJagResponse>, EnterpriseResponseError> {
         self.admit_id_jag_response_inner(
-            response, keys, idp_tenant, resource_tenant, policy, None, received_at,
+            response,
+            keys,
+            idp_tenant,
+            resource_tenant,
+            policy,
+            None,
+            received_at,
         )
     }
 
@@ -386,7 +461,13 @@ impl EnterpriseProfile {
         received_at: SystemTime,
     ) -> Result<EnterpriseResponseOutcome<EnterpriseIdJagResponse>, EnterpriseResponseError> {
         self.admit_id_jag_response_inner(
-            response, keys, idp_tenant, resource_tenant, policy, Some(disclosure), received_at,
+            response,
+            keys,
+            idp_tenant,
+            resource_tenant,
+            policy,
+            Some(disclosure),
+            received_at,
         )
     }
 
@@ -405,42 +486,64 @@ impl EnterpriseProfile {
             return Err(EnterpriseResponseError::PolicyBindingMismatch);
         }
         let (body, cache) = wire::admit(
-            &response, EnterpriseTokenResponseStage::IdJag,
+            &response,
+            EnterpriseTokenResponseStage::IdJag,
             self.idp_authentication() == EnterpriseClientAuthentication::ClientSecretBasic,
             policy.maximum_step_up_age.as_secs(),
         )?;
         let wire::AdmittedBody::Success(body) = body else {
             return terminal(body, cache);
         };
-        let compact = body.access_token.ok_or(EnterpriseResponseError::InvalidResponse)?;
+        let compact = body
+            .access_token
+            .ok_or(EnterpriseResponseError::InvalidResponse)?;
         let expected = IdJagExpectations {
-            audience: self.resource_as_issuer(), client_id: self.resource_as_client_id(),
-            resource: self.resource().as_str(), require_resource: true, idp_tenant, resource_tenant,
+            audience: self.resource_as_issuer(),
+            client_id: self.resource_as_client_id(),
+            resource: self.resource().as_str(),
+            require_resource: true,
+            idp_tenant,
+            resource_tenant,
             time: JwtTimePolicy::new(policy.id_jag_lifetime, policy.clock_skew)
                 .map_err(|_| EnterpriseResponseError::InvalidPolicy)?,
         };
         let assertion = match disclosure {
             Some(disclosure) => verify_id_jag_with_disclosure(
-                compact.as_str(), keys, &expected, disclosure, received_at,
+                compact.as_str(),
+                keys,
+                &expected,
+                disclosure,
+                received_at,
             ),
             None => verify_id_jag(compact.as_str(), keys, &expected, received_at),
-        }.map_err(|_| EnterpriseResponseError::AssertionRejected)?;
-        let granted_scopes = self.requested_scopes()
+        }
+        .map_err(|_| EnterpriseResponseError::AssertionRejected)?;
+        let granted_scopes = self
+            .requested_scopes()
             .admit_id_jag_grant(body.scope.as_deref(), assertion.scope())
             .map_err(|_| EnterpriseResponseError::ScopeRejected)?;
         let mut effective_expires_at = bounded_expiry(
-            received_at, body.expires_in, 900, policy.id_jag_lifetime, Some(assertion.expires_at()),
+            received_at,
+            body.expires_in,
+            900,
+            policy.id_jag_lifetime,
+            Some(assertion.expires_at()),
         )?;
         if let Some(disclosure) = assertion.disclosure() {
             effective_expires_at = effective_expires_at.min(disclosure.review_expires_at());
         }
         Ok(EnterpriseResponseOutcome::Success {
             value: EnterpriseIdJagResponse {
-                _assertion: compact, assertion,
+                _assertion: compact,
+                assertion,
                 requested_scopes: self.requested_scopes().as_slice().to_vec(),
-                granted_scopes, resource: self.resource().as_str().to_owned(), received_at,
-                effective_expires_at, policy,
-                used_basic: self.resource_as_authentication() == EnterpriseClientAuthentication::ClientSecretBasic,
+                granted_scopes,
+                resource: self.resource().as_str().to_owned(),
+                received_at,
+                effective_expires_at,
+                policy,
+                used_basic: self.resource_as_authentication()
+                    == EnterpriseClientAuthentication::ClientSecretBasic,
             },
             cache,
         })
@@ -448,10 +551,13 @@ impl EnterpriseProfile {
 }
 
 fn terminal<T>(
-    body: wire::AdmittedBody, cache: EnterpriseCacheDiagnostics,
+    body: wire::AdmittedBody,
+    cache: EnterpriseCacheDiagnostics,
 ) -> Result<EnterpriseResponseOutcome<T>, EnterpriseResponseError> {
     match body {
-        wire::AdmittedBody::Denied(denial) => Ok(EnterpriseResponseOutcome::Denied { denial, cache }),
+        wire::AdmittedBody::Denied(denial) => {
+            Ok(EnterpriseResponseOutcome::Denied { denial, cache })
+        }
         wire::AdmittedBody::StepUp(seconds) => Ok(EnterpriseResponseOutcome::StepUpRequired {
             requirement: EnterpriseStepUpRequired {
                 maximum_authentication_age: seconds.map(Duration::from_secs),
@@ -472,13 +578,21 @@ fn bounded_expiry(
     if response_seconds.is_some_and(|seconds| seconds == 0 || seconds > maximum_seconds) {
         return Err(EnterpriseResponseError::InvalidLifetime);
     }
-    let mut expires_at = received_at.checked_add(local_cap)
+    let mut expires_at = received_at
+        .checked_add(local_cap)
         .ok_or(EnterpriseResponseError::InvalidLifetime)?;
     if let Some(seconds) = response_seconds {
-        expires_at = expires_at.min(received_at.checked_add(Duration::from_secs(seconds))
-            .ok_or(EnterpriseResponseError::InvalidLifetime)?);
+        expires_at = expires_at.min(
+            received_at
+                .checked_add(Duration::from_secs(seconds))
+                .ok_or(EnterpriseResponseError::InvalidLifetime)?,
+        );
     }
-    if let Some(signed) = signed_expiry { expires_at = expires_at.min(signed); }
-    if expires_at <= received_at { return Err(EnterpriseResponseError::InvalidLifetime); }
+    if let Some(signed) = signed_expiry {
+        expires_at = expires_at.min(signed);
+    }
+    if expires_at <= received_at {
+        return Err(EnterpriseResponseError::InvalidLifetime);
+    }
     Ok(expires_at)
 }

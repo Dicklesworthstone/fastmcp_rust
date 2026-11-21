@@ -5,8 +5,10 @@ use fastmcp_protocol::{
     CoreResult, JsonRpcMessage, RequestId, ServerNotification, decode_strict_jsonrpc_message,
 };
 
-use super::super::{DpopStreamError, ManagedCoreError, ManagedCoreLimits, StreamDecoder, StreamEvent};
 use super::super::subscription_end::admit_cancelled;
+use super::super::{
+    DpopStreamError, ManagedCoreError, ManagedCoreLimits, StreamDecoder, StreamEvent,
+};
 use crate::http_auth::rpc::ManagedCoreEvent;
 use crate::http_auth::rpc::subscription::SubscriptionDecoder;
 
@@ -22,17 +24,26 @@ pub(super) struct TerminalDecoder {
 }
 
 impl TerminalDecoder {
-    pub(super) fn new(inner: SubscriptionDecoder, id: RequestId, limits: ManagedCoreLimits) -> Self {
+    pub(super) fn new(
+        inner: SubscriptionDecoder,
+        id: RequestId,
+        limits: ManagedCoreLimits,
+    ) -> Self {
         Self {
-            inner, id, limits, acknowledged: false, terminal: false,
+            inner,
+            id,
+            limits,
+            acknowledged: false,
+            terminal: false,
             control_bytes: 0,
         }
     }
 
     fn maximum(&self, frame: &[u8]) -> Result<usize, DpopStreamError> {
-        let maximum = self.limits.frame_bytes().min(
-            self.limits.total_bytes().saturating_sub(self.usage().0),
-        );
+        let maximum = self
+            .limits
+            .frame_bytes()
+            .min(self.limits.total_bytes().saturating_sub(self.usage().0));
         if frame.len() > maximum {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
@@ -43,30 +54,45 @@ impl TerminalDecoder {
 impl StreamDecoder for TerminalDecoder {
     type Terminal = Terminal;
 
-    fn completes_on_terminal(&self) -> bool { true }
+    fn completes_on_terminal(&self) -> bool {
+        true
+    }
 
-    fn admit(&mut self, frame: &[u8], allow_notification: bool)
-        -> Result<StreamEvent<Terminal>, DpopStreamError>
-    {
-        if self.terminal { return Err(ManagedCoreError::InvalidResponse.into()); }
+    fn admit(
+        &mut self,
+        frame: &[u8],
+        allow_notification: bool,
+    ) -> Result<StreamEvent<Terminal>, DpopStreamError> {
+        if self.terminal {
+            return Err(ManagedCoreError::InvalidResponse.into());
+        }
         let maximum = self.maximum(frame)?;
-        if !allow_notification { return Err(self.inner.json_error(frame).into()); }
+        if !allow_notification {
+            return Err(self.inner.json_error(frame).into());
+        }
         let message = decode_strict_jsonrpc_message(frame, maximum)
             .map_err(|_| ManagedCoreError::InvalidResponse)?;
         if let JsonRpcMessage::Request(request) = &message
             && request.method == "notifications/cancelled"
         {
-            if !self.acknowledged { return Err(ManagedCoreError::UnexpectedNotification.into()); }
+            if !self.acknowledged {
+                return Err(ManagedCoreError::UnexpectedNotification.into());
+            }
             admit_cancelled(frame, &self.id, maximum)?;
             self.control_bytes += frame.len();
             self.terminal = true;
-            return Ok(StreamEvent::Result(Err(DpopStreamError::SubscriptionCancelled)));
+            return Ok(StreamEvent::Result(Err(
+                DpopStreamError::SubscriptionCancelled,
+            )));
         }
         // All ACK subset, URI, metadata, category, exact result and notification
         // quota decisions still belong to the existing shared core codec.
         match self.inner.admit(frame)? {
             ManagedCoreEvent::Notification(notification) => {
-                if matches!(&*notification, ServerNotification::SubscriptionsAcknowledged(_)) {
+                if matches!(
+                    &*notification,
+                    ServerNotification::SubscriptionsAcknowledged(_)
+                ) {
                     self.acknowledged = true;
                 }
                 Ok(StreamEvent::Notification(notification))

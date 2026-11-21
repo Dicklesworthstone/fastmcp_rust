@@ -1342,9 +1342,8 @@ fn e2e_mixed_operations() {
 
 #[test]
 fn e2e_server_with_tools_only() {
-    let (builder, client_transport, server_transport) = TestServer::builder()
-        .with_name("tools-only")
-        .build();
+    let (builder, client_transport, server_transport) =
+        TestServer::builder().with_name("tools-only").build();
 
     let server = builder.tool(GreetingToolHandler).build();
 
@@ -1365,9 +1364,8 @@ fn e2e_server_with_tools_only() {
 
 #[test]
 fn e2e_server_with_resources_only() {
-    let (builder, client_transport, server_transport) = TestServer::builder()
-        .with_name("resources-only")
-        .build();
+    let (builder, client_transport, server_transport) =
+        TestServer::builder().with_name("resources-only").build();
 
     let server = builder.resource(TextFileResourceHandlerResource).build();
 
@@ -1386,9 +1384,8 @@ fn e2e_server_with_resources_only() {
 
 #[test]
 fn e2e_server_with_prompts_only() {
-    let (builder, client_transport, server_transport) = TestServer::builder()
-        .with_name("prompts-only")
-        .build();
+    let (builder, client_transport, server_transport) =
+        TestServer::builder().with_name("prompts-only").build();
 
     let server = builder.prompt(GreetingPromptHandlerPrompt).build();
 
@@ -1407,9 +1404,8 @@ fn e2e_server_with_prompts_only() {
 
 #[test]
 fn e2e_empty_server() {
-    let (builder, client_transport, server_transport) = TestServer::builder()
-        .with_name("empty-server")
-        .build();
+    let (builder, client_transport, server_transport) =
+        TestServer::builder().with_name("empty-server").build();
 
     let server = builder.build();
 

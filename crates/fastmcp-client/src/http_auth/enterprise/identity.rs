@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, Sha256Digest, crypto::sha256_bounded};
 use fastmcp_protocol::jose::enterprise::{
-    ClientFacingSubjectId, ResourceAudienceSubjectId, ResourceFacingSubjectId,
-    VerifiedIdJag, VerifiedOidcIdToken,
+    ClientFacingSubjectId, ResourceAudienceSubjectId, ResourceFacingSubjectId, VerifiedIdJag,
+    VerifiedOidcIdToken,
 };
 
 use super::policy::EnterpriseProfile;
@@ -72,15 +72,23 @@ impl fmt::Display for EnterpriseIdentityError {
             Self::InvalidNamespace => "invalid enterprise subject namespace",
             Self::InvalidSnapshot => "invalid enterprise identity review snapshot",
             Self::ExpiredSnapshot => "enterprise identity review is not current",
-            Self::SnapshotMismatch => "enterprise identity snapshot differs from the expected snapshot",
+            Self::SnapshotMismatch => {
+                "enterprise identity snapshot differs from the expected snapshot"
+            }
             Self::ProfileMismatch => "enterprise profile differs from the identity snapshot",
             Self::RegistrationMismatch => "enterprise identity registration differs from its role",
-            Self::TrustDomainMismatch => "enterprise issuer and redeemer trust domains are not distinct",
+            Self::TrustDomainMismatch => {
+                "enterprise issuer and redeemer trust domains are not distinct"
+            }
             Self::TenantMismatch => "enterprise tenant relationship is not explicitly configured",
-            Self::DuplicateMapping => "enterprise identity configuration contains ambiguous mappings",
+            Self::DuplicateMapping => {
+                "enterprise identity configuration contains ambiguous mappings"
+            }
             Self::InvalidMapping => "invalid preexisting enterprise subject mapping",
             Self::MappingUnavailable => "enterprise subject mapping is unavailable",
-            Self::TokenBindingMismatch => "verified enterprise facts differ from their configured binding",
+            Self::TokenBindingMismatch => {
+                "verified enterprise facts differ from their configured binding"
+            }
             Self::TokenTimeInvalid => "verified enterprise facts are not current",
             Self::CapacityExceeded => "enterprise identity configuration exceeds its bound",
         })
@@ -172,13 +180,21 @@ impl OidcSubjectNamespace {
     }
 
     #[must_use]
-    pub fn issuer(&self) -> &str { &self.issuer }
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
     #[must_use]
-    pub const fn subject_type(&self) -> EnterpriseOidcSubjectType { self.subject_type }
+    pub const fn subject_type(&self) -> EnterpriseOidcSubjectType {
+        self.subject_type
+    }
     #[must_use]
-    pub fn sector_host(&self) -> Option<&str> { self.sector_host.as_deref() }
+    pub fn sector_host(&self) -> Option<&str> {
+        self.sector_host.as_deref()
+    }
     #[must_use]
-    pub const fn registration_generation(&self) -> Option<u64> { self.registration_generation }
+    pub const fn registration_generation(&self) -> Option<u64> {
+        self.registration_generation
+    }
 }
 
 /// Exact, independently reviewed Client-to-IdP or resource-AS-to-IdP RP inputs.
@@ -228,7 +244,9 @@ pub struct EnterpriseGlobalClientRegistration {
 #[derive(Clone)]
 pub enum EnterpriseClientIdModel {
     /// The selected registration must appear exactly once in this inventory.
-    Global { registrations: Vec<EnterpriseGlobalClientRegistration> },
+    Global {
+        registrations: Vec<EnterpriseGlobalClientRegistration>,
+    },
     /// The selected configured tenant is part of the resource-domain key.
     TenantScoped,
 }
@@ -296,21 +314,27 @@ pub struct PreexistingEnterpriseSubjectMapping {
 pub struct ConfiguredIdpTenantId(String);
 impl ConfiguredIdpTenantId {
     #[must_use]
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConfiguredResourceAsTenantId(String);
 impl ConfiguredResourceAsTenantId {
     #[must_use]
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// An identifier for an existing local account; it has no principal conversion.
 pub struct LocalEnterpriseSubjectId(String);
 impl LocalEnterpriseSubjectId {
     #[must_use]
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -322,13 +346,21 @@ pub struct ClientIdpRelyingPartyKey {
 }
 impl ClientIdpRelyingPartyKey {
     #[must_use]
-    pub fn issuer(&self) -> &str { &self.issuer }
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
     #[must_use]
-    pub fn tenant(&self) -> Option<&ConfiguredIdpTenantId> { self.tenant.as_ref() }
+    pub fn tenant(&self) -> Option<&ConfiguredIdpTenantId> {
+        self.tenant.as_ref()
+    }
     #[must_use]
-    pub fn client_id(&self) -> &str { &self.client_id }
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
     #[must_use]
-    pub const fn registration_generation(&self) -> u64 { self.registration_generation }
+    pub const fn registration_generation(&self) -> u64 {
+        self.registration_generation
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -341,15 +373,25 @@ pub struct EnterpriseClientKey {
 }
 impl EnterpriseClientKey {
     #[must_use]
-    pub fn issuer(&self) -> &str { &self.resource_as_issuer }
+    pub fn issuer(&self) -> &str {
+        &self.resource_as_issuer
+    }
     #[must_use]
-    pub fn tenant(&self) -> Option<&ConfiguredResourceAsTenantId> { self.resource_as_tenant.as_ref() }
+    pub fn tenant(&self) -> Option<&ConfiguredResourceAsTenantId> {
+        self.resource_as_tenant.as_ref()
+    }
     #[must_use]
-    pub fn client_id(&self) -> &str { &self.client_id }
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
     #[must_use]
-    pub const fn registration_generation(&self) -> u64 { self.registration_generation }
+    pub const fn registration_generation(&self) -> u64 {
+        self.registration_generation
+    }
     #[must_use]
-    pub const fn scope(&self) -> EnterpriseClientIdScope { self.scope }
+    pub const fn scope(&self) -> EnterpriseClientIdScope {
+        self.scope
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -363,17 +405,29 @@ pub struct ResourceAsIdpRelyingPartyKey {
 }
 impl ResourceAsIdpRelyingPartyKey {
     #[must_use]
-    pub fn idp_issuer(&self) -> &str { &self.idp_issuer }
+    pub fn idp_issuer(&self) -> &str {
+        &self.idp_issuer
+    }
     #[must_use]
-    pub fn idp_tenant(&self) -> Option<&ConfiguredIdpTenantId> { self.idp_tenant.as_ref() }
+    pub fn idp_tenant(&self) -> Option<&ConfiguredIdpTenantId> {
+        self.idp_tenant.as_ref()
+    }
     #[must_use]
-    pub fn resource_as_issuer(&self) -> &str { &self.resource_as_issuer }
+    pub fn resource_as_issuer(&self) -> &str {
+        &self.resource_as_issuer
+    }
     #[must_use]
-    pub fn resource_as_tenant(&self) -> &ConfiguredResourceAsTenantId { &self.resource_as_tenant }
+    pub fn resource_as_tenant(&self) -> &ConfiguredResourceAsTenantId {
+        &self.resource_as_tenant
+    }
     #[must_use]
-    pub fn relying_party_client_id(&self) -> &str { &self.relying_party_client_id }
+    pub fn relying_party_client_id(&self) -> &str {
+        &self.relying_party_client_id
+    }
     #[must_use]
-    pub const fn registration_generation(&self) -> u64 { self.registration_generation }
+    pub const fn registration_generation(&self) -> u64 {
+        self.registration_generation
+    }
 }
 
 /// A locally derived snapshot identity. The digest covers the exact profile,
@@ -386,11 +440,17 @@ pub struct EnterpriseIdentitySnapshotKey {
 }
 impl EnterpriseIdentitySnapshotKey {
     #[must_use]
-    pub fn id(&self) -> &str { &self.id }
+    pub fn id(&self) -> &str {
+        &self.id
+    }
     #[must_use]
-    pub const fn generation(&self) -> u64 { self.generation }
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
     #[must_use]
-    pub const fn digest(&self) -> Sha256Digest { self.digest }
+    pub const fn digest(&self) -> Sha256Digest {
+        self.digest
+    }
 }
 
 #[allow(clippy::struct_field_names)]
@@ -429,7 +489,12 @@ impl EnterpriseSubjectMappingTable {
         now: SystemTime,
     ) -> Result<Self, EnterpriseIdentityError> {
         Self::from_trusted_configuration_with_sector_reviews(
-            profile, configuration, mappings, None, None, now,
+            profile,
+            configuration,
+            mappings,
+            None,
+            None,
+            now,
         )
     }
 
@@ -504,12 +569,12 @@ impl EnterpriseSubjectMappingTable {
             return Err(EnterpriseIdentityError::RegistrationMismatch);
         }
         admit_client_id(&resource.relying_party.client_id)?;
-        let client_namespace = namespace(
-            client, OidcSectorRegistrationRole::Client, client_sector,
-        )?;
+        let client_namespace =
+            namespace(client, OidcSectorRegistrationRole::Client, client_sector)?;
         let resource_namespace = namespace(
             &resource.relying_party,
-            OidcSectorRegistrationRole::ResourceAuthorizationServer, resource_sector,
+            OidcSectorRegistrationRole::ResourceAuthorizationServer,
+            resource_sector,
         )?;
         let inventory = admit_inventory(&configuration.client_id_model, profile, &resource_tenant)?;
         let scope = match &configuration.client_id_model {
@@ -518,8 +583,12 @@ impl EnterpriseSubjectMappingTable {
         };
         let records = admit_mappings(mappings, resource_claim_tenant.is_some())?;
         let digest = snapshot_digest(
-            &configuration, profile_digest(profile)?, &inventory, &records,
-            client_sector, resource_sector,
+            &configuration,
+            profile_digest(profile)?,
+            &inventory,
+            &records,
+            client_sector,
+            resource_sector,
         )?;
         Ok(Self {
             profile: profile.clone(),
@@ -560,17 +629,29 @@ impl EnterpriseSubjectMappingTable {
     }
 
     #[must_use]
-    pub fn snapshot(&self) -> &EnterpriseIdentitySnapshotKey { &self.snapshot }
+    pub fn snapshot(&self) -> &EnterpriseIdentitySnapshotKey {
+        &self.snapshot
+    }
     #[must_use]
-    pub fn client_relying_party(&self) -> &ClientIdpRelyingPartyKey { &self.client_rp }
+    pub fn client_relying_party(&self) -> &ClientIdpRelyingPartyKey {
+        &self.client_rp
+    }
     #[must_use]
-    pub fn resource_client(&self) -> &EnterpriseClientKey { &self.resource_client }
+    pub fn resource_client(&self) -> &EnterpriseClientKey {
+        &self.resource_client
+    }
     #[must_use]
-    pub fn resource_as_relying_party(&self) -> &ResourceAsIdpRelyingPartyKey { &self.resource_rp }
+    pub fn resource_as_relying_party(&self) -> &ResourceAsIdpRelyingPartyKey {
+        &self.resource_rp
+    }
     #[must_use]
-    pub fn client_namespace(&self) -> &OidcSubjectNamespace { &self.client_namespace }
+    pub fn client_namespace(&self) -> &OidcSubjectNamespace {
+        &self.client_namespace
+    }
     #[must_use]
-    pub fn resource_namespace(&self) -> &OidcSubjectNamespace { &self.resource_namespace }
+    pub fn resource_namespace(&self) -> &OidcSubjectNamespace {
+        &self.resource_namespace
+    }
 
     /// Resolves one pair of already cryptographically verified facts against a
     /// caller-selected current snapshot and profile. This never infers that the
@@ -598,19 +679,26 @@ impl EnterpriseSubjectMappingTable {
         }
         if profile_names(current_profile) != profile_names(&self.profile)
             || profile_generations(current_profile) != profile_generations(&self.profile)
-            || current_profile.requested_scopes().as_slice() != self.profile.requested_scopes().as_slice()
+            || current_profile.requested_scopes().as_slice()
+                != self.profile.requested_scopes().as_slice()
             || current_profile.permits_oidc_openid() != self.profile.permits_oidc_openid()
         {
             return Err(EnterpriseIdentityError::ProfileMismatch);
         }
-        if now < oidc.issued_at() || now < id_jag.issued_at()
-            || now >= oidc.expires_at() || now >= id_jag.expires_at()
-            || id_jag.disclosure().is_some_and(|policy| now >= policy.review_expires_at())
+        if now < oidc.issued_at()
+            || now < id_jag.issued_at()
+            || now >= oidc.expires_at()
+            || now >= id_jag.expires_at()
+            || id_jag
+                .disclosure()
+                .is_some_and(|policy| now >= policy.review_expires_at())
         {
             return Err(EnterpriseIdentityError::TokenTimeInvalid);
         }
         let idp_tenant = self.client_rp.tenant().map(ConfiguredIdpTenantId::as_str);
-        let resource_tenant = self.expected_resource_claim_tenant.as_ref()
+        let resource_tenant = self
+            .expected_resource_claim_tenant
+            .as_ref()
             .map(ConfiguredResourceAsTenantId::as_str);
         if oidc.issuer() != self.client_rp.issuer()
             || oidc.client_id() != self.client_rp.client_id()
@@ -626,14 +714,22 @@ impl EnterpriseSubjectMappingTable {
         {
             return Err(EnterpriseIdentityError::TokenBindingMismatch);
         }
-        let row = self.records.get(oidc.subject().as_str())
-            .filter(|row| row.resource_subject == id_jag.subject().as_str()
-                && row.audience_subject.as_deref()
-                    == id_jag.audience_subject().map(|subject| subject.as_str()))
+        let row = self
+            .records
+            .get(oidc.subject().as_str())
+            .filter(|row| {
+                row.resource_subject == id_jag.subject().as_str()
+                    && row.audience_subject.as_deref()
+                        == id_jag.audience_subject().map(|subject| subject.as_str())
+            })
             .ok_or(EnterpriseIdentityError::MappingUnavailable)?;
-        let expires_at = self.review_expires_at.min(oidc.expires_at()).min(id_jag.expires_at());
-        let expires_at = id_jag.disclosure()
-            .map_or(expires_at, |policy| expires_at.min(policy.review_expires_at()));
+        let expires_at = self
+            .review_expires_at
+            .min(oidc.expires_at())
+            .min(id_jag.expires_at());
+        let expires_at = id_jag.disclosure().map_or(expires_at, |policy| {
+            expires_at.min(policy.review_expires_at())
+        });
         let mut binding = IdentityEncoding::new(b"fastmcp-enterprise-subject-resolution-v1");
         binding.field(self.snapshot.digest.as_bytes())?;
         binding.field(oidc.compact_digest().as_bytes())?;
@@ -674,11 +770,17 @@ pub struct ClientSessionSubjectKey<'a> {
 }
 impl<'a> ClientSessionSubjectKey<'a> {
     #[must_use]
-    pub const fn registration(&self) -> &'a ClientIdpRelyingPartyKey { self.registration }
+    pub const fn registration(&self) -> &'a ClientIdpRelyingPartyKey {
+        self.registration
+    }
     #[must_use]
-    pub const fn namespace(&self) -> &'a OidcSubjectNamespace { self.namespace }
+    pub const fn namespace(&self) -> &'a OidcSubjectNamespace {
+        self.namespace
+    }
     #[must_use]
-    pub const fn subject(&self) -> &'a ClientFacingSubjectId { self.subject }
+    pub const fn subject(&self) -> &'a ClientFacingSubjectId {
+        self.subject
+    }
 }
 
 pub struct EnterpriseSubjectKey<'a> {
@@ -688,11 +790,17 @@ pub struct EnterpriseSubjectKey<'a> {
 }
 impl<'a> EnterpriseSubjectKey<'a> {
     #[must_use]
-    pub const fn registration(&self) -> &'a ResourceAsIdpRelyingPartyKey { self.registration }
+    pub const fn registration(&self) -> &'a ResourceAsIdpRelyingPartyKey {
+        self.registration
+    }
     #[must_use]
-    pub const fn namespace(&self) -> &'a OidcSubjectNamespace { self.namespace }
+    pub const fn namespace(&self) -> &'a OidcSubjectNamespace {
+        self.namespace
+    }
     #[must_use]
-    pub const fn subject(&self) -> &'a ResourceFacingSubjectId { self.subject }
+    pub const fn subject(&self) -> &'a ResourceFacingSubjectId {
+        self.subject
+    }
 }
 
 /// A successful local table lookup bound to both exact signed-token digests.
@@ -712,27 +820,49 @@ pub struct ResolvedEnterpriseSubject<'a> {
 }
 impl<'a> ResolvedEnterpriseSubject<'a> {
     #[must_use]
-    pub const fn local_subject(&self) -> &'a LocalEnterpriseSubjectId { self.local_subject }
+    pub const fn local_subject(&self) -> &'a LocalEnterpriseSubjectId {
+        self.local_subject
+    }
     #[must_use]
-    pub const fn client_subject(&self) -> &ClientSessionSubjectKey<'a> { &self.client_subject }
+    pub const fn client_subject(&self) -> &ClientSessionSubjectKey<'a> {
+        &self.client_subject
+    }
     #[must_use]
-    pub const fn enterprise_subject(&self) -> &EnterpriseSubjectKey<'a> { &self.enterprise_subject }
+    pub const fn enterprise_subject(&self) -> &EnterpriseSubjectKey<'a> {
+        &self.enterprise_subject
+    }
     #[must_use]
-    pub const fn audience_subject(&self) -> Option<&'a ResourceAudienceSubjectId> { self.audience_subject }
+    pub const fn audience_subject(&self) -> Option<&'a ResourceAudienceSubjectId> {
+        self.audience_subject
+    }
     #[must_use]
-    pub const fn resource_client(&self) -> &'a EnterpriseClientKey { self.resource_client }
+    pub const fn resource_client(&self) -> &'a EnterpriseClientKey {
+        self.resource_client
+    }
     #[must_use]
-    pub const fn resource(&self) -> &'a CanonicalResourceId { self.resource }
+    pub const fn resource(&self) -> &'a CanonicalResourceId {
+        self.resource
+    }
     #[must_use]
-    pub const fn snapshot(&self) -> &'a EnterpriseIdentitySnapshotKey { self.snapshot }
+    pub const fn snapshot(&self) -> &'a EnterpriseIdentitySnapshotKey {
+        self.snapshot
+    }
     #[must_use]
-    pub const fn oidc_digest(&self) -> Sha256Digest { self.oidc_digest }
+    pub const fn oidc_digest(&self) -> Sha256Digest {
+        self.oidc_digest
+    }
     #[must_use]
-    pub const fn id_jag_digest(&self) -> Sha256Digest { self.id_jag_digest }
+    pub const fn id_jag_digest(&self) -> Sha256Digest {
+        self.id_jag_digest
+    }
     #[must_use]
-    pub const fn binding_digest(&self) -> Sha256Digest { self.binding_digest }
+    pub const fn binding_digest(&self) -> Sha256Digest {
+        self.binding_digest
+    }
     #[must_use]
-    pub const fn expires_at(&self) -> SystemTime { self.expires_at }
+    pub const fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
 }
 
 fn namespace(
@@ -744,8 +874,10 @@ fn namespace(
         OidcSubjectNamespace::from_reviewed_sector(registration, role, review)
     } else {
         OidcSubjectNamespace::from_preregistered_redirects(
-            &registration.issuer, registration.subject_type,
-            registration.registration_generation, &registration.redirect_uris,
+            &registration.issuer,
+            registration.subject_type,
+            registration.registration_generation,
+            &registration.redirect_uris,
         )
     }
 }
@@ -765,24 +897,30 @@ fn admit_mappings(
             || !valid_oidc_subject(&mapping.resource_subject)
             || admit_text(&mapping.local_subject, MAX_IDENTIFIER_BYTES).is_err()
             || mapping.resource_audience_subject.is_some() != audience_required
-            || mapping.resource_audience_subject.as_ref().is_some_and(|subject| {
-                admit_text(subject, MAX_IDENTIFIER_BYTES).is_err()
-            })
+            || mapping
+                .resource_audience_subject
+                .as_ref()
+                .is_some_and(|subject| admit_text(subject, MAX_IDENTIFIER_BYTES).is_err())
         {
             return Err(EnterpriseIdentityError::InvalidMapping);
         }
         if records.contains_key(&mapping.client_subject)
             || !resource_subjects.insert(mapping.resource_subject.clone())
-            || mapping.resource_audience_subject.as_ref()
+            || mapping
+                .resource_audience_subject
+                .as_ref()
                 .is_some_and(|subject| !audience_subjects.insert(subject.clone()))
         {
             return Err(EnterpriseIdentityError::DuplicateMapping);
         }
-        records.insert(mapping.client_subject, MappingRecord {
-            resource_subject: mapping.resource_subject,
-            audience_subject: mapping.resource_audience_subject,
-            local_subject: LocalEnterpriseSubjectId(mapping.local_subject),
-        });
+        records.insert(
+            mapping.client_subject,
+            MappingRecord {
+                resource_subject: mapping.resource_subject,
+                audience_subject: mapping.resource_audience_subject,
+                local_subject: LocalEnterpriseSubjectId(mapping.local_subject),
+            },
+        );
     }
     Ok(records)
 }
@@ -803,13 +941,21 @@ fn admit_inventory(
             if registration.registration_generation == 0 {
                 return Err(EnterpriseIdentityError::InvalidConfiguration);
             }
-            if inventory.insert(registration.client_id.clone(), (
-                registration.resource_as_tenant.clone(), registration.registration_generation,
-            )).is_some() {
+            if inventory
+                .insert(
+                    registration.client_id.clone(),
+                    (
+                        registration.resource_as_tenant.clone(),
+                        registration.registration_generation,
+                    ),
+                )
+                .is_some()
+            {
                 return Err(EnterpriseIdentityError::DuplicateMapping);
             }
         }
-        let selected = inventory.get(profile.resource_as_client_id())
+        let selected = inventory
+            .get(profile.resource_as_client_id())
             .ok_or(EnterpriseIdentityError::RegistrationMismatch)?;
         if selected.0 != tenant.as_str()
             || selected.1 != profile.resource_as_registration_generation()
@@ -821,7 +967,9 @@ fn admit_inventory(
 }
 
 fn admit_text(value: &str, limit: usize) -> Result<(), EnterpriseIdentityError> {
-    if value.is_empty() || value.len() > limit || value.trim() != value
+    if value.is_empty()
+        || value.len() > limit
+        || value.trim() != value
         || value.chars().any(char::is_control)
     {
         Err(EnterpriseIdentityError::InvalidConfiguration)
@@ -832,8 +980,7 @@ fn admit_text(value: &str, limit: usize) -> Result<(), EnterpriseIdentityError> 
 
 fn admit_client_id(value: &str) -> Result<(), EnterpriseIdentityError> {
     admit_text(value, MAX_IDENTIFIER_BYTES)?;
-    if !value.is_ascii() || value.contains("://")
-        || fastmcp_core::AbsoluteUri::parse(value).is_ok()
+    if !value.is_ascii() || value.contains("://") || fastmcp_core::AbsoluteUri::parse(value).is_ok()
     {
         return Err(EnterpriseIdentityError::RegistrationMismatch);
     }
@@ -842,10 +989,13 @@ fn admit_client_id(value: &str) -> Result<(), EnterpriseIdentityError> {
 
 fn admit_issuer(value: &str) -> Result<(), EnterpriseIdentityError> {
     admit_text(value, MAX_URL_BYTES)?;
-    let url = CanonicalHttpUrl::parse(value)
-        .map_err(|_| EnterpriseIdentityError::InvalidNamespace)?;
-    if url.scheme() != "https" || url.has_syntax_violation() || url.has_userinfo()
-        || url.query().is_some() || url.fragment().is_some()
+    let url =
+        CanonicalHttpUrl::parse(value).map_err(|_| EnterpriseIdentityError::InvalidNamespace)?;
+    if url.scheme() != "https"
+        || url.has_syntax_violation()
+        || url.has_userinfo()
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
         return Err(EnterpriseIdentityError::InvalidNamespace);
     }
@@ -855,8 +1005,12 @@ fn admit_issuer(value: &str) -> Result<(), EnterpriseIdentityError> {
 fn admit_redirect(value: &str) -> Result<CanonicalHttpUrl, EnterpriseIdentityError> {
     let url = CanonicalHttpUrl::parse_with_max_bytes(value, MAX_URL_BYTES)
         .map_err(|_| EnterpriseIdentityError::InvalidNamespace)?;
-    if url.scheme() != "https" || url.as_str() != value || url.has_syntax_violation()
-        || url.has_userinfo() || url.query().is_some() || url.fragment().is_some()
+    if url.scheme() != "https"
+        || url.as_str() != value
+        || url.has_syntax_violation()
+        || url.has_userinfo()
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
         return Err(EnterpriseIdentityError::InvalidNamespace);
     }
@@ -864,7 +1018,9 @@ fn admit_redirect(value: &str) -> Result<CanonicalHttpUrl, EnterpriseIdentityErr
 }
 
 fn valid_oidc_subject(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_SUBJECT_BYTES && value.is_ascii()
+    !value.is_empty()
+        && value.len() <= MAX_SUBJECT_BYTES
+        && value.is_ascii()
         && !value.chars().any(char::is_control)
 }
 
@@ -874,9 +1030,12 @@ fn admit_review(
 ) -> Result<(), EnterpriseIdentityError> {
     admit_text(&review.id, MAX_TENANT_BYTES)
         .map_err(|_| EnterpriseIdentityError::InvalidSnapshot)?;
-    let duration = review.review_expires_at.duration_since(review.reviewed_at)
+    let duration = review
+        .review_expires_at
+        .duration_since(review.reviewed_at)
         .map_err(|_| EnterpriseIdentityError::InvalidSnapshot)?;
-    if review.generation == 0 || duration.is_zero()
+    if review.generation == 0
+        || duration.is_zero()
         || duration > MAX_ENTERPRISE_IDENTITY_REVIEW_LIFETIME
         || finite_time(review.reviewed_at).is_err()
         || finite_time(review.review_expires_at).is_err()
@@ -890,7 +1049,9 @@ fn admit_review(
 }
 
 fn finite_time(value: SystemTime) -> Result<Duration, EnterpriseIdentityError> {
-    value.duration_since(UNIX_EPOCH).ok()
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
         .filter(|value| value.as_secs() <= MAX_UNIX_SECONDS)
         .ok_or(EnterpriseIdentityError::InvalidSnapshot)
 }
@@ -900,15 +1061,21 @@ fn finite_time(value: SystemTime) -> Result<Duration, EnterpriseIdentityError> {
 // deterministic. No serde serializer or platform-width integer enters a digest.
 struct IdentityEncoding(Vec<u8>);
 impl IdentityEncoding {
-    fn new(domain: &[u8]) -> Self { Self(domain.to_vec()) }
+    fn new(domain: &[u8]) -> Self {
+        Self(domain.to_vec())
+    }
     fn field(&mut self, value: &[u8]) -> Result<(), EnterpriseIdentityError> {
-        let total = self.0.len().checked_add(8).and_then(|n| n.checked_add(value.len()))
+        let total = self
+            .0
+            .len()
+            .checked_add(8)
+            .and_then(|n| n.checked_add(value.len()))
             .ok_or(EnterpriseIdentityError::CapacityExceeded)?;
         if total > MAX_CONFIGURATION_BYTES {
             return Err(EnterpriseIdentityError::CapacityExceeded);
         }
-        let length = u64::try_from(value.len())
-            .map_err(|_| EnterpriseIdentityError::CapacityExceeded)?;
+        let length =
+            u64::try_from(value.len()).map_err(|_| EnterpriseIdentityError::CapacityExceeded)?;
         self.0.extend_from_slice(&length.to_be_bytes());
         self.0.extend_from_slice(value);
         Ok(())
@@ -921,7 +1088,9 @@ impl IdentityEncoding {
     }
     fn optional(&mut self, value: Option<&str>) -> Result<(), EnterpriseIdentityError> {
         self.field(&[u8::from(value.is_some())])?;
-        if let Some(value) = value { self.text(value)?; }
+        if let Some(value) = value {
+            self.text(value)?;
+        }
         Ok(())
     }
     fn time(&mut self, value: SystemTime) -> Result<(), EnterpriseIdentityError> {
@@ -936,29 +1105,49 @@ impl IdentityEncoding {
 }
 
 fn profile_names(profile: &EnterpriseProfile) -> [&str; 12] {
-    [profile.idp_issuer(), profile.idp_token_endpoint(),
-        profile.idp_authorization_endpoint(), profile.idp_client_id(),
-        profile.idp_authentication().as_str(), profile.oidc_jwks_uri(),
-        profile.id_jag_jwks_uri(), profile.resource_as_issuer(),
-        profile.resource_as_token_endpoint(), profile.resource_as_client_id(),
-        profile.resource_as_authentication().as_str(), profile.resource().as_str()]
+    [
+        profile.idp_issuer(),
+        profile.idp_token_endpoint(),
+        profile.idp_authorization_endpoint(),
+        profile.idp_client_id(),
+        profile.idp_authentication().as_str(),
+        profile.oidc_jwks_uri(),
+        profile.id_jag_jwks_uri(),
+        profile.resource_as_issuer(),
+        profile.resource_as_token_endpoint(),
+        profile.resource_as_client_id(),
+        profile.resource_as_authentication().as_str(),
+        profile.resource().as_str(),
+    ]
 }
 
 fn profile_generations(profile: &EnterpriseProfile) -> [u64; 9] {
-    [profile.oidc_key_generation(), profile.id_jag_key_generation(),
-        profile.id_jag_policy_generation(), profile.policy_generation(),
-        profile.idp_metadata_generation(), profile.resource_as_metadata_generation(),
-        profile.idp_registration_generation(), profile.resource_as_registration_generation(),
-        profile.aggregate_registration_generation()]
+    [
+        profile.oidc_key_generation(),
+        profile.id_jag_key_generation(),
+        profile.id_jag_policy_generation(),
+        profile.policy_generation(),
+        profile.idp_metadata_generation(),
+        profile.resource_as_metadata_generation(),
+        profile.idp_registration_generation(),
+        profile.resource_as_registration_generation(),
+        profile.aggregate_registration_generation(),
+    ]
 }
 
 fn profile_digest(profile: &EnterpriseProfile) -> Result<Sha256Digest, EnterpriseIdentityError> {
     let mut encoded = IdentityEncoding::new(b"fastmcp-enterprise-identity-profile-v1");
-    for value in profile_names(profile) { encoded.text(value)?; }
-    for value in profile_generations(profile) { encoded.number(value)?; }
+    for value in profile_names(profile) {
+        encoded.text(value)?;
+    }
+    for value in profile_generations(profile) {
+        encoded.number(value)?;
+    }
     encoded.field(&[u8::from(profile.permits_oidc_openid())])?;
     encoded.number(profile.requested_scopes().as_slice().len() as u64)?;
-    for scope in profile.requested_scopes().as_slice() { encoded.text(scope)?; }
+    for scope in profile.requested_scopes().as_slice() {
+        encoded.text(scope)?;
+    }
     encoded.finish()
 }
 
@@ -976,7 +1165,9 @@ fn encode_rp(
     })?;
     let redirects: BTreeSet<_> = registration.redirect_uris.iter().collect();
     encoded.number(redirects.len() as u64)?;
-    for redirect in redirects { encoded.text(redirect)?; }
+    for redirect in redirects {
+        encoded.text(redirect)?;
+    }
     Ok(())
 }
 
@@ -1016,7 +1207,10 @@ fn snapshot_digest(
         EnterpriseClientIdModel::TenantScoped => "tenant-scoped",
     })?;
     encode_rp(&mut encoded, &configuration.client_relying_party)?;
-    encode_rp(&mut encoded, &configuration.resource_as_relying_party.relying_party)?;
+    encode_rp(
+        &mut encoded,
+        &configuration.resource_as_relying_party.relying_party,
+    )?;
     if has_sector {
         for review in [client_sector, resource_sector] {
             encoded.field(&[u8::from(review.is_some())])?;
@@ -1058,16 +1252,29 @@ macro_rules! redacted_debug {
     )+};
 }
 redacted_debug!(
-    OidcSubjectNamespace, EnterpriseOidcRelyingPartyConfiguration,
-    ResourceAsIdpRelyingPartyConfiguration, EnterpriseIdpTenancyConfiguration,
-    EnterpriseResourceAsTenancyConfiguration, EnterpriseGlobalClientRegistration,
-    EnterpriseClientIdModel, EnterpriseTenantRelationshipConfiguration,
-    EnterpriseIdentityTrustDomains, EnterpriseIdentitySnapshotConfiguration,
-    EnterpriseIdentityConfiguration, PreexistingEnterpriseSubjectMapping,
-    ConfiguredIdpTenantId, ConfiguredResourceAsTenantId, LocalEnterpriseSubjectId,
-    ClientIdpRelyingPartyKey, EnterpriseClientKey, ResourceAsIdpRelyingPartyKey,
-    EnterpriseIdentitySnapshotKey, EnterpriseSubjectMappingTable,
-    ClientSessionSubjectKey<'_>, EnterpriseSubjectKey<'_>, ResolvedEnterpriseSubject<'_>,
+    OidcSubjectNamespace,
+    EnterpriseOidcRelyingPartyConfiguration,
+    ResourceAsIdpRelyingPartyConfiguration,
+    EnterpriseIdpTenancyConfiguration,
+    EnterpriseResourceAsTenancyConfiguration,
+    EnterpriseGlobalClientRegistration,
+    EnterpriseClientIdModel,
+    EnterpriseTenantRelationshipConfiguration,
+    EnterpriseIdentityTrustDomains,
+    EnterpriseIdentitySnapshotConfiguration,
+    EnterpriseIdentityConfiguration,
+    PreexistingEnterpriseSubjectMapping,
+    ConfiguredIdpTenantId,
+    ConfiguredResourceAsTenantId,
+    LocalEnterpriseSubjectId,
+    ClientIdpRelyingPartyKey,
+    EnterpriseClientKey,
+    ResourceAsIdpRelyingPartyKey,
+    EnterpriseIdentitySnapshotKey,
+    EnterpriseSubjectMappingTable,
+    ClientSessionSubjectKey<'_>,
+    EnterpriseSubjectKey<'_>,
+    ResolvedEnterpriseSubject<'_>,
 );
 
 #[cfg(test)]

@@ -60,7 +60,9 @@ struct EventBudget {
 impl EventBudget {
     fn charge(&mut self, value: &impl Serialize) -> Result<(), HttpClientError> {
         if self.notifications == 0 {
-            return Err(refusal("Managed core subscription notification limit exceeded"));
+            return Err(refusal(
+                "Managed core subscription notification limit exceeded",
+            ));
         }
         let mut remaining = ByteBudget(self.bytes);
         serde_json::to_writer(&mut remaining, value)
@@ -151,13 +153,8 @@ impl<'a> ListenRequest<'a> {
         boundary.check(cx).map_err(HttpClientError::CoreResult)?;
         // Wire framing is independent of the aggregate application budget:
         // JSON-RPC/SSE overhead cannot reject an exactly fitting payload.
-        let limits = SseLimits::with_data_lines(
-            MAX_FRAME_BYTES + 8,
-            MAX_FRAME_BYTES,
-            64,
-            4_096,
-        )
-        .ok_or_else(|| refusal("Invalid managed core subscription framing limits"))?;
+        let limits = SseLimits::with_data_lines(MAX_FRAME_BYTES + 8, MAX_FRAME_BYTES, 64, 4_096)
+            .ok_or_else(|| refusal("Invalid managed core subscription framing limits"))?;
         let id = client.next_request_id()?;
         let mut listener = client
             .connection
@@ -179,10 +176,14 @@ impl<'a> ListenRequest<'a> {
             boundary.check(cx).map_err(HttpClientError::CoreResult)?;
             match event {
                 ModernHttpSubscriptionListenEvent::Terminal { result, .. } => {
-                    return Ok(Some(Box::new(ModernHttpSubscriptionTermination::Complete(result))));
+                    return Ok(Some(Box::new(ModernHttpSubscriptionTermination::Complete(
+                        result,
+                    ))));
                 }
                 ModernHttpSubscriptionListenEvent::Cancelled { params, .. } => {
-                    return Ok(Some(Box::new(ModernHttpSubscriptionTermination::Cancelled(params))));
+                    return Ok(Some(Box::new(
+                        ModernHttpSubscriptionTermination::Cancelled(params),
+                    )));
                 }
                 _ => {}
             }
@@ -328,10 +329,7 @@ mod tests {
     fn filter_limit_counts_encoded_bytes_instead_of_uri_count() {
         let mut observer = |_: &ModernHttpSubscriptionListenEvent| ControlFlow::Continue(());
         let filter = SubscriptionFilter {
-            resource_subscriptions: Some(vec![format!(
-                "file:///{}",
-                "x".repeat(MAX_FILTER_BYTES)
-            )]),
+            resource_subscriptions: Some(vec![format!("file:///{}", "x".repeat(MAX_FILTER_BYTES))]),
             ..SubscriptionFilter::default()
         };
         assert!(ListenRequest::new(filter, 1, 4096, &mut observer).is_err());

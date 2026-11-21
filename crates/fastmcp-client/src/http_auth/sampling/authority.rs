@@ -225,22 +225,26 @@ fn a_pending_wait_reads_the_new_ambient_ceiling_on_each_poll() {
         let cancellation = McpRequestCancellation::new();
         let end = cx.now().saturating_add_nanos(10_000_000_000);
         let mut observed = Vec::new();
-        let mut future = Box::pin(within(cx, &cancellation, end, poll_fn(|_| {
-            observed.push(row(&Cx::current().unwrap()));
-            if observed.len() == 3 {
-                Poll::Ready(Ok(42))
-            } else {
-                Poll::Pending
-            }
-        })));
-        for (index, bits) in [ALL & !8, ALL & !4, ALL & !1 & !16]
-            .into_iter()
-            .enumerate()
-        {
+        let mut future = Box::pin(within(
+            cx,
+            &cancellation,
+            end,
+            poll_fn(|_| {
+                observed.push(row(&Cx::current().unwrap()));
+                if observed.len() == 3 {
+                    Poll::Ready(Ok(42))
+                } else {
+                    Poll::Pending
+                }
+            }),
+        ));
+        for (index, bits) in [ALL & !8, ALL & !4, ALL & !1 & !16].into_iter().enumerate() {
             let ambient = held(&Cx::for_testing(), bits);
             let _ambient = Cx::set_current(Some(ambient));
             let depth = Cx::restriction_depth();
-            let outcome = future.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            let outcome = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
             assert_eq!(
                 outcome,
                 if index == 2 {
@@ -280,13 +284,20 @@ fn withdrawing_time_permission_retires_quiet_work_without_another_child_poll() {
             })
             .await
         }));
-        assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert_eq!(timer.pending_count(), 1);
         let denied = held(&Cx::for_testing(), ALL & !TIME);
         let _ambient = Cx::set_current(Some(denied));
         assert_eq!(
-            future.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(SamplingRunError::RuntimeUnavailable))
         );
         drop(future);
@@ -313,10 +324,12 @@ fn a_panicking_model_callback_cannot_leave_a_wider_context_installed() {
         let ambient = held(&Cx::for_testing(), ALL & !8);
         let _ambient = Cx::set_current(Some(ambient));
         let depth = Cx::restriction_depth();
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = run.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = run.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            }))
+            .is_err()
+        );
         drop(run);
         assert_eq!(host.calls, ["model"]);
         assert_eq!(row(&Cx::current().unwrap()), ALL & !8);

@@ -249,7 +249,11 @@ impl OutputOwner {
     }
 
     fn suppresses_message(&self, message: &JsonRpcMessage) -> bool {
-        if self.subscription_terminal.as_ref().is_some_and(|delivery| delivery.is_settled()) {
+        if self
+            .subscription_terminal
+            .as_ref()
+            .is_some_and(|delivery| delivery.is_settled())
+        {
             return true;
         }
         if let Some(delivery) = self.subscription_drain_delivery(message)
@@ -334,16 +338,20 @@ impl OutputFrame {
         {
             return None;
         }
-        self.owner.as_ref()?.subscription_drain_delivery(&self.message)
+        self.owner
+            .as_ref()?
+            .subscription_drain_delivery(&self.message)
     }
 
     fn suppressed(&self) -> bool {
         self.owner.as_ref().is_some_and(|owner| {
             owner.suppresses_message(&self.message)
                 || (!self.subscription_control
-                    && owner.subscription_cancellation_delivery(&self.message)
+                    && owner
+                        .subscription_cancellation_delivery(&self.message)
                         .is_some_and(|delivery| {
-                            delivery.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
+                            delivery.completion_state.load(Ordering::Acquire)
+                                == FINAL_TERMINAL_DRAINED
                         }))
         })
     }
@@ -557,27 +565,42 @@ impl OutputQueue {
     }
 
     fn begin_subscription_drain(&self, deadline: asupersync::Time) {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.subscription_drain_deadline = Some(
-            state.subscription_drain_deadline.map_or(deadline, |old| old.min(deadline)),
+            state
+                .subscription_drain_deadline
+                .map_or(deadline, |old| old.min(deadline)),
         );
     }
 
     fn write_deadline(&self, frame_deadline: asupersync::Time) -> asupersync::Time {
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .subscription_drain_deadline.map_or(frame_deadline, |drain| drain.min(frame_deadline))
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .subscription_drain_deadline
+            .map_or(frame_deadline, |drain| drain.min(frame_deadline))
     }
 
     fn has_subscription_drain(&self) -> bool {
         let candidates = {
-            let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.candidates.values().cloned().collect::<Vec<_>>()
         };
         candidates.iter().filter_map(Weak::upgrade).any(|owner| {
-            owner.subscription_terminal.as_ref().is_some_and(|delivery| {
-                delivery.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
-                    && delivery.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
-            })
+            owner
+                .subscription_terminal
+                .as_ref()
+                .is_some_and(|delivery| {
+                    delivery.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
+                        && delivery.completion_state.load(Ordering::Acquire)
+                            == FINAL_TERMINAL_DRAINED
+                })
         })
     }
 
@@ -598,11 +621,18 @@ impl OutputQueue {
         self.enqueue_frame(message, owner, false)
     }
 
-    fn enqueue_subscription_control(&self, message: JsonRpcMessage, owner: Arc<OutputOwner>) -> bool {
-        if owner.subscription_cancellation_delivery(&message).is_none_or(|delivery| {
-            delivery.state.load(Ordering::Acquire) != FINAL_TERMINAL_ENQUEUED
-                || delivery.completion_state.load(Ordering::Acquire) != FINAL_TERMINAL_DRAINED
-        }) {
+    fn enqueue_subscription_control(
+        &self,
+        message: JsonRpcMessage,
+        owner: Arc<OutputOwner>,
+    ) -> bool {
+        if owner
+            .subscription_cancellation_delivery(&message)
+            .is_none_or(|delivery| {
+                delivery.state.load(Ordering::Acquire) != FINAL_TERMINAL_ENQUEUED
+                    || delivery.completion_state.load(Ordering::Acquire) != FINAL_TERMINAL_DRAINED
+            })
+        {
             return false;
         }
         self.enqueue_frame(message, Some(owner), true)
@@ -812,15 +842,11 @@ impl OutputQueue {
     /// writer alone decides whether suppression is safe or partial output
     /// requires terminating the connection.
     fn discard_cancelled(&self) -> usize {
-        self.discard_frames(|frame| {
-            frame.suppressed()
-        })
+        self.discard_frames(|frame| frame.suppressed())
     }
 
     fn retain_subscription_drain(&self) {
-        self.discard_frames(|frame| {
-            frame.drain_delivery().is_none() || frame.suppressed()
-        });
+        self.discard_frames(|frame| frame.drain_delivery().is_none() || frame.suppressed());
     }
 
     fn discard_frames(&self, discard: impl Fn(&OutputFrame) -> bool) -> usize {
@@ -1013,13 +1039,20 @@ async fn send_frame<W: ConnectionWriter>(
         if terminal_control {
             // Retain the caller's absolute ceiling even while masking its
             // cancellation for this elected, bounded terminal write only.
-            if cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline) {
+            if cx
+                .budget()
+                .deadline
+                .is_some_and(|deadline| cx.now() >= deadline)
+            {
                 return Poll::Ready(WriteAttempt::Complete(Err(TransportError::Timeout)));
             }
             let sent = cx.masked(|| sending.as_mut().poll(task));
             if sent.is_ready() {
                 if cx.now() >= output.write_deadline(write_deadline)
-                    || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+                    || cx
+                        .budget()
+                        .deadline
+                        .is_some_and(|deadline| cx.now() >= deadline)
                 {
                     return Poll::Ready(WriteAttempt::Complete(Err(TransportError::Timeout)));
                 }
@@ -1108,8 +1141,16 @@ fn write<W: ConnectionWriter>(
                             charge.bytes = frame.bytes;
                             output.discard_cancelled();
                             if keep_response {
-                                match send_frame(&mut writer, &cx, &frame, &output, timeout.as_mut(), write_deadline, false)
-                                    .await
+                                match send_frame(
+                                    &mut writer,
+                                    &cx,
+                                    &frame,
+                                    &output,
+                                    timeout.as_mut(),
+                                    write_deadline,
+                                    false,
+                                )
+                                .await
                                 {
                                     WriteAttempt::Complete(result) => result,
                                     // Never re-arm the expired request timer
@@ -1327,11 +1368,17 @@ fn prepare_request(
         let notification_cancellation = dispatch_cancellation.clone();
         let notifications: NotificationSender = Arc::new(move |notification| {
             let message = JsonRpcMessage::Request(notification);
-            let scoped = notification_owner.subscription_drain_delivery(&message).is_some();
-            let terminal = notification_owner.subscription_cancellation_delivery(&message)
-                .is_some_and(|delivery| delivery.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED);
+            let scoped = notification_owner
+                .subscription_drain_delivery(&message)
+                .is_some();
+            let terminal = notification_owner
+                .subscription_cancellation_delivery(&message)
+                .is_some_and(|delivery| {
+                    delivery.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
+                });
             let queued = if terminal {
-                notification_output.enqueue_subscription_control(message, Arc::clone(&notification_owner))
+                notification_output
+                    .enqueue_subscription_control(message, Arc::clone(&notification_owner))
             } else {
                 notification_output.enqueue(message, Some(Arc::clone(&notification_owner)))
             };
@@ -1815,31 +1862,30 @@ impl LegacyIngress {
                 active: None,
             })),
         });
-        let authentication = match Self::authenticate(lifetime, cx, budget, &mut request)
-            .and_then(|receipt| {
+        let authentication =
+            match Self::authenticate(lifetime, cx, budget, &mut request).and_then(|receipt| {
                 bind_connection_principal(&self.principal, receipt.fingerprint)?;
                 Ok(receipt)
-            })
-        {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                if let Some(id) = request.id {
-                    let error = mask_peer_error(error, lifetime.server.mask_error_details);
-                    lifetime.output.enqueue(
-                        JsonRpcMessage::Response(JsonRpcResponse::error(
-                            Some(id),
-                            JsonRpcError {
-                                code: error.code.into(),
-                                message: error.message,
-                                data: error.data,
-                            },
-                        )),
-                        Some(owner),
-                    );
+            }) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    if let Some(id) = request.id {
+                        let error = mask_peer_error(error, lifetime.server.mask_error_details);
+                        lifetime.output.enqueue(
+                            JsonRpcMessage::Response(JsonRpcResponse::error(
+                                Some(id),
+                                JsonRpcError {
+                                    code: error.code.into(),
+                                    message: error.message,
+                                    data: error.data,
+                                },
+                            )),
+                            Some(owner),
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-        };
+            };
         let sender = self.sender.as_ref().ok_or_else(|| {
             server_run_error("receive", "legacy_closed", "Native legacy input is closed")
         })?;
@@ -3003,7 +3049,9 @@ impl Server {
                 lifetime.output.retain_subscription_drain();
             }
             if !stopping
-                && subscription_shutdown.as_ref().is_none_or(|shutdown| shutdown.admission_stopped)
+                && subscription_shutdown
+                    .as_ref()
+                    .is_none_or(|shutdown| shutdown.admission_stopped)
                 && writing.is_none()
                 && lifetime.output.has_frames()
             {
@@ -3062,7 +3110,9 @@ impl Server {
                                 cx.masked(|| drain.as_mut().poll(task)).is_ready()
                             })
                     } else {
-                        drain.as_mut().is_some_and(|drain| drain.as_mut().poll(task).is_ready())
+                        drain
+                            .as_mut()
+                            .is_some_and(|drain| drain.as_mut().poll(task).is_ready())
                     };
                     if drain_expired {
                         return Poll::Ready(Event::DrainExpired);
@@ -3295,7 +3345,10 @@ impl Server {
                         u64::try_from(DISPATCH_WORKER_SHUTDOWN_TIMEOUT.as_nanos())
                             .unwrap_or(u64::MAX),
                     );
-                    let deadline = cx.budget().deadline.map_or(maximum, |original| original.min(maximum));
+                    let deadline = cx
+                        .budget()
+                        .deadline
+                        .map_or(maximum, |original| original.min(maximum));
                     let receipt = server.final_subscriptions.terminate_with_receipt();
                     if receipt.terminated != 0 || lifetime.output.has_subscription_drain() {
                         lifetime.output.begin_subscription_drain(deadline);
@@ -4470,10 +4523,8 @@ mod tests {
         run(|cx| async move {
             let gate = Arc::new(Gate::default());
             let io = Arc::new(IoProbe::default());
-            let bound = server(&gate).bind_stdio_io(
-                ProbeReader(Arc::clone(&io)),
-                ProbeWriter(Arc::clone(&io)),
-            );
+            let bound = server(&gate)
+                .bind_stdio_io(ProbeReader(Arc::clone(&io)), ProbeWriter(Arc::clone(&io)));
             let operator = bound.operator_handle();
             let starting = OperatorSnapshot::capture(&operator).unwrap();
             assert_eq!(starting.readiness(), OperatorReadiness::Starting);
@@ -4554,10 +4605,8 @@ mod tests {
             for poll_serving in [false, true] {
                 let gate = Arc::new(Gate::default());
                 let io = Arc::new(IoProbe::default());
-                let bound = server(&gate).bind_stdio_io(
-                    ProbeReader(Arc::clone(&io)),
-                    ProbeWriter(Arc::clone(&io)),
-                );
+                let bound = server(&gate)
+                    .bind_stdio_io(ProbeReader(Arc::clone(&io)), ProbeWriter(Arc::clone(&io)));
                 let operator = bound.operator_handle();
                 let mut serving = Box::pin(bound.serve(&cx));
                 io.feed(&encoded(&discover(1)));
@@ -5226,12 +5275,16 @@ mod tests {
         fn owner() -> Arc<OutputOwner> {
             let admission = Arc::new(DispatchQueueState::default());
             let JsonRpcMessage::Request(request) = request(
-                50, SUBSCRIPTIONS_LISTEN, serde_json::json!({"notifications":{}}),
-            ) else { unreachable!() };
+                50,
+                SUBSCRIPTIONS_LISTEN,
+                serde_json::json!({"notifications":{}}),
+            ) else {
+                unreachable!()
+            };
             Arc::new(OutputOwner {
-                reservation: admission.admit_modern_request(
-                    &request, Arc::new(AtomicBool::new(false)),
-                ).unwrap(),
+                reservation: admission
+                    .admit_modern_request(&request, Arc::new(AtomicBool::new(false)))
+                    .unwrap(),
                 log_level: None,
                 subscription_terminal: Some(Arc::new(FinalSubscriptionTerminalDelivery::default())),
                 #[cfg(feature = "legacy-2024-11-05")]
@@ -5240,7 +5293,9 @@ mod tests {
         }
 
         fn control() -> JsonRpcMessage {
-            JsonRpcMessage::Request(subscription_cancellation_notification(&RequestId::Number(50)).unwrap())
+            JsonRpcMessage::Request(
+                subscription_cancellation_notification(&RequestId::Number(50)).unwrap(),
+            )
         }
 
         #[test]
@@ -5257,7 +5312,10 @@ mod tests {
                 assert!(!output.admits_write(&generic));
                 output.finish(generic.bytes);
                 drop(generic);
-                assert_eq!(delivery.state.load(Ordering::Acquire), FINAL_TERMINAL_ENQUEUED);
+                assert_eq!(
+                    delivery.state.load(Ordering::Acquire),
+                    FINAL_TERMINAL_ENQUEUED
+                );
                 assert!(!delivery.is_settled());
                 match withdrawal {
                     0 => output.stop(),
@@ -5272,14 +5330,23 @@ mod tests {
                         drop(elected);
                     }
                 }
-                assert_eq!(delivery.state.load(Ordering::Acquire), FINAL_TERMINAL_FAILED);
+                assert_eq!(
+                    delivery.state.load(Ordering::Acquire),
+                    FINAL_TERMINAL_FAILED
+                );
                 assert!(delivery.is_settled());
                 assert!(!delivery.is_drained());
             }
         }
 
         #[derive(Clone, Copy, Debug)]
-        enum GuardCase { Live, CallerDeadline, DrainDeadline, PeerCancellation, ReceiptFailure }
+        enum GuardCase {
+            Live,
+            CallerDeadline,
+            DrainDeadline,
+            PeerCancellation,
+            ReceiptFailure,
+        }
 
         struct ReadyWriter {
             clock: Arc<VirtualClock>,
@@ -5301,31 +5368,56 @@ mod tests {
         impl ConnectionWriter for ReadyWriter {
             #[allow(clippy::unused_async_trait_impl)]
             async fn send(&mut self, cx: &Cx, _: &JsonRpcMessage) -> Result<(), TransportError> {
-                assert!(cx.checkpoint().is_ok(), "the elected write poll has bounded cancellation masking");
+                assert!(
+                    cx.checkpoint().is_ok(),
+                    "the elected write poll has bounded cancellation masking"
+                );
                 self.sends += 1;
                 match self.case {
                     GuardCase::Live => {}
-                    GuardCase::CallerDeadline => { self.clock.advance(10); }
-                    GuardCase::DrainDeadline => { self.clock.advance(5); }
-                    GuardCase::PeerCancellation => { self.owner.reservation.cancellation.cancel_by_peer(); }
-                    GuardCase::ReceiptFailure => self.owner.subscription_terminal.as_ref().unwrap().mark_failed(),
+                    GuardCase::CallerDeadline => {
+                        self.clock.advance(10);
+                    }
+                    GuardCase::DrainDeadline => {
+                        self.clock.advance(5);
+                    }
+                    GuardCase::PeerCancellation => {
+                        self.owner.reservation.cancellation.cancel_by_peer();
+                    }
+                    GuardCase::ReceiptFailure => self
+                        .owner
+                        .subscription_terminal
+                        .as_ref()
+                        .unwrap()
+                        .mark_failed(),
                 }
                 Ok(())
             }
             #[allow(clippy::unused_async_trait_impl)]
-            async fn close(&mut self, _: &Cx) -> Result<(), TransportError> { Ok(()) }
-            fn is_closed(&self) -> bool { false }
+            async fn close(&mut self, _: &Cx) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn is_closed(&self) -> bool {
+                false
+            }
         }
 
         #[test]
         fn ready_terminal_write_rechecks_original_and_whole_drain_authority_after_poll() {
-            for case in [GuardCase::Live, GuardCase::CallerDeadline, GuardCase::DrainDeadline,
-                GuardCase::PeerCancellation, GuardCase::ReceiptFailure]
-            {
+            for case in [
+                GuardCase::Live,
+                GuardCase::CallerDeadline,
+                GuardCase::DrainDeadline,
+                GuardCase::PeerCancellation,
+                GuardCase::ReceiptFailure,
+            ] {
                 let clock = Arc::new(VirtualClock::new());
                 let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
-                let runtime = RuntimeBuilder::current_thread().blocking_threads(0, 0)
-                    .with_timer_driver(timer.clone()).build().unwrap();
+                let runtime = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .with_timer_driver(timer.clone())
+                    .build()
+                    .unwrap();
                 let cx = runtime.request_cx_with_budget(
                     Budget::new().with_deadline(asupersync::Time::from_nanos(10)),
                 );
@@ -5337,23 +5429,46 @@ mod tests {
                 }
                 let output = Arc::new(OutputQueue::default());
                 output.begin_subscription_drain(asupersync::Time::from_nanos(
-                    if matches!(case, GuardCase::DrainDeadline) { 5 } else { 100 },
+                    if matches!(case, GuardCase::DrainDeadline) {
+                        5
+                    } else {
+                        100
+                    },
                 ));
                 assert!(output.enqueue_subscription_control(control(), Arc::clone(&owner)));
                 cx.set_cancel_requested(true);
                 let mut writing = write(
-                    ReadyWriter { clock: Arc::clone(&clock), case, owner, sends: 0 },
-                    cx.clone(), output.pop().unwrap(), Arc::clone(&output),
+                    ReadyWriter {
+                        clock: Arc::clone(&clock),
+                        case,
+                        owner,
+                        sends: 0,
+                    },
+                    cx.clone(),
+                    output.pop().unwrap(),
+                    Arc::clone(&output),
                 );
                 let caller = Cx::set_current(Some(cx.clone()));
-                let Poll::Ready((writer, result, _bytes)) = writing.as_mut().poll(
-                    &mut Context::from_waker(Waker::noop()),
-                ) else { panic!("the ready writer must settle in one poll: {case:?}") };
+                let Poll::Ready((writer, result, _bytes)) = writing
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("the ready writer must settle in one poll: {case:?}")
+                };
                 assert_eq!(writer.sends, 1);
                 assert_eq!(result.is_ok(), matches!(case, GuardCase::Live), "{case:?}");
-                assert_eq!(delivery.state.load(Ordering::Acquire),
-                    if matches!(case, GuardCase::Live) { FINAL_TERMINAL_DRAINED } else { FINAL_TERMINAL_FAILED });
-                assert!(cx.is_cancel_requested(), "masking never clears the caller cancellation");
+                assert_eq!(
+                    delivery.state.load(Ordering::Acquire),
+                    if matches!(case, GuardCase::Live) {
+                        FINAL_TERMINAL_DRAINED
+                    } else {
+                        FINAL_TERMINAL_FAILED
+                    }
+                );
+                assert!(
+                    cx.is_cancel_requested(),
+                    "masking never clears the caller cancellation"
+                );
                 drop(writing);
                 drop(caller);
                 drop(cx);
@@ -5369,39 +5484,69 @@ mod tests {
                     asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
                         let gate = Arc::new(Gate::default());
                         let io = Arc::new(IoProbe::default());
-                        io.allow(if partial_acknowledgement { 1 } else { usize::MAX });
+                        io.allow(if partial_acknowledgement {
+                            1
+                        } else {
+                            usize::MAX
+                        });
                         let service = server(&gate);
                         let registry = Arc::clone(&service.final_subscriptions);
                         let stream = Arc::clone(&io);
                         let (context_tx, context_rx) = std::sync::mpsc::sync_channel(1);
-                        let mut serving = cx.spawn(move |server_cx| async move {
-                            context_tx.send(server_cx.clone()).unwrap();
-                            service.serve_stdio_io(&server_cx,
-                                ProbeReader(Arc::clone(&stream)), ProbeWriter(stream)).await
-                        }).unwrap();
-                        io.feed(&encoded(&request(50, SUBSCRIPTIONS_LISTEN,
-                            serde_json::json!({"notifications":{}}))));
-                        until(&cx, || if partial_acknowledgement {
-                            io.0.lock().unwrap().outbound.len() == 1
-                        } else {
-                            io.messages().len() == 1
-                        }).await;
+                        let mut serving = cx
+                            .spawn(move |server_cx| async move {
+                                context_tx.send(server_cx.clone()).unwrap();
+                                service
+                                    .serve_stdio_io(
+                                        &server_cx,
+                                        ProbeReader(Arc::clone(&stream)),
+                                        ProbeWriter(stream),
+                                    )
+                                    .await
+                            })
+                            .unwrap();
+                        io.feed(&encoded(&request(
+                            50,
+                            SUBSCRIPTIONS_LISTEN,
+                            serde_json::json!({"notifications":{}}),
+                        )));
+                        until(&cx, || {
+                            if partial_acknowledgement {
+                                io.0.lock().unwrap().outbound.len() == 1
+                            } else {
+                                io.messages().len() == 1
+                            }
+                        })
+                        .await;
                         let before = io.0.lock().unwrap().outbound.len();
-                        if !partial_acknowledgement { io.allow(1); }
+                        if !partial_acknowledgement {
+                            io.allow(1);
+                        }
                         context_rx.try_recv().unwrap().cancel_with(
-                            CancelKind::User, Some("subscription shutdown drain regression"),
+                            CancelKind::User,
+                            Some("subscription shutdown drain regression"),
                         );
-                        until(&cx, || registry.is_terminating()
-                            && (partial_acknowledgement || io.0.lock().unwrap().outbound.len() == before + 1)).await;
+                        until(&cx, || {
+                            registry.is_terminating()
+                                && (partial_acknowledgement
+                                    || io.0.lock().unwrap().outbound.len() == before + 1)
+                        })
+                        .await;
                         {
                             let state = io.0.lock().unwrap();
-                            assert!(!state.reader_dropped && !state.writer_dropped,
-                                "the partial frame still owns both native halves");
+                            assert!(
+                                !state.reader_dropped && !state.writer_dropped,
+                                "the partial frame still owns both native halves"
+                            );
                         }
                         io.allow(usize::MAX);
                         serving.join(&cx).await.unwrap().unwrap();
                         let messages = io.messages();
-                        assert_eq!(messages.len(), 2, "only acknowledgement and cancellation may be written");
+                        assert_eq!(
+                            messages.len(),
+                            2,
+                            "only acknowledgement and cancellation may be written"
+                        );
                         assert!(matches!(&messages[0], JsonRpcMessage::Request(request)
                             if request.method == "notifications/subscriptions/acknowledged"));
                         let JsonRpcMessage::Request(control) = &messages[1] else {
@@ -5416,7 +5561,11 @@ mod tests {
                         assert!(state.outbound.ends_with(b"\n"));
                         assert!(state.reader_dropped && state.writer_dropped);
                         assert!(cx.checkpoint().is_ok());
-                    }).await.expect("partial subscription frames must drain within the owned shutdown bound");
+                    })
+                    .await
+                    .expect(
+                        "partial subscription frames must drain within the owned shutdown bound",
+                    );
                 });
             }
         }

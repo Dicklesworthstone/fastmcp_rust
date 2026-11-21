@@ -6,7 +6,10 @@
 use super::*;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
@@ -21,8 +24,10 @@ const SECOND: &str = "https://alternate.example/callback";
 
 fn registration() -> EnterpriseOidcRelyingPartyConfiguration {
     EnterpriseOidcRelyingPartyConfiguration {
-        issuer: "https://idp.example".into(), tenant: None,
-        client_id: "native-idp".into(), registration_generation: 11,
+        issuer: "https://idp.example".into(),
+        tenant: None,
+        client_id: "native-idp".into(),
+        registration_generation: 11,
         subject_type: EnterpriseOidcSubjectType::Pairwise,
         redirect_uris: vec![FIRST.into(), SECOND.into()],
     }
@@ -30,15 +35,23 @@ fn registration() -> EnterpriseOidcRelyingPartyConfiguration {
 
 fn policy() -> GuardedHttpFetchPolicy {
     GuardedHttpFetchPolicy::new(
-        MAX_OIDC_SECTOR_DOCUMENT_BYTES, Duration::from_secs(5),
-        Duration::from_secs(2), "reviewed-roots-7",
-    ).unwrap()
+        MAX_OIDC_SECTOR_DOCUMENT_BYTES,
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        "reviewed-roots-7",
+    )
+    .unwrap()
 }
 
 fn request_for(registration: &EnterpriseOidcRelyingPartyConfiguration) -> PreparedSectorReview {
     PreparedSectorReview::new(
-        OidcSectorRegistrationRole::Client, registration, SECTOR, &policy(), 7,
-    ).unwrap()
+        OidcSectorRegistrationRole::Client,
+        registration,
+        SECTOR,
+        &policy(),
+        7,
+    )
+    .unwrap()
 }
 
 fn response(
@@ -48,14 +61,20 @@ fn response(
 ) -> GuardedHttpFetchResponse {
     GuardedHttpFetchResponse {
         status: 200,
-        headers: vec![("content-type".into(), "application/json; charset=utf-8".into())],
-        body: body.to_vec(), redirect: None,
+        headers: vec![(
+            "content-type".into(),
+            "application/json; charset=utf-8".into(),
+        )],
+        body: body.to_vec(),
+        redirect: None,
         provenance: GuardedHttpPeerProvenance {
             host: url.host().into(),
             selected_address: SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)), url.port(),
+                IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)),
+                url.port(),
             ),
-            leaf_certificate_sha256: [42; 32], alpn: Some(b"http/1.1".to_vec()),
+            leaf_certificate_sha256: [42; 32],
+            alpn: Some(b"http/1.1".to_vec()),
             tls_protocol: Some("TLSv1_3".into()),
             root_policy_revision: policy.root_policy_revision().into(),
         },
@@ -81,34 +100,64 @@ pub(crate) fn reviewed_fixture(
 #[test]
 fn sector_review_accepts_multi_host_registration_without_granting_additional_redirects() {
     let registration = registration();
-    assert!(OidcSubjectNamespace::from_preregistered_redirects(
-        &registration.issuer, registration.subject_type, registration.registration_generation,
-        &registration.redirect_uris,
-    ).is_err());
+    assert!(
+        OidcSubjectNamespace::from_preregistered_redirects(
+            &registration.issuer,
+            registration.subject_type,
+            registration.registration_generation,
+            &registration.redirect_uris,
+        )
+        .is_err()
+    );
     let review = reviewed_fixture(
-        OidcSectorRegistrationRole::Client, &registration, SECTOR,
-        &["custom:another-client-callback", "https://extra.example/callback"],
+        OidcSectorRegistrationRole::Client,
+        &registration,
+        SECTOR,
+        &[
+            "custom:another-client-callback",
+            "https://extra.example/callback",
+        ],
     );
     let namespace = OidcSubjectNamespace::from_reviewed_sector(
-        &registration, OidcSectorRegistrationRole::Client, &review,
-    ).unwrap();
+        &registration,
+        OidcSectorRegistrationRole::Client,
+        &review,
+    )
+    .unwrap();
     assert_eq!(namespace.sector_host(), Some("sector.example"));
     assert_eq!(namespace.registration_generation(), Some(11));
-    assert_eq!(namespace.sector_review_digest(), Some(review.binding_digest()));
+    assert_eq!(
+        namespace.sector_review_digest(),
+        Some(review.binding_digest())
+    );
     assert_eq!(review.sector_identifier_uri(), SECTOR);
     assert_eq!(review.fetch_policy_generation(), 7);
     assert_eq!(review.fetch_policy(), &policy());
     assert_eq!(review.provenance().leaf_certificate_sha256, [42; 32]);
     let mut reordered = registration.clone();
     reordered.redirect_uris.reverse();
-    assert_eq!(OidcSubjectNamespace::from_reviewed_sector(
-        &reordered, OidcSectorRegistrationRole::Client, &review,
-    ).unwrap(), namespace);
+    assert_eq!(
+        OidcSubjectNamespace::from_reviewed_sector(
+            &reordered,
+            OidcSectorRegistrationRole::Client,
+            &review,
+        )
+        .unwrap(),
+        namespace
+    );
     let mut expanded = registration.clone();
-    expanded.redirect_uris.push("https://extra.example/callback".into());
-    assert_eq!(OidcSubjectNamespace::from_reviewed_sector(
-        &expanded, OidcSectorRegistrationRole::Client, &review,
-    ).err(), Some(EnterpriseIdentityError::RegistrationMismatch));
+    expanded
+        .redirect_uris
+        .push("https://extra.example/callback".into());
+    assert_eq!(
+        OidcSubjectNamespace::from_reviewed_sector(
+            &expanded,
+            OidcSectorRegistrationRole::Client,
+            &review,
+        )
+        .err(),
+        Some(EnterpriseIdentityError::RegistrationMismatch)
+    );
     let debug = format!("{review:?} {namespace:?}");
     for private in ["idp.example", "sector.example", "native-idp", FIRST] {
         assert!(!debug.contains(private));
@@ -136,22 +185,39 @@ fn sector_review_rejects_wrong_shapes_duplicates_and_missing_registered_redirect
         assert!(request.admit_response(wire).is_err(), "accepted malformed sector document");
     }
     let mut entries = registration.redirect_uris.clone();
-    entries.extend((2..MAX_OIDC_SECTOR_DOCUMENT_REDIRECTS).map(|index| {
-        format!("https://extra.example/callback-{index}")
-    }));
+    entries.extend(
+        (2..MAX_OIDC_SECTOR_DOCUMENT_REDIRECTS)
+            .map(|index| format!("https://extra.example/callback-{index}")),
+    );
     let request = request_for(&registration);
-    let wire = response(&serde_json::to_vec(&entries).unwrap(), &request.url, &request.policy);
+    let wire = response(
+        &serde_json::to_vec(&entries).unwrap(),
+        &request.url,
+        &request.policy,
+    );
     assert!(request.admit_response(wire).is_ok());
     entries.push("https://extra.example/one-too-many".into());
     let request = request_for(&registration);
-    let wire = response(&serde_json::to_vec(&entries).unwrap(), &request.url, &request.policy);
-    assert_eq!(request.admit_response(wire).err(), Some(OidcSectorReviewError::InvalidDocument));
+    let wire = response(
+        &serde_json::to_vec(&entries).unwrap(),
+        &request.url,
+        &request.policy,
+    );
+    assert_eq!(
+        request.admit_response(wire).err(),
+        Some(OidcSectorReviewError::InvalidDocument)
+    );
 }
 
 #[test]
 fn sector_review_is_bound_to_exact_relying_party_role_and_generation() {
     let registration = registration();
-    let review = reviewed_fixture(OidcSectorRegistrationRole::Client, &registration, SECTOR, &[]);
+    let review = reviewed_fixture(
+        OidcSectorRegistrationRole::Client,
+        &registration,
+        SECTOR,
+        &[],
+    );
     let before = review.binding_digest();
     for mutation in 0..7 {
         let mut changed = registration.clone();
@@ -161,21 +227,40 @@ fn sector_review_is_bound_to_exact_relying_party_role_and_generation() {
             2 => changed.client_id = "other-rp".into(),
             3 => changed.registration_generation += 1,
             4 => changed.subject_type = EnterpriseOidcSubjectType::Public,
-            5 => { changed.redirect_uris.pop(); }
+            5 => {
+                changed.redirect_uris.pop();
+            }
             6 => changed.redirect_uris.push(FIRST.into()),
             _ => unreachable!(),
         }
-        assert_eq!(OidcSubjectNamespace::from_reviewed_sector(
-            &changed, OidcSectorRegistrationRole::Client, &review,
-        ).err(), Some(EnterpriseIdentityError::RegistrationMismatch));
+        assert_eq!(
+            OidcSubjectNamespace::from_reviewed_sector(
+                &changed,
+                OidcSectorRegistrationRole::Client,
+                &review,
+            )
+            .err(),
+            Some(EnterpriseIdentityError::RegistrationMismatch)
+        );
         assert_eq!(review.binding_digest(), before);
     }
-    assert_eq!(OidcSubjectNamespace::from_reviewed_sector(
-        &registration, OidcSectorRegistrationRole::ResourceAuthorizationServer, &review,
-    ).err(), Some(EnterpriseIdentityError::RegistrationMismatch));
-    assert!(OidcSubjectNamespace::from_reviewed_sector(
-        &registration, OidcSectorRegistrationRole::Client, &review,
-    ).is_ok());
+    assert_eq!(
+        OidcSubjectNamespace::from_reviewed_sector(
+            &registration,
+            OidcSectorRegistrationRole::ResourceAuthorizationServer,
+            &review,
+        )
+        .err(),
+        Some(EnterpriseIdentityError::RegistrationMismatch)
+    );
+    assert!(
+        OidcSubjectNamespace::from_reviewed_sector(
+            &registration,
+            OidcSectorRegistrationRole::Client,
+            &review,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -187,14 +272,21 @@ fn sector_review_refuses_redirects_representation_confusion_and_foreign_provenan
         let mut wire = response(&body, &request.url, &request.policy);
         match mutation {
             0 => wire.status = 302,
-            1 => wire.redirect = Some(GuardedHttpRedirect {
-                status: 302, location: Some("https://other.example/redirects.json".into()),
-            }),
+            1 => {
+                wire.redirect = Some(GuardedHttpRedirect {
+                    status: 302,
+                    location: Some("https://other.example/redirects.json".into()),
+                })
+            }
             2 => wire.headers.clear(),
             3 => wire.headers[0].1 = "text/plain".into(),
             4 => wire.headers[0].1 = "application/json; charset=latin1".into(),
-            5 => wire.headers.push(("Content-Type".into(), "application/json".into())),
-            6 => wire.headers.push(("content-encoding".into(), "gzip".into())),
+            5 => wire
+                .headers
+                .push(("Content-Type".into(), "application/json".into())),
+            6 => wire
+                .headers
+                .push(("content-encoding".into(), "gzip".into())),
             7 => wire.provenance.host = "other.example".into(),
             8 => wire.provenance.selected_address.set_port(8443),
             9 => wire.provenance.root_policy_revision = "foreign-roots".into(),
@@ -203,23 +295,35 @@ fn sector_review_refuses_redirects_representation_confusion_and_foreign_provenan
             12 => wire.provenance.tls_protocol = Some("TLSv1_3\nforeign".into()),
             _ => unreachable!(),
         }
-        assert!(request.admit_response(wire).is_err(), "accepted response mutation {mutation}");
+        assert!(
+            request.admit_response(wire).is_err(),
+            "accepted response mutation {mutation}"
+        );
     }
 }
 
 #[test]
 fn sector_review_digest_binds_document_url_policy_and_tls_observation() {
     let registration = registration();
-    let base = reviewed_fixture(OidcSectorRegistrationRole::Client, &registration, SECTOR, &[]);
+    let base = reviewed_fixture(
+        OidcSectorRegistrationRole::Client,
+        &registration,
+        SECTOR,
+        &[],
+    );
     let extra = reviewed_fixture(
-        OidcSectorRegistrationRole::Client, &registration, SECTOR,
+        OidcSectorRegistrationRole::Client,
+        &registration,
+        SECTOR,
         &["https://extra.example/callback"],
     );
     assert_ne!(base.document_digest(), extra.document_digest());
     assert_ne!(base.binding_digest(), extra.binding_digest());
     let moved = reviewed_fixture(
-        OidcSectorRegistrationRole::Client, &registration,
-        "https://sector.example/revised.json", &[],
+        OidcSectorRegistrationRole::Client,
+        &registration,
+        "https://sector.example/revised.json",
+        &[],
     );
     assert_eq!(base.sector_host(), moved.sector_host());
     assert_eq!(base.document_digest(), moved.document_digest());
@@ -227,27 +331,43 @@ fn sector_review_digest_binds_document_url_policy_and_tls_observation() {
     let body = serde_json::to_vec(&registration.redirect_uris).unwrap();
     for mutation in 0..6 {
         let mut request = request_for(&registration);
-        if mutation == 0 { request.policy_generation += 1; }
+        if mutation == 0 {
+            request.policy_generation += 1;
+        }
         if mutation == 1 {
             request.policy = GuardedHttpFetchPolicy::new(
-                MAX_OIDC_SECTOR_DOCUMENT_BYTES, Duration::from_secs(4),
-                Duration::from_secs(2), "reviewed-roots-7",
-            ).unwrap();
+                MAX_OIDC_SECTOR_DOCUMENT_BYTES,
+                Duration::from_secs(4),
+                Duration::from_secs(2),
+                "reviewed-roots-7",
+            )
+            .unwrap();
         }
         if mutation == 2 {
             request.policy = GuardedHttpFetchPolicy::new(
-                MAX_OIDC_SECTOR_DOCUMENT_BYTES, Duration::from_secs(5),
-                Duration::from_secs(2), "reviewed-roots-8",
-            ).unwrap();
+                MAX_OIDC_SECTOR_DOCUMENT_BYTES,
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+                "reviewed-roots-8",
+            )
+            .unwrap();
         }
         let mut wire = response(&body, &request.url, &request.policy);
-        if mutation == 3 { wire.provenance.leaf_certificate_sha256[0] ^= 1; }
-        if mutation == 4 {
-            wire.provenance.selected_address.set_ip(IpAddr::V4(Ipv4Addr::new(93, 184, 215, 15)));
+        if mutation == 3 {
+            wire.provenance.leaf_certificate_sha256[0] ^= 1;
         }
-        if mutation == 5 { wire.body.push(b' '); }
+        if mutation == 4 {
+            wire.provenance
+                .selected_address
+                .set_ip(IpAddr::V4(Ipv4Addr::new(93, 184, 215, 15)));
+        }
+        if mutation == 5 {
+            wire.body.push(b' ');
+        }
         let changed = request.admit_response(wire).unwrap();
-        if mutation != 5 { assert_eq!(base.document_digest(), changed.document_digest()); }
+        if mutation != 5 {
+            assert_eq!(base.document_digest(), changed.document_digest());
+        }
         assert_ne!(base.binding_digest(), changed.binding_digest());
     }
 }
@@ -258,7 +378,8 @@ impl GuardedHttpResolver for CountingResolver {
         &self,
         _cx: Cx,
         _host: String,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>>
+    {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Err(GuardedHttpFetchError::ResolutionEmpty) })
     }
@@ -266,23 +387,41 @@ impl GuardedHttpResolver for CountingResolver {
 
 fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
     let mut future = std::pin::pin!(future);
-    future.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+    future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
 }
 
 #[test]
 fn public_sector_fetch_refuses_invalid_inputs_and_effect_ceiling_before_resolution() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let fetcher = GuardedHttpFetcher::with_resolver(
-        policy(), Arc::new(CountingResolver(Arc::clone(&calls))),
-    ).unwrap();
+    let fetcher =
+        GuardedHttpFetcher::with_resolver(policy(), Arc::new(CountingResolver(Arc::clone(&calls))))
+            .unwrap();
     let cx = Cx::for_testing();
     let registration = registration();
     for (uri, generation, error) in [
         (SECTOR, 0, OidcSectorReviewError::InvalidFetchPolicy),
-        ("http://sector.example/redirects.json", 7, OidcSectorReviewError::InvalidSectorUri),
-        ("https://user@sector.example/redirects.json", 7, OidcSectorReviewError::InvalidSectorUri),
-        ("https://sector.example/redirects.json#fragment", 7, OidcSectorReviewError::InvalidSectorUri),
-        ("https://127.0.0.1/redirects.json", 7, OidcSectorReviewError::InvalidSectorUri),
+        (
+            "http://sector.example/redirects.json",
+            7,
+            OidcSectorReviewError::InvalidSectorUri,
+        ),
+        (
+            "https://user@sector.example/redirects.json",
+            7,
+            OidcSectorReviewError::InvalidSectorUri,
+        ),
+        (
+            "https://sector.example/redirects.json#fragment",
+            7,
+            OidcSectorReviewError::InvalidSectorUri,
+        ),
+        (
+            "https://127.0.0.1/redirects.json",
+            7,
+            OidcSectorReviewError::InvalidSectorUri,
+        ),
     ] {
         assert!(matches!(poll_once(OidcSectorDocumentReview::fetch(
             &cx, &fetcher, OidcSectorRegistrationRole::Client, &registration, uri, generation,
@@ -290,36 +429,82 @@ fn public_sector_fetch_refuses_invalid_inputs_and_effect_ceiling_before_resoluti
     }
     let mut public = registration.clone();
     public.subject_type = EnterpriseOidcSubjectType::Public;
-    assert!(matches!(poll_once(OidcSectorDocumentReview::fetch(
-        &cx, &fetcher, OidcSectorRegistrationRole::Client, &public, SECTOR, 7,
-    )), Poll::Ready(Err(OidcSectorReviewError::InvalidRegistration))));
+    assert!(matches!(
+        poll_once(OidcSectorDocumentReview::fetch(
+            &cx,
+            &fetcher,
+            OidcSectorRegistrationRole::Client,
+            &public,
+            SECTOR,
+            7,
+        )),
+        Poll::Ready(Err(OidcSectorReviewError::InvalidRegistration))
+    ));
     let oversized = GuardedHttpFetcher::with_resolver(
         GuardedHttpFetchPolicy::new(
-            MAX_OIDC_SECTOR_DOCUMENT_BYTES + 1, Duration::from_secs(5),
-            Duration::from_secs(2), "reviewed-roots-7",
-        ).unwrap(), Arc::new(CountingResolver(Arc::clone(&calls))),
-    ).unwrap();
-    assert!(matches!(poll_once(OidcSectorDocumentReview::fetch(
-        &cx, &oversized, OidcSectorRegistrationRole::Client, &registration, SECTOR, 7,
-    )), Poll::Ready(Err(OidcSectorReviewError::InvalidFetchPolicy))));
+            MAX_OIDC_SECTOR_DOCUMENT_BYTES + 1,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            "reviewed-roots-7",
+        )
+        .unwrap(),
+        Arc::new(CountingResolver(Arc::clone(&calls))),
+    )
+    .unwrap();
+    assert!(matches!(
+        poll_once(OidcSectorDocumentReview::fetch(
+            &cx,
+            &oversized,
+            OidcSectorRegistrationRole::Client,
+            &registration,
+            SECTOR,
+            7,
+        )),
+        Poll::Ready(Err(OidcSectorReviewError::InvalidFetchPolicy))
+    ));
     {
         let _caller = Cx::set_current(Some(cx.clone()));
         let _no_io = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
-        assert!(matches!(poll_once(OidcSectorDocumentReview::fetch(
-            &cx, &fetcher, OidcSectorRegistrationRole::Client, &registration, SECTOR, 7,
-        )), Poll::Ready(Err(OidcSectorReviewError::RuntimeUnavailable))));
+        assert!(matches!(
+            poll_once(OidcSectorDocumentReview::fetch(
+                &cx,
+                &fetcher,
+                OidcSectorRegistrationRole::Client,
+                &registration,
+                SECTOR,
+                7,
+            )),
+            Poll::Ready(Err(OidcSectorReviewError::RuntimeUnavailable))
+        ));
     }
     cx.set_cancel_requested(true);
-    assert!(matches!(poll_once(OidcSectorDocumentReview::fetch(
-        &cx, &fetcher, OidcSectorRegistrationRole::Client, &registration, SECTOR, 7,
-    )), Poll::Ready(Err(OidcSectorReviewError::Cancelled))));
+    assert!(matches!(
+        poll_once(OidcSectorDocumentReview::fetch(
+            &cx,
+            &fetcher,
+            OidcSectorRegistrationRole::Client,
+            &registration,
+            SECTOR,
+            7,
+        )),
+        Poll::Ready(Err(OidcSectorReviewError::Cancelled))
+    ));
     let expired = Cx::for_testing_with_budget(Budget::new().with_deadline(Time::ZERO));
-    assert!(matches!(poll_once(OidcSectorDocumentReview::fetch(
-        &expired, &fetcher, OidcSectorRegistrationRole::Client, &registration, SECTOR, 7,
-    )), Poll::Ready(Err(OidcSectorReviewError::TimedOut | OidcSectorReviewError::Cancelled))));
+    assert!(matches!(
+        poll_once(OidcSectorDocumentReview::fetch(
+            &expired,
+            &fetcher,
+            OidcSectorRegistrationRole::Client,
+            &registration,
+            SECTOR,
+            7,
+        )),
+        Poll::Ready(Err(
+            OidcSectorReviewError::TimedOut | OidcSectorReviewError::Cancelled
+        ))
+    ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
-
 
 fn capability_bits(cx: &Cx) -> usize {
     let capabilities = cx.capabilities();
@@ -342,7 +527,8 @@ impl GuardedHttpResolver for CapabilityResolver {
         &self,
         cx: Cx,
         _host: String,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>>
+    {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.held.store(capability_bits(&cx), Ordering::SeqCst);
         self.ambient.store(
@@ -365,10 +551,16 @@ fn public_sector_fetch_passes_the_admitted_effect_ceiling_to_resolver_children()
         let calls = Arc::new(AtomicUsize::new(0));
         let held = Arc::new(AtomicUsize::new(usize::MAX));
         let ambient = Arc::new(AtomicUsize::new(usize::MAX));
-        let fetcher = GuardedHttpFetcher::with_resolver(policy(), Arc::new(CapabilityResolver {
-            calls: Arc::clone(&calls), held: Arc::clone(&held),
-            ambient: Arc::clone(&ambient), pending: false,
-        })).unwrap();
+        let fetcher = GuardedHttpFetcher::with_resolver(
+            policy(),
+            Arc::new(CapabilityResolver {
+                calls: Arc::clone(&calls),
+                held: Arc::clone(&held),
+                ambient: Arc::clone(&ambient),
+                pending: false,
+            }),
+        )
+        .unwrap();
         let registration = registration();
         let mask = match denied {
             4 => CapSet::<true, true, false, true, true>::MASK,
@@ -380,12 +572,18 @@ fn public_sector_fetch_passes_the_admitted_effect_ceiling_to_resolver_children()
             let caller = Cx::current().expect("test runtime installs its caller");
             assert_eq!(capability_bits(&caller), 31);
             let mut review = std::pin::pin!(OidcSectorDocumentReview::fetch(
-                &caller, &fetcher, OidcSectorRegistrationRole::Client, &registration, SECTOR, 7,
+                &caller,
+                &fetcher,
+                OidcSectorRegistrationRole::Client,
+                &registration,
+                SECTOR,
+                7,
             ));
             poll_fn(|task_cx| {
                 let _restriction = Cx::push_restriction(mask);
                 review.as_mut().poll(task_cx)
-            }).await
+            })
+            .await
         });
         assert_eq!(outcome.err(), Some(OidcSectorReviewError::FetchFailed));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -401,17 +599,26 @@ fn public_sector_fetch_stops_before_repolling_under_a_narrower_effect_ceiling() 
         CapSet::<true, true, true, true, false>::MASK,
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
-        let fetcher = GuardedHttpFetcher::with_resolver(policy(), Arc::new(CapabilityResolver {
-            calls: Arc::clone(&calls),
-            held: Arc::new(AtomicUsize::new(usize::MAX)),
-            ambient: Arc::new(AtomicUsize::new(usize::MAX)),
-            pending: true,
-        })).unwrap();
+        let fetcher = GuardedHttpFetcher::with_resolver(
+            policy(),
+            Arc::new(CapabilityResolver {
+                calls: Arc::clone(&calls),
+                held: Arc::new(AtomicUsize::new(usize::MAX)),
+                ambient: Arc::new(AtomicUsize::new(usize::MAX)),
+                pending: true,
+            }),
+        )
+        .unwrap();
         let registration = registration();
         fastmcp_core::block_on(async {
             let caller = Cx::current().expect("test runtime installs its caller");
             let mut review = std::pin::pin!(OidcSectorDocumentReview::fetch(
-                &caller, &fetcher, OidcSectorRegistrationRole::Client, &registration, SECTOR, 7,
+                &caller,
+                &fetcher,
+                OidcSectorRegistrationRole::Client,
+                &registration,
+                SECTOR,
+                7,
             ));
             poll_fn(|task_cx| {
                 assert!(review.as_mut().poll(task_cx).is_pending());
@@ -420,10 +627,14 @@ fn public_sector_fetch_stops_before_repolling_under_a_narrower_effect_ceiling() 
                     let _restriction = Cx::push_restriction(mask);
                     review.as_mut().poll(task_cx)
                 };
-                assert!(matches!(result, Poll::Ready(Err(OidcSectorReviewError::RuntimeUnavailable))));
+                assert!(matches!(
+                    result,
+                    Poll::Ready(Err(OidcSectorReviewError::RuntimeUnavailable))
+                ));
                 assert_eq!(calls.load(Ordering::SeqCst), before);
                 Poll::Ready(())
-            }).await;
+            })
+            .await;
         });
     }
 }

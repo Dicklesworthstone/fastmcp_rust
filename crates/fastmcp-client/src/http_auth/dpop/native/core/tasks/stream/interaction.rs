@@ -19,21 +19,21 @@ use fastmcp_protocol::{
 };
 use serde_json::{Value, json};
 
-use super::{
-    DpopCredential, DpopHttpClient, DpopStreamError, DpopStreamLimits, DpopTaskOperation,
-    Idle, ManagedCoreError, ManagedTaskEvent, Prepared, PreparedStream, Reply,
-    TaskStreamDecoder, WaitBounds, check_live, progress_marker,
-};
 use super::super::{CoreDecoder, DpopHttpError, DpopTasksError, ManagedTaskRequest, wire};
+use super::{
+    DpopCredential, DpopHttpClient, DpopStreamError, DpopStreamLimits, DpopTaskOperation, Idle,
+    ManagedCoreError, ManagedTaskEvent, Prepared, PreparedStream, Reply, TaskStreamDecoder,
+    WaitBounds, check_live, progress_marker,
+};
 use crate::http_auth::dpop::native::within;
 use crate::http_auth::rpc::interaction::{
     ManagedInputReply, ManagedInteractionError, ManagedInteractionLimits, admit_challenge,
     admit_fresh_id, continuation_request, validate_initial,
 };
-use crate::http_auth::sampling::inputs::mixed::{CoreInputHost, CoreInputLimits};
 use crate::http_auth::sampling::inputs::mixed::session::{
     CoreInputSession, CoreInputSessionError, CoreInputUsage,
 };
+use crate::http_auth::sampling::inputs::mixed::{CoreInputHost, CoreInputLimits};
 use crate::http_executor::parameter_headers::ReviewedToolHeaders;
 
 /// Whole-conversation limits. Core total bytes count both encoded request
@@ -69,9 +69,16 @@ impl DpopTaskHostLimits {
         maximum_input_responses: usize,
     ) -> Result<Self, DpopTaskHostError> {
         let interaction = ManagedInteractionLimits::new(
-            stream.core, maximum_continuations, maximum_input_responses,
+            stream.core,
+            maximum_continuations,
+            maximum_input_responses,
         )?;
-        Ok(Self { stream, interaction, inputs, resolutions: maximum_continuations })
+        Ok(Self {
+            stream,
+            interaction,
+            inputs,
+            resolutions: maximum_continuations,
+        })
     }
 }
 
@@ -113,22 +120,34 @@ impl fmt::Display for DpopTaskHostError {
 }
 impl std::error::Error for DpopTaskHostError {}
 impl From<DpopStreamError> for DpopTaskHostError {
-    fn from(error: DpopStreamError) -> Self { Self::Stream(error) }
+    fn from(error: DpopStreamError) -> Self {
+        Self::Stream(error)
+    }
 }
 impl From<DpopTasksError> for DpopTaskHostError {
-    fn from(error: DpopTasksError) -> Self { Self::Stream(error.into()) }
+    fn from(error: DpopTasksError) -> Self {
+        Self::Stream(error.into())
+    }
 }
 impl From<DpopHttpError> for DpopTaskHostError {
-    fn from(error: DpopHttpError) -> Self { Self::Stream(error.into()) }
+    fn from(error: DpopHttpError) -> Self {
+        Self::Stream(error.into())
+    }
 }
 impl From<ManagedCoreError> for DpopTaskHostError {
-    fn from(error: ManagedCoreError) -> Self { Self::Stream(error.into()) }
+    fn from(error: ManagedCoreError) -> Self {
+        Self::Stream(error.into())
+    }
 }
 impl From<ManagedInteractionError> for DpopTaskHostError {
-    fn from(error: ManagedInteractionError) -> Self { Self::Interaction(error) }
+    fn from(error: ManagedInteractionError) -> Self {
+        Self::Interaction(error)
+    }
 }
 impl From<CoreInputSessionError> for DpopTaskHostError {
-    fn from(error: CoreInputSessionError) -> Self { Self::Input(error) }
+    fn from(error: CoreInputSessionError) -> Self {
+        Self::Input(error)
+    }
 }
 
 impl DpopHttpClient {
@@ -179,12 +198,24 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         let bounds = WaitBounds::new(
-            cx, self.policy.timeout.min(limits.stream.core.timeout()), credential,
+            cx,
+            self.policy.timeout.min(limits.stream.core.timeout()),
+            credential,
         )?;
         self.execute_task_conversation_with_bounds(
-            cx, cancellation, credential, metadata, operation, id_prefix,
-            limits, bounds, host, observer,
-        ).await.map(|completed| completed.result)
+            cx,
+            cancellation,
+            credential,
+            metadata,
+            operation,
+            id_prefix,
+            limits,
+            bounds,
+            host,
+            observer,
+        )
+        .await
+        .map(|completed| completed.result)
     }
 
     // Both entrypoints use the same conversation, input session, decoders and
@@ -208,78 +239,137 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         let mut idle = Idle::new(cx.now(), limits.stream.idle);
-        check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+        check_live(
+            cx,
+            cancellation,
+            &self.session,
+            credential,
+            idle.bounds(bounds),
+        )?;
         validate_prefix(id_prefix)?;
         if !matches!(&operation.request, ManagedTaskRequest::CallTool { .. }) {
             return Err(ManagedInteractionError::InvalidInitialRequest.into());
         }
-        let ids = (operation.discovery_id.clone(), operation.operation_id.clone());
+        let ids = (
+            operation.discovery_id.clone(),
+            operation.operation_id.clone(),
+        );
         let reviewed = operation.reviewed_headers.clone();
         let mut prepared = Box::new(Prepared::new(
-            self.resource().as_str(), metadata, operation, limits.stream.core,
+            self.resource().as_str(),
+            metadata,
+            operation,
+            limits.stream.core,
             self.policy.max_body_bytes,
         )?);
         let mut conversation = Conversation::new(&prepared, ids, reviewed, limits.interaction)?;
         let mut inputs = CoreInputSession::new(
-            cx, cancellation, conversation.original.clone(), limits.inputs, limits.resolutions,
+            cx,
+            cancellation,
+            conversation.original.clone(),
+            limits.inputs,
+            limits.resolutions,
         )?;
         if inputs.deadline() < bounds.deadline {
             bounds.deadline = inputs.deadline();
             bounds.terminal = DpopHttpError::TimedOut;
         }
         loop {
-            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+            check_live(
+                cx,
+                cancellation,
+                &self.session,
+                credential,
+                idle.bounds(bounds),
+            )?;
             let charged = conversation.reserve_round(&mut prepared)?;
-            let progress = progress_marker(&prepared.operation_wire, limits.stream.core.request_bytes())?;
-            let response = self.post_resource_with_bounds(
-                cx, cancellation, credential, &prepared.discovery_wire, idle.bounds(bounds),
-            ).await?;
-            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-            let bytes = charged.checked_add(response.body().len())
+            let progress =
+                progress_marker(&prepared.operation_wire, limits.stream.core.request_bytes())?;
+            let response = self
+                .post_resource_with_bounds(
+                    cx,
+                    cancellation,
+                    credential,
+                    &prepared.discovery_wire,
+                    idle.bounds(bounds),
+                )
+                .await?;
+            check_live(
+                cx,
+                cancellation,
+                &self.session,
+                credential,
+                idle.bounds(bounds),
+            )?;
+            let bytes = charged
+                .checked_add(response.body().len())
                 .ok_or(ManagedCoreError::ResponseByteLimit)?;
             let admitted = (*prepared).admit(response);
-            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-            let (wire, mut decoder) = TaskStreamDecoder::from_admitted(
-                admitted?, limits.stream.core, bytes, progress,
+            check_live(
+                cx,
+                cancellation,
+                &self.session,
+                credential,
+                idle.bounds(bounds),
             )?;
+            let (wire, mut decoder) =
+                TaskStreamDecoder::from_admitted(admitted?, limits.stream.core, bytes, progress)?;
             // The fresh per-method decoder inherits cumulative quotas, not the
             // previous round's progress value or terminal flag.
             decoder.notifications = conversation.usage.1;
             let completed = Box::pin(self.execute_prepared_core_stream(
-                cx, cancellation, credential,
-                PreparedStream { wire, decoder, limits: limits.stream, bounds, idle },
+                cx,
+                cancellation,
+                credential,
+                PreparedStream {
+                    wire,
+                    decoder,
+                    limits: limits.stream,
+                    bounds,
+                    idle,
+                },
                 &mut observer,
-            )).await?;
+            ))
+            .await?;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             let input = match conversation.accept(completed.result, completed.usage)? {
-                Step::Complete(result) => return Ok(CompletedTaskConversation {
-                    result: DpopTaskHostResult {
-                        result, usage: inputs.usage(), continuations: conversation.continuations,
-                    },
-                    usage: conversation.usage,
-                    bounds,
-                }),
+                Step::Complete(result) => {
+                    return Ok(CompletedTaskConversation {
+                        result: DpopTaskHostResult {
+                            result,
+                            usage: inputs.usage(),
+                            continuations: conversation.continuations,
+                        },
+                        usage: conversation.usage,
+                        bounds,
+                    });
+                }
                 Step::Input(input) => input,
             };
             let ids = conversation.next_ids(id_prefix)?;
             let reply = within(cx, cancellation, &self.session, credential, bounds, async {
-                Ok(inputs.resolve(cx, (*input).clone(), ids.1.clone(), host).await)
-            }).await??;
+                Ok(inputs
+                    .resolve(cx, (*input).clone(), ids.1.clone(), host)
+                    .await)
+            })
+            .await??;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             conversation.resume(&input, ids, reply)?;
             // A new idle allowance is per network round, never a new absolute
             // lifetime. Local serialization and discovery spend it too.
             idle = Idle::new(cx.now(), limits.stream.idle);
-            *prepared = conversation.prepare(
-                self.resource().as_str(), self.policy.max_body_bytes,
-            )?;
+            *prepared =
+                conversation.prepare(self.resource().as_str(), self.policy.max_body_bytes)?;
         }
     }
 }
 
 fn validate_prefix(prefix: &str) -> Result<(), DpopTaskHostError> {
-    if prefix.is_empty() || prefix.len() > 128
-        || !prefix.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    if prefix.is_empty()
+        || prefix.len() > 128
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
     {
         return Err(DpopTaskHostError::InvalidIdPrefix);
     }
@@ -318,20 +408,30 @@ impl Conversation {
         };
         validate_initial(original)?;
         Ok(Self {
-            original: (**original).clone(), current: (**original).clone(),
-            used_ids: vec![ids.0.clone(), ids.1.clone()], ids, reviewed, limits,
-            usage: (0, 0), continuations: 0, input_responses: 0,
+            original: (**original).clone(),
+            current: (**original).clone(),
+            used_ids: vec![ids.0.clone(), ids.1.clone()],
+            ids,
+            reviewed,
+            limits,
+            usage: (0, 0),
+            continuations: 0,
+            input_responses: 0,
         })
     }
 
     fn reserve_round(&self, prepared: &mut Prepared) -> Result<usize, DpopTaskHostError> {
-        let bytes = self.usage.0
+        let bytes = self
+            .usage
+            .0
             .checked_add(prepared.discovery_wire.body().len())
             .and_then(|bytes| bytes.checked_add(prepared.operation_wire.body().len()))
             .ok_or(ManagedCoreError::ResponseByteLimit)?;
         // Before even discovery can spend authority. The discovery decoder's
         // remaining limit subsequently becomes the operation decoder's limit.
-        prepared.discovery_decoder.resume_usage(bytes, self.usage.1)?;
+        prepared
+            .discovery_decoder
+            .resume_usage(bytes, self.usage.1)?;
         Ok(bytes)
     }
 
@@ -340,7 +440,8 @@ impl Conversation {
         event: ManagedTaskEvent,
         usage: (usize, usize),
     ) -> Result<Step, DpopTaskHostError> {
-        if usage.0 < self.usage.0 || usage.1 < self.usage.1
+        if usage.0 < self.usage.0
+            || usage.1 < self.usage.1
             || usage.0 > self.limits.core().total_bytes()
             || usage.1 > self.limits.core().notifications()
         {
@@ -357,8 +458,13 @@ impl Conversation {
                 if usage.0 >= self.limits.core().total_bytes() {
                     return Err(ManagedCoreError::ResponseByteLimit.into());
                 }
-                admit_challenge(&self.original, input, self.limits,
-                    self.continuations, self.input_responses)?;
+                admit_challenge(
+                    &self.original,
+                    input,
+                    self.limits,
+                    self.continuations,
+                    self.input_responses,
+                )?;
                 let input: &InputRequiredResult = input;
                 Step::Input(Box::new(input.clone()))
             }
@@ -384,14 +490,22 @@ impl Conversation {
         ids: (RequestId, RequestId),
         reply: ManagedInputReply,
     ) -> Result<(), DpopTaskHostError> {
-        admit_challenge(&self.original, input, self.limits,
-            self.continuations, self.input_responses)?;
+        admit_challenge(
+            &self.original,
+            input,
+            self.limits,
+            self.continuations,
+            self.input_responses,
+        )?;
         admit_fresh_id(&self.used_ids, &ids.0)?;
         admit_fresh_id(&self.used_ids, &ids.1)?;
         if ids.0.correlates_with(&ids.1) || !ids.1.correlates_with(&reply.request_id) {
             return Err(ManagedInteractionError::RepeatedRequestId.into());
         }
-        let count = reply.input_responses.as_ref().map_or(0, |answers| answers.len());
+        let count = reply
+            .input_responses
+            .as_ref()
+            .map_or(0, |answers| answers.len());
         let next = continuation_request(&self.original, input, reply.input_responses)?;
         self.current = next;
         self.used_ids.extend([ids.0.clone(), ids.1.clone()]);
@@ -404,28 +518,55 @@ impl Conversation {
     fn prepare(&self, target: &str, native_maximum: usize) -> Result<Prepared, DpopTaskHostError> {
         let limits = self.limits.core();
         let maximum = limits.request_bytes().min(native_maximum);
-        let params = self.current.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+        let params = self
+            .current
+            .encode_params()
+            .map_err(|_| ManagedCoreError::InvalidRequest)?
             .ok_or(ManagedCoreError::InvalidRequest)?;
-        let name = params.get("name").and_then(Value::as_str)
-            .ok_or(ManagedCoreError::InvalidRequest)?.to_owned();
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(ManagedCoreError::InvalidRequest)?
+            .to_owned();
         // Only original metadata enters discovery. No argument, host reply or
         // opaque continuation state can leak through the negotiation request.
         let discovery_params = json!({"_meta":params["_meta"]});
         let discovery = CoreRequest::decode(
-            ProtocolEra::Modern2026, "server/discover", Some(&discovery_params),
-        ).map_err(|_| ManagedCoreError::InvalidRequest)?;
-        let discovery_wire = wire(target, "server/discover", &self.ids.0,
-            discovery_params, None, maximum)?;
+            ProtocolEra::Modern2026,
+            "server/discover",
+            Some(&discovery_params),
+        )
+        .map_err(|_| ManagedCoreError::InvalidRequest)?;
+        let discovery_wire = wire(
+            target,
+            "server/discover",
+            &self.ids.0,
+            discovery_params,
+            None,
+            maximum,
+        )?;
         let discovery_decoder = CoreDecoder::for_request(discovery, self.ids.0.clone(), limits)?;
-        let operation_wire = wire(target, "tools/call", &self.ids.1, params, Some(name), maximum)?;
+        let operation_wire = wire(
+            target,
+            "tools/call",
+            &self.ids.1,
+            params,
+            Some(name),
+            maximum,
+        )?;
         let operation_wire = match &self.reviewed {
-            Some(reviewed) => operation_wire.with_reviewed_tool_headers(reviewed)
+            Some(reviewed) => operation_wire
+                .with_reviewed_tool_headers(reviewed)
                 .map_err(DpopTasksError::from)?,
             None => operation_wire,
         };
         Ok(Prepared {
-            discovery_wire, discovery_decoder, operation_wire,
-            operation_id: self.ids.1.clone(), reply: Reply::Tool(Box::new(self.current.clone())), limits,
+            discovery_wire,
+            discovery_decoder,
+            operation_wire,
+            operation_id: self.ids.1.clone(),
+            reply: Reply::Tool(Box::new(self.current.clone())),
+            limits,
         })
     }
 }
@@ -433,48 +574,80 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_auth::rpc::ManagedCoreLimits;
     use fastmcp_core::CanonicalHttpUrl;
     use fastmcp_protocol::{ClientCapabilities, CoreResult, FinalInputResponses};
-    use crate::http_auth::rpc::ManagedCoreLimits;
     use std::time::Duration;
 
     const TARGET: &str = "https://mcp.example/mcp?tenant=one";
     const INPUT: &str = r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"  state+/%\u0000  "}"#;
 
     fn setup(continuations: usize, responses: usize) -> Conversation {
-        let mut metadata = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        let mut metadata =
+            serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
         metadata["io.modelcontextprotocol/clientCapabilities"] = json!({"roots":{}});
         metadata["progressToken"] = json!("owned");
-        let limits = ManagedInteractionLimits::new(ManagedCoreLimits::default(), continuations, responses).unwrap();
-        let reviewed = Arc::new(ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(),
-            "echo", json!({"type":"object","properties":{
-                "region":{"type":"string","x-mcp-header":"Region"},
-                "private":{"type":"string","writeOnly":true}
-            }}), |_| true).unwrap());
+        let limits =
+            ManagedInteractionLimits::new(ManagedCoreLimits::default(), continuations, responses)
+                .unwrap();
+        let reviewed = Arc::new(
+            ReviewedToolHeaders::new(
+                CanonicalHttpUrl::parse(TARGET).unwrap(),
+                "echo",
+                json!({"type":"object","properties":{
+                    "region":{"type":"string","x-mcp-header":"Region"},
+                    "private":{"type":"string","writeOnly":true}
+                }}),
+                |_| true,
+            )
+            .unwrap(),
+        );
         let ids = (RequestId::Number(1), RequestId::Number(2));
-        let operation = DpopTaskOperation::new(ids.0.clone(), ids.1.clone(), ManagedTaskRequest::CallTool {
-            name: "echo".to_owned(), arguments: Some(json!({"region":"eu","private":"body-only"})),
-        }).unwrap().with_reviewed_tool_headers(Arc::clone(&reviewed)).unwrap();
-        let prepared = Prepared::new(TARGET, serde_json::from_value(metadata).unwrap(), operation,
-            limits.core(), 8192).unwrap();
+        let operation = DpopTaskOperation::new(
+            ids.0.clone(),
+            ids.1.clone(),
+            ManagedTaskRequest::CallTool {
+                name: "echo".to_owned(),
+                arguments: Some(json!({"region":"eu","private":"body-only"})),
+            },
+        )
+        .unwrap()
+        .with_reviewed_tool_headers(Arc::clone(&reviewed))
+        .unwrap();
+        let prepared = Prepared::new(
+            TARGET,
+            serde_json::from_value(metadata).unwrap(),
+            operation,
+            limits.core(),
+            8192,
+        )
+        .unwrap();
         Conversation::new(&prepared, ids, Some(reviewed), limits).unwrap()
     }
 
     fn result(state: &Conversation, source: &str) -> ManagedTaskEvent {
-        let CoreResult::Final(result) = state.current.decode_result(source).unwrap() else { panic!("modern result"); };
+        let CoreResult::Final(result) = state.current.decode_result(source).unwrap() else {
+            panic!("modern result");
+        };
         ManagedTaskEvent::ToolResult(Box::new(result))
     }
 
     fn challenge(state: &mut Conversation, source: &str) -> Box<InputRequiredResult> {
         let event = result(state, source);
-        let Step::Input(input) = state.accept(event, (state.usage.0 + 1, state.usage.1)).unwrap()
-        else { panic!("input challenge"); };
+        let Step::Input(input) = state
+            .accept(event, (state.usage.0 + 1, state.usage.1))
+            .unwrap()
+        else {
+            panic!("input challenge");
+        };
         input
     }
 
     fn reply(id: &RequestId, value: Value) -> ManagedInputReply {
-        ManagedInputReply { request_id: id.clone(),
-            input_responses: Some(serde_json::from_value::<FinalInputResponses>(value).unwrap()) }
+        ManagedInputReply {
+            request_id: id.clone(),
+            input_responses: Some(serde_json::from_value::<FinalInputResponses>(value).unwrap()),
+        }
     }
 
     #[test]
@@ -483,19 +656,45 @@ mod tests {
         let original = state.original.encode_params().unwrap().unwrap();
         let input = challenge(&mut state, INPUT);
         let ids = state.next_ids("run").unwrap();
-        state.resume(&input, ids.clone(), reply(&ids.1, json!({"roots":{"roots":[]}}))).unwrap();
+        state
+            .resume(
+                &input,
+                ids.clone(),
+                reply(&ids.1, json!({"roots":{"roots":[]}})),
+            )
+            .unwrap();
         let prepared = state.prepare(TARGET, 8192).unwrap();
         let body: Value = serde_json::from_slice(prepared.operation_wire.body()).unwrap();
         assert_eq!(body["params"]["arguments"], original["arguments"]);
         assert_eq!(body["params"]["_meta"], original["_meta"]);
         assert_eq!(body["params"]["requestState"], "  state+/%\0  ");
-        assert_eq!(body["params"]["inputResponses"], json!({"roots":{"roots":[]}}));
+        assert_eq!(
+            body["params"]["inputResponses"],
+            json!({"roots":{"roots":[]}})
+        );
         assert_eq!(body["id"], json!(ids.1));
         let discovery: Value = serde_json::from_slice(prepared.discovery_wire.body()).unwrap();
         assert_eq!(discovery["params"], json!({"_meta":original["_meta"]}));
-        assert!(!prepared.discovery_wire.headers().iter().any(|(name, _)| name.starts_with("Mcp-Param-")));
-        assert!(prepared.operation_wire.headers().contains(&("Mcp-Param-Region".to_owned(), "eu".to_owned())));
-        assert!(!prepared.operation_wire.headers().iter().any(|(_, value)| value.contains("body-only")));
+        assert!(
+            !prepared
+                .discovery_wire
+                .headers()
+                .iter()
+                .any(|(name, _)| name.starts_with("Mcp-Param-"))
+        );
+        assert!(
+            prepared
+                .operation_wire
+                .headers()
+                .contains(&("Mcp-Param-Region".to_owned(), "eu".to_owned()))
+        );
+        assert!(
+            !prepared
+                .operation_wire
+                .headers()
+                .iter()
+                .any(|(_, value)| value.contains("body-only"))
+        );
         assert_eq!(prepared.operation_wire.target(), TARGET);
         assert_eq!(state.original.encode_params().unwrap().unwrap(), original);
         assert_eq!((state.continuations, state.input_responses), (1, 1));
@@ -507,22 +706,51 @@ mod tests {
         let mut state = setup(3, 3);
         let first = challenge(&mut state, INPUT);
         let ids = state.next_ids("run").unwrap();
-        state.resume(&first, ids.clone(), reply(&ids.1, json!({"roots":{"roots":[]}}))).unwrap();
-        let second = challenge(&mut state,
-            r#"{"resultType":"input_required","inputRequests":{},"requestState":"next"}"#);
+        state
+            .resume(
+                &first,
+                ids.clone(),
+                reply(&ids.1, json!({"roots":{"roots":[]}})),
+            )
+            .unwrap();
+        let second = challenge(
+            &mut state,
+            r#"{"resultType":"input_required","inputRequests":{},"requestState":"next"}"#,
+        );
         let next = state.next_ids("run").unwrap();
         assert_ne!(ids, next);
-        state.resume(&second, next.clone(), reply(&next.1, json!({}))).unwrap();
+        state
+            .resume(&second, next.clone(), reply(&next.1, json!({})))
+            .unwrap();
         let params = state.current.encode_params().unwrap().unwrap();
         assert_eq!(params["inputResponses"], json!({}));
         assert_eq!(params["requestState"], "next");
-        let third = challenge(&mut state, r#"{"resultType":"input_required","requestState":""}"#);
+        let third = challenge(
+            &mut state,
+            r#"{"resultType":"input_required","requestState":""}"#,
+        );
         let ids = state.next_ids("run").unwrap();
-        state.resume(&third, ids.clone(), ManagedInputReply { request_id: ids.1, input_responses: None }).unwrap();
+        state
+            .resume(
+                &third,
+                ids.clone(),
+                ManagedInputReply {
+                    request_id: ids.1,
+                    input_responses: None,
+                },
+            )
+            .unwrap();
         let params = state.current.encode_params().unwrap().unwrap();
         assert!(params.get("inputResponses").is_none());
         assert_eq!(params["requestState"], "");
-        assert_eq!((state.continuations, state.input_responses, state.used_ids.len()), (3, 1, 8));
+        assert_eq!(
+            (
+                state.continuations,
+                state.input_responses,
+                state.used_ids.len()
+            ),
+            (3, 1, 8)
+        );
     }
 
     #[test]
@@ -532,15 +760,49 @@ mod tests {
         let before = state.current.encode_params().unwrap();
         let ids = state.next_ids("run").unwrap();
         for answers in [json!({}), json!({"foreign":{"roots":[]}})] {
-            assert!(state.resume(&input, ids.clone(), reply(&ids.1, answers)).is_err());
+            assert!(
+                state
+                    .resume(&input, ids.clone(), reply(&ids.1, answers))
+                    .is_err()
+            );
             assert_eq!(state.current.encode_params().unwrap(), before);
-            assert_eq!((state.continuations, state.input_responses, state.used_ids.len()), (0, 0, 2));
+            assert_eq!(
+                (
+                    state.continuations,
+                    state.input_responses,
+                    state.used_ids.len()
+                ),
+                (0, 0, 2)
+            );
         }
         let alias: RequestId = serde_json::from_str("1e0").unwrap();
-        assert!(state.resume(&input, (alias, ids.1.clone()), reply(&ids.1, json!({"roots":{"roots":[]}}))).is_err());
-        assert!(state.resume(&input, ids.clone(), reply(&RequestId::Number(99), json!({"roots":{"roots":[]}}))).is_err());
-        state.used_ids.push(RequestId::String("run:1:discover".to_owned()));
-        assert!(matches!(state.next_ids("run"), Err(DpopTaskHostError::Interaction(ManagedInteractionError::RepeatedRequestId))));
+        assert!(
+            state
+                .resume(
+                    &input,
+                    (alias, ids.1.clone()),
+                    reply(&ids.1, json!({"roots":{"roots":[]}}))
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .resume(
+                    &input,
+                    ids.clone(),
+                    reply(&RequestId::Number(99), json!({"roots":{"roots":[]}}))
+                )
+                .is_err()
+        );
+        state
+            .used_ids
+            .push(RequestId::String("run:1:discover".to_owned()));
+        assert!(matches!(
+            state.next_ids("run"),
+            Err(DpopTaskHostError::Interaction(
+                ManagedInteractionError::RepeatedRequestId
+            ))
+        ));
         assert_eq!(state.current.encode_params().unwrap(), before);
     }
 
@@ -558,14 +820,25 @@ mod tests {
         ] {
             let mut state = setup(0, 0);
             let event = result(&state, source);
-            let Step::Complete(result) = state.accept(event, (1, 0)).unwrap() else { panic!("terminal"); };
-            assert!(matches!(*result, FinalCoreResult::ToolsCall { .. } | FinalCoreResult::ToolsCallTask { .. }));
+            let Step::Complete(result) = state.accept(event, (1, 0)).unwrap() else {
+                panic!("terminal");
+            };
+            assert!(matches!(
+                *result,
+                FinalCoreResult::ToolsCall { .. } | FinalCoreResult::ToolsCallTask { .. }
+            ));
             assert_eq!(state.continuations, 0);
         }
         let mut state = setup(2, 2);
-        let bad = result(&state, r#"{"resultType":"input_required","inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}},"requestState":"private-canary"}"#);
+        let bad = result(
+            &state,
+            r#"{"resultType":"input_required","inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}},"requestState":"private-canary"}"#,
+        );
         let error = state.accept(bad, (1, 0)).err().unwrap();
-        assert!(matches!(&error, DpopTaskHostError::Interaction(ManagedInteractionError::CapabilityNotAdvertised)));
+        assert!(matches!(
+            &error,
+            DpopTaskHostError::Interaction(ManagedInteractionError::CapabilityNotAdvertised)
+        ));
         assert!(!format!("{error:?} {error}").contains("private-canary"));
         assert_eq!(state.usage, (0, 0));
     }
@@ -575,7 +848,8 @@ mod tests {
         let mut state = setup(2, 2);
         state.usage = (137, 2);
         let mut prepared = state.prepare(TARGET, 8192).unwrap();
-        let expected = 137 + prepared.discovery_wire.body().len() + prepared.operation_wire.body().len();
+        let expected =
+            137 + prepared.discovery_wire.body().len() + prepared.operation_wire.body().len();
         assert_eq!(state.reserve_round(&mut prepared).unwrap(), expected);
         assert_eq!(prepared.discovery_decoder.usage(), (expected, 2));
         // A fresh decoder is mandatory; accounting cannot reset a used owner.

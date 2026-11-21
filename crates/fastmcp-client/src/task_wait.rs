@@ -15,6 +15,8 @@ use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::types::Time;
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 
+#[cfg(unix)]
+use crate::Client;
 #[cfg(feature = "websocket-experimental")]
 use crate::WebSocketClient;
 use crate::http_auth::caller::with_caller;
@@ -25,11 +27,9 @@ use crate::http_auth::managed::tasks::driver::{
     DriverState, ManagedTaskDriverError, ManagedTaskDriverPolicy,
 };
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
-#[cfg(unix)]
-use crate::Client;
 use crate::{
-    FinalTask, FinalTaskHandle, FinalTaskId, FinalTaskInputResponses, FinalUpdateTaskResult,
-    FinalTaskWatchEvent, HttpClient, HttpClientError, MemoryClient, MemorySubscriptionEvent,
+    FinalTask, FinalTaskHandle, FinalTaskId, FinalTaskInputResponses, FinalTaskWatchEvent,
+    FinalUpdateTaskResult, HttpClient, HttpClientError, MemoryClient, MemorySubscriptionEvent,
     MemorySubscriptionExecution, RequestId, StdioTaskSubscriptionEvent, SubscriptionFilter,
     SubscriptionTimeoutPolicy, TaskInputLedger, task_subscription_ids,
 };
@@ -654,7 +654,9 @@ impl FinalTaskHandle {
         if self.is_terminal() {
             return Ok(&self.task);
         }
-        let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+        let caller = with_caller(cx, || {
+            Cx::current().expect("Task operation caller is installed")
+        });
         let cx = &caller;
         let result = guard_websocket_task_operation(
             cx,
@@ -712,7 +714,9 @@ impl FinalTaskHandle {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+        let caller = with_caller(cx, || {
+            Cx::current().expect("Task operation caller is installed")
+        });
         let cx = &caller;
         checkpoint_task_operation(cx, cancellation)?;
         admit_task_input(&self.task, &input_responses)?;
@@ -769,9 +773,8 @@ impl FinalTaskHandle {
         cx: &Cx,
         client: &'client mut MemoryClient,
         cancellation: &McpRequestCancellation,
-    ) -> McpResult<
-        FinalTaskStreamWatch<'client, 'handle, MemoryClient, MemorySubscriptionExecution>,
-    > {
+    ) -> McpResult<FinalTaskStreamWatch<'client, 'handle, MemoryClient, MemorySubscriptionExecution>>
+    {
         open_task_stream_watch(self, cx, client, cancellation).await
     }
 
@@ -964,7 +967,10 @@ impl TaskWatchTransport for MemoryClient {
         cancellation: &McpRequestCancellation,
         owner: &mut Self::Owner,
     ) -> McpResult<StdioTaskSubscriptionEvent> {
-        match self.next_subscription_event(cx, cancellation, owner).await? {
+        match self
+            .next_subscription_event(cx, cancellation, owner)
+            .await?
+        {
             Some(MemorySubscriptionEvent::Acknowledged { accepted, .. }) => {
                 Ok(StdioTaskSubscriptionEvent::Acknowledged(accepted))
             }
@@ -1141,7 +1147,9 @@ async fn open_task_stream_watch<'client, 'handle, T: TaskWatchTransport>(
     if terminal {
         return Ok(watch);
     }
-    let caller = with_caller(cx, || Cx::current().expect("Task watch caller is installed"));
+    let caller = with_caller(cx, || {
+        Cx::current().expect("Task watch caller is installed")
+    });
     let cx = &caller;
     let budget = WaitBudget::new(cx, watch.client.watch_timeout(), watch.handle.task())?;
     if let Some(reason) = budget.stop(cx, cancellation) {
@@ -1584,7 +1592,9 @@ where
         name: &str,
         arguments: serde_json::Value,
     ) -> McpResult<crate::FinalToolCallOutcome> {
-        let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+        let caller = with_caller(cx, || {
+            Cx::current().expect("Task operation caller is installed")
+        });
         let cx = &caller;
         guard_websocket_task_operation_with_result(
             cx,
@@ -1605,7 +1615,9 @@ where
         cancellation: &McpRequestCancellation,
         task_id: FinalTaskId,
     ) -> McpResult<FinalTaskHandle> {
-        let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+        let caller = with_caller(cx, || {
+            Cx::current().expect("Task operation caller is installed")
+        });
         let cx = &caller;
         guard_websocket_task_operation(cx, cancellation, self.get_task_final(cx, task_id))
             .await
@@ -1637,7 +1649,9 @@ async fn guard_websocket_task_operation_with_result<T>(
     operation: impl Future<Output = McpResult<T>>,
     preserve_admitted: impl Fn(&T) -> bool,
 ) -> McpResult<T> {
-    let caller = with_caller(cx, || Cx::current().expect("Task operation caller is installed"));
+    let caller = with_caller(cx, || {
+        Cx::current().expect("Task operation caller is installed")
+    });
     let cx = &caller;
     let mut operation = std::pin::pin!(operation);
     let mut cancelled = std::pin::pin!(cancellation.cancelled());
@@ -2335,9 +2349,11 @@ impl TaskDriveWatchTransport for HttpTaskInputTransport<'_> {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled().into());
         }
-        *listener = Some(self.client_mut()
-            .open_final_task_watch_listener(cx, filter, limits)
-            .await?);
+        *listener = Some(
+            self.client_mut()
+                .open_final_task_watch_listener(cx, filter, limits)
+                .await?,
+        );
         Ok(())
     }
 
@@ -2353,7 +2369,9 @@ impl TaskDriveWatchTransport for HttpTaskInputTransport<'_> {
             return Err(McpError::request_cancelled().into());
         }
         let event = listener.next_event(cx).await.map_err(|error| {
-            HttpClientError::Connection(crate::ClientHttpConnectionError::SubscriptionsListen(error))
+            HttpClientError::Connection(crate::ClientHttpConnectionError::SubscriptionsListen(
+                error,
+            ))
         })?;
         match event {
             Some(Event::Acknowledged { accepted_filter }) => {
@@ -2458,7 +2476,9 @@ async fn drive_task_watching<T: TaskDriveWatchTransport>(
     {
         return Ok(outcome);
     }
-    let caller = with_caller(cx, || Cx::current().expect("Task drive caller is installed"));
+    let caller = with_caller(cx, || {
+        Cx::current().expect("Task drive caller is installed")
+    });
     let cx = &caller;
     let policy = driver.policy;
     let mut budget = WaitBudget::new(cx, policy.wait.timeout, driver.task())?;
@@ -2481,14 +2501,17 @@ async fn drive_task_watching<T: TaskDriveWatchTransport>(
         .map_err(|_| McpError::internal_error("Final Task watch filter could not be composed"))?;
     // This fact survives future drop and a later switch to poll-only driving.
     driver.reconcile_before_input = true;
-    let mut watch = TaskDriveWatch { client, listener: None };
+    let mut watch = TaskDriveWatch {
+        client,
+        listener: None,
+    };
     match budget
         .guard(
             cx,
             cancellation,
-            watch.client.open_drive_watch(
-                cx, cancellation, filter, options, &mut watch.listener,
-            ),
+            watch
+                .client
+                .open_drive_watch(cx, cancellation, filter, options, &mut watch.listener),
         )
         .await
     {
@@ -2511,7 +2534,12 @@ async fn drive_task_watching<T: TaskDriveWatchTransport>(
         }
         let previous_updates = updates;
         if let Some(outcome) = resolve_driver_inputs(
-            driver, cx, watch.client, cancellation, &budget, &mut updates,
+            driver,
+            cx,
+            watch.client,
+            cancellation,
+            &budget,
+            &mut updates,
         )
         .await?
         {
@@ -2540,7 +2568,9 @@ async fn drive_task_watching<T: TaskDriveWatchTransport>(
                     .guard(
                         cx,
                         cancellation,
-                        watch.client.read(cx, cancellation, driver.task_id().clone()),
+                        watch
+                            .client
+                            .read(cx, cancellation, driver.task_id().clone()),
                     )
                     .await
                 {
@@ -2559,7 +2589,9 @@ async fn drive_task_watching<T: TaskDriveWatchTransport>(
             }
             Some(StdioTaskSubscriptionEvent::Acknowledged(accepted_filter)) => {
                 let accepted = task_subscription_ids(&accepted_filter)
-                    .map_err(|_| McpError::invalid_request("Invalid final Task watch acknowledgement"))?
+                    .map_err(|_| {
+                        McpError::invalid_request("Invalid final Task watch acknowledgement")
+                    })?
                     .unwrap_or_default();
                 if accepted.iter().any(|id| id != driver.task_id()) {
                     return Err(McpError::invalid_request(
@@ -2584,11 +2616,17 @@ async fn drive_task_watching<T: TaskDriveWatchTransport>(
                 notifications += 1;
                 let task = notification.params.task;
                 admit_identity(driver.task(), &task)?;
-                if driver.handle.snapshot_is_identical(&task).map_err(task_watch_comparison_error)? {
+                if driver
+                    .handle
+                    .snapshot_is_identical(&task)
+                    .map_err(task_watch_comparison_error)?
+                {
                     asupersync::runtime::yield_now().await;
                     continue;
                 }
-                if driver.handle.notification_needs_reconciliation(&task)
+                if driver
+                    .handle
+                    .notification_needs_reconciliation(&task)
                     .map_err(task_watch_comparison_error)?
                 {
                     driver.reconcile_before_input = true;
@@ -2623,7 +2661,9 @@ async fn drive_task<T: TaskInputTransport>(
     {
         return Ok(outcome);
     }
-    let caller = with_caller(cx, || Cx::current().expect("Task drive caller is installed"));
+    let caller = with_caller(cx, || {
+        Cx::current().expect("Task drive caller is installed")
+    });
     let cx = &caller;
     let policy = driver.policy;
     let mut budget = WaitBudget::new(cx, policy.wait.timeout, driver.task())?;

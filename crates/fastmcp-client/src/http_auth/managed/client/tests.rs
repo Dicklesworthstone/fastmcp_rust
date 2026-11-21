@@ -434,10 +434,7 @@ fn managed_extension_builder(peer: &Peer) -> (ExtensionId, ClientBuilder, Arc<At
     other.result_discriminator = Some("com.example/other-result".into());
     let settings = ExtensionSettings::new(json!({"mode":"raw"})).unwrap();
     let discovery = ClientExtensionDiscovery {
-        extensions: BTreeMap::from([
-            (id.clone(), settings.clone()),
-            (other.id.clone(), settings),
-        ]),
+        extensions: BTreeMap::from([(id.clone(), settings.clone()), (other.id.clone(), settings)]),
     };
     let mut registry = ExtensionDescriptorRegistry::new();
     registry.register(descriptor).unwrap();
@@ -1208,8 +1205,7 @@ fn pre_cancelled_call_retires_catalog_custody_before_any_network_poll() {
             peer.mcp("tools/list", "access-one", page).await;
         })
         .await;
-        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = listed.unwrap()
-        else {
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = listed.unwrap() else {
             panic!("expected a catalog page with live continuation custody");
         };
         let cursor = result.payload.next_cursor.unwrap();
@@ -1217,12 +1213,8 @@ fn pre_cancelled_call_retires_catalog_custody_before_any_network_poll() {
 
         let cancellation = McpRequestCancellation::new();
         cancellation.cancel();
-        let mut call = Box::pin(client.call_tool_with_cancellation(
-            &cx,
-            &cancellation,
-            "lookup",
-            json!({}),
-        ));
+        let mut call =
+            Box::pin(client.call_tool_with_cancellation(&cx, &cancellation, "lookup", json!({})));
         poll_fn(|task| {
             assert!(matches!(
                 call.as_mut().poll(task),
@@ -1473,7 +1465,8 @@ fn managed_extensions_authenticated_json_sse_preserve_source_and_live_progress()
             let (id, builder, _) = managed_extension_builder(&peer);
             let mut client =
                 ManagedHttpClient::new(session.clone(), builder, Duration::from_secs(30)).unwrap();
-            let source = r#"{"resultType":"com.example/raw-result","value":7.30e-2,"extra":{"n":1.20e+4}}"#;
+            let source =
+                r#"{"resultType":"com.example/raw-result","value":7.30e-2,"extra":{"n":1.20e+4}}"#;
             let observed = Arc::new(AtomicUsize::new(0));
             let mut observer = |event: &ModernHttpExtensionEvent| {
                 let ModernHttpExtensionEvent::Progress(progress) = event else {
@@ -1558,9 +1551,15 @@ fn managed_extensions_authenticated_json_sse_preserve_source_and_live_progress()
             ))
             .await;
             let result = result.unwrap();
-            assert_eq!(serde_json::to_value(result.request_id()).unwrap(), request_id);
+            assert_eq!(
+                serde_json::to_value(result.request_id()).unwrap(),
+                request_id
+            );
             assert_eq!(result.raw_result_source(), source);
-            assert_eq!(result.result(), &serde_json::from_str::<Value>(source).unwrap());
+            assert_eq!(
+                result.result(),
+                &serde_json::from_str::<Value>(source).unwrap()
+            );
             assert_eq!(observed.load(Ordering::SeqCst), usize::from(use_sse));
             assert_eq!(client.cached_credential_generation(), Some(1));
             assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
@@ -1625,7 +1624,11 @@ fn managed_extensions_reject_one_sided_discovery_and_foreign_result_owners() {
                 ));
             }
             let diagnostic = format!("{error:?} {error}");
-            for private in ["access-one", "private-extension-payload", "com.example/other-result"] {
+            for private in [
+                "access-one",
+                "private-extension-payload",
+                "com.example/other-result",
+            ] {
                 assert!(!diagnostic.contains(private));
             }
             assert_eq!(client.cached_credential_generation(), None);
@@ -1677,12 +1680,16 @@ fn managed_extensions_pending_cancel_or_revocation_retires_only_owned_state() {
             if revoke {
                 assert!(matches!(
                     result,
-                    Err(ManagedHttpClientError::Session(OAuthSessionError::LoginRequired))
+                    Err(ManagedHttpClientError::Session(
+                        OAuthSessionError::LoginRequired
+                    ))
                 ));
             } else {
                 assert!(matches!(
                     result,
-                    Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))
+                    Err(ManagedHttpClientError::Session(
+                        OAuthSessionError::Cancelled
+                    ))
                 ));
             }
             assert_eq!(client.cached_credential_generation(), None);
@@ -1708,12 +1715,9 @@ fn managed_extensions_pending_cancel_or_revocation_retires_only_owned_state() {
                 peer.no_more(&cx).await;
             } else {
                 let (_, builder, _) = managed_extension_builder(&peer);
-                let mut sibling = ManagedHttpClient::new(
-                    session.clone(),
-                    builder,
-                    Duration::from_secs(30),
-                )
-                .unwrap();
+                let mut sibling =
+                    ManagedHttpClient::new(session.clone(), builder, Duration::from_secs(30))
+                        .unwrap();
                 // Both a fresh explicit call on the cancelled owner and an
                 // independent client retain the original, unrevoked login.
                 for target in [&mut client, &mut sibling] {
@@ -1818,11 +1822,15 @@ fn managed_extensions_callback_authority_loss_discards_buffered_events_and_termi
             match stop {
                 Stop::Cancel => assert!(matches!(
                     result,
-                    Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))
+                    Err(ManagedHttpClientError::Session(
+                        OAuthSessionError::Cancelled
+                    ))
                 )),
                 Stop::Revoke => assert!(matches!(
                     result,
-                    Err(ManagedHttpClientError::Session(OAuthSessionError::LoginRequired))
+                    Err(ManagedHttpClientError::Session(
+                        OAuthSessionError::LoginRequired
+                    ))
                 )),
                 Stop::Logout => assert!(matches!(
                     result,
@@ -1866,7 +1874,9 @@ fn managed_extensions_preflight_and_event_budget_refuse_before_observation() {
                     json!({}),
                 )
                 .await,
-            Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))
+            Err(ManagedHttpClientError::Session(
+                OAuthSessionError::Cancelled
+            ))
         ));
         peer.no_more(&cx).await;
 
@@ -1980,8 +1990,7 @@ fn managed_extensions_renewal_rechecks_changed_settings_without_replay() {
                     extension_discovery(json!({"mode":"raw"})),
                 )
                 .await;
-                let (mut stream, request, _) =
-                    peer.mcp_request("example/echo", "access-two").await;
+                let (mut stream, request, _) = peer.mcp_request("example/echo", "access-two").await;
                 assert_eq!(request["params"]["turn"], 3);
                 reply(
                     &mut stream,
@@ -2061,15 +2070,21 @@ fn managed_extensions_notifications_use_fresh_proof_and_do_not_allocate_request_
             if value == 1 {
                 assert!(after > before);
             } else {
-                assert_eq!(after, before + 1, "every message needs fresh compatibility proof");
+                assert_eq!(
+                    after,
+                    before + 1,
+                    "every message needs fresh compatibility proof"
+                );
             }
         }
         let (result, ()) = Box::pin(pair(
             client.request_final_extension(&cx, &id, "example/echo", json!({})),
             async {
-                let (mut stream, request, _) =
-                    peer.mcp_request("example/echo", "access-one").await;
-                assert_eq!(request["id"], 2, "only discovery consumed an earlier request ID");
+                let (mut stream, request, _) = peer.mcp_request("example/echo", "access-one").await;
+                assert_eq!(
+                    request["id"], 2,
+                    "only discovery consumed an earlier request ID"
+                );
                 reply(
                     &mut stream,
                     200,

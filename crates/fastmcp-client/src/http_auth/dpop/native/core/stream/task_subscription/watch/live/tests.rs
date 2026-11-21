@@ -2,8 +2,8 @@ use super::*;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,9 @@ impl Control {
             channel.frames.push_back(bytes);
             channel.waiter.take()
         };
-        if let Some(wake) = wake { wake.wake(); }
+        if let Some(wake) = wake {
+            wake.wake();
+        }
     }
 
     fn finish(&self) {
@@ -41,7 +43,9 @@ impl Control {
             channel.eof = true;
             channel.waiter.take()
         };
-        if let Some(wake) = wake { wake.wake(); }
+        if let Some(wake) = wake {
+            wake.wake();
+        }
     }
 }
 
@@ -55,41 +59,62 @@ impl Body for TestBody {
     type Data = BytesCursor;
     type Error = ();
 
-    fn poll_frame(self: Pin<&mut Self>, task: &mut Context<'_>)
-        -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>>
-    {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        task: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         self.polls.fetch_add(1, Ordering::SeqCst);
         let mut channel = self.control.0.lock().unwrap();
         if let Some(bytes) = channel.frames.pop_front() {
-            return Poll::Ready(Some(Ok(Frame::Data(Bytes::copy_from_slice(&bytes).reader()))));
+            return Poll::Ready(Some(Ok(Frame::Data(
+                Bytes::copy_from_slice(&bytes).reader(),
+            ))));
         }
-        if channel.eof { return Poll::Ready(None); }
+        if channel.eof {
+            return Poll::Ready(None);
+        }
         channel.waiter = Some(task.waker().clone());
         Poll::Pending
     }
 }
 
 impl Drop for TestBody {
-    fn drop(&mut self) { self.drops.fetch_add(1, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Default)]
 struct Wakes(AtomicUsize);
 impl Wake for Wakes {
-    fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
-    fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
-struct Work { polls: Rc<Cell<usize>>, drops: Rc<Cell<usize>>, ready: Rc<Cell<bool>> }
+struct Work {
+    polls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+    ready: Rc<Cell<bool>>,
+}
 impl Future for Work {
     type Output = Result<u8, DpopTaskWatchError>;
     fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
         self.polls.set(self.polls.get() + 1);
-        if self.ready.get() { Poll::Ready(Ok(7)) } else { Poll::Pending }
+        if self.ready.get() {
+            Poll::Ready(Ok(7))
+        } else {
+            Poll::Pending
+        }
     }
 }
 impl Drop for Work {
-    fn drop(&mut self) { self.drops.set(self.drops.get() + 1); }
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
 }
 
 fn event(value: serde_json::Value) -> Vec<u8> {
@@ -97,9 +122,11 @@ fn event(value: serde_json::Value) -> Vec<u8> {
 }
 
 fn ack() -> Vec<u8> {
-    event(json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
+    event(
+        json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
         "params":{"notifications":{"taskIds":["task-one"]},
-            "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:"watch.listen"}}}))
+            "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:"watch.listen"}}}),
+    )
 }
 
 fn status() -> Vec<u8> {
@@ -110,22 +137,37 @@ fn status() -> Vec<u8> {
 }
 
 fn terminal() -> Vec<u8> {
-    event(json!({"jsonrpc":"2.0", "id":"watch.listen", "result":{"resultType":"complete",
-        "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:"watch.listen"}}}))
+    event(
+        json!({"jsonrpc":"2.0", "id":"watch.listen", "result":{"resultType":"complete",
+        "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:"watch.listen"}}}),
+    )
 }
 
 fn fixture(test: impl FnOnce(&ReadOwner<'_>, &TimerDriverHandle, &Arc<VirtualClock>)) {
     let clock = Arc::new(VirtualClock::new());
     let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
-    let runtime = RuntimeBuilder::current_thread().blocking_threads(0, 0)
-        .with_timer_driver(timer.clone()).build().unwrap();
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .with_timer_driver(timer.clone())
+        .build()
+        .unwrap();
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
-    let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(),
-        CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap()).unwrap();
-    let credential = session.admit_token_response(&issuer, 200,
-        br#"{"access_token":"live-watch-test","token_type":"DPoP","expires_in":300}"#,
-        Instant::now(), Duration::from_secs(300)).unwrap();
+    let session = DpopSession::new(
+        DpopKey::generate().unwrap(),
+        issuer.clone(),
+        CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap(),
+    )
+    .unwrap();
+    let credential = session
+        .admit_token_response(
+            &issuer,
+            200,
+            br#"{"access_token":"live-watch-test","token_type":"DPoP","expires_in":300}"#,
+            Instant::now(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
     let cancellation = McpRequestCancellation::new();
     let bounds = WaitBounds::new(&cx, Duration::from_secs(60), &credential).unwrap();
     let owner = ReadOwner::new(&cx, &cancellation, &session, &credential, bounds);
@@ -144,35 +186,71 @@ fn fixture(test: impl FnOnce(&ReadOwner<'_>, &TimerDriverHandle, &Arc<VirtualClo
     assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
 }
 
-fn listen(owner: &ReadOwner<'_>, notifications: usize)
-    -> (LiveListen<TestBody>, Control, Arc<AtomicUsize>, Arc<AtomicUsize>)
-{
+fn listen(
+    owner: &ReadOwner<'_>,
+    notifications: usize,
+) -> (
+    LiveListen<TestBody>,
+    Control,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
     let limits = DpopStreamLimits::new(
         ManagedCoreLimits::new(8192, 8192, 32768, notifications, Duration::from_secs(60)).unwrap(),
-        Duration::from_secs(10)).unwrap();
+        Duration::from_secs(10),
+    )
+    .unwrap();
     let state = WatchState::new("watch", DpopTaskWatchPolicy::new(8).unwrap(), limits).unwrap();
     let task = TaskId::parse("task-one").unwrap();
-    let selection = state.selection(FinalRequestMeta::new(ClientCapabilities::default()), &task).unwrap();
+    let selection = state
+        .selection(FinalRequestMeta::new(ClientCapabilities::default()), &task)
+        .unwrap();
     let discovery_id = selection.discovery_id.clone();
     let prepared = Prepared::new("https://mcp.example/mcp", selection, limits.core, 8192).unwrap();
     let body = serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":discovery_id, "result":{
         "resultType":"complete", "supportedVersions":[FINAL_PROTOCOL_VERSION],
         "capabilities":{"extensions":{TASKS_EXTENSION:{}}}, "ttlMs":0,"cacheScope":"private",
         "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"live-peer","version":"1"}}
-    }})).unwrap();
-    let (_, decoder) = prepared.admit(DpopHttpResponse { status:200, headers:vec![], body }).unwrap();
+    }}))
+    .unwrap();
+    let (_, decoder) = prepared
+        .admit(DpopHttpResponse {
+            status: 200,
+            headers: vec![],
+            body,
+        })
+        .unwrap();
     let budget = SharedStreamBudget::new(limits.core, decoder.usage()).unwrap();
-    let control = Control(Arc::new(Mutex::new(Channel { frames: VecDeque::new(), eof:false, waiter:None })));
+    let control = Control(Arc::new(Mutex::new(Channel {
+        frames: VecDeque::new(),
+        eof: false,
+        waiter: None,
+    })));
     let polls = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
-    let body = TestBody { control: control.clone(), polls: polls.clone(), drops: drops.clone() };
-    let mut listen = LiveListen::new(body, crate::http_executor::ModernHttpResponseKind::Sse,
-        decoder, Idle::new(owner.cx.now(), limits.idle), task, limits, 1024 * 1024, budget).unwrap();
+    let body = TestBody {
+        control: control.clone(),
+        polls: polls.clone(),
+        drops: drops.clone(),
+    };
+    let mut listen = LiveListen::new(
+        body,
+        crate::http_executor::ModernHttpResponseKind::Sse,
+        decoder,
+        Idle::new(owner.cx.now(), limits.idle),
+        task,
+        limits,
+        1024 * 1024,
+        budget,
+    )
+    .unwrap();
     control.send(ack());
     {
         let mut next = Box::pin(listen.next(owner));
-        assert!(matches!(next.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Ok(LiveStep::Hint))));
+        assert!(matches!(
+            next.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(LiveStep::Hint))
+        ));
     }
     listen.clear_hint();
     (listen, control, polls, drops)
@@ -185,7 +263,11 @@ fn pending_companion_keeps_listening_and_teardown_drops_it_without_waiting_for_e
         let budget = listen.budget.clone();
         let polls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
-        let work = Work { polls: polls.clone(), drops: drops.clone(), ready: Rc::new(Cell::new(false)) };
+        let work = Work {
+            polls: polls.clone(),
+            drops: drops.clone(),
+            ready: Rc::new(Cell::new(false)),
+        };
         let wakes = Arc::new(Wakes::default());
         let waker = Waker::from(wakes.clone());
         let mut task = Context::from_waker(&waker);
@@ -194,17 +276,35 @@ fn pending_companion_keeps_listening_and_teardown_drops_it_without_waiting_for_e
         control.send(status());
         assert!(wakes.0.load(Ordering::SeqCst) > 0);
         assert!(follow.as_mut().poll(&mut task).is_pending());
-        assert_eq!(budget.usage().unwrap().1, 2, "status admitted while work is pending");
+        assert_eq!(
+            budget.usage().unwrap().1,
+            2,
+            "status admitted while work is pending"
+        );
         let before = polls.get();
         control.send(terminal());
-        assert!(matches!(follow.as_mut().poll(&mut task), Poll::Ready(Ok(Follow::Stopped))));
-        assert_eq!(polls.get(), before, "terminal wins before another host poll");
+        assert!(matches!(
+            follow.as_mut().poll(&mut task),
+            Poll::Ready(Ok(Follow::Stopped))
+        ));
+        assert_eq!(
+            polls.get(),
+            before,
+            "terminal wins before another host poll"
+        );
         drop(follow);
         assert_eq!(drops.get(), 1);
-        assert_eq!(body_drops.load(Ordering::SeqCst), 1, "winning terminal releases the body before EOF");
+        assert_eq!(
+            body_drops.load(Ordering::SeqCst),
+            1,
+            "winning terminal releases the body before EOF"
+        );
         {
             let mut next = Box::pin(listen.next(owner));
-            assert!(matches!(next.as_mut().poll(&mut task), Poll::Ready(Ok(LiveStep::Closed))));
+            assert!(matches!(
+                next.as_mut().poll(&mut task),
+                Poll::Ready(Ok(LiveStep::Closed))
+            ));
         }
         assert_eq!(body_drops.load(Ordering::SeqCst), 1);
     });
@@ -220,8 +320,12 @@ fn ready_terminal_prevents_even_the_first_companion_poll() {
             #[allow(unreachable_code)]
             Ok::<(), DpopTaskWatchError>(())
         }));
-        assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Ok(Follow::Stopped))));
+        assert!(matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(Follow::Stopped))
+        ));
     });
 }
 
@@ -232,8 +336,11 @@ fn peer_cancellation_closes_the_body_and_stops_companion_work_without_eof() {
             let (mut listen, control, _, body_drops) = listen(owner, 1);
             let polls = Rc::new(Cell::new(0));
             let drops = Rc::new(Cell::new(0));
-            let work = Work { polls: polls.clone(), drops: drops.clone(),
-                ready: Rc::new(Cell::new(false)) };
+            let work = Work {
+                polls: polls.clone(),
+                drops: drops.clone(),
+                ready: Rc::new(Cell::new(false)),
+            };
             let mut follow = Box::pin(listen.follow(owner, work));
             let mut task = Context::from_waker(Waker::noop());
             if already_pending {
@@ -246,8 +353,12 @@ fn peer_cancellation_closes_the_body_and_stops_companion_work_without_eof() {
             wire.extend(terminal());
             wire.extend_from_slice(b"data: {malformed}\n\n");
             control.send(wire);
-            assert!(matches!(follow.as_mut().poll(&mut task),
-                Poll::Ready(Err(DpopTaskWatchError::Stream(DpopStreamError::SubscriptionCancelled)))));
+            assert!(matches!(
+                follow.as_mut().poll(&mut task),
+                Poll::Ready(Err(DpopTaskWatchError::Stream(
+                    DpopStreamError::SubscriptionCancelled
+                )))
+            ));
             assert_eq!(polls.get(), before);
             drop(follow);
             assert_eq!(drops.get(), 1);
@@ -275,9 +386,16 @@ fn a_large_unread_frame_suffix_cannot_be_overtaken_by_host_work() {
         assert!(future.as_mut().poll(&mut task).is_pending());
         let body_polls = polls.load(Ordering::SeqCst);
         assert_eq!(work_polls.get(), 0);
-        assert!(matches!(future.as_mut().poll(&mut task), Poll::Ready(Ok(Follow::Stopped))));
+        assert!(matches!(
+            future.as_mut().poll(&mut task),
+            Poll::Ready(Ok(Follow::Stopped))
+        ));
         assert_eq!(work_polls.get(), 0);
-        assert_eq!(polls.load(Ordering::SeqCst), body_polls, "consume the saved Buf before polling the body");
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            body_polls,
+            "consume the saved Buf before polling the body"
+        );
     });
 }
 
@@ -289,15 +407,24 @@ fn completed_subscription_discards_its_tail_before_any_successor_work() {
         control.send(b"data: {\"unfinished\":".to_vec());
         control.finish();
         {
-            let mut follow = Box::pin(listen.follow(owner, std::future::pending::<Result<(), DpopTaskWatchError>>()));
-            assert!(matches!(follow.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-                Poll::Ready(Ok(Follow::Stopped))));
+            let mut follow = Box::pin(listen.follow(
+                owner,
+                std::future::pending::<Result<(), DpopTaskWatchError>>(),
+            ));
+            assert!(matches!(
+                follow
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Ok(Follow::Stopped))
+            ));
         }
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let before = polls.load(Ordering::SeqCst);
         let mut next = Box::pin(listen.next(owner));
-        assert!(matches!(next.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Ok(LiveStep::Closed))));
+        assert!(matches!(
+            next.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(LiveStep::Closed))
+        ));
         assert_eq!(polls.load(Ordering::SeqCst), before);
     });
 }
@@ -307,8 +434,16 @@ fn an_early_eof_is_an_error_not_a_clean_rollover() {
     fixture(|owner, _, _| {
         let (mut listen, control, _, _) = listen(owner, 8);
         control.finish();
-        let mut future = Box::pin(listen.follow(owner, std::future::pending::<Result<(), DpopTaskWatchError>>()));
-        assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Err(_))));
+        let mut future = Box::pin(listen.follow(
+            owner,
+            std::future::pending::<Result<(), DpopTaskWatchError>>(),
+        ));
+        assert!(matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(_))
+        ));
     });
 }
 
@@ -319,7 +454,9 @@ fn a_completed_companion_is_not_repolled_across_receive_fairness_yields() {
         let calls = Cell::new(0);
         let mut future = Box::pin(listen.follow(owner, async {
             calls.set(calls.get() + 1);
-            for _ in 0..100 { control.send(Vec::new()); }
+            for _ in 0..100 {
+                control.send(Vec::new());
+            }
             Ok::<u8, DpopTaskWatchError>(42)
         }));
         let mut task = Context::from_waker(Waker::noop());
@@ -343,30 +480,46 @@ fn all_cancellation_domains_wake_a_quiet_listen_and_pending_companion() {
         fixture(|owner, timer, clock| {
             let (mut listen, _, _, body_drops) = listen(owner, 8);
             let drops = Rc::new(Cell::new(0));
-            let work = Work { polls: Rc::new(Cell::new(0)), drops: drops.clone(), ready: Rc::new(Cell::new(false)) };
+            let work = Work {
+                polls: Rc::new(Cell::new(0)),
+                drops: drops.clone(),
+                ready: Rc::new(Cell::new(false)),
+            };
             let wakes = Arc::new(Wakes::default());
             let waker = Waker::from(wakes.clone());
             let mut task = Context::from_waker(&waker);
             let mut future = Box::pin(listen.follow(owner, work));
             assert!(future.as_mut().poll(&mut task).is_pending());
             match action {
-                0 => { owner.cancellation.cancel(); }
+                0 => {
+                    owner.cancellation.cancel();
+                }
                 1 => owner.credential.revoke(),
-                2 => { owner.owner.cancel(); }
+                2 => {
+                    owner.owner.cancel();
+                }
                 3 => owner.cx.set_cancel_requested(true),
-                4 => { clock.advance(10_000_000_000); assert!(timer.process_timers() > 0); }
+                4 => {
+                    clock.advance(10_000_000_000);
+                    assert!(timer.process_timers() > 0);
+                }
                 _ => {}
             }
             if action != 5 {
                 assert!(wakes.0.load(Ordering::SeqCst) > 0);
-                assert!(matches!(future.as_mut().poll(&mut task), Poll::Ready(Err(_))));
+                assert!(matches!(
+                    future.as_mut().poll(&mut task),
+                    Poll::Ready(Err(_))
+                ));
             }
             drop(future);
             assert_eq!(drops.get(), 1);
             assert_eq!(timer.pending_count(), 0);
             drop(listen);
             assert_eq!(body_drops.load(Ordering::SeqCst), 1);
-            if action != 2 { assert!(!owner.owner.is_cancel_requested()); }
+            if action != 2 {
+                assert!(!owner.owner.is_cancel_requested());
+            }
         });
     }
 }
@@ -384,7 +537,12 @@ fn concurrent_quota_spending_is_checked_before_delivering_a_listen_event() {
             #[allow(unreachable_code)]
             Ok::<(), DpopTaskWatchError>(())
         }));
-        assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Err(_))));
+        assert!(matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(_))
+        ));
         assert_eq!(budget.usage().unwrap(), before);
     });
 }
@@ -394,13 +552,20 @@ fn status_hints_received_during_a_companion_remain_pending_for_reconciliation() 
     fixture(|owner, _, _| {
         let (mut listen, control, _, _) = listen(owner, 8);
         let ready = Rc::new(Cell::new(false));
-        let work = Work { polls: Rc::new(Cell::new(0)), drops: Rc::new(Cell::new(0)), ready: ready.clone() };
+        let work = Work {
+            polls: Rc::new(Cell::new(0)),
+            drops: Rc::new(Cell::new(0)),
+            ready: ready.clone(),
+        };
         let mut future = Box::pin(listen.follow(owner, work));
         let mut task = Context::from_waker(Waker::noop());
         assert!(future.as_mut().poll(&mut task).is_pending());
         control.send(status());
         ready.set(true);
-        assert!(matches!(future.as_mut().poll(&mut task), Poll::Ready(Ok(Follow::Completed(7)))));
+        assert!(matches!(
+            future.as_mut().poll(&mut task),
+            Poll::Ready(Ok(Follow::Completed(7)))
+        ));
         drop(future);
         assert!(listen.has_hint());
         assert!(!listen.closed);
@@ -415,7 +580,11 @@ fn selected_task_hint_invalidates_pending_or_unpolled_input_without_closing_the_
             let budget = listen.budget.clone();
             let polls = Rc::new(Cell::new(0));
             let drops = Rc::new(Cell::new(0));
-            let work = Work { polls: polls.clone(), drops: drops.clone(), ready: Rc::new(Cell::new(false)) };
+            let work = Work {
+                polls: polls.clone(),
+                drops: drops.clone(),
+                ready: Rc::new(Cell::new(false)),
+            };
             let wakes = Arc::new(Wakes::default());
             let waker = Waker::from(wakes.clone());
             let mut task = Context::from_waker(&waker);
@@ -425,9 +594,18 @@ fn selected_task_hint_invalidates_pending_or_unpolled_input_without_closing_the_
             }
             let before = polls.get();
             control.send(status());
-            if already_pending { assert!(wakes.0.load(Ordering::SeqCst) > 0); }
-            assert!(matches!(future.as_mut().poll(&mut task), Poll::Ready(Ok(Follow::Changed))));
-            assert_eq!(polls.get(), before, "no host poll after the invalidating hint");
+            if already_pending {
+                assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            }
+            assert!(matches!(
+                future.as_mut().poll(&mut task),
+                Poll::Ready(Ok(Follow::Changed))
+            ));
+            assert_eq!(
+                polls.get(),
+                before,
+                "no host poll after the invalidating hint"
+            );
             drop(future);
             assert_eq!(drops.get(), 1);
             assert_eq!(timer.pending_count(), 0);
@@ -449,7 +627,11 @@ fn a_hint_after_host_completion_suppresses_the_ready_answer_without_repolling() 
             let calls = Cell::new(0);
             let mut future = Box::pin(listen.follow_input(owner, async {
                 calls.set(calls.get() + 1);
-                if yields { for _ in 0..100 { control.send(Vec::new()); } }
+                if yields {
+                    for _ in 0..100 {
+                        control.send(Vec::new());
+                    }
+                }
                 control.send(status());
                 Ok::<u8, DpopTaskWatchError>(42)
             }));
@@ -458,7 +640,10 @@ fn a_hint_after_host_completion_suppresses_the_ready_answer_without_repolling() 
             for _ in 0..8 {
                 match future.as_mut().poll(&mut task) {
                     Poll::Pending => {}
-                    Poll::Ready(Ok(Follow::Changed)) => { changed = true; break; }
+                    Poll::Ready(Ok(Follow::Changed)) => {
+                        changed = true;
+                        break;
+                    }
                     _ => panic!("stale ready answer escaped"),
                 }
             }
@@ -477,7 +662,11 @@ fn invalidation_cannot_overtake_a_ready_malformed_or_terminal_frame_suffix() {
             let (mut listen, control, _, _) = listen(owner, 8);
             let mut wire = status();
             wire.extend(format!(":{}\n\n", "x".repeat(BYTES_PER_TURN + 64)).into_bytes());
-            wire.extend(if terminal_suffix { terminal() } else { b"data: {invalid}\n\n".to_vec() });
+            wire.extend(if terminal_suffix {
+                terminal()
+            } else {
+                b"data: {invalid}\n\n".to_vec()
+            });
             control.send(wire);
             let mut future = Box::pin(listen.follow_input(owner, async {
                 panic!("unread listen suffix must win before host work");
@@ -502,19 +691,31 @@ fn invalidation_and_restarted_resolution_keep_the_original_idle_deadline() {
         let (mut listen, control, _, _) = listen(owner, 8);
         let mut task = Context::from_waker(Waker::noop());
         {
-            let mut future = Box::pin(listen.follow_input(owner, std::future::pending::<Result<(), DpopTaskWatchError>>()));
+            let mut future = Box::pin(listen.follow_input(
+                owner,
+                std::future::pending::<Result<(), DpopTaskWatchError>>(),
+            ));
             assert!(future.as_mut().poll(&mut task).is_pending());
             clock.advance(9_000_000_000);
             control.send(status());
-            assert!(matches!(future.as_mut().poll(&mut task), Poll::Ready(Ok(Follow::Changed))));
+            assert!(matches!(
+                future.as_mut().poll(&mut task),
+                Poll::Ready(Ok(Follow::Changed))
+            ));
         }
         assert_eq!(timer.pending_count(), 0);
         listen.clear_hint();
-        let mut future = Box::pin(listen.follow_input(owner, std::future::pending::<Result<(), DpopTaskWatchError>>()));
+        let mut future = Box::pin(listen.follow_input(
+            owner,
+            std::future::pending::<Result<(), DpopTaskWatchError>>(),
+        ));
         assert!(future.as_mut().poll(&mut task).is_pending());
         clock.advance(1_000_000_000);
         assert!(timer.process_timers() > 0);
-        assert!(matches!(future.as_mut().poll(&mut task), Poll::Ready(Err(_))));
+        assert!(matches!(
+            future.as_mut().poll(&mut task),
+            Poll::Ready(Err(_))
+        ));
         drop(future);
         assert_eq!(timer.pending_count(), 0);
         assert!(!owner.cx.is_cancel_requested());
@@ -527,14 +728,21 @@ fn foreign_task_notifications_cannot_invalidate_or_start_input_resolution() {
         let (mut listen, control, _, _) = listen(owner, 8);
         let budget = listen.budget.clone();
         let before = budget.usage().unwrap();
-        let foreign = String::from_utf8(status()).unwrap().replace("task-one", "task-other");
+        let foreign = String::from_utf8(status())
+            .unwrap()
+            .replace("task-one", "task-other");
         control.send(foreign.into_bytes());
         let mut future = Box::pin(listen.follow_input(owner, async {
             panic!("unselected Task cannot authorize host work or reconciliation");
             #[allow(unreachable_code)]
             Ok::<(), DpopTaskWatchError>(())
         }));
-        assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Err(_))));
+        assert!(matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(_))
+        ));
         assert_eq!(budget.usage().unwrap(), before);
     });
 }

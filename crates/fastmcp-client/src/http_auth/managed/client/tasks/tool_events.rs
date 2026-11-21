@@ -77,7 +77,9 @@ impl EventBudget {
                         .as_ref()
                         .is_some_and(|last| progress.progress.cmp(last).is_le())
                 {
-                    return Err(refused("Managed tool progress is not request-owned or increasing"));
+                    return Err(refused(
+                        "Managed tool progress is not request-owned or increasing",
+                    ));
                 }
                 Some(progress.progress.clone())
             }
@@ -332,10 +334,18 @@ mod tests {
             .admit(Some(&marker), &progress(json!("7"), "9007199254740993"))
             .unwrap();
         for value in ["9007199254740993", "9007199254740992"] {
-            assert!(budget.admit(Some(&marker), &progress(json!("7"), value)).is_err());
+            assert!(
+                budget
+                    .admit(Some(&marker), &progress(json!("7"), value))
+                    .is_err()
+            );
         }
         assert_eq!(budget.remaining, 2);
-        assert!(budget.admit(None, &progress(json!("7"), "9007199254740994")).is_err());
+        assert!(
+            budget
+                .admit(None, &progress(json!("7"), "9007199254740994"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -345,7 +355,9 @@ mod tests {
             Some(json!({})),
         ))
         .unwrap();
-        let bytes = serde_json::to_vec(&notification.encode().unwrap()).unwrap().len();
+        let bytes = serde_json::to_vec(&notification.encode().unwrap())
+            .unwrap()
+            .len();
         let mut budget = EventBudget {
             remaining: 3,
             bytes: 2 * bytes,
@@ -362,7 +374,9 @@ mod tests {
     fn byte_refusal_does_not_advance_the_progress_watermark() {
         let marker: ProgressMarker = serde_json::from_value(json!(0)).unwrap();
         let notification = progress(json!(0), "1.0000000000000000000001");
-        let bytes = serde_json::to_vec(&notification.encode().unwrap()).unwrap().len();
+        let bytes = serde_json::to_vec(&notification.encode().unwrap())
+            .unwrap()
+            .len();
         let mut budget = EventBudget {
             remaining: 1,
             bytes: bytes - 1,
@@ -393,7 +407,8 @@ mod tests {
         let marker: ProgressMarker =
             serde_json::from_value(json!("x".repeat(MAX_MARKER_BYTES))).unwrap();
         assert!(
-            ToolEventRequest::new("tool", json!({}), Some(&marker), 1, 4096, &mut observer).is_err()
+            ToolEventRequest::new("tool", json!({}), Some(&marker), 1, 4096, &mut observer)
+                .is_err()
         );
         let mut zero = budget();
         zero.remaining = 0;

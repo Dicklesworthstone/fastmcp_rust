@@ -78,7 +78,9 @@ impl fmt::Display for EnterprisePolicyError {
             Self::UnsupportedAuthentication => "enterprise client authentication is not admitted",
             Self::UnsupportedOidcAlgorithm => "enterprise OIDC registration does not select RS256",
             Self::EncryptedIdTokenUnsupported => "encrypted enterprise ID tokens are unsupported",
-            Self::UnsupportedIdJagPolicy => "enterprise ID-JAG crypto configuration is inconsistent",
+            Self::UnsupportedIdJagPolicy => {
+                "enterprise ID-JAG crypto configuration is inconsistent"
+            }
             Self::InvalidScopes => "invalid enterprise scope set",
             Self::ScopeExpansion => "enterprise scope exceeds its admitted allowance",
             Self::ScopeMismatch => "enterprise scope representations disagree",
@@ -260,17 +262,9 @@ impl EnterpriseProfile {
             "authorization_grant_profiles_supported",
             &[ID_JAG_GRANT_PROFILE],
         )?;
-        require_values(
-            &resource_as,
-            "grant_types_supported",
-            &[JWT_BEARER_GRANT],
-        )?;
-        require_values(
-            &idp,
-            "id_token_signing_alg_values_supported",
-            &["RS256"],
-        )
-        .map_err(|_| EnterprisePolicyError::UnsupportedOidcAlgorithm)?;
+        require_values(&resource_as, "grant_types_supported", &[JWT_BEARER_GRANT])?;
+        require_values(&idp, "id_token_signing_alg_values_supported", &["RS256"])
+            .map_err(|_| EnterprisePolicyError::UnsupportedOidcAlgorithm)?;
         require_values(
             &aggregate,
             "authorization_grant_profiles_supported",
@@ -313,23 +307,29 @@ impl EnterpriseProfile {
         }
         for registration in [&idp_client, &resource_client, &aggregate] {
             if let Some(value) = registration.get("scope") {
-                let allowed = scope_string(
-                    value.as_str().ok_or(EnterprisePolicyError::InvalidScopes)?,
-                )?;
+                let allowed =
+                    scope_string(value.as_str().ok_or(EnterprisePolicyError::InvalidScopes)?)?;
                 require_scope_subset(configuration.requested_scopes.as_slice(), &allowed)?;
             }
         }
-        let mut oidc_openid_allowed = configuration.idp.scope_allowance.iter()
+        let mut oidc_openid_allowed = configuration
+            .idp
+            .scope_allowance
+            .iter()
             .any(|scope| scope == "openid");
         if idp.contains_key("scopes_supported") {
             oidc_openid_allowed &= required_array(&idp, "scopes_supported")?.contains(&"openid");
         }
         if let Some(value) = idp_client.get("scope") {
-            oidc_openid_allowed &= scope_string(
-                value.as_str().ok_or(EnterprisePolicyError::InvalidScopes)?,
-            )?.iter().any(|scope| scope == "openid");
+            oidc_openid_allowed &=
+                scope_string(value.as_str().ok_or(EnterprisePolicyError::InvalidScopes)?)?
+                    .iter()
+                    .any(|scope| scope == "openid");
         }
-        Ok(Self { configuration, oidc_openid_allowed })
+        Ok(Self {
+            configuration,
+            oidc_openid_allowed,
+        })
     }
 
     /// Whether the original IdP deployment, metadata and registration scope
@@ -345,11 +345,9 @@ impl EnterpriseProfile {
         if settings.len() > MAX_SETTINGS_BYTES {
             return Err(EnterprisePolicyError::InvalidClientSettings);
         }
-        let settings = admit_security_document_object(
-            SecurityDocumentKind::ClientRegistration,
-            settings,
-        )
-        .map_err(|_| EnterprisePolicyError::InvalidClientSettings)?;
+        let settings =
+            admit_security_document_object(SecurityDocumentKind::ClientRegistration, settings)
+                .map_err(|_| EnterprisePolicyError::InvalidClientSettings)?;
         if settings.is_empty() {
             Ok(())
         } else {
@@ -604,8 +602,8 @@ fn exact_https_url(value: &str, query_free: bool) -> Result<(), EnterprisePolicy
     {
         return Err(EnterprisePolicyError::InvalidConfiguration);
     }
-    let parsed = CanonicalHttpUrl::parse(value)
-        .map_err(|_| EnterprisePolicyError::InvalidConfiguration)?;
+    let parsed =
+        CanonicalHttpUrl::parse(value).map_err(|_| EnterprisePolicyError::InvalidConfiguration)?;
     if parsed.scheme() != "https"
         || parsed.has_userinfo()
         || parsed.has_syntax_violation()
@@ -681,10 +679,7 @@ fn required_string<'a>(
         .get(key)
         .and_then(Value::as_str)
         .ok_or(EnterprisePolicyError::InvalidDocument)?;
-    if value.is_empty()
-        || value.len() > MAX_STRING_BYTES
-        || value.chars().any(char::is_control)
-    {
+    if value.is_empty() || value.len() > MAX_STRING_BYTES || value.chars().any(char::is_control) {
         return Err(EnterprisePolicyError::InvalidDocument);
     }
     Ok(value)
@@ -703,7 +698,9 @@ fn required_array<'a>(
     }
     let mut seen = BTreeSet::new();
     for value in values {
-        let value = value.as_str().ok_or(EnterprisePolicyError::InvalidDocument)?;
+        let value = value
+            .as_str()
+            .ok_or(EnterprisePolicyError::InvalidDocument)?;
         if value.is_empty()
             || value.len() > MAX_STRING_BYTES
             || value.chars().any(char::is_control)
@@ -765,7 +762,11 @@ fn admit_registration(
     if required_string(registration, "issuer")? != configuration.issuer {
         return Err(EnterprisePolicyError::IssuerMismatch);
     }
-    exact_endpoint(registration, "token_endpoint", &configuration.token_endpoint)?;
+    exact_endpoint(
+        registration,
+        "token_endpoint",
+        &configuration.token_endpoint,
+    )?;
     if required_string(registration, "client_id")? != configuration.client_id {
         return Err(EnterprisePolicyError::RegistrationMismatch);
     }
@@ -1001,20 +1002,53 @@ mod tests {
         ] {
             let mut documents = documents();
             documents[index].as_object_mut().unwrap().remove(field);
-            assert!(admit(configuration(), &documents).is_err(), "{index}:{field}");
+            assert!(
+                admit(configuration(), &documents).is_err(),
+                "{index}:{field}"
+            );
         }
         for (index, field, value, expected) in [
-            (0, "issuer", "https://idp.example/", EnterprisePolicyError::IssuerMismatch),
-            (1, "issuer", "https://idp.example", EnterprisePolicyError::IssuerMismatch),
-            (0, "token_endpoint", "https://authorization.example/token", EnterprisePolicyError::EndpointMismatch),
-            (1, "token_endpoint", "https://idp.example/token", EnterprisePolicyError::EndpointMismatch),
-            (0, "jwks_uri", "https://idp.example/id-jag-keys", EnterprisePolicyError::EndpointMismatch),
+            (
+                0,
+                "issuer",
+                "https://idp.example/",
+                EnterprisePolicyError::IssuerMismatch,
+            ),
+            (
+                1,
+                "issuer",
+                "https://idp.example",
+                EnterprisePolicyError::IssuerMismatch,
+            ),
+            (
+                0,
+                "token_endpoint",
+                "https://authorization.example/token",
+                EnterprisePolicyError::EndpointMismatch,
+            ),
+            (
+                1,
+                "token_endpoint",
+                "https://idp.example/token",
+                EnterprisePolicyError::EndpointMismatch,
+            ),
+            (
+                0,
+                "jwks_uri",
+                "https://idp.example/id-jag-keys",
+                EnterprisePolicyError::EndpointMismatch,
+            ),
         ] {
             let mut documents = documents();
             documents[index][field] = json!(value);
             assert_eq!(admit(configuration(), &documents).unwrap_err(), expected);
         }
-        for replacement in [json!(null), json!(ID_JAG_TOKEN_TYPE), json!([]), json!([ID_JAG_TOKEN_TYPE, ID_JAG_TOKEN_TYPE])] {
+        for replacement in [
+            json!(null),
+            json!(ID_JAG_TOKEN_TYPE),
+            json!([]),
+            json!([ID_JAG_TOKEN_TYPE, ID_JAG_TOKEN_TYPE]),
+        ] {
             let mut documents = documents();
             documents[0]["identity_chaining_requested_token_types_supported"] = replacement;
             assert!(admit(configuration(), &documents).is_err());
@@ -1027,9 +1061,17 @@ mod tests {
             (2, "grant_types", json!([TOKEN_EXCHANGE_GRANT])),
             (2, "grant_types", json!([JWT_BEARER_GRANT])),
             (3, "grant_types", json!(["authorization_code"])),
-            (3, "grant_types", json!([TOKEN_EXCHANGE_GRANT, JWT_BEARER_GRANT])),
+            (
+                3,
+                "grant_types",
+                json!([TOKEN_EXCHANGE_GRANT, JWT_BEARER_GRANT]),
+            ),
             (4, "grant_types", json!([TOKEN_EXCHANGE_GRANT])),
-            (4, "grant_types", json!([JWT_BEARER_GRANT, "authorization_code"])),
+            (
+                4,
+                "grant_types",
+                json!([JWT_BEARER_GRANT, "authorization_code"]),
+            ),
             (3, "client_id", json!("client-at-resource-as")),
             (4, "client_id", json!("client-at-idp")),
             (3, "token_endpoint_auth_method", json!("none")),
@@ -1037,7 +1079,10 @@ mod tests {
         ] {
             let mut documents = documents();
             documents[index][field] = value;
-            assert!(admit(configuration(), &documents).is_err(), "{index}:{field}");
+            assert!(
+                admit(configuration(), &documents).is_err(),
+                "{index}:{field}"
+            );
         }
         for index in [2, 3, 4] {
             let mut documents = documents();
@@ -1052,7 +1097,12 @@ mod tests {
             admit(configuration(), &documents).unwrap_err(),
             EnterprisePolicyError::IssuerMismatch
         );
-        for client_id in ["https://client.example/metadata", "HTTP://client.example/id", " client", "client\n"] {
+        for client_id in [
+            "https://client.example/metadata",
+            "HTTP://client.example/id",
+            " client",
+            "client\n",
+        ] {
             let mut configuration = configuration();
             configuration.idp.client_id = client_id.to_owned();
             assert_eq!(
@@ -1072,7 +1122,10 @@ mod tests {
                 EnterprisePolicyError::UnsupportedOidcAlgorithm
             );
         }
-        for field in ["id_token_encrypted_response_alg", "id_token_encrypted_response_enc"] {
+        for field in [
+            "id_token_encrypted_response_alg",
+            "id_token_encrypted_response_enc",
+        ] {
             let mut documents = documents();
             documents[3][field] = Value::Null;
             assert_eq!(
@@ -1091,7 +1144,10 @@ mod tests {
             match mutation {
                 0 => configuration.id_jag_crypto.algorithm = "PS256".to_owned(),
                 1 => configuration.id_jag_crypto.issuer = "https://another.example".to_owned(),
-                2 => configuration.id_jag_crypto.resource_as_issuer = "https://another.example".to_owned(),
+                2 => {
+                    configuration.id_jag_crypto.resource_as_issuer =
+                        "https://another.example".to_owned()
+                }
                 3 => configuration.id_jag_crypto.jwks_uri = "http://idp.example/keys".to_owned(),
                 _ => configuration.id_jag_crypto.key_generation = 0,
             }
@@ -1112,9 +1168,14 @@ mod tests {
         for role in 0..3 {
             let mut configuration = configuration();
             match role {
-                0 => configuration.idp_authorization_endpoint.push_str("?extra=1"),
+                0 => configuration
+                    .idp_authorization_endpoint
+                    .push_str("?extra=1"),
                 1 => configuration.idp.token_endpoint.push_str("?extra=1"),
-                _ => configuration.resource_as.token_endpoint.push_str("?extra=1"),
+                _ => configuration
+                    .resource_as
+                    .token_endpoint
+                    .push_str("?extra=1"),
             }
             assert_eq!(
                 admit(configuration, &documents()).unwrap_err(),
@@ -1130,21 +1191,46 @@ mod tests {
             .iter()
             .map(|document| serde_json::to_vec(document).unwrap())
             .collect();
-        bytes[0] = br#"{"issuer":"https://idp.example","issuer":"https://foreign.example"}"#.to_vec();
+        bytes[0] =
+            br#"{"issuer":"https://idp.example","issuer":"https://foreign.example"}"#.to_vec();
         assert_eq!(
-            EnterpriseProfile::from_documents(configuration(), &bytes[0], &bytes[1], &bytes[2], &bytes[3], &bytes[4]).unwrap_err(),
+            EnterpriseProfile::from_documents(
+                configuration(),
+                &bytes[0],
+                &bytes[1],
+                &bytes[2],
+                &bytes[3],
+                &bytes[4]
+            )
+            .unwrap_err(),
             EnterprisePolicyError::InvalidDocument
         );
         bytes[0] = serde_json::to_vec(&documents[0]).unwrap();
         bytes[2] = br#"{"unknown":{"scope":"read","scope":"write"}}"#.to_vec();
         assert_eq!(
-            EnterpriseProfile::from_documents(configuration(), &bytes[0], &bytes[1], &bytes[2], &bytes[3], &bytes[4]).unwrap_err(),
+            EnterpriseProfile::from_documents(
+                configuration(),
+                &bytes[0],
+                &bytes[1],
+                &bytes[2],
+                &bytes[3],
+                &bytes[4]
+            )
+            .unwrap_err(),
             EnterprisePolicyError::InvalidDocument
         );
         bytes[2] = serde_json::to_vec(&documents[2]).unwrap();
         bytes[3] = vec![b' '; SecurityDocumentKind::ClientRegistration.byte_limit() + 1];
         assert_eq!(
-            EnterpriseProfile::from_documents(configuration(), &bytes[0], &bytes[1], &bytes[2], &bytes[3], &bytes[4]).unwrap_err(),
+            EnterpriseProfile::from_documents(
+                configuration(),
+                &bytes[0],
+                &bytes[1],
+                &bytes[2],
+                &bytes[3],
+                &bytes[4]
+            )
+            .unwrap_err(),
             EnterprisePolicyError::InvalidDocument
         );
     }
@@ -1157,7 +1243,11 @@ mod tests {
                 "registration_access_token",
                 "registration_client_uri",
             ] {
-                for value in [Value::Null, json!("protected-value"), json!({"nested": true})] {
+                for value in [
+                    Value::Null,
+                    json!("protected-value"),
+                    json!({"nested": true}),
+                ] {
                     let mut documents = documents();
                     documents[index][field] = value;
                     assert_eq!(
@@ -1200,10 +1290,18 @@ mod tests {
 
     #[test]
     fn enterprise_oidc_scope_permission_retains_each_original_idp_allowance() {
-        assert!(!admit(configuration(), &documents()).unwrap().permits_oidc_openid());
+        assert!(
+            !admit(configuration(), &documents())
+                .unwrap()
+                .permits_oidc_openid()
+        );
         let mut configured = configuration();
         configured.idp.scope_allowance.push("openid".to_owned());
-        assert!(admit(configured.clone(), &documents()).unwrap().permits_oidc_openid());
+        assert!(
+            admit(configured.clone(), &documents())
+                .unwrap()
+                .permits_oidc_openid()
+        );
         for source in 0..2 {
             let mut docs = documents();
             if source == 0 {
@@ -1211,7 +1309,11 @@ mod tests {
             } else {
                 docs[3]["scope"] = json!("tool:read tool:write");
             }
-            assert!(!admit(configured.clone(), &docs).unwrap().permits_oidc_openid());
+            assert!(
+                !admit(configured.clone(), &docs)
+                    .unwrap()
+                    .permits_oidc_openid()
+            );
         }
         let mut docs = documents();
         docs[3]["scope"] = json!("tool:read openid tool:write");
@@ -1221,11 +1323,18 @@ mod tests {
     #[test]
     fn enterprise_scope_grants_preserve_the_exact_three_way_decision() {
         let requested = configuration().requested_scopes;
-        let unchanged = requested.admit_id_jag_grant(None, Some("tool:write tool:read")).unwrap();
+        let unchanged = requested
+            .admit_id_jag_grant(None, Some("tool:write tool:read"))
+            .unwrap();
         assert_eq!(unchanged.as_slice(), requested.as_slice());
-        let narrowed = requested.admit_id_jag_grant(Some("tool:read"), Some("tool:read")).unwrap();
+        let narrowed = requested
+            .admit_id_jag_grant(Some("tool:read"), Some("tool:read"))
+            .unwrap();
         assert_eq!(narrowed.as_slice(), &["tool:read"]);
-        assert_eq!(narrowed.admit_access_grant(Some("tool:read")).unwrap(), ["tool:read"]);
+        assert_eq!(
+            narrowed.admit_access_grant(Some("tool:read")).unwrap(),
+            ["tool:read"]
+        );
         for (response, signed) in [
             (None, Some("tool:read")),
             (Some("tool:write"), Some("tool:read")),
@@ -1250,18 +1359,44 @@ mod tests {
 
     #[test]
     fn enterprise_scope_grammar_and_limits_do_not_normalize_authority() {
-        for invalid in ["", " read", "read ", "read\twrite", "réad", "read\"", "read\\write"] {
+        for invalid in [
+            "",
+            " read",
+            "read ",
+            "read\twrite",
+            "réad",
+            "read\"",
+            "read\\write",
+        ] {
             assert!(RequestedEnterpriseScopeSet::from_literals([invalid.to_owned()]).is_err());
         }
-        assert!(RequestedEnterpriseScopeSet::from_literals(["read".to_owned(), "read".to_owned()]).is_err());
+        assert!(
+            RequestedEnterpriseScopeSet::from_literals(["read".to_owned(), "read".to_owned()])
+                .is_err()
+        );
         assert!(RequestedEnterpriseScopeSet::from_literals(["r".repeat(257)]).is_err());
         RequestedEnterpriseScopeSet::from_literals(["r".repeat(256)]).unwrap();
-        RequestedEnterpriseScopeSet::from_literals((0..64).map(|index| format!("s{index}"))).unwrap();
-        assert!(RequestedEnterpriseScopeSet::from_literals((0..65).map(|index| format!("s{index}"))).is_err());
-        assert!(RequestedEnterpriseScopeSet::from_literals((0..17).map(|index| format!("{index:03}{}", "r".repeat(253)))).is_err());
-        let requested = RequestedEnterpriseScopeSet::from_literals(["read".to_owned(), "write".to_owned()]).unwrap();
+        RequestedEnterpriseScopeSet::from_literals((0..64).map(|index| format!("s{index}")))
+            .unwrap();
+        assert!(
+            RequestedEnterpriseScopeSet::from_literals((0..65).map(|index| format!("s{index}")))
+                .is_err()
+        );
+        assert!(
+            RequestedEnterpriseScopeSet::from_literals(
+                (0..17).map(|index| format!("{index:03}{}", "r".repeat(253)))
+            )
+            .is_err()
+        );
+        let requested =
+            RequestedEnterpriseScopeSet::from_literals(["read".to_owned(), "write".to_owned()])
+                .unwrap();
         for malformed in ["read  write", " read write", "read write ", "read read"] {
-            assert!(requested.admit_id_jag_grant(Some(malformed), Some(malformed)).is_err());
+            assert!(
+                requested
+                    .admit_id_jag_grant(Some(malformed), Some(malformed))
+                    .is_err()
+            );
         }
         assert_eq!(requested.as_slice(), &["read", "write"]);
     }

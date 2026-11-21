@@ -295,21 +295,37 @@ mod tests {
             let (wire, _) = prepared("resources/read", json!({"uri":uri}));
             let body: Value = serde_json::from_slice(wire.body()).unwrap();
             let headers = wire.headers();
-            let mirrors: Vec<_> = headers.iter()
+            let mirrors: Vec<_> = headers
+                .iter()
                 .filter(|(name, _)| name.eq_ignore_ascii_case("mcp-name"))
                 .collect();
             assert_eq!(mirrors.len(), 1);
             assert_eq!(
-                fastmcp_protocol::http_headers::decode_mcp_header_value(mirrors[0].1.as_bytes()).unwrap(),
+                fastmcp_protocol::http_headers::decode_mcp_header_value(mirrors[0].1.as_bytes())
+                    .unwrap(),
                 uri,
             );
             assert_eq!(body["params"]["uri"], uri);
             assert_eq!(wire.target(), "https://mcp.example/mcp");
-            assert!(!headers.iter().any(|(name, _)| name == "Authorization" || name == "DPoP"));
+            assert!(
+                !headers
+                    .iter()
+                    .any(|(name, _)| name == "Authorization" || name == "DPoP")
+            );
         }
-        for method in ["resources/list", "resources/templates/list", "tools/list", "prompts/list"] {
+        for method in [
+            "resources/list",
+            "resources/templates/list",
+            "tools/list",
+            "prompts/list",
+        ] {
             let (wire, _) = prepared(method, json!({}));
-            assert!(!wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("mcp-name")));
+            assert!(
+                !wire
+                    .headers()
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("mcp-name"))
+            );
         }
     }
 

@@ -260,7 +260,9 @@ impl ExtensionRequest<'_> {
                     budget.charge_notification(&wire)?;
                     // This owner consumes events directly. Invalidate cached
                     // results without filling an inaccessible shared queue.
-                    client.final_result_cache.invalidate_notification(notification);
+                    client
+                        .final_result_cache
+                        .invalidate_notification(notification);
                 }
                 ModernHttpExtensionEvent::ExtensionNotification {
                     notification,

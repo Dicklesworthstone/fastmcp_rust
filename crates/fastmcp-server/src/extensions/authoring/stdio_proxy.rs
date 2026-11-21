@@ -4,9 +4,9 @@ use std::sync::{Mutex, OnceLock, TryLockError};
 
 use fastmcp_client::{Client, ClientBuilder, StdioRequestExecution, StdioRequestExecutor};
 use fastmcp_core::Cx;
+use fastmcp_protocol::JsonRpcRequest;
 use fastmcp_protocol::extensions::ClientExtensionDiscovery;
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
-use fastmcp_protocol::JsonRpcRequest;
 
 use super::{
     AdmittedSchema, Arc, AuthorizedNotificationPayload, BTreeMap, BoxFuture, DeserializeOwned,
@@ -144,7 +144,11 @@ impl ExtensionSettingsCompatibilityResolver for StdioSettingsResolver {
             return Err(rejected());
         }
         let effective = (self.resolve)(client, server).map_err(|_| rejected())?;
-        if self.effective.get().is_some_and(|expected| expected != &effective) {
+        if self
+            .effective
+            .get()
+            .is_some_and(|expected| expected != &effective)
+        {
             return Err(rejected());
         }
         Ok(effective)
@@ -181,7 +185,10 @@ impl ExtensionRegistration {
         ClientSettings: Serialize + Sync + ?Sized,
     {
         if builder.selected_protocol_plan().policy() != ProtocolPolicy::ModernOnly
-            || builder.selected_protocol_plan().modern_post_target().is_some()
+            || builder
+                .selected_protocol_plan()
+                .modern_post_target()
+                .is_some()
         {
             return Err(McpError::invalid_params(
                 "stdio extension proxy requires a modern-only stdio client plan",
@@ -202,18 +209,21 @@ impl ExtensionRegistration {
         let resolve: Arc<SettingsResolver> = Arc::from(self.resolver.resolve);
         let effective = Arc::new(OnceLock::new());
         let resolver_effective = Arc::clone(&effective);
-        let builder = builder.extension_registry(descriptors, discovery, move || {
-            StdioSettingsResolver {
+        let builder =
+            builder.extension_registry(descriptors, discovery, move || StdioSettingsResolver {
                 descriptor: resolver_protocol.clone(),
                 resolve: Arc::clone(&resolve),
                 effective: Arc::clone(&resolver_effective),
-            }
-        })?;
+            })?;
         drop(self.handlers);
         let mut client = Box::pin(builder.connect_stdio_with_cx(cx, command, args)).await?;
         let initialized = client.ensure_initialized_with_cx(cx).await.and_then(|()| {
             cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-            if cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline) {
+            if cx
+                .budget()
+                .deadline
+                .is_some_and(|deadline| cx.now() >= deadline)
+            {
                 return Err(McpError::request_cancelled());
             }
             let negotiated = client
@@ -225,7 +235,9 @@ impl ExtensionRegistration {
             let executor = client.multiplexed_stdio_executor()?;
             effective
                 .set(negotiated.effective_settings().settings().clone())
-                .map_err(|_| McpError::internal_error("stdio upstream settings are already sealed"))?;
+                .map_err(|_| {
+                    McpError::internal_error("stdio upstream settings are already sealed")
+                })?;
             Ok((negotiated, executor))
         });
         let (negotiated, executor) = match initialized {
@@ -306,11 +318,15 @@ where
         Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
         Notification: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
     {
-        let declaration = self.descriptor.request_notification.as_ref().ok_or_else(|| {
-            McpError::invalid_params(
-                "stdio notification proxy requires a typed notification declaration",
-            )
-        })?;
+        let declaration = self
+            .descriptor
+            .request_notification
+            .as_ref()
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "stdio notification proxy requires a typed notification declaration",
+                )
+            })?;
         if upstream.descriptor.request_notification.as_ref() != Some(declaration) {
             return Err(McpError::invalid_params(
                 "stdio notification proxy requires matching notification declarations",
@@ -415,7 +431,11 @@ where
         Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
     {
         if upstream.descriptor.id != self.descriptor.id
-            || !upstream.descriptor.methods.iter().any(|entry| entry.name == method)
+            || !upstream
+                .descriptor
+                .methods
+                .iter()
+                .any(|entry| entry.name == method)
         {
             return Err(McpError::invalid_params(
                 "stdio upstream does not own this extension method",
@@ -485,9 +505,9 @@ where
         authorized: AuthorizedNotificationPayload,
     ) -> BoxFuture<'a, McpResult<Value>> {
         Box::pin(async move {
-            let (notification, _settings) = self.binding.prepare::<Notification, Settings>(
-                context, negotiated, authorized,
-            )?;
+            let (notification, _settings) = self
+                .binding
+                .prepare::<Notification, Settings>(context, negotiated, authorized)?;
             admit_settings(negotiated, &self.upstream.negotiated)?;
             let parameters = encode_application_value(
                 &notification,
@@ -495,9 +515,14 @@ where
             )?;
             admit_application_parameters(&parameters, &self.parameter_schema)?;
             ensure_live(context)?;
-            let method = self.binding.descriptor.notification.as_ref().ok_or_else(|| {
-                McpError::internal_error("typed notification descriptor is unavailable")
-            })?;
+            let method = self
+                .binding
+                .descriptor
+                .notification
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::internal_error("typed notification descriptor is unavailable")
+                })?;
             self.upstream
                 .connection
                 .executor
@@ -532,12 +557,10 @@ fn admit_settings(
 
 fn encode_application_value<T: Serialize>(value: &T, limit: usize) -> McpResult<Value> {
     let source = encode_bytes(value, limit)?;
-    fastmcp_protocol::admit_raw_jsonrpc_document(&source, limit).map_err(|_| {
-        McpError::invalid_params("typed proxy serialization is invalid JSON")
-    })?;
-    serde_json::from_slice(&source).map_err(|_| {
-        McpError::invalid_params("typed proxy serialization is invalid JSON")
-    })
+    fastmcp_protocol::admit_raw_jsonrpc_document(&source, limit)
+        .map_err(|_| McpError::invalid_params("typed proxy serialization is invalid JSON"))?;
+    serde_json::from_slice(&source)
+        .map_err(|_| McpError::invalid_params("typed proxy serialization is invalid JSON"))
 }
 
 fn admit_application_parameters(parameters: &Value, schema: &AdmittedSchema) -> McpResult<()> {
@@ -570,16 +593,16 @@ impl StdioProxyNotification {
         let parameters = notification.params.ok_or_else(|| {
             McpError::invalid_request("stdio notification proxy requires notification parameters")
         })?;
-        let mut parameters = encode_application_value(
-            &parameters,
-            MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
-        )?;
+        let mut parameters =
+            encode_application_value(&parameters, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)?;
         let object = parameters.as_object_mut().ok_or_else(|| {
             McpError::invalid_request("stdio upstream notification parameters must be an object")
         })?;
         object.remove("_meta");
         self.schema.validate(&parameters).map_err(|_| {
-            McpError::invalid_request("stdio upstream notification does not satisfy its typed schema")
+            McpError::invalid_request(
+                "stdio upstream notification does not satisfy its typed schema",
+            )
         })?;
         let parameters = (self.codec)(parameters)?;
         admit_application_parameters(&parameters, &self.schema)?;
@@ -616,8 +639,9 @@ where
         negotiated: &NegotiatedExtension,
         parameters: Value,
     ) -> McpResult<Value> {
-        let (request, _settings) =
-            self.binding.decode::<Request, Settings>(context, negotiated, parameters)?;
+        let (request, _settings) = self
+            .binding
+            .decode::<Request, Settings>(context, negotiated, parameters)?;
         admit_settings(negotiated, &self.upstream.negotiated)?;
         if self.notification.is_some() {
             context.ensure_request_extension_notifications_available()?;

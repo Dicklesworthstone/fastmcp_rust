@@ -1229,7 +1229,9 @@ impl FinalTaskStore for MinimalBackend {
 
     fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
         let id = expected.task().base().task_id.clone();
-        if self.locked().get(&id).map(|(_, generation, _)| *generation) != Some(expected.generation()) {
+        if self.locked().get(&id).map(|(_, generation, _)| *generation)
+            != Some(expected.generation())
+        {
             return Ok(false);
         }
         self.request_cancellation(&id)?;

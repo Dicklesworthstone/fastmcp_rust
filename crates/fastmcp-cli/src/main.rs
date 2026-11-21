@@ -3216,17 +3216,15 @@ fn bounded_server_entries(servers: &[ServerEntry]) -> ListOutput {
         let source = bounded_json_string_with_limit(&entry.source, PEER_FIELD_LIMIT, &mut budget);
         let transport =
             bounded_json_string_with_limit(&entry.transport, PEER_FIELD_LIMIT, &mut budget);
-        let command = (!entry.command.is_empty()).then(|| {
-            bounded_json_string_with_limit(&entry.command, PEER_FIELD_LIMIT, &mut budget)
-        });
+        let command = (!entry.command.is_empty())
+            .then(|| bounded_json_string_with_limit(&entry.command, PEER_FIELD_LIMIT, &mut budget));
         let cwd = entry
             .cwd
             .as_deref()
             .map(|cwd| bounded_json_string_with_limit(cwd, PEER_FIELD_LIMIT, &mut budget));
-        let endpoint = entry
-            .endpoint
-            .as_deref()
-            .map(|endpoint| bounded_json_string_with_limit(endpoint, PEER_FIELD_LIMIT, &mut budget));
+        let endpoint = entry.endpoint.as_deref().map(|endpoint| {
+            bounded_json_string_with_limit(endpoint, PEER_FIELD_LIMIT, &mut budget)
+        });
         budget.mutation.redacted |= entry
             .endpoint
             .as_deref()
@@ -6726,7 +6724,12 @@ async fn stdio_operation(
         #[cfg(feature = "tasks")]
         if wait {
             return Box::pin(waiting_stdio_tool_call(
-                cx, &mut client, connection, parameters, budget, &cancellation,
+                cx,
+                &mut client,
+                connection,
+                parameters,
+                budget,
+                &cancellation,
             ))
             .await;
         }
@@ -6862,7 +6865,10 @@ async fn waiting_stdio_tool_call(
     let Some(mut task) = prepare_operation_task_wait(connection, &result)? else {
         return Ok(Some(result));
     };
-    if !matches!(task.task(), fastmcp_protocol::tasks_extension::Task::Working(_)) {
+    if !matches!(
+        task.task(),
+        fastmcp_protocol::tasks_extension::Task::Working(_)
+    ) {
         return emitted_operation_task_outcome(task.task()).map(|()| None);
     }
     let remaining = budget.remaining(cx)?;
@@ -6922,7 +6928,10 @@ async fn waiting_http_tool_call(
     let Some(mut task) = prepare_operation_task_wait(connection, &result)? else {
         return Ok(Some(result));
     };
-    if !matches!(task.task(), fastmcp_protocol::tasks_extension::Task::Working(_)) {
+    if !matches!(
+        task.task(),
+        fastmcp_protocol::tasks_extension::Task::Working(_)
+    ) {
         return emitted_operation_task_outcome(task.task()).map(|()| None);
     }
     let remaining = budget.remaining(cx)?;
@@ -6936,9 +6945,7 @@ async fn waiting_http_tool_call(
     .map_err(|_| OperationBudget::timeout_error())
     .and_then(|result| {
         result.map_err(|_| {
-            fastmcp_core::McpError::internal_error(
-                "task observation failed; no action was retried",
-            )
+            fastmcp_core::McpError::internal_error("task observation failed; no action was retried")
         })
     });
     finish_operation_task_wait(connection, task.task(), outcome)?;
@@ -7105,9 +7112,7 @@ fn finish_operation_task_wait(
 }
 
 #[cfg(feature = "tasks")]
-fn emitted_operation_task_outcome(
-    task: &fastmcp_protocol::tasks_extension::Task,
-) -> McpResult<()> {
+fn emitted_operation_task_outcome(task: &fastmcp_protocol::tasks_extension::Task) -> McpResult<()> {
     use fastmcp_protocol::tasks_extension::Task;
     match task {
         Task::Completed { result, .. } if !result.result.is_error => Ok(()),
@@ -8714,7 +8719,9 @@ fn stdio_inspect_capabilities(client: &Client) -> McpResult<InspectCapabilities>
                     "modern stdio inspect completed without a server/discover result",
                 )
             })?;
-            Ok(InspectCapabilities::final_from_discovery(discovery.capabilities()))
+            Ok(InspectCapabilities::final_from_discovery(
+                discovery.capabilities(),
+            ))
         }
         #[cfg(feature = "legacy-2024-11-05")]
         Some(ProtocolEra::Legacy2024) => Ok(InspectCapabilities::Legacy(
@@ -8815,14 +8822,13 @@ async fn cmd_inspect_http(
     let server_info =
         InspectIdentity::from_discovery(client.server_info(), client.server_discovery().as_ref());
     let capabilities = http_inspect_capabilities(&client)?;
-    let (acquisition_truncated, tools, resources, resource_templates, prompts) =
-        inspect_catalogs(
-            cx,
-            &mut InspectClient::Http(&mut client),
-            &capabilities,
-            max_pages,
-        )
-        .await?;
+    let (acquisition_truncated, tools, resources, resource_templates, prompts) = inspect_catalogs(
+        cx,
+        &mut InspectClient::Http(&mut client),
+        &capabilities,
+        max_pages,
+    )
+    .await?;
 
     write_inspect_report(
         server_info.as_ref(),
@@ -8848,7 +8854,9 @@ fn http_inspect_capabilities(
                     "modern HTTP inspect completed without a server/discover result",
                 )
             })?;
-            Ok(InspectCapabilities::final_from_discovery(discovery.capabilities()))
+            Ok(InspectCapabilities::final_from_discovery(
+                discovery.capabilities(),
+            ))
         }
         #[cfg(feature = "legacy-2024-11-05")]
         ProtocolEra::Legacy2024 => client
@@ -14484,7 +14492,8 @@ mod portable_install {
         })?;
         let existing = read_bounded_with_context(path, max_bytes, context)?;
         if existing.as_deref() == Some(contents) {
-            if read_bounded_with_context(path, max_bytes, context)?.as_deref() != existing.as_deref()
+            if read_bounded_with_context(path, max_bytes, context)?.as_deref()
+                != existing.as_deref()
             {
                 return Err(McpError::invalid_params(format!(
                     "Refusing to report {context} at {display} unchanged: the destination changed while the no-op was verified"
@@ -14500,7 +14509,8 @@ mod portable_install {
                 .map_err(|error| io_error("create the output directory", &error))?;
         }
         let mode = if existing.is_some() {
-            let metadata = fs::symlink_metadata(path).map_err(|error| io_error("inspect", &error))?;
+            let metadata =
+                fs::symlink_metadata(path).map_err(|error| io_error("inspect", &error))?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(McpError::invalid_params(format!(
                     "Refusing to write {context} at {display}: destination changed to a non-regular file"
@@ -14904,9 +14914,8 @@ mod portable_install {
 
             let missing_parent = directory.join("must-not-exist");
             let traversal = missing_parent.join("..").join("escape.json");
-            let traversal_err =
-                replace_file(&traversal, b"{\"new\":1}\n", "inspect output", 1024)
-                    .expect_err("parent traversal");
+            let traversal_err = replace_file(&traversal, b"{\"new\":1}\n", "inspect output", 1024)
+                .expect_err("parent traversal");
             assert_eq!(traversal_err.code, McpErrorCode::InvalidParams);
             assert!(traversal_err.message.contains("traversal components"));
             assert!(!missing_parent.exists());
@@ -15331,7 +15340,10 @@ mod tests {
                     if status == "completed" {
                         assert!(receipt_text.contains(r#""com.example\/number":1.20e+4"#));
                     }
-                    assert!(budget.remaining(&cx).is_err(), "receipt cannot renew active work");
+                    assert!(
+                        budget.remaining(&cx).is_err(),
+                        "receipt cannot renew active work"
+                    );
                     // There is deliberately no client or transport here: local
                     // adoption cannot turn cancellation/expiry into tasks/get.
                 });
@@ -15362,7 +15374,10 @@ mod tests {
             })
             .is_err()
         );
-        assert!(!invoked, "reject oversized receipt before attempting output");
+        assert!(
+            !invoked,
+            "reject oversized receipt before attempting output"
+        );
     }
 
     #[test]

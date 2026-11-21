@@ -10,10 +10,10 @@ use fastmcp_protocol::{CoreRequest, JsonRpcRequest};
 
 use super::{
     CoreResult, Cx, McpAppsActivationProof, McpAppsHostError, McpAppsRoutedMethod,
-    McpAppsServerInputClient, McpAppsWireBridgeTransport, McpAppsWireHost,
-    McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
-    McpAppsWireHostPolicy, McpError, McpRequestCancellation, McpResult, Value,
-    dispatch_apps_server_input, project_reused_core_result, wire_policy_checkpoint,
+    McpAppsServerInputClient, McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
+    McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy, McpError,
+    McpRequestCancellation, McpResult, Value, dispatch_apps_server_input,
+    project_reused_core_result, wire_policy_checkpoint,
 };
 use crate::{ProtocolEra, WebSocketClient};
 
@@ -45,9 +45,7 @@ where
         if !self.mcp_apps_active() {
             return Err(McpAppsHostError::NotNegotiated);
         }
-        McpAppsActivationProof::from_activation_receipt(
-            self.session.mcp_apps_activation_receipt(),
-        )
+        McpAppsActivationProof::from_activation_receipt(self.session.mcp_apps_activation_receipt())
     }
 
     /// Starts a closed Apps View bridge with explicit embedder forwarding.
@@ -158,9 +156,10 @@ where
         if let Some(error) = received.response.error {
             return Err(crate::json_rpc_error_to_mcp(error));
         }
-        let result = received.response.result.as_ref().ok_or_else(|| {
-            McpError::invalid_request("Apps WebSocket response has no result")
-        })?;
+        let result =
+            received.response.result.as_ref().ok_or_else(|| {
+                McpError::invalid_request("Apps WebSocket response has no result")
+            })?;
         let source = received.raw_result.as_deref().ok_or_else(|| {
             McpError::invalid_request("Apps WebSocket response has no admitted result source")
         })?;
@@ -180,12 +179,9 @@ where
             let cx = self.connection_cx.clone();
             let closed = self.close(&cx).await;
             return Err(McpAppsHostError::Core(
-                result
-                    .err()
-                    .or_else(|| closed.err())
-                    .unwrap_or_else(|| {
-                        McpError::internal_error("Apps WebSocket connection is closed")
-                    }),
+                result.err().or_else(|| closed.err()).unwrap_or_else(|| {
+                    McpError::internal_error("Apps WebSocket connection is closed")
+                }),
             ));
         }
         Ok(())
@@ -196,11 +192,7 @@ impl<IO> McpAppsServerInputClient for WebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    fn prepare_apps_server_input(
-        &self,
-        cx: &Cx,
-        params: Value,
-    ) -> McpResult<(Instant, Value)> {
+    fn prepare_apps_server_input(&self, cx: &Cx, params: Value) -> McpResult<(Instant, Value)> {
         Ok((
             crate::mrtr_operation_deadline(cx, self.request_timeout_policy)?,
             self.apps_request_parameters(params)?,
@@ -271,7 +263,9 @@ where
         responses: crate::FinalTaskInputResponses,
     ) -> McpResult<()> {
         crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
-        self.update_task_final(cx, task, responses).await.map(|_| ())
+        self.update_task_final(cx, task, responses)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -308,7 +302,12 @@ where
             McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
         ) {
             return dispatch_apps_server_input(
-                self.client, cx, cancellation, method, params, effects,
+                self.client,
+                cx,
+                cancellation,
+                method,
+                params,
+                effects,
             )
             .await;
         }

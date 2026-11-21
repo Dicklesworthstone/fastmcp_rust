@@ -748,7 +748,6 @@ fn secured_http_returned_sse_retains_its_session_until_explicit_close() {
     });
 }
 
-
 fn browser_server(probe: &Probe, protocol: ProtocolPolicy) -> Server {
     Server::new("browser-http", "1.0.0")
         .protocol_policy(protocol)
@@ -787,8 +786,7 @@ fn native_http_embedding_preflight_does_not_authenticate_or_dispatch() {
         for (request, status) in [
             (browser_preflight(), 200),
             (
-                browser_preflight()
-                    .with_header("access-control-request-headers", "x-unreviewed"),
+                browser_preflight().with_header("access-control-request-headers", "x-unreviewed"),
                 403,
             ),
             (
@@ -857,9 +855,7 @@ async fn browser_exchange(
         .map_err(|_| "browser HTTP exchange timed out".to_owned())?
 }
 
-fn browser_response(
-    response: &[u8],
-) -> (u16, std::collections::HashMap<String, String>, &[u8]) {
+fn browser_response(response: &[u8]) -> (u16, std::collections::HashMap<String, String>, &[u8]) {
     let boundary = response
         .windows(4)
         .position(|bytes| bytes == b"\r\n\r\n")
@@ -906,7 +902,9 @@ fn native_http_browser_round_trip(protocol: ProtocolPolicy) {
                     ] {
                         responses.push(browser_exchange(&client_cx, address, preflight).await?);
                         if observing.counts() != (0, 0) {
-                            return Err("preflight invoked authentication or application code".to_owned());
+                            return Err(
+                                "preflight invoked authentication or application code".to_owned()
+                            );
                         }
                     }
                     for accept in ["application/json", "text/event-stream"] {
@@ -928,7 +926,9 @@ fn native_http_browser_round_trip(protocol: ProtocolPolicy) {
                             }
                             responses.push(browser_exchange(&client_cx, address, post).await?);
                             if observing.counts().1 != 2 {
-                                return Err("rejected credentials reached application code".to_owned());
+                                return Err(
+                                    "rejected credentials reached application code".to_owned()
+                                );
                             }
                         }
                     }
@@ -967,7 +967,10 @@ fn native_http_browser_round_trip(protocol: ProtocolPolicy) {
             );
             assert_eq!(headers.contains_key("access-control-allow-origin"), allowed);
             if allowed {
-                assert_eq!(headers["access-control-allow-origin"], "https://app.example");
+                assert_eq!(
+                    headers["access-control-allow-origin"],
+                    "https://app.example"
+                );
                 assert!(
                     headers["access-control-expose-headers"]
                         .to_ascii_lowercase()
@@ -981,7 +984,11 @@ fn native_http_browser_round_trip(protocol: ProtocolPolicy) {
                 assert_eq!(result["result"]["content"][0]["text"], "verified-subject");
             } else if index == 5 {
                 assert_eq!(headers["content-type"], "text/event-stream");
-                assert!(std::str::from_utf8(body).unwrap().contains("verified-subject"));
+                assert!(
+                    std::str::from_utf8(body)
+                        .unwrap()
+                        .contains("verified-subject")
+                );
             } else {
                 assert!(body.is_empty());
                 assert_eq!(headers["www-authenticate"], "Bearer");

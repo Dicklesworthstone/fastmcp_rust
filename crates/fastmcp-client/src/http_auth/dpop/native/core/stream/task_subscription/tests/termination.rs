@@ -6,7 +6,8 @@ fn cancelled(id: Value, marker: Option<Value>) -> Vec<u8> {
     if let Some(marker) = marker {
         params["_meta"] = json!({FINAL_SUBSCRIPTION_ID_META_KEY:marker});
     }
-    serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":params})).unwrap()
+    serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":params}))
+        .unwrap()
 }
 
 #[test]
@@ -23,13 +24,20 @@ fn all_terminal_orders_keep_the_first_outcome_at_every_byte_split() {
             ] {
                 let mut wire = event(&acknowledged);
                 wire.extend_from_slice(&event(first));
-                if let Some(second) = second { wire.extend_from_slice(&event(second)); }
+                if let Some(second) = second {
+                    wire.extend_from_slice(&event(second));
+                }
                 for split in 0..=wire.len() {
                     // ACK exhausts the notification allowance; control teardown
                     // still works, discarding a second signal in the same frame.
                     let selected = limits(1);
-                    let mut reader = Reader::new(ModernHttpResponseKind::Sse,
-                        decoder(selected), selected, 32768).unwrap();
+                    let mut reader = Reader::new(
+                        ModernHttpResponseKind::Sse,
+                        decoder(selected),
+                        selected,
+                        32768,
+                    )
+                    .unwrap();
                     let mut idle = Idle::new(life.cx.now(), selected.idle);
                     let deadline = idle.deadline;
                     let mut observed = 0;
@@ -38,16 +46,25 @@ fn all_terminal_orders_keep_the_first_outcome_at_every_byte_split() {
                         observed += 1;
                         true
                     };
-                    reader.push(&wire[..split], life, &mut idle, &mut observer).unwrap();
-                    reader.push(&wire[split..], life, &mut idle, &mut observer).unwrap();
+                    reader
+                        .push(&wire[..split], life, &mut idle, &mut observer)
+                        .unwrap();
+                    reader
+                        .push(&wire[split..], life, &mut idle, &mut observer)
+                        .unwrap();
                     assert_eq!(observed, 1);
                     assert_eq!(idle.deadline, deadline);
                     let completed = reader.finish(life, &idle).unwrap();
                     assert_eq!(completed.usage.1, 1);
-                    assert_eq!(completed.usage.0, discovery(discovery_result()).len()
-                        + acknowledged.len() + first.len());
+                    assert_eq!(
+                        completed.usage.0,
+                        discovery(discovery_result()).len() + acknowledged.len() + first.len()
+                    );
                     if is_cancelled {
-                        assert!(matches!(completed.result, Err(DpopStreamError::SubscriptionCancelled)));
+                        assert!(matches!(
+                            completed.result,
+                            Err(DpopStreamError::SubscriptionCancelled)
+                        ));
                     } else {
                         let encoded = completed.result.unwrap().encode().unwrap();
                         assert!(encoded.contains("900719925474099312345"));
@@ -66,9 +83,14 @@ fn cancellation_uses_request_identity_and_invalid_frames_leave_every_field_uncha
     let valid = cancelled(json!(2), Some(json!(2)));
     let mut decoder = decoder(limits(1));
     let before = snapshot(&decoder);
-    assert!(decoder.admit(&valid, true).is_err(), "ACK must establish the selection first");
+    assert!(
+        decoder.admit(&valid, true).is_err(),
+        "ACK must establish the selection first"
+    );
     assert_eq!(snapshot(&decoder), before);
-    decoder.admit(&ack(json!(2), json!({"taskIds":["task-one"]})), true).unwrap();
+    decoder
+        .admit(&ack(json!(2), json!({"taskIds":["task-one"]})), true)
+        .unwrap();
     for bad in [
         cancelled(json!("2"), Some(json!(2))),
         cancelled(json!(2), None),
@@ -84,11 +106,16 @@ fn cancellation_uses_request_identity_and_invalid_frames_leave_every_field_uncha
         assert!(decoder.admit(&bad, true).is_err());
         assert_eq!(snapshot(&decoder), before);
     }
-    assert!(matches!(decoder.admit(&valid, true).unwrap(),
-        StreamEvent::Result(Err(DpopStreamError::SubscriptionCancelled))));
+    assert!(matches!(
+        decoder.admit(&valid, true).unwrap(),
+        StreamEvent::Result(Err(DpopStreamError::SubscriptionCancelled))
+    ));
     assert_eq!(decoder.notifications, 1);
-    let diagnostic = format!("{:?} {}", DpopStreamError::SubscriptionCancelled,
-        DpopStreamError::SubscriptionCancelled);
+    let diagnostic = format!(
+        "{:?} {}",
+        DpopStreamError::SubscriptionCancelled,
+        DpopStreamError::SubscriptionCancelled
+    );
     assert!(!diagnostic.contains("canary"));
 }
 
@@ -97,21 +124,41 @@ fn first_terminal_spends_bytes_without_requiring_an_unused_notification_slot() {
     let discovery = discovery(discovery_result());
     let ack = ack(json!(2), json!({"taskIds":["task-one"]}));
     let cancel = cancelled(json!(2), Some(json!(2)));
-    let maximum = discovery.len().max(ack.len()).max(cancel.len()).max(COMPLETE.len());
+    let maximum = discovery
+        .len()
+        .max(ack.len())
+        .max(cancel.len())
+        .max(COMPLETE.len());
     for cancelled_first in [false, true] {
-        let first = if cancelled_first { &cancel[..] } else { COMPLETE.as_bytes() };
+        let first = if cancelled_first {
+            &cancel[..]
+        } else {
+            COMPLETE.as_bytes()
+        };
         let total = discovery.len() + ack.len() + first.len();
         for short in [false, true] {
-            let core = ManagedCoreLimits::new(8192, maximum, total - usize::from(short),
-                1, Duration::from_secs(60)).unwrap();
+            let core = ManagedCoreLimits::new(
+                8192,
+                maximum,
+                total - usize::from(short),
+                1,
+                Duration::from_secs(60),
+            )
+            .unwrap();
             let (_, mut decoder) = Prepared::new(TARGET, selection(&["task-one"]), core, 8192)
-                .unwrap().admit(response(discovery.clone())).unwrap();
+                .unwrap()
+                .admit(response(discovery.clone()))
+                .unwrap();
             decoder.admit(&ack, true).unwrap();
             let before = snapshot(&decoder);
             let terminal = decoder.admit(first, true);
             if short {
-                assert!(matches!(terminal, Err(DpopStreamError::Core(DpopCoreError::Protocol(
-                    ManagedCoreError::ResponseByteLimit)))));
+                assert!(matches!(
+                    terminal,
+                    Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                        ManagedCoreError::ResponseByteLimit
+                    )))
+                ));
                 assert_eq!(snapshot(&decoder), before);
             } else {
                 terminal.unwrap();
@@ -148,7 +195,11 @@ fn first_terminal_discards_task_traffic_duplicate_signals_and_incomplete_tails()
         let cancel = event(&cancelled(json!(2), Some(json!(2))));
         let complete = event(COMPLETE.as_bytes());
         for cancelled_first in [false, true] {
-            let (first, second) = if cancelled_first { (&cancel, &complete) } else { (&complete, &cancel) };
+            let (first, second) = if cancelled_first {
+                (&cancel, &complete)
+            } else {
+                (&complete, &cancel)
+            };
             for tail in [
                 event(&status(json!(2), "task-one")),
                 first.clone(),
@@ -159,13 +210,23 @@ fn first_terminal_discards_task_traffic_duplicate_signals_and_incomplete_tails()
                 let mut reader = reader(ModernHttpResponseKind::Sse);
                 let mut idle = Idle::new(life.cx.now(), limits(8).idle);
                 reader.push(&ack, life, &mut idle, &mut |_| true).unwrap();
-                reader.push(first, life, &mut idle, &mut |_| panic!("terminal is not a Task event")).unwrap();
-                let pushed = reader.push(&tail, life, &mut idle,
-                    &mut |_| panic!("post-terminal traffic escaped"));
+                reader
+                    .push(first, life, &mut idle, &mut |_| {
+                        panic!("terminal is not a Task event")
+                    })
+                    .unwrap();
+                let pushed = reader.push(&tail, life, &mut idle, &mut |_| {
+                    panic!("post-terminal traffic escaped")
+                });
                 pushed.unwrap();
                 let completed = reader.finish(life, &idle).unwrap();
-                assert_eq!(matches!(completed.result, Err(DpopStreamError::SubscriptionCancelled)),
-                    cancelled_first);
+                assert_eq!(
+                    matches!(
+                        completed.result,
+                        Err(DpopStreamError::SubscriptionCancelled)
+                    ),
+                    cancelled_first
+                );
             }
         }
     });
@@ -177,12 +238,21 @@ fn local_cancellation_or_revocation_before_publication_overrides_the_remote_term
         fixture(|life| {
             let mut reader = reader(ModernHttpResponseKind::Sse);
             let mut idle = Idle::new(life.cx.now(), limits(8).idle);
-            let wire = [event(&ack(json!(2), json!({"taskIds":["task-one"]}))),
-                event(&cancelled(json!(2), Some(json!(2))))].concat();
+            let wire = [
+                event(&ack(json!(2), json!({"taskIds":["task-one"]}))),
+                event(&cancelled(json!(2), Some(json!(2)))),
+            ]
+            .concat();
             reader.push(&wire, life, &mut idle, &mut |_| true).unwrap();
-            if revoked { life.credential.revoke(); } else { life.cancellation.cancel(); }
-            assert!(matches!(reader.finish(life, &idle),
-                Err(DpopStreamError::Core(DpopCoreError::Transport(_)))));
+            if revoked {
+                life.credential.revoke();
+            } else {
+                life.cancellation.cancel();
+            }
+            assert!(matches!(
+                reader.finish(life, &idle),
+                Err(DpopStreamError::Core(DpopCoreError::Transport(_)))
+            ));
             assert!(life.cx.checkpoint().is_ok());
         });
     }

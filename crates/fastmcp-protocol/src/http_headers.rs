@@ -1501,10 +1501,8 @@ mod tests {
     fn local_registration_cannot_review_away_an_ancestor_secret() {
         for kind in ["string", "integer", "boolean"] {
             for at_root in [false, true] {
-                for (keyword, marker) in [
-                    ("writeOnly", json!(true)),
-                    ("format", json!("PaSsWoRd")),
-                ] {
+                for (keyword, marker) in [("writeOnly", json!(true)), ("format", json!("PaSsWoRd"))]
+                {
                     let public = json!({"type":"object", "properties":{
                         "a/b~c":{"type":"object", "properties":{
                             "0":{"type":kind, "writeOnly":false, "x-mcp-header":"Value"}
@@ -1633,7 +1631,10 @@ mod tests {
                 McpHeaderError::InvalidAnnotation,
             ),
         ] {
-            assert_eq!(AdmittedToolHeaderSchema::admit(source).unwrap_err(), expected);
+            assert_eq!(
+                AdmittedToolHeaderSchema::admit(source).unwrap_err(),
+                expected
+            );
         }
     }
 

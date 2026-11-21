@@ -42,9 +42,7 @@ use fastmcp_core::{
     AbsoluteUri, AccessToken, AuthContext, CanonicalResourceId, McpContext, McpError, McpErrorCode,
     McpResult, Sha256Digest,
 };
-use fastmcp_protocol::jose::{
-    AdmittedRsaJwks, VerifiedCompactJws, verify_compact_jws_rs256,
-};
+use fastmcp_protocol::jose::{AdmittedRsaJwks, VerifiedCompactJws, verify_compact_jws_rs256};
 use serde_json::{Value, json};
 
 use crate::auth::{AuthRequest, TokenVerifier, principal_fingerprint};
@@ -626,9 +624,7 @@ fn checkpoint(ctx: &McpContext) -> Result<(), JwtResourceAuthError> {
 }
 
 fn valid_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_IDENTIFIER_BYTES
-        && !value.chars().any(char::is_control)
+    !value.is_empty() && value.len() <= MAX_IDENTIFIER_BYTES && !value.chars().any(char::is_control)
 }
 
 fn identifier(value: &Value) -> Result<&str, JwtResourceAuthError> {
@@ -853,8 +849,7 @@ pub(in crate::providers) mod tests {
     }
 
     pub(in crate::providers) fn policy() -> JwtResourcePolicy {
-        JwtResourcePolicy::new(ISSUER, RESOURCE, Duration::from_secs(3600), Duration::ZERO)
-            .unwrap()
+        JwtResourcePolicy::new(ISSUER, RESOURCE, Duration::from_secs(3600), Duration::ZERO).unwrap()
     }
 
     pub(in crate::providers) fn jwks(kid: &str) -> Vec<u8> {
@@ -928,21 +923,34 @@ pub(in crate::providers) mod tests {
         let token = sign(&header(), &source);
         let candidate = verifier.prepare_verification(&ctx(), &token).unwrap();
         let before = Instant::now();
-        let facts = verifier.admit_verified_precise(&ctx(), candidate, || {
-            Ok(Duration::from_secs(NOW) + Duration::from_millis(875))
-        }).unwrap();
+        let facts = verifier
+            .admit_verified_precise(&ctx(), candidate, || {
+                Ok(Duration::from_secs(NOW) + Duration::from_millis(875))
+            })
+            .unwrap();
         let after = Instant::now();
         let expiry = facts.verification_valid_until().unwrap();
         assert!(expiry >= before + Duration::from_millis(1125));
         assert!(expiry <= after + Duration::from_millis(1125));
-        let other = verifier.verify_with_clock(&ctx(), &token, || Ok(NOW)).unwrap();
+        let other = verifier
+            .verify_with_clock(&ctx(), &token, || Ok(NOW))
+            .unwrap();
         assert_eq!(facts.session_owner(), other.session_owner());
-        assert_eq!(principal_fingerprint(Some(&facts)).unwrap(), principal_fingerprint(Some(&other)).unwrap());
-        assert!(!serde_json::to_string(&facts).unwrap().contains("verification_valid_until"));
+        assert_eq!(
+            principal_fingerprint(Some(&facts)).unwrap(),
+            principal_fingerprint(Some(&other)).unwrap()
+        );
+        assert!(
+            !serde_json::to_string(&facts)
+                .unwrap()
+                .contains("verification_valid_until")
+        );
         let expired = verifier.prepare_verification(&ctx(), &token).unwrap();
-        assert!(matches!(verifier.admit_verified_precise(&ctx(), expired, || {
-            Ok(Duration::from_secs(NOW + 2))
-        }), Err(JwtResourceAuthError::InvalidClaims)));
+        assert!(matches!(
+            verifier
+                .admit_verified_precise(&ctx(), expired, || { Ok(Duration::from_secs(NOW + 2)) }),
+            Err(JwtResourceAuthError::InvalidClaims)
+        ));
     }
 
     fn verify_at(
@@ -1099,26 +1107,30 @@ pub(in crate::providers) mod tests {
             (oversized.as_str(), "deployment"),
             ("provider", oversized.as_str()),
         ] {
-            assert!(AcceptedAudiencePolicy::new(
-                ISSUER,
-                resource.clone(),
-                provider,
-                deployment,
-                1,
-                one(),
-            )
-            .is_err());
+            assert!(
+                AcceptedAudiencePolicy::new(
+                    ISSUER,
+                    resource.clone(),
+                    provider,
+                    deployment,
+                    1,
+                    one(),
+                )
+                .is_err()
+            );
         }
         for issuer in ["http://issuer.example", "https://issuer.example?tenant=one"] {
-            assert!(AcceptedAudiencePolicy::new(
-                issuer,
-                resource.clone(),
-                "provider",
-                "deployment",
-                1,
-                one(),
-            )
-            .is_err());
+            assert!(
+                AcceptedAudiencePolicy::new(
+                    issuer,
+                    resource.clone(),
+                    "provider",
+                    "deployment",
+                    1,
+                    one(),
+                )
+                .is_err()
+            );
         }
         for audiences in [
             Vec::new(),
@@ -1127,15 +1139,17 @@ pub(in crate::providers) mod tests {
                 AcceptedAudienceId::new(API_AUDIENCE).unwrap(),
             ],
         ] {
-            assert!(AcceptedAudiencePolicy::new(
-                ISSUER,
-                resource.clone(),
-                "provider",
-                "deployment",
-                1,
-                audiences,
-            )
-            .is_err());
+            assert!(
+                AcceptedAudiencePolicy::new(
+                    ISSUER,
+                    resource.clone(),
+                    "provider",
+                    "deployment",
+                    1,
+                    audiences,
+                )
+                .is_err()
+            );
         }
 
         // An unbounded configuration iterator is consumed only to the limit.
@@ -1145,15 +1159,17 @@ pub(in crate::providers) mod tests {
             observed.set(index + 1);
             Some(AcceptedAudienceId::new(format!("audience-{index}")).unwrap())
         });
-        assert!(AcceptedAudiencePolicy::new(
-            ISSUER,
-            resource.clone(),
-            "provider",
-            "deployment",
-            1,
-            unbounded,
-        )
-        .is_err());
+        assert!(
+            AcceptedAudiencePolicy::new(
+                ISSUER,
+                resource.clone(),
+                "provider",
+                "deployment",
+                1,
+                unbounded,
+            )
+            .is_err()
+        );
         assert_eq!(observed.get(), MAX_AUDIENCES + 1);
 
         // Typed resources may have a larger bound than this JWT profile.
@@ -1165,25 +1181,22 @@ pub(in crate::providers) mod tests {
             not_inspected.set(true);
             Some(AcceptedAudienceId::new(API_AUDIENCE).unwrap())
         });
-        assert!(AcceptedAudiencePolicy::new(
-            ISSUER,
-            too_large,
-            "provider",
-            "deployment",
-            1,
-            audiences,
-        )
-        .is_err());
+        assert!(
+            AcceptedAudiencePolicy::new(ISSUER, too_large, "provider", "deployment", 1, audiences,)
+                .is_err()
+        );
         assert!(!not_inspected.get());
-        assert!(AcceptedAudiencePolicy::new(
-            ISSUER,
-            bound_resource(RESOURCE, "endpoint\none"),
-            "provider",
-            "deployment",
-            1,
-            one(),
-        )
-        .is_err());
+        assert!(
+            AcceptedAudiencePolicy::new(
+                ISSUER,
+                bound_resource(RESOURCE, "endpoint\none"),
+                "provider",
+                "deployment",
+                1,
+                one(),
+            )
+            .is_err()
+        );
 
         let full_set = (0..MAX_AUDIENCES).map(|index| {
             AcceptedAudienceId::new(format!(
@@ -1247,15 +1260,13 @@ pub(in crate::providers) mod tests {
                 JwtResourceAuthError::InvalidPolicy
             );
         }
-        for resource in ["https://tools.example/caf%C3%A9", "https://tools.example/%6dcp"] {
+        for resource in [
+            "https://tools.example/caf%C3%A9",
+            "https://tools.example/%6dcp",
+        ] {
             let verifier = JwtResourceVerifier::new(
-                JwtResourcePolicy::new(
-                    ISSUER,
-                    resource,
-                    Duration::from_secs(3600),
-                    Duration::ZERO,
-                )
-                .unwrap(),
+                JwtResourcePolicy::new(ISSUER, resource, Duration::from_secs(3600), Duration::ZERO)
+                    .unwrap(),
                 &jwks("one"),
             )
             .unwrap();
@@ -1272,7 +1283,13 @@ pub(in crate::providers) mod tests {
     fn signed_api_audience_authenticates_only_under_explicit_deployment_policy() {
         let audiences = audience_policy(&[API_AUDIENCE]);
         let debug = format!("{audiences:?}");
-        for private in [ISSUER, RESOURCE, API_AUDIENCE, "provider-one", "deployment-one"] {
+        for private in [
+            ISSUER,
+            RESOURCE,
+            API_AUDIENCE,
+            "provider-one",
+            "deployment-one",
+        ] {
             assert!(!debug.contains(private));
         }
         let provider = mapped_provider(audiences);
@@ -1286,7 +1303,11 @@ pub(in crate::providers) mod tests {
         assert!(admitted.session_owner().is_some());
         assert_eq!(admitted.claims.as_ref().unwrap()["aud"], json!(RESOURCE));
         let facts = serde_json::to_string(&admitted).unwrap();
-        for private in [API_AUDIENCE, "DO_NOT_EXPOSE_MAPPED_TOKEN", token.token.as_str()] {
+        for private in [
+            API_AUDIENCE,
+            "DO_NOT_EXPOSE_MAPPED_TOKEN",
+            token.token.as_str(),
+        ] {
             assert!(!facts.contains(private));
         }
         let default = TokenAuthProvider::new(verifier());
@@ -1390,7 +1411,10 @@ pub(in crate::providers) mod tests {
                     "urn:example:enterprise-tools-extra",
                 ],
             ),
-            ("enterprise tools", vec!["Enterprise tools", "enterprise tools ", "enterprise"]),
+            (
+                "enterprise tools",
+                vec!["Enterprise tools", "enterprise tools ", "enterprise"],
+            ),
         ] {
             let provider = mapped_provider(audience_policy(&[accepted]));
             source["aud"] = json!(accepted);
@@ -1438,7 +1462,9 @@ pub(in crate::providers) mod tests {
         let reordered = mapped_provider(audience_policy(&[MIGRATION_AUDIENCE, API_AUDIENCE]));
         assert_eq!(
             original.session_owner(),
-            authenticate_claims(&reordered, &source).unwrap().session_owner()
+            authenticate_claims(&reordered, &source)
+                .unwrap()
+                .session_owner()
         );
 
         let retired = mapped_provider(configured_audiences(
@@ -1461,17 +1487,43 @@ pub(in crate::providers) mod tests {
     fn audience_policy_bindings_isolate_provider_deployment_endpoint_and_resource() {
         let mut source = live_claims();
         source["aud"] = json!(API_AUDIENCE);
-        let baseline = authenticate_claims(
-            &mapped_provider(audience_policy(&[API_AUDIENCE])),
-            &source,
-        )
-        .unwrap();
+        let baseline =
+            authenticate_claims(&mapped_provider(audience_policy(&[API_AUDIENCE])), &source)
+                .unwrap();
         let baseline_principal = principal_fingerprint(Some(&baseline)).unwrap();
         for (provider_id, deployment, generation, endpoint, resource, issuer) in [
-            ("provider-two", "deployment-one", 1, "endpoint-one", RESOURCE, ISSUER),
-            ("provider-one", "deployment-two", 1, "endpoint-one", RESOURCE, ISSUER),
-            ("provider-one", "deployment-one", 2, "endpoint-one", RESOURCE, ISSUER),
-            ("provider-one", "deployment-one", 1, "endpoint-two", RESOURCE, ISSUER),
+            (
+                "provider-two",
+                "deployment-one",
+                1,
+                "endpoint-one",
+                RESOURCE,
+                ISSUER,
+            ),
+            (
+                "provider-one",
+                "deployment-two",
+                1,
+                "endpoint-one",
+                RESOURCE,
+                ISSUER,
+            ),
+            (
+                "provider-one",
+                "deployment-one",
+                2,
+                "endpoint-one",
+                RESOURCE,
+                ISSUER,
+            ),
+            (
+                "provider-one",
+                "deployment-one",
+                1,
+                "endpoint-two",
+                RESOURCE,
+                ISSUER,
+            ),
             (
                 "provider-one",
                 "deployment-one",
@@ -1504,7 +1556,10 @@ pub(in crate::providers) mod tests {
             bound["iss"] = json!(issuer);
             let admitted = authenticate_claims(&provider, &bound).unwrap();
             assert_ne!(baseline.session_owner(), admitted.session_owner());
-            assert_ne!(baseline_principal, principal_fingerprint(Some(&admitted)).unwrap());
+            assert_ne!(
+                baseline_principal,
+                principal_fingerprint(Some(&admitted)).unwrap()
+            );
             assert_eq!(admitted.claims.as_ref().unwrap()["aud"], json!(resource));
             assert_eq!(admitted.claims.as_ref().unwrap()["iss"], json!(issuer));
         }
@@ -1514,14 +1569,19 @@ pub(in crate::providers) mod tests {
         let changed_set = mapped_provider(audience_policy(&[API_AUDIENCE, MIGRATION_AUDIENCE]));
         let admitted = authenticate_claims(&changed_set, &source).unwrap();
         assert_ne!(baseline.session_owner(), admitted.session_owner());
-        assert_ne!(baseline_principal, principal_fingerprint(Some(&admitted)).unwrap());
+        assert_ne!(
+            baseline_principal,
+            principal_fingerprint(Some(&admitted)).unwrap()
+        );
         let provider = mapped_provider(audience_policy(&[API_AUDIENCE]));
         for (field, value) in [("client_id", "client-two"), ("sub", "bob")] {
             let mut changed = source.clone();
             changed[field] = json!(value);
             assert_ne!(
                 baseline.session_owner(),
-                authenticate_claims(&provider, &changed).unwrap().session_owner()
+                authenticate_claims(&provider, &changed)
+                    .unwrap()
+                    .session_owner()
             );
         }
     }
@@ -1549,11 +1609,8 @@ pub(in crate::providers) mod tests {
             principal_fingerprint(Some(&repeated)).unwrap()
         );
         source["aud"] = json!(RESOURCE);
-        let explicit = authenticate_claims(
-            &mapped_provider(audience_policy(&[RESOURCE])),
-            &source,
-        )
-        .unwrap();
+        let explicit =
+            authenticate_claims(&mapped_provider(audience_policy(&[RESOURCE])), &source).unwrap();
         assert_ne!(default.session_owner(), explicit.session_owner());
         assert_ne!(
             principal_fingerprint(Some(&default)).unwrap(),
@@ -1578,7 +1635,9 @@ pub(in crate::providers) mod tests {
         ));
         assert_ne!(
             authenticate_claims(&left, &source).unwrap().session_owner(),
-            authenticate_claims(&right, &source).unwrap().session_owner()
+            authenticate_claims(&right, &source)
+                .unwrap()
+                .session_owner()
         );
 
         source["aud"] = json!("z");
@@ -1586,7 +1645,9 @@ pub(in crate::providers) mod tests {
         let right = mapped_provider(audience_policy(&["a", "bc", "z"]));
         assert_ne!(
             authenticate_claims(&left, &source).unwrap().session_owner(),
-            authenticate_claims(&right, &source).unwrap().session_owner()
+            authenticate_claims(&right, &source)
+                .unwrap()
+                .session_owner()
         );
     }
 
@@ -1807,10 +1868,12 @@ pub(in crate::providers) mod tests {
         let verifier = verifier();
         let source = serde_json::to_string(&claims(NOW)).unwrap();
         let duplicate = format!("{{\"sub\":\"mallory\",{}", &source[1..]);
-        let token = sign_raw(&serde_json::to_vec(&header()).unwrap(), duplicate.as_bytes());
+        let token = sign_raw(
+            &serde_json::to_vec(&header()).unwrap(),
+            duplicate.as_bytes(),
+        );
         assert!(verify_at(&verifier, &token, NOW).is_err());
-        let duplicate_header =
-            br#"{"alg":"RS256","kid":"one","typ":"at+jwt","typ":"JWT"}"#;
+        let duplicate_header = br#"{"alg":"RS256","kid":"one","typ":"at+jwt","typ":"JWT"}"#;
         let token = sign_raw(duplicate_header, source.as_bytes());
         assert!(verify_at(&verifier, &token, NOW).is_err());
         let token = AccessToken {
@@ -1830,7 +1893,9 @@ pub(in crate::providers) mod tests {
         let good = sign(&header(), &claims(NOW));
         assert_eq!(
             verifier
-                .verify_with_clock(&ctx(), &good, || Err(JwtResourceAuthError::ClockUnavailable))
+                .verify_with_clock(&ctx(), &good, || Err(
+                    JwtResourceAuthError::ClockUnavailable
+                ))
                 .unwrap_err(),
             JwtResourceAuthError::ClockUnavailable
         );
@@ -1917,7 +1982,11 @@ pub(in crate::providers) mod tests {
                 admin.replace_jwks(invalid),
                 Err(JwtResourceAuthError::InvalidKeys)
             );
-            assert!(installed.admit_verified(&ctx(), candidate, || Ok(NOW)).is_ok());
+            assert!(
+                installed
+                    .admit_verified(&ctx(), candidate, || Ok(NOW))
+                    .is_ok()
+            );
             assert!(verify_at(&admin, &token, NOW).is_ok());
         }
     }
@@ -1928,7 +1997,11 @@ pub(in crate::providers) mod tests {
         let installed = admin.clone();
         let token = sign(&header(), &claims(NOW));
         let unchanged = installed.prepare_verification(&ctx(), &token).unwrap();
-        assert!(installed.admit_verified(&ctx(), unchanged, || Ok(NOW)).is_ok());
+        assert!(
+            installed
+                .admit_verified(&ctx(), unchanged, || Ok(NOW))
+                .is_ok()
+        );
         let stale = installed.prepare_verification(&ctx(), &token).unwrap();
         admin.replace_jwks(&jwks("one")).unwrap();
         let mut clock_called = false;
@@ -1961,7 +2034,9 @@ pub(in crate::providers) mod tests {
             );
         }
         assert_eq!(
-            installed.admit_verified(&ctx(), candidate, || Ok(NOW)).unwrap_err(),
+            installed
+                .admit_verified(&ctx(), candidate, || Ok(NOW))
+                .unwrap_err(),
             JwtResourceAuthError::KeysUnavailable
         );
         assert!(verify_at(&independent, &token, NOW).is_ok());
@@ -1991,11 +2066,19 @@ pub(in crate::providers) mod tests {
             JwtResourceAuthError::KeysUnavailable
         );
         assert_eq!(
-            installed.admit_verified(&ctx(), candidate, || Ok(NOW)).unwrap_err(),
+            installed
+                .admit_verified(&ctx(), candidate, || Ok(NOW))
+                .unwrap_err(),
             JwtResourceAuthError::KeysUnavailable
         );
-        assert_eq!(admin.replace_jwks(&jwks("one")), Err(JwtResourceAuthError::KeysUnavailable));
-        assert_eq!(admin.revoke_all(), Err(JwtResourceAuthError::KeysUnavailable));
+        assert_eq!(
+            admin.replace_jwks(&jwks("one")),
+            Err(JwtResourceAuthError::KeysUnavailable)
+        );
+        assert_eq!(
+            admin.revoke_all(),
+            Err(JwtResourceAuthError::KeysUnavailable)
+        );
         assert!(verify_at(&verifier(), &token, NOW).is_ok());
     }
 
@@ -2004,10 +2087,16 @@ pub(in crate::providers) mod tests {
         let verifier = verifier();
         let token = sign(&header(), &claims(NOW));
         let live = verifier.prepare_verification(&ctx(), &token).unwrap();
-        assert!(verifier.admit_verified(&ctx(), live, || Ok(NOW + 59)).is_ok());
+        assert!(
+            verifier
+                .admit_verified(&ctx(), live, || Ok(NOW + 59))
+                .is_ok()
+        );
         let expired = verifier.prepare_verification(&ctx(), &token).unwrap();
         assert_eq!(
-            verifier.admit_verified(&ctx(), expired, || Ok(NOW + 60)).unwrap_err(),
+            verifier
+                .admit_verified(&ctx(), expired, || Ok(NOW + 60))
+                .unwrap_err(),
             JwtResourceAuthError::InvalidClaims
         );
     }

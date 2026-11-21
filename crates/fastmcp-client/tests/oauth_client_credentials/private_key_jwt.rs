@@ -768,7 +768,6 @@ fn private_key_login_composes_with_typed_tasks_and_subscriptions() {
     );
 }
 
-
 mod logout {
     use super::*;
     use fastmcp_client::http_auth::discovery::client_credentials::ClientCredentialsRemoteRevocation as RemoteRevocation;
@@ -869,7 +868,10 @@ mod logout {
         assert_eq!(claims["aud"], expected);
         let issued = claims["iat"].as_u64().unwrap();
         let expiry = claims["exp"].as_u64().unwrap();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         assert!(issued <= now && expiry > now && expiry - issued <= 60);
         let jti = claims["jti"].as_str().unwrap().to_owned();
         assert_eq!(jti.len(), 64);
@@ -906,15 +908,21 @@ mod logout {
                 let ((), client) =
                     Box::pin(pair(serve_metadata(&peer, &good), plan.discover(&cx))).await;
                 let client = client.unwrap();
-                let (grant_jti, generation) =
-                    Box::pin(acquire_jwt(&peer, &signer, grant_audience, &client, &cx, 300)).await;
+                let (grant_jti, generation) = Box::pin(acquire_jwt(
+                    &peer,
+                    &signer,
+                    grant_audience,
+                    &client,
+                    &cx,
+                    300,
+                ))
+                .await;
                 assert_eq!(generation, 1);
                 let snapshot = client.credential(&cx).await.unwrap();
                 let extracted = snapshot.credential().clone();
                 let clone = client.clone();
                 let server = async {
-                    let (mut tls, jti) =
-                        receive_revocation(&peer, &signer, revoke_audience).await;
+                    let (mut tls, jti) = receive_revocation(&peer, &signer, revoke_audience).await;
                     assert!(snapshot.credential().is_revoked() && extracted.is_revoked());
                     assert!(matches!(clone.credential(&cx).await, Err(Error::Closed)));
                     tls.write_all(
@@ -948,8 +956,8 @@ mod logout {
                 let peer = Peer::new().await;
                 let (backend, signer) = TestSigner::create();
                 let audience = ClientAssertionAudience::Issuer;
-                let revoke_audience = (case != 0)
-                    .then_some(RevocationAssertionAudience::RevocationEndpoint);
+                let revoke_audience =
+                    (case != 0).then_some(RevocationAssertionAudience::RevocationEndpoint);
                 let plan = plan(&peer, signer.clone(), audience, revoke_audience);
                 let mut document = metadata(&peer);
                 if case == 1 {
@@ -1006,15 +1014,16 @@ mod logout {
                 let client = client.unwrap();
                 Box::pin(acquire_jwt(&peer, &signer, audience, &client, &cx, 300)).await;
                 let snapshot = client.credential(&cx).await.unwrap();
-                backend.mode.store(if mode >= 6 { 4 } else { mode }, Ordering::SeqCst);
+                backend
+                    .mode
+                    .store(if mode >= 6 { 4 } else { mode }, Ordering::SeqCst);
                 if mode < 6 {
                     let report = client.logout(&cx).await.unwrap();
                     assert!(report.local_closed());
                     assert_eq!(report.remote(), RemoteRevocation::Failed);
                 } else {
                     let cancellation = McpRequestCancellation::new();
-                    let mut pending =
-                        Box::pin(client.logout_with_cancellation(&cx, &cancellation));
+                    let mut pending = Box::pin(client.logout_with_cancellation(&cx, &cancellation));
                     poll_fn(|task| {
                         assert!(pending.as_mut().poll(task).is_pending());
                         if backend.in_flight.load(Ordering::SeqCst) == 1 {

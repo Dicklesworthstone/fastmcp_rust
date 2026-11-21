@@ -105,7 +105,9 @@ pub(super) fn admit_revocation(
     authentication: &MachineAuthentication,
 ) -> Result<RevocationTarget, ClientCredentialsError> {
     let metadata: RevocationMetadata = decode_metadata(kind, body)?;
-    let methods = metadata.revocation_endpoint_auth_methods_supported.as_deref();
+    let methods = metadata
+        .revocation_endpoint_auth_methods_supported
+        .as_deref();
     let algorithms = metadata
         .revocation_endpoint_auth_signing_alg_values_supported
         .as_deref();
@@ -334,7 +336,8 @@ async fn prepare_revocation(
 fn require_logout_runtime(cx: &Cx) -> Result<(), ClientCredentialsError> {
     let active = Cx::current().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
     let capabilities = active.capabilities();
-    if cx.timer_driver().is_none() || !capabilities.time || !capabilities.io || !capabilities.remote {
+    if cx.timer_driver().is_none() || !capabilities.time || !capabilities.io || !capabilities.remote
+    {
         return Err(OAuthDiscoveryError::RuntimeUnavailable.into());
     }
     Ok(())
@@ -358,7 +361,10 @@ async fn within_logout<T>(
     deadline: Time,
     future: impl Future<Output = Result<T, ClientCredentialsError>>,
 ) -> Result<T, ClientCredentialsError> {
-    let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
+    let deadline = cx
+        .budget()
+        .deadline
+        .map_or(deadline, |parent| parent.min(deadline));
     let mut timer = std::pin::pin!(Sleep::new(deadline));
     let mut cancelled = std::pin::pin!(cancellation.cancelled());
     let (_sender, mut receiver) = oneshot::channel::<()>();
@@ -739,10 +745,10 @@ mod tests {
 
 #[cfg(test)]
 mod logout_tests {
-    use super::*;
     use super::super::{
         ClientCredentialsPlan, ClientInner, ClientSecret, ServiceToken, TokenState,
     };
+    use super::*;
     use crate::http_auth::BoundBearerCredential;
     use asupersync::sync::Mutex;
     use asupersync::time::{TimerDriverHandle, VirtualClock};
@@ -758,15 +764,22 @@ mod logout_tests {
         let closed = McpRequestCancellation::new();
         let expires_at = Instant::now() + Duration::from_secs(120);
         let bearer = BoundBearerCredential::bind_with_expiry(
-            url("https://machine.example/mcp"), "cached-secret", expires_at,
-        ).unwrap().for_owner(&closed).unwrap();
+            url("https://machine.example/mcp"),
+            "cached-secret",
+            expires_at,
+        )
+        .unwrap()
+        .for_owner(&closed)
+        .unwrap();
         let client = ClientCredentialsClient {
             inner: Arc::new(ClientInner {
                 resource: url("https://machine.example/mcp"),
                 token_endpoint: url("https://issuer.example/token"),
                 client_id: "service-client".to_owned(),
                 scopes: vec!["read".to_owned()],
-                authentication: MachineAuthentication::Basic(Arc::new(ClientSecret("secret".to_owned()))),
+                authentication: MachineAuthentication::Basic(Arc::new(ClientSecret(
+                    "secret".to_owned(),
+                ))),
                 issuer_roots: vec![],
                 resource_tls: None,
                 timeout: Duration::from_secs(1),
@@ -795,7 +808,8 @@ mod logout_tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .blocking_threads(0, 0)
             .with_timer_driver(timer.clone())
-            .build().unwrap();
+            .build()
+            .unwrap();
         let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         test(&cx, &clock, &timer);
         assert_eq!(timer.pending_count(), 0);
@@ -807,9 +821,13 @@ mod logout_tests {
     fn revocation_metadata_presence_and_duplicates_cannot_impersonate_defaults() {
         let issuer = TrustedOAuthIssuer::new("https://issuer.example").unwrap();
         let plan = ClientCredentialsPlan::new(
-            url("https://machine.example/mcp"), issuer.clone(),
-            "service-client", "secret", vec!["read".to_owned()],
-        ).unwrap();
+            url("https://machine.example/mcp"),
+            issuer.clone(),
+            "service-client",
+            "secret",
+            vec!["read".to_owned()],
+        )
+        .unwrap();
         let good = br#"{"revocation_endpoint":"https://issuer.example/revoke"}"#;
         assert!(matches!(
             admit_revocation(
@@ -861,20 +879,35 @@ mod logout_tests {
                 assert!(client.inner.closed.is_cancel_requested());
                 assert!(snapshot.is_revoked());
                 assert!(held.as_ref().unwrap().current.is_some());
-                if release_before_drop { drop(held.take()); }
+                if release_before_drop {
+                    drop(held.take());
+                }
                 drop(logout);
                 drop(held);
                 let state = client.inner.state.try_lock_owned().unwrap();
-                assert_eq!(state.current.is_some(), !release_before_drop,
-                    "best-effort cleanup cannot take another owner's lock");
+                assert_eq!(
+                    state.current.is_some(),
+                    !release_before_drop,
+                    "best-effort cleanup cannot take another owner's lock"
+                );
                 drop(state);
                 assert_eq!(snapshot.authorization_for_target(client.resource()), None);
                 let mut retry = Box::pin(client.logout(cx));
-                assert!(matches!(retry.as_mut().poll(&mut task),
-                    Poll::Ready(Err(ClientCredentialsError::Closed))));
+                assert!(matches!(
+                    retry.as_mut().poll(&mut task),
+                    Poll::Ready(Err(ClientCredentialsError::Closed))
+                ));
                 drop(retry);
                 client.close();
-                assert!(client.inner.state.try_lock_owned().unwrap().current.is_none());
+                assert!(
+                    client
+                        .inner
+                        .state
+                        .try_lock_owned()
+                        .unwrap()
+                        .current
+                        .is_none()
+                );
                 assert!(cx.checkpoint().is_ok());
             });
         }
@@ -901,16 +934,27 @@ mod logout_tests {
                     panic!("logout must settle while custody remains contended");
                 };
                 assert!(report.local_closed());
-                assert_eq!(report.remote(), if cancel {
-                    ClientCredentialsRemoteRevocation::Cancelled
-                } else {
-                    ClientCredentialsRemoteRevocation::TimedOut
-                });
+                assert_eq!(
+                    report.remote(),
+                    if cancel {
+                        ClientCredentialsRemoteRevocation::Cancelled
+                    } else {
+                        ClientCredentialsRemoteRevocation::TimedOut
+                    }
+                );
                 assert!(snapshot.is_revoked());
                 drop(logout);
                 drop(held);
                 client.close();
-                assert!(client.inner.state.try_lock_owned().unwrap().current.is_none());
+                assert!(
+                    client
+                        .inner
+                        .state
+                        .try_lock_owned()
+                        .unwrap()
+                        .current
+                        .is_none()
+                );
             });
         }
     }

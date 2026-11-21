@@ -502,7 +502,10 @@ mod secret_exposure_tests {
                 .into_iter()
                 .filter(|(name, _)| name.starts_with("Mcp-Param-"))
                 .collect();
-            assert_eq!(fields, vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]);
+            assert_eq!(
+                fields,
+                vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]
+            );
             assert!(
                 !projected
                     .headers()
@@ -605,7 +608,9 @@ mod secret_exposure_tests {
 
         gateway.replace([("lookup", &secret), ("other", &safe)]);
         assert_eq!(
-            call("lookup").with_gateway_tool_headers(&gateway).unwrap_err(),
+            call("lookup")
+                .with_gateway_tool_headers(&gateway)
+                .unwrap_err(),
             ToolHeaderDispatchError::DisclosureDenied
         );
         assert_eq!(
@@ -617,7 +622,10 @@ mod secret_exposure_tests {
         assert!(call("lookup").with_gateway_tool_headers(&gateway).is_ok());
         gateway.replace([("other", &safe)]);
         let original = call("lookup");
-        let unplanned = original.clone().with_gateway_tool_headers(&gateway).unwrap();
+        let unplanned = original
+            .clone()
+            .with_gateway_tool_headers(&gateway)
+            .unwrap();
         assert_eq!(unplanned.body(), original.body());
         assert!(parameter_fields(&unplanned).is_empty());
     }
@@ -634,7 +642,10 @@ mod secret_exposure_tests {
             "lookup",
             Some(json!({"region":"eu", "private":"body-only-secret"})),
         );
-        let projected = original.clone().with_gateway_tool_headers(&gateway).unwrap();
+        let projected = original
+            .clone()
+            .with_gateway_tool_headers(&gateway)
+            .unwrap();
         assert_eq!(projected.body(), original.body());
         assert_eq!(
             parameter_fields(&projected),

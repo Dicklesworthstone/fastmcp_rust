@@ -23,10 +23,10 @@ use fastmcp_protocol::extensions::{
     ExtensionHttpEraDisposition, ExtensionId, ExtensionMethodDescriptor, ExtensionNegotiationError,
     ExtensionNegotiationResolver, ExtensionNotificationDescriptor, ExtensionSettings,
     ExtensionSettingsCompatibilityResolver, ExtensionSettingsSchema,
-    MAX_EXTENSION_MEMBER_NAME_BYTES, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES, NegotiatedExtension,
+    MAX_EXTENSION_MEMBER_NAME_BYTES, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES,
+    MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES, NegotiatedExtension,
     NotificationActivationProofDescriptor, NotificationActivationProofLocation,
     ServerExtensionDiscovery, StdioCorrelationCodec, StdioCorrelationDescriptor,
-    MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
 };
 use fastmcp_protocol::schema::{
     AdmittedSchema, JsonSchemaType, MAX_SCHEMA_INSTANCE_BYTES, SchemaGenerator, admit_final_schema,
@@ -735,47 +735,59 @@ impl<ClientSettings, ServerSettings, Settings>
         }
         let digest = self.contract_digest()?;
         let digest = hex_digest(&digest);
-        let protocol = ProtocolDescriptor {
-            id: self.descriptor.id.clone(),
-            client_settings: ExtensionSettingsSchema {
-                schema_id: self.descriptor.client_settings_schema_id.clone(),
-                codec_id: format!("fastmcp.ext-dev.client.v1.{digest}"),
-            },
-            server_settings: ExtensionSettingsSchema {
-                schema_id: self.descriptor.server_settings_schema_id.clone(),
-                codec_id: format!("fastmcp.ext-dev.server.v1.{digest}"),
-            },
-            resolver: ExtensionNegotiationResolver {
-                id: format!("fastmcp.ext-dev.resolver.v1.{digest}"),
-                version: self.descriptor.version,
-                fallback: ExtensionFallbackPolicy::RejectOneSided,
-            },
-            method: self.descriptor.methods.first().map(ExtensionMethod::protocol_method),
-            notification: self
-                .descriptor
-                .notification
-                .as_ref()
-                .map(ExtensionNotification::protocol_notification)
-                .or_else(|| self.descriptor.request_notification.as_ref().map(|notification| {
-                    ExtensionNotificationDescriptor {
-                        name: notification.name.clone(),
+        let protocol =
+            ProtocolDescriptor {
+                id: self.descriptor.id.clone(),
+                client_settings: ExtensionSettingsSchema {
+                    schema_id: self.descriptor.client_settings_schema_id.clone(),
+                    codec_id: format!("fastmcp.ext-dev.client.v1.{digest}"),
+                },
+                server_settings: ExtensionSettingsSchema {
+                    schema_id: self.descriptor.server_settings_schema_id.clone(),
+                    codec_id: format!("fastmcp.ext-dev.server.v1.{digest}"),
+                },
+                resolver: ExtensionNegotiationResolver {
+                    id: format!("fastmcp.ext-dev.resolver.v1.{digest}"),
+                    version: self.descriptor.version,
+                    fallback: ExtensionFallbackPolicy::RejectOneSided,
+                },
+                method: self
+                    .descriptor
+                    .methods
+                    .first()
+                    .map(ExtensionMethod::protocol_method),
+                notification: self
+                    .descriptor
+                    .notification
+                    .as_ref()
+                    .map(ExtensionNotification::protocol_notification)
+                    .or_else(|| {
+                        self.descriptor
+                            .request_notification
+                            .as_ref()
+                            .map(|notification| ExtensionNotificationDescriptor {
+                                name: notification.name.clone(),
+                                direction: ExtensionDirection::ServerToClient,
+                                activation_proof: None,
+                            })
+                    }),
+                result_discriminator: None,
+                routing_headers: Vec::new(),
+                stdio_correlation: self.descriptor.request_notification.as_ref().map(
+                    |notification| StdioCorrelationDescriptor {
+                        metadata_key: notification.correlation_metadata_key.clone(),
+                        methods: vec![notification.name.clone()],
                         direction: ExtensionDirection::ServerToClient,
-                        activation_proof: None,
-                    }
-                })),
-            result_discriminator: None,
-            routing_headers: Vec::new(),
-            stdio_correlation: self.descriptor.request_notification.as_ref().map(|notification| {
-                StdioCorrelationDescriptor {
-                    metadata_key: notification.correlation_metadata_key.clone(),
-                    methods: vec![notification.name.clone()],
-                    direction: ExtensionDirection::ServerToClient,
-                    codec: StdioCorrelationCodec::RequestId,
-                }
-            }),
-        };
+                        codec: StdioCorrelationCodec::RequestId,
+                    },
+                ),
+            };
         #[cfg(feature = "proxy")]
-        if self.proxy_contracts.iter().any(|upstream| upstream != &protocol) {
+        if self
+            .proxy_contracts
+            .iter()
+            .any(|upstream| upstream != &protocol)
+        {
             return Err(McpError::invalid_params(
                 "HTTP proxy requires the same complete typed extension contract on both legs",
             ));
@@ -827,7 +839,8 @@ impl<ClientSettings, ServerSettings, Settings>
                 })?;
         }
         if let Some(schema) = self.request_notification_schema {
-            handlers.register_request_notification_schema(descriptor.id.clone(), schema.admitted)?;
+            handlers
+                .register_request_notification_schema(descriptor.id.clone(), schema.admitted)?;
         }
         let discovery = ServerExtensionDiscovery {
             extensions: BTreeMap::from([(descriptor.id.clone(), self.server_settings)]),
@@ -851,8 +864,11 @@ impl<ClientSettings, ServerSettings, Settings>
         parameter_schema_id: String,
         result_schema_id: String,
     ) -> McpResult<(ExtensionMethod, CompiledSchema, CompiledSchema, usize)> {
-        if self.pending.len() + usize::from(self.descriptor.notification.is_some()
-            || self.descriptor.request_notification.is_some())
+        if self.pending.len()
+            + usize::from(
+                self.descriptor.notification.is_some()
+                    || self.descriptor.request_notification.is_some(),
+            )
             >= MAX_AUTHORING_METHODS
         {
             return Err(McpError::invalid_params("extension method budget exceeded"));
@@ -879,7 +895,10 @@ impl<ClientSettings, ServerSettings, Settings>
                 .notification
                 .as_ref()
                 .is_some_and(|entry| entry.name == method)
-            || self.descriptor.request_notification.as_ref()
+            || self
+                .descriptor
+                .request_notification
+                .as_ref()
                 .is_some_and(|entry| entry.name == method)
         {
             return Err(McpError::invalid_params(
@@ -933,7 +952,8 @@ impl<ClientSettings, ServerSettings, Settings>
         parameter_schema_id: String,
         activation_metadata_key: String,
     ) -> McpResult<(ExtensionNotification, CompiledSchema, usize)> {
-        if self.descriptor.notification.is_some() || self.descriptor.request_notification.is_some() {
+        if self.descriptor.notification.is_some() || self.descriptor.request_notification.is_some()
+        {
             return Err(McpError::invalid_params(
                 "extension authoring supports one notification per descriptor",
             ));
@@ -1033,18 +1053,24 @@ impl<ClientSettings, ServerSettings, Settings>
             methods,
             notification,
         );
-        let bytes = if let Some((notification, schema)) = self.descriptor.request_notification
-            .as_ref().zip(self.request_notification_schema.as_ref())
+        let bytes = if let Some((notification, schema)) = self
+            .descriptor
+            .request_notification
+            .as_ref()
+            .zip(self.request_notification_schema.as_ref())
         {
-            encode_bytes(&(
-                subject,
-                "request-notification-v1",
-                notification.name.as_str(),
-                notification.parameter_schema_id.as_str(),
-                notification.correlation_metadata_key.as_str(),
-                "request-id",
-                schema.digest,
-            ), MAX_EXTENSION_REGISTRY_CANONICAL_BYTES)?
+            encode_bytes(
+                &(
+                    subject,
+                    "request-notification-v1",
+                    notification.name.as_str(),
+                    notification.parameter_schema_id.as_str(),
+                    notification.correlation_metadata_key.as_str(),
+                    "request-id",
+                    schema.digest,
+                ),
+                MAX_EXTENSION_REGISTRY_CANONICAL_BYTES,
+            )?
         } else {
             // Preserve the existing fingerprint for descriptors without this capability.
             encode_bytes(&subject, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES)?
