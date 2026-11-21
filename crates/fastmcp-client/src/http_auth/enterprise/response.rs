@@ -241,7 +241,7 @@ impl EnterpriseResponsePolicy {
 /// This is not the sealed authorization-code-flow receipt needed for exchange
 /// activation; there is no compact-token getter or credential conversion.
 pub struct EnterpriseIdentityAssertion {
-    _assertion: SecretString,
+    compact_assertion: SecretString,
     identity: VerifiedOidcIdToken,
     profile: EnterpriseProfile,
     policy: EnterpriseResponsePolicy,
@@ -256,7 +256,7 @@ impl EnterpriseIdentityAssertion {
 /// The signed ID-JAG, original request, IdP scope grant and earliest effective
 /// expiry stay coupled. Local ownership is not resource-AS replay prevention.
 pub struct EnterpriseIdJagResponse {
-    _assertion: SecretString,
+    compact_assertion: SecretString,
     assertion: VerifiedIdJag,
     profile: EnterpriseProfile,
     requested_scopes: Vec<String>,
@@ -332,7 +332,7 @@ impl EnterpriseIdJagResponse {
         }
         Ok(EnterpriseResponseOutcome::Success {
             value: EnterpriseAccessTokenResponse {
-                _access_token: token,
+                access_token: token,
                 resource: self.resource,
                 requested_scopes: self.requested_scopes,
                 idp_granted_scopes: self.granted_scopes.as_slice().to_vec(),
@@ -352,7 +352,7 @@ impl EnterpriseIdJagResponse {
 /// method. The original request, signed IdP grant and final grant remain three
 /// separate values so absence or narrowing cannot recreate authority.
 pub struct EnterpriseAccessTokenResponse {
-    _access_token: SecretString,
+    access_token: SecretString,
     resource: String,
     requested_scopes: Vec<String>,
     idp_granted_scopes: Vec<String>,
@@ -442,7 +442,7 @@ impl EnterpriseProfile {
         drop(access);
         Ok(EnterpriseResponseOutcome::Success {
             value: EnterpriseIdentityAssertion {
-                _assertion: assertion,
+                compact_assertion: assertion,
                 identity,
                 profile: self.clone(),
                 policy,
@@ -566,7 +566,7 @@ impl EnterpriseProfile {
         }
         Ok(EnterpriseResponseOutcome::Success {
             value: EnterpriseIdJagResponse {
-                _assertion: compact,
+                compact_assertion: compact,
                 assertion,
                 profile: self.clone(),
                 requested_scopes: self.requested_scopes().as_slice().to_vec(),
@@ -830,7 +830,7 @@ impl EnterpriseBoundAccessToken {
             .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)?;
         BoundBearerCredential::bind_with_expiry(
             resource,
-            self.response._access_token.as_str(),
+            self.response.access_token.as_str(),
             deadline,
         )
         .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)
@@ -972,7 +972,7 @@ impl EnterpriseExchangeDriver {
             ("requested_token_type", ID_JAG_TOKEN_TYPE),
             ("audience", profile.resource_as_issuer()),
             ("resource", profile.resource().as_str()),
-            ("subject_token", assertion._assertion.as_str()),
+            ("subject_token", assertion.compact_assertion.as_str()),
             ("subject_token_type", SUBJECT_TOKEN_TYPE_ID_TOKEN),
         ];
         if let Some(scope) = scope_wire.as_deref() {
@@ -1081,7 +1081,7 @@ impl EnterpriseExchangeDriver {
         let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
         let mut fields: Vec<(&str, &str)> = vec![
             ("grant_type", JWT_BEARER_GRANT),
-            ("assertion", id_jag._assertion.as_str()),
+            ("assertion", id_jag.compact_assertion.as_str()),
         ];
         let request = build_confidential_token_request(
             profile.resource_as_authentication(),

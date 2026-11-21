@@ -379,7 +379,7 @@ pub(super) fn form(fields: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
                 match b {
                     b' ' => out.push(b'+'),
                     b if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') => {
-                        out.push(b)
+                        out.push(b);
                     }
                     _ => out.extend_from_slice(&[
                         b'%',
