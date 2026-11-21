@@ -1505,7 +1505,7 @@ fn e2e_cli_inspect_rejects_schema_misleading_mcp_format_alias() {
     assert!(stderr_str(&output).contains("text, json"));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn e2e_cli_inspect_output_file_writes_payload() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1557,6 +1557,18 @@ fn e2e_cli_inspect_output_file_writes_payload() {
     assert_eq!(first_metadata.uid(), seeded_metadata.uid());
     assert_eq!(first_metadata.gid(), seeded_metadata.gid());
 
+    // Zero orphan staging/backup siblings may remain in the output directory.
+    let entries: Vec<_> = std::fs::read_dir(&output_dir.path)
+        .expect("read inspect output directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from("inspect-output.json")],
+        "inspect --output must not leave orphan staging files behind"
+    );
+
     let second = run_cli(&fixture_server_args(
         &[
             "inspect",
@@ -1582,6 +1594,107 @@ fn e2e_cli_inspect_output_file_writes_payload() {
     );
     assert_eq!(second_metadata.ino(), first_metadata.ino());
     assert_eq!(second_metadata.permissions().mode() & 0o777, 0o640);
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_inspect_output_file_refuses_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let output_dir = TestTempDir::new("inspect-output-symlink");
+    let real_target = output_dir.join("real-target.json");
+    let seeded = b"{\"sentinel\":\"unchanged\"}\n";
+    std::fs::write(&real_target, seeded).expect("seed real target file");
+    let link_path = output_dir.join("inspect-link.json");
+    symlink(&real_target, &link_path).expect("create symlink target");
+
+    let output = run_cli(&fixture_server_args(
+        &[
+            "inspect",
+            "-f",
+            "json",
+            "-o",
+            link_path
+                .to_str()
+                .expect("symlink output path should be valid utf-8"),
+        ],
+        &[],
+    ));
+
+    assert!(
+        !output.status.success(),
+        "inspect --output must refuse a symbolic link target"
+    );
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.to_ascii_lowercase().contains("symbolic link"),
+        "expected symlink refusal diagnostic, got: {stderr}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link_path)
+            .expect("inspect symlink metadata")
+            .file_type()
+            .is_symlink(),
+        "refused symlink must remain a symlink"
+    );
+    assert_eq!(
+        std::fs::read(&real_target).expect("read real target after symlink refusal"),
+        seeded,
+        "symlink target bytes must remain untouched on refusal"
+    );
+    let mut entries: Vec<_> = std::fs::read_dir(&output_dir.path)
+        .expect("list symlink test directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            "inspect-link.json".to_owned(),
+            "real-target.json".to_owned(),
+        ],
+        "symlink refusal must not leave staging files behind"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_inspect_output_file_preserves_existing_on_failed_inspect() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let output_dir = TestTempDir::new("inspect-output-fail");
+    let output_path = output_dir.join("existing.json");
+    let seeded = b"{\"previous\":\"preserved\"}\n";
+    std::fs::write(&output_path, seeded).expect("seed existing inspect output");
+    let before = std::fs::metadata(&output_path).expect("inspect seeded metadata");
+
+    let output = run_cli(&[
+        "inspect",
+        "-f",
+        "json",
+        "-o",
+        output_path
+            .to_str()
+            .expect("output path should be valid utf-8"),
+        "definitely_missing_server_command_abc123",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "inspect against missing server must fail"
+    );
+    let after = std::fs::metadata(&output_path).expect("inspect preserved metadata");
+    assert_eq!(
+        std::fs::read(&output_path).expect("read preserved inspect output"),
+        seeded,
+        "failed inspect must not overwrite or truncate existing --output file"
+    );
+    assert_eq!(
+        after.ino(),
+        before.ino(),
+        "failed inspect must leave existing --output inode untouched"
+    );
 }
 
 #[test]

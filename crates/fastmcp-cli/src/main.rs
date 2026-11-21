@@ -665,7 +665,9 @@ enum Commands {
         #[arg(long, short = 'f', default_value = "text")]
         format: InspectFormat,
 
-        /// Output file (default: stdout).
+        /// Output file (default: stdout). Written atomically on Unix (Linux and macOS);
+        /// non-Unix targets fail closed because atomic no-symlink publication is not yet
+        /// verified there.
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
@@ -11666,6 +11668,25 @@ fn atomic_replace_file(
     context: &str,
     max_bytes: usize,
 ) -> McpResult<AtomicReplaceOutcome> {
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        portable_install::replace_file(path, contents, context, max_bytes)
+    }
+    #[cfg(any(target_os = "linux", not(unix)))]
+    {
+        atomic_replace_file_proven(path, contents, context, max_bytes)
+    }
+}
+
+// Compiled everywhere so its helpers keep one definition of "used"; non-Linux
+// Unix uses `portable_install::replace_file`.
+#[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
+fn atomic_replace_file_proven(
+    path: &Path,
+    contents: &[u8],
+    context: &str,
+    max_bytes: usize,
+) -> McpResult<AtomicReplaceOutcome> {
     if contents.len() > max_bytes {
         return Err(fastmcp_core::McpError::invalid_params(format!(
             "Refusing to write {context}: output is {} bytes (maximum {max_bytes})",
@@ -14278,10 +14299,10 @@ mod portable_install {
     use fastmcp_core::{McpError, McpResult};
 
     use super::{
-        CONFIG_INPUT_MAX_BYTES, InstallDocumentChange, InstallTarget, McpServerConfig,
-        PEER_FIELD_LIMIT, apply_install_entry, json_parse_error, prepare_json_config,
-        sanitize_config_path, sanitize_peer_text, usable_parent, validate_atomic_destination_name,
-        write_cli_warning, write_install_stdout,
+        AtomicReplaceOutcome, CONFIG_INPUT_MAX_BYTES, InstallDocumentChange, InstallTarget,
+        McpServerConfig, PEER_FIELD_LIMIT, apply_install_entry, json_parse_error,
+        prepare_json_config, sanitize_config_path, sanitize_peer_text, usable_parent,
+        validate_atomic_destination_name, write_cli_warning, write_install_stdout,
     };
 
     /// What a successful publication did beyond writing the new content.
@@ -14353,6 +14374,14 @@ mod portable_install {
     /// refused, as on Linux: replacing it by rename would turn a managed link
     /// (dotfiles, for example) into a detached regular file.
     pub(super) fn read_bounded(path: &Path, max: usize) -> McpResult<Option<Vec<u8>>> {
+        read_bounded_with_context(path, max, "installation config")
+    }
+
+    fn read_bounded_with_context(
+        path: &Path,
+        max: usize,
+        context: &str,
+    ) -> McpResult<Option<Vec<u8>>> {
         use std::os::unix::fs::MetadataExt as _;
 
         let display = sanitize_config_path(path);
@@ -14361,14 +14390,14 @@ mod portable_install {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(McpError::internal_error(format!(
-                    "Failed to inspect installation config at {display} (I/O kind: {:?})",
+                    "Failed to inspect {context} at {display} (I/O kind: {:?})",
                     error.kind()
                 )));
             }
         };
         if linked.file_type().is_symlink() {
             return Err(McpError::invalid_params(format!(
-                "Installation config at {display} is a symbolic link; symbolic links are not accepted. Pass the link's target path instead"
+                "Refusing to write {context} at {display}: destination is a symbolic link; pass the link's target path instead"
             )));
         }
         let file = match File::open(path) {
@@ -14376,43 +14405,147 @@ mod portable_install {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(McpError::internal_error(format!(
-                    "Failed to open installation config at {display} (I/O kind: {:?})",
+                    "Failed to open {context} at {display} (I/O kind: {:?})",
                     error.kind()
                 )));
             }
         };
         let opened = file.metadata().map_err(|error| {
             McpError::internal_error(format!(
-                "Failed to inspect installation config at {display} (I/O kind: {:?})",
+                "Failed to inspect {context} at {display} (I/O kind: {:?})",
                 error.kind()
             ))
         })?;
         if !opened.is_file() {
             return Err(McpError::invalid_params(format!(
-                "Installation config at {display} is not a regular file"
+                "Refusing to write {context} at {display}: destination is not a regular file"
             )));
         }
         // The path checked above must be the file that was opened; a swap to
         // a symbolic link in between opens a different inode.
         if (opened.dev(), opened.ino()) != (linked.dev(), linked.ino()) {
             return Err(McpError::invalid_params(format!(
-                "Installation config at {display} was replaced while it was being opened; nothing was written. Retry the command."
+                "{context} at {display} was replaced while it was being opened; nothing was written. Retry the command."
             )));
         }
         let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
         let mut bytes = Vec::new();
         file.take(limit).read_to_end(&mut bytes).map_err(|error| {
             McpError::internal_error(format!(
-                "Failed to read installation config at {display} (I/O kind: {:?})",
+                "Failed to read {context} at {display} (I/O kind: {:?})",
                 error.kind()
             ))
         })?;
         if bytes.len() > max {
             return Err(McpError::invalid_params(format!(
-                "Refusing to update installation config at {display}: it exceeds {max} bytes"
+                "Refusing to update {context} at {display}: it exceeds {max} bytes"
             )));
         }
         Ok(Some(bytes))
+    }
+
+    /// Atomically replaces a standalone CLI output file (such as `fastmcp
+    /// inspect --output`) on non-Linux Unix platforms without leaving backup
+    /// or staging sibling files behind.
+    pub(super) fn replace_file(
+        path: &Path,
+        contents: &[u8],
+        context: &str,
+        max_bytes: usize,
+    ) -> McpResult<AtomicReplaceOutcome> {
+        if contents.len() > max_bytes {
+            return Err(McpError::invalid_params(format!(
+                "Refusing to write {context}: output is {} bytes (maximum {max_bytes})",
+                contents.len()
+            )));
+        }
+        validate_atomic_destination_name(path, context)?;
+        let parent = usable_parent(path);
+        if parent
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(McpError::invalid_params(format!(
+                "Refusing to write {context} at {}: parent-directory traversal components are not accepted for atomic publication",
+                sanitize_config_path(path)
+            )));
+        }
+        let display = sanitize_config_path(path);
+        let io_error = |action: &str, error: &io::Error| {
+            McpError::internal_error(format!(
+                "Failed to {action} for {context} at {display} (I/O kind: {:?})",
+                error.kind()
+            ))
+        };
+        let file_name = path.file_name().ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "Cannot write {context} at {display}: destination has no relative file name"
+            ))
+        })?;
+        let existing = read_bounded_with_context(path, max_bytes, context)?;
+        if existing.as_deref() == Some(contents) {
+            if read_bounded_with_context(path, max_bytes, context)?.as_deref() != existing.as_deref()
+            {
+                return Err(McpError::invalid_params(format!(
+                    "Refusing to report {context} at {display} unchanged: the destination changed while the no-op was verified"
+                )));
+            }
+            return Ok(AtomicReplaceOutcome::Unchanged);
+        }
+        if existing.is_none() && !parent.exists() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|error| io_error("create the output directory", &error))?;
+        }
+        let mode = if existing.is_some() {
+            let metadata = fs::symlink_metadata(path).map_err(|error| io_error("inspect", &error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(McpError::invalid_params(format!(
+                    "Refusing to write {context} at {display}: destination changed to a non-regular file"
+                )));
+            }
+            metadata.permissions().mode() & 0o7777
+        } else {
+            0o600
+        };
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        );
+        let mut stage_name = std::ffi::OsString::from(".fastmcp-stage.");
+        stage_name.push(file_name);
+        stage_name.push(format!(".{nonce}"));
+        let stage = parent.join(stage_name);
+        if let Err(error) = write_staged(&stage, mode, contents) {
+            let _ = fs::remove_file(&stage);
+            return Err(io_error("stage the output file", &error));
+        }
+        match read_bounded_with_context(path, max_bytes, context) {
+            Ok(current) if current.as_deref() == existing.as_deref() => {}
+            Ok(_) => {
+                let _ = fs::remove_file(&stage);
+                return Err(McpError::invalid_params(format!(
+                    "{context} at {display} changed while output was being staged; nothing was written. Retry the command."
+                )));
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&stage);
+                return Err(error);
+            }
+        }
+        if let Err(error) = fs::rename(&stage, path) {
+            let _ = fs::remove_file(&stage);
+            return Err(io_error("publish the output file", &error));
+        }
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| io_error("sync the output directory", &error))?;
+        Ok(AtomicReplaceOutcome::Committed)
     }
 
     /// Writes `contents` to a freshly created (never pre-existing) file with
@@ -14707,6 +14840,83 @@ mod portable_install {
                 [std::ffi::OsString::from("config.json")],
                 "the refused publication removed its staging file and its backup link"
             );
+            fs::remove_dir_all(&directory).expect("remove scratch directory");
+        }
+
+        #[test]
+        fn replace_file_creates_preserves_mode_and_is_idempotent_without_orphans() {
+            let directory = scratch("replace-file-positive");
+            let path = directory.join("nested").join("inspect.json");
+
+            let created =
+                replace_file(&path, b"{\"ok\":1}\n", "inspect output", 1024).expect("create");
+            assert!(matches!(created, AtomicReplaceOutcome::Committed));
+            assert_eq!(fs::read(&path).expect("read created"), b"{\"ok\":1}\n");
+            assert_eq!(mode(&path), 0o600);
+
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
+            let updated =
+                replace_file(&path, b"{\"ok\":2}\n", "inspect output", 1024).expect("update");
+            assert!(matches!(updated, AtomicReplaceOutcome::Committed));
+            assert_eq!(fs::read(&path).expect("read updated"), b"{\"ok\":2}\n");
+            assert_eq!(mode(&path), 0o640);
+            let inode_after_update = fs::metadata(&path).expect("metadata").ino();
+
+            let unchanged =
+                replace_file(&path, b"{\"ok\":2}\n", "inspect output", 1024).expect("unchanged");
+            assert!(matches!(unchanged, AtomicReplaceOutcome::Unchanged));
+            assert_eq!(
+                fs::metadata(&path).expect("metadata after unchanged").ino(),
+                inode_after_update,
+                "idempotent replace_file must preserve inode"
+            );
+
+            let entries: Vec<_> = fs::read_dir(directory.join("nested"))
+                .expect("list nested")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect();
+            assert_eq!(
+                entries,
+                vec![std::ffi::OsString::from("inspect.json")],
+                "replace_file must leave zero staging or backup siblings"
+            );
+            fs::remove_dir_all(&directory).expect("remove scratch directory");
+        }
+
+        #[test]
+        fn replace_file_refuses_symlinks_traversal_and_oversized_without_mutation() {
+            let directory = scratch("replace-file-negative");
+            let real = directory.join("real.json");
+            let seeded = b"{\"sentinel\":true}\n";
+            fs::write(&real, seeded).expect("seed real");
+            let link = directory.join("link.json");
+            std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+            let symlink_err =
+                replace_file(&link, b"{\"new\":1}\n", "inspect output", 1024).expect_err("symlink");
+            assert_eq!(symlink_err.code, McpErrorCode::InvalidParams);
+            assert_eq!(
+                fs::read(&real).expect("real unchanged"),
+                seeded,
+                "symlink target must remain untouched"
+            );
+
+            let missing_parent = directory.join("must-not-exist");
+            let traversal = missing_parent.join("..").join("escape.json");
+            let traversal_err =
+                replace_file(&traversal, b"{\"new\":1}\n", "inspect output", 1024)
+                    .expect_err("parent traversal");
+            assert_eq!(traversal_err.code, McpErrorCode::InvalidParams);
+            assert!(traversal_err.message.contains("traversal components"));
+            assert!(!missing_parent.exists());
+
+            let oversized_target = directory.join("oversized.json");
+            let oversized_err = replace_file(&oversized_target, b"12345", "inspect output", 4)
+                .expect_err("oversized");
+            assert_eq!(oversized_err.code, McpErrorCode::InvalidParams);
+            assert!(!oversized_target.exists());
+
             fs::remove_dir_all(&directory).expect("remove scratch directory");
         }
     }
