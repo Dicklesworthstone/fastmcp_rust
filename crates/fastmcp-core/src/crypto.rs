@@ -35,6 +35,9 @@ pub const EPHEMERAL_KEY_MATERIAL_BYTES: usize = 32;
 /// Width of a nonce-domain-material draw in bytes.
 pub const NONCE_DOMAIN_MATERIAL_BYTES: usize = 16;
 
+/// Width of a purpose-specific OAuth client-secret KDF salt.
+pub const OAUTH_CLIENT_SECRET_SALT_BYTES: usize = 16;
+
 /// Width of a WebSocket masking-key draw in bytes.
 pub const WEBSOCKET_MASK_BYTES: usize = 4;
 
@@ -391,6 +394,31 @@ impl fmt::Debug for NonceDomainMaterial {
     }
 }
 
+/// Fresh salt for an OAuth confidential-client password verifier.
+///
+/// This is a separate random purpose from protocol identifiers, envelope
+/// nonces and key material. It cannot be constructed from caller-supplied
+/// bytes or cloned for another registration.
+#[repr(transparent)]
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct OAuthClientSecretSalt {
+    bytes: [u8; OAUTH_CLIENT_SECRET_SALT_BYTES],
+}
+
+impl OAuthClientSecretSalt {
+    /// Borrows the exact sixteen bytes for the password-hash salt codec.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; OAUTH_CLIENT_SECRET_SALT_BYTES] {
+        &self.bytes
+    }
+}
+
+impl fmt::Debug for OAuthClientSecretSalt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OAuthClientSecretSalt([redacted; 16 bytes])")
+    }
+}
+
 /// Purpose-specific 32-bit WebSocket masking material.
 ///
 /// This value is deliberately non-`Clone` and non-`Copy` to discourage
@@ -485,6 +513,17 @@ fn draw_nonce_domain_material_with(
     source: &impl RandomSource,
 ) -> Result<NonceDomainMaterial, RandomDrawError> {
     draw_bytes(source).map(|bytes| NonceDomainMaterial { bytes })
+}
+
+/// Draws a fresh, purpose-specific sixteen-byte OAuth client-secret KDF salt.
+pub fn draw_oauth_client_secret_salt() -> Result<OAuthClientSecretSalt, RandomDrawError> {
+    draw_oauth_client_secret_salt_with(&OsRandomSource)
+}
+
+fn draw_oauth_client_secret_salt_with(
+    source: &impl RandomSource,
+) -> Result<OAuthClientSecretSalt, RandomDrawError> {
+    draw_bytes(source).map(|bytes| OAuthClientSecretSalt { bytes })
 }
 
 /// Draws a fresh, purpose-specific four-byte WebSocket mask.
@@ -709,14 +748,19 @@ mod tests {
         let mut ephemeral = EphemeralKeyMaterial {
             bytes: [0xa5; EPHEMERAL_KEY_MATERIAL_BYTES],
         };
+        let mut oauth_salt = OAuthClientSecretSalt {
+            bytes: [0xa5; OAUTH_CLIENT_SECRET_SALT_BYTES],
+        };
 
         hmac_key.zeroize();
         identifier.zeroize();
         ephemeral.zeroize();
+        oauth_salt.zeroize();
 
         assert_eq!(hmac_key.bytes, [0_u8; HMAC_SHA256_KEY_BYTES]);
         assert_eq!(identifier.bytes, [0_u8; SECURITY_IDENTIFIER_BYTES]);
         assert_eq!(ephemeral.bytes, [0_u8; EPHEMERAL_KEY_MATERIAL_BYTES]);
+        assert_eq!(oauth_salt.bytes, [0_u8; OAUTH_CLIENT_SECRET_SALT_BYTES]);
     }
 
     #[test]
@@ -730,14 +774,17 @@ mod tests {
             .expect("fixed source must produce ephemeral material");
         let nonce = draw_nonce_domain_material_with(&source)
             .expect("fixed source must produce nonce material");
+        let oauth_salt = draw_oauth_client_secret_salt_with(&source)
+            .expect("fixed source must produce an OAuth client-secret salt");
         let mask = draw_websocket_mask_with(&source).expect("fixed source must produce a mask");
 
         assert_eq!(hmac_key.bytes, [0x5a; HMAC_SHA256_KEY_BYTES]);
         assert_eq!(identifier.as_bytes(), &[0x5a; SECURITY_IDENTIFIER_BYTES]);
         assert_eq!(ephemeral.as_bytes(), &[0x5a; EPHEMERAL_KEY_MATERIAL_BYTES]);
         assert_eq!(nonce.into_bytes(), [0x5a; NONCE_DOMAIN_MATERIAL_BYTES]);
+        assert_eq!(oauth_salt.as_bytes(), &[0x5a; OAUTH_CLIENT_SECRET_SALT_BYTES]);
         assert_eq!(mask.into_bytes(), [0x5a; WEBSOCKET_MASK_BYTES]);
-        assert_eq!(source.calls.get(), 5);
+        assert_eq!(source.calls.get(), 6);
     }
 
     #[test]
@@ -758,6 +805,14 @@ mod tests {
             TypeId::of::<HmacSha256Key>(),
             TypeId::of::<EphemeralKeyMaterial>()
         );
+        assert_ne!(
+            TypeId::of::<OAuthClientSecretSalt>(),
+            TypeId::of::<NonceDomainMaterial>()
+        );
+        assert_ne!(
+            TypeId::of::<OAuthClientSecretSalt>(),
+            TypeId::of::<SecurityIdentifier>()
+        );
 
         assert_eq!(size_of::<SecurityIdentifier>(), SECURITY_IDENTIFIER_BYTES);
         assert_eq!(
@@ -769,6 +824,10 @@ mod tests {
             NONCE_DOMAIN_MATERIAL_BYTES
         );
         assert_eq!(size_of::<WebSocketMask>(), WEBSOCKET_MASK_BYTES);
+        assert_eq!(
+            size_of::<OAuthClientSecretSalt>(),
+            OAUTH_CLIENT_SECRET_SALT_BYTES
+        );
     }
 
     #[test]
@@ -779,8 +838,9 @@ mod tests {
         assert!(draw_security_identifier_with(&source).is_err());
         assert!(draw_ephemeral_key_material_with(&source).is_err());
         assert!(draw_nonce_domain_material_with(&source).is_err());
+        assert!(draw_oauth_client_secret_salt_with(&source).is_err());
         assert!(draw_websocket_mask_with(&source).is_err());
-        assert_eq!(source.calls.get(), 5);
+        assert_eq!(source.calls.get(), 6);
     }
 
     #[test]
@@ -802,11 +862,18 @@ mod tests {
             .expect("fixed source must produce ephemeral material");
         let nonce = draw_nonce_domain_material_with(&source)
             .expect("fixed source must produce nonce material");
+        let oauth_salt = draw_oauth_client_secret_salt_with(&source)
+            .expect("fixed source must produce an OAuth client-secret salt");
         let mask = draw_websocket_mask_with(&source).expect("fixed source must produce a mask");
 
         assert_eq!(identifier.as_bytes(), &[0x3c; SECURITY_IDENTIFIER_BYTES]);
         assert_eq!(ephemeral.as_bytes(), &[0x3c; EPHEMERAL_KEY_MATERIAL_BYTES]);
         assert_eq!(nonce.as_bytes(), &[0x3c; NONCE_DOMAIN_MATERIAL_BYTES]);
+        assert_eq!(oauth_salt.as_bytes(), &[0x3c; OAUTH_CLIENT_SECRET_SALT_BYTES]);
+        assert_eq!(
+            format!("{oauth_salt:?}"),
+            "OAuthClientSecretSalt([redacted; 16 bytes])"
+        );
         assert_eq!(mask.as_bytes(), &[0x3c; WEBSOCKET_MASK_BYTES]);
     }
 
@@ -816,12 +883,15 @@ mod tests {
         let identifier = draw_security_identifier().expect("operating-system identifier draw");
         let ephemeral = draw_ephemeral_key_material().expect("operating-system ephemeral-key draw");
         let nonce = draw_nonce_domain_material().expect("operating-system nonce-domain draw");
+        let oauth_salt =
+            draw_oauth_client_secret_salt().expect("operating-system OAuth client-secret salt draw");
         let mask = draw_websocket_mask().expect("operating-system mask draw");
 
         assert_eq!(size_of_val(&hmac_key), HMAC_SHA256_KEY_BYTES);
         assert_eq!(identifier.as_bytes().len(), SECURITY_IDENTIFIER_BYTES);
         assert_eq!(ephemeral.as_bytes().len(), EPHEMERAL_KEY_MATERIAL_BYTES);
         assert_eq!(nonce.as_bytes().len(), NONCE_DOMAIN_MATERIAL_BYTES);
+        assert_eq!(oauth_salt.as_bytes().len(), OAUTH_CLIENT_SECRET_SALT_BYTES);
         assert_eq!(mask.as_bytes().len(), WEBSOCKET_MASK_BYTES);
     }
 
@@ -830,12 +900,13 @@ mod tests {
             .expect("crypto.rs must end at one parsed #[cfg(test)] tests module")
     }
 
-    const SEALED_EXTERNAL_CALLABLES: [&str; 33] = [
+    const SEALED_EXTERNAL_CALLABLES: [&str; 36] = [
         "pub fn sha256_bounded ( input : & [ u8 ] , max_input_bytes : usize ) -> Result < Sha256Digest , CryptoInputTooLongError >",
         "pub fn draw_hmac_sha256_key ( ) -> Result < HmacSha256Key , RandomDrawError >",
         "pub fn draw_security_identifier ( ) -> Result < SecurityIdentifier , RandomDrawError >",
         "pub fn draw_ephemeral_key_material ( ) -> Result < EphemeralKeyMaterial , RandomDrawError >",
         "pub fn draw_nonce_domain_material ( ) -> Result < NonceDomainMaterial , RandomDrawError >",
+        "pub fn draw_oauth_client_secret_salt ( ) -> Result < OAuthClientSecretSalt , RandomDrawError >",
         "pub fn draw_websocket_mask ( ) -> Result < WebSocketMask , RandomDrawError >",
         "Sha256Digest :: pub const fn from_bytes ( bytes : [ u8 ; SHA256_DIGEST_BYTES ] ) -> Self",
         "Sha256Digest :: pub const fn as_bytes ( & self ) -> & [ u8 ; SHA256_DIGEST_BYTES ]",
@@ -850,6 +921,7 @@ mod tests {
         "EphemeralKeyMaterial :: pub const fn as_bytes ( & self ) -> & [ u8 ; EPHEMERAL_KEY_MATERIAL_BYTES ]",
         "NonceDomainMaterial :: pub const fn as_bytes ( & self ) -> & [ u8 ; NONCE_DOMAIN_MATERIAL_BYTES ]",
         "NonceDomainMaterial :: pub const fn into_bytes ( self ) -> [ u8 ; NONCE_DOMAIN_MATERIAL_BYTES ]",
+        "OAuthClientSecretSalt :: pub const fn as_bytes ( & self ) -> & [ u8 ; OAUTH_CLIENT_SECRET_SALT_BYTES ]",
         "WebSocketMask :: pub const fn as_bytes ( & self ) -> & [ u8 ; WEBSOCKET_MASK_BYTES ]",
         "WebSocketMask :: pub const fn into_bytes ( self ) -> [ u8 ; WEBSOCKET_MASK_BYTES ]",
         "fmt :: Display for CryptoInputTooLongError :: fn fmt ( & self , f : & mut fmt :: Formatter < ' _ > ) -> fmt :: Result",
@@ -863,25 +935,28 @@ mod tests {
         "fmt :: Debug for SecurityIdentifier :: fn fmt ( & self , f : & mut fmt :: Formatter < ' _ > ) -> fmt :: Result",
         "fmt :: Debug for EphemeralKeyMaterial :: fn fmt ( & self , f : & mut fmt :: Formatter < ' _ > ) -> fmt :: Result",
         "fmt :: Debug for NonceDomainMaterial :: fn fmt ( & self , f : & mut fmt :: Formatter < ' _ > ) -> fmt :: Result",
+        "fmt :: Debug for OAuthClientSecretSalt :: fn fmt ( & self , f : & mut fmt :: Formatter < ' _ > ) -> fmt :: Result",
         "fmt :: Debug for WebSocketMask :: fn fmt ( & self , f : & mut fmt :: Formatter < ' _ > ) -> fmt :: Result",
     ];
 
-    const PRIVATE_WITH_SEAMS: [&str; 6] = [
+    const PRIVATE_WITH_SEAMS: [&str; 7] = [
         "sha256_bounded_with",
         "draw_hmac_sha256_key_with",
         "draw_security_identifier_with",
         "draw_ephemeral_key_material_with",
         "draw_nonce_domain_material_with",
+        "draw_oauth_client_secret_salt_with",
         "draw_websocket_mask_with",
     ];
 
-    const SEALED_PUBLIC_CONSTANTS: [&str; 7] = [
+    const SEALED_PUBLIC_CONSTANTS: [&str; 8] = [
         "const SHA256_DIGEST_BYTES : usize = 32",
         "const HMAC_SHA256_KEY_BYTES : usize = 32",
         "const HMAC_SHA256_TAG_BYTES : usize = 32",
         "const SECURITY_IDENTIFIER_BYTES : usize = 32",
         "const EPHEMERAL_KEY_MATERIAL_BYTES : usize = 32",
         "const NONCE_DOMAIN_MATERIAL_BYTES : usize = 16",
+        "const OAUTH_CLIENT_SECRET_SALT_BYTES : usize = 16",
         "const WEBSOCKET_MASK_BYTES : usize = 4",
     ];
 
@@ -2422,6 +2497,11 @@ mod tests {
                 "/// Purpose-specific 128-bit nonce-domain material.",
             ),
             (
+                "OAuth client-secret salt",
+                "/// Fresh salt for an OAuth confidential-client password verifier.",
+                "/// Purpose-specific 32-bit WebSocket masking material.",
+            ),
+            (
                 "WebSocket mask",
                 "/// Purpose-specific 32-bit WebSocket masking material.",
                 "trait RandomSource",
@@ -2454,6 +2534,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn api_deny_oauth_client_secret_salt_is_sealed_and_exact_width() {
+        let production = production_source();
+        validate_random_draw_api(production).expect("purpose-typed salt is admitted");
+
+        let wrong_width = replace_required(
+            production,
+            "pub const OAUTH_CLIENT_SECRET_SALT_BYTES: usize = 16;",
+            "pub const OAUTH_CLIENT_SECRET_SALT_BYTES: usize = 15;",
+        );
+        assert_random_draw_denial(
+            &wrong_width,
+            RandomDrawApiDenyError::PublicEntropyExport(
+                "const OAUTH_CLIENT_SECRET_SALT_BYTES: usize = 15".to_owned(),
+            ),
+            "random draw API denial: public entropy export `const OAUTH_CLIENT_SECRET_SALT_BYTES: usize = 15`",
+        );
+
+        let caller_selected_salt = format!(
+            "{production}\nimpl OAuthClientSecretSalt {{ pub fn from_slice(bytes: &[u8]) -> Self {{ Self {{ bytes: bytes.try_into().expect(\"fixed-width salt\") }} }} }}\n"
+        );
+        assert_random_draw_denial(
+            &caller_selected_salt,
+            RandomDrawApiDenyError::UnexpectedExternalCallable(
+                "OAuthClientSecretSalt::pub fn from_slice(bytes: &[u8]) -> Self".to_owned(),
+            ),
+            "random draw API denial: unexpected external callable `OAuthClientSecretSalt::pub fn from_slice(bytes: &[u8]) -> Self`",
+        );
+
+        let missing_draw = replace_required(
+            production,
+            "pub fn draw_oauth_client_secret_salt()",
+            "fn draw_oauth_client_secret_salt()",
+        );
+        assert_random_draw_denial(
+            &missing_draw,
+            RandomDrawApiDenyError::MissingSealedExternalCallable(
+                "pub fn draw_oauth_client_secret_salt() -> Result<OAuthClientSecretSalt, RandomDrawError>".to_owned(),
+            ),
+            "random draw API denial: missing sealed external callable `pub fn draw_oauth_client_secret_salt() -> Result<OAuthClientSecretSalt, RandomDrawError>`",
+        );
     }
 
     #[test]

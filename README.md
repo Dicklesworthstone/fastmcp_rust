@@ -1600,6 +1600,43 @@ store. That profile also honors the native certificate provider's
 `SSL_CERT_FILE` and `SSL_CERT_DIR` overrides; these select the trust source,
 and do not disable certificate or hostname verification.
 
+### Built-in OAuth client secret verification (current source tree)
+
+With `builtin-auth-server`, confidential client secrets use Argon2id v19 with
+64 MiB of memory, three passes, one lane, a fresh 16-byte salt drawn by the
+core's fallible OS-random boundary, and a 32-byte output. Registrations retain
+the encoded PHC verifier instead of the original secret. Verification admits
+only this exact policy, salt width, output width, and bounded canonical PHC
+encoding before allocating Argon2 memory; imported higher costs and weaker
+parameters are rejected.
+
+The issuer runs this work on a dedicated Asupersync blocking pool. Two jobs
+can hash concurrently, with at most 32 admitted jobs and 64 admissions per
+one-second window. An admitted caller waits at most 30 seconds and checks its
+runtime cancellation and deadline while waiting. Cancelling a waiter does
+not release a running job's quota until its secret and work retire.
+Overload or unavailable verification returns an explicit availability error.
+Unknown clients, wrong authentication methods, and public-client exchanges
+perform bounded dummy verification and share the same KDF admission budget.
+
+Credential work holds no issuer-state lock. After verification, the issuer
+revalidates the client's exact registration under the guard that reads or
+commits state, so a result from a removed registration cannot authorize its
+replacement. Cancellation is checked again before consuming codes, rotating
+refresh tokens, or committing token and revocation state.
+
+Native OAuth HTTP routes require an admitted blocking worker and refuse
+expensive dispatch with 503 when none is available. Immutable authorization
+server metadata remains available without that worker. Listener cancellation
+is forwarded to the route's context, and connection ownership continues until
+the blocking callback retires. Application callbacks must still cooperate
+with cancellation. The synchronous `OAuthServer` APIs wait for KDF completion;
+async embedders must call them from a blocking lane.
+
+The profile without `builtin-auth-server` retains its development-only salted
+SHA-256 verifier. This change does not promote the in-memory issuer to durable
+or production-qualified OAuth/OIDC support.
+
 ### Enterprise authorization components (native, opt-in)
 
 Enable `enterprise-auth` to use
