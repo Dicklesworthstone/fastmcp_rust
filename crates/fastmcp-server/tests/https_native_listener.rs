@@ -39,12 +39,12 @@ use std::sync::{
 use std::time::Duration;
 
 use asupersync::Cx;
-use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::net::TcpStream;
 use asupersync::runtime::TaskHandle;
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsConnector};
 use asupersync::types::CancelKind;
-use fastmcp_core::{AuthContext, McpContext, McpResult};
+use fastmcp_core::{AuthContext, McpContext, McpResult, OperatorLifecycle, OperatorSnapshot};
 use fastmcp_protocol::{Content, FINAL_PROTOCOL_VERSION, Tool, protocol_policy::ProtocolPolicy};
 use fastmcp_server::http_admission::security::endpoint::listener::SecuredHttpIoLimits;
 use fastmcp_server::http_admission::security::{
@@ -57,8 +57,8 @@ use fastmcp_server::oauth::{
     OAuthServerConfig,
 };
 use fastmcp_server::{
-    AuthProvider, AuthRequest, HttpServerShutdown, Server, StaticTokenVerifier, TokenAuthProvider,
-    ToolHandler,
+    AuthProvider, AuthRequest, HttpOperatorHandle, HttpServerConfig, HttpServerShutdown, Server,
+    StaticTokenVerifier, TokenAuthProvider, ToolHandler,
 };
 use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpResponse, HttpStatus};
 use serde_json::{Value, json};
@@ -193,6 +193,7 @@ fn request(sse: bool) -> HttpRequest {
 
 struct Running {
     address: SocketAddr,
+    operator: HttpOperatorHandle,
     owner: Cx,
     task: Option<TaskHandle<McpResult<HttpServerShutdown>>>,
 }
@@ -237,6 +238,7 @@ impl Running {
             .with_io_limits(limits);
         assert!(bound.is_https());
         let address = bound.local_addr().unwrap();
+        let operator = bound.operator_handle();
         let (sender, mut receiver) = asupersync::channel::oneshot::channel();
         let task = cx
             .spawn(move |server_cx| async move {
@@ -247,6 +249,7 @@ impl Running {
         let owner = receiver.recv(cx).await.unwrap();
         Self {
             address,
+            operator,
             owner,
             task: Some(task),
         }
@@ -1282,5 +1285,426 @@ fn https_native_oauth_pipelining_and_incomplete_body_fail_uncacheably_before_dis
             201
         );
         running.stop(&cx).await;
+    });
+}
+
+fn readiness_server(probe: &Probe, capacity: usize) -> Server {
+    Server::new("private-tls-readiness-server", "private-tls-version")
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .unwrap()
+        .http_config(
+            HttpServerConfig::new()
+                .health_path("/livez")
+                .readiness_path("/readyz")
+                .max_connections(capacity),
+        )
+        .auth_provider(probe.clone())
+        .tool(probe.clone())
+        .build()
+}
+
+async fn wait_operator(
+    operator: &HttpOperatorHandle,
+    predicate: impl Fn(&OperatorSnapshot) -> bool,
+) -> OperatorSnapshot {
+    let deadline = std::time::Instant::now() + EXCHANGE_TIMEOUT;
+    loop {
+        if let Ok(snapshot) = OperatorSnapshot::capture(operator)
+            && predicate(&snapshot)
+        {
+            return snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "secured listener observation exceeded its test bound",
+        );
+        asupersync::runtime::yield_now().await;
+    }
+}
+
+fn diagnostic(path: &str) -> HttpRequest {
+    HttpRequest::new(HttpMethod::Get, path)
+        .with_header("host", "localhost")
+        .with_header("origin", ORIGIN)
+        .with_header("authorization", "Bearer private-tls-health-bearer")
+        .with_header("cookie", "private-tls-health-cookie")
+        .with_header("x-request-id", "private-tls-health-request-id")
+}
+
+fn https_readiness(bytes: &[u8], status: u16) -> Value {
+    let response = decode_wire(bytes);
+    assert_eq!(response.status.0, status);
+    assert_eq!(response.headers["cache-control"], "no-store");
+    assert_eq!(response.headers["access-control-allow-origin"], ORIGIN);
+    assert!(!response.headers.contains_key("www-authenticate"));
+    assert!(response.body.len() < 2048);
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["schema"], "fastmcp.http.readiness/v1");
+    assert_eq!(body["snapshotSchema"], OperatorSnapshot::SCHEMA_VERSION);
+    assert_eq!(body["schemaVersion"], OperatorSnapshot::SCHEMA_VERSION);
+    assert_eq!(body.as_object().unwrap().len(), 12);
+    assert!(body["reasons"].is_array());
+    let wire = std::str::from_utf8(bytes).unwrap();
+    for private in [
+        "private-tls-readiness-server",
+        "private-tls-version",
+        "private-tls-health-bearer",
+        "private-tls-health-cookie",
+        "private-tls-health-request-id",
+    ] {
+        assert!(
+            !wire.contains(private),
+            "diagnostic exposed private context"
+        );
+    }
+    body
+}
+
+async fn finish_admitted_tls<S>(cx: &Cx, stream: &mut S) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, async {
+        stream.write_all(&encode(request(false))).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut chunk).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            assert!(response.len() + count <= 256 * 1024);
+            response.extend_from_slice(&chunk[..count]);
+        }
+        response
+    })
+    .await
+    .expect("a TLS request admitted before drain must complete")
+}
+
+#[test]
+fn https_native_readiness_tracks_saturation_recovery_and_drain() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let running = Running::configured(
+            &cx,
+            readiness_server(&probe, 1),
+            policy(),
+            Duration::from_secs(30),
+        )
+        .await;
+        wait_operator(&running.operator, |snapshot| {
+            snapshot.lifecycle() == OperatorLifecycle::Running
+        })
+        .await;
+        let healthy = exchange(&cx, running.address, diagnostic("/readyz"))
+            .await
+            .unwrap();
+        let body = https_readiness(&healthy, 200);
+        assert_eq!(
+            body["connections"],
+            json!({"limit":1,"active":0,"reserved":0})
+        );
+        assert_eq!(body["saturated"], false);
+        let generation = body["generation"].clone();
+        assert_eq!(probe.counts(), (0, 0));
+
+        // A fully established TLS socket owns the sole protocol permit. The
+        // independent control connection must report saturation without
+        // confiscating that permit or invoking authentication.
+        let tcp = TcpStream::connect(running.address).await.unwrap();
+        let occupied = connector(true, vec![b"http/1.1".to_vec()])
+            .connect("localhost", tcp)
+            .await
+            .unwrap();
+        wait_operator(&running.operator, |snapshot| {
+            snapshot.connections().active == 1
+        })
+        .await;
+        let saturated = exchange(&cx, running.address, diagnostic("/readyz"))
+            .await
+            .unwrap();
+        let body = https_readiness(&saturated, 503);
+        assert_eq!(body["readiness"], "ready");
+        assert_eq!(body["saturated"], true);
+        assert_eq!(body["connections"]["active"], 1);
+        assert_eq!(body["generation"], generation);
+        let live = decode_wire(
+            &exchange(&cx, running.address, diagnostic("/livez"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(live.status.0, 200);
+        assert_eq!(live.headers["cache-control"], "no-store");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&live.body).unwrap(),
+            json!({"status":"ok"})
+        );
+        drop(occupied);
+        wait_operator(&running.operator, |snapshot| {
+            snapshot.connections().in_use() == 0
+        })
+        .await;
+        let recovered = exchange(&cx, running.address, diagnostic("/readyz"))
+            .await
+            .unwrap();
+        assert_eq!(https_readiness(&recovered, 200)["generation"], generation);
+
+        let tcp = TcpStream::connect(running.address).await.unwrap();
+        let mut admitted = connector(true, vec![b"http/1.1".to_vec()])
+            .connect("localhost", tcp)
+            .await
+            .unwrap();
+        wait_operator(&running.operator, |snapshot| {
+            snapshot.connections().active == 1
+        })
+        .await;
+        running.operator.begin_drain().unwrap();
+        let draining = exchange(&cx, running.address, diagnostic("/readyz"))
+            .await
+            .unwrap();
+        assert_eq!(https_readiness(&draining, 503)["lifecycle"], "stopping");
+        let refused = decode_wire(
+            &exchange(&cx, running.address, request(false))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(refused.status.0, 503);
+        let metadata_path = policy().resource_metadata_path().unwrap().to_owned();
+        let metadata = decode_wire(
+            &exchange(&cx, running.address, diagnostic(&metadata_path))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            metadata.status.0, 503,
+            "the overflow lane must not turn another public route into a drain bypass",
+        );
+        assert_eq!(
+            probe.counts(),
+            (0, 0),
+            "control capacity cannot dispatch MCP"
+        );
+        success(
+            &decode_wire(&finish_admitted_tls(&cx, &mut admitted).await),
+            false,
+        );
+        drop(admitted);
+        assert_eq!(probe.counts(), (1, 1));
+        let settled = wait_operator(&running.operator, |snapshot| {
+            snapshot.connections().in_use() == 0
+        })
+        .await;
+        assert_eq!(settled.counters().accepted, settled.counters().released);
+        assert_eq!(settled.counters().probes_acquired, 0);
+        let drained = exchange(&cx, running.address, diagnostic("/readyz"))
+            .await
+            .unwrap();
+        let body = https_readiness(&drained, 503);
+        assert_eq!(body["generation"], generation);
+        assert_eq!(body["lifecycle"], "stopping");
+        assert_eq!(body["saturated"], false, "drain must not reopen admission");
+        let operator = running.operator.clone();
+        running.stop(&cx).await;
+        let stopped = OperatorSnapshot::capture(&operator).unwrap();
+        assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+        assert_eq!(stopped.connections().in_use(), 0);
+        assert_eq!(stopped.counters().accepted, stopped.counters().released);
+    });
+}
+
+#[test]
+fn https_native_readiness_enforces_raw_security_without_authentication() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let running = Running::configured(
+            &cx,
+            readiness_server(&probe, 1),
+            policy(),
+            Duration::from_secs(30),
+        )
+        .await;
+        wait_operator(&running.operator, |snapshot| {
+            snapshot.lifecycle() == OperatorLifecycle::Running
+        })
+        .await;
+        for saturated in [false, true] {
+            let occupied = if saturated {
+                let tcp = TcpStream::connect(running.address).await.unwrap();
+                let stream = connector(true, vec![b"http/1.1".to_vec()])
+                    .connect("localhost", tcp)
+                    .await
+                    .unwrap();
+                wait_operator(&running.operator, |snapshot| {
+                    snapshot.connections().active == 1
+                })
+                .await;
+                Some(stream)
+            } else {
+                None
+            };
+            let accepted = exchange(&cx, running.address, diagnostic("/readyz"))
+                .await
+                .unwrap();
+            https_readiness(&accepted, if saturated { 503 } else { 200 });
+            let mut missing_host = diagnostic("/readyz");
+            missing_host.headers.remove("host");
+            for (request, expected) in [
+                (missing_host, 403),
+                (
+                    diagnostic("/readyz").with_header("host", "private-evil-host.example"),
+                    403,
+                ),
+                (
+                    diagnostic("/readyz")
+                        .with_header("origin", "https://private-evil-origin.example"),
+                    403,
+                ),
+                (diagnostic("/readyz?private-query-canary"), 400),
+                (diagnostic("/readyz?"), 400),
+                (
+                    diagnostic("/readyz").with_body(b"private-body-canary".to_vec()),
+                    400,
+                ),
+                (
+                    HttpRequest::new(HttpMethod::Post, "/readyz")
+                        .with_header("host", "localhost")
+                        .with_header("origin", ORIGIN),
+                    405,
+                ),
+            ] {
+                let bytes = exchange(&cx, running.address, request).await.unwrap();
+                let response = decode_wire(&bytes);
+                assert_eq!(response.status.0, expected);
+                assert_eq!(response.headers["cache-control"], "no-store");
+                assert!(!std::str::from_utf8(&bytes).unwrap().contains("private-"));
+                assert!(
+                    response.body.is_empty(),
+                    "refusal must not expose a snapshot"
+                );
+                assert_eq!(probe.counts(), (0, 0));
+            }
+            for extra in [
+                "Host: localhost\r\n",
+                "Origin: https://browser.example\r\n",
+                "Content-Length: 0\r\n",
+                "Transfer-Encoding: chunked\r\n",
+            ] {
+                let raw = format!(
+                    "GET /readyz HTTP/1.1\r\nHost: localhost\r\nOrigin: {ORIGIN}\r\nContent-Length: 0\r\n{extra}Connection: close\r\n\r\n",
+                );
+                let response = decode_wire(
+                    &exchange_bytes(&cx, running.address, raw.into_bytes())
+                        .await
+                        .unwrap(),
+                );
+                assert_eq!(response.status.0, 400);
+                assert!(response.body.is_empty());
+                assert_eq!(probe.counts(), (0, 0));
+            }
+            for raw in [
+                format!(
+                    "GET /readyz HTTP/1.1\r\nHost: localhost\r\nOrigin: {ORIGIN}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
+                ),
+                format!(
+                    "GET /readyz HTTP/1.1\r\nHost: localhost\r\nOrigin: {ORIGIN}\r\nContent-Length: 0\r\nConnection: close\r\n\r\nGET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                ),
+            ] {
+                let response = decode_wire(
+                    &exchange_bytes(&cx, running.address, raw.into_bytes())
+                        .await
+                        .unwrap(),
+                );
+                assert_eq!(response.status.0, 400);
+                assert!(response.body.is_empty());
+                assert_eq!(probe.counts(), (0, 0));
+            }
+            let preflight = HttpRequest::new(HttpMethod::Options, "/readyz")
+                .with_header("host", "localhost")
+                .with_header("origin", ORIGIN)
+                .with_header("access-control-request-method", "GET");
+            let preflight = decode_wire(&exchange(&cx, running.address, preflight).await.unwrap());
+            assert_eq!(preflight.status.0, 204);
+            assert_eq!(preflight.headers["access-control-allow-origin"], ORIGIN);
+            assert!(preflight.body.is_empty());
+            assert_eq!(probe.counts(), (0, 0));
+            let reaccepted = exchange(&cx, running.address, diagnostic("/readyz"))
+                .await
+                .unwrap();
+            https_readiness(&reaccepted, if saturated { 503 } else { 200 });
+            drop(occupied);
+            wait_operator(&running.operator, |snapshot| {
+                snapshot.connections().in_use() == 0
+            })
+            .await;
+        }
+        running.stop(&cx).await;
+        assert_eq!(probe.counts(), (0, 0));
+    });
+}
+
+#[test]
+fn https_native_readiness_control_handshakes_are_bounded_and_recover_capacity() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let running = Running::with_limits(
+            &cx,
+            readiness_server(&probe, 0),
+            policy(),
+            SecuredHttpIoLimits::new(Duration::from_secs(30), Duration::from_secs(30))
+                .unwrap()
+                .with_handshake_timeout(Duration::from_secs(120))
+                .unwrap(),
+        )
+        .await;
+        wait_operator(&running.operator, |snapshot| {
+            snapshot.lifecycle() == OperatorLifecycle::Running
+        })
+        .await;
+        let mut idle = TcpStream::connect(running.address).await.unwrap();
+        wait_operator(&running.operator, |snapshot| {
+            snapshot.counters().rejected >= 1
+        })
+        .await;
+        let mut excess = TcpStream::connect(running.address).await.unwrap();
+        let mut byte = [0_u8; 1];
+        let refused =
+            asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, excess.read(&mut byte)).await;
+        assert!(
+            matches!(refused, Ok(Ok(0) | Err(_))),
+            "a second TLS control child must be hard-closed before handshake",
+        );
+        let expired =
+            asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, idle.read(&mut byte)).await;
+        assert!(
+            matches!(expired, Ok(Ok(0) | Err(_))),
+            "control handshake must expire below the normal 120-second allowance",
+        );
+        drop(excess);
+        drop(idle);
+        let recovered = exchange(&cx, running.address, diagnostic("/readyz"))
+            .await
+            .unwrap();
+        let body = https_readiness(&recovered, 503);
+        assert_eq!(
+            body["connections"],
+            json!({"limit":0,"active":0,"reserved":0})
+        );
+        assert_eq!(body["readiness"], "not_ready");
+        let snapshot = OperatorSnapshot::capture(&running.operator).unwrap();
+        assert_eq!(snapshot.counters().accepted, 0);
+        assert_eq!(snapshot.counters().released, 0);
+        assert_eq!(snapshot.counters().probes_acquired, 0);
+        assert_eq!(probe.counts(), (0, 0));
+        let operator = running.operator.clone();
+        running.stop(&cx).await;
+        assert_eq!(
+            OperatorSnapshot::capture(&operator)
+                .unwrap()
+                .connections()
+                .in_use(),
+            0
+        );
     });
 }

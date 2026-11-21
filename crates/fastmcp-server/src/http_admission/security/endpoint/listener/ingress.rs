@@ -14,8 +14,9 @@ use super::super::super::{
     CorsResponseHeaders, HttpSecurityError, HttpSecurityHead, HttpSecurityPolicy,
 };
 use crate::{
-    BytesMut, Decoder, Encoder, Framed, HTTP_ACCEPT_CANCEL_POLL, Http1DecodeError, Http1Response,
-    HttpListenerShutdown, NativeHttp1Codec, OAuthHttpRoutes, OAuthNativeH1RouteLimits,
+    BytesMut, Decoder, Encoder, Framed, HTTP_ACCEPT_CANCEL_POLL, HTTP_HEALTH_MAX_HEADER_BYTES,
+    Http1DecodeError, Http1Response, HttpListenerShutdown, NativeHttp1Codec, OAuthHttpRoutes,
+    OAuthNativeH1RouteLimits,
 };
 
 const MAX_REQUEST_LINE_BYTES: usize = 8192;
@@ -28,6 +29,10 @@ pub(super) enum Ingress {
         cors: CorsResponseHeaders,
     },
     Immediate(HttpResponse),
+    Diagnostic {
+        readiness: bool,
+        cors: CorsResponseHeaders,
+    },
     // Head admission only, never a dispatch or authentication permit.
     Continue,
 }
@@ -38,6 +43,10 @@ enum AdmittedHead {
         send_continue: bool,
     },
     Immediate(HttpResponse),
+    Diagnostic {
+        readiness: bool,
+        cors: CorsResponseHeaders,
+    },
 }
 
 pub(super) struct SecuredCodec {
@@ -45,6 +54,8 @@ pub(super) struct SecuredCodec {
     policy: Arc<HttpSecurityPolicy>,
     body_limit: usize,
     oauth_limits: Option<OAuthNativeH1RouteLimits>,
+    diagnostic_paths: Option<(String, String)>,
+    health_only: bool,
     cors: Option<CorsResponseHeaders>,
     finished: bool,
 }
@@ -57,6 +68,8 @@ impl SecuredCodec {
             policy,
             body_limit,
             oauth_limits: None,
+            diagnostic_paths: None,
+            health_only: false,
             cors: None,
             finished: false,
         }
@@ -65,6 +78,17 @@ impl SecuredCodec {
     pub(super) fn with_oauth_routes(mut self, routes: Option<&OAuthHttpRoutes>) -> Self {
         self.inner = NativeHttp1Codec::new(self.body_limit, routes);
         self.oauth_limits = routes.map(OAuthNativeH1RouteLimits::from_routes);
+        self
+    }
+
+    pub(super) fn with_diagnostics(
+        mut self,
+        health_path: &str,
+        readiness_path: &str,
+        health_only: bool,
+    ) -> Self {
+        self.diagnostic_paths = Some((health_path.to_owned(), readiness_path.to_owned()));
+        self.health_only = health_only;
         self
     }
 
@@ -100,6 +124,26 @@ impl SecuredCodec {
             return Err(HttpSecurityError::InvalidHeader);
         }
         let path = target.split_once('?').map_or(target, |(path, _)| path);
+        let diagnostic = self
+            .diagnostic_paths
+            .as_ref()
+            .and_then(|(health, readiness)| {
+                if path == health {
+                    Some(false)
+                } else if path == readiness {
+                    Some(true)
+                } else {
+                    None
+                }
+            });
+        if diagnostic.is_some() {
+            if target != path {
+                return Err(HttpSecurityError::InvalidHeader);
+            }
+            if end.saturating_add(4) > HTTP_HEALTH_MAX_HEADER_BYTES {
+                return Err(HttpSecurityError::HeaderLimit);
+            }
+        }
         if self.policy.is_metadata_path(path) && target != path {
             return Err(HttpSecurityError::EndpointMismatch);
         }
@@ -132,9 +176,23 @@ impl SecuredCodec {
             .oauth_limits
             .as_ref()
             .and_then(|routes| routes.body_limit_for_path(path));
-        let head = match oauth_limit {
-            Some(limit) => self.policy.admit_oauth_head(method, &headers, limit == 0)?,
-            None => self.policy.admit_head(method, path, &headers)?,
+        let head = if diagnostic.is_some() {
+            self.policy.admit_diagnostic_head(method, &headers)?
+        } else if self.health_only {
+            // Validate the raw security fields, then refuse before any body,
+            // OAuth callback or MCP dispatch. Spare capacity cannot upgrade
+            // a connection that was admitted solely to the control slot.
+            self.policy
+                .admit_route_head(method, &headers, "GET", None)?;
+            return Ok(AdmittedHead::Immediate(
+                HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+                    .with_header("cache-control", "no-store"),
+            ));
+        } else {
+            match oauth_limit {
+                Some(limit) => self.policy.admit_oauth_head(method, &headers, limit == 0)?,
+                None => self.policy.admit_head(method, path, &headers)?,
+            }
         };
         if let HttpSecurityHead::Post(cors) = &head {
             self.cors = Some(cors.clone());
@@ -183,7 +241,10 @@ impl SecuredCodec {
                     .map_err(|_| HttpSecurityError::ContentLengthMismatch)
             })
             .transpose()?;
-        if !matches!(&head, HttpSecurityHead::Post(_)) || oauth_limit == Some(0) {
+        if !matches!(&head, HttpSecurityHead::Post(_))
+            || oauth_limit == Some(0)
+            || diagnostic.is_some()
+        {
             // Preflight and public metadata GET are bodyless. Never wait for a
             // claimed body, and reject already-buffered pipelining. The response
             // closes this connection, so later request data cannot dispatch.
@@ -216,6 +277,9 @@ impl SecuredCodec {
                 Ok(AdmittedHead::Immediate(response))
             }
             HttpSecurityHead::Post(cors) => {
+                if let Some(readiness) = diagnostic {
+                    return Ok(AdmittedHead::Diagnostic { readiness, cors });
+                }
                 // RFC 9110 10.1.1: never wait for content before acknowledging
                 // an admitted HTTP/1.1 expectation. HTTP/1.0 ignores it, and no
                 // informational response is needed once content has arrived.
@@ -273,6 +337,11 @@ impl Decoder for SecuredCodec {
                 .max_header_block_bytes()
                 .saturating_add(limits.max_header_count().saturating_mul(4))
                 .saturating_add(MAX_REQUEST_LINE_BYTES + 4);
+            let maximum = if self.health_only {
+                maximum.min(HTTP_HEALTH_MAX_HEADER_BYTES.saturating_sub(4))
+            } else {
+                maximum
+            };
             let end = source.windows(4).position(|window| window == b"\r\n\r\n");
             let Some(end) = end else {
                 if source.len() > maximum {
@@ -291,6 +360,11 @@ impl Decoder for SecuredCodec {
                     source.clear();
                     self.finished = true;
                     return Ok(Some(Ingress::Immediate(response)));
+                }
+                Ok(AdmittedHead::Diagnostic { readiness, cors }) => {
+                    source.clear();
+                    self.finished = true;
+                    return Ok(Some(Ingress::Diagnostic { readiness, cors }));
                 }
                 Ok(AdmittedHead::Post {
                     cors,

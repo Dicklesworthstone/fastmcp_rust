@@ -362,6 +362,24 @@ impl HttpSecurityPolicy {
         Ok(admitted)
     }
 
+    // Only an installed native diagnostic route may use this bodyless public
+    // admission. It shares the canonical Host, Origin and duplicate-header
+    // checks, but cannot acquire MCP authentication or challenge authority.
+    fn admit_diagnostic_head(
+        &self,
+        method: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpSecurityHead, HttpSecurityError> {
+        let mut admitted = self.admit_route_head(method, headers, "GET", None)?;
+        if !matches!(method, "GET" | "OPTIONS") {
+            return Err(HttpSecurityError::MetadataMethodNotAllowed);
+        }
+        if let HttpSecurityHead::Post(cors) = &mut admitted {
+            cors.metadata_location = None;
+        }
+        Ok(admitted)
+    }
+
     fn admit_route_head(
         &self,
         method: &str,

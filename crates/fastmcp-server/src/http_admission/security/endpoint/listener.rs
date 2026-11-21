@@ -30,10 +30,12 @@ use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 
 use super::super::HttpSecurityPolicy;
 use crate::{
-    BoundHttpServer, HTTP_ACCEPT_CANCEL_POLL, HttpConnectionChildren, HttpListenerShutdown,
-    HttpNonquiescentShutdown, HttpServerShutdown, MODERN_HTTP_SESSION_REAP_INTERVAL, Server,
-    detach_live_modern_http_sessions, expire_live_modern_http_sessions,
-    finish_live_modern_http_sessions, take_unsettled_retired_modern_http_dispatches,
+    BoundHttpServer, HTTP_ACCEPT_CANCEL_POLL, HTTP_HEALTH_IO_TIMEOUT, HttpConnectionChildren,
+    HttpHealthControlPermit, HttpListenerShutdown, HttpNativeConnectionAdmission,
+    HttpNonquiescentShutdown, HttpOperatorHandle, HttpServerShutdown,
+    MODERN_HTTP_SESSION_REAP_INTERVAL, Server, detach_live_modern_http_sessions,
+    expire_live_modern_http_sessions, finish_live_modern_http_sessions,
+    take_unsettled_retired_modern_http_dispatches,
 };
 
 /// Finite TLS-handshake, request-read and individual response-write bounds.
@@ -95,6 +97,14 @@ impl SecuredHttpIoLimits {
     pub fn write_timeout(self) -> Duration {
         self.write_timeout
     }
+
+    fn diagnostic(self) -> Self {
+        Self {
+            handshake_bound: self.handshake_bound.min(HTTP_HEALTH_IO_TIMEOUT),
+            request_timeout: self.request_timeout.min(HTTP_HEALTH_IO_TIMEOUT),
+            write_timeout: self.write_timeout.min(HTTP_HEALTH_IO_TIMEOUT),
+        }
+    }
 }
 
 /// Native bound socket and immutable security/TLS policy. Accepted connection
@@ -148,6 +158,13 @@ impl Server {
         if self.http_config.handler_config.base_path != policy.endpoint().path() {
             return Err(McpError::invalid_request(
                 "secured HTTP policy does not match the MCP route",
+            ));
+        }
+        if policy.resource_metadata_path().is_some_and(|path| {
+            path == self.http_config.health_path || path == self.http_config.readiness_path
+        }) {
+            return Err(McpError::invalid_request(
+                "secured HTTP diagnostic and resource metadata routes overlap",
             ));
         }
         if let Some(routes) = &self.oauth_http_routes {
@@ -276,6 +293,17 @@ impl BoundSecuredHttpServer {
         self.inner.local_addr()
     }
 
+    /// Observes and drains this listener's exact native connection admission.
+    ///
+    /// TLS handshakes consume the same protocol capacity as established MCP
+    /// requests. `begin_drain()` fences new protocol connections without
+    /// cancelling accepted work. The configured liveness/readiness routes
+    /// retain one bounded control connection, including a bounded TLS handshake.
+    #[must_use]
+    pub fn operator_handle(&self) -> HttpOperatorHandle {
+        self.inner.operator_handle()
+    }
+
     /// Whether this bound listener requires TLS on every accepted connection.
     pub fn is_https(&self) -> bool {
         self.tls.is_some()
@@ -288,8 +316,9 @@ impl BoundSecuredHttpServer {
     }
 
     /// Accepts secured HTTP requests until caller cancellation or listener error.
-    /// Capacity refusal drops the socket without spawning an error-writing task.
-    /// TLS handshakes consume that same capacity and remain in the same child
+    /// Capacity refusal permits at most one bounded diagnostic connection;
+    /// additional sockets are dropped without spawning error-writing tasks.
+    /// TLS handshakes consume their admitted capacity and remain in the same child
     /// inventory. Shutdown retains the native two-phase terminal drain and
     /// transfers noncooperating children to `HttpServerShutdown::Nonquiescent`.
     ///
@@ -381,18 +410,33 @@ impl BoundSecuredHttpServer {
                     Err(_) if cx.checkpoint().is_err() => break Ok(()),
                     Err(_) => break Err(McpError::internal_error("secured HTTP accept failed")),
                 };
-                let Some(permit) = bound.connection_limiter.try_acquire() else {
-                    drop(stream);
-                    continue;
+                let admission = match bound.connection_limiter.try_acquire() {
+                    Some(permit) => HttpNativeConnectionAdmission::Protocol(permit),
+                    None => {
+                        let Some(permit) = HttpHealthControlPermit::try_acquire(
+                            &bound.endpoint.health_control_active,
+                        ) else {
+                            drop(stream);
+                            continue;
+                        };
+                        HttpNativeConnectionAdmission::Health(permit)
+                    }
                 };
                 let endpoint = Arc::clone(&bound.endpoint);
                 let sessions = Arc::clone(&bound.modern_sessions);
                 let policy = Arc::clone(&self.policy);
-                let io = self.io;
+                let io = if admission.health_only() {
+                    self.io.diagnostic()
+                } else {
+                    self.io
+                };
                 let acceptor = self.tls.clone();
                 let stopping = shutdown.clone();
                 match cx.spawn_in(&scope, move |connection_cx| async move {
-                    let _permit = permit;
+                    // The selected permit also owns TLS close_notify. A
+                    // diagnostic may exchange its data slot for the single
+                    // control slot, but may never become protocol work later.
+                    let mut admission = Some(admission);
                     let stream = match acceptor {
                         Some(acceptor) => match tls::accept(
                             &connection_cx,
@@ -420,6 +464,7 @@ impl BoundSecuredHttpServer {
                             policy,
                             io,
                             &subscription_drain,
+                            &mut admission,
                         ));
                     // Per-I/O limits cannot bound a silent response wait or
                     // a handler that ignores its deadline. Keep the caller's
@@ -433,9 +478,18 @@ impl BoundSecuredHttpServer {
                         connection,
                     )
                     .await;
+                    let close_timeout = if admission
+                        .as_ref()
+                        .is_some_and(HttpNativeConnectionAdmission::health_only)
+                    {
+                        io.diagnostic().write_timeout
+                    } else {
+                        io.write_timeout
+                    };
                     if let Some(mut close) = close
                         && served.is_ok()
                         && connection_cx.checkpoint().is_ok()
+                        && admission.is_some()
                     {
                         // Application response ownership has finished. TLS
                         // close_notify is best-effort: its local timeout must
@@ -444,12 +498,13 @@ impl BoundSecuredHttpServer {
                             &connection_cx,
                             asupersync::time::timeout(
                                 connection_cx.now(),
-                                io.write_timeout,
+                                close_timeout,
                                 close.shutdown(),
                             ),
                         )
                         .await;
                     }
+                    drop(admission);
                 }) {
                     Ok(child) => children.tasks.push(child),
                     Err(_) => {
