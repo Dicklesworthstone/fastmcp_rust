@@ -4,6 +4,7 @@
 //! in-memory pair below). This module never renders HTML and never routes Apps
 //! messages through MCP client/server RPC.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
@@ -21,19 +22,23 @@ use asupersync::types::Time;
 use fastmcp_core::runtime::{CallerContextFuture, with_caller_context};
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 use fastmcp_protocol::{
-    MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeAdmission,
-    McpAppsBridgeDirection, McpAppsBridgeError, McpAppsBridgeImplementation,
-    McpAppsBridgeLifecycle, McpAppsBridgeRequestId, McpAppsCancelledControlParams,
-    McpAppsContentBlockModalities, McpAppsControlDisposition, McpAppsDisplayMode,
-    McpAppsDisplayModeParams, McpAppsHostCapabilities, McpAppsHostContext, McpAppsHostIdAllocator,
-    McpAppsHostNotification, McpAppsHostRequest, McpAppsHostResponse, McpAppsHostToView,
-    McpAppsInitializeParams, McpAppsInitializeResult, McpAppsJsonRpcEnvelope, McpAppsJsonRpcError,
-    McpAppsJsonRpcRequestId, McpAppsOperationResult, McpAppsPinnedHostCapabilities,
-    McpAppsPinnedHostContext, McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
-    McpAppsProgressControlParams, McpAppsResourceTeardownParams, McpAppsRoutedMethod,
-    McpAppsSamplingParams, McpAppsSamplingResult, McpAppsUpdateModelContextParams,
-    McpAppsViewLifecycle, McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse,
-    McpAppsViewToHost,
+    MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, MCP_APPS_HTML_MIME_TYPE,
+    McpAppsBridgeAdmission, McpAppsBridgeDirection, McpAppsBridgeError,
+    McpAppsBridgeImplementation, McpAppsBridgeLifecycle, McpAppsBridgeRequestId,
+    McpAppsCancelledControlParams, McpAppsContentBlockModalities, McpAppsControlDisposition,
+    McpAppsDisplayMode, McpAppsDisplayModeParams, McpAppsHostCapabilities, McpAppsHostContext,
+    McpAppsHostIdAllocator, McpAppsHostNotification, McpAppsHostRequest, McpAppsHostResponse,
+    McpAppsHostToView, McpAppsInitializeParams, McpAppsInitializeResult, McpAppsJsonRpcEnvelope,
+    McpAppsJsonRpcError, McpAppsJsonRpcRequestId, McpAppsOperationResult,
+    McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext, McpAppsPinnedInitializeParams,
+    McpAppsPinnedInitializeResult, McpAppsProgressControlParams, McpAppsResourceTeardownParams,
+    McpAppsRoutedMethod, McpAppsSamplingParams, McpAppsSamplingResult,
+    McpAppsUpdateModelContextParams, McpAppsViewLifecycle, McpAppsViewNotification,
+    McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
+};
+use html5ever::tendril::StrTendril;
+use html5ever::tokenizer::{
+    BufferQueue, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts, states,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -585,6 +590,194 @@ impl<T: McpAppsBridgeTransport, P: McpAppsHostPolicy> McpAppsHost<T, P> {
     }
 }
 
+/// Maximum admitted UTF-8 byte length of a View HTML document (4 MiB).
+pub const MAX_MCP_APPS_VIEW_HTML_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum HTML5 tokenizer events processed while admitting a View HTML document.
+pub const MAX_MCP_APPS_VIEW_HTML_TOKENS: usize = 200_000;
+
+/// Structural HTML5 admission failure for an untrusted View document received
+/// by an MCP Apps Host before mounting it into an embedder's sandboxed iframe
+/// or webview.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsViewHtmlError {
+    /// Resource MIME type is missing or does not equal `text/html;profile=mcp-app`.
+    InvalidMimeType,
+    /// Document is empty or contains only whitespace.
+    EmptyDocument,
+    /// Document exceeds [`MAX_MCP_APPS_VIEW_HTML_BYTES`].
+    ExceedsByteLimit,
+    /// Document contains a NUL (`U+0000`) byte.
+    ContainsNullByte,
+    /// Document exceeds [`MAX_MCP_APPS_VIEW_HTML_TOKENS`].
+    ExceedsTokenLimit,
+    /// Document declares `<base>`, which can redirect relative URLs outside the
+    /// sandbox's negotiated `baseUriDomains` boundary.
+    ForbiddenBaseElement,
+    /// Document declares `<meta http-equiv="content-security-policy">` or
+    /// `<meta http-equiv="refresh">`.
+    ForbiddenMetaHttpEquiv,
+    /// Document is truncated mid-tag, mid-comment, or with an unclosed raw
+    /// `<script>`/`<style>` element at EOF.
+    TruncatedSyntax,
+}
+
+impl fmt::Display for McpAppsViewHtmlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidMimeType => {
+                "MCP Apps View resource MIME type must be text/html;profile=mcp-app"
+            }
+            Self::EmptyDocument => "MCP Apps View HTML document must not be empty",
+            Self::ExceedsByteLimit => "MCP Apps View HTML document exceeds maximum byte limit",
+            Self::ContainsNullByte => "MCP Apps View HTML document must not contain NUL bytes",
+            Self::ExceedsTokenLimit => {
+                "MCP Apps View HTML document exceeds maximum HTML5 token limit"
+            }
+            Self::ForbiddenBaseElement => {
+                "MCP Apps View HTML document must not declare a <base> element"
+            }
+            Self::ForbiddenMetaHttpEquiv => {
+                "MCP Apps View HTML document must not declare <meta http-equiv> CSP or refresh directives"
+            }
+            Self::TruncatedSyntax => {
+                "MCP Apps View HTML document has truncated HTML5 tag, comment, or rawtext syntax at EOF"
+            }
+        })
+    }
+}
+
+impl std::error::Error for McpAppsViewHtmlError {}
+
+struct ViewHtmlAuditSink {
+    token_count: Cell<usize>,
+    open_raw_tag: Cell<Option<&'static str>>,
+    error: Cell<Option<McpAppsViewHtmlError>>,
+}
+
+impl ViewHtmlAuditSink {
+    const fn new() -> Self {
+        Self {
+            token_count: Cell::new(0),
+            open_raw_tag: Cell::new(None),
+            error: Cell::new(None),
+        }
+    }
+
+    fn fail(&self, err: McpAppsViewHtmlError) {
+        if self.error.get().is_none() {
+            self.error.set(Some(err));
+        }
+    }
+}
+
+impl TokenSink for ViewHtmlAuditSink {
+    type Handle = ();
+
+    fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<Self::Handle> {
+        let next_count = self.token_count.get().saturating_add(1);
+        self.token_count.set(next_count);
+        if next_count > MAX_MCP_APPS_VIEW_HTML_TOKENS {
+            self.fail(McpAppsViewHtmlError::ExceedsTokenLimit);
+            return TokenSinkResult::Continue;
+        }
+        match token {
+            Token::NullCharacterToken => {
+                self.fail(McpAppsViewHtmlError::ContainsNullByte);
+            }
+            Token::ParseError(message) => {
+                if message.contains("EOF") {
+                    self.fail(McpAppsViewHtmlError::TruncatedSyntax);
+                }
+            }
+            Token::EOFToken => {
+                if self.open_raw_tag.get().is_some() {
+                    self.fail(McpAppsViewHtmlError::TruncatedSyntax);
+                }
+            }
+            Token::TagToken(tag) => {
+                let tag_name: &str = &tag.name;
+                match tag.kind {
+                    TagKind::StartTag => {
+                        if tag_name == "base" {
+                            self.fail(McpAppsViewHtmlError::ForbiddenBaseElement);
+                        } else if tag_name == "meta" {
+                            for attr in &tag.attrs {
+                                if &*attr.name.local == "http-equiv" {
+                                    let value = attr.value.trim();
+                                    if value.eq_ignore_ascii_case("content-security-policy")
+                                        || value.eq_ignore_ascii_case("refresh")
+                                    {
+                                        self.fail(McpAppsViewHtmlError::ForbiddenMetaHttpEquiv);
+                                    }
+                                }
+                            }
+                        } else if tag_name == "script" && !tag.self_closing {
+                            self.open_raw_tag.set(Some("script"));
+                            return TokenSinkResult::RawData(states::RawKind::ScriptData);
+                        } else if tag_name == "style" && !tag.self_closing {
+                            self.open_raw_tag.set(Some("style"));
+                            return TokenSinkResult::RawData(states::RawKind::Rawtext);
+                        } else if tag_name == "textarea" && !tag.self_closing {
+                            self.open_raw_tag.set(Some("textarea"));
+                            return TokenSinkResult::RawData(states::RawKind::Rcdata);
+                        } else if tag_name == "title" && !tag.self_closing {
+                            self.open_raw_tag.set(Some("title"));
+                            return TokenSinkResult::RawData(states::RawKind::Rcdata);
+                        }
+                    }
+                    TagKind::EndTag => {
+                        if self.open_raw_tag.get() == Some(tag_name) {
+                            self.open_raw_tag.set(None);
+                        }
+                    }
+                }
+            }
+            Token::DoctypeToken(_) | Token::CommentToken(_) | Token::CharacterTokens(_) => {}
+        }
+        TokenSinkResult::Continue
+    }
+}
+
+/// Validates an MCP Apps View HTML document with the WHATWG HTML5 tokenizer
+/// (`html5ever`) before an embedder mounts it into a sandboxed webview/iframe.
+pub fn validate_mcp_apps_view_html(html: &str) -> Result<(), McpAppsViewHtmlError> {
+    if html.len() > MAX_MCP_APPS_VIEW_HTML_BYTES {
+        return Err(McpAppsViewHtmlError::ExceedsByteLimit);
+    }
+    if html.as_bytes().contains(&0) {
+        return Err(McpAppsViewHtmlError::ContainsNullByte);
+    }
+    if html.trim().is_empty() {
+        return Err(McpAppsViewHtmlError::EmptyDocument);
+    }
+
+    let tokenizer = Tokenizer::new(ViewHtmlAuditSink::new(), TokenizerOpts::default());
+    let input = BufferQueue::default();
+    input.push_back(StrTendril::from_slice(html));
+    let _ = tokenizer.feed(&input);
+    tokenizer.end();
+
+    if let Some(error) = tokenizer.sink.error.get() {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Admits an MCP Apps View resource body by enforcing the exact MCP Apps HTML
+/// MIME type (`text/html;profile=mcp-app`) and running [`validate_mcp_apps_view_html`].
+pub fn admit_mcp_apps_view_html<'a>(
+    mime_type: Option<&str>,
+    html: &'a str,
+) -> Result<&'a str, McpAppsHostError> {
+    if mime_type != Some(MCP_APPS_HTML_MIME_TYPE) {
+        return Err(McpAppsHostError::InvalidViewHtml(
+            McpAppsViewHtmlError::InvalidMimeType,
+        ));
+    }
+    validate_mcp_apps_view_html(html).map_err(McpAppsHostError::InvalidViewHtml)?;
+    Ok(html)
+}
+
 /// Bridge runtime errors.
 #[derive(Debug)]
 pub enum McpAppsHostError {
@@ -596,6 +789,7 @@ pub enum McpAppsHostError {
     DuplicateLiveRequest(McpAppsBridgeRequestId),
     UnsupportedAppsProtocolVersion(String),
     UnknownResponse(McpAppsBridgeRequestId),
+    InvalidViewHtml(McpAppsViewHtmlError),
     DeadlineExceeded,
     TimerUnavailable,
     Transport(String),
@@ -620,6 +814,7 @@ impl fmt::Display for McpAppsHostError {
             Self::UnknownResponse(id) => {
                 write!(f, "MCP Apps bridge received unknown response {}", id.get())
             }
+            Self::InvalidViewHtml(error) => error.fmt(f),
             Self::DeadlineExceeded => f.write_str("MCP Apps request deadline exceeded"),
             Self::TimerUnavailable => {
                 f.write_str("pending Apps operations require the caller's timer driver")
@@ -634,6 +829,7 @@ impl std::error::Error for McpAppsHostError {
             Self::Lifecycle(error) => Some(error),
             Self::Bridge(error) => Some(error),
             Self::Core(error) => Some(error),
+            Self::InvalidViewHtml(error) => Some(error),
             Self::NotNegotiated
             | Self::NotActive(_)
             | Self::DuplicateLiveRequest(_)
@@ -6097,8 +6293,16 @@ exec sleep 10
                     let result = if catalog {
                         let parameters = request["params"].as_object().unwrap();
                         assert!(parameters.keys().all(|key| key == "_meta"));
-                        assert!(request["params"]["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]
-                        ["extensions"].get(fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID).is_none());
+                        #[cfg(feature = "tasks")]
+                        let tasks_ext_id = fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
+                        #[cfg(not(feature = "tasks"))]
+                        let tasks_ext_id = "io.modelcontextprotocol/tasks";
+                        assert!(
+                            request["params"]["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]
+                                ["extensions"]
+                                .get(tasks_ext_id)
+                                .is_none()
+                        );
                         apps_server_tool_page(&[
                             "server_task",
                             "ordinary",
@@ -12982,11 +13186,22 @@ exec sleep 10
                 configuration: &McpAppsWireHostConfiguration,
             ) -> McpAppsPinnedInitializeResult {
                 let mut response = configuration.initialize_result();
-                response.host_capabilities.logging = Some(json!({}));
+                response.host_capabilities.logging =
+                    Some(fastmcp_protocol::mcp_apps_bridge::McpAppsCapabilityMarker {});
                 if self.tamper_protocol_version {
                     response.protocol_version = "1999-01-01".to_owned();
                 }
                 response
+            }
+
+            async fn dispatch_reused_request(
+                &mut self,
+                _cx: &Cx,
+                _cancellation: &McpRequestCancellation,
+                _method: McpAppsRoutedMethod,
+                _params: Option<Value>,
+            ) -> Result<Value, McpAppsHostError> {
+                Err(wire_policy_denied())
             }
         }
 
@@ -13038,7 +13253,7 @@ exec sleep 10
                     .capabilities
                     .as_ref()
                     .and_then(|caps| caps.logging.as_ref()),
-                Some(&json!({})),
+                Some(&fastmcp_protocol::mcp_apps_bridge::McpAppsCapabilityMarker {}),
                 "Host must commit delegated + augmented capabilities"
             );
 
@@ -13099,5 +13314,68 @@ exec sleep 10
             )
             .unwrap();
         admission
+    }
+
+    #[test]
+    fn html5ever_view_html_admission_positive_and_planted_negatives() {
+        let valid_html = "<!doctype html><html><head><meta charset=\"utf-8\"></head>\
+            <body><main>view</main><script>const less = 3 < 4;</script></body></html>";
+
+        // Positive: exact MCP Apps HTML MIME type + valid HTML5 body passes.
+        let admitted = admit_mcp_apps_view_html(Some(MCP_APPS_HTML_MIME_TYPE), valid_html)
+            .expect("valid MCP Apps View HTML must be admitted");
+        assert_eq!(admitted, valid_html);
+
+        // Near-identical planted negatives (RH-5):
+        assert!(matches!(
+            admit_mcp_apps_view_html(Some("text/html"), valid_html),
+            Err(McpAppsHostError::InvalidViewHtml(
+                McpAppsViewHtmlError::InvalidMimeType
+            ))
+        ));
+        assert!(matches!(
+            admit_mcp_apps_view_html(None, valid_html),
+            Err(McpAppsHostError::InvalidViewHtml(
+                McpAppsViewHtmlError::InvalidMimeType
+            ))
+        ));
+        assert_eq!(
+            validate_mcp_apps_view_html("  \n "),
+            Err(McpAppsViewHtmlError::EmptyDocument)
+        );
+        assert_eq!(
+            validate_mcp_apps_view_html("<main>\0</main>"),
+            Err(McpAppsViewHtmlError::ContainsNullByte)
+        );
+        assert_eq!(
+            validate_mcp_apps_view_html("<BASE href=\"https://evil.example/\"><main>x</main>"),
+            Err(McpAppsViewHtmlError::ForbiddenBaseElement)
+        );
+        assert_eq!(
+            validate_mcp_apps_view_html(
+                "<meta http-equiv=\"content-security-policy\" content=\"default-src *\">\
+                 <main>x</main>"
+            ),
+            Err(McpAppsViewHtmlError::ForbiddenMetaHttpEquiv)
+        );
+        assert_eq!(
+            validate_mcp_apps_view_html(
+                "<meta http-equiv=\"REFRESH\" content=\"0;url=https://evil.example\"><main>x</main>"
+            ),
+            Err(McpAppsViewHtmlError::ForbiddenMetaHttpEquiv)
+        );
+        assert_eq!(
+            validate_mcp_apps_view_html("<main><!-- unterminated comment"),
+            Err(McpAppsViewHtmlError::TruncatedSyntax)
+        );
+        assert_eq!(
+            validate_mcp_apps_view_html("<style>body { color: red;"),
+            Err(McpAppsViewHtmlError::TruncatedSyntax)
+        );
+        let oversized = "x".repeat(MAX_MCP_APPS_VIEW_HTML_BYTES + 1);
+        assert_eq!(
+            validate_mcp_apps_view_html(&oversized),
+            Err(McpAppsViewHtmlError::ExceedsByteLimit)
+        );
     }
 }

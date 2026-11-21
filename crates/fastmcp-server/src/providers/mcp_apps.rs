@@ -4,6 +4,7 @@
 //! A `ui://` document is meaningful only to a negotiated modern Apps Host, so
 //! it must never leak into MCP 2024-11-05 resource discovery or dispatch.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -14,9 +15,182 @@ use fastmcp_protocol::{
     MCP_APPS_HTML_MIME_TYPE, McpAppsMetadataError, McpAppsResourceMetadata, Resource,
     ResourceContent, ResultMeta,
 };
+use html5ever::tendril::StrTendril;
+use html5ever::tokenizer::{
+    BufferQueue, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts, states,
+};
 
 use crate::handler::DEFAULT_FINAL_RESOURCE_TTL_MS;
 use crate::{FinalResourceReadCacheHintProvenance, ResourceHandler, UriParams};
+
+/// Maximum admitted UTF-8 byte length of a single MCP Apps HTML document (4 MiB).
+pub const MAX_MCP_APPS_HTML_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum HTML5 tokenizer events processed per MCP Apps document.
+pub const MAX_MCP_APPS_HTML_TOKENS: usize = 200_000;
+
+/// Structural HTML5 admission failure for an MCP Apps `ui://` document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsHtmlValidationError {
+    /// Document is empty or contains only ASCII whitespace.
+    EmptyDocument,
+    /// Document exceeds [`MAX_MCP_APPS_HTML_BYTES`].
+    ExceedsByteLimit,
+    /// Document contains a NUL (`U+0000`) byte.
+    ContainsNullByte,
+    /// Document exceeds [`MAX_MCP_APPS_HTML_TOKENS`].
+    ExceedsTokenLimit,
+    /// Document declares a `<base>` element, which can redirect relative URLs
+    /// outside the negotiated Apps CSP `baseUriDomains` boundary.
+    ForbiddenBaseElement,
+    /// Document declares `<meta http-equiv="content-security-policy">` or
+    /// `<meta http-equiv="refresh">`, which conflicts with host-enforced Apps
+    /// CSP or initiates unmediated navigation.
+    ForbiddenMetaHttpEquiv,
+    /// Document is truncated mid-tag, mid-comment, or with an unclosed raw
+    /// `<script>`/`<style>` element at EOF.
+    TruncatedSyntax,
+}
+
+impl fmt::Display for McpAppsHtmlValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::EmptyDocument => "MCP Apps HTML document must not be empty",
+            Self::ExceedsByteLimit => "MCP Apps HTML document exceeds maximum byte limit",
+            Self::ContainsNullByte => "MCP Apps HTML document must not contain NUL bytes",
+            Self::ExceedsTokenLimit => "MCP Apps HTML document exceeds maximum HTML5 token limit",
+            Self::ForbiddenBaseElement => {
+                "MCP Apps HTML document must not declare a <base> element"
+            }
+            Self::ForbiddenMetaHttpEquiv => {
+                "MCP Apps HTML document must not declare <meta http-equiv> CSP or refresh directives"
+            }
+            Self::TruncatedSyntax => {
+                "MCP Apps HTML document has truncated HTML5 tag, comment, or rawtext syntax at EOF"
+            }
+        })
+    }
+}
+
+impl std::error::Error for McpAppsHtmlValidationError {}
+
+struct McpAppsHtmlAuditSink {
+    token_count: Cell<usize>,
+    open_raw_tag: Cell<Option<&'static str>>,
+    error: Cell<Option<McpAppsHtmlValidationError>>,
+}
+
+impl McpAppsHtmlAuditSink {
+    const fn new() -> Self {
+        Self {
+            token_count: Cell::new(0),
+            open_raw_tag: Cell::new(None),
+            error: Cell::new(None),
+        }
+    }
+
+    fn fail(&self, err: McpAppsHtmlValidationError) {
+        if self.error.get().is_none() {
+            self.error.set(Some(err));
+        }
+    }
+}
+
+impl TokenSink for McpAppsHtmlAuditSink {
+    type Handle = ();
+
+    fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<Self::Handle> {
+        let next_count = self.token_count.get().saturating_add(1);
+        self.token_count.set(next_count);
+        if next_count > MAX_MCP_APPS_HTML_TOKENS {
+            self.fail(McpAppsHtmlValidationError::ExceedsTokenLimit);
+            return TokenSinkResult::Continue;
+        }
+
+        match token {
+            Token::NullCharacterToken => {
+                self.fail(McpAppsHtmlValidationError::ContainsNullByte);
+            }
+            Token::ParseError(message) => {
+                if message.contains("EOF") {
+                    self.fail(McpAppsHtmlValidationError::TruncatedSyntax);
+                }
+            }
+            Token::EOFToken => {
+                if self.open_raw_tag.get().is_some() {
+                    self.fail(McpAppsHtmlValidationError::TruncatedSyntax);
+                }
+            }
+            Token::TagToken(tag) => {
+                let tag_name: &str = &tag.name;
+                match tag.kind {
+                    TagKind::StartTag => {
+                        if tag_name == "base" {
+                            self.fail(McpAppsHtmlValidationError::ForbiddenBaseElement);
+                        } else if tag_name == "meta" {
+                            for attr in &tag.attrs {
+                                if &*attr.name.local == "http-equiv" {
+                                    let value = attr.value.trim();
+                                    if value.eq_ignore_ascii_case("content-security-policy")
+                                        || value.eq_ignore_ascii_case("refresh")
+                                    {
+                                        self.fail(
+                                            McpAppsHtmlValidationError::ForbiddenMetaHttpEquiv,
+                                        );
+                                    }
+                                }
+                            }
+                        } else if tag_name == "script" && !tag.self_closing {
+                            self.open_raw_tag.set(Some("script"));
+                            return TokenSinkResult::RawData(states::RawKind::ScriptData);
+                        } else if tag_name == "style" && !tag.self_closing {
+                            self.open_raw_tag.set(Some("style"));
+                            return TokenSinkResult::RawData(states::RawKind::Rawtext);
+                        } else if tag_name == "textarea" && !tag.self_closing {
+                            self.open_raw_tag.set(Some("textarea"));
+                            return TokenSinkResult::RawData(states::RawKind::Rcdata);
+                        } else if tag_name == "title" && !tag.self_closing {
+                            self.open_raw_tag.set(Some("title"));
+                            return TokenSinkResult::RawData(states::RawKind::Rcdata);
+                        }
+                    }
+                    TagKind::EndTag => {
+                        if self.open_raw_tag.get() == Some(tag_name) {
+                            self.open_raw_tag.set(None);
+                        }
+                    }
+                }
+            }
+            Token::DoctypeToken(_) | Token::CommentToken(_) | Token::CharacterTokens(_) => {}
+        }
+
+        TokenSinkResult::Continue
+    }
+}
+
+/// Validates an MCP Apps HTML document through the WHATWG HTML5 tokenizer
+/// (`html5ever`) under bounded byte and token budgets.
+pub fn validate_mcp_apps_html(html: &str) -> Result<(), McpAppsHtmlValidationError> {
+    if html.len() > MAX_MCP_APPS_HTML_BYTES {
+        return Err(McpAppsHtmlValidationError::ExceedsByteLimit);
+    }
+    if html.as_bytes().contains(&0) {
+        return Err(McpAppsHtmlValidationError::ContainsNullByte);
+    }
+    if html.trim().is_empty() {
+        return Err(McpAppsHtmlValidationError::EmptyDocument);
+    }
+
+    let tokenizer = Tokenizer::new(McpAppsHtmlAuditSink::new(), TokenizerOpts::default());
+    let input = BufferQueue::default();
+    input.push_back(StrTendril::from_slice(html));
+    let _ = tokenizer.feed(&input);
+    tokenizer.end();
+
+    if let Some(error) = tokenizer.sink.error.get() {
+        return Err(error);
+    }
+    Ok(())
+}
 
 /// An immutable HTML document advertised as one final-only `ui://` resource.
 #[derive(Clone, Debug)]
@@ -42,11 +216,13 @@ impl McpAppsUiResource {
         if name.is_empty() {
             return Err(McpAppsUiResourceError::EmptyName);
         }
+        let html = html.into();
+        validate_mcp_apps_html(&html).map_err(McpAppsUiResourceError::InvalidHtml)?;
         Ok(Self {
             uri,
             name,
             description: None,
-            html: html.into(),
+            html,
             apps_metadata: None,
         })
     }
@@ -185,6 +361,8 @@ pub enum McpAppsUiResourceError {
     UriMustUseUiPrefix,
     /// A resource needs a stable non-empty catalog name.
     EmptyName,
+    /// The HTML document failed bounded HTML5 structural validation.
+    InvalidHtml(McpAppsHtmlValidationError),
     /// Typed Apps rendering metadata did not satisfy its closed validation rules.
     InvalidMetadata(McpAppsMetadataError),
 }
@@ -196,6 +374,9 @@ impl fmt::Display for McpAppsUiResourceError {
                 formatter.write_str("MCP Apps UI resource URI must start with ui://")
             }
             Self::EmptyName => formatter.write_str("MCP Apps UI resource name must not be empty"),
+            Self::InvalidHtml(error) => {
+                write!(formatter, "MCP Apps UI resource HTML: {error}")
+            }
             Self::InvalidMetadata(error) => {
                 write!(formatter, "MCP Apps UI resource metadata: {error}")
             }
@@ -670,6 +851,73 @@ mod tests {
             reads.load(Ordering::SeqCst),
             0,
             "exact 2024 rejection must not invoke the Apps document reader"
+        );
+    }
+
+    #[test]
+    fn html5ever_ui_resource_validation_positive_and_planted_negatives() {
+        let uri = AbsoluteUri::parse("ui://weather/dashboard").expect("valid ui URI");
+
+        // Positive: clean HTML5 documents including safe <meta charset> and
+        // inline <script> containing `<` comparison operators pass validation.
+        let valid_html = "<!doctype html>\n<html><head><meta charset=\"utf-8\">\
+            <meta name=\"viewport\" content=\"width=device-width\"></head>\
+            <body><main>weather</main><script>const ok = 1 < 2;</script></body></html>";
+        let resource = McpAppsUiResource::try_new(uri.clone(), "weather-dashboard", valid_html)
+            .expect("valid HTML5 MCP Apps document must be admitted");
+        assert_eq!(resource.uri().as_str(), "ui://weather/dashboard");
+
+        // Near-identical planted negatives (RH-5):
+        assert_eq!(
+            McpAppsUiResource::try_new(uri.clone(), "weather-dashboard", "   \n\t  ").unwrap_err(),
+            McpAppsUiResourceError::InvalidHtml(McpAppsHtmlValidationError::EmptyDocument)
+        );
+        assert_eq!(
+            McpAppsUiResource::try_new(uri.clone(), "weather-dashboard", "<main>\0</main>")
+                .unwrap_err(),
+            McpAppsUiResourceError::InvalidHtml(McpAppsHtmlValidationError::ContainsNullByte)
+        );
+        assert_eq!(
+            McpAppsUiResource::try_new(
+                uri.clone(),
+                "weather-dashboard",
+                "<!doctype html><head><BaSe href=\"https://evil.example/\"></head><main>x</main>",
+            )
+            .unwrap_err(),
+            McpAppsUiResourceError::InvalidHtml(McpAppsHtmlValidationError::ForbiddenBaseElement)
+        );
+        assert_eq!(
+            McpAppsUiResource::try_new(
+                uri.clone(),
+                "weather-dashboard",
+                "<head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src *\"></head><main>x</main>",
+            )
+            .unwrap_err(),
+            McpAppsUiResourceError::InvalidHtml(McpAppsHtmlValidationError::ForbiddenMetaHttpEquiv)
+        );
+        assert_eq!(
+            McpAppsUiResource::try_new(
+                uri.clone(),
+                "weather-dashboard",
+                "<head><meta http-equiv=\"refresh\" content=\"0;url=https://evil.example\"></head><main>x</main>",
+            )
+            .unwrap_err(),
+            McpAppsUiResourceError::InvalidHtml(McpAppsHtmlValidationError::ForbiddenMetaHttpEquiv)
+        );
+        assert_eq!(
+            McpAppsUiResource::try_new(uri.clone(), "weather-dashboard", "<main class=\"open")
+                .unwrap_err(),
+            McpAppsUiResourceError::InvalidHtml(McpAppsHtmlValidationError::TruncatedSyntax)
+        );
+        assert_eq!(
+            McpAppsUiResource::try_new(uri.clone(), "weather-dashboard", "<main><script>alert(1)")
+                .unwrap_err(),
+            McpAppsUiResourceError::InvalidHtml(McpAppsHtmlValidationError::TruncatedSyntax)
+        );
+        let oversized = "a".repeat(MAX_MCP_APPS_HTML_BYTES + 1);
+        assert_eq!(
+            McpAppsUiResource::try_new(uri, "weather-dashboard", oversized).unwrap_err(),
+            McpAppsUiResourceError::InvalidHtml(McpAppsHtmlValidationError::ExceedsByteLimit)
         );
     }
 }

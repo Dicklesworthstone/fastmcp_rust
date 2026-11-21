@@ -84,7 +84,10 @@ pub use blocking::{
 pub use fastmcp_protocol::{SchemaRegistryError, SchemaRegistryLimits, SchemaResourceRegistry};
 pub use filesystem::{FilesystemProvider, FilesystemProviderError, FilesystemResourceHandler};
 #[cfg(feature = "apps")]
-pub use mcp_apps::{McpAppsUiResource, McpAppsUiResourceError};
+pub use mcp_apps::{
+    MAX_MCP_APPS_HTML_BYTES, MAX_MCP_APPS_HTML_TOKENS, McpAppsHtmlValidationError,
+    McpAppsUiResource, McpAppsUiResourceError, validate_mcp_apps_html,
+};
 pub use schema_tool::{RegisteredSchemaTool, RegisteredSchemaToolError};
 
 /// Enumeration guard over the `host_cancelled` conversion family.

@@ -338,15 +338,17 @@ pub mod client {
     };
     #[cfg(feature = "apps")]
     pub use crate::{
-        McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
-        McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
+        MAX_MCP_APPS_VIEW_HTML_BYTES, MAX_MCP_APPS_VIEW_HTML_TOKENS, McpAppsBridgeTransport,
+        McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
+        McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
         McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
-        McpAppsMemoryClientWirePolicy, McpAppsViewCallToolResult, McpAppsViewTool,
-        McpAppsViewToolsPage, McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
-        McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
-        McpAppsWireHostResponse, McpAppsWireHostWithEffects, mcp_apps_in_memory_pair,
-        mcp_apps_in_memory_wire_pair,
+        McpAppsMemoryClientWirePolicy, McpAppsViewCallToolResult, McpAppsViewHtmlError,
+        McpAppsViewTool, McpAppsViewToolsPage, McpAppsWireBridgeTransport, McpAppsWireHost,
+        McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
+        McpAppsWireHostPolicy, McpAppsWireHostResponse, McpAppsWireHostWithEffects,
+        admit_mcp_apps_view_html, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+        validate_mcp_apps_view_html,
     };
     pub use crate::{ResourceSubscriptionRelations, SubscriptionListenRequest};
     #[cfg(unix)]
@@ -1174,16 +1176,16 @@ pub use fastmcp_client::McpAppsServerTaskPolicy;
 pub use fastmcp_client::McpAppsWebSocketClientWirePolicy;
 #[cfg(feature = "apps")]
 pub use fastmcp_client::{
-    McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
-    McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
-    McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
-    McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
-    McpAppsMemoryClientWirePolicy, McpAppsViewCallToolResult,
-    McpAppsViewTool, McpAppsViewToolsPage, McpAppsWireBridgeTransport, McpAppsWireHost,
-    McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
+    MAX_MCP_APPS_VIEW_HTML_BYTES, MAX_MCP_APPS_VIEW_HTML_TOKENS, McpAppsBridgeTransport,
+    McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
+    McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome, McpAppsHttpClientWirePolicy,
+    McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
+    McpAppsInMemoryWireViewTransport, McpAppsMemoryClientWirePolicy, McpAppsViewCallToolResult,
+    McpAppsViewHtmlError, McpAppsViewTool, McpAppsViewToolsPage, McpAppsWireBridgeTransport,
+    McpAppsWireHost, McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
     McpAppsWireHostPolicy, McpAppsWireHostResponse, McpAppsWireHostWithEffects,
-    mcp_apps_in_memory_pair,
-    mcp_apps_in_memory_wire_pair,
+    admit_mcp_apps_view_html, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+    validate_mcp_apps_view_html,
 };
 // `mcp_apps_bridge` is forwarded because the list immediately above already
 // hands consumers two traits an embedder IMPLEMENTS -- `McpAppsWireHostPolicy`
@@ -3431,8 +3433,9 @@ pub mod modern {
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
-        McpAppsHostRequestOutcome, McpAppsViewCallToolResult, McpAppsViewTool,
-        McpAppsViewToolsPage, McpAppsWireHostResponse,
+        MAX_MCP_APPS_VIEW_HTML_BYTES, MAX_MCP_APPS_VIEW_HTML_TOKENS, McpAppsHostRequestOutcome,
+        McpAppsViewCallToolResult, McpAppsViewHtmlError, McpAppsViewTool, McpAppsViewToolsPage,
+        McpAppsWireHostResponse, admit_mcp_apps_view_html, validate_mcp_apps_view_html,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_protocol::extensions::{

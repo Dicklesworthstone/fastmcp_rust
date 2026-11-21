@@ -218,14 +218,16 @@ pub use mcp_apps::McpAppsServerTaskPolicy;
 pub use mcp_apps::McpAppsWebSocketClientWirePolicy;
 #[cfg(feature = "apps")]
 pub use mcp_apps::{
-    McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
-    McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome,
-    McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
-    McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport, McpAppsViewCallToolResult,
+    MAX_MCP_APPS_VIEW_HTML_BYTES, MAX_MCP_APPS_VIEW_HTML_TOKENS, McpAppsBridgeTransport,
+    McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
+    McpAppsHostError, McpAppsHostPolicy, McpAppsHostRequestOutcome, McpAppsHttpClientWirePolicy,
+    McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
+    McpAppsInMemoryWireViewTransport, McpAppsViewCallToolResult, McpAppsViewHtmlError,
     McpAppsViewTool, McpAppsViewToolsPage, McpAppsWireBridgeTransport, McpAppsWireHost,
     McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
     McpAppsWireHostPolicy, McpAppsWireHostResponse, McpAppsWireHostWithEffects,
-    mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+    admit_mcp_apps_view_html, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+    validate_mcp_apps_view_html,
 };
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{

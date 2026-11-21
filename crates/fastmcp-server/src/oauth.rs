@@ -69,9 +69,11 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "builtin-auth-server")]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 #[cfg(feature = "builtin-auth-server")]
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use fastmcp_core::{
@@ -112,7 +114,44 @@ const MAX_OPAQUE_CREDENTIAL_DIGEST_INPUT_BYTES: usize =
     AUTHORIZATION_CODE_DIGEST_DOMAIN.len() + OAUTH_OPAQUE_CREDENTIAL_BYTES;
 const MAX_GRANT_ID_DERIVATION_INPUT_BYTES: usize = AUTHORIZATION_GRANT_ID_DOMAIN.len() + 64;
 const DUMMY_CLIENT_SECRET_SALT: [u8; CLIENT_SECRET_SALT_BYTES] = [0x5a; CLIENT_SECRET_SALT_BYTES];
+#[cfg(not(feature = "builtin-auth-server"))]
 const DUMMY_CLIENT_SECRET_DIGEST: Sha256Digest = Sha256Digest::from_bytes([0xa5; 32]);
+
+/// Minimum memory cost (KiB) admitted for Argon2id client-secret verification (8 MiB).
+#[cfg(feature = "builtin-auth-server")]
+pub const MIN_ARGON2_MEMORY_KIB: u32 = 8 * 1_024;
+/// Default OWASP interactive memory cost (KiB) for Argon2id client-secret verification (19 MiB).
+#[cfg(feature = "builtin-auth-server")]
+pub const DEFAULT_ARGON2_MEMORY_KIB: u32 = 19_456;
+/// Maximum memory cost (KiB) admitted for Argon2id client-secret verification (64 MiB).
+#[cfg(feature = "builtin-auth-server")]
+pub const MAX_ARGON2_MEMORY_KIB: u32 = 64 * 1_024;
+/// Minimum time cost (iterations) admitted for Argon2id client-secret verification.
+#[cfg(feature = "builtin-auth-server")]
+pub const MIN_ARGON2_TIME_COST: u32 = 1;
+/// Default OWASP interactive time cost (iterations) for Argon2id client-secret verification.
+#[cfg(feature = "builtin-auth-server")]
+pub const DEFAULT_ARGON2_TIME_COST: u32 = 2;
+/// Maximum time cost (iterations) admitted for Argon2id client-secret verification.
+#[cfg(feature = "builtin-auth-server")]
+pub const MAX_ARGON2_TIME_COST: u32 = 8;
+/// Minimum parallelism lanes admitted for Argon2id client-secret verification.
+#[cfg(feature = "builtin-auth-server")]
+pub const MIN_ARGON2_PARALLELISM: u32 = 1;
+/// Default parallelism lanes for Argon2id client-secret verification.
+#[cfg(feature = "builtin-auth-server")]
+pub const DEFAULT_ARGON2_PARALLELISM: u32 = 1;
+/// Maximum parallelism lanes admitted for Argon2id client-secret verification.
+#[cfg(feature = "builtin-auth-server")]
+pub const MAX_ARGON2_PARALLELISM: u32 = 4;
+/// Hard process-wide cap on concurrent Argon2id derivations so burst invalid
+/// credentials cannot exhaust server RAM (8 * 19 MiB ~= 152 MiB peak).
+#[cfg(feature = "builtin-auth-server")]
+const MAX_CONCURRENT_ARGON2_VERIFICATIONS: usize = 8;
+#[cfg(feature = "builtin-auth-server")]
+const ARGON2_DERIVED_KEY_BYTES: usize = 32;
+#[cfg(feature = "builtin-auth-server")]
+static ACTIVE_ARGON2_VERIFICATIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Maximum UTF-8 byte length of the configured OAuth issuer URL.
 pub const MAX_OAUTH_ISSUER_BYTES: usize = 2_048;
@@ -1923,17 +1962,176 @@ impl std::fmt::Debug for ClientSecret {
     }
 }
 
-/// Bounded salted verifier used by the current in-memory development server.
+/// Bounded Argon2id parameter profile for `builtin-auth-server` client-secret verification.
 ///
-/// It removes plaintext retention and provides fixed-width comparison, but it
-/// is not the AUTH-06 Argon2id production verifier. Production promotion still
-/// requires the admitted blocking-work/KDF provider described by the plan.
-#[derive(Clone, Copy)]
+/// Enforces explicit memory, iteration, and lane floors/ceilings so neither weak
+/// parameters nor DoS-scale memory allocations can be configured.
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Argon2ClientSecretParams {
+    memory_kib: u32,
+    time_cost: u32,
+    parallelism: u32,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl Default for Argon2ClientSecretParams {
+    fn default() -> Self {
+        Self {
+            memory_kib: DEFAULT_ARGON2_MEMORY_KIB,
+            time_cost: DEFAULT_ARGON2_TIME_COST,
+            parallelism: DEFAULT_ARGON2_PARALLELISM,
+        }
+    }
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl Argon2ClientSecretParams {
+    /// Validates and constructs bounded Argon2id parameters.
+    pub fn try_new(memory_kib: u32, time_cost: u32, parallelism: u32) -> Result<Self, OAuthError> {
+        if !(MIN_ARGON2_MEMORY_KIB..=MAX_ARGON2_MEMORY_KIB).contains(&memory_kib)
+            || !(MIN_ARGON2_TIME_COST..=MAX_ARGON2_TIME_COST).contains(&time_cost)
+            || !(MIN_ARGON2_PARALLELISM..=MAX_ARGON2_PARALLELISM).contains(&parallelism)
+        {
+            return Err(OAuthError::ServerError(
+                "Argon2id client-secret parameters are outside admitted bounds".to_string(),
+            ));
+        }
+        // Validate against argon2's own invariants (e.g., m_cost >= 8 * p_cost).
+        let _ = argon2::Params::new(
+            memory_kib,
+            time_cost,
+            parallelism,
+            Some(ARGON2_DERIVED_KEY_BYTES),
+        )
+        .map_err(|_| {
+            OAuthError::ServerError("Argon2id client-secret parameters were refused".to_string())
+        })?;
+        Ok(Self {
+            memory_kib,
+            time_cost,
+            parallelism,
+        })
+    }
+
+    /// Configured memory cost in KiB.
+    #[must_use]
+    pub const fn memory_kib(self) -> u32 {
+        self.memory_kib
+    }
+
+    /// Configured iteration count.
+    #[must_use]
+    pub const fn time_cost(self) -> u32 {
+        self.time_cost
+    }
+
+    /// Configured parallelism lane count.
+    #[must_use]
+    pub const fn parallelism(self) -> u32 {
+        self.parallelism
+    }
+}
+
+#[cfg(feature = "builtin-auth-server")]
+struct Argon2ConcurrencyGuard;
+
+#[cfg(feature = "builtin-auth-server")]
+impl Argon2ConcurrencyGuard {
+    fn try_acquire() -> Option<Self> {
+        ACTIVE_ARGON2_VERIFICATIONS
+            .try_update(
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+                |current| (current < MAX_CONCURRENT_ARGON2_VERIFICATIONS).then_some(current + 1),
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl Drop for Argon2ConcurrencyGuard {
+    fn drop(&mut self) {
+        ACTIVE_ARGON2_VERIFICATIONS.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+}
+
+/// Client-secret verifier retained for confidential OAuth clients.
+///
+/// With `builtin-auth-server` enabled, secrets are hashed and verified using
+/// bounded Argon2id (`argon2 = "=0.6.0"`, v0x13) with a 32-byte OS-random salt,
+/// zeroized output buffer, bounded process-wide concurrency, and constant-time
+/// digest comparison. Without `builtin-auth-server`, the in-memory development
+/// path retains the bounded salted SHA-256 fallback without pulling `argon2`.
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Clone)]
+struct ClientSecretVerifier {
+    salt: [u8; CLIENT_SECRET_SALT_BYTES],
+    params: Argon2ClientSecretParams,
+    digest: Zeroizing<[u8; ARGON2_DERIVED_KEY_BYTES]>,
+}
+
+#[cfg(not(feature = "builtin-auth-server"))]
+#[derive(Clone)]
 struct ClientSecretVerifier {
     salt: [u8; CLIENT_SECRET_SALT_BYTES],
     digest: Sha256Digest,
 }
 
+#[cfg(feature = "builtin-auth-server")]
+impl ClientSecretVerifier {
+    fn create(secret: &ClientSecret) -> Result<Self, OAuthError> {
+        Self::create_with_params(secret.as_bytes(), Argon2ClientSecretParams::default())
+    }
+
+    fn create_with_params(
+        secret: &[u8],
+        params: Argon2ClientSecretParams,
+    ) -> Result<Self, OAuthError> {
+        let salt = draw_security_identifier()
+            .map_err(|error| OAuthError::ServerError(error.to_string()))?;
+        Self::create_with_salt_and_params(secret, *salt.as_bytes(), params)
+    }
+
+    fn create_with_salt_and_params(
+        secret: &[u8],
+        salt: [u8; CLIENT_SECRET_SALT_BYTES],
+        params: Argon2ClientSecretParams,
+    ) -> Result<Self, OAuthError> {
+        let digest = client_secret_argon2id_digest(&salt, secret, params)?;
+        Ok(Self {
+            salt,
+            params,
+            digest,
+        })
+    }
+
+    fn dummy() -> &'static Self {
+        static DUMMY: OnceLock<ClientSecretVerifier> = OnceLock::new();
+        DUMMY.get_or_init(|| {
+            let params = Argon2ClientSecretParams::default();
+            let digest = client_secret_argon2id_digest(
+                &DUMMY_CLIENT_SECRET_SALT,
+                b"fastmcp-oauth-dummy-client-secret-sentinel",
+                params,
+            )
+            .expect("static Argon2id dummy verifier parameters are valid");
+            Self {
+                salt: DUMMY_CLIENT_SECRET_SALT,
+                params,
+                digest,
+            }
+        })
+    }
+
+    fn verify(&self, provided: &[u8]) -> bool {
+        client_secret_argon2id_digest(&self.salt, provided, self.params)
+            .is_ok_and(|provided_digest| constant_time_digest_eq(&self.digest, &provided_digest))
+    }
+}
+
+#[cfg(not(feature = "builtin-auth-server"))]
 impl ClientSecretVerifier {
     fn create(secret: &ClientSecret) -> Result<Self, OAuthError> {
         let salt = draw_security_identifier()
@@ -1949,11 +2147,12 @@ impl ClientSecretVerifier {
         Ok(Self { salt, digest })
     }
 
-    fn dummy() -> Self {
-        Self {
+    fn dummy() -> &'static Self {
+        static DUMMY: ClientSecretVerifier = ClientSecretVerifier {
             salt: DUMMY_CLIENT_SECRET_SALT,
             digest: DUMMY_CLIENT_SECRET_DIGEST,
-        }
+        };
+        &DUMMY
     }
 
     fn verify(&self, provided: &[u8]) -> bool {
@@ -6436,6 +6635,50 @@ fn derive_grant_id(
     Ok(OAuthGrantId::from_bytes(digest.into_bytes()))
 }
 
+#[cfg(feature = "builtin-auth-server")]
+fn client_secret_argon2id_digest(
+    salt: &[u8; CLIENT_SECRET_SALT_BYTES],
+    secret: &[u8],
+    params: Argon2ClientSecretParams,
+) -> Result<Zeroizing<[u8; ARGON2_DERIVED_KEY_BYTES]>, OAuthError> {
+    if secret.len() > MAX_OAUTH_CLIENT_CREDENTIAL_BYTES {
+        return Err(OAuthError::InvalidClient(
+            OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
+        ));
+    }
+    let _permit = Argon2ConcurrencyGuard::try_acquire().ok_or_else(|| {
+        OAuthError::ServerError("Argon2id client-secret verification capacity exhausted".to_string())
+    })?;
+    let mut framed = Zeroizing::new(Vec::with_capacity(
+        CLIENT_SECRET_VERIFIER_DOMAIN.len() + secret.len(),
+    ));
+    framed.extend_from_slice(CLIENT_SECRET_VERIFIER_DOMAIN);
+    framed.extend_from_slice(secret);
+    if framed.len() + salt.len() > MAX_CLIENT_SECRET_VERIFIER_INPUT_BYTES {
+        return Err(OAuthError::InvalidClient(
+            OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
+        ));
+    }
+    let argon2_params = argon2::Params::new(
+        params.memory_kib(),
+        params.time_cost(),
+        params.parallelism(),
+        Some(ARGON2_DERIVED_KEY_BYTES),
+    )
+    .map_err(|_| OAuthError::ServerError("Argon2id parameter construction failed".to_string()))?;
+    let hasher = argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2_params,
+    );
+    let mut out = Zeroizing::new([0u8; ARGON2_DERIVED_KEY_BYTES]);
+    hasher
+        .hash_password_into(&framed, salt, out.as_mut())
+        .map_err(|_| OAuthError::ServerError("Argon2id key derivation failed".to_string()))?;
+    Ok(out)
+}
+
+#[cfg(not(feature = "builtin-auth-server"))]
 fn client_secret_digest(
     salt: &[u8; CLIENT_SECRET_SALT_BYTES],
     secret: &[u8],
@@ -10308,11 +10551,95 @@ mod tests {
 
         let state = server.state.read().unwrap();
         let registered = state.clients.get("confidential-client").unwrap();
-        let verifier = registered.secret_verifier.expect("stored verifier");
+        let verifier = registered.secret_verifier.as_ref().expect("stored verifier");
         assert!(verifier.verify(SECRET.as_bytes()));
         assert!(!verifier.verify(b"wrong-secret"));
         assert!(!format!("{verifier:?}").contains(SECRET));
         assert_eq!(registered.metadata.client_type, ClientType::Confidential);
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn argon2id_client_secret_verifier_positive_and_planted_negatives() {
+        let params = Argon2ClientSecretParams::try_new(
+            MIN_ARGON2_MEMORY_KIB,
+            MIN_ARGON2_TIME_COST,
+            MIN_ARGON2_PARALLELISM,
+        )
+        .expect("minimum admitted Argon2id params are accepted");
+        assert_eq!(params.memory_kib(), MIN_ARGON2_MEMORY_KIB);
+        assert_eq!(params.time_cost(), MIN_ARGON2_TIME_COST);
+        assert_eq!(params.parallelism(), MIN_ARGON2_PARALLELISM);
+
+        // Positive: real Argon2id derivation matches the exact secret and uses
+        // distinct digests under distinct salts.
+        let salt_a = [0x11; CLIENT_SECRET_SALT_BYTES];
+        let salt_b = [0x22; CLIENT_SECRET_SALT_BYTES];
+        let secret = b"argon2id-confidential-client-secret-01";
+        let verifier_a =
+            ClientSecretVerifier::create_with_salt_and_params(secret, salt_a, params)
+                .expect("create Argon2id verifier A");
+        let verifier_b =
+            ClientSecretVerifier::create_with_salt_and_params(secret, salt_b, params)
+                .expect("create Argon2id verifier B");
+        assert_ne!(
+            verifier_a.digest.as_slice(),
+            verifier_b.digest.as_slice(),
+            "different salts must yield different Argon2id digests"
+        );
+        assert!(verifier_a.verify(secret));
+
+        // Near-identical planted negatives (RH-5):
+        // 1) 1-byte secret flip must fail verification.
+        assert!(!verifier_a.verify(b"argon2id-confidential-client-secret-02"));
+        // 2) Oversized secret (> MAX_OAUTH_CLIENT_CREDENTIAL_BYTES) fails closed before KDF.
+        let oversized = vec![b'x'; MAX_OAUTH_CLIENT_CREDENTIAL_BYTES + 1];
+        assert!(!verifier_a.verify(&oversized));
+        assert!(
+            ClientSecretVerifier::create_with_salt_and_params(&oversized, salt_a, params).is_err()
+        );
+        // 3) Out-of-bounds memory/time/parallelism params are refused (anti-DoS & anti-weakening).
+        assert!(Argon2ClientSecretParams::try_new(MIN_ARGON2_MEMORY_KIB - 1, 1, 1).is_err());
+        assert!(Argon2ClientSecretParams::try_new(MAX_ARGON2_MEMORY_KIB + 1, 1, 1).is_err());
+        assert!(Argon2ClientSecretParams::try_new(MIN_ARGON2_MEMORY_KIB, 0, 1).is_err());
+        assert!(
+            Argon2ClientSecretParams::try_new(
+                MIN_ARGON2_MEMORY_KIB,
+                MAX_ARGON2_TIME_COST + 1,
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            Argon2ClientSecretParams::try_new(
+                MIN_ARGON2_MEMORY_KIB,
+                1,
+                MAX_ARGON2_PARALLELISM + 1
+            )
+            .is_err()
+        );
+
+        // 4) Concurrency ceiling fails closed without panicking and restores permits on drop.
+        let mut guards = Vec::new();
+        while let Some(guard) = Argon2ConcurrencyGuard::try_acquire() {
+            guards.push(guard);
+            if guards.len() > MAX_CONCURRENT_ARGON2_VERIFICATIONS {
+                panic!("concurrency guard exceeded cap");
+            }
+        }
+        assert!(
+            Argon2ConcurrencyGuard::try_acquire().is_none(),
+            "cap must reject excess concurrent derivations"
+        );
+        assert!(
+            !verifier_a.verify(secret),
+            "verification must fail closed when concurrency cap is saturated"
+        );
+        drop(guards);
+        assert!(
+            verifier_a.verify(secret),
+            "releasing concurrency guards restores normal Argon2id verification"
+        );
     }
 
     #[test]
