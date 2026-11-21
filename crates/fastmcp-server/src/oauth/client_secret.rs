@@ -184,7 +184,7 @@ impl KdfExecutor {
     }
 
     fn reserve(&self) -> Result<Permit, OAuthError> {
-        let mut state = self.admission.try_lock().map_err(|_| unavailable())?;
+        let mut state = self.admission.lock().map_err(|_| unavailable())?;
         let now = Instant::now();
         if now.duration_since(state.window) >= Duration::from_secs(1) {
             state.window = now;
@@ -308,6 +308,36 @@ mod tests {
         drop(permits);
         assert_eq!(executor.admission.lock().unwrap().live, 0);
         drop(executor.reserve().unwrap());
+        assert_eq!(executor.admission.lock().unwrap().live, 0);
+    }
+
+    #[test]
+    fn concurrent_reservations_do_not_fail_spuriously_under_contention() {
+        let executor = Arc::new(KdfExecutor::new());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let executor = Arc::clone(&executor);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut held = Vec::new();
+                for _ in 0..(MAX_ADMITTED / 8) {
+                    held.push(executor.reserve().expect("bounded slot under contention"));
+                }
+                held
+            }));
+        }
+        let mut all_permits = Vec::new();
+        for handle in threads {
+            all_permits.extend(handle.join().unwrap());
+        }
+        assert_eq!(all_permits.len(), MAX_ADMITTED);
+        assert_eq!(executor.admission.lock().unwrap().live, MAX_ADMITTED);
+        // Near-identical planted negative (RH-5): once all MAX_ADMITTED slots are
+        // occupied, the next reservation still fails closed.
+        assert!(executor.reserve().is_err());
+        drop(all_permits);
         assert_eq!(executor.admission.lock().unwrap().live, 0);
     }
 
