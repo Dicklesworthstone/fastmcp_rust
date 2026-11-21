@@ -10,6 +10,490 @@ mod result_client;
 #[path = "extension_authoring/request_notifications.rs"]
 mod request_notifications;
 
+#[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
+mod websocket_proxy {
+    use super::*;
+
+    struct HeldScaleHandler {
+        started: Arc<AtomicUsize>,
+        release: Arc<asupersync::sync::Notify>,
+    }
+
+    impl
+        fastmcp_rust::extensions::authoring::ExtensionHandler<ScaleRequest, ScaleResponse, Settings>
+        for HeldScaleHandler
+    {
+        fn handle<'a>(
+            &'a self,
+            context: ExtensionContext<'a, Settings>,
+            request: ScaleRequest,
+        ) -> fastmcp_rust::BoxFuture<'a, McpResult<ScaleResponse>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                context.checkpoint()?;
+                Ok(ScaleResponse {
+                    value: request.value * context.settings().multiplier,
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn typed_websocket_proxy_cancelled_close_bounds_contention_and_retries_after_release() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(asupersync::sync::Notify::new());
+        let upstream_registration = builder()
+            .typed_request(
+                METHOD,
+                "scale-params-v1",
+                "scale-result-v1",
+                HeldScaleHandler {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        with_upstream(upstream_registration, move |cx, address| async move {
+            let declaration_calls = Arc::new(AtomicUsize::new(0));
+            let transport =
+                fastmcp_rust::AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp"))
+                    .await
+                    .unwrap();
+            let upstream = modern::ClientBuilder::new()
+                .connect_extension_websocket_upstream_with_cx(
+                    &cx,
+                    transport,
+                    registration(Arc::clone(&declaration_calls)),
+                    &ClientSettings { version: 1 },
+                )
+                .await
+                .unwrap();
+            let gateway_registration = builder()
+                .typed_websocket_proxy_request::<ScaleRequest, ScaleResponse, _>(
+                    METHOD,
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let server = modern::ServerBuilder::new("typed-websocket-close-gateway", "1")
+                .extension(gateway_registration)
+                .unwrap()
+                .try_build()
+                .unwrap();
+            let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+            let mut serving =
+                cx.spawn(move |server_cx| async move {
+                    server.serve_memory(&server_cx, transport).await
+                })
+                .unwrap();
+            peer.send_async(&cx, &request(906, Some(json!({"version": 1})), json!(7)))
+                .await
+                .unwrap();
+            while started.load(Ordering::SeqCst) == 0 {
+                asupersync::runtime::yield_now().await;
+            }
+            let closing = cx
+                .open_child_region(asupersync::cx::child_region::ChildRegionSpec::inherit())
+                .await
+                .unwrap();
+            closing.cx().cancel_with(
+                asupersync::types::CancelKind::Shutdown,
+                Some("close while a forwarded request holds the connection"),
+            );
+            let error = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(2),
+                upstream.close(closing.cx()),
+            )
+            .await
+            .expect("busy cleanup acquisition must retain its finite bound")
+            .unwrap_err();
+            assert_eq!(
+                error.message,
+                "WebSocket extension upstream close acquisition timed out"
+            );
+            assert!(closing.cx().is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+
+            let mut retry = Box::pin(upstream.close(closing.cx()));
+            assert!(
+                std::future::poll_fn(|task| Poll::Ready(retry.as_mut().poll(task)))
+                    .await
+                    .is_pending(),
+                "the cancelled caller must retain a cleanup waiter while busy"
+            );
+            release.notify_one();
+            let (reply, closed) = {
+                let mut incoming = Box::pin(response(&cx, &mut peer, 906));
+                let mut reply = None;
+                let mut closed = None;
+                std::future::poll_fn(|task| {
+                    if reply.is_none()
+                        && let Poll::Ready(value) = incoming.as_mut().poll(task)
+                    {
+                        reply = Some(value);
+                    }
+                    if closed.is_none()
+                        && let Poll::Ready(value) = retry.as_mut().poll(task)
+                    {
+                        closed = Some(value);
+                    }
+                    if reply.is_some() && closed.is_some() {
+                        Poll::Ready((reply.take().unwrap(), closed.take().unwrap()))
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await
+            };
+            drop(retry);
+            assert!(
+                reply.error.is_none(),
+                "cleanup must not cancel the active request: {reply:?}"
+            );
+            assert_eq!(reply.result.as_ref().unwrap()["value"], 21);
+            closed.unwrap();
+            assert!(closing.cx().is_cancel_requested());
+            closing.close().await.unwrap();
+            upstream.close(&cx).await.unwrap();
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            assert_eq!(declaration_calls.load(Ordering::SeqCst), 0);
+            let (mut input, output) = peer.into_split();
+            drop(output);
+            assert!(matches!(
+                input.recv_async(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            serving.join(&cx).await.unwrap().unwrap();
+        });
+    }
+
+    fn with_upstream<F, Fut>(registration: ExtensionRegistration, exercise: F)
+    where
+        F: FnOnce(Cx, std::net::SocketAddr) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+                let server = modern::ServerBuilder::new("typed-websocket-upstream", "1")
+                    .extension(registration)
+                    .unwrap()
+                    .try_build()
+                    .unwrap();
+                let bound = server.bind_websocket(&cx, "127.0.0.1:0").await.unwrap();
+                let address = bound.local_addr().unwrap();
+                let (ready, mut receiver) = asupersync::channel::oneshot::channel();
+                let mut serving = cx
+                    .spawn(move |server_cx| async move {
+                        ready.send(&server_cx, server_cx.clone()).unwrap();
+                        bound.serve(&server_cx).await
+                    })
+                    .unwrap();
+                let server_cx = receiver.recv(&cx).await.unwrap();
+                exercise(cx.clone(), address).await;
+                server_cx.cancel_with(
+                    asupersync::types::CancelKind::Shutdown,
+                    Some("typed WebSocket proxy test complete"),
+                );
+                assert!(matches!(
+                    serving.join(&cx).await.unwrap().unwrap(),
+                    fastmcp_rust::WebSocketServerShutdown::Quiescent
+                ));
+                assert!(cx.checkpoint().is_ok());
+            })
+            .await
+            .expect("bounded proxy exchange and native cleanup");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    async fn exchange(
+        cx: &Cx,
+        registration: ExtensionRegistration,
+        requests: Vec<JsonRpcMessage>,
+    ) -> Vec<JsonRpcResponse> {
+        let server = modern::ServerBuilder::new("typed-websocket-gateway", "1")
+            .extension(registration)
+            .unwrap()
+            .try_build()
+            .unwrap();
+        let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+        let mut serving = cx
+            .spawn(move |server_cx| async move { server.serve_memory(&server_cx, transport).await })
+            .unwrap();
+        let mut replies = Vec::new();
+        for message in requests {
+            let JsonRpcMessage::Request(request) = &message else {
+                panic!("request fixture expected");
+            };
+            let Some(RequestId::Number(id)) = request.id else {
+                panic!("numbered request fixture expected");
+            };
+            peer.send_async(cx, &message).await.unwrap();
+            replies.push(response(cx, &mut peer, id).await);
+        }
+        let (mut input, output) = peer.into_split();
+        drop(output);
+        assert!(matches!(
+            input.recv_async(cx).await,
+            Err(TransportError::Closed)
+        ));
+        serving.join(cx).await.unwrap().unwrap();
+        replies
+    }
+
+    #[test]
+    fn typed_websocket_proxy_revalidates_both_legs_and_reuses_its_native_connection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        with_upstream(registration(calls), move |cx, address| async move {
+            let declaration_calls = Arc::new(AtomicUsize::new(0));
+            let transport =
+                fastmcp_rust::AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp"))
+                    .await
+                    .unwrap();
+            let upstream = modern::ClientBuilder::new()
+                .client_info("typed-gateway-client", "1")
+                .connect_extension_websocket_upstream_with_cx(
+                    &cx,
+                    transport,
+                    registration(Arc::clone(&declaration_calls)),
+                    &ClientSettings { version: 1 },
+                )
+                .await
+                .unwrap();
+            assert_eq!(upstream.descriptor().id(), EXTENSION);
+
+            let different_schema = builder()
+                .typed_websocket_proxy_request::<ScaleRequest, ScaleResponse, _>(
+                    METHOD,
+                    "different-scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
+                )
+                .unwrap()
+                .build();
+            assert!(
+                different_schema.is_err(),
+                "the complete contract must agree"
+            );
+            assert!(
+                builder()
+                    .typed_request_notification::<ScaleResponse>(
+                        "com.example/request-scaled",
+                        "request-scaled-v1",
+                        "com.example/request-id",
+                    )
+                    .unwrap()
+                    .typed_websocket_proxy_request::<ScaleRequest, ScaleResponse, _>(
+                        METHOD,
+                        "scale-params-v1",
+                        "scale-result-v1",
+                        upstream.clone(),
+                    )
+                    .is_err(),
+                "request-owned server notifications require a supported relay"
+            );
+
+            let gateway = builder()
+                .typed_websocket_proxy_request::<ScaleRequest, ScaleResponse, _>(
+                    METHOD,
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let replies = exchange(
+                &cx,
+                gateway,
+                vec![
+                    request(900, Some(json!({"version": 1})), json!(7)),
+                    request(901, Some(json!({"version": 2})), json!(7)),
+                    request(902, None, json!(7)),
+                    request(903, Some(json!({"version": 1})), json!("wrong-type")),
+                    request(904, Some(json!({"version": 1})), json!(11)),
+                ],
+            )
+            .await;
+            assert_eq!(replies[0].result.as_ref().unwrap()["value"], 21);
+            assert_eq!(replies[4].result.as_ref().unwrap()["value"], 33);
+            for reply in &replies[1..4] {
+                assert!(reply.error.is_some(), "{reply:?}");
+                assert!(reply.result.is_none());
+            }
+            assert_eq!(observed.load(Ordering::SeqCst), 2);
+            assert_eq!(declaration_calls.load(Ordering::SeqCst), 0);
+
+            let mismatched = ExtensionBuilder::new(
+                EXTENSION,
+                1,
+                "typed-math-client-v1",
+                "typed-math-server-v1",
+                ServerSettings {
+                    version: 1,
+                    multiplier: 4,
+                },
+                |client: ClientSettings, server: ServerSettings| {
+                    if client.version != server.version {
+                        return Err(McpError::invalid_params("incompatible math version"));
+                    }
+                    Ok(Settings {
+                        multiplier: server.multiplier,
+                    })
+                },
+            )
+            .unwrap()
+            .typed_websocket_proxy_request::<ScaleRequest, ScaleResponse, _>(
+                METHOD,
+                "scale-params-v1",
+                "scale-result-v1",
+                upstream.clone(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            let replies = exchange(
+                &cx,
+                mismatched,
+                vec![request(905, Some(json!({"version": 1})), json!(7))],
+            )
+            .await;
+            assert!(
+                replies[0].error.is_some(),
+                "effective settings differ across legs"
+            );
+            assert_eq!(observed.load(Ordering::SeqCst), 2);
+            let closing = cx
+                .open_child_region(asupersync::cx::child_region::ChildRegionSpec::inherit())
+                .await
+                .unwrap();
+            closing.cx().cancel_with(
+                asupersync::types::CancelKind::Shutdown,
+                Some("close an upstream after its caller was cancelled"),
+            );
+            upstream.close(closing.cx()).await.unwrap();
+            assert!(closing.cx().is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+            closing.close().await.unwrap();
+            upstream.close(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn typed_websocket_proxy_notifications_require_current_proof_and_authorization() {
+        let observations = Arc::new(NotificationObservations::default());
+        let retained = Arc::clone(&observations);
+        with_upstream(
+            notification_registration(Arc::clone(&observations)),
+            move |cx, address| async move {
+                let declaration = Arc::new(NotificationObservations::default());
+                let transport = fastmcp_rust::AsyncWsClientTransport::connect(
+                    &cx,
+                    &format!("ws://{address}/mcp"),
+                )
+                .await
+                .unwrap();
+                let upstream = modern::ClientBuilder::new()
+                    .connect_extension_websocket_upstream_with_cx(
+                        &cx,
+                        transport,
+                        notification_registration(Arc::clone(&declaration)),
+                        &ClientSettings { version: 1 },
+                    )
+                    .await
+                    .unwrap();
+                let authorizations = Arc::new(AtomicUsize::new(0));
+                let counted = Arc::clone(&authorizations);
+                let registration = builder()
+                    .typed_websocket_proxy_notification::<ScaleNotification, _, _>(
+                        NOTIFICATION,
+                        "scaled-notification-v1",
+                        ACTIVATION,
+                        move |notification| {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            if notification.value == 13 {
+                                return Err(McpError::invalid_request("operation denied"));
+                            }
+                            Ok(())
+                        },
+                        upstream.clone(),
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let server = modern::ServerBuilder::new("typed-notification-gateway", "1")
+                    .extension(registration)
+                    .unwrap()
+                    .try_build()
+                    .unwrap();
+                let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+                let mut serving = cx
+                    .spawn(move |server_cx| async move {
+                        server.serve_memory(&server_cx, transport).await
+                    })
+                    .unwrap();
+                let valid = notification(7, false);
+                let mut missing = valid.clone();
+                missing["params"]["_meta"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(ACTIVATION);
+                let mut incompatible = valid.clone();
+                incompatible["params"]["_meta"][ACTIVATION]["version"] = json!(2);
+                let mut malformed = valid.clone();
+                malformed["params"]["value"] = json!("wrong-type");
+                for value in [
+                    valid,
+                    missing,
+                    incompatible,
+                    malformed,
+                    notification(13, false),
+                ] {
+                    let message: JsonRpcMessage =
+                        fastmcp_rust::serde_json::from_value(value).unwrap();
+                    peer.send_async(&cx, &message).await.unwrap();
+                }
+                while observations.completed.load(Ordering::SeqCst) < 1
+                    || authorizations.load(Ordering::SeqCst) < 2
+                {
+                    asupersync::runtime::yield_now().await;
+                }
+                let (mut input, output) = peer.into_split();
+                drop(output);
+                assert!(matches!(
+                    input.recv_async(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+                serving.join(&cx).await.unwrap().unwrap();
+                assert_eq!(authorizations.load(Ordering::SeqCst), 2);
+                assert_eq!(observations.authorized.load(Ordering::SeqCst), 1);
+                assert_eq!(declaration.started.load(Ordering::SeqCst), 0);
+                assert_eq!(declaration.authorized.load(Ordering::SeqCst), 0);
+                upstream.close(&cx).await.unwrap();
+            },
+        );
+        assert_eq!(retained.completed.load(Ordering::SeqCst), 1);
+        assert_eq!(retained.total.load(Ordering::SeqCst), 21);
+    }
+}
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

@@ -54,6 +54,11 @@ mod stdio_proxy;
 #[cfg(all(feature = "proxy", unix))]
 pub use stdio_proxy::ExtensionStdioUpstream;
 
+#[cfg(all(feature = "proxy", feature = "websocket"))]
+mod websocket_proxy;
+#[cfg(all(feature = "proxy", feature = "websocket"))]
+pub use websocket_proxy::ExtensionWebSocketUpstream;
+
 /// Maximum request and notification entries retained by one registration.
 pub const MAX_AUTHORING_METHODS: usize = 64;
 /// Aggregate encoded schema budget for one registration, including settings.

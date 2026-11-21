@@ -1264,6 +1264,59 @@ best-effort safety net. The group anchor protects its numeric PGID while it is
 live and closes an owner-death channel when the host exits, but this is not
 portable process-tree containment or a substitute for Windows Job Objects.
 
+### Test HTTP connectivity (current source tree)
+
+A CLI built from the current source can test an HTTP server's negotiation,
+liveness, and advertised tools, resources, and prompts without starting a
+subprocess.
+
+```bash
+# Modern MCP endpoint
+fastmcp test \
+  --protocol-policy modern-only \
+  --http-url https://mcp.example/mcp \
+  --json
+
+# Auto: supply the modern endpoint and both explicit legacy endpoints
+fastmcp test \
+  --protocol-policy auto \
+  --http-url https://mcp.example/mcp \
+  --legacy-sse-url https://mcp.example/sse \
+  --legacy-message-url https://mcp.example/messages \
+  --json
+
+# Exact MCP 2024-11-05 over SSE and message POST
+fastmcp test \
+  --protocol-policy legacy-only \
+  --legacy-sse-url https://mcp.example/sse \
+  --legacy-message-url https://mcp.example/messages \
+  --verbose
+```
+
+From a source checkout, replace `fastmcp` with `cargo run -p fastmcp-cli --`.
+Auto and legacy-only require the `legacy-2024-11-05` feature. Auto requires all
+three endpoints and falls back only when negotiation permits it; an application
+failure after modern selection does not trigger a downgrade. The legacy SSE
+and message endpoints must share an origin. Omit the subprocess command when
+supplying HTTP endpoints.
+
+For bearer authentication, add `--bearer-token-file ./mcp-token.txt` to the modern
+command. The file must be a regular file containing at most 16 KiB, and the
+modern endpoint must use HTTPS. Authenticated requests never fall back to
+legacy. Add `--idle-timeout 10 --absolute-timeout 30` for shorter probe deadlines.
+The defaults are 30 seconds idle and 120 seconds absolute; accepted ranges are
+1–300 and 1–900 seconds respectively. For HTTP, the absolute limit also bounds
+the complete connection handshake and each probe, including connection setup.
+These limits do not impose one deadline on the entire command.
+
+Modern liveness uses `server/discover`; legacy liveness uses `ping`. Catalog
+probes fetch one bounded page for each advertised capability, mark unadvertised
+capabilities as skipped, and report when more entries were omitted. `--json`
+emits bounded, sanitized `fastmcp.cli.test/v1` results with the negotiated
+protocol, probe outcomes, and local idle/absolute timeout sources. Failures
+before testing begins use `fastmcp.cli.error/v2`. Failed tests return a nonzero
+exit status; use `--verbose` for detailed text output.
+
 **Requirements:**
 - Rust nightly-2026-08-25 (see `rust-toolchain.toml`) for Edition 2024. The last FND-01 evidence snapshot still records `nightly-2026-07-11` until that harness is re-attested.
 
@@ -1696,22 +1749,35 @@ response admission and local identity resolution separate:
   atomic assertion-use store, and independent commit acknowledgment. It returns
   an exclusive reserved assertion only after the complete transaction succeeds.
 
-The local OIDC sequence is
+The native OIDC sequence is
 `OidcCodeFlowConfiguration::prepare` →
 `PreparedOidcAuthorization::admit_callback` →
-`OidcCodeGrant::write_token_form` →
-`OidcCodeResponseAdmission::admit_token_response`. Callback admission checks
-the exact route, state, issuer and decoded parameter uniqueness. Code forms
-contain only the grant, code, redirect URI and verifier. Each stage consumes
-its owner; a partial form write cannot produce a response-admission owner.
-The final validator retains the generated nonce and selected client/tenant
-expectations, and composes them with real signed-response verification.
+`EnterpriseExchangeDriver::exchange_oidc_code_for_identity`. Callback admission
+checks the exact route, state, issuer and decoded parameter uniqueness. The
+driver consumes the code grant, adds the preregistered Basic or secret-post
+client authentication, and posts to the original IdP endpoint through guarded
+HTTPS. The form contains the grant, code, redirect URI and PKCE verifier;
+MCP scope, resource and audience fields are never added to this code grant.
 
-This codec exposes the authorization URL for an external browser adapter and
-writes the code form to a caller-selected confidential sink. That sink can
-observe the code/verifier and must erase its buffers. Confidential client
-authentication and HTTP dispatch are separate; local byte digests do not
-establish launch or transport provenance.
+The response validator retains the generated nonce and selected client/tenant
+expectations, and verifies the real ID-token signature and optional access-token
+hash. Profile, response-policy or key-generation drift is rejected before any
+POST. Dispatch shares the driver's single-flight slot and is bounded by the
+code's original expiry, the caller's budget and the fetch policy. Redirects and
+automatic retries are refused; each outcome consumes the code grant.
+
+A successful identity still needs `IdentityAssertionReplay::reserve` before
+`exchange_identity_for_id_jag` can redeem it. The subsequent
+`exchange_id_jag_for_access_token` returns a credential bound to the configured
+MCP resource. Code redemption does not bypass that durable replay boundary.
+
+The lower-level `OidcCodeGrant::write_token_form` and
+`OidcCodeResponseAdmission::admit_token_response` remain available to embeddings
+with their own dispatcher. That codec writes to a caller-selected confidential
+sink, which can observe the code/verifier and must erase its buffers. A partial
+write cannot produce a response-admission owner. The authorization URL still
+requires an external browser adapter; local byte digests do not establish
+browser-launch provenance or durable callback custody.
 
 For native signing-key acquisition, construct `keys::EnterpriseKeySource` with
 the admitted profile, a `GuardedHttpFetcher`, and a nonzero fetch-policy
@@ -1773,8 +1839,9 @@ and the locally retained final token. The ordinary verification method keeps
 its closed claim set; actor, subject-alias, RAR and sender-constraining claims
 cannot be enabled through this policy.
 
-These components do not yet perform OAuth token exchanges or complete
-enterprise sign-in, and they do not activate the MCP extension.
+The native driver performs the three distinct grant exchanges, but complete
+enterprise sign-in still requires browser/callback custody and deployment
+qualification. These components do not activate the MCP extension.
 The mapping table supports public, redirect-host pairwise, and explicitly
 reviewed sector-document OIDC subject namespaces. It rechecks the current
 profile, selected snapshot, signed token bindings and review/claim lifetimes on
@@ -1906,8 +1973,8 @@ return a normal conflict. Unknown outcomes remain unresolved. Administrative
 epoch advance and fenced migration remain unfinished.
 
 Durable browser launch/callback custody, confidential credential providers,
-the native token-exchange driver, attested mapping authority and qualified
-deployments of the replay/restore providers remain required before activation.
+attested mapping authority and qualified deployments of the replay/restore
+providers remain required before activation.
 SAML and durable/distributed server Task stores remain separate incomplete
 extension work.
 
@@ -2550,6 +2617,51 @@ to the pipe. The adapter does not create a detached task or private runtime,
 and its receive turns retain the native client's bounded synchronous slices.
 After dropping installed routes and other handles, consume the last handle
 with `close_with_cx` to await observable subprocess cleanup.
+
+### Typed extension gateways to WebSocket upstreams
+
+Enable `extension-authoring`, `proxy`, and `websocket-experimental`. The caller
+supplies an owned `AsyncWsClientTransport`, acquired with `connect`, `connect_wss`,
+or its own Upgrade/TLS setup. Reusing the typed echo declaration above:
+
+```rust
+let upstream = modern::ClientBuilder::new()
+    .connect_extension_websocket_upstream_with_cx(
+        cx,
+        transport,
+        EchoExtension.register(make_builder()?)?.build()?,
+        &Settings {},
+    )
+    .await?;
+let registration = make_builder()?
+    .typed_websocket_proxy_request::<Message, Message, _>(
+        "com.example/echo",
+        "echo-params-v1",
+        "echo-result-v1",
+        upstream.clone(),
+    )?
+    .build()?;
+```
+
+Install `registration` on the gateway as above. Both legs independently
+negotiate the complete contract; schema identities and effective settings must
+match. The adapter validates typed payloads and creates fresh upstream IDs and
+metadata. Cloned handles share one connection and admit at most 64 running or
+waiting operations on the caller's runtime.
+
+Awaited cancellation settles native request retirement before connection reuse.
+Dropped requests retain cleanup ownership for the next operation or close.
+After serving finishes, call `upstream.close(cx).await?`; retain the handle to
+retry an acquisition failure. Idle cleanup accepts a cancelled caller; busy
+cleanup requires the caller's timer and has a finite acquisition bound.
+
+Standalone client notifications use
+`typed_websocket_proxy_notification::<Notification, _, _>` with an explicit
+authorization policy and the same complete declaration. They receive fresh
+activation proof, allocate no request ID, and are never retried automatically.
+This adapter supports finite request/results and standalone client notifications;
+request-owned server notifications, Tasks, and subscription relays remain outside
+its supported contract.
 
 ## In-process test clients
 

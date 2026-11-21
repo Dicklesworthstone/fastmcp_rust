@@ -2,8 +2,10 @@
 //!
 //! This module joins preregistered OIDC discovery, independent state/nonce/PKCE
 //! generation, an exact authorization GET, callback admission, confidential
-//! code-form serialization, and the signed token-response validator. It does
-//! not launch a browser, perform HTTP, or create deployment/dispatch receipts.
+//! code-form serialization, and the signed token-response validator. The
+//! guarded [`super::response::EnterpriseExchangeDriver`] can consume its code
+//! grant directly for native HTTPS redemption. These codecs do not launch a
+//! browser or create deployment/dispatch receipts.
 //! Its in-memory owners are not the durable pending-flow store required for
 //! enterprise activation. An embedding must separately provide the attested
 //! browser, persistent custody, replay and identity authorities before using
@@ -30,13 +32,14 @@ use super::identity::{
 };
 use super::policy::{EnterpriseProfile, RequestedEnterpriseScopeSet, TOKEN_EXCHANGE_GRANT};
 use super::response::{
-    EnterpriseIdentityAssertion, EnterpriseResponseOutcome, EnterpriseResponsePolicy,
-    EnterpriseTokenResponse,
+    EnterpriseExchangeError, EnterpriseIdentityAssertion, EnterpriseResponseError,
+    EnterpriseResponseOutcome, EnterpriseResponsePolicy, EnterpriseTokenResponse,
+    build_confidential_token_request,
 };
 use super::verification::{OidcVerificationKeys, TenantExpectation};
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 const MAX_URL_BYTES: usize = 4096;
 const MAX_LAUNCH_BYTES: usize = 32 * 1024;
@@ -690,6 +693,46 @@ impl OidcCodeGrant {
         self.expires_at
     }
 
+    /// The driver can serialize the protected code only for the original
+    /// profile and response policy. This consumes the local grant on every
+    /// outcome without exposing its code, verifier or nonce to the caller.
+    pub(super) fn into_token_request(
+        self,
+        profile: &EnterpriseProfile,
+        policy: EnterpriseResponsePolicy,
+        client_secret: &str,
+        keys: &OidcVerificationKeys,
+        now: SystemTime,
+    ) -> Result<
+        (
+            fastmcp_transport::GuardedHttpRequest,
+            OidcCodeResponseAdmission,
+        ),
+        EnterpriseExchangeError,
+    > {
+        if self.configuration.profile != *profile
+            || self.configuration.response_policy != policy
+            || keys.issuer() != profile.idp_issuer()
+            || keys.generation() != profile.oidc_key_generation()
+        {
+            return Err(EnterpriseExchangeError::ResponseRejected(
+                EnterpriseResponseError::PolicyBindingMismatch,
+            ));
+        }
+        live(self.created_at, self.expires_at, now)
+            .map_err(EnterpriseExchangeError::CodeFlowRejected)?;
+        let mut fields = self.token_fields().to_vec();
+        let request = build_confidential_token_request(
+            profile.idp_authentication(),
+            profile.idp_client_id(),
+            client_secret,
+            &mut fields,
+        )?;
+        let request_digest = digest(request.body(), MAX_CODE_FORM_BYTES)
+            .map_err(EnterpriseExchangeError::CodeFlowRejected)?;
+        Ok((request, self.into_response_admission(request_digest, now)))
+    }
+
     /// Serializes the closed unauthenticated code form to a confidential sink.
     ///
     /// Emits only grant_type, code, redirect_uri and code_verifier. The caller's
@@ -705,27 +748,37 @@ impl OidcCodeGrant {
         now: SystemTime,
     ) -> Result<OidcCodeResponseAdmission, OidcCodeFlowError> {
         live(self.created_at, self.expires_at, now)?;
-        let body = form(
-            &[
-                ("grant_type", "authorization_code"),
-                ("code", self.code.as_str()),
-                ("redirect_uri", &self.configuration.redirect_uri),
-                ("code_verifier", self.verifier.as_str()),
-            ],
-            MAX_CODE_FORM_BYTES,
-        )?;
+        let body = form(&self.token_fields(), MAX_CODE_FORM_BYTES)?;
         writer
             .write_all(body.as_bytes())
             .map_err(|_| OidcCodeFlowError::EncodingFailed)?;
-        Ok(OidcCodeResponseAdmission {
+        let request_digest = digest(body.as_bytes(), MAX_CODE_FORM_BYTES)?;
+        Ok(self.into_response_admission(request_digest, now))
+    }
+
+    fn token_fields(&self) -> [(&str, &str); 4] {
+        [
+            ("grant_type", "authorization_code"),
+            ("code", self.code.as_str()),
+            ("redirect_uri", &self.configuration.redirect_uri),
+            ("code_verifier", self.verifier.as_str()),
+        ]
+    }
+
+    fn into_response_admission(
+        self,
+        request_digest: [u8; 32],
+        now: SystemTime,
+    ) -> OidcCodeResponseAdmission {
+        OidcCodeResponseAdmission {
             configuration: self.configuration,
             nonce: self.nonce,
             launch_url_digest: self.launch_url_digest,
             callback_digest: self.callback_digest,
-            request_digest: digest(body.as_bytes(), MAX_CODE_FORM_BYTES)?,
+            request_digest,
             created_at: now,
             expires_at: self.expires_at,
-        })
+        }
     }
 }
 

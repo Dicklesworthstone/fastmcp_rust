@@ -790,16 +790,36 @@ enum Commands {
 
     /// Test MCP server connectivity.
     ///
-    /// Spawns the server and tests initialization, capability listing, ping,
-    /// and verified subprocess cleanup. This command is currently Unix-only:
-    /// other platforms fail before spawning because no Job Object equivalent
-    /// is implemented yet.
+    /// Tests negotiation, liveness, and advertised capability catalogs over
+    /// stdio or explicit HTTP endpoints. Subprocess testing also verifies
+    /// cleanup and is Unix-only; HTTP testing does not spawn a process.
     Test {
-        /// Server command or path.
-        server: String,
+        /// Server command or path. Omit when using explicit HTTP endpoints.
+        #[arg(conflicts_with_all = ["http_url", "legacy_sse_url", "legacy_message_url"])]
+        server: Option<String>,
+
+        /// Explicit modern Streamable HTTP MCP POST endpoint.
+        #[arg(long, value_name = "URL")]
+        http_url: Option<String>,
+
+        /// Read a bearer token from a regular file (at most 16 KiB); HTTPS only.
+        #[arg(long, value_name = "PATH", requires = "http_url")]
+        bearer_token_file: Option<PathBuf>,
+
+        /// Explicit MCP 2024-11-05 SSE GET endpoint (requires the legacy feature).
+        #[arg(long, value_name = "URL")]
+        legacy_sse_url: Option<String>,
+
+        /// Explicit MCP 2024-11-05 message POST endpoint (requires the legacy feature).
+        #[arg(long, value_name = "URL")]
+        legacy_message_url: Option<String>,
 
         /// Arguments to pass to the server.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            requires = "server"
+        )]
         args: Vec<String>,
 
         /// Protocol-policy selection for both client negotiation and server launch.
@@ -825,6 +845,8 @@ enum Commands {
         /// does not bound the whole CLI or subprocess lifetime. On Unix child
         /// stdio, the request timers bound silent and partial-frame reads;
         /// blocking child-stdin writes cannot be preempted by these timers.
+        /// HTTP also bounds the whole connection handshake and each probe,
+        /// including time spent connecting before request commitment.
         #[arg(
             long,
             default_value_t = 120,
@@ -1508,25 +1530,54 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
         } => cmd_list(target, config, format, verbose),
         Commands::Test {
             server,
+            http_url,
+            bearer_token_file,
+            legacy_sse_url,
+            legacy_message_url,
             args,
             protocol_policy,
             idle_timeout,
             absolute_timeout,
             verbose,
             json,
-        } => {
-            Box::pin(cmd_test(
-                cx,
-                &server,
-                &args,
-                protocol_policy,
-                idle_timeout,
-                absolute_timeout,
-                verbose,
-                json,
-            ))
-            .await
-        }
+        } => match server {
+            Some(server) => {
+                Box::pin(cmd_test(
+                    cx,
+                    &server,
+                    &args,
+                    protocol_policy,
+                    idle_timeout,
+                    absolute_timeout,
+                    verbose,
+                    json,
+                ))
+                .await
+            }
+            None if http_url.is_some()
+                || legacy_sse_url.is_some()
+                || legacy_message_url.is_some() =>
+            {
+                Box::pin(cmd_test_http(
+                    cx,
+                    http_inspect_protocol_plan(
+                        http_url.as_deref(),
+                        legacy_sse_url.as_deref(),
+                        legacy_message_url.as_deref(),
+                        protocol_policy,
+                    )?,
+                    bearer_token_file.as_deref(),
+                    idle_timeout,
+                    absolute_timeout,
+                    verbose,
+                    json,
+                ))
+                .await
+            }
+            None => Err(fastmcp_core::McpError::invalid_params(
+                "test requires a server command or explicit HTTP endpoints",
+            )),
+        },
         Commands::Dev {
             target,
             reload_dirs,
@@ -4684,6 +4735,224 @@ async fn cmd_test(
     }
 }
 
+fn http_test_timeout_error(source: fastmcp_client::RequestTimeoutSource) -> fastmcp_core::McpError {
+    let (message, source) = match source {
+        fastmcp_client::RequestTimeoutSource::Idle => {
+            ("Request timed out at the idle deadline", "idle")
+        }
+        fastmcp_client::RequestTimeoutSource::Absolute => {
+            ("Request timed out at the absolute deadline", "absolute")
+        }
+    };
+    fastmcp_core::McpError::with_data(
+        fastmcp_core::McpErrorCode::InternalError,
+        message,
+        serde_json::json!({"timeoutSource": source}),
+    )
+}
+
+/// Preserve native timeout classification without interpreting peer text or
+/// copying arbitrary peer error data into the diagnostic report.
+fn http_test_error(error: fastmcp_client::HttpClientError) -> fastmcp_core::McpError {
+    use fastmcp_client::http_executor::ModernHttpExecutorError;
+
+    let mut cause: &(dyn std::error::Error + 'static) = &error;
+    for _ in 0..8 {
+        if let Some(ModernHttpExecutorError::Timeout(source)) =
+            cause.downcast_ref::<ModernHttpExecutorError>()
+        {
+            return http_test_timeout_error(*source);
+        }
+        let Some(next) = cause.source() else {
+            break;
+        };
+        cause = next;
+    }
+    match error {
+        fastmcp_client::HttpClientError::CoreResult(mut error) => {
+            // A JSON-RPC error may copy the exact local timeout tuple. Only
+            // the typed executor error above can grant that classification.
+            error.data = None;
+            error
+        }
+        error => {
+            fastmcp_core::McpError::internal_error(format!("HTTP MCP request failed: {error}"))
+        }
+    }
+}
+
+/// Native response timers start at request commitment. This additional bound
+/// also covers DNS, TCP/TLS setup, and the entire Auto negotiation attempt.
+/// Dropping an expired native HTTP operation retires its owned exchange.
+async fn bounded_http_test<T>(
+    cx: &Cx,
+    absolute_timeout: std::time::Duration,
+    operation: impl std::future::Future<Output = Result<T, fastmcp_client::HttpClientError>>,
+) -> McpResult<T> {
+    asupersync::time::timeout(cx.now(), absolute_timeout, Box::pin(operation))
+        .await
+        .map_err(|_| http_test_timeout_error(fastmcp_client::RequestTimeoutSource::Absolute))?
+        .map_err(http_test_error)
+}
+
+/// Test a policy-bound HTTP bundle with the same first-page catalog admission
+/// and bounded report as stdio. No probe retries a dispatched request.
+async fn cmd_test_http(
+    cx: &Cx,
+    protocol_plan: ClientProtocolPlan,
+    bearer_token_file: Option<&Path>,
+    idle_timeout_secs: u64,
+    absolute_timeout_secs: u64,
+    verbose: bool,
+    json_output: bool,
+) -> McpResult<()> {
+    use std::time::{Duration, Instant};
+
+    let total_start = Instant::now();
+    let server = if protocol_plan.policy() == ProtocolPolicy::LegacyOnly {
+        protocol_plan.legacy_sse_target()
+    } else {
+        protocol_plan.modern_post_target()
+    }
+    .ok_or_else(|| {
+        fastmcp_core::McpError::invalid_params("HTTP test requires a configured endpoint")
+    })?
+    .to_owned();
+    let absolute_timeout = Duration::from_secs(absolute_timeout_secs);
+    let timeout_policy = fastmcp_client::RequestTimeoutPolicy::new(
+        Duration::from_secs(idle_timeout_secs),
+        absolute_timeout,
+    )?;
+    // Admit endpoints and credentials before network contact, using the same
+    // exact-target HTTPS credential binding as inspect and operation commands.
+    let builder = http_client_builder(protocol_plan, bearer_token_file)?
+        .request_timeout_policy(timeout_policy);
+    if !json_output {
+        write_stdout(
+            &format!(
+                "Testing server: {}",
+                sanitize_peer_text(&server, PEER_FIELD_LIMIT)
+            ),
+            "test output",
+            true,
+        )?;
+    }
+    let init_start = Instant::now();
+    let connection = bounded_http_test(
+        cx,
+        absolute_timeout,
+        builder.connect_http_client_with_cx(cx),
+    )
+    .await;
+    let mut client = match connection {
+        Ok(client) => client,
+        Err(mut error) => {
+            let result = failed_test_result("initialize", init_start.elapsed(), &error);
+            if !json_output {
+                if let Err(output_error) = print_test_result(&result, verbose) {
+                    return Err(combine_test_failure_with_output(error, output_error));
+                }
+            }
+            let report = TestReport {
+                server,
+                success: false,
+                tests: vec![result],
+                total_duration_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            };
+            if let Err(output_error) = write_test_report(&report, json_output) {
+                error = combine_test_failure_with_output(error, output_error);
+            }
+            return Err(error);
+        }
+    };
+    let protocol_version = client.connection().protocol_version().ok_or_else(|| {
+        fastmcp_core::McpError::internal_error("HTTP test completed without a negotiated protocol")
+    })?;
+    let mut results = vec![TestResult {
+        name: "initialize".to_owned(),
+        success: true,
+        skipped: false,
+        duration_ms: init_start.elapsed().as_secs_f64() * 1000.0,
+        details: Some(format!("protocol {protocol_version} over HTTP")),
+        error: None,
+        timeout_source: None,
+        mutation: OutputMutationMetadata::default(),
+        machine_text: None,
+    }];
+    let capabilities = http_inspect_capabilities(&client)?;
+    client.set_final_result_cache_enabled(false);
+    results.push(
+        run_test(cx, "ping", async |cx| {
+            // The native client sends server/discover in the modern era and
+            // ping only after exact-2024 negotiation selected the legacy era.
+            bounded_http_test(cx, absolute_timeout, client.ping(cx)).await?;
+            Ok("server responded".to_owned())
+        })
+        .await,
+    );
+    for (name, capability, method) in [
+        ("list_tools", "tools", "tools/list"),
+        ("list_resources", "resources", "resources/list"),
+        ("list_prompts", "prompts", "prompts/list"),
+    ] {
+        let result = if capabilities.advertises(capability) {
+            run_test(cx, name, async |cx| {
+                let response = bounded_http_test(
+                    cx,
+                    absolute_timeout,
+                    client.request_final_core(cx, method, serde_json::json!({})),
+                )
+                .await?;
+                let (count, truncated) = match capability {
+                    "tools" => {
+                        let (items, truncated) = inspect_tools_result(response)?;
+                        (items.len(), truncated)
+                    }
+                    "resources" => {
+                        let (items, truncated) = inspect_resources_result(response)?;
+                        (items.len(), truncated)
+                    }
+                    _ => {
+                        let (items, truncated) = inspect_prompts_result(response)?;
+                        (items.len(), truncated)
+                    }
+                };
+                let qualifier = if truncated {
+                    " in the bounded first page; more were omitted"
+                } else {
+                    ""
+                };
+                Ok(format!("{count} {capability}{qualifier}"))
+            })
+            .await
+        } else {
+            skipped_test(name, &format!("server did not advertise {capability}"))
+        };
+        results.push(result);
+    }
+    // HTTP exchanges and the optional legacy receiver belong to the client.
+    // Release them before writing output, including when stdout is broken.
+    drop(client);
+    let all_passed = results.iter().all(|result| result.success);
+    let report = TestReport {
+        server,
+        success: all_passed,
+        tests: results,
+        total_duration_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+    };
+    if !json_output {
+        for result in &report.tests {
+            print_test_result(result, verbose)?;
+        }
+    }
+    write_test_report(&report, json_output)?;
+    if all_passed {
+        Ok(())
+    } else {
+        Err(fastmcp_core::McpError::internal_error("Some tests failed"))
+    }
+}
+
 /// Run a single test and measure its duration.
 async fn run_test<F>(cx: &Cx, name: &str, test_fn: F) -> TestResult
 where
@@ -6219,7 +6488,7 @@ fn read_http_bearer_credential(
     fastmcp_client::http_auth::BoundBearerCredential::bind(resource, token).map_err(|_| invalid())
 }
 
-/// Both HTTP command families use the SDK's exact-endpoint credential binding.
+/// HTTP commands use the SDK's exact-endpoint credential binding.
 fn http_client_builder(
     plan: ClientProtocolPlan,
     bearer_token_file: Option<&Path>,
@@ -8738,7 +9007,7 @@ fn stdio_inspect_capabilities(client: &Client) -> McpResult<InspectCapabilities>
     }
 }
 
-/// Builds the immutable, explicit HTTP endpoint plan accepted by `inspect`.
+/// Builds the immutable, explicit HTTP endpoint plan accepted by CLI commands.
 ///
 /// Every supplied route is parsed independently and passed unchanged to the
 /// client's negotiation authority. This command never derives a legacy route
@@ -16992,7 +17261,7 @@ IFS= read -r end
                     json,
                     ..
                 } => {
-                    assert_eq!(server, "./server");
+                    assert_eq!(server.as_deref(), Some("./server"));
                     assert_eq!(protocol_policy, CliProtocolPolicy::default());
                     assert_eq!(idle_timeout, 30);
                     assert_eq!(absolute_timeout, 120);
@@ -17036,6 +17305,77 @@ IFS= read -r end
                 }
                 _ => unreachable!("Expected Test command"),
             }
+        }
+
+        #[test]
+        fn test_test_command_http_bundle_and_bearer() {
+            let cli = Cli::try_parse_from([
+                "fastmcp",
+                "test",
+                "--http-url",
+                "https://example.test/mcp",
+                "--bearer-token-file",
+                "token.txt",
+                "--legacy-sse-url",
+                "https://example.test/sse",
+                "--legacy-message-url",
+                "https://example.test/messages",
+                "--protocol-policy",
+                "auto",
+                "--json",
+            ])
+            .unwrap();
+            let Commands::Test {
+                server,
+                args,
+                http_url,
+                bearer_token_file,
+                legacy_sse_url,
+                legacy_message_url,
+                protocol_policy,
+                json,
+                ..
+            } = cli.command
+            else {
+                panic!("Expected Test command");
+            };
+            assert!(server.is_none());
+            assert!(args.is_empty());
+            assert_eq!(http_url.as_deref(), Some("https://example.test/mcp"));
+            assert_eq!(bearer_token_file, Some(PathBuf::from("token.txt")));
+            assert_eq!(legacy_sse_url.as_deref(), Some("https://example.test/sse"));
+            assert_eq!(
+                legacy_message_url.as_deref(),
+                Some("https://example.test/messages")
+            );
+            assert_eq!(protocol_policy, CliProtocolPolicy::Auto);
+            assert!(json);
+        }
+
+        #[test]
+        fn test_test_command_rejects_mixed_transports_and_unbound_bearer() {
+            for endpoint in ["--http-url", "--legacy-sse-url", "--legacy-message-url"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "fastmcp",
+                        "test",
+                        endpoint,
+                        "https://example.test/mcp",
+                        "./server",
+                    ])
+                    .is_err()
+                );
+            }
+            assert!(
+                Cli::try_parse_from([
+                    "fastmcp",
+                    "test",
+                    "--bearer-token-file",
+                    "token.txt",
+                    "./server",
+                ])
+                .is_err()
+            );
         }
 
         #[test]
@@ -19315,6 +19655,63 @@ IFS= read -r end
                 serde_json::json!({"timeoutSource": "peer-defined"}),
             );
             assert_eq!(allowlisted_test_timeout_source(&unknown_source), None);
+        }
+
+        #[test]
+        fn test_http_native_timeout_keeps_trusted_source_in_report() {
+            use fastmcp_client::http_executor::ModernHttpExecutorError;
+            for (source, expected) in [
+                (
+                    fastmcp_client::RequestTimeoutSource::Idle,
+                    TestTimeoutSource::Idle,
+                ),
+                (
+                    fastmcp_client::RequestTimeoutSource::Absolute,
+                    TestTimeoutSource::Absolute,
+                ),
+            ] {
+                let error = http_test_error(fastmcp_client::HttpClientError::Connection(
+                    fastmcp_client::ClientHttpConnectionError::Modern(
+                        fastmcp_client::ModernHttpClientError::Executor(
+                            ModernHttpExecutorError::Timeout(source),
+                        ),
+                    ),
+                ));
+                assert_eq!(allowlisted_test_timeout_source(&error), Some(expected));
+            }
+            for (message, source, expected) in [
+                (
+                    "Request timed out at the idle deadline",
+                    "idle",
+                    TestTimeoutSource::Idle,
+                ),
+                (
+                    "Request timed out at the absolute deadline",
+                    "absolute",
+                    TestTimeoutSource::Absolute,
+                ),
+            ] {
+                for data in [
+                    serde_json::json!({"timeoutSource": source}),
+                    serde_json::json!({"timeoutSource": source, "secret": "not-a-timer"}),
+                ] {
+                    let peer = fastmcp_core::McpError::with_data(
+                        fastmcp_core::McpErrorCode::InternalError,
+                        message,
+                        data,
+                    );
+                    assert_eq!(allowlisted_test_timeout_source(&peer), Some(expected));
+                    let error = http_test_error(fastmcp_client::HttpClientError::CoreResult(peer));
+                    let result =
+                        failed_test_result("list_tools", std::time::Duration::ZERO, &error);
+                    assert_eq!(result.timeout_source, None);
+                    assert!(
+                        !serde_json::to_string(&result)
+                            .unwrap()
+                            .contains("not-a-timer")
+                    );
+                }
+            }
         }
 
         #[test]

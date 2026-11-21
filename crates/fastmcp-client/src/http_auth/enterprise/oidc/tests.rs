@@ -171,6 +171,65 @@ fn seeded() -> PreparedOidcAuthorization {
         .unwrap()
 }
 
+/// Reuses the real callback and code serializers with the nonce in the
+/// independently signed fixture. This is local test flow construction, not a
+/// browser-launch or durable pending-flow attestation.
+pub(in crate::http_auth::enterprise) fn grant_for_exchange(
+    profile: EnterpriseProfile,
+    policy: EnterpriseResponsePolicy,
+    nonce_byte: u8,
+) -> OidcCodeGrant {
+    let authentication = profile.idp_authentication().as_str();
+    let metadata = json!({
+        "issuer": profile.idp_issuer(),
+        "authorization_endpoint": profile.idp_authorization_endpoint(),
+        "token_endpoint": profile.idp_token_endpoint(),
+        "jwks_uri": profile.oidc_jwks_uri(),
+        "grant_types_supported": ["authorization_code", TOKEN_EXCHANGE_GRANT],
+        "response_types_supported": ["code"],
+        "response_modes_supported": ["query"],
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": ["openid", "read", "write"],
+        "subject_types_supported": ["public"],
+        "token_endpoint_auth_methods_supported": [authentication],
+        "identity_chaining_requested_token_types_supported": [ID_JAG_TOKEN_TYPE],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "authorization_response_iss_parameter_supported": true
+    });
+    let registration = json!({
+        "issuer": profile.idp_issuer(),
+        "token_endpoint": profile.idp_token_endpoint(),
+        "client_id": profile.idp_client_id(),
+        "grant_types": ["authorization_code", TOKEN_EXCHANGE_GRANT],
+        "token_endpoint_auth_method": authentication,
+        "application_type": "web",
+        "response_types": ["code"],
+        "redirect_uris": [REDIRECT],
+        "subject_type": "public",
+        "scope": "openid read write"
+    });
+    let selected = admit_configuration(
+        profile,
+        &metadata,
+        &registration,
+        EnterpriseOidcSubjectType::Public,
+    )
+    .unwrap()
+    .with_response_policy(policy, None)
+    .unwrap();
+    let pending = selected
+        .prepare_from_draws(
+            &[0x11; 32],
+            &[nonce_byte; 32],
+            &[0x33; 32],
+            now(),
+            now() + Duration::from_secs(300),
+        )
+        .unwrap();
+    let response = callback(&pending, "code=one-time%2Bcode%3Dvalue");
+    code(pending.admit_callback(&response, now()).unwrap())
+}
+
 fn callback(prepared: &PreparedOidcAuthorization, suffix: &str) -> String {
     format!(
         "{REDIRECT}?state={}&iss=https%3A%2F%2Fidp.example&{suffix}",
@@ -844,7 +903,7 @@ fn response_owner(pending: PreparedOidcAuthorization) -> OidcCodeResponseAdmissi
     owner
 }
 
-fn token_body() -> Vec<u8> {
+pub(in crate::http_auth::enterprise) fn token_body() -> Vec<u8> {
     serde_json::to_vec(&json!({
         "access_token":"temporary-access", "token_type":"Bearer",
         "id_token":SIGNED_CODE_TOKEN, "scope":"openid"

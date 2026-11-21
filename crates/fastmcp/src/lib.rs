@@ -1839,6 +1839,32 @@ pub mod auto {
                 .await
         }
 
+        /// Sends one generic final extension request with request-local cancellation.
+        ///
+        /// Cancellation retires only this request's native upstream ID. The
+        /// caller's context and independently owned work remain usable.
+        pub async fn request_final_extension_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &fastmcp_core::McpRequestCancellation,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> McpResult<JsonValue>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .request_final_extension_with_cancellation(
+                    cx,
+                    cancellation,
+                    extension_id,
+                    method,
+                    parameters,
+                )
+                .await
+        }
+
         /// Publishes one configured extension notification with fresh settings proof.
         /// Auto sessions selected to exact 2024 reject before writing a frame.
         /// This does not allocate a request ID or wait for a response.
@@ -3285,6 +3311,8 @@ pub mod modern {
             pub use fastmcp_server::extensions::authoring::ExtensionHttpUpstream;
             #[cfg(all(feature = "proxy", unix))]
             pub use fastmcp_server::extensions::authoring::ExtensionStdioUpstream;
+            #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
+            pub use fastmcp_server::extensions::authoring::ExtensionWebSocketUpstream;
             pub use fastmcp_server::extensions::authoring::{
                 ExtensionBuilder, ExtensionContext, ExtensionDescriptor, ExtensionHandler,
                 ExtensionNotification, ExtensionNotificationContext, ExtensionNotificationHandler,
@@ -3716,6 +3744,38 @@ pub mod modern {
                 self.inner,
                 command,
                 args,
+                client_settings,
+            ))
+            .await
+        }
+
+        /// Connects an authored extension to an owned native WebSocket transport.
+        ///
+        /// The caller supplies the upgraded transport and owns its TLS policy.
+        /// Discovery independently negotiates the complete declaration before
+        /// returning the shared upstream handle. Install it with the typed
+        /// WebSocket proxy request or client-notification routes; request-owned
+        /// server notifications are not supported by this adapter.
+        #[cfg(all(
+            feature = "extension-authoring",
+            feature = "proxy",
+            feature = "websocket-experimental"
+        ))]
+        pub async fn connect_extension_websocket_upstream_with_cx<ClientSettings, IO>(
+            self,
+            cx: &Cx,
+            transport: fastmcp_transport::websocket::AsyncWsClientTransport<IO>,
+            registration: extensions::authoring::ExtensionRegistration,
+            client_settings: &ClientSettings,
+        ) -> McpResult<extensions::authoring::ExtensionWebSocketUpstream<IO>>
+        where
+            ClientSettings: serde::Serialize + Sync + ?Sized,
+            IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            Box::pin(registration.connect_websocket_upstream(
+                cx,
+                self.inner,
+                transport,
                 client_settings,
             ))
             .await
@@ -4950,6 +5010,32 @@ pub mod modern {
         {
             self.inner
                 .request_final_extension(cx, extension_id, method, parameters)
+                .await
+        }
+
+        /// Sends one generic final extension request with request-local cancellation.
+        ///
+        /// Cancellation retires only this request's native upstream ID. The
+        /// caller's context and independently owned work remain usable.
+        pub async fn request_final_extension_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &fastmcp_core::McpRequestCancellation,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> McpResult<JsonValue>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .request_final_extension_with_cancellation(
+                    cx,
+                    cancellation,
+                    extension_id,
+                    method,
+                    parameters,
+                )
                 .await
         }
 
