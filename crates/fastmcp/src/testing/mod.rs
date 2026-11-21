@@ -97,7 +97,7 @@ pub mod prelude {
     };
 
     #[cfg(feature = "testing-lab")]
-    pub use super::lab::{LabConfig, LabRuntime, TestClient, TestContext};
+    pub use super::lab::{LabConfig, LabRuntime, TestClient, TestClientProtocolMode, TestContext};
 
     // Re-export commonly used types
     pub use crate::{

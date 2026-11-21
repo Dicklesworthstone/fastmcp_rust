@@ -9,21 +9,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::{
-    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, GetPromptParams,
-    GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, LegacyContent, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
-    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
-    Prompt, ReadResourceParams, ReadResourceResult, RequestId, Resource, ResourceTemplate,
+    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
+    FINAL_SERVER_INFO_META_KEY, GetPromptParams, GetPromptResult, InitializeParams,
+    InitializeResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent,
+    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
+    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, Prompt,
+    ReadResourceParams, ReadResourceResult, RequestId, Resource, ResourceTemplate,
     ServerCapabilities, ServerInfo, Tool,
 };
 use fastmcp_transport::Transport;
 use fastmcp_transport::memory::MemoryTransport;
 
+/// Protocol era selection for [`TestClient`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TestClientProtocolMode {
+    /// Exact MCP `2024-11-05` (`initialize` + `notifications/initialized`).
+    ///
+    /// Default for [`TestClient::new`] so existing exact-2024 test harnesses
+    /// keep their exact wire behavior.
+    #[default]
+    Legacy2024,
+    /// Exact MCP `2026-07-28` (`server/discover` + `_meta` request headers).
+    ///
+    /// Never downgrades to `2024-11-05`.
+    Modern2026,
+    /// Modern-first negotiation: probes `server/discover` (`2026-07-28`) and
+    /// falls back to exact `2024-11-05` `initialize` only when the peer
+    /// replies `MethodNotFound` (`-32601`).
+    Auto,
+}
+
 /// Test client for in-process MCP testing.
 ///
 /// Unlike the production `Client`, this works with `MemoryTransport` for
-/// fast, in-process testing without subprocess spawning.
+/// fast, in-process testing without subprocess spawning. Supports exact
+/// MCP `2024-11-05` ([`TestClient::new`]), exact MCP `2026-07-28`
+/// ([`TestClient::new_modern`]), and modern-first negotiation
+/// ([`TestClient::new_auto`]).
 ///
 /// # Example
 ///
@@ -35,8 +59,8 @@ use fastmcp_transport::memory::MemoryTransport;
 /// // Run server in a background thread (omitted here). Prefer using the
 /// // higher-level E2E harness helpers in this crate which join threads on drop.
 ///
-/// // Create test client on the caller's context
-/// let mut client = TestClient::new(client_transport, cx.clone());
+/// // Create modern 2026-07-28 test client on the caller's context
+/// let mut client = TestClient::new_modern(client_transport, cx.clone());
 /// client.initialize().unwrap();
 ///
 /// // Test operations
@@ -48,6 +72,10 @@ pub struct TestClient {
     transport: MemoryTransport,
     /// Capability context for cancellation.
     cx: Cx,
+    /// Configured protocol era mode.
+    protocol_mode: TestClientProtocolMode,
+    /// Negotiated protocol era after initialization.
+    negotiated_mode: Option<TestClientProtocolMode>,
     /// Client identification info.
     client_info: ClientInfo,
     /// Client capabilities.
@@ -67,6 +95,10 @@ pub struct TestClient {
 impl TestClient {
     /// Creates a test client over `transport` that runs on the caller's `cx`.
     ///
+    /// Defaults to [`TestClientProtocolMode::Legacy2024`] for existing exact-2024
+    /// harness compatibility; use [`Self::new_modern`] for MCP `2026-07-28` or
+    /// [`Self::new_auto`] for modern-first negotiation.
+    ///
     /// The caller supplies the context: a library helper that built one would
     /// have to create or enter a runtime of its own (FND-04).
     ///
@@ -81,6 +113,8 @@ impl TestClient {
         Self {
             transport,
             cx,
+            protocol_mode: TestClientProtocolMode::Legacy2024,
+            negotiated_mode: None,
             client_info: ClientInfo {
                 name: "test-client".to_owned(),
                 version: "1.0.0".to_owned(),
@@ -92,6 +126,37 @@ impl TestClient {
             next_id: AtomicU64::new(1),
             initialized: false,
         }
+    }
+
+    /// Creates a test client configured strictly for MCP `2026-07-28` (`server/discover`).
+    #[must_use]
+    pub fn new_modern(transport: MemoryTransport, cx: Cx) -> Self {
+        Self::new(transport, cx).with_protocol_mode(TestClientProtocolMode::Modern2026)
+    }
+
+    /// Creates a test client using modern-first (`2026-07-28` then `2024-11-05`) negotiation.
+    #[must_use]
+    pub fn new_auto(transport: MemoryTransport, cx: Cx) -> Self {
+        Self::new(transport, cx).with_protocol_mode(TestClientProtocolMode::Auto)
+    }
+
+    /// Selects the protocol era mode before initialization.
+    #[must_use]
+    pub const fn with_protocol_mode(mut self, mode: TestClientProtocolMode) -> Self {
+        self.protocol_mode = mode;
+        self
+    }
+
+    /// Returns the configured protocol era mode.
+    #[must_use]
+    pub const fn protocol_mode(&self) -> TestClientProtocolMode {
+        self.protocol_mode
+    }
+
+    /// Returns the negotiated protocol era after initialization (`Legacy2024` or `Modern2026`).
+    #[must_use]
+    pub const fn negotiated_mode(&self) -> Option<TestClientProtocolMode> {
+        self.negotiated_mode
     }
 
     /// Sets the client info for initialization.
@@ -111,7 +176,8 @@ impl TestClient {
         self
     }
 
-    /// Performs the MCP initialization handshake.
+    /// Performs the MCP initialization or modern `server/discover` handshake
+    /// according to [`Self::protocol_mode`].
     ///
     /// Must be called before any other operations.
     ///
@@ -119,6 +185,20 @@ impl TestClient {
     ///
     /// Returns an error if the initialization fails.
     pub fn initialize(&mut self) -> McpResult<InitializeResult> {
+        match self.protocol_mode {
+            TestClientProtocolMode::Legacy2024 => self.initialize_legacy(),
+            TestClientProtocolMode::Modern2026 => self.initialize_modern(),
+            TestClientProtocolMode::Auto => match self.initialize_modern() {
+                Ok(result) => Ok(result),
+                Err(error) if error.code == fastmcp_core::McpErrorCode::MethodNotFound => {
+                    self.initialize_legacy()
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    fn initialize_legacy(&mut self) -> McpResult<InitializeResult> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: self.capabilities.clone(),
@@ -141,8 +221,92 @@ impl TestClient {
             )
             .map_err(|error| McpError::internal_error(format!("Transport error: {error:?}")))?;
 
+        self.negotiated_mode = Some(TestClientProtocolMode::Legacy2024);
         self.initialized = true;
         Ok(result)
+    }
+
+    fn initialize_modern(&mut self) -> McpResult<InitializeResult> {
+        let params = serde_json::json!({
+            "_meta": self.modern_request_meta(),
+        });
+        let raw = self.send_raw_request(fastmcp_protocol::methods::SERVER_DISCOVER, params)?;
+        let server_info: ServerInfo = raw
+            .get("_meta")
+            .and_then(|meta| meta.get(FINAL_SERVER_INFO_META_KEY))
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                McpError::internal_error(format!("Failed to deserialize modern serverInfo: {error}"))
+            })?
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "Modern server/discover response missing _meta serverInfo",
+                )
+            })?;
+        let capabilities: ServerCapabilities = raw
+            .get("capabilities")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                McpError::internal_error(format!(
+                    "Failed to deserialize modern capabilities: {error}"
+                ))
+            })?
+            .unwrap_or_default();
+        let instructions = raw
+            .get("instructions")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let result = InitializeResult {
+            protocol_version: FINAL_PROTOCOL_VERSION.to_owned(),
+            capabilities: capabilities.clone(),
+            server_info: server_info.clone(),
+            instructions,
+        };
+        self.server_info = Some(server_info);
+        self.server_capabilities = Some(capabilities);
+        self.protocol_version = Some(FINAL_PROTOCOL_VERSION.to_owned());
+        self.negotiated_mode = Some(TestClientProtocolMode::Modern2026);
+        self.initialized = true;
+        Ok(result)
+    }
+
+    fn modern_request_meta(&self) -> serde_json::Value {
+        let caps = serde_json::to_value(&self.capabilities).unwrap_or_else(|_| serde_json::json!({}));
+        serde_json::json!({
+            FINAL_PROTOCOL_VERSION_META_KEY: FINAL_PROTOCOL_VERSION,
+            FINAL_CLIENT_CAPABILITIES_META_KEY: caps,
+        })
+    }
+
+    const fn is_modern(&self) -> bool {
+        matches!(self.negotiated_mode, Some(TestClientProtocolMode::Modern2026))
+    }
+
+    fn send_modern_request(
+        &mut self,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        let meta = self.modern_request_meta();
+        if let Some(obj) = params.as_object_mut() {
+            match obj.get_mut("_meta").and_then(serde_json::Value::as_object_mut) {
+                Some(existing) => {
+                    if let Some(meta_obj) = meta.as_object() {
+                        for (k, v) in meta_obj {
+                            existing.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+                None => {
+                    obj.insert("_meta".to_owned(), meta);
+                }
+            }
+        }
+        self.send_raw_request(method, params)
     }
 
     /// Returns whether the client has been initialized.
@@ -176,6 +340,16 @@ impl TestClient {
     /// Returns an error if the request fails.
     pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
         self.ensure_initialized()?;
+        if self.is_modern() {
+            let raw = self.send_modern_request("tools/list", serde_json::json!({}))?;
+            let tools = raw
+                .get("tools")
+                .cloned()
+                .ok_or_else(|| McpError::internal_error("Modern tools/list missing tools array"))?;
+            return serde_json::from_value(tools).map_err(|e| {
+                McpError::internal_error(format!("Failed to deserialize modern tools: {e}"))
+            });
+        }
         let params = ListToolsParams::default();
         let result: ListToolsResult = self.send_request("tools/list", params)?;
         Ok(result.tools)
@@ -192,12 +366,38 @@ impl TestClient {
         arguments: serde_json::Value,
     ) -> McpResult<Vec<LegacyContent>> {
         self.ensure_initialized()?;
-        let params = CallToolParams {
-            name: name.to_string(),
-            arguments: Some(arguments),
-            meta: None,
+        let result: CallToolResult = if self.is_modern() {
+            let raw = self.send_modern_request(
+                "tools/call",
+                serde_json::json!({
+                    "name": name,
+                    "arguments": arguments,
+                }),
+            )?;
+            let is_error = raw
+                .get("isError")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let content: Vec<LegacyContent> = raw
+                .get("content")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| {
+                    McpError::internal_error(format!(
+                        "Failed to deserialize modern tool content: {e}"
+                    ))
+                })?
+                .unwrap_or_default();
+            CallToolResult { content, is_error }
+        } else {
+            let params = CallToolParams {
+                name: name.to_string(),
+                arguments: Some(arguments),
+                meta: None,
+            };
+            self.send_request("tools/call", params)?
         };
-        let result: CallToolResult = self.send_request("tools/call", params)?;
 
         if result.is_error {
             let error_msg = result
@@ -221,6 +421,15 @@ impl TestClient {
     /// Returns an error if the request fails.
     pub fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
         self.ensure_initialized()?;
+        if self.is_modern() {
+            let raw = self.send_modern_request("resources/list", serde_json::json!({}))?;
+            let resources = raw.get("resources").cloned().ok_or_else(|| {
+                McpError::internal_error("Modern resources/list missing resources array")
+            })?;
+            return serde_json::from_value(resources).map_err(|e| {
+                McpError::internal_error(format!("Failed to deserialize modern resources: {e}"))
+            });
+        }
         let params = ListResourcesParams::default();
         let result: ListResourcesResult = self.send_request("resources/list", params)?;
         Ok(result.resources)
@@ -233,6 +442,20 @@ impl TestClient {
     /// Returns an error if the request fails.
     pub fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
         self.ensure_initialized()?;
+        if self.is_modern() {
+            let raw =
+                self.send_modern_request("resources/templates/list", serde_json::json!({}))?;
+            let templates = raw.get("resourceTemplates").cloned().ok_or_else(|| {
+                McpError::internal_error(
+                    "Modern resources/templates/list missing resourceTemplates array",
+                )
+            })?;
+            return serde_json::from_value(templates).map_err(|e| {
+                McpError::internal_error(format!(
+                    "Failed to deserialize modern resource templates: {e}"
+                ))
+            });
+        }
         let params = ListResourceTemplatesParams::default();
         let result: ListResourceTemplatesResult =
             self.send_request("resources/templates/list", params)?;
@@ -246,6 +469,20 @@ impl TestClient {
     /// Returns an error if the resource cannot be read.
     pub fn read_resource(&mut self, uri: &str) -> McpResult<Vec<LegacyResourceContent>> {
         self.ensure_initialized()?;
+        if self.is_modern() {
+            let raw = self.send_modern_request(
+                "resources/read",
+                serde_json::json!({ "uri": uri }),
+            )?;
+            let contents = raw.get("contents").cloned().ok_or_else(|| {
+                McpError::internal_error("Modern resources/read missing contents array")
+            })?;
+            return serde_json::from_value(contents).map_err(|e| {
+                McpError::internal_error(format!(
+                    "Failed to deserialize modern resource contents: {e}"
+                ))
+            });
+        }
         let params = ReadResourceParams {
             uri: uri.to_string(),
             meta: None,
@@ -261,6 +498,15 @@ impl TestClient {
     /// Returns an error if the request fails.
     pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
         self.ensure_initialized()?;
+        if self.is_modern() {
+            let raw = self.send_modern_request("prompts/list", serde_json::json!({}))?;
+            let prompts = raw.get("prompts").cloned().ok_or_else(|| {
+                McpError::internal_error("Modern prompts/list missing prompts array")
+            })?;
+            return serde_json::from_value(prompts).map_err(|e| {
+                McpError::internal_error(format!("Failed to deserialize modern prompts: {e}"))
+            });
+        }
         let params = ListPromptsParams::default();
         let result: ListPromptsResult = self.send_request("prompts/list", params)?;
         Ok(result.prompts)
@@ -277,6 +523,23 @@ impl TestClient {
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<LegacyPromptMessage>> {
         self.ensure_initialized()?;
+        if self.is_modern() {
+            let mut body = serde_json::json!({ "name": name });
+            if !arguments.is_empty() {
+                body["arguments"] = serde_json::to_value(&arguments).map_err(|e| {
+                    McpError::internal_error(format!("Failed to serialize prompt arguments: {e}"))
+                })?;
+            }
+            let raw = self.send_modern_request("prompts/get", body)?;
+            let messages = raw.get("messages").cloned().ok_or_else(|| {
+                McpError::internal_error("Modern prompts/get missing messages array")
+            })?;
+            return serde_json::from_value(messages).map_err(|e| {
+                McpError::internal_error(format!(
+                    "Failed to deserialize modern prompt messages: {e}"
+                ))
+            });
+        }
         let params = GetPromptParams {
             name: name.to_string(),
             arguments: if arguments.is_empty() {
@@ -675,5 +938,223 @@ mod tests {
         );
         assert!(notification.id.is_none());
         assert!(notification.params.is_none());
+    }
+
+    #[test]
+    fn modern_and_auto_test_client_positive_and_planted_negative() {
+        use std::thread;
+
+        use fastmcp_core::McpContext;
+        use fastmcp_protocol::{Content, PromptMessage, ResourceContent, Role};
+        use fastmcp_server::{PromptHandler, ResourceHandler, Server, ToolHandler};
+        use serde_json::json;
+
+        struct EchoTool;
+        impl ToolHandler for EchoTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "echo".to_owned(),
+                    description: Some("Echoes message".to_owned()),
+                    input_schema: json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+                let msg = arguments
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                Ok(vec![Content::text(format!("modern:{msg}"))])
+            }
+        }
+
+        struct InfoResource;
+        impl ResourceHandler for InfoResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "test://info".to_owned(),
+                    name: "info".to_owned(),
+                    description: None,
+                    mime_type: Some("text/plain".to_owned()),
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![ResourceContent {
+                    uri: "test://info".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    text: Some("hello-resource".to_owned()),
+                    blob: None,
+                }])
+            }
+        }
+
+        struct GreetPrompt;
+        impl PromptHandler for GreetPrompt {
+            fn definition(&self) -> Prompt {
+                Prompt {
+                    name: "greet".to_owned(),
+                    description: Some("Greets user".to_owned()),
+                    arguments: Vec::new(),
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
+            }
+
+            fn get(
+                &self,
+                _ctx: &McpContext,
+                arguments: HashMap<String, String>,
+            ) -> McpResult<Vec<PromptMessage>> {
+                let who = arguments.get("who").map_or("world", String::as_str);
+                Ok(vec![PromptMessage {
+                    role: Role::User,
+                    content: Content::text(format!("Hi, {who}")),
+                }])
+            }
+        }
+
+        // Positive 1: Modern2026 against a real FastMCP server over MemoryTransport.
+        for mode in [
+            TestClientProtocolMode::Modern2026,
+            TestClientProtocolMode::Auto,
+        ] {
+            let (client_transport, server_transport) = create_memory_transport_pair();
+            let server = Server::new("modern-test-server", "2.0.0")
+                .tool(EchoTool)
+                .resource(InfoResource)
+                .prompt(GreetPrompt)
+                .build();
+            let handle = thread::spawn(move || {
+                let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("test server runtime");
+                rt.block_on(async move {
+                    let cx = Cx::current().expect("runtime cx");
+                    let _ = server.serve_memory(&cx, server_transport).await;
+                });
+            });
+
+            let mut client = TestClient::new(client_transport, Cx::for_testing())
+                .with_protocol_mode(mode);
+            let init = client.initialize().expect("modern server/discover succeeds");
+            assert_eq!(init.protocol_version, FINAL_PROTOCOL_VERSION);
+            assert_eq!(init.server_info.name, "modern-test-server");
+            assert_eq!(client.protocol_version(), Some(FINAL_PROTOCOL_VERSION));
+            assert_eq!(
+                client.negotiated_mode(),
+                Some(TestClientProtocolMode::Modern2026)
+            );
+
+            let tools = client.list_tools().expect("modern tools/list");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].name, "echo");
+
+            let content = client
+                .call_tool("echo", json!({"message": "2026"}))
+                .expect("modern tools/call");
+            assert!(matches!(
+                content.first(),
+                Some(LegacyContent::Text { text, .. }) if text == "modern:2026"
+            ));
+
+            let resources = client.list_resources().expect("modern resources/list");
+            assert_eq!(resources.len(), 1);
+            let contents = client.read_resource("test://info").expect("modern resources/read");
+            assert_eq!(contents[0].text.as_deref(), Some("hello-resource"));
+
+            let prompts = client.list_prompts().expect("modern prompts/list");
+            assert_eq!(prompts.len(), 1);
+            let messages = client
+                .get_prompt("greet", HashMap::from([("who".to_owned(), "mcp".to_owned())]))
+                .expect("modern prompts/get");
+            assert!(matches!(
+                &messages[0].content,
+                LegacyContent::Text { text, .. } if text == "Hi, mcp"
+            ));
+
+            client.close();
+            handle.join().expect("server thread settles");
+        }
+
+        // Positive 2: Auto falls back cleanly to exact 2024-11-05 when peer
+        // returns MethodNotFound (-32601) for server/discover.
+        {
+            let (client_transport, mut server_transport) = create_memory_transport_pair();
+            let server_cx = Cx::for_testing();
+            // Queue MethodNotFound for id=1 (server/discover), then legacy InitializeResult for id=2.
+            server_transport
+                .send(
+                    &server_cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::error(
+                        Some(RequestId::Number(1)),
+                        McpError::method_not_found(fastmcp_protocol::methods::SERVER_DISCOVER)
+                            .into(),
+                    )),
+                )
+                .unwrap();
+            let legacy_init = InitializeResult {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                capabilities: ServerCapabilities::default(),
+                server_info: ServerInfo {
+                    name: "legacy-peer".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                instructions: None,
+            };
+            server_transport
+                .send(
+                    &server_cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(2),
+                        serde_json::to_value(legacy_init).unwrap(),
+                    )),
+                )
+                .unwrap();
+
+            let mut client = TestClient::new_auto(client_transport, Cx::for_testing());
+            let init = client.initialize().expect("Auto falls back to 2024-11-05");
+            assert_eq!(init.protocol_version, PROTOCOL_VERSION);
+            assert_eq!(
+                client.negotiated_mode(),
+                Some(TestClientProtocolMode::Legacy2024)
+            );
+        }
+
+        // Near-identical planted negative (RH-5): Modern2026 MUST fail closed
+        // on the exact same MethodNotFound response without downgrading or
+        // marking initialized.
+        {
+            let (client_transport, mut server_transport) = create_memory_transport_pair();
+            let server_cx = Cx::for_testing();
+            server_transport
+                .send(
+                    &server_cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::error(
+                        Some(RequestId::Number(1)),
+                        McpError::method_not_found(fastmcp_protocol::methods::SERVER_DISCOVER)
+                            .into(),
+                    )),
+                )
+                .unwrap();
+
+            let mut client = TestClient::new_modern(client_transport, Cx::for_testing());
+            let err = client
+                .initialize()
+                .expect_err("Modern2026 must refuse legacy-only peer without silent downgrade");
+            assert_eq!(err.code, fastmcp_core::McpErrorCode::MethodNotFound);
+            assert!(!client.is_initialized());
+            assert!(client.negotiated_mode().is_none());
+            assert!(client.protocol_version().is_none());
+        }
     }
 }
