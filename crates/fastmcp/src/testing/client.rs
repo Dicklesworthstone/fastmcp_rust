@@ -1808,11 +1808,15 @@ mod tests {
         let (client_transport, mut server_transport) = create_memory_transport_pair();
         let server_cx = Cx::for_testing();
         let discovery = serde_json::json!({
-            "protocolVersion": MODERN_PROTOCOL_VERSION,
-            "serverInfo": { "name": "modern-null-arg-peer", "version": "1.0.0" },
-            "capabilities": {
-                "behaviors": {
-                    "tools": { "list": {}, "call": {} }
+            "resultType": "complete",
+            "supportedVersions": [FINAL_PROTOCOL_VERSION],
+            "capabilities": { "tools": {} },
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "modern-null-arg-peer",
+                    "version": "1.0.0"
                 }
             }
         });
@@ -1837,19 +1841,18 @@ mod tests {
                 )),
             )
             .unwrap();
-        server_transport
-            .send(
-                &server_cx,
-                &JsonRpcMessage::Response(JsonRpcResponse::error(
-                    Some(RequestId::Number(3)),
-                    McpError::invalid_params("arguments must be an object").into(),
-                )),
-            )
-            .unwrap();
 
         let mut client = TestClient::new_modern(client_transport, Cx::for_testing());
-        let debug = format!("{client:?}");
-        assert!(debug.contains("protocol_mode: Modern2026"));
+        let debug_before = format!("{client:?}");
+        assert!(debug_before.contains("protocol_mode: Modern2026"));
+        assert!(debug_before.contains("negotiated_mode: None"));
+
+        let init = client
+            .initialize()
+            .expect("modern discovery must succeed");
+        assert_eq!(init.protocol_version, FINAL_PROTOCOL_VERSION);
+        let debug_after = format!("{client:?}");
+        assert!(debug_after.contains("negotiated_mode: Some(Modern2026)"));
 
         // Positive: Value::Null omits `"arguments"` on the modern wire request.
         let content = client
@@ -1867,16 +1870,20 @@ mod tests {
             "Value::Null must omit arguments rather than sending arguments: null"
         );
 
-        // Near-identical planted negative (RH-5): non-null scalar arguments are still forwarded
-        // and rejected rather than silently dropped.
+        // Near-identical planted negative (RH-5): non-null scalar arguments are NOT
+        // silently dropped as null; CoreRequest::decode rejects them locally as
+        // InvalidParams before emitting any malformed wire frame.
         let err = client
             .call_tool("ping", serde_json::json!(42))
-            .expect_err("scalar arguments must still be forwarded and rejected");
+            .expect_err("scalar arguments must be rejected rather than dropped");
         assert_eq!(err.code, fastmcp_core::McpErrorCode::InvalidParams);
-        let JsonRpcMessage::Request(scalar_call) = server_transport.recv(&server_cx).unwrap()
-        else {
-            panic!("expected second tools/call request");
-        };
-        assert_eq!(scalar_call.params.unwrap()["arguments"], 42);
+        client.close();
+        assert!(
+            matches!(
+                server_transport.recv(&server_cx),
+                Err(TransportError::Closed)
+            ),
+            "locally rejected scalar arguments must never send a malformed wire frame"
+        );
     }
 }
