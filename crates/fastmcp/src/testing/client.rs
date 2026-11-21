@@ -9,21 +9,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use asupersync::Cx;
 use fastmcp_client::{MemoryClient, MemoryClientBuilder};
 use fastmcp_core::{McpError, McpErrorCode, McpResult};
+use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, CoreRequest, CoreResult,
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION,
     FINAL_PROTOCOL_VERSION_META_KEY, FinalCoreResult, GetPromptParams, GetPromptResult,
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, LegacyContent, LegacyCoreResult,
-    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, Prompt,
-    ReadResourceParams, ReadResourceResult, RequestId, Resource, ResourceTemplate,
+    JsonRpcResponse, LegacyContent, LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent,
+    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
+    Prompt, ReadResourceParams, ReadResourceResult, RequestId, Resource, ResourceTemplate,
     ServerCapabilities, ServerDiscoverResult, ServerInfo, Tool,
 };
-use fastmcp_protocol::protocol_policy::ProtocolEra;
-use fastmcp_transport::{Transport, TransportError};
 use fastmcp_transport::memory::MemoryTransport;
+use fastmcp_transport::{Transport, TransportError};
 
 const MAX_INTERLEAVED_MESSAGES: usize = 128;
 
@@ -210,14 +209,16 @@ impl TestClient {
     where
         F: FnOnce(MemoryClientBuilder) -> McpResult<MemoryClientBuilder>,
     {
-        if self.initialized || self.transport.is_closed() || self.next_id.load(Ordering::SeqCst) != 1 {
+        if self.initialized
+            || self.transport.is_closed()
+            || self.next_id.load(Ordering::SeqCst) != 1
+        {
             return Err(McpError::invalid_request(
                 "Production Memory handoff requires an unused, open TestClient",
             ));
         }
-        let builder = configure(
-            MemoryClientBuilder::new(self.client_info).capabilities(self.capabilities),
-        )?;
+        let builder =
+            configure(MemoryClientBuilder::new(self.client_info).capabilities(self.capabilities))?;
         builder.connect(&self.cx, self.transport).await
     }
 
@@ -281,7 +282,9 @@ impl TestClient {
                     protocol_version: FINAL_PROTOCOL_VERSION.to_owned(),
                     capabilities: self.server_capabilities.clone().unwrap_or_default(),
                     server_info,
-                    instructions: discovery.instructions().map(|value| value.as_str().to_owned()),
+                    instructions: discovery
+                        .instructions()
+                        .map(|value| value.as_str().to_owned()),
                 })
             }
             _ => unreachable!("initialization only admits its selected discovery result"),
@@ -297,7 +300,9 @@ impl TestClient {
     pub fn initialize_core(&mut self) -> McpResult<CoreResult> {
         self.ensure_open()?;
         if self.initialized {
-            return Err(McpError::invalid_request("TestClient is already initialized"));
+            return Err(McpError::invalid_request(
+                "TestClient is already initialized",
+            ));
         }
         if self.next_id.load(Ordering::SeqCst) != 1 {
             self.close();
@@ -314,16 +319,18 @@ impl TestClient {
 
     fn initialize_selected(&mut self) -> McpResult<CoreResult> {
         if self.protocol_mode == TestClientProtocolMode::Legacy2024 {
-            return self.initialize_legacy().map(|result| {
-                CoreResult::Legacy(LegacyCoreResult::Initialize(result))
-            });
+            return self
+                .initialize_legacy()
+                .map(|result| CoreResult::Legacy(LegacyCoreResult::Initialize(result)));
         }
         match self.probe_modern()? {
             ModernProbe::Discovered(discovery) => {
                 let discovery = *discovery;
                 let capabilities = serde_json::to_value(discovery.capabilities())
                     .and_then(serde_json::from_value)
-                    .map_err(|_| McpError::invalid_request("Invalid modern discovery capabilities"))?;
+                    .map_err(|_| {
+                        McpError::invalid_request("Invalid modern discovery capabilities")
+                    })?;
                 self.server_info = discovery.server_info().cloned();
                 self.server_capabilities = Some(capabilities);
                 self.protocol_version = Some(FINAL_PROTOCOL_VERSION.to_owned());
@@ -346,12 +353,13 @@ impl TestClient {
                     ));
                 }
 
-                self.cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+                self.cx
+                    .checkpoint()
+                    .map_err(|_| McpError::request_cancelled())?;
                 self.transport = factory(&self.cx)?;
                 self.ensure_open()?;
-                self.initialize_legacy().map(|result| {
-                    CoreResult::Legacy(LegacyCoreResult::Initialize(result))
-                })
+                self.initialize_legacy()
+                    .map(|result| CoreResult::Legacy(LegacyCoreResult::Initialize(result)))
             }
         }
     }
@@ -391,7 +399,12 @@ impl TestClient {
     }
 
     fn probe_modern(&mut self) -> McpResult<ModernProbe> {
-        if self.capabilities.extensions.as_ref().is_some_and(|settings| !settings.is_empty()) {
+        if self
+            .capabilities
+            .extensions
+            .as_ref()
+            .is_some_and(|settings| !settings.is_empty())
+        {
             return Err(McpError::invalid_params(
                 "Extension capabilities require an explicitly configured production MemoryClient",
             ));
@@ -413,7 +426,9 @@ impl TestClient {
         let CoreResult::Final(FinalCoreResult::Discover(discovery)) =
             self.decode_core_response(&request, received)?
         else {
-            return Err(McpError::invalid_request("Unexpected modern discovery result"));
+            return Err(McpError::invalid_request(
+                "Unexpected modern discovery result",
+            ));
         };
         if !discovery
             .supported_versions()
@@ -463,9 +478,9 @@ impl TestClient {
                 "Modern operation requires input; use request_core to retain input requests and retry state",
             ));
         }
-        let source = result.encode().map_err(|_| {
-            McpError::internal_error("Failed to encode admitted TestClient result")
-        })?;
+        let source = result
+            .encode()
+            .map_err(|_| McpError::internal_error("Failed to encode admitted TestClient result"))?;
         serde_json::from_str(&source)
             .map_err(|_| McpError::internal_error("Failed to project admitted TestClient result"))
     }
@@ -524,7 +539,11 @@ impl TestClient {
         } else {
             ProtocolEra::Legacy2024
         };
-        let params = if self.is_modern() { self.modern_parameters(params)? } else { params };
+        let params = if self.is_modern() {
+            self.modern_parameters(params)?
+        } else {
+            params
+        };
         let request = CoreRequest::decode(era, method, Some(&params))
             .map_err(|_| McpError::invalid_params("Invalid TestClient core request"))?;
         let received = self.exchange(method, params)?;
@@ -868,23 +887,32 @@ impl TestClient {
             .map_err(|_| McpError::invalid_params("Invalid or unavailable exact-2024 request"))?;
         let received = self.exchange(method, params_value)?;
         let result = self.decode_core_response(&request, received)?;
-        let source = result.encode()
+        let source = result
+            .encode()
             .map_err(|_| McpError::internal_error("Failed to encode admitted exact-2024 result"))?;
         serde_json::from_str(&source)
             .map_err(|e| McpError::internal_error(format!("Failed to deserialize response: {e}")))
     }
 
-    fn exchange(&mut self, method: &str, params: serde_json::Value) -> McpResult<TestClientResponse> {
+    fn exchange(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> McpResult<TestClientResponse> {
         self.ensure_open()?;
         let id = match i64::try_from(self.next_request_id()) {
             Ok(id) => RequestId::Number(id),
             Err(_) => {
                 self.close();
-                return Err(McpError::invalid_request("TestClient request IDs exhausted"));
+                return Err(McpError::invalid_request(
+                    "TestClient request IDs exhausted",
+                ));
             }
         };
         let request = JsonRpcRequest::new(method, Some(params), id.clone());
-        let result = self.transport.send(&self.cx, &JsonRpcMessage::Request(request))
+        let result = self
+            .transport
+            .send(&self.cx, &JsonRpcMessage::Request(request))
             .map_err(Self::transport_error)
             .and_then(|()| self.recv_response(&id));
         if result.is_err() {
@@ -902,19 +930,29 @@ impl TestClient {
             return Err(Self::peer_error(error));
         }
         // A raw extension advertisement is not a Tasks execution owner.
-        if received.response.result.as_ref().and_then(|result| result.get("resultType"))
-            .and_then(serde_json::Value::as_str) == Some("task")
+        if received
+            .response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("resultType"))
+            .and_then(serde_json::Value::as_str)
+            == Some("task")
         {
             self.close();
             return Err(McpError::invalid_request(
                 "Task results require an explicitly configured production MemoryClient",
             ));
         }
-        let result = received.result_source.as_ref()
+        let result = received
+            .result_source
+            .as_ref()
             .ok_or_else(|| McpError::invalid_request("Core response omitted its result source"))
             .and_then(|source| {
-                request.decode_response_result(&received.response, source.get())
-                    .map_err(|_| McpError::invalid_request("Peer response failed core result admission"))
+                request
+                    .decode_response_result(&received.response, source.get())
+                    .map_err(|_| {
+                        McpError::invalid_request("Peer response failed core result admission")
+                    })
             });
         if result.is_err() {
             self.close();
@@ -923,7 +961,10 @@ impl TestClient {
     }
 
     fn peer_error(error: JsonRpcError) -> McpError {
-        let code = error.code.as_i32().map(McpErrorCode::from)
+        let code = error
+            .code
+            .as_i32()
+            .map(McpErrorCode::from)
             .unwrap_or(McpErrorCode::InternalError);
         match error.data {
             Some(data) => McpError::with_data(code, error.message, data),
@@ -945,8 +986,11 @@ impl TestClient {
             result: Option<Box<serde_json::value::RawValue>>,
         }
         for _ in 0..MAX_INTERLEAVED_MESSAGES {
-            let (message, source) = self.transport.recv_with_source(&self.cx)
-                .map_err(Self::transport_error)?.into_parts();
+            let (message, source) = self
+                .transport
+                .recv_with_source(&self.cx)
+                .map_err(Self::transport_error)?
+                .into_parts();
             match message {
                 JsonRpcMessage::Response(response) => {
                     if response.id.as_ref() != Some(expected_id) {
@@ -954,9 +998,13 @@ impl TestClient {
                             "TestClient response ID does not match its outstanding request",
                         ));
                     }
-                    let source: ResponseSource = serde_json::from_slice(&source)
-                        .map_err(|_| McpError::invalid_request("Invalid admitted response source"))?;
-                    return Ok(TestClientResponse { response, result_source: source.result });
+                    let source: ResponseSource = serde_json::from_slice(&source).map_err(|_| {
+                        McpError::invalid_request("Invalid admitted response source")
+                    })?;
+                    return Ok(TestClientResponse {
+                        response,
+                        result_source: source.result,
+                    });
                 }
                 JsonRpcMessage::Request(request) => {
                     // Notifications don't require a response.
@@ -1191,17 +1239,28 @@ mod tests {
     fn modern_fixture() -> (TestClient, MemoryTransport) {
         let (transport, mut peer) = create_memory_transport_pair();
         let cx = Cx::for_testing();
-        peer.send(&cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(1), discovery_fixture(),
-        ))).unwrap();
+        peer.send(
+            &cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(1),
+                discovery_fixture(),
+            )),
+        )
+        .unwrap();
         let mut client = TestClient::new_modern(transport, cx.clone());
-        assert!(matches!(client.initialize_core().unwrap(), CoreResult::Final(FinalCoreResult::Discover(_))));
+        assert!(matches!(
+            client.initialize_core().unwrap(),
+            CoreResult::Final(FinalCoreResult::Discover(_))
+        ));
         let JsonRpcMessage::Request(request) = peer.recv(&cx).unwrap() else {
             panic!("expected the modern discovery request");
         };
         assert_eq!(request.method, "server/discover");
         assert_eq!(request.id, Some(RequestId::Number(1)));
-        assert_eq!(request.params.unwrap()["_meta"][FINAL_CLIENT_INFO_META_KEY]["name"], "test-client");
+        assert_eq!(
+            request.params.unwrap()["_meta"][FINAL_CLIENT_INFO_META_KEY]["name"],
+            "test-client"
+        );
         (client, peer)
     }
 
@@ -1209,7 +1268,10 @@ mod tests {
     fn modern_core_retains_optional_identity_input_state_and_exact_open_members() {
         let (mut client, mut peer) = modern_fixture();
         assert!(client.server_info().is_none());
-        assert_eq!(client.server_discovery().unwrap().supported_versions(), [FINAL_PROTOCOL_VERSION]);
+        assert_eq!(
+            client.server_discovery().unwrap().supported_versions(),
+            [FINAL_PROTOCOL_VERSION]
+        );
         let mut input = serde_json::json!({
             "resultType": "input_required", "requestState": "retry-opaque",
             "inputRequests": {"roots": {"method": "roots/list"}},
@@ -1219,19 +1281,35 @@ mod tests {
             serde_json::Number::from_string_unchecked("7.30e-2".to_owned()),
         );
         for id in [2, 3] {
-            peer.send(&client.cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
-                RequestId::Number(id), input.clone(),
-            ))).unwrap();
+            peer.send(
+                &client.cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    RequestId::Number(id),
+                    input.clone(),
+                )),
+            )
+            .unwrap();
         }
-        let error = client.call_tool("interactive", serde_json::json!({})).unwrap_err();
+        let error = client
+            .call_tool("interactive", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(error.message.contains("requires input"));
-        assert!(client.is_initialized(), "a valid input-required result is not a connection failure");
-        let result = client.request_core("tools/call", serde_json::json!({
-            "name": "interactive", "arguments": {},
-        })).unwrap();
+        assert!(
+            client.is_initialized(),
+            "a valid input-required result is not a connection failure"
+        );
+        let result = client
+            .request_core(
+                "tools/call",
+                serde_json::json!({
+                    "name": "interactive", "arguments": {},
+                }),
+            )
+            .unwrap();
         assert!(result.encode().unwrap().contains("7.30e-2"));
-        let CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) = result else {
+        let CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) = result
+        else {
             panic!("the full input-required result must remain caller-owned");
         };
         assert_eq!(result.request_state(), Some("retry-opaque"));
@@ -1239,7 +1317,11 @@ mod tests {
         client.close();
         assert!(!client.is_initialized());
         assert!(client.server_discovery().is_none());
-        assert!(client.request_core("tools/list", serde_json::json!({})).is_err());
+        assert!(
+            client
+                .request_core("tools/list", serde_json::json!({}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1255,13 +1337,26 @@ mod tests {
         missing_cache.as_object_mut().unwrap().remove("ttlMs");
         let mut malformed_capabilities = discovery_fixture();
         malformed_capabilities["capabilities"] = serde_json::Value::Null;
-        for result in [unsupported, discriminator, missing_cache, malformed_capabilities] {
-            for mode in [TestClientProtocolMode::Modern2026, TestClientProtocolMode::Auto] {
+        for result in [
+            unsupported,
+            discriminator,
+            missing_cache,
+            malformed_capabilities,
+        ] {
+            for mode in [
+                TestClientProtocolMode::Modern2026,
+                TestClientProtocolMode::Auto,
+            ] {
                 let (transport, mut peer) = create_memory_transport_pair();
                 let cx = Cx::for_testing();
-                peer.send(&cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
-                    RequestId::Number(1), result.clone(),
-                ))).unwrap();
+                peer.send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(1),
+                        result.clone(),
+                    )),
+                )
+                .unwrap();
                 let fallback_calls = Arc::new(AtomicUsize::new(0));
                 let calls = Arc::clone(&fallback_calls);
                 let mut client = TestClient::new(transport, cx.clone())
@@ -1276,7 +1371,10 @@ mod tests {
                 assert!(client.protocol_version().is_none());
                 assert!(client.initialize_core().is_err());
                 assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
-                assert!(matches!(peer.recv(&cx).unwrap(), JsonRpcMessage::Request(_)));
+                assert!(matches!(
+                    peer.recv(&cx).unwrap(),
+                    JsonRpcMessage::Request(_)
+                ));
                 assert!(matches!(peer.recv(&cx), Err(TransportError::Closed)));
             }
         }
@@ -1287,24 +1385,45 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
 
-        for id in [None, Some(RequestId::Number(2)), Some(RequestId::String("1".to_owned()))] {
+        for id in [
+            None,
+            Some(RequestId::Number(2)),
+            Some(RequestId::String("1".to_owned())),
+        ] {
             let (transport, mut peer) = create_memory_transport_pair();
             let cx = Cx::for_testing();
-            peer.send(&cx, &JsonRpcMessage::Response(JsonRpcResponse::error(
-                id, McpError::method_not_found("server/discover").into(),
-            ))).unwrap();
+            peer.send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::error(
+                    id,
+                    McpError::method_not_found("server/discover").into(),
+                )),
+            )
+            .unwrap();
             let fallback_calls = Arc::new(AtomicUsize::new(0));
             let calls = Arc::clone(&fallback_calls);
             let mut client = TestClient::new_auto(transport, cx.clone())
                 .with_legacy_transport_factory(move |_| {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    Err(McpError::internal_error("uncorrelated errors cannot authorize fallback"))
+                    Err(McpError::internal_error(
+                        "uncorrelated errors cannot authorize fallback",
+                    ))
                 });
-            assert_eq!(client.initialize_core().unwrap_err().code, McpErrorCode::InvalidRequest);
+            assert_eq!(
+                client.initialize_core().unwrap_err().code,
+                McpErrorCode::InvalidRequest
+            );
             assert!(client.transport().is_closed());
             assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
-            assert!(client.send_raw_request("initialize", serde_json::json!({})).is_err());
-            assert!(matches!(peer.recv(&cx).unwrap(), JsonRpcMessage::Request(_)));
+            assert!(
+                client
+                    .send_raw_request("initialize", serde_json::json!({}))
+                    .is_err()
+            );
+            assert!(matches!(
+                peer.recv(&cx).unwrap(),
+                JsonRpcMessage::Request(_)
+            ));
             assert!(matches!(peer.recv(&cx), Err(TransportError::Closed)));
         }
     }
@@ -1312,17 +1431,34 @@ mod tests {
     #[test]
     fn modern_core_rejects_wrong_results_and_conflicting_metadata_before_further_output() {
         let (mut client, mut peer) = modern_fixture();
-        let error = client.request_core("tools/list", serde_json::json!({
-            "_meta": {FINAL_PROTOCOL_VERSION_META_KEY: PROTOCOL_VERSION},
-        })).unwrap_err();
+        let error = client
+            .request_core(
+                "tools/list",
+                serde_json::json!({
+                    "_meta": {FINAL_PROTOCOL_VERSION_META_KEY: PROTOCOL_VERSION},
+                }),
+            )
+            .unwrap_err();
         assert_eq!(error.code, McpErrorCode::InvalidParams);
-        assert_eq!(client.next_id.load(Ordering::SeqCst), 2, "rejected parameters publish no request");
+        assert_eq!(
+            client.next_id.load(Ordering::SeqCst),
+            2,
+            "rejected parameters publish no request"
+        );
         assert!(client.is_initialized());
         // An untagged 2024-shaped tools/list lacks the final cache contract.
-        peer.send(&client.cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(2), serde_json::json!({"tools": []}),
-        ))).unwrap();
-        assert_eq!(client.list_tools().unwrap_err().code, McpErrorCode::InvalidRequest);
+        peer.send(
+            &client.cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(2),
+                serde_json::json!({"tools": []}),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            client.list_tools().unwrap_err().code,
+            McpErrorCode::InvalidRequest
+        );
         assert!(client.transport().is_closed());
         assert!(!client.is_initialized());
         assert!(client.server_discovery().is_none());
@@ -1332,11 +1468,17 @@ mod tests {
     fn peer_errors_preserve_data_without_closing_a_negotiated_connection() {
         let (mut client, mut peer) = modern_fixture();
         let data = serde_json::json!({"reason": "bounded-refusal", "retry": false});
-        peer.send(&client.cx, &JsonRpcMessage::Response(JsonRpcResponse::error(
-            Some(RequestId::Number(2)),
-            McpError::with_data(McpErrorCode::InvalidParams, "refused", data.clone()).into(),
-        ))).unwrap();
-        let error = client.request_core("tools/list", serde_json::json!({})).unwrap_err();
+        peer.send(
+            &client.cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::error(
+                Some(RequestId::Number(2)),
+                McpError::with_data(McpErrorCode::InvalidParams, "refused", data.clone()).into(),
+            )),
+        )
+        .unwrap();
+        let error = client
+            .request_core("tools/list", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(error.data, Some(data));
         assert!(client.is_initialized());
@@ -1345,12 +1487,19 @@ mod tests {
     #[test]
     fn interleaved_traffic_and_cancellation_have_finite_terminal_boundaries() {
         let (transport, mut peer) =
-            fastmcp_transport::memory::create_memory_transport_pair_with_capacity(MAX_INTERLEAVED_MESSAGES);
+            fastmcp_transport::memory::create_memory_transport_pair_with_capacity(
+                MAX_INTERLEAVED_MESSAGES,
+            );
         let cx = Cx::for_testing();
         for _ in 0..MAX_INTERLEAVED_MESSAGES {
-            peer.send(&cx, &JsonRpcMessage::Request(JsonRpcRequest::notification(
-                "notifications/message", Some(serde_json::json!({"data": "bounded"})),
-            ))).unwrap();
+            peer.send(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/message",
+                    Some(serde_json::json!({"data": "bounded"})),
+                )),
+            )
+            .unwrap();
         }
         let mut client = TestClient::new_modern(transport, cx);
         let error = client.initialize_core().unwrap_err();
@@ -1359,7 +1508,10 @@ mod tests {
 
         let (mut client, _peer) = modern_fixture();
         client.cx.set_cancel_requested(true);
-        assert_eq!(client.list_tools().unwrap_err().code, McpErrorCode::RequestCancelled);
+        assert_eq!(
+            client.list_tools().unwrap_err().code,
+            McpErrorCode::RequestCancelled
+        );
         assert!(client.transport().is_closed());
         assert!(!client.is_initialized());
     }
@@ -1369,17 +1521,28 @@ mod tests {
     fn legacy_initialization_refuses_a_different_protocol_version() {
         let (transport, mut peer) = create_memory_transport_pair();
         let cx = Cx::for_testing();
-        peer.send(&cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
-            RequestId::Number(1), serde_json::json!({
-                "protocolVersion": "2025-06-18", "capabilities": {},
-                "serverInfo": {"name": "wrong-era", "version": "1"},
-            }),
-        ))).unwrap();
+        peer.send(
+            &cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(1),
+                serde_json::json!({
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "serverInfo": {"name": "wrong-era", "version": "1"},
+                }),
+            )),
+        )
+        .unwrap();
         let mut client = TestClient::new(transport, cx.clone());
         assert!(client.initialize().is_err());
         assert!(!client.is_initialized());
-        assert!(matches!(peer.recv(&cx).unwrap(), JsonRpcMessage::Request(_)));
-        assert!(matches!(peer.recv(&cx), Err(TransportError::Closed)), "no initialized notification follows a refused version");
+        assert!(matches!(
+            peer.recv(&cx).unwrap(),
+            JsonRpcMessage::Request(_)
+        ));
+        assert!(
+            matches!(peer.recv(&cx), Err(TransportError::Closed)),
+            "no initialized notification follows a refused version"
+        );
     }
 
     #[test]
@@ -1596,7 +1759,10 @@ mod tests {
                 panic!("the disposable endpoint receives only its discovery probe");
             };
             assert_eq!(probe.method, "server/discover");
-            assert!(matches!(server_transport.recv(&server_cx), Err(TransportError::Closed)));
+            assert!(matches!(
+                server_transport.recv(&server_cx),
+                Err(TransportError::Closed)
+            ));
             let JsonRpcMessage::Request(initialize) = legacy_peer.recv(&server_cx).unwrap() else {
                 panic!("the fresh endpoint receives exact-2024 initialization");
             };

@@ -71,12 +71,12 @@ pub mod prelude {
     pub use super::{
         // Timing
         Stopwatch,
-        // Server
-        TestServer,
-        TestServerBuilder,
         // Client
         TestClient,
         TestClientProtocolMode,
+        // Server
+        TestServer,
+        TestServerBuilder,
         // Trace
         TestTrace,
         TestTraceBuilder,

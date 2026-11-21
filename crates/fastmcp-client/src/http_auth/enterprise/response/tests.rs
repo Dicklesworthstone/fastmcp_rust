@@ -1290,7 +1290,12 @@ fn enterprise_exchange_preflight_binds_profile_keys_and_tenancy_before_post() {
         let (driver, _) = driver_with_poster(changed, Arc::clone(&poster));
         let (original, _) = exchanged_for_test(&cx, &selected).await;
         let result = driver
-            .exchange_id_jag_for_access_token(&cx, original, &secret, now() + Duration::from_secs(1))
+            .exchange_id_jag_for_access_token(
+                &cx,
+                original,
+                &secret,
+                now() + Duration::from_secs(1),
+            )
             .await;
         assert!(matches!(result, Err(error) if error == denied));
         assert!(poster.take_recorded().is_empty());

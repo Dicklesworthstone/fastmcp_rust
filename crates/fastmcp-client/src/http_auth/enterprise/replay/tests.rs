@@ -670,7 +670,10 @@ fn reserved_exchange_guard_keeps_profile_monotonic_lifetime_and_restore_binding(
         assert!(guard.identity_deadline() <= Instant::now() + Duration::from_secs(240));
         assert!(guard.check().is_ok());
         ready(fixture.quarantine(cx));
-        assert_eq!(guard.check(), Err(IdentityAssertionReplayError::RestoreUnavailable));
+        assert_eq!(
+            guard.check(),
+            Err(IdentityAssertionReplayError::RestoreUnavailable)
+        );
         assert_eq!(fixture.reserved_aliases(), 2);
 
         let fixture = ExchangeReplayFixture::new(cx);

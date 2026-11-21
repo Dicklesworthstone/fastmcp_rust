@@ -1354,9 +1354,11 @@ fn map_exchange_fetch_error(error: GuardedHttpFetchError) -> EnterpriseExchangeE
 
 fn map_reservation_error(error: IdentityAssertionReplayError) -> EnterpriseExchangeError {
     match error {
-        IdentityAssertionReplayError::InvalidAssertion => EnterpriseExchangeError::ResponseRejected(
-            EnterpriseResponseError::PolicyBindingMismatch,
-        ),
+        IdentityAssertionReplayError::InvalidAssertion => {
+            EnterpriseExchangeError::ResponseRejected(
+                EnterpriseResponseError::PolicyBindingMismatch,
+            )
+        }
         _ => EnterpriseExchangeError::ReservationRejected,
     }
 }

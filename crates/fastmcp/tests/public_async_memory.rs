@@ -944,7 +944,9 @@ mod interactions {
                     .build();
                 let (transport, peer) = create_memory_transport_pair_with_capacity(4);
                 let mut serving = cx
-                    .spawn(move |serve_cx| async move { server.serve_memory(&serve_cx, peer).await })
+                    .spawn(
+                        move |serve_cx| async move { server.serve_memory(&serve_cx, peer).await },
+                    )
                     .unwrap();
                 let calls = Arc::new(AtomicUsize::new(0));
                 let reverse = handlers(&calls);
@@ -953,27 +955,54 @@ mod interactions {
                     .connect_modern_with(|builder| Ok(builder.reverse_request_handlers(reverse)))
                     .await
                     .unwrap();
-                assert_eq!(client.server_discovery().server_info().unwrap().name, "testing-handoff");
+                assert_eq!(
+                    client.server_discovery().server_info().unwrap().name,
+                    "testing-handoff"
+                );
                 let cancellation = McpRequestCancellation::new();
 
                 // These are two independently owned, actually committed requests.
-                let mut cancelled = client.execute_core(
-                    &cx, &cancellation, "tools/call",
-                    json!({"name": "memory_echo", "arguments": {"value": "cancelled"}}),
-                ).await.unwrap();
-                let mut sibling = client.execute_core(
-                    &cx, &cancellation, "tools/call",
-                    json!({"name": "memory_echo", "arguments": {"value": "retained sibling"}}),
-                ).await.unwrap();
+                let mut cancelled = client
+                    .execute_core(
+                        &cx,
+                        &cancellation,
+                        "tools/call",
+                        json!({"name": "memory_echo", "arguments": {"value": "cancelled"}}),
+                    )
+                    .await
+                    .unwrap();
+                let mut sibling = client
+                    .execute_core(
+                        &cx,
+                        &cancellation,
+                        "tools/call",
+                        json!({"name": "memory_echo", "arguments": {"value": "retained sibling"}}),
+                    )
+                    .await
+                    .unwrap();
                 assert_ne!(cancelled.request_id(), sibling.request_id());
                 client.cancel(&cx, &mut cancelled).unwrap();
                 assert_eq!(
-                    client.next_event(&cx, &cancellation, &mut cancelled).await.unwrap_err().code,
+                    client
+                        .next_event(&cx, &cancellation, &mut cancelled)
+                        .await
+                        .unwrap_err()
+                        .code,
                     McpErrorCode::RequestCancelled,
                 );
-                assert!(client.next_event(&cx, &cancellation, &mut cancelled).await.unwrap().is_none());
+                assert!(
+                    client
+                        .next_event(&cx, &cancellation, &mut cancelled)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
                 let retained = loop {
-                    match client.next_event(&cx, &cancellation, &mut sibling).await.unwrap() {
+                    match client
+                        .next_event(&cx, &cancellation, &mut sibling)
+                        .await
+                        .unwrap()
+                    {
                         Some(MemoryRequestEvent::Result(result)) => break *result,
                         Some(MemoryRequestEvent::Notification(_)) => {}
                         None => panic!("the independent sibling must retain its terminal result"),
@@ -982,35 +1011,67 @@ mod interactions {
                 let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = retained else {
                     panic!("the sibling keeps its exact typed tool result");
                 };
-                assert_eq!(serde_json::to_value(result.payload).unwrap()["content"][0]["text"], "retained sibling");
-                assert!(client.next_event(&cx, &cancellation, &mut sibling).await.unwrap().is_none());
+                assert_eq!(
+                    serde_json::to_value(result.payload).unwrap()["content"][0]["text"],
+                    "retained sibling"
+                );
+                assert!(
+                    client
+                        .next_event(&cx, &cancellation, &mut sibling)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
 
                 // The configured production client owns actual MRTR callbacks and
                 // retries, including the server's opaque continuation state.
-                let tool = client.call_tool(
-                    &cx, &cancellation, "memory_interactive_tool", json!({"subject": "tool"}),
-                ).await.unwrap();
-                let resource = client.read_resource(
-                    &cx, &cancellation, "memory://interactive/resource",
-                ).await.unwrap();
-                let prompt = client.get_prompt(
-                    &cx, &cancellation, "memory_interactive_prompt",
-                    HashMap::from([("subject".to_owned(), "prompt".to_owned())]),
-                ).await.unwrap();
+                let tool = client
+                    .call_tool(
+                        &cx,
+                        &cancellation,
+                        "memory_interactive_tool",
+                        json!({"subject": "tool"}),
+                    )
+                    .await
+                    .unwrap();
+                let resource = client
+                    .read_resource(&cx, &cancellation, "memory://interactive/resource")
+                    .await
+                    .unwrap();
+                let prompt = client
+                    .get_prompt(
+                        &cx,
+                        &cancellation,
+                        "memory_interactive_prompt",
+                        HashMap::from([("subject".to_owned(), "prompt".to_owned())]),
+                    )
+                    .await
+                    .unwrap();
                 for result in [tool, resource, prompt] {
-                    assert!(matches!(result, CoreResult::Final(
-                        FinalCoreResult::ToolsCall { .. }
-                            | FinalCoreResult::ResourcesRead { .. }
-                            | FinalCoreResult::PromptsGet { .. }
-                    )));
+                    assert!(matches!(
+                        result,
+                        CoreResult::Final(
+                            FinalCoreResult::ToolsCall { .. }
+                                | FinalCoreResult::ResourcesRead { .. }
+                                | FinalCoreResult::PromptsGet { .. }
+                        )
+                    ));
                 }
                 assert_eq!(calls.load(Ordering::Acquire), 3);
-                assert!(cx.checkpoint().is_ok(), "request cancellation never cancels the caller");
+                assert!(
+                    cx.checkpoint().is_ok(),
+                    "request cancellation never cancels the caller"
+                );
                 client.close(&cx).unwrap();
                 assert!(client.list_tools(&cx, &cancellation, None).await.is_err());
                 serving.join(&cx).await.unwrap().unwrap();
-                assert!(stopped.load(Ordering::Acquire), "the real server must finish cleanup");
-            }).await.expect("the public testing handoff must make bounded caller-runtime progress");
+                assert!(
+                    stopped.load(Ordering::Acquire),
+                    "the real server must finish cleanup"
+                );
+            })
+            .await
+            .expect("the public testing handoff must make bounded caller-runtime progress");
         });
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }

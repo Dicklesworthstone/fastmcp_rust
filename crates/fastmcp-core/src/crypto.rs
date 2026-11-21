@@ -782,7 +782,10 @@ mod tests {
         assert_eq!(identifier.as_bytes(), &[0x5a; SECURITY_IDENTIFIER_BYTES]);
         assert_eq!(ephemeral.as_bytes(), &[0x5a; EPHEMERAL_KEY_MATERIAL_BYTES]);
         assert_eq!(nonce.into_bytes(), [0x5a; NONCE_DOMAIN_MATERIAL_BYTES]);
-        assert_eq!(oauth_salt.as_bytes(), &[0x5a; OAUTH_CLIENT_SECRET_SALT_BYTES]);
+        assert_eq!(
+            oauth_salt.as_bytes(),
+            &[0x5a; OAUTH_CLIENT_SECRET_SALT_BYTES]
+        );
         assert_eq!(mask.into_bytes(), [0x5a; WEBSOCKET_MASK_BYTES]);
         assert_eq!(source.calls.get(), 6);
     }
@@ -869,7 +872,10 @@ mod tests {
         assert_eq!(identifier.as_bytes(), &[0x3c; SECURITY_IDENTIFIER_BYTES]);
         assert_eq!(ephemeral.as_bytes(), &[0x3c; EPHEMERAL_KEY_MATERIAL_BYTES]);
         assert_eq!(nonce.as_bytes(), &[0x3c; NONCE_DOMAIN_MATERIAL_BYTES]);
-        assert_eq!(oauth_salt.as_bytes(), &[0x3c; OAUTH_CLIENT_SECRET_SALT_BYTES]);
+        assert_eq!(
+            oauth_salt.as_bytes(),
+            &[0x3c; OAUTH_CLIENT_SECRET_SALT_BYTES]
+        );
         assert_eq!(
             format!("{oauth_salt:?}"),
             "OAuthClientSecretSalt([redacted; 16 bytes])"
@@ -883,8 +889,8 @@ mod tests {
         let identifier = draw_security_identifier().expect("operating-system identifier draw");
         let ephemeral = draw_ephemeral_key_material().expect("operating-system ephemeral-key draw");
         let nonce = draw_nonce_domain_material().expect("operating-system nonce-domain draw");
-        let oauth_salt =
-            draw_oauth_client_secret_salt().expect("operating-system OAuth client-secret salt draw");
+        let oauth_salt = draw_oauth_client_secret_salt()
+            .expect("operating-system OAuth client-secret salt draw");
         let mask = draw_websocket_mask().expect("operating-system mask draw");
 
         assert_eq!(size_of_val(&hmac_key), HMAC_SHA256_KEY_BYTES);
