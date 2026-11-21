@@ -2,11 +2,11 @@
 //!
 //! Bounded response admission and an explicit guarded HTTPS exchange driver.
 //!
-//! The driver binds each protected assertion to its original profile before
-//! serialization, requires durable assertion reservation, keeps the two grant
-//! forms distinct, and consumes inputs on every outcome. It does not activate
-//! EMA or issue browser-flow, credential-
-//! custody, subject-mapping or deployment receipts. Those trust boundaries are
+//! The driver binds each protected grant to its original profile before
+//! serialization, requires durable identity-assertion reservation before ID-JAG
+//! exchange, keeps the three grant forms distinct, and consumes inputs on every
+//! outcome. It does not activate EMA or issue browser-flow, credential-custody,
+//! subject-mapping or deployment receipts. Those trust boundaries are
 //! additional requirements for the complete enterprise profile. Embeddings run
 //! synchronous signature admission on their caller-owned bounded CPU lane.
 
@@ -34,6 +34,7 @@ use fastmcp_transport::{
     GuardedHttpRequest, GuardedHttpsUrl,
 };
 
+use super::oidc::{OidcCodeFlowError, OidcCodeGrant};
 use super::policy::{
     EnterpriseClientAuthentication, EnterpriseProfile, ID_JAG_TOKEN_TYPE, IdJagGrantedScopeSet,
     JWT_BEARER_GRANT, TOKEN_EXCHANGE_GRANT,
@@ -687,6 +688,7 @@ pub enum EnterpriseExchangeError {
     EvidenceMismatch,
     ReservationRejected,
     EncodingFailed,
+    CodeFlowRejected(OidcCodeFlowError),
     ResponseRejected(EnterpriseResponseError),
     CredentialBindingFailed,
 }
@@ -724,6 +726,7 @@ impl fmt::Display for EnterpriseExchangeError {
             Self::EncodingFailed => {
                 formatter.write_str("enterprise token exchange form encoding failed")
             }
+            Self::CodeFlowRejected(error) => error.fmt(formatter),
             Self::ResponseRejected(error) => error.fmt(formatter),
             Self::CredentialBindingFailed => {
                 formatter.write_str("enterprise access token could not be bound to HTTPS resource")
@@ -858,10 +861,17 @@ struct ExchangeDriverInner {
     test_post: Option<Arc<dyn tests::ExchangePoster>>,
 }
 
-/// Sealed guarded-HTTPS driver executing the two-stage Enterprise-Managed
-/// Authorization token exchange:
-/// 1. RFC 8693 (`token-exchange`) at the IdP token endpoint (`ReservedIdentityAssertion` -> `EnterpriseExchangedIdJag`)
-/// 2. RFC 7523 (`jwt-bearer`) at the Resource AS token endpoint (`EnterpriseExchangedIdJag` -> `EnterpriseBoundAccessToken`)
+/// Sealed guarded-HTTPS driver redeeming an OIDC code grant and executing the
+/// two-stage Enterprise-Managed Authorization token exchange:
+///
+/// 1. OIDC authorization-code redemption consumes [`OidcCodeGrant`] and produces
+///    a nonce-bound, signature-verified [`EnterpriseIdentityAssertion`]. The
+///    caller must reserve that assertion through the separate replay boundary
+///    before it can enter the two-stage exchange.
+/// 2. RFC 8693 (`token-exchange`) at the IdP token endpoint consumes
+///    `ReservedIdentityAssertion` and produces `EnterpriseExchangedIdJag`.
+/// 3. RFC 7523 (`jwt-bearer`) at the Resource AS token endpoint consumes
+///    `EnterpriseExchangedIdJag` and produces `EnterpriseBoundAccessToken`.
 ///
 /// Enforces single-flight execution, bounded deadlines, zero HTTP redirects,
 /// strict peer provenance verification, exact per-role client authentication
@@ -913,6 +923,94 @@ impl EnterpriseExchangeDriver {
     #[must_use]
     pub fn profile(&self) -> &EnterpriseProfile {
         &self.inner.profile
+    }
+
+    /// Redeems one locally admitted OIDC authorization code at its exact IdP
+    /// endpoint without exposing the code, verifier, nonce or temporary token.
+    ///
+    /// The grant retains its original issuer, client registration, redirect,
+    /// response policy, tenancy and nonce. Those bindings and the OIDC key
+    /// issuer/generation are checked before serialization. The closed form
+    /// carries only grant, code, redirect, verifier and the registered client
+    /// authentication; it never carries MCP scope, resource or audience.
+    ///
+    /// `received_at` is the embedding's trusted wall-clock sample at call entry;
+    /// monotonic elapsed time advances it through dispatch and signed-response
+    /// admission. The request shares this driver's single-flight slot and is
+    /// bounded by the grant expiry, caller budget and guarded fetch deadline.
+    /// Every outcome consumes the code grant. There is no redirect or retry.
+    ///
+    /// This low-level operation does not attest browser launch or durable
+    /// pending-flow custody, activate EMA, or reserve identity-assertion replay
+    /// aliases. A successful identity must still pass that separate reservation
+    /// before [`Self::exchange_identity_for_id_jag`] can consume it.
+    pub async fn exchange_oidc_code_for_identity(
+        &self,
+        cx: &Cx,
+        grant: OidcCodeGrant,
+        idp_client_secret: &EnterpriseClientSecret,
+        oidc_keys: &OidcVerificationKeys,
+        received_at: SystemTime,
+    ) -> Result<
+        (
+            EnterpriseResponseOutcome<EnterpriseIdentityAssertion>,
+            EnterpriseExchangeObservation,
+        ),
+        EnterpriseExchangeError,
+    > {
+        let clock = ExchangeClock::new(received_at);
+        let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
+        let expires_at = grant.expires_at();
+        let (request, response_admission) = grant.into_token_request(
+            &self.inner.profile,
+            self.inner.response_policy,
+            idp_client_secret.as_str(),
+            oidc_keys,
+            clock.wall_now()?,
+        )?;
+        let input_deadline = clock.deadline(expires_at)?;
+        let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
+        let response = self
+            .dispatch_post(
+                &admitted,
+                &self.inner.idp_token_url,
+                &request,
+                input_deadline,
+                Arc::clone(&permit),
+                // No identity assertion exists until this response is verified.
+                // Replay reservation is mandatory in the subsequent stage.
+                || Ok(()),
+            )
+            .await?;
+        let observation = EnterpriseExchangeObservation {
+            endpoint: self.inner.profile.idp_token_endpoint().to_owned(),
+            provenance: response.provenance,
+        };
+        let outcome = response_admission
+            .admit_token_response(
+                EnterpriseTokenResponse {
+                    status: response.status,
+                    headers: &response.headers,
+                    body: &response.body,
+                },
+                oidc_keys,
+                clock.wall_now()?,
+            )
+            .map_err(EnterpriseExchangeError::CodeFlowRejected)?;
+        // Signature validation is bounded synchronous work. A caller cancellation
+        // or deadline reached during that work must still prevent identity release.
+        crate::http_auth::caller::with_caller(&admitted, admit_exchange_caller)?;
+        if Instant::now() >= input_deadline
+            || clock.monotonic.elapsed() >= self.inner.fetcher.policy().deadline()
+        {
+            return Err(EnterpriseExchangeError::TimedOut);
+        }
+        if let EnterpriseResponseOutcome::Success(assertion) = &outcome
+            && assertion.identity().expires_at() <= clock.wall_now()?
+        {
+            return Err(EnterpriseExchangeError::TimedOut);
+        }
+        Ok((outcome, observation))
     }
 
     /// Stage 1 (RFC 8693): consumes a durably reserved OIDC identity assertion
@@ -991,7 +1089,7 @@ impl EnterpriseExchangeDriver {
                 &request,
                 input_deadline,
                 Arc::clone(&permit),
-                &reservation,
+                || reservation.check().map_err(map_reservation_error),
             )
             .await?;
         let observation = EnterpriseExchangeObservation {
@@ -1096,7 +1194,7 @@ impl EnterpriseExchangeDriver {
                 &request,
                 input_deadline,
                 Arc::clone(&permit),
-                &reservation,
+                || reservation.check().map_err(map_reservation_error),
             )
             .await?;
         let observation = EnterpriseExchangeObservation {
@@ -1148,7 +1246,7 @@ impl EnterpriseExchangeDriver {
         request: &GuardedHttpRequest,
         input_deadline: Instant,
         permit: Arc<ExchangePermit>,
-        reservation: &IdentityAssertionExchangeGuard,
+        check_reservation: impl Fn() -> Result<(), EnterpriseExchangeError>,
     ) -> Result<GuardedHttpFetchResponse, EnterpriseExchangeError> {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let response = CallerContextFuture::new(&admitted, async {
@@ -1173,7 +1271,7 @@ impl EnterpriseExchangeDriver {
                     .await
             });
             poll_fn(|task| {
-                reservation.check().map_err(map_reservation_error)?;
+                check_reservation()?;
                 exchange_checkpoint(&admitted, deadline, started, timeout)?;
                 if cancelled.as_mut().poll(task).is_ready() {
                     return Poll::Ready(Err(EnterpriseExchangeError::Cancelled));
@@ -1183,7 +1281,7 @@ impl EnterpriseExchangeDriver {
                     return Poll::Ready(Err(EnterpriseExchangeError::TimedOut));
                 }
                 let res = call.as_mut().poll(task);
-                reservation.check().map_err(map_reservation_error)?;
+                check_reservation()?;
                 exchange_checkpoint(&admitted, deadline, started, timeout)?;
                 res
             })
@@ -1403,7 +1501,7 @@ fn encode_form_component(value: &str) -> SecretString {
     SecretString::from_string(encoded)
 }
 
-fn build_confidential_token_request<'a>(
+pub(super) fn build_confidential_token_request<'a>(
     auth: EnterpriseClientAuthentication,
     client_id: &'a str,
     client_secret: &'a str,

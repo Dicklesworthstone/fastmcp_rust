@@ -2,6 +2,9 @@
 //! Only public key material and compact signatures are retained here.
 
 use super::*;
+use crate::http_auth::enterprise::oidc::tests::{
+    grant_for_exchange, token_body as oidc_token_body,
+};
 use crate::http_auth::enterprise::policy::{
     EnterpriseProfileConfiguration, EnterpriseRegistrationConfiguration, ID_JAG_GRANT_PROFILE,
     ID_JAG_TOKEN_TYPE, IdJagCryptoConfiguration, JWT_BEARER_GRANT, RequestedEnterpriseScopeSet,
@@ -878,6 +881,496 @@ fn run_exchange_async<T>(f: impl Future<Output = T>) -> T {
         .build()
         .expect("enterprise exchange test runtime");
     rt.block_on(f)
+}
+
+#[test]
+fn enterprise_oidc_code_redemption_reaches_bearer_through_both_confidential_methods() {
+    let (oidc_keys, jag_keys) = keys();
+    let secret = EnterpriseClientSecret::try_new("client + secret:/=").unwrap();
+    for authentication in [
+        EnterpriseClientAuthentication::ClientSecretBasic,
+        EnterpriseClientAuthentication::ClientSecretPost,
+    ] {
+        let selected = profile_with_authentication(
+            &["read"],
+            authentication,
+            EnterpriseClientAuthentication::ClientSecretPost,
+        );
+        let fetcher = test_fetcher();
+        let poster = ScriptedExchangePoster::new(vec![
+            Ok(ok_exchange_response(
+                "idp.example",
+                fetcher.root_identity(),
+                oidc_token_body(),
+            )),
+            Ok(ok_exchange_response(
+                "idp.example",
+                fetcher.root_identity(),
+                serde_json::to_vec(&jag_body()).unwrap(),
+            )),
+            Ok(ok_exchange_response(
+                "as.example",
+                fetcher.root_identity(),
+                serde_json::to_vec(&access_body()).unwrap(),
+            )),
+        ]);
+        let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+        run_exchange_async(async {
+            let cx = Cx::current().unwrap();
+            let (outcome, observation) = driver
+                .exchange_oidc_code_for_identity(
+                    &cx,
+                    grant_for_exchange(selected.clone(), EnterpriseResponsePolicy::default(), 0x22),
+                    &secret,
+                    &oidc_keys,
+                    now(),
+                )
+                .await
+                .unwrap();
+            let identity = success(outcome);
+            assert_eq!(observation.endpoint(), "https://idp.example/token");
+            assert_eq!(identity.identity().subject().as_str(), "client-subject");
+            assert_eq!(identity.identity().client_id(), "native-idp");
+            assert_eq!(identity.identity().generation(), 21);
+            let replay = ExchangeReplayFixture::new(&cx);
+            let reserved = replay
+                .reserve(&cx, &selected, identity, now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            let (outcome, _) = driver
+                .exchange_identity_for_id_jag(
+                    &cx,
+                    reserved,
+                    &secret,
+                    &jag_keys,
+                    TenantExpectation::SingleTenant,
+                    ResourceTenantExpectation::SingleTenant,
+                    now() + Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            let (outcome, _) = driver
+                .exchange_id_jag_for_access_token(
+                    &cx,
+                    success(outcome),
+                    &secret,
+                    now() + Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            let bearer = success(outcome)
+                .into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(3))
+                .unwrap();
+            assert_eq!(
+                bearer
+                    .authorization_for_target(
+                        &CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap()
+                    )
+                    .as_deref(),
+                Some("Bearer final-opaque-token")
+            );
+            assert!(
+                bearer
+                    .authorization_for_target(
+                        &CanonicalHttpUrl::parse("https://other.example/mcp").unwrap()
+                    )
+                    .is_none()
+            );
+            assert_eq!(replay.reserved_aliases(), 2);
+        });
+        let recorded = poster.take_recorded();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0].host, "idp.example");
+        assert_eq!(
+            recorded[0].content_type,
+            "application/x-www-form-urlencoded"
+        );
+        let unauthenticated_form = concat!(
+            "grant_type=authorization_code&code=one-time%2Bcode%3Dvalue",
+            "&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback",
+            "&code_verifier=MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM"
+        );
+        if authentication == EnterpriseClientAuthentication::ClientSecretBasic {
+            assert!(recorded[0].has_authorization);
+            assert_eq!(recorded[0].body, unauthenticated_form);
+        } else {
+            assert!(!recorded[0].has_authorization);
+            assert_eq!(
+                recorded[0].body,
+                format!(
+                    "{unauthenticated_form}&client_id=native-idp&client_secret=client+%2B+secret%3A%2F%3D"
+                )
+            );
+        }
+        assert!(!recorded[0].body.contains("scope="));
+        assert!(!recorded[0].body.contains("resource="));
+        assert!(!recorded[0].body.contains("audience="));
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn enterprise_oidc_code_redemption_rejects_nonce_and_temporary_token_substitution() {
+    let selected = profile(&["read"]);
+    let (oidc_keys, _) = keys();
+    let secret = EnterpriseClientSecret::try_new("confidential-canary").unwrap();
+    for different_nonce in [true, false] {
+        let body = if different_nonce {
+            oidc_token_body()
+        } else {
+            let mut body: Value = serde_json::from_slice(&oidc_token_body()).unwrap();
+            body["access_token"] = json!("substituted-temporary-access");
+            serde_json::to_vec(&body).unwrap()
+        };
+        let fetcher = test_fetcher();
+        let poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+            "idp.example",
+            fetcher.root_identity(),
+            body,
+        ))]);
+        let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+        run_exchange_async(async {
+            let cx = Cx::current().unwrap();
+            let result = driver
+                .exchange_oidc_code_for_identity(
+                    &cx,
+                    grant_for_exchange(
+                        selected.clone(),
+                        EnterpriseResponsePolicy::default(),
+                        if different_nonce { 0x23 } else { 0x22 },
+                    ),
+                    &secret,
+                    &oidc_keys,
+                    now(),
+                )
+                .await;
+            assert_eq!(
+                result.err(),
+                Some(EnterpriseExchangeError::CodeFlowRejected(
+                    OidcCodeFlowError::TokenResponseRejected
+                ))
+            );
+        });
+        assert_eq!(poster.take_recorded().len(), 1);
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn enterprise_oidc_code_redemption_rejects_binding_drift_before_any_post() {
+    let selected = profile(&["read"]);
+    let (oidc_keys, _) = keys();
+    let secret = EnterpriseClientSecret::try_new("confidential-canary").unwrap();
+    let poster = ScriptedExchangePoster::new(vec![]);
+    let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+    let different_policy = EnterpriseResponsePolicy::new(
+        Duration::from_secs(1800),
+        Duration::from_secs(300),
+        Duration::from_secs(3600),
+        Duration::from_secs(60),
+        Duration::from_hours(24),
+    )
+    .unwrap();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        for grant in [
+            grant_for_exchange(
+                profile(&["write"]),
+                EnterpriseResponsePolicy::default(),
+                0x22,
+            ),
+            grant_for_exchange(selected.clone(), different_policy, 0x22),
+        ] {
+            assert_eq!(
+                driver
+                    .exchange_oidc_code_for_identity(&cx, grant, &secret, &oidc_keys, now())
+                    .await
+                    .err(),
+                Some(EnterpriseExchangeError::ResponseRejected(
+                    EnterpriseResponseError::PolicyBindingMismatch
+                ))
+            );
+        }
+        for (issuer, generation) in [("https://other.example", 21), ("https://idp.example", 22)] {
+            let wrong_keys = OidcVerificationKeys::from_trusted_jwks(
+                issuer,
+                generation,
+                &serde_json::to_vec(&fixtures()["jwks"]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                driver
+                    .exchange_oidc_code_for_identity(
+                        &cx,
+                        grant_for_exchange(
+                            selected.clone(),
+                            EnterpriseResponsePolicy::default(),
+                            0x22
+                        ),
+                        &secret,
+                        &wrong_keys,
+                        now(),
+                    )
+                    .await
+                    .err(),
+                Some(EnterpriseExchangeError::ResponseRejected(
+                    EnterpriseResponseError::PolicyBindingMismatch
+                ))
+            );
+        }
+    });
+    assert!(poster.take_recorded().is_empty());
+    assert!(!driver.inner.busy.load(Ordering::Acquire));
+}
+
+#[test]
+fn enterprise_oidc_code_redemption_checks_lifetime_runtime_and_singleflight_before_post() {
+    let selected = profile(&["read"]);
+    let (oidc_keys, _) = keys();
+    let secret = EnterpriseClientSecret::try_new("confidential-canary").unwrap();
+    let poster = ScriptedExchangePoster::new(vec![]);
+    let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        for time in [
+            now() - Duration::from_secs(1),
+            now() + Duration::from_secs(300),
+        ] {
+            assert_eq!(
+                driver
+                    .exchange_oidc_code_for_identity(
+                        &cx,
+                        grant_for_exchange(
+                            selected.clone(),
+                            EnterpriseResponsePolicy::default(),
+                            0x22
+                        ),
+                        &secret,
+                        &oidc_keys,
+                        time,
+                    )
+                    .await
+                    .err(),
+                Some(EnterpriseExchangeError::CodeFlowRejected(
+                    OidcCodeFlowError::InvalidLifetime
+                ))
+            );
+        }
+        for cancelled in [false, true] {
+            let unavailable = Cx::for_testing();
+            unavailable.set_cancel_requested(cancelled);
+            assert_eq!(
+                driver
+                    .exchange_oidc_code_for_identity(
+                        &unavailable,
+                        grant_for_exchange(
+                            selected.clone(),
+                            EnterpriseResponsePolicy::default(),
+                            0x22
+                        ),
+                        &secret,
+                        &oidc_keys,
+                        now(),
+                    )
+                    .await
+                    .err(),
+                Some(if cancelled {
+                    EnterpriseExchangeError::Cancelled
+                } else {
+                    EnterpriseExchangeError::RuntimeUnavailable
+                })
+            );
+        }
+        let held = ExchangePermit::acquire(Arc::clone(&driver.inner.busy)).unwrap();
+        assert_eq!(
+            driver
+                .exchange_oidc_code_for_identity(
+                    &cx,
+                    grant_for_exchange(selected.clone(), EnterpriseResponsePolicy::default(), 0x22),
+                    &secret,
+                    &oidc_keys,
+                    now(),
+                )
+                .await
+                .err(),
+            Some(EnterpriseExchangeError::ExchangeInProgress)
+        );
+        drop(held);
+    });
+    assert!(poster.take_recorded().is_empty());
+    assert!(!driver.inner.busy.load(Ordering::Acquire));
+}
+
+#[test]
+fn enterprise_oidc_code_redemption_refuses_redirect_and_peer_substitution_without_retry() {
+    let selected = profile(&["read"]);
+    let (oidc_keys, _) = keys();
+    let secret = EnterpriseClientSecret::try_new("confidential-canary").unwrap();
+    for redirect in [true, false] {
+        let fetcher = test_fetcher();
+        let mut response =
+            ok_exchange_response("idp.example", fetcher.root_identity(), oidc_token_body());
+        let expected = if redirect {
+            response.status = 302;
+            response.redirect = Some(fastmcp_transport::GuardedHttpRedirect {
+                status: 302,
+                location: Some("https://other.example/token".to_owned()),
+            });
+            EnterpriseExchangeError::RedirectRefused
+        } else {
+            response.provenance.host = "other.example".to_owned();
+            EnterpriseExchangeError::EvidenceMismatch
+        };
+        let poster = ScriptedExchangePoster::new(vec![Ok(response)]);
+        let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+        run_exchange_async(async {
+            let cx = Cx::current().unwrap();
+            assert_eq!(
+                driver
+                    .exchange_oidc_code_for_identity(
+                        &cx,
+                        grant_for_exchange(
+                            selected.clone(),
+                            EnterpriseResponsePolicy::default(),
+                            0x22
+                        ),
+                        &secret,
+                        &oidc_keys,
+                        now(),
+                    )
+                    .await
+                    .err(),
+                Some(expected)
+            );
+        });
+        assert_eq!(poster.take_recorded().len(), 1);
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn enterprise_oidc_code_redemption_preserves_typed_denial_without_retry() {
+    let selected = profile(&["read"]);
+    let (oidc_keys, _) = keys();
+    let secret = EnterpriseClientSecret::try_new("confidential-canary").unwrap();
+    let fetcher = test_fetcher();
+    let mut response = ok_exchange_response(
+        "idp.example",
+        fetcher.root_identity(),
+        br#"{"error":"invalid_grant"}"#.to_vec(),
+    );
+    response.status = 400;
+    let poster = ScriptedExchangePoster::new(vec![Ok(response)]);
+    let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let (outcome, observation) = driver
+            .exchange_oidc_code_for_identity(
+                &cx,
+                grant_for_exchange(selected.clone(), EnterpriseResponsePolicy::default(), 0x22),
+                &secret,
+                &oidc_keys,
+                now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observation.endpoint(), "https://idp.example/token");
+        assert!(matches!(
+            outcome,
+            EnterpriseResponseOutcome::Denied { denial, .. }
+                if denial.code() == EnterpriseOAuthErrorCode::InvalidGrant
+                    && denial.status() == 400
+        ));
+    });
+    assert_eq!(poster.take_recorded().len(), 1);
+    assert!(!driver.inner.busy.load(Ordering::Acquire));
+}
+
+struct ParkedCodePoster {
+    calls: std::sync::atomic::AtomicUsize,
+    held_lifetime: std::sync::Mutex<Option<Arc<dyn Send + Sync>>>,
+}
+
+impl ExchangePoster for ParkedCodePoster {
+    fn post<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _url: &'a GuardedHttpsUrl,
+        _request: &'a GuardedHttpRequest,
+        lifetime: Arc<dyn Send + Sync>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.held_lifetime.lock().unwrap() = Some(lifetime);
+        Box::pin(std::future::pending())
+    }
+}
+
+#[test]
+fn enterprise_oidc_code_redemption_cancellation_and_deadline_retain_dispatch_custody() {
+    let selected = profile(&["read"]);
+    let (oidc_keys, _) = keys();
+    let secret = EnterpriseClientSecret::try_new("confidential-canary").unwrap();
+    for cancelled in [false, true] {
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .with_timer_driver(timer)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let poster = Arc::new(ParkedCodePoster {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            held_lifetime: std::sync::Mutex::new(None),
+        });
+        let mut driver = EnterpriseExchangeDriver::new(
+            selected.clone(),
+            test_fetcher(),
+            EnterpriseResponsePolicy::default(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut driver.inner).unwrap().test_post = Some(poster.clone());
+        runtime.block_on(async {
+            let mut exchange = std::pin::pin!(driver.exchange_oidc_code_for_identity(
+                &cx,
+                grant_for_exchange(selected.clone(), EnterpriseResponsePolicy::default(), 0x22),
+                &secret,
+                &oidc_keys,
+                now(),
+            ));
+            poll_fn(|task| {
+                assert!(exchange.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(poster.calls.load(Ordering::SeqCst), 1);
+            if cancelled {
+                cx.set_cancel_requested(true);
+            } else {
+                clock.advance(6_000_000_000);
+            }
+            assert_eq!(
+                exchange.await.err(),
+                Some(if cancelled {
+                    EnterpriseExchangeError::Cancelled
+                } else {
+                    EnterpriseExchangeError::TimedOut
+                })
+            );
+        });
+        assert_eq!(poster.calls.load(Ordering::SeqCst), 1);
+        assert!(driver.inner.busy.load(Ordering::Acquire));
+        // The external HTTP owner still retains its dispatch lifetime even
+        // though the caller was released. Only actual quiescence frees it.
+        drop(poster.held_lifetime.lock().unwrap().take());
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
+    }
 }
 
 #[test]

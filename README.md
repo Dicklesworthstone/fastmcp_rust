@@ -1696,22 +1696,35 @@ response admission and local identity resolution separate:
   atomic assertion-use store, and independent commit acknowledgment. It returns
   an exclusive reserved assertion only after the complete transaction succeeds.
 
-The local OIDC sequence is
+The native OIDC sequence is
 `OidcCodeFlowConfiguration::prepare` →
 `PreparedOidcAuthorization::admit_callback` →
-`OidcCodeGrant::write_token_form` →
-`OidcCodeResponseAdmission::admit_token_response`. Callback admission checks
-the exact route, state, issuer and decoded parameter uniqueness. Code forms
-contain only the grant, code, redirect URI and verifier. Each stage consumes
-its owner; a partial form write cannot produce a response-admission owner.
-The final validator retains the generated nonce and selected client/tenant
-expectations, and composes them with real signed-response verification.
+`EnterpriseExchangeDriver::exchange_oidc_code_for_identity`. Callback admission
+checks the exact route, state, issuer and decoded parameter uniqueness. The
+driver consumes the code grant, adds the preregistered Basic or secret-post
+client authentication, and posts to the original IdP endpoint through guarded
+HTTPS. The form contains the grant, code, redirect URI and PKCE verifier;
+MCP scope, resource and audience fields are never added to this code grant.
 
-This codec exposes the authorization URL for an external browser adapter and
-writes the code form to a caller-selected confidential sink. That sink can
-observe the code/verifier and must erase its buffers. Confidential client
-authentication and HTTP dispatch are separate; local byte digests do not
-establish launch or transport provenance.
+The response validator retains the generated nonce and selected client/tenant
+expectations, and verifies the real ID-token signature and optional access-token
+hash. Profile, response-policy or key-generation drift is rejected before any
+POST. Dispatch shares the driver's single-flight slot and is bounded by the
+code's original expiry, the caller's budget and the fetch policy. Redirects and
+automatic retries are refused; each outcome consumes the code grant.
+
+A successful identity still needs `IdentityAssertionReplay::reserve` before
+`exchange_identity_for_id_jag` can redeem it. The subsequent
+`exchange_id_jag_for_access_token` returns a credential bound to the configured
+MCP resource. Code redemption does not bypass that durable replay boundary.
+
+The lower-level `OidcCodeGrant::write_token_form` and
+`OidcCodeResponseAdmission::admit_token_response` remain available to embeddings
+with their own dispatcher. That codec writes to a caller-selected confidential
+sink, which can observe the code/verifier and must erase its buffers. A partial
+write cannot produce a response-admission owner. The authorization URL still
+requires an external browser adapter; local byte digests do not establish
+browser-launch provenance or durable callback custody.
 
 For native signing-key acquisition, construct `keys::EnterpriseKeySource` with
 the admitted profile, a `GuardedHttpFetcher`, and a nonzero fetch-policy
@@ -1773,8 +1786,9 @@ and the locally retained final token. The ordinary verification method keeps
 its closed claim set; actor, subject-alias, RAR and sender-constraining claims
 cannot be enabled through this policy.
 
-These components do not yet perform OAuth token exchanges or complete
-enterprise sign-in, and they do not activate the MCP extension.
+The native driver performs the three distinct grant exchanges, but complete
+enterprise sign-in still requires browser/callback custody and deployment
+qualification. These components do not activate the MCP extension.
 The mapping table supports public, redirect-host pairwise, and explicitly
 reviewed sector-document OIDC subject namespaces. It rechecks the current
 profile, selected snapshot, signed token bindings and review/claim lifetimes on
@@ -1906,8 +1920,8 @@ return a normal conflict. Unknown outcomes remain unresolved. Administrative
 epoch advance and fenced migration remain unfinished.
 
 Durable browser launch/callback custody, confidential credential providers,
-the native token-exchange driver, attested mapping authority and qualified
-deployments of the replay/restore providers remain required before activation.
+attested mapping authority and qualified deployments of the replay/restore
+providers remain required before activation.
 SAML and durable/distributed server Task stores remain separate incomplete
 extension work.
 
