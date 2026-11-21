@@ -518,7 +518,8 @@ pub fn proxy_legacy_peer_notifications_and_progress_params_through_the_facade()
     };
 
     fn backend_trait_is_nameable<B: ProxyBackend>() {}
-    let _ = backend_trait_is_nameable::<fastmcp_rust::ProxyClient>;
+    let _ = backend_trait_is_nameable::<fastmcp_rust::Client>;
+    let _: Option<fastmcp_rust::ProxyClient> = None;
 
     ProxyLegacyPeerNotifications {
         updated_uris: vec!["probe://resource".to_owned()],

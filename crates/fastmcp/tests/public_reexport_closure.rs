@@ -969,7 +969,7 @@ fn facade_exposes_enterprise_exchange_driver_types() {
         EnterpriseClientSecret::try_new("bad\nsecret").unwrap_err(),
         EnterpriseExchangeError::InvalidConfiguration
     );
-    let _driver_type: Option<EnterpriseExchangeDriver> = None;
-    let _token_type: Option<EnterpriseBoundAccessToken> = None;
-    let _obs_type: Option<EnterpriseExchangeObservation> = None;
+    let _: Option<EnterpriseExchangeDriver> = None;
+    let _: Option<EnterpriseBoundAccessToken> = None;
+    let _: Option<EnterpriseExchangeObservation> = None;
 }

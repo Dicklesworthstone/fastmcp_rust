@@ -9172,7 +9172,6 @@ pub mod modern {
 
         /// Sets finite TLS-handshake, request-read, and response-write bounds
         /// before serving begins.
-        #[must_use]
         pub fn with_io_limits(mut self, limits: SecuredHttpIoLimits) -> Self {
             self.inner = self.inner.with_io_limits(limits);
             self
