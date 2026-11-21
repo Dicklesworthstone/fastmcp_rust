@@ -54,11 +54,16 @@ fn parse(path: &str) -> toml::Value {
 
 const POLICY: &str = "evidence/fnd-01/dependency-verification.toml";
 
-/// The ten drifts measured on 2026-09-19, recorded on bd-dmnn6, against these
+/// The ten drifts measured on 2026-09-19 (recorded on bd-dmnn6) plus the two
+/// dependency-pin drifts baselined on 2026-11-20 under `bd-oi73c` (documented
+/// in `UPGRADE_LOG.md`: `serde_json =1.0.154` required by `bd-5kreb`'s `-0`
+/// preservation in `common_types.rs`, and `zeroize =1.9.1`), against these
 /// exact inputs:
 ///
-///     Cargo.toml           blob 2cf86cc1e4178ad09c9bd8159942da97cd9e65a0
+///     Cargo.toml           blob a4e631904721ba69c1b5c073f7db83a127635ebf
 ///     rust-toolchain.toml  blob e36bd453a98fc579be6afd951f5ef5b7cc170469
+///
+/// (Original 2026-09-19 `Cargo.toml` blob was `2cf86cc1e4178ad09c9bd8159942da97cd9e65a0`.)
 ///
 /// Bound by BLOB, not by revision. The measurement sha was 1a18f942, which is
 /// already rebase-orphaned (twin aa09a123) barely an hour after it was written;
@@ -67,9 +72,9 @@ const POLICY: &str = "evidence/fnd-01/dependency-verification.toml";
 /// outlive a rebase names the content. The shas above are a convenience for a
 /// reader who wants context, not the anchor.
 ///
-/// Ten drifts render as NINE keys: the license VALUE drift ("MIT" -> gone) and the
-/// license KEY drift (`license.workspace` -> `license-file.workspace`) are one
-/// observation here, reported as `policy="MIT" tree="(key absent)"`.
+/// Twelve drifts render as twelve keys: the license VALUE drift ("MIT" -> gone)
+/// and the license KEY drift (`license.workspace` -> `license-file.workspace`)
+/// are one observation here, reported as `policy="MIT" tree="(key absent)"`.
 ///
 /// This baseline is itself a frozen constant and will rot — which is the exact
 /// defect this file exists to catch. So the test fails in BOTH directions: a new
@@ -85,7 +90,9 @@ const KNOWN_DRIFTS: &[&str] = &[
     "dependency.asupersync",
     "dependency.flate2",
     "dependency.hmac",
+    "dependency.serde_json",
     "dependency.sha2",
+    "dependency.zeroize",
     "workspace.package.ids",
 ];
 

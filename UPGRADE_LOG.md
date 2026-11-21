@@ -1,6 +1,25 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-10-12 | **Project:** fastmcp_rust | **Language:** Rust
+**Date:** 2026-11-20 | **Project:** fastmcp_rust | **Language:** Rust
+
+## 2026-11-20 FND-01 declaration-ratchet disposition for `serde_json =1.0.154` and `zeroize =1.9.1` (`bd-oi73c`)
+
+After the v0.13.0 currency sweep, two FND-01 policy-bound root pins advanced in `Cargo.toml`
+(blob `a4e631904721ba69c1b5c073f7db83a127635ebf`):
+
+| Dependency | FND-01 Policy Pin | Current Workspace Pin | Disposition |
+|---|---|---|---|
+| `serde_json` | `=1.0.151` | `=1.0.154` | Kept at `=1.0.154` (required by `bd-5kreb` in `crates/fastmcp-protocol/src/common_types.rs:4083` for negative-zero `-0` preservation; reverting to `1.0.151` breaks protocol number handling) |
+| `zeroize` | `=1.9.0` | `=1.9.1` | Kept at `=1.9.1` (current stable security/memory-zeroization patch release, already active across the lockfile and `argon2`/`fastmcp-protocol` consumers) |
+
+Under explicit user disposition (RULE 0, 2026-11-20) to resolve `bd-oi73c` without regressing
+`bd-5kreb` or weakening FND-01's two-way declaration ratchet (`RH-1`), `dependency.serde_json`
+and `dependency.zeroize` are recorded in `KNOWN_DRIFTS` in
+`tools/xtask/tests/fnd_01_declaration_drift.rs` against exact `Cargo.toml` blob
+`a4e631904721ba69c1b5c073f7db83a127635ebf`. The frozen `evidence/fnd-01/` snapshot is NOT
+rewritten (full FND-01 re-attestation remains tracked on `bd-dmnn6` / `bd-3zzrz`), and all three
+two-way planted negative arms (fresh drift detection, repair detection, and toolchain-input
+detection) remain strictly enforced.
 
 ## 2026-11-09 asupersync =0.5.0 -> =0.6.2
 
