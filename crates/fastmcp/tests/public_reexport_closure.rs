@@ -36,6 +36,7 @@
 //! re-exports remove and therefore could never have detected their absence.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 // Every path below goes through `fastmcp_rust`. None of them names
 // `fastmcp_core` or `fastmcp_protocol`, which is the entire point.
@@ -801,7 +802,9 @@ fn facade_modern_server_binds_secured_http_with_readiness_and_drain_positive_and
     use fastmcp_rust::modern::{
         HttpAdmissionLimits, HttpSecurityPolicy, SecuredHttpIoLimits, ServerBuilder,
     };
-    use fastmcp_rust::{HttpServerConfig, HttpServerShutdown, OperatorLifecycle};
+    use fastmcp_rust::{
+        HttpServerConfig, HttpServerShutdown, OperatorLifecycle, OperatorSnapshotSource,
+    };
 
     fn exchange_http(addr: std::net::SocketAddr, request: &str) -> String {
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
