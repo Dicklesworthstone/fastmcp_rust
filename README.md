@@ -38,12 +38,20 @@ pin and the result tally. Measurements use
 
 | revision | date | scenarios | checks | SUCCESS | FAILURE | WARNING | INFO |
 |---|---|---|---|---|---|---|---|
+| `65d2247d` | 2026-11-20 | 40 | 115 | **112** | **0** | 2 | 1 |
 | `1c2dc896` | 2026-10-12 | 40 | 115 | **112** | **0** | 2 | 1 |
 | `e2a0ac5c` | 2026-10-12 | 40 | 115 | 110 | **0** | 4 | 1 |
 | `99a3b4e8` | 2026-10-05 | 40 | 115 | 110 | **0** | 4 | 1 |
 | working tree (unanchored) | 2026-10-04 | 40 | 115 | 110 | **0** | 4 | 1 |
 | `6b54e023` | 2026-10-03 | 40 | 114 | 108 | 1 | 4 | 1 |
 | `bba5a09f` | 2026-10-01 | 40 | 92 | 54 | 38 | 0 | 0 |
+
+The latest `65d2247d` re-measurement (2026-11-20, arm64 Darwin, pinned
+`nightly-2026-08-25`, `conformance_server` adapter blob
+`a2d1f906889039b7d5935464b2fa934adc585630`, binary sha256
+`c3b4385de40dc4d0...f2deb37ec`, `suite exit status: 0`) reproduces the
+`112 SUCCESS / 0 FAILURE / 2 WARNING / 1 INFO` standing across all 40 scenarios
+and 115 checks.
 
 The `99a3b4e8` row is bound to identity rather than to a date, which the row
 above it is not: 98 commits and 388 lines across four server-mode source files
@@ -84,14 +92,14 @@ push a percentage *up*. Compare the *sets* of failing check ids, which is what
 
 **Client mode.** The gate is the harness passing in *both* modes.
 32 scenarios / 155 checks: SUCCESS=55, FAILURE=46, SKIPPED=2, WARNING=1,
-INFO=51. Measured 2026-10-13, bound to:
-
-    revision          2b6c519e, crates tree 6a57e7ca
-    adapter binary    sha256 2d47186b24962718e3e9a01be48f746449823ecf...
-    suite             @modelcontextprotocol/conformance@0.2.0-alpha.10,
-                      client --suite all --spec-version 2026-07-28
-    host              hz3 (x86_64 linux), cold dependency rebuild
-    exit              build rc 0, suite rc 1 (FAILUREs present, as expected)
+INFO=51. Re-measured 2026-11-20 at `65d2247d` (adapter blob
+`fcf1296f971c60ce778bfd63dc5cdd7dcd610b22`, binary sha256
+`066a512dc2a2d92d...99170934ca`, arm64 Darwin, pinned `nightly-2026-08-25`),
+reproducing the 2026-10-13 `2b6c519e` baseline (`crates` tree `6a57e7ca`,
+adapter binary sha256 `2d47186b24962718e3e9a01be48f746449823ecf...`, host `hz3`,
+suite `@modelcontextprotocol/conformance@0.2.0-alpha.10`,
+`client --suite all --spec-version 2026-07-28`, build rc 0, suite rc 1)
+across all five counts:
 
 This row previously read "most recent run" with no revision, date, host or
 toolchain, which made it unverifiable; the re-measurement reproduces all five

@@ -108,7 +108,21 @@ mkdir -p "$OUT" || die "cannot create $OUT"
 
 # One tally program, shared by both modes. Written to a temp file rather than
 # inlined twice so the two modes can never drift into reporting differently.
-TALLY="$(mktemp "${TMPDIR:-/tmp}/fastmcp-tally.XXXXXX.py")" || die 'cannot create tally program'
+# Keep XXXXXX at the suffix so both GNU and BSD/macOS mktemp expand it.
+TALLY="$(mktemp "${TMPDIR:-/tmp}/fastmcp-tally.XXXXXX")" || die 'cannot create tally program'
+ADAPTER=""
+cleanup_all() {
+    if [ -n "$ADAPTER" ] && kill -0 "$ADAPTER" 2>/dev/null; then
+        kill -TERM "$ADAPTER" 2>/dev/null
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$ADAPTER" 2>/dev/null || break
+            sleep 0.2
+        done
+        kill -KILL "$ADAPTER" 2>/dev/null
+    fi
+    rm -f "$TALLY" 2>/dev/null || true
+}
+trap cleanup_all EXIT INT TERM
 cat > "$TALLY" <<'TALLY_PY'
 import json, pathlib, re, sys
 
@@ -227,17 +241,6 @@ printf '== adapter: %s\n== endpoint: http://127.0.0.1:%s/mcp\n== suite: %s @ %s\
 
 "$BIN" "127.0.0.1:$PORT" > "$OUT/adapter.log" 2>&1 &
 ADAPTER=$!
-cleanup() {
-    if kill -0 "$ADAPTER" 2>/dev/null; then
-        kill -TERM "$ADAPTER" 2>/dev/null
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            kill -0 "$ADAPTER" 2>/dev/null || break
-            sleep 0.2
-        done
-        kill -KILL "$ADAPTER" 2>/dev/null
-    fi
-}
-trap cleanup EXIT INT TERM
 
 # Wait for the listener, bounded, and treat an early exit as fatal rather than
 # letting the suite report every scenario as a connection failure.
