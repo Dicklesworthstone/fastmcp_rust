@@ -35,7 +35,10 @@ use std::sync::{
 };
 
 use asupersync::Cx;
-use fastmcp_core::{AuthContext, McpContext, McpResult, TraceContext, TraceContextRecovery};
+use fastmcp_core::{
+    AuthContext, McpContext, McpResult, OperatorLifecycle, OperatorSnapshot, TraceContext,
+    TraceContextRecovery,
+};
 use fastmcp_protocol::{
     Content, FINAL_PROTOCOL_VERSION, JsonRpcRequest, Tool, protocol_policy::ProtocolPolicy,
 };
@@ -43,10 +46,10 @@ use fastmcp_server::http_admission::security::HttpSecurityPolicy;
 use fastmcp_server::http_admission::security::endpoint::SecuredHttpEndpointError;
 use fastmcp_server::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
 use fastmcp_server::{
-    AuthProvider, AuthRequest, BoxFuture, FinalToolOutcome, HttpServerConfig, HttpServerShutdown,
-    Middleware, MiddlewareDecision, Server, ServerHttpEndpoint, ServerHttpEndpointResponse,
-    StaticTokenVerifier, TokenAuthProvider, ToolExecutionMode, ToolHandler,
-    promote_legacy_tool_content,
+    AuthProvider, AuthRequest, BoxFuture, FinalToolOutcome, HttpOperatorHandle, HttpServerConfig,
+    HttpServerShutdown, Middleware, MiddlewareDecision, Server, ServerHttpEndpoint,
+    ServerHttpEndpointResponse, StaticTokenVerifier, TokenAuthProvider, ToolExecutionMode,
+    ToolHandler, promote_legacy_tool_content,
 };
 use fastmcp_transport::http::{HttpHandlerConfig, HttpMethod, HttpRequest};
 use serde_json::json;
@@ -1003,4 +1006,411 @@ fn native_http_modern_listener_serves_browser_preflight_json_and_sse() {
 #[test]
 fn native_http_auto_listener_serves_browser_preflight_json_and_sse() {
     native_http_browser_round_trip(ProtocolPolicy::Auto);
+}
+
+struct StopReadinessListener(Cx);
+
+impl Drop for StopReadinessListener {
+    fn drop(&mut self) {
+        self.0.cancel_with(asupersync::CancelKind::User, None);
+    }
+}
+
+async fn wait_readiness_snapshot(
+    operator: &HttpOperatorHandle,
+    predicate: impl Fn(&OperatorSnapshot) -> bool,
+) -> OperatorSnapshot {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(snapshot) = OperatorSnapshot::capture(operator)
+            && predicate(&snapshot)
+        {
+            return snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "listener observation timed out",
+        );
+        asupersync::runtime::yield_now().await;
+    }
+}
+
+fn readiness_json(response: &[u8], expected_status: u16) -> serde_json::Value {
+    let (status, headers, body) = browser_response(response);
+    assert_eq!(status, expected_status);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        body.len() < 2048,
+        "diagnostic response must have a fixed bound"
+    );
+    let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(body["schema"], "fastmcp.http.readiness/v1");
+    assert_eq!(body["snapshotSchema"], OperatorSnapshot::SCHEMA_VERSION);
+    assert_eq!(body.as_object().unwrap().len(), 10);
+    body
+}
+
+async fn readiness_finish_admitted_request(
+    cx: &Cx,
+    address: std::net::SocketAddr,
+    mut admitted: asupersync::net::TcpStream,
+) {
+    use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+    let accepted = request();
+    let mut head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        accepted.body.len(),
+    );
+    for (name, value) in &accepted.headers {
+        if !name.eq_ignore_ascii_case("host") {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    head.push_str("\r\n");
+    admitted.write_all(head.as_bytes()).await.unwrap();
+    admitted.write_all(&accepted.body).await.unwrap();
+    admitted.flush().await.unwrap();
+    let mut response = Vec::new();
+    asupersync::time::timeout(
+        cx.now(),
+        std::time::Duration::from_secs(5),
+        admitted.read_to_end(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(browser_response(&response).0, 200);
+    let body: serde_json::Value = serde_json::from_slice(browser_response(&response).2).unwrap();
+    assert_eq!(body["result"]["content"][0]["text"], "verified-subject");
+}
+
+async fn readiness_capacity_checks(
+    cx: &Cx,
+    address: std::net::SocketAddr,
+    operator: &HttpOperatorHandle,
+    probe: &Probe,
+) -> serde_json::Value {
+    let diagnostic = || {
+        HttpRequest::new(HttpMethod::Get, "/readyz")
+            .with_header("authorization", "Bearer private-health-bearer")
+            .with_header("cookie", "private-health-cookie")
+            .with_header("x-request-id", "private-health-request-id")
+    };
+    let healthy = browser_exchange(cx, address, diagnostic()).await.unwrap();
+    let body = readiness_json(&healthy, 200);
+    assert_eq!(
+        body["connections"],
+        json!({"limit":1,"active":0,"reserved":0})
+    );
+    assert_eq!(body["saturated"], false);
+    let generation = body["generation"].clone();
+    assert_eq!(probe.counts(), (0, 0));
+
+    // The same request now sees one real socket retaining the only data
+    // permit. The extra control socket must still return an honest 503.
+    let occupied = asupersync::net::TcpStream::connect(address).await.unwrap();
+    wait_readiness_snapshot(operator, |snapshot| snapshot.connections().active == 1).await;
+    let saturated = browser_exchange(cx, address, diagnostic()).await.unwrap();
+    let body = readiness_json(&saturated, 503);
+    assert_eq!(body["readiness"], "ready");
+    assert_eq!(body["saturated"], true);
+    assert_eq!(body["connections"]["active"], 1);
+    assert_eq!(body["generation"], generation);
+    let live = browser_exchange(cx, address, HttpRequest::new(HttpMethod::Get, "/livez"))
+        .await
+        .unwrap();
+    assert_eq!(browser_response(&live).0, 200);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(browser_response(&live).2).unwrap(),
+        json!({"status":"ok"}),
+    );
+    drop(occupied);
+    wait_readiness_snapshot(operator, |snapshot| snapshot.connections().in_use() == 0).await;
+    let recovered = browser_exchange(cx, address, diagnostic()).await.unwrap();
+    assert_eq!(readiness_json(&recovered, 200)["generation"], generation);
+
+    for response in [&healthy, &saturated, &recovered] {
+        let wire = std::str::from_utf8(response).unwrap();
+        for canary in [
+            "private-health-server-name",
+            "private-health-bearer",
+            "private-health-cookie",
+            "private-health-request-id",
+        ] {
+            assert!(
+                !wire.contains(canary),
+                "diagnostics exposed peer or server identity"
+            );
+        }
+    }
+    assert_eq!(probe.counts(), (0, 0));
+    generation
+}
+
+async fn readiness_drain_checks(
+    cx: &Cx,
+    address: std::net::SocketAddr,
+    operator: &HttpOperatorHandle,
+    probe: &Probe,
+    generation: &serde_json::Value,
+) {
+    // Drain fences future connections but does not confiscate an already
+    // admitted socket or its right to finish one request.
+    let admitted = asupersync::net::TcpStream::connect(address).await.unwrap();
+    wait_readiness_snapshot(operator, |snapshot| snapshot.connections().active == 1).await;
+    operator.begin_drain().unwrap();
+    let draining = browser_exchange(cx, address, HttpRequest::new(HttpMethod::Get, "/readyz"))
+        .await
+        .unwrap();
+    assert_eq!(readiness_json(&draining, 503)["lifecycle"], "stopping");
+    let refused = browser_exchange(cx, address, request()).await.unwrap();
+    assert_eq!(browser_response(&refused).0, 503);
+    assert_eq!(
+        probe.counts(),
+        (0, 0),
+        "control capacity must never dispatch MCP"
+    );
+    readiness_finish_admitted_request(cx, address, admitted).await;
+    assert_eq!(probe.counts(), (1, 1));
+    let settled =
+        wait_readiness_snapshot(operator, |snapshot| snapshot.connections().in_use() == 0).await;
+    assert_eq!(settled.counters().accepted, settled.counters().released);
+    assert_eq!(
+        settled.counters().probes_acquired,
+        0,
+        "diagnostics never reserve admission"
+    );
+    let drained = browser_exchange(cx, address, HttpRequest::new(HttpMethod::Get, "/readyz"))
+        .await
+        .unwrap();
+    let body = readiness_json(&drained, 503);
+    assert_eq!(&body["generation"], generation);
+    assert_eq!(body["lifecycle"], "stopping");
+    assert_eq!(
+        body["saturated"], false,
+        "drain must not reopen when work completes"
+    );
+}
+
+fn native_http_readiness_lifecycle(protocol: ProtocolPolicy) {
+    run(move |cx| async move {
+        let probe = Probe::new();
+        let bound = Server::new("private-health-server-name", "1.0.0")
+            .protocol_policy(protocol)
+            .unwrap()
+            .http_config(
+                HttpServerConfig::new()
+                    .health_path("/livez")
+                    .readiness_path("/readyz")
+                    .max_connections(1)
+                    .request_read_timeout(std::time::Duration::from_secs(15)),
+            )
+            .auth_provider(probe.clone())
+            .tool(probe.clone())
+            .build()
+            .bind_http(&cx, "127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = bound.local_addr().unwrap();
+        let operator = bound.operator_handle();
+        let observed = operator.clone();
+        let shutdown_cx = cx.clone();
+        let mut client = cx
+            .spawn(move |client_cx| async move {
+                let _stop = StopReadinessListener(shutdown_cx);
+                wait_readiness_snapshot(&observed, |snapshot| {
+                    snapshot.lifecycle() == OperatorLifecycle::Running
+                })
+                .await;
+                let generation =
+                    readiness_capacity_checks(&client_cx, address, &observed, &probe).await;
+                readiness_drain_checks(&client_cx, address, &observed, &probe, &generation).await;
+            })
+            .unwrap();
+        let shutdown = bound.serve(&cx).await.unwrap();
+        client.join(&cx).await.unwrap();
+        assert!(matches!(shutdown, HttpServerShutdown::Quiescent));
+        let stopped = OperatorSnapshot::capture(&operator).unwrap();
+        assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+        assert_eq!(stopped.connections().in_use(), 0);
+        assert_eq!(stopped.counters().accepted, stopped.counters().released);
+    });
+}
+
+#[test]
+fn native_http_readiness_modern_tracks_saturation_recovery_and_drain() {
+    native_http_readiness_lifecycle(ProtocolPolicy::ModernOnly);
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn native_http_readiness_auto_tracks_saturation_recovery_and_drain() {
+    native_http_readiness_lifecycle(ProtocolPolicy::Auto);
+}
+
+#[test]
+fn native_http_readiness_control_lane_is_bounded_and_idle_capacity_recovers() {
+    run(|cx| async move {
+        use asupersync::io::AsyncReadExt;
+
+        let probe = Probe::new();
+        let bound = Server::new("control-health", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .http_config(
+                HttpServerConfig::new()
+                    .max_connections(0)
+                    .request_read_timeout(std::time::Duration::from_secs(30)),
+            )
+            .auth_provider(probe.clone())
+            .tool(probe.clone())
+            .build()
+            .bind_http(&cx, "127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = bound.local_addr().unwrap();
+        let operator = bound.operator_handle();
+        let observed = operator.clone();
+        let shutdown_cx = cx.clone();
+        let mut client = cx
+            .spawn(move |client_cx| async move {
+                let _stop = StopReadinessListener(shutdown_cx);
+                wait_readiness_snapshot(&observed, |snapshot| {
+                    snapshot.lifecycle() == OperatorLifecycle::Running
+                })
+                .await;
+                let mut idle = asupersync::net::TcpStream::connect(address).await.unwrap();
+                wait_readiness_snapshot(&observed, |snapshot| snapshot.counters().rejected == 1)
+                    .await;
+                let mut excess = asupersync::net::TcpStream::connect(address).await.unwrap();
+                let mut excess_bytes = Vec::new();
+                asupersync::time::timeout(
+                    client_cx.now(),
+                    std::time::Duration::from_secs(3),
+                    excess.read_to_end(&mut excess_bytes),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(
+                    excess_bytes.is_empty(),
+                    "a second control child must not be admitted"
+                );
+                let mut idle_bytes = Vec::new();
+                asupersync::time::timeout(
+                    client_cx.now(),
+                    std::time::Duration::from_secs(3),
+                    idle.read_to_end(&mut idle_bytes),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(
+                    idle_bytes.is_empty(),
+                    "idle control socket must expire below the 30s data limit"
+                );
+                let recovered = browser_exchange(
+                    &client_cx,
+                    address,
+                    HttpRequest::new(HttpMethod::Get, "/ready"),
+                )
+                .await
+                .unwrap();
+                let body = readiness_json(&recovered, 503);
+                assert_eq!(
+                    body["connections"],
+                    json!({"limit":0,"active":0,"reserved":0})
+                );
+                assert_eq!(body["readiness"], "not_ready");
+                let snapshot = OperatorSnapshot::capture(&observed).unwrap();
+                assert_eq!(snapshot.counters().accepted, 0);
+                assert_eq!(snapshot.counters().released, 0);
+            })
+            .unwrap();
+        let shutdown = bound.serve(&cx).await.unwrap();
+        client.join(&cx).await.unwrap();
+        assert!(matches!(shutdown, HttpServerShutdown::Quiescent));
+        assert_eq!(probe.counts(), (0, 0));
+        assert_eq!(
+            OperatorSnapshot::capture(&operator)
+                .unwrap()
+                .connections()
+                .in_use(),
+            0
+        );
+    });
+}
+
+#[test]
+fn native_http_readiness_routes_reject_collisions_before_listener_binding() {
+    run(|cx| async move {
+        let invalid = vec![
+            HttpServerConfig::new().readiness_path("/mcp"),
+            HttpServerConfig::new().health_path("/ready"),
+            HttpServerConfig::new().readiness_path("relative"),
+            HttpServerConfig::new().readiness_path("//authority/path"),
+            HttpServerConfig::new().readiness_path("/ready?secret=value"),
+            HttpServerConfig::new().readiness_path("/ready#fragment"),
+            HttpServerConfig::new().readiness_path("/ready%2fpath"),
+            HttpServerConfig::new().health_path("/ready\r\n"),
+        ];
+        #[cfg(feature = "legacy-2024-11-05")]
+        let invalid = {
+            let mut invalid = invalid;
+            invalid.push(HttpServerConfig::new().readiness_path("/sse"));
+            invalid
+        };
+        for config in invalid {
+            let result = Server::new("invalid-health", "1.0.0")
+                .http_config(config)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await;
+            assert!(
+                result.is_err(),
+                "diagnostic path must not shadow an application route"
+            );
+        }
+    });
+}
+
+#[test]
+fn native_http_readiness_embedding_is_unbound_and_diagnostics_have_no_auth_effects() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let endpoint = endpoint(&probe);
+        let mut session = endpoint.open_session(&cx).unwrap();
+        for (request, expected) in [
+            (
+                HttpRequest::new(HttpMethod::Get, "/ready")
+                    .with_header("authorization", "Bearer secret-canary"),
+                503,
+            ),
+            (HttpRequest::new(HttpMethod::Post, "/ready"), 405),
+            (
+                HttpRequest::new(HttpMethod::Get, "/ready").with_body(b"body-canary".to_vec()),
+                400,
+            ),
+            (
+                HttpRequest::new(HttpMethod::Get, "/ready")
+                    .with_header("origin", "https://untrusted.example"),
+                403,
+            ),
+            (HttpRequest::new(HttpMethod::Get, "/health"), 200),
+        ] {
+            let ServerHttpEndpointResponse::Immediate(response) =
+                session.handle_async(&cx, request).await.unwrap()
+            else {
+                panic!("diagnostic routes must never create a protocol stream");
+            };
+            assert_eq!(response.status.0, expected);
+            let body = std::str::from_utf8(&response.body).unwrap();
+            assert!(!body.contains("secret-canary"));
+            assert!(!body.contains("body-canary"));
+            assert!(!body.contains("untrusted.example"));
+            assert_eq!(probe.counts(), (0, 0));
+        }
+        session.close(&cx).await;
+    });
 }

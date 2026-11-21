@@ -795,6 +795,39 @@ directly when that dependency boundary is required.
 This feature selection does not change the transport qualification boundaries
 described above.
 
+### Native HTTP readiness and draining (current source tree)
+
+`BoundHttpServer` exposes `GET /health` for listener liveness and `GET /ready`
+for connection readiness. Configure their paths with
+`HttpServerConfig::health_path` and `HttpServerConfig::readiness_path`.
+Diagnostic paths must be distinct absolute paths and cannot overlap MCP,
+legacy SSE, or installed OAuth routes; invalid configurations fail before bind.
+
+The readiness response is a bounded, `Cache-Control: no-store` JSON snapshot
+with schema `fastmcp.http.readiness/v1`. It returns 200 only while the listener
+is running, structurally ready, and has spare connection capacity. Saturation,
+draining, an unavailable snapshot, or an endpoint without a bound listener
+returns 503. The snapshot reports lifecycle, capacity, and fixed counters;
+it contains no request identifiers or credentials and invokes no authentication
+provider or application handler. It observes capacity without reserving it.
+
+A listener retains one bounded diagnostic connection when protocol capacity
+is full or admission is draining. This connection has an 8 KiB header limit,
+accepts no request body, and has one-second read and write bounds. It cannot
+become a protocol connection if capacity becomes available while it is open.
+
+Keep the handle returned by `bound.operator_handle()` and call
+`operator.begin_drain()?` before cancelling the listener's serving context.
+The call fences new protocol admission and revokes unused reservations while
+accepted work retains its permits. `/ready` then returns 503, and `/health`
+remains available so a load balancer can observe the draining listener.
+Draining is irreversible for that listener generation; the call does not wait
+for requests to finish. A busy admission cell returns a retryable `Busy` error.
+
+These diagnostics apply to the native bound HTTP listener. Secured HTTP/HTTPS
+wrappers retain their existing route policies. Readiness does not establish
+upstream availability, durable Tasks, or OAuth security qualification.
+
 ### Modern subscription admission (current source tree)
 
 Modern subscription listeners share a server-wide capacity of 64 streams and

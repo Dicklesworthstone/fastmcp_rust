@@ -4282,8 +4282,24 @@ pub enum DuplicateBehavior {
 /// ```
 #[derive(Debug, Clone)]
 pub struct HttpServerConfig {
-    /// Path for the health-check endpoint (default: `"/health"`).
+    /// Path for the liveness endpoint (default: `"/health"`).
+    ///
+    /// A successful response proves that this listener can service a bounded
+    /// diagnostic request. Use [`Self::readiness_path`] to observe admission
+    /// capacity and the drain fence instead.
     pub health_path: String,
+    /// Path for the connection-readiness endpoint (default: `"/ready"`).
+    ///
+    /// [`BoundHttpServer`] returns 200 only while running with available
+    /// connection capacity, otherwise 503. The bounded JSON body separates
+    /// structural readiness from momentary saturation. It is an observation,
+    /// not a reservation or a claim about authentication, Tasks, or upstreams.
+    /// Both diagnostic routes are GET-only, contain no peer data, and never
+    /// invoke MCP authentication or handlers. Their configured paths must be
+    /// distinct from all protocol and OAuth routes. Secured HTTP/HTTPS wrappers
+    /// retain their own route policies; this option does not install a
+    /// diagnostic route on those listeners.
+    pub readiness_path: String,
     /// Maximum number of concurrent connections (default: 64).
     pub max_connections: usize,
     /// Time allowed to receive one complete request on an accepted
@@ -4392,6 +4408,7 @@ impl Default for HttpServerConfig {
     fn default() -> Self {
         Self {
             health_path: "/health".to_string(),
+            readiness_path: "/ready".to_string(),
             max_connections: 64,
             request_read_timeout: DEFAULT_HTTP_REQUEST_READ_TIMEOUT,
             response_write_timeout: DEFAULT_HTTP_RESPONSE_WRITE_TIMEOUT,
@@ -4422,10 +4439,20 @@ impl HttpServerConfig {
         self
     }
 
-    /// Sets the health-check endpoint path.
+    /// Sets the liveness endpoint path.
     #[must_use]
     pub fn health_path(mut self, path: impl Into<String>) -> Self {
         self.health_path = path.into();
+        self
+    }
+
+    /// Sets the connection-readiness endpoint path.
+    ///
+    /// The path must be an absolute path without a query, fragment, escape,
+    /// whitespace, or control character, and must not overlap another route.
+    #[must_use]
+    pub fn readiness_path(mut self, path: impl Into<String>) -> Self {
+        self.readiness_path = path.into();
         self
     }
 
@@ -4572,6 +4599,8 @@ fn http_request_accepts_sse(request: &HttpRequest) -> bool {
 /// legacy feature is enabled.
 pub struct ServerHttpEndpoint {
     server: Arc<Server>,
+    http_operator: Option<HttpOperatorHandle>,
+    health_control_active: Arc<AtomicBool>,
     #[cfg(feature = "legacy-2024-11-05")]
     legacy_origin: String,
 }
@@ -4579,19 +4608,32 @@ pub struct ServerHttpEndpoint {
 fn validate_server_http_route_configuration(
     server: &Server,
 ) -> Result<(), ServerHttpEndpointError> {
-    let Some(routes) = server.oauth_http_routes.as_ref() else {
-        return Ok(());
-    };
-    let occupied = vec![
-        server.http_config.handler_config.base_path.as_str(),
-        server.http_config.health_path.as_str(),
-    ];
+    let mut occupied = vec![server.http_config.handler_config.base_path.as_str()];
     #[cfg(feature = "legacy-2024-11-05")]
-    let occupied = {
-        let mut occupied = occupied;
+    {
         occupied.push(server.http_config.legacy_sse_path.as_str());
         occupied.push(server.http_config.legacy_message_path.as_str());
-        occupied
+    }
+    for path in [
+        server.http_config.health_path.as_str(),
+        server.http_config.readiness_path.as_str(),
+    ] {
+        if !path.starts_with('/')
+            || path.starts_with("//")
+            || path.len() > 1024
+            || path.bytes().any(|byte| {
+                byte <= b' ' || byte >= 0x7f || matches!(byte, b'?' | b'#' | b'%' | b'\\')
+            })
+            || occupied.contains(&path)
+        {
+            return Err(ServerHttpEndpointError::InvalidConfiguration(
+                "HTTP diagnostic routes must be distinct absolute paths".to_owned(),
+            ));
+        }
+        occupied.push(path);
+    }
+    let Some(routes) = server.oauth_http_routes.as_ref() else {
+        return Ok(());
     };
     routes
         .validate_non_overlapping_paths(occupied)
@@ -4607,6 +4649,7 @@ fn validate_server_http_route_configuration(
 #[must_use = "a ServerHttpSession with admitted work must be closed asynchronously"]
 pub struct ServerHttpSession {
     server: Arc<Server>,
+    http_operator: Option<HttpOperatorHandle>,
     endpoint_session: Arc<Mutex<DualEraHttpSession>>,
     #[cfg(feature = "legacy-2024-11-05")]
     legacy_session_id: String,
@@ -8739,13 +8782,44 @@ impl HttpOperatorHandle {
             limiter: Arc::clone(&self.limiter),
         }
     }
+
+    /// Fences new protocol connections while already admitted work drains.
+    ///
+    /// This non-waiting transition is irreversible for this listener generation.
+    /// Unconsumed connection reservations are revoked exactly once; accepted
+    /// work retains its permits. The native HTTP diagnostic routes stay alive
+    /// and the configured readiness route returns 503, allowing a load balancer
+    /// to stop routing work before the owner cancels [`BoundHttpServer::serve`].
+    /// This method neither cancels existing requests nor waits for them to finish.
+    ///
+    /// A busy or poisoned admission cell returns an error without claiming that
+    /// the fence was installed. The caller may retry a busy observation.
+    pub fn begin_drain(&self) -> Result<(), OperatorSnapshotError> {
+        let mut state = match self.limiter.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(OperatorSnapshotError::Poisoned);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return Err(OperatorSnapshotError::Busy),
+        };
+        if matches!(
+            state.lifecycle,
+            OperatorLifecycle::Starting | OperatorLifecycle::Running
+        ) {
+            state.lifecycle = OperatorLifecycle::Stopping;
+            self.limiter.revoke_probes(&mut state);
+        }
+        Ok(())
+    }
 }
 
 impl OperatorSnapshotSource for HttpOperatorHandle {
     fn operator_snapshot(&self) -> Result<OperatorSnapshot, OperatorSnapshotError> {
         let mut state = match self.limiter.state.try_lock() {
             Ok(state) => state,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(OperatorSnapshotError::Poisoned);
+            }
             Err(std::sync::TryLockError::WouldBlock) => return Err(OperatorSnapshotError::Busy),
         };
         let captured_at = Instant::now();
@@ -8771,6 +8845,165 @@ impl OperatorSnapshotSource for HttpOperatorHandle {
             state.counters,
         ))
     }
+}
+
+/// One extra socket may classify a diagnostic request when protocol capacity
+/// is exhausted. It cannot acquire protocol authority or enter a handler.
+/// A single non-waiting atomic bounds both this overflow path and diagnostic
+/// response writes after a normal connection releases its data permit.
+struct HttpHealthControlPermit {
+    active: Arc<AtomicBool>,
+}
+
+impl HttpHealthControlPermit {
+    fn try_acquire(active: &Arc<AtomicBool>) -> Option<Self> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self {
+                active: Arc::clone(active),
+            })
+    }
+}
+
+impl Drop for HttpHealthControlPermit {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+enum HttpNativeConnectionAdmission {
+    Protocol(HttpConnectionPermit),
+    Health(HttpHealthControlPermit),
+}
+
+impl HttpNativeConnectionAdmission {
+    fn health_only(&self) -> bool {
+        matches!(self, Self::Health(_))
+    }
+
+    fn into_health(self, active: &Arc<AtomicBool>) -> Option<HttpHealthControlPermit> {
+        match self {
+            Self::Protocol(protocol) => {
+                // Bound the response lifetime before releasing data admission.
+                // Otherwise slow health readers could become an unbounded
+                // population after returning their protocol connection slots.
+                let health = HttpHealthControlPermit::try_acquire(active)?;
+                drop(protocol);
+                Some(health)
+            }
+            Self::Health(health) => Some(health),
+        }
+    }
+}
+
+const HTTP_HEALTH_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const HTTP_HEALTH_MAX_HEADER_BYTES: usize = 8 * 1024;
+
+fn http_readiness_response(operator: Option<&HttpOperatorHandle>) -> HttpResponse {
+    let snapshot = operator.map(OperatorSnapshot::capture);
+    let snapshot = match snapshot {
+        Some(Ok(snapshot)) => snapshot,
+        unavailable => {
+            let reason = match unavailable {
+                None => "listener_unbound",
+                Some(Err(OperatorSnapshotError::Busy)) => "snapshot_busy",
+                Some(Err(OperatorSnapshotError::Poisoned)) => "snapshot_poisoned",
+                Some(Err(OperatorSnapshotError::GenerationExhausted)) => "generation_exhausted",
+                Some(Ok(_)) => unreachable!("successful capture returned above"),
+            };
+            return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+                .with_header("cache-control", "no-store")
+                .with_json(&serde_json::json!({
+                    "schema": "fastmcp.http.readiness/v1",
+                    "snapshotSchema": OperatorSnapshot::SCHEMA_VERSION,
+                    "status": "unavailable",
+                    "reason": reason,
+                }));
+        }
+    };
+    let connections = snapshot.connections();
+    let counters = snapshot.counters();
+    let ready = snapshot.readiness() == OperatorReadiness::Ready
+        && snapshot.lifecycle() == OperatorLifecycle::Running
+        && !connections.is_saturated();
+    let lifecycle = match snapshot.lifecycle() {
+        OperatorLifecycle::Starting => "starting",
+        OperatorLifecycle::Running => "running",
+        OperatorLifecycle::Stopping => "stopping",
+        OperatorLifecycle::Stopped => "stopped",
+    };
+    let readiness = match snapshot.readiness() {
+        OperatorReadiness::Starting => "starting",
+        OperatorReadiness::Ready => "ready",
+        OperatorReadiness::NotReady => "not_ready",
+        OperatorReadiness::Stopping => "stopping",
+    };
+    let profile = match snapshot.profile() {
+        OperatorProfile::Modern => "modern",
+        OperatorProfile::Legacy2024 => "legacy_2024",
+        OperatorProfile::Auto => "auto",
+    };
+    // All strings are local constants and all numbers are fixed-width bounded
+    // counters. This exporter never serializes an application or peer value.
+    HttpResponse::new(if ready {
+        HttpStatus::OK
+    } else {
+        HttpStatus::SERVICE_UNAVAILABLE
+    })
+    .with_header("cache-control", "no-store")
+    .with_json(&serde_json::json!({
+        "schema": "fastmcp.http.readiness/v1",
+        "snapshotSchema": snapshot.schema_version(),
+        "generation": snapshot.configuration_generation(),
+        "status": if ready { "ready" } else { "not_ready" },
+        "profile": profile,
+        "lifecycle": lifecycle,
+        "readiness": readiness,
+        "saturated": connections.is_saturated(),
+        "connections": {
+            "limit": connections.limit,
+            "active": connections.active,
+            "reserved": connections.reserved,
+        },
+        "counters": {
+            "accepted": counters.accepted,
+            "rejected": counters.rejected,
+            "probesAcquired": counters.probes_acquired,
+            "released": counters.released,
+            "expired": counters.expired,
+            "cancelled": counters.cancelled,
+            "shutdownRevoked": counters.shutdown_revoked,
+            "overflowed": counters.overflowed,
+        },
+    }))
+}
+
+fn http_diagnostic_response(
+    server: &Server,
+    operator: Option<&HttpOperatorHandle>,
+    request: &HttpRequest,
+) -> Option<HttpResponse> {
+    if request.path != server.http_config.health_path
+        && request.path != server.http_config.readiness_path
+    {
+        return None;
+    }
+    let response = if request
+        .header("origin")
+        .is_some_and(|origin| !server.http_config.handler_config.admits_origin(origin))
+    {
+        HttpResponse::new(HttpStatus::FORBIDDEN)
+    } else if request.method != HttpMethod::Get {
+        HttpResponse::new(HttpStatus::METHOD_NOT_ALLOWED).with_header("allow", "GET")
+    } else if !request.body.is_empty() || !request.query.is_empty() {
+        HttpResponse::bad_request()
+    } else if request.path == server.http_config.health_path {
+        HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"}))
+    } else {
+        http_readiness_response(operator)
+    };
+    Some(response.with_header("cache-control", "no-store"))
 }
 
 /// Optional one-shot connection admission, distinct from an observational snapshot.
@@ -8928,6 +9161,159 @@ mod http_operator_tests {
 
     fn capture(handle: &HttpOperatorHandle) -> OperatorSnapshot {
         OperatorSnapshot::capture(handle).unwrap()
+    }
+
+    fn readiness_body(
+        handle: &HttpOperatorHandle,
+        expected_status: HttpStatus,
+    ) -> serde_json::Value {
+        let response = http_readiness_response(Some(handle));
+        assert_eq!(response.status, expected_status);
+        assert_eq!(
+            response.headers.get("cache-control").map(String::as_str),
+            Some("no-store")
+        );
+        assert!(response.body.len() < 2048);
+        serde_json::from_slice(&response.body).unwrap()
+    }
+
+    #[test]
+    fn http_readiness_reports_capacity_and_drain_without_reserving_slots() {
+        let limiter =
+            Arc::new(HttpConnectionLimiter::for_http(1, ProtocolPolicy::ModernOnly).unwrap());
+        let handle = HttpOperatorHandle {
+            limiter: Arc::clone(&limiter),
+        };
+        assert_eq!(
+            readiness_body(&handle, HttpStatus::SERVICE_UNAVAILABLE)["lifecycle"],
+            "starting",
+        );
+        let cx = Cx::for_testing();
+        limiter.start_serving(&cx);
+        let before = capture(&handle);
+        let body = readiness_body(&handle, HttpStatus::OK);
+        assert_eq!(body["schema"], "fastmcp.http.readiness/v1");
+        assert_eq!(body["snapshotSchema"], before.schema_version());
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["saturated"], false);
+        assert_eq!(capture(&handle).counters(), before.counters());
+        let permit = handle
+            .admission_probe()
+            .acquire(&cx, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let full = capture(&handle);
+        let body = readiness_body(&handle, HttpStatus::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["readiness"], "ready",
+            "structural readiness is not saturation"
+        );
+        assert_eq!(body["saturated"], true);
+        assert_eq!(body["connections"]["reserved"], 1);
+        assert_eq!(capture(&handle).counters(), full.counters());
+        drop(permit);
+        assert_eq!(
+            readiness_body(&handle, HttpStatus::OK)["connections"]["reserved"],
+            0
+        );
+        handle.begin_drain().unwrap();
+        handle.begin_drain().unwrap();
+        limiter.start_serving(&cx);
+        let body = readiness_body(&handle, HttpStatus::SERVICE_UNAVAILABLE);
+        assert_eq!(body["lifecycle"], "stopping");
+        assert_eq!(body["saturated"], false);
+        assert_eq!(body["generation"], before.configuration_generation());
+        limiter.set_lifecycle(OperatorLifecycle::Stopped);
+        assert_eq!(
+            readiness_body(&handle, HttpStatus::SERVICE_UNAVAILABLE)["lifecycle"],
+            "stopped",
+        );
+    }
+
+    #[test]
+    fn http_readiness_busy_and_poisoned_snapshots_never_report_ready() {
+        let (limiter, handle) = running(1);
+        let before = capture(&handle);
+        {
+            let _held = limiter.state.lock().unwrap();
+            assert_eq!(
+                readiness_body(&handle, HttpStatus::SERVICE_UNAVAILABLE)["reason"],
+                "snapshot_busy",
+            );
+            assert_eq!(handle.begin_drain(), Err(OperatorSnapshotError::Busy));
+        }
+        assert_eq!(capture(&handle).counters(), before.counters());
+        assert_eq!(capture(&handle).lifecycle(), OperatorLifecycle::Running);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = limiter.state.lock().unwrap();
+            panic!("synthetic readiness contributor failure");
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(
+            readiness_body(&handle, HttpStatus::SERVICE_UNAVAILABLE)["reason"],
+            "snapshot_poisoned",
+        );
+        assert_eq!(handle.begin_drain(), Err(OperatorSnapshotError::Poisoned));
+        let unbound = http_readiness_response(None);
+        assert_eq!(unbound.status, HttpStatus::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&unbound.body).unwrap()["reason"],
+            "listener_unbound"
+        );
+    }
+
+    #[test]
+    fn http_operator_drain_preserves_accepted_work_and_revokes_reservations_once() {
+        let (limiter, handle) = running(2);
+        let connection = limiter.try_acquire().unwrap();
+        let cx = Cx::for_testing();
+        let reservation = handle
+            .admission_probe()
+            .acquire(&cx, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        handle.begin_drain().unwrap();
+        let draining = capture(&handle);
+        assert_eq!(draining.connections().active, 1);
+        assert_eq!(draining.connections().reserved, 0);
+        assert_eq!(draining.counters().released, 1);
+        assert_eq!(draining.counters().shutdown_revoked, 1);
+        assert!(limiter.try_acquire().is_none());
+        assert_eq!(
+            handle
+                .admission_probe()
+                .acquire(&cx, Instant::now() + Duration::from_secs(5))
+                .unwrap_err(),
+            HttpConnectionAdmissionError::NotServing,
+        );
+        drop(reservation);
+        handle.begin_drain().unwrap();
+        assert_eq!(capture(&handle).counters().released, 1);
+        drop(connection);
+        let settled = capture(&handle);
+        assert_eq!(settled.connections().in_use(), 0);
+        assert_eq!(
+            settled.counters().accepted + settled.counters().probes_acquired,
+            settled.counters().released
+        );
+    }
+
+    #[test]
+    fn http_readiness_control_slot_is_bounded_and_handoff_releases_data_capacity() {
+        let (limiter, handle) = running(1);
+        let active = Arc::new(AtomicBool::new(false));
+        let connection = HttpNativeConnectionAdmission::Protocol(limiter.try_acquire().unwrap());
+        let health = connection.into_health(&active).unwrap();
+        assert_eq!(capture(&handle).connections().in_use(), 0);
+        assert_eq!(capture(&handle).counters().released, 1);
+        assert!(HttpHealthControlPermit::try_acquire(&active).is_none());
+        let refused = HttpNativeConnectionAdmission::Protocol(limiter.try_acquire().unwrap());
+        assert!(refused.into_health(&active).is_none());
+        assert_eq!(capture(&handle).connections().in_use(), 0);
+        drop(health);
+        let reacquired = HttpHealthControlPermit::try_acquire(&active).unwrap();
+        drop(reacquired);
+        assert!(!active.load(Ordering::Acquire));
+        assert_eq!(capture(&handle).counters().accepted, 2);
+        assert_eq!(capture(&handle).counters().released, 2);
     }
 
     #[test]
@@ -9661,13 +10047,20 @@ impl BoundHttpServer {
                         )));
                     }
                 };
-                let Some(permit) = self.connection_limiter.try_acquire() else {
-                    // A capacity rejection must not wait for a slow peer to read
-                    // an HTTP error response. Dropping the socket applies the
-                    // configured bound without creating an unbounded population
-                    // of rejection tasks.
-                    drop(stream);
-                    continue;
+                let admission = match self.connection_limiter.try_acquire() {
+                    Some(permit) => HttpNativeConnectionAdmission::Protocol(permit),
+                    None => {
+                        let Some(permit) = HttpHealthControlPermit::try_acquire(
+                            &self.endpoint.health_control_active,
+                        ) else {
+                            drop(stream);
+                            continue;
+                        };
+                        // At most one separately bounded control child may
+                        // identify a health route while protocol admission is
+                        // full or draining. It can never dispatch MCP or OAuth.
+                        HttpNativeConnectionAdmission::Health(permit)
+                    }
                 };
                 let endpoint = Arc::clone(&self.endpoint);
                 #[cfg(feature = "legacy-2024-11-05")]
@@ -9676,7 +10069,6 @@ impl BoundHttpServer {
                 let listener_shutdown = connection_shutdown.clone();
                 let connection = cx
                     .spawn_in(&connection_scope, move |connection_cx| async move {
-                        let _permit = permit;
                         #[cfg(feature = "legacy-2024-11-05")]
                         {
                             // Keep the nested connection future's Send proof in
@@ -9688,6 +10080,7 @@ impl BoundHttpServer {
                                 &connection_cx,
                                 stream,
                                 endpoint,
+                                admission,
                                 legacy_sessions,
                                 modern_sessions,
                                 listener_shutdown,
@@ -9699,6 +10092,7 @@ impl BoundHttpServer {
                             &connection_cx,
                             stream,
                             endpoint,
+                            admission,
                             modern_sessions,
                             listener_shutdown,
                         )
@@ -10676,6 +11070,8 @@ impl Server {
         validate_server_http_route_configuration(&self)?;
         let endpoint = ServerHttpEndpoint {
             server: Arc::new(self),
+            http_operator: None,
+            health_control_active: Arc::new(AtomicBool::new(false)),
         };
         let _ = endpoint
             .transport_endpoint()
@@ -10695,6 +11091,8 @@ impl Server {
         validate_server_http_route_configuration(&self)?;
         let endpoint = ServerHttpEndpoint {
             server: Arc::new(self),
+            http_operator: None,
+            health_control_active: Arc::new(AtomicBool::new(false)),
             legacy_origin: legacy_origin.into(),
         };
         let _ = endpoint
@@ -10714,6 +11112,8 @@ impl Server {
         if cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
+        validate_server_http_route_configuration(&self)
+            .map_err(|error| McpError::invalid_request(error.to_string()))?;
         let listener = AsyncTcpListener::bind(addr.into()).await.map_err(|error| {
             McpError::internal_error(format!("HTTP listener bind failed: {error}"))
         })?;
@@ -10727,15 +11127,18 @@ impl Server {
             McpError::internal_error(format!("HTTP listener address unavailable: {error}"))
         })?;
         #[cfg(feature = "legacy-2024-11-05")]
-        let endpoint = self
+        let mut endpoint = self
             .into_http_endpoint(format!("http://{local_addr}"))
             .map_err(|error| {
                 McpError::internal_error(format!("HTTP endpoint setup failed: {error}"))
             })?;
         #[cfg(not(feature = "legacy-2024-11-05"))]
-        let endpoint = self.into_http_endpoint().map_err(|error| {
+        let mut endpoint = self.into_http_endpoint().map_err(|error| {
             McpError::internal_error(format!("HTTP endpoint setup failed: {error}"))
         })?;
+        endpoint.http_operator = Some(HttpOperatorHandle {
+            limiter: Arc::clone(&connection_limiter),
+        });
         Ok(BoundHttpServer {
             listener,
             endpoint: Arc::new(endpoint),
@@ -10873,6 +11276,7 @@ impl ServerHttpEndpoint {
         );
         Ok(ServerHttpSession {
             server: Arc::clone(&self.server),
+            http_operator: self.http_operator.clone(),
             endpoint_session,
             #[cfg(feature = "legacy-2024-11-05")]
             legacy_session_id,
@@ -11218,11 +11622,10 @@ impl ServerHttpSession {
             return Ok(ServerHttpEndpointResponse::Immediate(response));
         }
         let mut request = request;
-        if request.path == self.server.http_config.health_path && request.method == HttpMethod::Get
+        if let Some(response) =
+            http_diagnostic_response(&self.server, self.http_operator.as_ref(), &request)
         {
-            return Ok(ServerHttpEndpointResponse::Immediate(
-                HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"})),
-            ));
+            return Ok(ServerHttpEndpointResponse::Immediate(response));
         }
 
         // DNS-rebinding protection for every MCP route, modern and exact-2024
@@ -15609,20 +16012,107 @@ where
     (output, peer_departed)
 }
 
+/// Services diagnostics before creating any protocol session or credential
+/// custody. A control-only socket is never upgraded to protocol admission,
+/// even if capacity becomes available while its request is being read.
+async fn serve_native_http_diagnostic(
+    cx: &Cx,
+    listener_shutdown: &HttpListenerShutdown,
+    framed: &mut Framed<AsyncTcpStream, NativeHttp1Codec>,
+    endpoint: &ServerHttpEndpoint,
+    admission: HttpNativeConnectionAdmission,
+    request: &asupersync::http::h1::Request,
+) -> Option<HttpNativeConnectionAdmission> {
+    let path = request
+        .uri
+        .split_once('?')
+        .map_or(request.uri.as_str(), |(path, _)| path);
+    let diagnostic = path == endpoint.server.http_config.health_path
+        || path == endpoint.server.http_config.readiness_path;
+    if !diagnostic && !admission.health_only() {
+        return Some(admission);
+    }
+    let Some(_health_permit) = admission.into_health(&endpoint.health_control_active) else {
+        return None;
+    };
+    let response = if !diagnostic {
+        HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+    } else if request.uri.contains('?') {
+        HttpResponse::bad_request()
+    } else {
+        match h1_request_to_transport(request) {
+            Ok(request) => http_diagnostic_response(
+                &endpoint.server,
+                endpoint.http_operator.as_ref(),
+                &request,
+            )
+            .unwrap_or_else(HttpResponse::bad_request),
+            Err(response) => response,
+        }
+    };
+    let diagnostic_shutdown = listener_shutdown.clone().with_response_write_timeout(
+        listener_shutdown
+            .response_write_timeout
+            .min(HTTP_HEALTH_IO_TIMEOUT),
+    );
+    let _ = send_h1_response(
+        cx,
+        &diagnostic_shutdown,
+        framed,
+        response.with_header("cache-control", "no-store"),
+    )
+    .await;
+    None
+}
+
+fn native_http_connection_codec(
+    endpoint: &ServerHttpEndpoint,
+    admission: &HttpNativeConnectionAdmission,
+) -> NativeHttp1Codec {
+    if admission.health_only() {
+        NativeHttp1Codec {
+            inner: Http1Codec::new()
+                .max_body_size(0)
+                .max_headers_size(HTTP_HEALTH_MAX_HEADER_BYTES),
+            oauth_limits: None,
+            pre_body_admission: NativeHttp1PreBodyAdmission::AwaitingHead,
+        }
+    } else {
+        native_http1_codec(endpoint)
+    }
+}
+
 #[cfg(feature = "legacy-2024-11-05")]
 async fn serve_http_connection(
     cx: &Cx,
     stream: AsyncTcpStream,
     endpoint: Arc<ServerHttpEndpoint>,
+    admission: HttpNativeConnectionAdmission,
     legacy_sessions: LiveHttpSessionRegistry,
     modern_sessions: LiveModernHttpSessionRegistry,
     listener_shutdown: HttpListenerShutdown,
 ) {
     let http_config = &endpoint.server.http_config.handler_config;
-    let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
+    let mut framed = Framed::new(stream, native_http_connection_codec(&endpoint, &admission));
+    let listener_shutdown = if admission.health_only() {
+        let timeout = listener_shutdown
+            .response_write_timeout
+            .min(HTTP_HEALTH_IO_TIMEOUT);
+        listener_shutdown.with_response_write_timeout(timeout)
+    } else {
+        listener_shutdown
+    };
     #[cfg(test)]
     lib_unit_tests::record_live_http_connection_read_wait();
-    let read_timeout = endpoint.server.http_config.request_read_timeout;
+    let read_timeout = if admission.health_only() {
+        endpoint
+            .server
+            .http_config
+            .request_read_timeout
+            .min(HTTP_HEALTH_IO_TIMEOUT)
+    } else {
+        endpoint.server.http_config.request_read_timeout
+    };
     let Some(request) =
         next_native_http1_request(cx, &listener_shutdown, &mut framed, read_timeout).await
     else {
@@ -15635,7 +16125,12 @@ async fn serve_http_connection(
                 cx,
                 &listener_shutdown,
                 &mut framed,
-                HttpResponse::bad_request(),
+                if admission.health_only() {
+                    HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+                        .with_header("cache-control", "no-store")
+                } else {
+                    HttpResponse::bad_request()
+                },
             )
             .await;
             return;
@@ -15651,6 +16146,18 @@ async fn serve_http_connection(
         .await;
         return;
     }
+    let Some(_admission) = serve_native_http_diagnostic(
+        cx,
+        &listener_shutdown,
+        &mut framed,
+        &endpoint,
+        admission,
+        &request,
+    )
+    .await
+    else {
+        return;
+    };
     if serve_oauth_h1_request(cx, &listener_shutdown, &mut framed, &endpoint, &request).await {
         return;
     }
@@ -16038,14 +16545,31 @@ async fn serve_modern_http_connection(
     cx: &Cx,
     stream: AsyncTcpStream,
     endpoint: Arc<ServerHttpEndpoint>,
+    admission: HttpNativeConnectionAdmission,
     modern_sessions: LiveModernHttpSessionRegistry,
     listener_shutdown: HttpListenerShutdown,
 ) {
     let http_config = &endpoint.server.http_config.handler_config;
-    let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
+    let mut framed = Framed::new(stream, native_http_connection_codec(&endpoint, &admission));
+    let listener_shutdown = if admission.health_only() {
+        let timeout = listener_shutdown
+            .response_write_timeout
+            .min(HTTP_HEALTH_IO_TIMEOUT);
+        listener_shutdown.with_response_write_timeout(timeout)
+    } else {
+        listener_shutdown
+    };
     #[cfg(test)]
     lib_unit_tests::record_live_http_connection_read_wait();
-    let read_timeout = endpoint.server.http_config.request_read_timeout;
+    let read_timeout = if admission.health_only() {
+        endpoint
+            .server
+            .http_config
+            .request_read_timeout
+            .min(HTTP_HEALTH_IO_TIMEOUT)
+    } else {
+        endpoint.server.http_config.request_read_timeout
+    };
     let Some(request) =
         next_native_http1_request(cx, &listener_shutdown, &mut framed, read_timeout).await
     else {
@@ -16058,7 +16582,12 @@ async fn serve_modern_http_connection(
                 cx,
                 &listener_shutdown,
                 &mut framed,
-                HttpResponse::bad_request(),
+                if admission.health_only() {
+                    HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+                        .with_header("cache-control", "no-store")
+                } else {
+                    HttpResponse::bad_request()
+                },
             )
             .await;
             return;
@@ -16074,6 +16603,18 @@ async fn serve_modern_http_connection(
         .await;
         return;
     }
+    let Some(_admission) = serve_native_http_diagnostic(
+        cx,
+        &listener_shutdown,
+        &mut framed,
+        &endpoint,
+        admission,
+        &request,
+    )
+    .await
+    else {
+        return;
+    };
     if serve_oauth_h1_request(cx, &listener_shutdown, &mut framed, &endpoint, &request).await {
         return;
     }
