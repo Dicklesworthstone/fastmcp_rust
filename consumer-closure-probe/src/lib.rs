@@ -145,7 +145,7 @@ pub fn build_modern_server() -> fastmcp_rust::modern::Server {
 /// `#[cfg(feature = "testing-lab")]`, and its own comment says production
 /// callers "receive `Cx` directly from this facade and do not need a
 /// test-internals runtime dependency". The README agrees from the other side,
-/// instructing `asupersync = "=0.5.0"` in the consumer's own manifest. So the
+/// instructing `asupersync = "=0.6.2"` in the consumer's own manifest. So the
 /// runtime is a CONSUMER-OWNED dependency by design, resolved through the
 /// consumer's own extern prelude, and therefore not a facade closure property
 /// and not probeable from here. Recorded rather than deleted because the
@@ -426,13 +426,13 @@ pub fn jwt_resource_providers_install_through_the_facade() {
 #[allow(clippy::unused_async_trait_impl, clippy::no_effect_underscore_binding)]
 pub fn apps_embedder_hooks_override_through_the_facade() {
     use fastmcp_rust::mcp_apps_bridge::{
-        McpAppsCancelledControlParams, McpAppsJsonRpcError, McpAppsJsonRpcRequestId,
-        McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
-        McpAppsProgressControlParams,
+        McpAppsCancelledControlParams, McpAppsCapabilityMarker, McpAppsJsonRpcError,
+        McpAppsJsonRpcRequestId, McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
+        McpAppsProgressControlParams, McpAppsRoutedMethod,
     };
     use fastmcp_rust::{
-        Cx, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostConfiguration,
-        McpAppsWireHostEffects, McpAppsWireHostPolicy,
+        Cx, JsonValue, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostConfiguration,
+        McpAppsWireHostEffects, McpAppsWireHostPolicy, McpError, McpRequestCancellation,
     };
 
     struct ProbeAppsEffects;
@@ -464,7 +464,21 @@ pub fn apps_embedder_hooks_override_through_the_facade() {
             _params: &McpAppsPinnedInitializeParams,
             configuration: &McpAppsWireHostConfiguration,
         ) -> McpAppsPinnedInitializeResult {
-            configuration.initialize_result()
+            let mut prepared = configuration.initialize_result();
+            prepared.host_capabilities.logging = Some(McpAppsCapabilityMarker {});
+            prepared
+        }
+
+        async fn dispatch_reused_request(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            _method: McpAppsRoutedMethod,
+            _params: Option<JsonValue>,
+        ) -> Result<JsonValue, McpAppsHostError> {
+            Err(McpAppsHostError::Core(McpError::method_not_found(
+                "probe-unused",
+            )))
         }
     }
 

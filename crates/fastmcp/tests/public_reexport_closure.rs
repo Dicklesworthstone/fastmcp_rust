@@ -367,14 +367,14 @@ fn facade_sampling_effect_is_implementable_and_consent_is_explicit() {
 fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
     use fastmcp_rust::mcp_apps_bridge::{
         MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeImplementation,
-        McpAppsCancelledControlParams, McpAppsJsonRpcEnvelope, McpAppsJsonRpcError,
-        McpAppsJsonRpcRequestId, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext,
-        McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
+        McpAppsCancelledControlParams, McpAppsCapabilityMarker, McpAppsJsonRpcEnvelope,
+        McpAppsJsonRpcError, McpAppsJsonRpcRequestId, McpAppsPinnedHostCapabilities,
+        McpAppsPinnedHostContext, McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
         McpAppsPinnedViewCapabilities, McpAppsProgressControlParams, McpAppsRoutedMethod,
     };
     use fastmcp_rust::{
-        Cx, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostConfiguration,
-        McpAppsWireHostEffects, McpAppsWireHostPolicy,
+        Cx, JsonValue, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostConfiguration,
+        McpAppsWireHostEffects, McpAppsWireHostPolicy, McpError, McpRequestCancellation,
     };
 
     #[derive(Default)]
@@ -426,11 +426,23 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
             configuration: &McpAppsWireHostConfiguration,
         ) -> McpAppsPinnedInitializeResult {
             let mut prepared = configuration.initialize_result();
-            prepared.host_capabilities.logging = Some(serde_json::json!({}));
+            prepared.host_capabilities.logging = Some(McpAppsCapabilityMarker {});
             if self.tamper_protocol_version {
                 prepared.protocol_version = "1999-01-01".to_owned();
             }
             prepared
+        }
+
+        async fn dispatch_reused_request(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            _method: McpAppsRoutedMethod,
+            _params: Option<JsonValue>,
+        ) -> Result<JsonValue, McpAppsHostError> {
+            Err(McpAppsHostError::Core(McpError::method_not_found(
+                "closure-test-unused",
+            )))
         }
     }
 
@@ -485,7 +497,6 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
             host_info: McpAppsBridgeImplementation {
                 name: "facade-host".to_owned(),
                 version: "1.0.0".to_owned(),
-                unknown: std::collections::BTreeMap::new(),
             },
             host_capabilities: McpAppsPinnedHostCapabilities::default(),
             host_context: McpAppsPinnedHostContext::default(),
@@ -494,7 +505,6 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
             app_info: McpAppsBridgeImplementation {
                 name: "facade-view".to_owned(),
                 version: "1.0.0".to_owned(),
-                unknown: std::collections::BTreeMap::new(),
             },
             app_capabilities: McpAppsPinnedViewCapabilities::default(),
             protocol_version: MCP_APPS_HOST_VIEW_PROTOCOL_VERSION.to_owned(),
@@ -512,7 +522,7 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
         assert_eq!(delegated.host_info.name, "facade-host");
         assert_eq!(
             delegated.host_capabilities.logging,
-            Some(serde_json::json!({}))
+            Some(McpAppsCapabilityMarker {})
         );
         assert!(
             configuration.initialize_result().host_capabilities.logging.is_none(),
