@@ -1,10 +1,13 @@
 //! Composed admission of OIDC, ID-JAG and final enterprise token responses.
 //!
-//! These bounded synchronous operations validate already-received responses.
-//! They do not fetch keys, send credentials, activate EMA or issue flow, custody,
-//! subject-mapping or replay receipts. Embeddings run signature verification on
-//! their caller-owned bounded CPU lane. Callers must erase confidential transport
-//! buffers; admitted compact tokens have private zeroizing custody.
+//! Bounded response admission and an explicit guarded HTTPS exchange driver.
+//!
+//! The driver binds each protected assertion to its original profile before
+//! serialization, keeps the two grant forms distinct, and consumes inputs on
+//! every outcome. It does not activate EMA or issue browser-flow, credential-
+//! custody, subject-mapping or deployment receipts. Those trust boundaries are
+//! additional requirements for the complete enterprise profile. Embeddings run
+//! synchronous signature admission on their caller-owned bounded CPU lane.
 
 #[cfg(test)]
 mod tests;
@@ -177,7 +180,7 @@ pub enum EnterpriseResponseOutcome<T> {
 }
 
 /// Immutable finite bounds for local response validation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EnterpriseResponsePolicy {
     id_token_lifetime: Duration,
     id_jag_lifetime: Duration,
@@ -236,6 +239,9 @@ impl EnterpriseResponsePolicy {
 pub struct EnterpriseIdentityAssertion {
     _assertion: SecretString,
     identity: VerifiedOidcIdToken,
+    profile: EnterpriseProfile,
+    policy: EnterpriseResponsePolicy,
+    received_at: SystemTime,
 }
 impl EnterpriseIdentityAssertion {
     pub fn identity(&self) -> &VerifiedOidcIdToken {
@@ -248,6 +254,7 @@ impl EnterpriseIdentityAssertion {
 pub struct EnterpriseIdJagResponse {
     _assertion: SecretString,
     assertion: VerifiedIdJag,
+    profile: EnterpriseProfile,
     requested_scopes: Vec<String>,
     granted_scopes: IdJagGrantedScopeSet,
     resource: String,
@@ -433,6 +440,9 @@ impl EnterpriseProfile {
             value: EnterpriseIdentityAssertion {
                 _assertion: assertion,
                 identity,
+                profile: self.clone(),
+                policy,
+                received_at,
             },
             cache,
         })
@@ -554,6 +564,7 @@ impl EnterpriseProfile {
             value: EnterpriseIdJagResponse {
                 _assertion: compact,
                 assertion,
+                profile: self.clone(),
                 requested_scopes: self.requested_scopes().as_slice().to_vec(),
                 granted_scopes,
                 resource: self.resource().as_str().to_owned(),
@@ -634,16 +645,14 @@ pub struct EnterpriseClientSecret {
 impl EnterpriseClientSecret {
     /// Validates and wraps a bounded non-empty confidential client secret.
     pub fn try_new(value: impl Into<String>) -> Result<Self, EnterpriseExchangeError> {
-        let value = value.into();
+        let value = SecretString::from_string(value.into());
         if value.is_empty()
             || value.len() > MAX_ENTERPRISE_CLIENT_SECRET_BYTES
-            || value.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || value.as_bytes().iter().any(|b| *b < 0x20 || *b == 0x7f)
         {
             return Err(EnterpriseExchangeError::InvalidConfiguration);
         }
-        Ok(Self {
-            value: SecretString::from_string(value),
-        })
+        Ok(Self { value })
     }
 
     fn as_str(&self) -> &str {
@@ -747,6 +756,8 @@ impl fmt::Debug for EnterpriseExchangeObservation {
 /// resource-bound bearer conversion.
 pub struct EnterpriseBoundAccessToken {
     response: EnterpriseAccessTokenResponse,
+    received_at: SystemTime,
+    expires_at_monotonic: Instant,
 }
 
 impl EnterpriseBoundAccessToken {
@@ -757,12 +768,16 @@ impl EnterpriseBoundAccessToken {
     }
 
     /// Consumes this grant and binds it strictly to its exact HTTPS MCP resource
-    /// with a monotonic deadline derived from `expires_at - received_at_wall`.
+    /// with a monotonic deadline no later than the original response's deadline.
+    /// A stale wall-clock sample cannot extend the grant or reset its lifetime.
     pub fn into_bound_bearer_credential(
         self,
         now_monotonic: Instant,
         received_at_wall: SystemTime,
     ) -> Result<BoundBearerCredential, EnterpriseExchangeError> {
+        if received_at_wall < self.received_at || Instant::now() >= self.expires_at_monotonic {
+            return Err(EnterpriseExchangeError::CredentialBindingFailed);
+        }
         let ttl = self
             .response
             .expires_at
@@ -773,7 +788,8 @@ impl EnterpriseBoundAccessToken {
         }
         let deadline = now_monotonic
             .checked_add(ttl)
-            .ok_or(EnterpriseExchangeError::CredentialBindingFailed)?;
+            .ok_or(EnterpriseExchangeError::CredentialBindingFailed)?
+            .min(self.expires_at_monotonic);
         let resource = CanonicalHttpUrl::parse(self.response.resource())
             .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)?;
         BoundBearerCredential::bind_with_expiry(
@@ -816,6 +832,11 @@ struct ExchangeDriverInner {
 /// (`client_secret_basic` vs `client_secret_post`), real RS256 ID-JAG signature
 /// verification, and scope/resource/expiry clamping without exposing compact
 /// assertions externally.
+///
+/// This is a low-level transport component, not complete EMA activation. Raw
+/// secrets supplied here do not attest a confidential credential provider, and
+/// locally verified assertions do not attest browser acquisition or durable
+/// replay protection. Callers must separately establish those authorities.
 #[derive(Clone)]
 pub struct EnterpriseExchangeDriver {
     inner: Arc<ExchangeDriverInner>,
@@ -859,6 +880,11 @@ impl EnterpriseExchangeDriver {
 
     /// Stage 1 (RFC 8693): exchanges a verified OIDC identity assertion at the
     /// IdP token endpoint for a signed ID-JAG assertion.
+    ///
+    /// `received_at` is the trusted wall-clock sample at call entry. Elapsed
+    /// monotonic time advances it before response admission. The exact original
+    /// profile, verification keys, tenancy and live input lifetime are checked
+    /// before a confidential form is constructed or posted.
     #[allow(clippy::too_many_arguments)]
     pub async fn exchange_identity_for_id_jag(
         &self,
@@ -876,7 +902,25 @@ impl EnterpriseExchangeDriver {
         ),
         EnterpriseExchangeError,
     > {
+        let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let profile = &self.inner.profile;
+        if assertion.profile != *profile
+            || assertion.policy != self.inner.response_policy
+            || id_jag_keys.issuer() != profile.idp_issuer()
+            || id_jag_keys.generation() != profile.id_jag_key_generation()
+            || !matches_tenant(
+                assertion.identity.tenant().map(|tenant| tenant.as_str()),
+                idp_tenant,
+            )
+        {
+            return Err(EnterpriseExchangeError::ResponseRejected(
+                EnterpriseResponseError::PolicyBindingMismatch,
+            ));
+        }
+        let clock = ExchangeClock::new(received_at);
+        let input_deadline =
+            clock.input_deadline(assertion.received_at, assertion.identity.expires_at())?;
+        let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
         let scope_wire = profile.requested_scopes().as_wire_value();
         let mut fields: Vec<(&str, &str)> = vec![
             ("grant_type", TOKEN_EXCHANGE_GRANT),
@@ -896,7 +940,13 @@ impl EnterpriseExchangeDriver {
             &mut fields,
         )?;
         let response = self
-            .dispatch_post(cx, &self.inner.idp_token_url, &request)
+            .dispatch_post(
+                &admitted,
+                &self.inner.idp_token_url,
+                &request,
+                input_deadline,
+                Arc::clone(&permit),
+            )
             .await?;
         let observation = EnterpriseExchangeObservation {
             endpoint: profile.idp_token_endpoint().to_owned(),
@@ -913,7 +963,7 @@ impl EnterpriseExchangeDriver {
                 idp_tenant,
                 resource_tenant,
                 self.inner.response_policy,
-                received_at,
+                clock.wall_now()?,
             )
             .map_err(EnterpriseExchangeError::ResponseRejected)?;
         Ok((outcome, observation))
@@ -921,6 +971,11 @@ impl EnterpriseExchangeDriver {
 
     /// Stage 2 (RFC 7523): exchanges a verified ID-JAG assertion at the Resource
     /// AS token endpoint for a resource-bound final MCP access token.
+    ///
+    /// The closed JWT-bearer form carries only grant_type, assertion and the
+    /// registered authentication representation. Its scope/resource authority
+    /// remains in the signed assertion and response checks, never extra form
+    /// fields. `received_at` is sampled at entry and advanced by elapsed time.
     pub async fn exchange_id_jag_for_access_token(
         &self,
         cx: &Cx,
@@ -934,17 +989,21 @@ impl EnterpriseExchangeDriver {
         ),
         EnterpriseExchangeError,
     > {
+        let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let profile = &self.inner.profile;
-        let scope_wire =
-            (!id_jag.granted_scopes().is_empty()).then(|| id_jag.granted_scopes().join(" "));
+        if id_jag.profile != *profile || id_jag.policy != self.inner.response_policy {
+            return Err(EnterpriseExchangeError::ResponseRejected(
+                EnterpriseResponseError::PolicyBindingMismatch,
+            ));
+        }
+        let clock = ExchangeClock::new(received_at);
+        let input_deadline =
+            clock.input_deadline(id_jag.received_at, id_jag.effective_expires_at)?;
+        let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
         let mut fields: Vec<(&str, &str)> = vec![
             ("grant_type", JWT_BEARER_GRANT),
             ("assertion", id_jag._assertion.as_str()),
-            ("resource", profile.resource().as_str()),
         ];
-        if let Some(scope) = scope_wire.as_deref() {
-            fields.push(("scope", scope));
-        }
         let request = build_confidential_token_request(
             profile.resource_as_authentication(),
             profile.resource_as_client_id(),
@@ -952,12 +1011,19 @@ impl EnterpriseExchangeDriver {
             &mut fields,
         )?;
         let response = self
-            .dispatch_post(cx, &self.inner.resource_as_token_url, &request)
+            .dispatch_post(
+                &admitted,
+                &self.inner.resource_as_token_url,
+                &request,
+                input_deadline,
+                Arc::clone(&permit),
+            )
             .await?;
         let observation = EnterpriseExchangeObservation {
             endpoint: profile.resource_as_token_endpoint().to_owned(),
             provenance: response.provenance,
         };
+        let received_at = clock.wall_now()?;
         let outcome = id_jag
             .admit_access_token_response(
                 EnterpriseTokenResponse {
@@ -970,8 +1036,13 @@ impl EnterpriseExchangeDriver {
             .map_err(EnterpriseExchangeError::ResponseRejected)?;
         let mapped = match outcome {
             EnterpriseResponseOutcome::Success { value, cache } => {
+                let expires_at_monotonic = clock.deadline(value.expires_at)?;
                 EnterpriseResponseOutcome::Success {
-                    value: EnterpriseBoundAccessToken { response: value },
+                    value: EnterpriseBoundAccessToken {
+                        response: value,
+                        received_at: clock.wall,
+                        expires_at_monotonic,
+                    },
                     cache,
                 }
             }
@@ -990,12 +1061,17 @@ impl EnterpriseExchangeDriver {
         cx: &Cx,
         url: &GuardedHttpsUrl,
         request: &GuardedHttpRequest,
+        input_deadline: Instant,
+        permit: Arc<ExchangePermit>,
     ) -> Result<GuardedHttpFetchResponse, EnterpriseExchangeError> {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
-        let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
         let response = CallerContextFuture::new(&admitted, async {
-            let timeout = self.inner.fetcher.policy().deadline();
             let started = Instant::now();
+            let remaining = input_deadline
+                .checked_duration_since(started)
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(EnterpriseExchangeError::TimedOut)?;
+            let timeout = self.inner.fetcher.policy().deadline().min(remaining);
             let nanos = u64::try_from(timeout.as_nanos())
                 .map_err(|_| EnterpriseExchangeError::InvalidPolicy)?;
             let deadline = admitted.now().saturating_add_nanos(nanos);
@@ -1062,6 +1138,60 @@ impl EnterpriseExchangeDriver {
         )
         .await
         .map_err(map_exchange_fetch_error)
+    }
+}
+
+/// One trusted wall sample advances with monotonic elapsed time. Caller time
+/// selects admission; it cannot freeze a signed lifetime across slow I/O or
+/// restart the final bearer lifetime when the credential is later installed.
+struct ExchangeClock {
+    wall: SystemTime,
+    monotonic: Instant,
+}
+
+impl ExchangeClock {
+    fn new(wall: SystemTime) -> Self {
+        Self {
+            wall,
+            monotonic: Instant::now(),
+        }
+    }
+
+    fn wall_now(&self) -> Result<SystemTime, EnterpriseExchangeError> {
+        self.wall.checked_add(self.monotonic.elapsed()).ok_or(
+            EnterpriseExchangeError::ResponseRejected(EnterpriseResponseError::InvalidLifetime),
+        )
+    }
+
+    fn deadline(&self, expires_at: SystemTime) -> Result<Instant, EnterpriseExchangeError> {
+        let remaining = expires_at.duration_since(self.wall).map_err(|_| {
+            EnterpriseExchangeError::ResponseRejected(EnterpriseResponseError::InvalidLifetime)
+        })?;
+        self.monotonic
+            .checked_add(remaining)
+            .ok_or(EnterpriseExchangeError::ResponseRejected(
+                EnterpriseResponseError::InvalidLifetime,
+            ))
+    }
+
+    fn input_deadline(
+        &self,
+        admitted_at: SystemTime,
+        expires_at: SystemTime,
+    ) -> Result<Instant, EnterpriseExchangeError> {
+        if self.wall < admitted_at || self.wall >= expires_at {
+            return Err(EnterpriseExchangeError::ResponseRejected(
+                EnterpriseResponseError::InvalidLifetime,
+            ));
+        }
+        self.deadline(expires_at)
+    }
+}
+
+fn matches_tenant(tenant: Option<&str>, expected: TenantExpectation<'_>) -> bool {
+    match expected {
+        TenantExpectation::SingleTenant => tenant.is_none(),
+        TenantExpectation::Exact(expected) => tenant == Some(expected),
     }
 }
 
@@ -1155,7 +1285,7 @@ fn verify_exchange_provenance(
     Ok(())
 }
 
-fn encode_form_component(value: &str) -> String {
+fn encode_form_component(value: &str) -> SecretString {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -1171,7 +1301,7 @@ fn encode_form_component(value: &str) -> String {
             }
         }
     }
-    encoded
+    SecretString::from_string(encoded)
 }
 
 fn build_confidential_token_request<'a>(
@@ -1183,9 +1313,9 @@ fn build_confidential_token_request<'a>(
     let basic_header = match auth {
         EnterpriseClientAuthentication::ClientSecretBasic => {
             let encoded_id = encode_form_component(client_id);
-            let encoded_secret = SecretString::from_string(encode_form_component(client_secret));
+            let encoded_secret = encode_form_component(client_secret);
             let header = H1Request::post("/")
-                .basic_auth(encoded_id, Some(encoded_secret.as_str()))
+                .basic_auth(encoded_id.as_str(), Some(encoded_secret.as_str()))
                 .build()
                 .headers
                 .into_iter()
@@ -1206,9 +1336,9 @@ fn build_confidential_token_request<'a>(
         if index != 0 {
             body_text.push('&');
         }
-        body_text.push_str(&encode_form_component(name));
+        body_text.push_str(encode_form_component(name).as_str());
         body_text.push('=');
-        body_text.push_str(&encode_form_component(value));
+        body_text.push_str(encode_form_component(value).as_str());
         if body_text.len() > MAX_ENTERPRISE_EXCHANGE_FORM_BYTES {
             drop(SecretString::from_string(body_text));
             return Err(EnterpriseExchangeError::EncodingFailed);

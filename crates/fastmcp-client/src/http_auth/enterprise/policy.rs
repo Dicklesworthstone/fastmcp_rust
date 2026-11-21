@@ -114,7 +114,7 @@ impl EnterpriseClientAuthentication {
 }
 
 /// One exact, operator-trusted, issuer-bound client preregistration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnterpriseRegistrationConfiguration {
     /// Exact issuer spelling; it is validated as HTTPS but never normalized.
     pub issuer: String,
@@ -136,7 +136,7 @@ pub struct EnterpriseRegistrationConfiguration {
 /// `id_token_signing_alg_values_supported`. It is an operator trust input, not
 /// the complete attested `IdJagIssuerCryptoPolicy` or a key-rotation provider.
 /// Reusing an OIDC JWKS requires explicitly configuring it here as well.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdJagCryptoConfiguration {
     /// Exact IdP issuer authorized for this purpose.
     pub issuer: String,
@@ -157,7 +157,7 @@ pub struct IdJagCryptoConfiguration {
 /// Every generation is immutable in the resulting profile. These integers are
 /// bindings, not attestations or rollback resistance. Changing metadata, keys,
 /// registrations, or allowances requires constructing a new profile.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnterpriseProfileConfiguration {
     /// Client-to-IdP registration, independently from the resource-AS client.
     pub idp: EnterpriseRegistrationConfiguration,
@@ -192,7 +192,7 @@ pub struct EnterpriseProfileConfiguration {
 /// This type contains no assertion or secret and performs no network access.
 /// It does not prove a remote registration, third-party subject mapping,
 /// deployment custody, replay protection, or complete EMA activation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnterpriseProfile {
     configuration: EnterpriseProfileConfiguration,
     oidc_openid_allowed: bool,

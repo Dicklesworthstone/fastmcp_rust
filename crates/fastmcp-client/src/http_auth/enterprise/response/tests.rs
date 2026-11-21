@@ -1005,6 +1005,18 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     );
     assert!(recorded[1].body.contains("client_id=native-resource"));
     assert!(recorded[1].body.contains("client_secret=as-secret-val"));
+    let second_fields = recorded[1]
+        .body
+        .split('&')
+        .map(|field| field.split_once('=').unwrap().0)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        second_fields,
+        std::collections::BTreeSet::from(
+            ["grant_type", "assertion", "client_id", "client_secret",]
+        ),
+        "JWT-bearer redemption must not repeat scope or resource"
+    );
 
     // Planted negatives (RH-5):
     // 1. Invalid client secret refused.
@@ -1105,5 +1117,226 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
             Ok(_) => panic!("provenance host mismatch must be refused"),
         };
         assert_eq!(err, EnterpriseExchangeError::EvidenceMismatch);
+    });
+}
+
+fn identity_for_exchange(selected: &EnterpriseProfile) -> EnterpriseIdentityAssertion {
+    let (oidc_keys, _) = keys();
+    let body = serde_json::to_vec(&json!({
+        "access_token": "temporary-access", "token_type": "Bearer",
+        "scope": "openid", "id_token": fixtures()["oidc"],
+    }))
+    .unwrap();
+    success(
+        selected
+            .admit_oidc_code_response(
+                EnterpriseTokenResponse {
+                    status: 200,
+                    headers: &headers(),
+                    body: &body,
+                },
+                &oidc_keys,
+                "oidc-flow-nonce",
+                TenantExpectation::SingleTenant,
+                None,
+                EnterpriseResponsePolicy::default(),
+                now(),
+            )
+            .unwrap(),
+    )
+}
+
+#[test]
+fn enterprise_exchange_preflight_binds_profile_keys_and_tenancy_before_post() {
+    let selected = profile(&["read"]);
+    let (_, jag_keys) = keys();
+    let secret = EnterpriseClientSecret::try_new("confidential-canary").unwrap();
+    let denied =
+        EnterpriseExchangeError::ResponseRejected(EnterpriseResponseError::PolicyBindingMismatch);
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        // Only the selected IdP authentication method changes. The original
+        // issuer/client/token are otherwise valid, but must never be disclosed
+        // under another registration/profile.
+        let changed = profile_with_authentication(
+            &["read"],
+            EnterpriseClientAuthentication::ClientSecretPost,
+            EnterpriseClientAuthentication::ClientSecretPost,
+        );
+        let poster = ScriptedExchangePoster::new(vec![]);
+        let (driver, _) = driver_with_poster(changed, Arc::clone(&poster));
+        let result = driver
+            .exchange_identity_for_id_jag(
+                &cx,
+                identity_for_exchange(&selected),
+                &secret,
+                &jag_keys,
+                TenantExpectation::SingleTenant,
+                ResourceTenantExpectation::SingleTenant,
+                now(),
+            )
+            .await;
+        assert!(matches!(result, Err(error) if error == denied));
+        assert!(poster.take_recorded().is_empty());
+
+        let poster = ScriptedExchangePoster::new(vec![]);
+        let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+        let wrong_keys = IdJagVerificationKeys::from_trusted_jwks(
+            "https://idp.example",
+            23,
+            &serde_json::to_vec(&fixtures()["jwks"]).unwrap(),
+        )
+        .unwrap();
+        let result = driver
+            .exchange_identity_for_id_jag(
+                &cx,
+                identity_for_exchange(&selected),
+                &secret,
+                &wrong_keys,
+                TenantExpectation::SingleTenant,
+                ResourceTenantExpectation::SingleTenant,
+                now(),
+            )
+            .await;
+        assert!(matches!(result, Err(error) if error == denied));
+        let result = driver
+            .exchange_identity_for_id_jag(
+                &cx,
+                identity_for_exchange(&selected),
+                &secret,
+                &jag_keys,
+                TenantExpectation::Exact("different-tenant"),
+                ResourceTenantExpectation::SingleTenant,
+                now(),
+            )
+            .await;
+        assert!(matches!(result, Err(error) if error == denied));
+        assert!(poster.take_recorded().is_empty());
+
+        // Only the final endpoint's authentication method changes; even a
+        // correctly signed ID-JAG cannot authorize that different profile.
+        let changed = profile_with_authentication(
+            &["read"],
+            EnterpriseClientAuthentication::ClientSecretBasic,
+            EnterpriseClientAuthentication::ClientSecretBasic,
+        );
+        let poster = ScriptedExchangePoster::new(vec![]);
+        let (driver, _) = driver_with_poster(changed, Arc::clone(&poster));
+        let original = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
+        let result = driver
+            .exchange_id_jag_for_access_token(&cx, original, &secret, now())
+            .await;
+        assert!(matches!(result, Err(error) if error == denied));
+        assert!(poster.take_recorded().is_empty());
+    });
+}
+
+#[test]
+fn enterprise_exchange_preflight_checks_input_lifetime_and_singleflight_before_post() {
+    let selected = profile(&["read"]);
+    let (_, jag_keys) = keys();
+    let secret = EnterpriseClientSecret::try_new("confidential-canary").unwrap();
+    let poster = ScriptedExchangePoster::new(vec![]);
+    let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+    let invalid_lifetime =
+        EnterpriseExchangeError::ResponseRejected(EnterpriseResponseError::InvalidLifetime);
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        for time in [
+            now() - Duration::from_secs(1),
+            now() + Duration::from_secs(240),
+        ] {
+            let result = driver
+                .exchange_identity_for_id_jag(
+                    &cx,
+                    identity_for_exchange(&selected),
+                    &secret,
+                    &jag_keys,
+                    TenantExpectation::SingleTenant,
+                    ResourceTenantExpectation::SingleTenant,
+                    time,
+                )
+                .await;
+            assert!(matches!(result, Err(error) if error == invalid_lifetime));
+        }
+        for time in [
+            now() - Duration::from_secs(1),
+            now() + Duration::from_secs(60),
+        ] {
+            let original = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
+            let result = driver
+                .exchange_id_jag_for_access_token(&cx, original, &secret, time)
+                .await;
+            assert!(matches!(result, Err(error) if error == invalid_lifetime));
+        }
+        let held = ExchangePermit::acquire(Arc::clone(&driver.inner.busy)).unwrap();
+        let result = driver
+            .exchange_identity_for_id_jag(
+                &cx,
+                identity_for_exchange(&selected),
+                &secret,
+                &jag_keys,
+                TenantExpectation::SingleTenant,
+                ResourceTenantExpectation::SingleTenant,
+                now(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(EnterpriseExchangeError::ExchangeInProgress)
+        ));
+        drop(held);
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
+        assert!(
+            poster.take_recorded().is_empty(),
+            "rejected inputs never disclose a form or secret"
+        );
+    });
+}
+
+#[test]
+fn enterprise_exchange_bearer_conversion_cannot_restart_or_backdate_lifetime() {
+    let selected = profile(&["read"]);
+    let (_, jag_keys) = keys();
+    let secret = EnterpriseClientSecret::try_new("as-secret").unwrap();
+    let fetcher = test_fetcher();
+    let poster = ScriptedExchangePoster::new(vec![
+        Ok(ok_exchange_response(
+            "as.example",
+            fetcher.root_identity(),
+            serde_json::to_vec(&access_body()).unwrap(),
+        )),
+        Ok(ok_exchange_response(
+            "as.example",
+            fetcher.root_identity(),
+            serde_json::to_vec(&access_body()).unwrap(),
+        )),
+    ]);
+    let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let original = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
+        let (outcome, _) = driver
+            .exchange_id_jag_for_access_token(&cx, original, &secret, now())
+            .await
+            .unwrap();
+        let token = success(outcome);
+        let original_deadline = token.expires_at_monotonic;
+        let credential = token
+            .into_bound_bearer_credential(Instant::now() + Duration::from_hours(1), now())
+            .unwrap();
+        assert_eq!(credential.expires_at(), Some(original_deadline));
+
+        let original = success(jag(&selected, &jag_keys, &jag_body(), now()).unwrap());
+        let (outcome, _) = driver
+            .exchange_id_jag_for_access_token(&cx, original, &secret, now())
+            .await
+            .unwrap();
+        assert!(matches!(
+            success(outcome)
+                .into_bound_bearer_credential(Instant::now(), now() - Duration::from_secs(1),),
+            Err(EnterpriseExchangeError::CredentialBindingFailed)
+        ));
+        assert_eq!(poster.take_recorded().len(), 2);
     });
 }
