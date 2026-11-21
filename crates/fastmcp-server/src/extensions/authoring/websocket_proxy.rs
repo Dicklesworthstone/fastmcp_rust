@@ -166,7 +166,7 @@ impl Drop for OperationPermit {
 
 fn reserve_operation(pending: &Arc<AtomicUsize>) -> McpResult<OperationPermit> {
     pending
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             (count < MAX_PENDING_OPERATIONS).then(|| count + 1)
         })
         .map_err(|_| {

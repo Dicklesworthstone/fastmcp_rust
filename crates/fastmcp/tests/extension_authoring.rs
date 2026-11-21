@@ -470,8 +470,12 @@ mod websocket_proxy {
                         fastmcp_rust::serde_json::from_value(value).unwrap();
                     peer.send_async(&cx, &message).await.unwrap();
                 }
+                // Authorization runs after schema validation and before activation-proof /
+                // compatibility checks (lib.rs): `valid`, `missing`, `incompatible`, and
+                // `notification(13)` invoke the authorizer (4), while `malformed` is rejected
+                // before authorization and only `valid` (1) is forwarded upstream.
                 while observations.completed.load(Ordering::SeqCst) < 1
-                    || authorizations.load(Ordering::SeqCst) < 2
+                    || authorizations.load(Ordering::SeqCst) < 4
                 {
                     asupersync::runtime::yield_now().await;
                 }
@@ -482,7 +486,7 @@ mod websocket_proxy {
                     Err(TransportError::Closed)
                 ));
                 serving.join(&cx).await.unwrap().unwrap();
-                assert_eq!(authorizations.load(Ordering::SeqCst), 2);
+                assert_eq!(authorizations.load(Ordering::SeqCst), 4);
                 assert_eq!(observations.authorized.load(Ordering::SeqCst), 1);
                 assert_eq!(declaration.started.load(Ordering::SeqCst), 0);
                 assert_eq!(declaration.authorized.load(Ordering::SeqCst), 0);
