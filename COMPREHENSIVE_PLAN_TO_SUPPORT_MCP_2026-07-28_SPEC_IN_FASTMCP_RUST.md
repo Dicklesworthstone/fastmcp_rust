@@ -1,8 +1,8 @@
 # Comprehensive Plan to Support MCP 2026-07-28 in FastMCP Rust
 
 - Status: active implementation campaign; aggregate support remains unverified
-- Latest source/tracker reality check: 2026-11-10, section 7.26 (updating the
-  2026-10-31 anchor in section 7.25 across 264 commits through `73ac9ca3`).
+- Latest source/tracker reality check: 2026-11-20, section 7.27 (updating the
+  2026-11-10 anchor in section 7.26 across 104 commits through `117388bc`).
   Earlier dated implementation inventories are historical observations.
 - Required protocol eras: MCP `2026-07-28` final and MCP `2024-11-05`
 - Required default product policy: automatic, downgrade-resistant negotiation
@@ -4545,6 +4545,125 @@ After creating and refining `bd-oi73c`, `bd-3ccwh`, `bd-y9j8t`, `bd-209js`, and
   passes **13 of 13** tests (`0.10s`), confirming exact canonical work-package
   and `wp-parent-*` label parity across the updated `.beads/issues.jsonl` and
   this plan.
+
+### 7.27 Reality check and bridge update (2026-11-20)
+
+This section updates the project reality check from the `2026-11-10` anchor
+(`73ac9ca3`, section 7.26) across the **104 commits** (`+63,912` / `-3,602`
+lines across `195+` files) that landed through
+`117388bcc1691cdcfd5933bfa7d8d1bba8d4ab19` (`2026-11-20`, tree `3457cc6b...`;
+session began at `90b07451` and observed two live concurrent commits
+`a4a5f34e` and `117388bc` land mid-audit, recorded per PL-6). All historical
+measurements and blob anchors in sections 7.23–7.26 are retained verbatim per
+PL-6. Shipped release reality (`v0.13.0`, published 2026-10-12/13, now **999
+commits behind `HEAD`**) is strictly separated from in-tree source reality.
+
+Anchor blob identities at `117388bc`:
+
+| Subject | Git blob |
+|---|---|
+| `Cargo.toml` | `a4e631904721ba69c1b5c073f7db83a127635ebf` |
+| `Cargo.lock` | `e1ee2818e248b0f09f75101ad7b0f53652a9d598` |
+| `rust-toolchain.toml` | `e36bd453a98fc579be6afd951f5ef5b7cc170469` |
+| `README.md` | `a91d39c0e17600a1c06521d141fae32efce68b73` |
+| `AGENTS.md` | `b52fcaed51e42e41efe43fbeeca8986d65464dd8` |
+| `tools/xtask/tests/fnd_01_declaration_drift.rs` | `6c4cde3a998af3d549c24359dd0abbbd8e13fbf7` |
+| `evidence/fnd-01/dependency-verification.toml` | `2d39f77fd8a9386b9e62895f53c84060019e2de7` |
+
+#### 1. What specifically IS working right now (`117388bc`, 2026-11-20)
+
+1. **Substantial, non-stub Rust codebase (`~908k` lines `src/` + `~328k` lines `tests/`, `14,844` `#[test]` functions across 10 workspace crates)**:
+   - **Zero production `todo!()` / `unimplemented!()`** (`RH-4`; only 2 fixture strings in `crates/fastmcp-server/src/providers/mod.rs:263,278`), **zero production `unsafe`** (`#![forbid(unsafe_code)]`), **zero forbidden runtime dependencies** (`tokio`, `hyper`, `reqwest`, `axum`, `tower`, `async-std`, `smol`, `redis`, `jsonwebtoken` absent from native default and all-feature normal/build `cargo tree`, `RH-11`), only **1** `TODO` comment across all 908k `src/` lines, and only **4** `#[ignore]` attributes in `crates/`.
+2. **Real end-to-end live CLI + server execution (verified live against cached 2026-11-14 `fastmcp` & `echo_server` binaries; predates `a4a5f34e` and `117388bc`)**:
+   - `fastmcp inspect --protocol-policy auto --format json echo_server` (`rc=0`, negotiates `modern-2026` / `2026-07-28`, emits `fastmcp.cli.inspect/v2` with rich identity & open capabilities).
+   - `fastmcp inspect --protocol-policy modern-only` (`rc=0`, `v2`) and `--protocol-policy legacy-only` (`rc=0`, `legacy-2024` / `2024-11-05`, `v1`).
+   - `fastmcp call echo --server echo_server --protocol-policy modern-only --arguments '{"message":"reality-check-2026-11-20"}' --json` (`rc=0`, pure JSON on stdout, banner isolated on stderr).
+   - `fastmcp test --protocol-policy auto echo_server` (`rc=0`, `initialize` 202.9ms, `ping` 0.9ms, `list_tools` 26 tools, `list_resources` 10, `list_prompts` 6, `cleanup` 24.3ms owned subprocess group stopped).
+   - All 10 CLI commands (`run`, `inspect`, `call`, `read`, `prompt`, `tasks`, `install`, `list`, `test`, `dev`) in `crates/fastmcp-cli/src/main.rs` (22,816 lines) are wired to real implementations (zero stubs).
+3. **Freshly verified green gates at `117388bc` (`nightly-2026-08-25`)**:
+   - **`fastmcp-xtask` (`6 of 7` integration suites + all `153` unit tests GREEN)**: `--lib` **153/153** (`0.04s`), `fnd_02_a` **9/9** (`0.51s`, recovered from 1/9), `fnd_02_b` **13/13** (`0.10s`), `fnd_02_i` **6/6** (`0.43s`, recovered from 2/6), `readme_mechanical_claims` **21/21** (`5.86s`, recovered from 20/21), `rel_071` **2/2** (`0.00s`), `transfer_excluded_compile_time_reads` **2/2** (`0.51s`, recovered from 1/2).
+   - **`FND-04-B-07` (`production-deny-inventory`) NOW PASSES (`0` denied sites)**: `fnd_04_runtime_conformance` improved to **17/21 PASS** (`10.85s`) after `da6ce141` fixed `bd-209js` and migrated the last shipped `std::thread::spawn` onto `blocking_dispatch_pool()`. `fastmcp-core::runtime::block_on` and TLS `RUNTIME` are fully gated behind `#[cfg(any(test, feature = "test-runtime"))]`, and facade `__private` / `core` have zero runtime leaks.
+   - **`consumer-closure-probe` (standalone single-dependency external consumer workspace)**: compiled cleanly via RCH (`7m 21s`, 0 errors, 0 warnings), proving `fastmcp-rust` alone suffices for default advertised APIs and all 3 async proc macros (`#[tool]`, `#[resource]`, `#[prompt]`, plus `#[extension]` and `#[derive(JsonSchema)]` via `proc-macro-crate`). `PartitionAuthorization`, `McpAppsRoutedMethod`, and `TestServerBuilder::build` are all fixed in source.
+   - **`scripts/verify_batch.sh --self-test-dsr-contract`**: **17/17 PASS**.
+   - **Major capabilities landed in `73ac9ca3..117388bc` (104 commits)**: native async WebSocket dispatcher across all policies (`b3f8f4f4`), WebSocket proxy upstreams (`ac796b6e`), WebSocket Task cancellation receipt preservation (`117388bc`), supervised stdio recovery + catalog subscription restore (`209128b0`, `9c983788`), `fastmcp call --wait` & multi-page `inspect --max-pages` (`4db3b20f`, `a4a5f34e`), typed extension HTTP/stdio gateways (`a75a9e53`+), per-principal subscription capacity & bounded MRTR retention (`babaf56b`, `595c65af`), gateway Task limits/retention/renewal (`1cabf411`, `e458ce8e`, `49a0d4e5`), W3C trace recovery/propagation (`fc410f2b`, `fcc0ca9d`, `2f16223e`), guarded enterprise JWKS fetch (`3e0687cd`), browser CORS (`ca75e00f`), persisted DPoP Task restart (`538f778e`), and a bound verification receipt for `3e0687cd..128ab645` (`084b2cf0`) reporting `clippy --workspace --lib --bins --all-features -- -D warnings` and `clippy --workspace --all-targets -- -D warnings` at 0 warnings on that wave.
+
+#### 2. What is NOT working or not yet implemented (`117388bc`, 2026-11-20)
+
+1. **`bd-oi73c` false-review / dropped fix — `fnd_01_declaration_drift` is STILL RED (1 passed / 2 failed)**:
+   - `bd-oi73c` sat in `review` (`batch-pending`) claiming a 3/3 pass in commit `2cf8e633` (blob `c0952383`), but `2cf8e633` is **missing from `HEAD`**, `tools/xtask/tests/fnd_01_declaration_drift.rs` is blob `6c4cde3a...`, and live execution fails on `dependency.serde_json` (`=1.0.151` vs `=1.0.154`) and `dependency.zeroize` (`=1.9.0` vs `=1.9.1`). Reopened to `open` + `rework`.
+2. **`fnd_01_a_evidence_binding` (9/17 FAIL) and `fnd_04_runtime_conformance` (17/21 FAIL)**:
+   - `fnd_01_a_evidence_binding`: 4 `sdk_batch` env-var failures + 4 genuine FND-01 frozen policy/snapshot/closed-child/anchor drift failures.
+   - `fnd_04_runtime_conformance`: 3 genuine upstream/transport failures remain (`FND-04-B-10` hung `spawn_blocking` `join()` fails `<2000ms` release; `FND-04-B-12` `cancel-aware-cross-platform-process-stdio` unmet at `asupersync 0.6.2`; `FND-04-B-13` missing own-process stdio + blocking `StdioTransport::stdio()`).
+3. **`cargo fmt --all -- --check` is chronically RED and rapidly compounding (`bd-s46tx`)**:
+   - Exited `1` with **95,708 diff lines**, **5,122 hunks** across **248 unique `.rs` files** (167 in `fastmcp-client`, 35 in `fastmcp-server`, 13 in `fastmcp-core`, 13 in `fastmcp`, 10 in `fastmcp-protocol`, 6 in `fastmcp-transport`, 3 in `fastmcp-cli`, 1 in `fastmcp-macros`) — up from 136 files / 2,218 hunks on Oct 31 and 83,579 diff lines on Nov 10.
+4. **Mandatory Section 0 capabilities still missing or incomplete in code**:
+   - **Zero SAML 2.0 implementation** anywhere in `crates/*/src/` (`AUTHX-04`).
+   - **Incomplete Enterprise-Managed Authorization (`AUTHX-01..03`)**: policy, guarded JWKS fetch, OIDC code-flow codec, RS256 verification, response admission, subject mapping, sector review, and replay exist (`12,391` lines), but **no native token-exchange HTTP driver** (RFC 8693 / RFC 7523), **no durable browser/callback custody**, **no MCP extension activation**, and **`fastmcp-server`'s `enterprise-auth` feature still gates 0 lines of server code**.
+   - **Zero durable or distributed/Redis server `FinalTaskStore` (`TASKP-01`, `TASKR-01`)**: `InMemoryFinalTaskStore` is the sole production store; `docket.rs` (3,405 lines) is excluded from compilation/packaging; all 5 backend traits in `fastmcp-core::src/{persistent,replay,restore}` have **zero shipped concrete backend implementations** (only `#[cfg(test)]` mocks), and `fastmcp_core::persistent` has zero in-workspace consumers.
+   - **Zero `PERF-01` benchmarks, soak harness, or receipts — AND `examples/bench.rs` is broken (`bd-ifjmx`)**: `crates/fastmcp/examples/bench.rs:428,432,471` swaps `schema::validate(schema, value)` arguments, invokes zero handlers despite claiming handler overhead, registers duplicate `"noop"` 100x, and uses `Cx::for_testing()`.
+   - **Official conformance (`CONF-01`) is 5+ weeks and >1,000 commits stale**, `--baseline` is permanently red on 2 SHOULD warnings (`bd-conformance-row-unanchored-jw3pb`), and all 46 client-mode auth checks stay blocked on the operator's binary HTTPS/loopback ruling (`bd-conformance-oauth-driver-unconfigured-97rnu`, now 31 raw + 1 `.scheme().is("https")` = 32 checks across 24 files).
+   - **Cross-SDK interoperability (`INTEROP-01`, `LEG-INTEROP-01`)**: unproven against external SDKs.
+   - **Unwired / test-only / dead surfaces**: `fastmcp-server`'s `argon2 = "=0.6.0"` and `fastmcp-server`/`fastmcp-client`'s `html5ever = "=0.40.1"` have **zero production callers** (`bd-s888g`; `oauth.rs` still hashes client secrets with single-pass salted SHA-256); built-in HTTP `/health` returns a static `200 {"status": "ok"}` ignoring `OperatorSnapshot` / `HttpConnectionAdmissionProbe` (`bd-lqcou`); zero Prometheus/OTLP exporters exist; `fastmcp inspect --output <PATH>` is silently **Linux-only** and undocumented (`bd-9q3vz`); `McpAppsWireHostConfiguration::initialize_result` is private (`bd-ajunk`); `TestClient` (`testing/client.rs`) is still 2024-only; `event_store.rs` and `HttpTransport` remain unwired; custom RFC 6455 codec in `websocket.rs` is `#[cfg(test)]`-only; `fastmcp test`/`dev` and `call/read/prompt --server` remain Unix-only; `NativePipeReader`/`Writer` remain Unix opt-in FIFO-only.
+   - **10 unchecked documentation & example drifts (`bd-xgosy`)**: `README.md:193` (`"23 points"` vs `31`), `:261-266` (false DPoP zero-test-target claim & line `:35` vs `:39`), `:222-225` (DPoP now 78 files / 36,739 lines, not 57 / 24,095), `:2699` (`jwt-resource-auth` now 3,735 lines, not 1,663), `:2678` (`asupersync 0.5.0` vs `0.6.2`), `:22` (`2026-08-27`), `crates/fastmcp-console/README.md:112-118` (contradicts root license status), `AGENTS.md:15-39` (duplicate `RULE 0.5` + `br close` contradiction), and stale example headers/versions (`calculator_server.rs`, `notes_server.rs`, `weather_server.rs`, `conformance_{server,client}.rs`).
+
+#### 3. What is blocking us from getting there
+
+1. **Central `batch_verify` closure collapse + RCH worker disk pressure (`bd-green-rch-batch-unsatisfiable-qkr6e`, `bd-bcgdq`, `bd-4calk`, `bd-09nja`)**:
+   - **0 beads closed since 2026-11-08** (12 days) while **104 commits** landed and the `review` (`batch-pending`) queue swelled to **137 beads** (11 P0, 81 P1, 37 P2, 8 P3; 131 with `batch-pending`, 6 missing the label). All **145 formal work-package parents remain open**, and only **17 of 594** `work-package-child` records are closed.
+   - RCH worker `vmi1152480` still aborts with `[RCH-E330] remote_build_disk_budget_exceeded` (free 117 GB vs reservations + 10.7 GB floor); `hz1` is in critical disk pressure; 5/7 probed Contabo workers are in WARNING pressure (20.4–86.2 GiB free). Local macOS `/` has 3.9 GiB free, `/Volumes/USBNVME16TB` is 98% full, and `/usr/local/bin/cargo` points directly to `nightly-2026-08-31`, causing `E0514` against the shared `nightly-2026-08-25` target cache unless `/Users/jemanuel/.cargo/bin/cargo +nightly-2026-08-25` is invoked explicitly.
+2. **Operator-gated bottlenecks blocking FND-01, formatting, and client auth conformance**:
+   - 9 non-closed beads carry `blocked-on-operator` (and `br ready` still advertises them per `bd-n6jb8`): coordinated FND-01 re-attestation on `asupersync 0.6.2` + `serde_json 1.0.154` + `zeroize 1.9.1` + `nightly-2026-08-25` (`bd-o590u`, `bd-rb77i`, `bd-gigqp`, `bd-oi73c`, `bd-zh3kx`, `bd-3zzrz`), atomic `cargo fmt --all` (`bd-s46tx`), binary loopback-HTTP client auth conformance ruling (`bd-conformance-oauth-driver-unconfigured-97rnu`), SELinux `fastmcp install` policy (`bd-z5hx9`), and provider-side `REL-QUAR-00` credential/release reconciliation (`bd-reconcile-071-release-9t607`).
+3. **External upstream `asupersync` blocker (`FND-04-B-10`, `B-12`, `B-13`)**:
+   - In-tree edits alone cannot close `FND-04` until `asupersync` ships cancel-aware cross-platform own-process `stdin`/`stdout` and interruptible `spawn_blocking` `join()` release.
+4. **101/133-layer tracker serialization depth (`bd-campaign-depth-133-layers-8ni0f`)**:
+   - Serial dependency chains across 1,404 nodes and 3,235 edges limit parallel drain and inflate apparent staleness (`847` stale alerts).
+
+#### 4. Would implementing all open and in-progress beads close the gap completely?
+
+**No — for four independent reasons:**
+1. **137 beads sit in `review` (`batch-pending`), outside `open`/`in_progress`**, and at least one (`bd-oi73c`, reopened today) had a dropped/missing fix commit (`2cf8e633`) while claiming 3/3 green. Without draining and auditing the entire `review` queue via central `batch_verify`, implemented capabilities remain unverified debt.
+2. **Six concrete defects/gaps discovered at `117388bc` had `NO_BEAD` coverage** prior to this audit (`bd-ifjmx`, `bd-9q3vz`, `bd-ajunk`, `bd-lqcou`, `bd-s888g`, `bd-xgosy`, filed below).
+3. **External upstream prerequisite in `asupersync 0.6.2`** (`FND-04-B-10`, `B-12`, `B-13`) cannot be closed by FastMCP-only bead execution.
+4. **Operator binary decisions** (FND-01 re-attestation + atomic `cargo fmt`, client-auth loopback-HTTP posture, SELinux `install` policy, `REL-QUAR-00` external credentials) must be decided explicitly rather than guessed by coding agents.
+
+#### 5. New `NO_BEAD` issues filed at `117388bc` (`2026-11-20`)
+
+Six self-contained beads (with frozen `RH-5` positive + planted-negative proofs and non-blocking `related` edges + `bd-st1o8` release gates) were created with `--actor RealityCheck-20261120`, and `bd-oi73c` was reopened from `review` to `open` + `rework`:
+
+| New Bead | Priority / Type | Uncovered Gap at `117388bc` | Related / Gated Consumers |
+|---|---|---|---|
+| `bd-ifjmx` | P1 `bug` | `examples/bench.rs:428,432,471` swaps `schema::validate(schema, value)` args, invokes 0 handlers despite header claim, registers duplicate `"noop"` 100x, and uses `Cx::for_testing()`. | `bd-mcp-perf-01-qxgw`, `bd-st1o8` |
+| `bd-9q3vz` | P1 `bug` | `fastmcp inspect --output <PATH>` routes through Linux-only `ensure_atomic_replace_supported()`, silently failing closed on macOS/Windows and undocumented in `README.md`. | `bd-k03la`, `bd-st1o8` |
+| `bd-ajunk` | P2 `bug` | `McpAppsWireHostConfiguration::initialize_result` (`mcp_apps.rs:806`) is private, preventing external `apps` embedders from delegating in `McpAppsWireHostPolicy::initialize`. | `bd-x8zpe` |
+| `bd-lqcou` | P2 `bug` | Built-in HTTP `/health` (`fastmcp-server/src/lib.rs:11221-11226`) returns static `200 {"status": "ok"}` disconnected from `OperatorSnapshot` and `HttpConnectionAdmissionProbe`. | `bd-mcp-ops-01-wi8p` |
+| `bd-s888g` | P2 `bug` | Dead optional dependencies `argon2 = "=0.6.0"` (`builtin-auth-server`) and `html5ever = "=0.40.1"` (`apps`) have zero production callers while `oauth.rs` still uses single-pass SHA-256. | `bd-mcp-auth-06-a-g3ot` |
+| `bd-xgosy` | P2 `docs` | 10 unchecked drifts across `README.md`, `fastmcp-console/README.md`, `AGENTS.md`, `consumer-closure-probe`, `websocket.rs`, and shipped examples; extend `readme_mechanical_claims.rs`. | `bd-3ccwh`, `bd-3zzrz`, `bd-st1o8` |
+
+#### Updated Bridge Plan (`BP-20261120-1` .. `BP-20261120-8`, refined through 3 ambition rounds and 5 plan-space passes)
+
+1. **`BP-20261120-1` — Unblock verification throughput and fix the dropped-fix & host-toolchain defects (`bd-oi73c`, `bd-green-rch-batch-unsatisfiable-qkr6e`, `bd-bcgdq`, `bd-4calk`, `bd-09nja`)**:
+   - Reclaim RCH worker disk space so `[RCH-E330]` clears across Contabo workers and `hz1`; fix `/usr/local/bin/cargo` symlink (`nightly-2026-08-31` -> rustup proxy `nightly-2026-08-25`) on this macOS host.
+   - Designate the central `batch_verify` lane and drain the 137-bead `review` queue in topological strata, auditing every claimed commit SHA against `HEAD` ancestry (catching any other dropped commits like `bd-oi73c`'s `2cf8e633`).
+2. **`BP-20261120-2` — Coordinated operator transaction: atomic `cargo fmt`, FND-01 re-attestation on `asupersync 0.6.2` + `serde_json 1.0.154` + `zeroize 1.9.1`, and `AGENTS.md` cleanup (`bd-s46tx`, `bd-o590u`, `bd-rb77i`, `bd-gigqp`, `bd-oi73c`, `bd-zh3kx`, `bd-3zzrz`)**:
+   - Execute one operator-authorized transaction: run `cargo fmt --all` (clearing all 248 files / 5,122 hunks), clean `AGENTS.md`'s duplicate `RULE 0.5` and contradictory `br close` lines, re-run FND-01 probes on `nightly-2026-08-25` + `asupersync 0.6.2`, and re-bind `evidence/fnd-01/*` once so `fnd_01_declaration_drift` (3/3) and `fnd_01_a_evidence_binding` (17/17 with `FASTMCP_FND01_SDK_BATCH_BIN`) go green without `RH-1` baseline widening.
+3. **`BP-20261120-3` — Repair the 6 newly uncovered `NO_BEAD` hygiene/DX defects (`bd-ifjmx`, `bd-9q3vz`, `bd-ajunk`, `bd-lqcou`, `bd-s888g`, `bd-xgosy`)**:
+   - Fix swapped `schema::validate` args and fake benchmarks in `examples/bench.rs`; wire macOS portable atomic writes for `fastmcp inspect --output`; expose `McpAppsWireHostConfiguration::initialize_result` and prove via `consumer-closure-probe`; wire `OperatorSnapshot` + `HttpConnectionAdmissionProbe` to real HTTP readiness (`503` on saturation/drain with exact permit conservation); wire `argon2` Argon2id into `AUTH-06` and resolve dead `html5ever` plus add a dead-optional-dep mechanical gate; reconcile all 10 doc/example drifts and harden `readme_mechanical_claims.rs`.
+4. **`BP-20261120-4` — Re-measure official conformance & resolve operator policy rulings (`bd-conformance-row-unanchored-jw3pb`, `bd-conformance-oauth-driver-unconfigured-97rnu`, `bd-z5hx9`, `CONF-01..03`)**:
+   - Re-run `scripts/run_official_conformance.sh` in BOTH server and client modes against `HEAD` (`117388bc`+) to retire the 5-week-stale Oct 12/13 measurements.
+   - Obtain operator ruling on client-auth loopback-HTTP / dynamic-issuer posture (32 HTTPS checks across 24 files vs explicit boundary) and SELinux `fastmcp install` replacement policy (`bd-z5hx9`).
+5. **`BP-20261120-5` — Close upstream `asupersync` own-process stdio & interruptible blocking join (`FND-04-B-10`, `B-12`, `B-13`)**:
+   - Ship cancel-aware own-process `stdin`/`stdout` (Linux, macOS, Windows) and interruptible `spawn_blocking` `join()` caller release in `asupersync`, wire `fastmcp-transport::stdio`, and retire blocking `StdioTransport::stdio()` so `fnd_04_runtime_conformance` reaches 21/21 PASS.
+6. **`BP-20261120-6` — Complete mandatory Section 0 extensions with linearizable state-machine & conservation proofs (`AUTHX-01..05`, `TASKP-01`, `TASKR-01`, `FND-08`, `DX-TEST-01`)**:
+   - Implement EMA native HTTP token-exchange driver (RFC 8693 / RFC 7523), SAML 2.0 assertion exchange (`AUTHX-04`), durable browser/callback custody, and real server-side `enterprise-auth` enforcement.
+   - Implement concrete durable (`TASKP-01`) and distributed/Redis (`TASKR-01`) `FinalTaskStore` backends and concrete persistent/replay/restore adapters with linearizability and permit/byte conservation proofs (`acquired == released + live == 0` at quiescence) tested under `LabRuntime`/DPOR and real crashes.
+   - Modernize `TestClient` (`DX-TEST-01`) to cover MCP `2026-07-28` + `Auto` alongside exact `2024-11-05`.
+7. **`BP-20261120-7` — Cross-subsystem composition, cross-SDK interop, and statistically valid `PERF-01` qualification (`COMP-ALL-01`, `INTEROP-01`, `LEG-INTEROP-01`, `PERF-01`)**:
+   - Execute higher-order authority-conservation matrices (`auth -> cache -> proxy`, `auth -> MRTR -> Tasks`, `EMA -> persistent/restore -> replay`, `Apps -> sampling -> Tasks/MRTR`) and differential cross-SDK interoperability against pinned external MCP SDKs.
+   - Replace ad-hoc timing with real `PERF-01` HDR-histogram tail-latency, overload-recovery, and 8-hour soak harnesses using Mann-Kendall / Theil-Sen RSS-slope bounds to prove zero memory/descriptor leaks.
+8. **`BP-20261120-8` — Gate closure, `DOC-02` evidence-derived support matrix, `REL-QUAR-00`, and `0.14.0` / all-MCP release (`bd-st1o8`, `GATE-ALL-MCP-READY`, `CI-ALL-MCP-01`, `REL-01`, `REL-02`)**:
+   - Run full 3-arm `scripts/check_all_targets.sh --arm all`, 43-probe `scripts/check_feature_matrix.sh`, multi-profile `consumer-closure-probe`, strict `clippy -D warnings`, `cargo fmt --check`, and DSR qualification pipeline (`scripts/verify_batch.sh`, `dsr quality`, `dsr build`) before cutting `0.14.0` or claiming aggregate MCP `2026-07-28` conformance.
+
+*Ambition & refinement notes (`2026-11-20`)*: Three ambition passes elevated the bridge from patch-level fixes to (1) packaged single-dependency consumer closure + review-dam draining with git-ancestry receipt verification, (2) zero-dead-dependency and real-readiness conservation across auth/apps/ops/CLI boundaries, and (3) linearizable state-machine/DPOR verification for durable Tasks/EMA replay + statistically rigorous `PERF-01` tail-latency/soak qualification. Five plan-space refinement passes verified zero duplication against all 145 formal work packages, non-blocking `related` edges avoiding the Oct 31 `parent-child` deadlock trap, exact `RH-5` positive/planted-negative contracts on all 6 new beads, `bd-oi73c` incident reopening, and `evidence/fnd-02/authoritative-sources.toml` re-binding verified against live `fnd_02_a`/`b`/`i`.
 
 #### Historical bridge baseline
 
