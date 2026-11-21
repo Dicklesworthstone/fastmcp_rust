@@ -747,7 +747,7 @@ pub(super) trait ExchangePoster: Send + Sync {
 }
 
 struct RecordedPost {
-    url: String,
+    host: String,
     content_type: String,
     has_authorization: bool,
     body: String,
@@ -761,9 +761,7 @@ struct ScriptedExchangePoster {
 }
 
 impl ScriptedExchangePoster {
-    fn new(
-        responses: Vec<Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>,
-    ) -> Arc<Self> {
+    fn new(responses: Vec<Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>) -> Arc<Self> {
         Arc::new(Self {
             responses: std::sync::Mutex::new(responses.into()),
             recorded: std::sync::Mutex::new(Vec::new()),
@@ -790,7 +788,7 @@ impl ExchangePoster for ScriptedExchangePoster {
         >,
     > {
         self.recorded.lock().unwrap().push(RecordedPost {
-            url: url.as_str().to_owned(),
+            host: url.host().to_owned(),
             content_type: request.content_type().to_owned(),
             has_authorization: request.has_authorization(),
             body: String::from_utf8(request.body().to_vec()).expect("utf-8 form body"),
@@ -807,12 +805,13 @@ impl ExchangePoster for ScriptedExchangePoster {
 
 fn test_fetcher() -> GuardedHttpFetcher {
     let policy = fastmcp_transport::GuardedHttpFetchPolicy::new(
-        Duration::from_secs(5),
         MAX_ENTERPRISE_EXCHANGE_RESPONSE_BYTES,
+        Duration::from_secs(5),
+        Duration::from_secs(2),
         "test-root-rev-1",
     )
     .expect("valid guarded fetch policy");
-    GuardedHttpFetcher::with_webpki_roots(policy).expect("webpki guarded fetcher")
+    GuardedHttpFetcher::new(policy).expect("webpki guarded fetcher")
 }
 
 fn ok_exchange_response(
@@ -834,7 +833,7 @@ fn ok_exchange_response(
             root_policy_revision: root_identity.to_owned(),
             alpn: Some(b"http/1.1".to_vec()),
             tls_protocol: Some("TLSv1.3".to_owned()),
-            server_certificate_sha256: [0x22; 32],
+            leaf_certificate_sha256: [0x22; 32],
         },
     }
 }
@@ -845,15 +844,15 @@ fn driver_with_poster(
 ) -> (EnterpriseExchangeDriver, String) {
     let fetcher = test_fetcher();
     let root_id = fetcher.root_identity().to_owned();
-    let driver =
-        EnterpriseExchangeDriver::new(selected, fetcher, EnterpriseResponsePolicy::default())
-            .expect("valid enterprise exchange driver");
+    let idp_token_url = GuardedHttpsUrl::parse(selected.idp_token_endpoint()).unwrap();
+    let resource_as_token_url =
+        GuardedHttpsUrl::parse(selected.resource_as_token_endpoint()).unwrap();
     let inner = ExchangeDriverInner {
-        profile: driver.inner.profile.clone(),
-        idp_token_url: driver.inner.idp_token_url.clone(),
-        resource_as_token_url: driver.inner.resource_as_token_url.clone(),
-        fetcher: driver.inner.fetcher.clone(),
-        response_policy: driver.inner.response_policy,
+        profile: selected,
+        idp_token_url,
+        resource_as_token_url,
+        fetcher,
+        response_policy: EnterpriseResponsePolicy::default(),
         busy: Arc::new(AtomicBool::new(false)),
         test_post: Some(poster),
     };
@@ -878,10 +877,10 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     let selected = profile(&["read"]);
     let (oidc_keys, jag_keys) = keys();
     let oidc_body = serde_json::to_vec(&json!({
-        "access_token": "oidc-temp-access-token-01",
+        "access_token": "temporary-access",
         "token_type": "Bearer",
         "scope": "openid",
-        "id_token": fixtures()["oidc"]["valid"].as_str().unwrap(),
+        "id_token": fixtures()["oidc"],
     }))
     .unwrap();
     let headers_val = headers();
@@ -894,7 +893,7 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
                     body: &oidc_body,
                 },
                 &oidc_keys,
-                "nonce-valid",
+                "oidc-flow-nonce",
                 TenantExpectation::SingleTenant,
                 None,
                 EnterpriseResponsePolicy::default(),
@@ -903,14 +902,7 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
             .expect("admit OIDC identity assertion"),
     );
 
-    let jag_body = serde_json::to_vec(&json!({
-        "issued_token_type": ID_JAG_TOKEN_TYPE,
-        "access_token": fixtures()["id_jag"]["valid"].as_str().unwrap(),
-        "token_type": "N_A",
-        "scope": "read",
-        "expires_in": 300,
-    }))
-    .unwrap();
+    let jag_body_bytes = serde_json::to_vec(&jag_body()).unwrap();
     let access_body_bytes = serde_json::to_vec(&json!({
         "access_token": "enterprise-final-bearer-token-2026",
         "token_type": "Bearer",
@@ -923,8 +915,16 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     let fetcher = test_fetcher();
     let root_id = fetcher.root_identity().to_owned();
     let poster = ScriptedExchangePoster::new(vec![
-        Ok(ok_exchange_response("idp.example", &root_id, jag_body.clone())),
-        Ok(ok_exchange_response("as.example", &root_id, access_body_bytes)),
+        Ok(ok_exchange_response(
+            "idp.example",
+            &root_id,
+            jag_body_bytes.clone(),
+        )),
+        Ok(ok_exchange_response(
+            "as.example",
+            &root_id,
+            access_body_bytes,
+        )),
     ]);
     let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
     let idp_secret = EnterpriseClientSecret::try_new("idp-secret-val").unwrap();
@@ -952,7 +952,12 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
         assert_eq!(id_jag.granted_scopes(), ["read"]);
 
         let (token_outcome, token_obs) = driver
-            .exchange_id_jag_for_access_token(&cx, id_jag, &as_secret, now() + Duration::from_secs(1))
+            .exchange_id_jag_for_access_token(
+                &cx,
+                id_jag,
+                &as_secret,
+                now() + Duration::from_secs(1),
+            )
             .await
             .expect("stage 2 RFC 7523 exchange succeeds");
         assert_eq!(token_obs.endpoint(), "https://as.example/token");
@@ -978,15 +983,26 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     let recorded = poster.take_recorded();
     assert_eq!(recorded.len(), 2);
     // Stage 1: IdP uses ClientSecretBasic -> Authorization header present, NO client_secret in body.
-    assert_eq!(recorded[0].url, "https://idp.example/token");
-    assert_eq!(recorded[0].content_type, "application/x-www-form-urlencoded");
+    assert_eq!(recorded[0].host, "idp.example");
+    assert_eq!(
+        recorded[0].content_type,
+        "application/x-www-form-urlencoded"
+    );
     assert!(recorded[0].has_authorization);
-    assert!(recorded[0].body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange"));
+    assert!(
+        recorded[0]
+            .body
+            .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange")
+    );
     assert!(!recorded[0].body.contains("client_secret="));
     // Stage 2: Resource AS uses ClientSecretPost -> NO Authorization header, client_id & client_secret in body.
-    assert_eq!(recorded[1].url, "https://as.example/token");
+    assert_eq!(recorded[1].host, "as.example");
     assert!(!recorded[1].has_authorization);
-    assert!(recorded[1].body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"));
+    assert!(
+        recorded[1]
+            .body
+            .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer")
+    );
     assert!(recorded[1].body.contains("client_id=native-resource"));
     assert!(recorded[1].body.contains("client_secret=as-secret-val"));
 
@@ -1002,11 +1018,11 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     );
 
     // 2. HTTP redirect refused without following.
-    let mut redirect_resp = ok_exchange_response("idp.example", &root_id, jag_body.clone());
+    let mut redirect_resp = ok_exchange_response("idp.example", &root_id, jag_body_bytes.clone());
     redirect_resp.status = 302;
     redirect_resp.redirect = Some(fastmcp_transport::GuardedHttpRedirect {
         status: 302,
-        location: "https://evil.example/token".to_owned(),
+        location: Some("https://evil.example/token".to_owned()),
     });
     let redirect_poster = ScriptedExchangePoster::new(vec![Ok(redirect_resp)]);
     let (redirect_driver, _) = driver_with_poster(selected.clone(), redirect_poster);
@@ -1019,7 +1035,7 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
                     body: &oidc_body,
                 },
                 &oidc_keys,
-                "nonce-valid",
+                "oidc-flow-nonce",
                 TenantExpectation::SingleTenant,
                 None,
                 EnterpriseResponsePolicy::default(),
@@ -1029,7 +1045,7 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     );
     run_exchange_async(async {
         let cx = Cx::current().unwrap();
-        let err = redirect_driver
+        let err = match redirect_driver
             .exchange_identity_for_id_jag(
                 &cx,
                 assertion_for_redirect,
@@ -1040,7 +1056,10 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
                 now(),
             )
             .await
-            .unwrap_err();
+        {
+            Err(err) => err,
+            Ok(_) => panic!("redirect response must be refused"),
+        };
         assert_eq!(err, EnterpriseExchangeError::RedirectRefused);
     });
 
@@ -1048,7 +1067,7 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     let wrong_host_poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
         "attacker.example",
         &root_id,
-        jag_body,
+        jag_body_bytes,
     ))]);
     let (wrong_host_driver, _) = driver_with_poster(selected.clone(), wrong_host_poster);
     let assertion_for_host = success(
@@ -1060,7 +1079,7 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
                     body: &oidc_body,
                 },
                 &oidc_keys,
-                "nonce-valid",
+                "oidc-flow-nonce",
                 TenantExpectation::SingleTenant,
                 None,
                 EnterpriseResponsePolicy::default(),
@@ -1070,7 +1089,7 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
     );
     run_exchange_async(async {
         let cx = Cx::current().unwrap();
-        let err = wrong_host_driver
+        let err = match wrong_host_driver
             .exchange_identity_for_id_jag(
                 &cx,
                 assertion_for_host,
@@ -1081,7 +1100,10 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
                 now(),
             )
             .await
-            .unwrap_err();
+        {
+            Err(err) => err,
+            Ok(_) => panic!("provenance host mismatch must be refused"),
+        };
         assert_eq!(err, EnterpriseExchangeError::EvidenceMismatch);
     });
 }

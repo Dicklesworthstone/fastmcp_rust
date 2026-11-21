@@ -34,13 +34,13 @@ use super::policy::{
     EnterpriseClientAuthentication, EnterpriseProfile, ID_JAG_TOKEN_TYPE, IdJagGrantedScopeSet,
     JWT_BEARER_GRANT, TOKEN_EXCHANGE_GRANT,
 };
-use crate::http_auth::BoundBearerCredential;
 use super::verification::disclosure::{IdJagDisclosureFacts, IdJagDisclosurePolicy};
 use super::verification::{
     IdJagExpectations, IdJagVerificationKeys, JwtTimePolicy, OidcIdTokenExpectations,
     OidcVerificationKeys, ResourceTenantExpectation, TenantExpectation, VerifiedIdJag,
     VerifiedOidcIdToken, verify_id_jag, verify_id_jag_with_disclosure, verify_oidc_id_token,
 };
+use crate::http_auth::BoundBearerCredential;
 
 /// Fixed diagnostics retain no tokens, claims, scopes, issuer text or peer body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -692,7 +692,9 @@ impl fmt::Display for EnterpriseExchangeError {
                 formatter.write_str("enterprise token exchange is already in progress")
             }
             Self::Cancelled => formatter.write_str("enterprise token exchange was cancelled"),
-            Self::TimedOut => formatter.write_str("enterprise token exchange exceeded its deadline"),
+            Self::TimedOut => {
+                formatter.write_str("enterprise token exchange exceeded its deadline")
+            }
             Self::TransportFailed => {
                 formatter.write_str("enterprise guarded HTTPS token exchange failed")
             }
@@ -933,8 +935,8 @@ impl EnterpriseExchangeDriver {
         EnterpriseExchangeError,
     > {
         let profile = &self.inner.profile;
-        let scope_wire = (!id_jag.granted_scopes().is_empty())
-            .then(|| id_jag.granted_scopes().join(" "));
+        let scope_wire =
+            (!id_jag.granted_scopes().is_empty()).then(|| id_jag.granted_scopes().join(" "));
         let mut fields: Vec<(&str, &str)> = vec![
             ("grant_type", JWT_BEARER_GRANT),
             ("assertion", id_jag._assertion.as_str()),
@@ -1172,11 +1174,11 @@ fn encode_form_component(value: &str) -> String {
     encoded
 }
 
-fn build_confidential_token_request(
+fn build_confidential_token_request<'a>(
     auth: EnterpriseClientAuthentication,
-    client_id: &str,
-    client_secret: &str,
-    fields: &mut Vec<(&str, &str)>,
+    client_id: &'a str,
+    client_secret: &'a str,
+    fields: &mut Vec<(&str, &'a str)>,
 ) -> Result<GuardedHttpRequest, EnterpriseExchangeError> {
     let basic_header = match auth {
         EnterpriseClientAuthentication::ClientSecretBasic => {
