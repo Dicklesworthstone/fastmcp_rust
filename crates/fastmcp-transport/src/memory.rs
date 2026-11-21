@@ -267,6 +267,18 @@ impl MemoryTransport {
         self.closed
     }
 
+    /// Receives one typed message together with its exact committed JSON source.
+    ///
+    /// This is the synchronous counterpart to [`Self::recv_with_source_async`].
+    /// It uses the same bounded ingress admission as the split receive half,
+    /// preserving result member order and number lexemes without reserializing
+    /// the decoded message. Cancellation before dequeue leaves the frame queued.
+    pub fn recv_with_source(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+        let source =
+            recv_memory_source(&mut self.receiver, &mut self.closed, self.poll_interval, cx)?;
+        ReceivedTransportFrame::admit(source)
+    }
+
     /// Separates bounded memory ingress from independently owned egress.
     ///
     /// Both halves preserve this endpoint's channel capacity, typed-message
@@ -833,6 +845,48 @@ mod tests {
             actual_response, &response,
             "typed message is derived from the one committed source document"
         );
+    }
+
+    #[test]
+    fn unsplit_source_receive_preserves_exact_numbers_and_terminal_close() {
+        let (mut client, mut server) = create_memory_transport_pair();
+        let cx = Cx::for_testing();
+        let exact = serde_json::Value::Number(
+            serde_json::Number::from_string_unchecked("7.30e-2".to_owned()),
+        );
+        let response = JsonRpcResponse::success(RequestId::Number(7), serde_json::json!({
+            "resultType": "complete", "content": [], "com.example/exact": exact,
+        }));
+        let expected = Codec::new().encode_response(&response).unwrap();
+        server.send(&cx, &JsonRpcMessage::Response(response.clone())).unwrap();
+        let received = client.recv_with_source(&cx).unwrap();
+        assert_eq!(received.source(), expected.strip_suffix(b"\n").unwrap());
+        let JsonRpcMessage::Response(admitted) = received.message() else {
+            panic!("the retained source must decode to the committed response");
+        };
+        assert_eq!(admitted, &response);
+        assert!(std::str::from_utf8(received.source()).unwrap().contains("7.30e-2"));
+
+        server.send(&cx, &JsonRpcMessage::Response(response.clone())).unwrap();
+        client.close(&cx).unwrap();
+        assert!(matches!(client.recv_with_source(&cx), Err(TransportError::Closed)));
+        assert!(matches!(server.send(&cx, &JsonRpcMessage::Response(response)), Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn unsplit_source_receive_cancellation_does_not_consume_committed_input() {
+        let (mut client, mut server) = create_memory_transport_pair();
+        let live = Cx::for_testing();
+        let stopped = Cx::for_testing();
+        let response = JsonRpcResponse::success(RequestId::Number(9), serde_json::json!({}));
+        server.send(&live, &JsonRpcMessage::Response(response.clone())).unwrap();
+        stopped.set_cancel_requested(true);
+        assert!(matches!(client.recv_with_source(&stopped), Err(TransportError::Cancelled)));
+        let JsonRpcMessage::Response(admitted) = client.recv_with_source(&live).unwrap().into_message() else {
+            panic!("the live caller receives the response left queued by cancellation");
+        };
+        assert_eq!(admitted, response);
+        assert!(!client.is_closed());
     }
 
     #[test]

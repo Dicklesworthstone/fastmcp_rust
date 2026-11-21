@@ -3,12 +3,14 @@
 //! This module provides utilities for writing comprehensive tests without mocks:
 //!
 //! - [`TestServer`]: Builder for creating test servers with real handlers
+//! - [`TestClient`]: Caller-context clients with typed results and a production
+//!   asynchronous Memory client handoff
 //! - Assertion helpers for validating JSON-RPC and MCP compliance
 //! - Timing utilities for performance measurements
 //! - [`fixtures`]: Test data generators for tools, resources, prompts, and messages
 //!
 //! With the `testing-lab` feature, [`lab`] also exposes deterministic-runtime
-//! helpers such as `TestContext`, `TestClient`, and `LabRuntime`.
+//! helpers such as `TestContext` and `LabRuntime`.
 //!
 //! # Example
 //!
@@ -35,7 +37,6 @@
 //! - **Resource cleanup**: Automatic cleanup of spawned tasks
 
 mod assertions;
-#[cfg(feature = "testing-lab")]
 mod client;
 #[cfg(feature = "testing-lab")]
 mod context;
@@ -45,6 +46,7 @@ mod timing;
 mod trace;
 
 pub use assertions::*;
+pub use client::*;
 pub use server::*;
 pub use timing::*;
 pub use trace::*;
@@ -72,6 +74,9 @@ pub mod prelude {
         // Server
         TestServer,
         TestServerBuilder,
+        // Client
+        TestClient,
+        TestClientProtocolMode,
         // Trace
         TestTrace,
         TestTraceBuilder,
@@ -97,7 +102,7 @@ pub mod prelude {
     };
 
     #[cfg(feature = "testing-lab")]
-    pub use super::lab::{LabConfig, LabRuntime, TestClient, TestClientProtocolMode, TestContext};
+    pub use super::lab::{LabConfig, LabRuntime, TestContext};
 
     // Re-export commonly used types
     pub use crate::{

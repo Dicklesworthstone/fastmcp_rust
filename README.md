@@ -2551,6 +2551,37 @@ and its receive turns retain the native client's bounded synchronous slices.
 After dropping installed routes and other handles, consume the last handle
 with `close_with_cx` to await observable subprocess cleanup.
 
+## In-process test clients
+
+Enable the facade's `testing` feature to use `testing::TestClient` with a
+caller-owned `Cx` and `MemoryTransport`. `TestClient::new_modern` selects exact
+MCP `2026-07-28`; `new` retains the exact-2024 helper when that protocol feature
+is enabled. These helpers do not create a runtime. Synchronous requests require
+the peer to be driven independently.
+
+Use `initialize_core()` to retain the complete modern discovery, including its
+optional identity, cache contract, and open members. `request_core(method,
+params)` returns the full typed method result with its original JSON number
+lexemes and modern `input_required` state. Legacy-shaped convenience helpers
+report an input-required result as an error directing the caller to that typed
+API. Invalid discovery, malformed results, and mismatched response IDs retire
+the endpoint. Valid peer errors preserve their data and leave it usable.
+
+For concurrent requests, reverse interactions, subscriptions, or explicitly
+configured Tasks, consume an unused helper with `connect_modern().await` or
+`connect_modern_with(configure).await`. These transfer the existing endpoint
+and caller context to the shipped asynchronous `MemoryClient`;
+`connect_modern_with` exposes its normal builder for reverse handlers and
+extension settings. The resulting client owns normal request cancellation and
+terminal results, and the server can run on the same caller runtime. No
+blocking pool or deterministic test runtime is required for Memory I/O.
+
+`new_auto` only retries after an admitted, correlated modern
+`MethodNotFound`. Install `with_legacy_transport_factory` to supply a fresh,
+independently driven endpoint for that one exact-2024 attempt. The modern probe
+is closed before the factory runs. Without the factory, the error is returned;
+the probe endpoint is never reused for a different protocol era.
+
 ## Client executor observations
 
 `OperatorExecutorSnapshot` captures the selected protocol profile, lifecycle,
