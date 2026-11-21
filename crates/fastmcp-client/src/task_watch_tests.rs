@@ -1043,10 +1043,7 @@ mod websocket {
         };
         advertised_discovery["result"]["capabilities"] = serde_json::to_value(
             ServerDiscoverCapabilities::from_registry(
-                &ServerBehaviorRegistry::from_behaviors([
-                    ServerBehavior::ToolsList,
-                    ServerBehavior::ToolsCall,
-                ]),
+                &ServerBehaviorRegistry::from_behaviors([ServerBehavior::ToolsList]),
                 extensions,
             )
             .unwrap(),
@@ -1145,17 +1142,27 @@ mod websocket {
                     } else {
                         match (family, result.unwrap()) {
                             ("complete", crate::FinalToolCallOutcome::Complete(result)) => {
-                                assert_eq!(serde_json::to_value(result).unwrap()["callExtra"], true);
+                                assert!(result.extras.members().iter().any(|member| {
+                                    member.name == "callExtra"
+                                        && member.value
+                                            == fastmcp_protocol::ExactJsonValue::Bool(true)
+                                }));
                             }
                             ("task", crate::FinalToolCallOutcome::Task(created)) => {
                                 assert_completed(&created.task);
                                 assert_eq!(created.additional["creationExtra"], true);
-                                assert_eq!(serde_json::to_value(&created).unwrap()["_meta"]["receipt"], "kept");
+                                assert_eq!(
+                                    serde_json::to_value(&created).unwrap()["_meta"]["receipt"],
+                                    "kept"
+                                );
                                 let handle = FinalTaskHandle::from_created(&created).unwrap();
                                 assert_completed(handle.task());
                             }
-                            ("input_required", crate::FinalToolCallOutcome::InputRequired(input)) => {
-                                assert_eq!(serde_json::to_value(input).unwrap()["requestState"], "one-use");
+                            (
+                                "input_required",
+                                crate::FinalToolCallOutcome::InputRequired(input),
+                            ) => {
+                                assert_eq!(input.request_state(), Some("one-use"));
                             }
                             _ => panic!("a Task-capable call changed the peer's result family"),
                         }

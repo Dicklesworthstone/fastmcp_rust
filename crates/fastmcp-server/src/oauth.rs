@@ -69,7 +69,9 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+#[cfg(feature = "builtin-auth-server")]
+use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use fastmcp_core::{
@@ -1939,7 +1941,6 @@ struct ClientSecretVerifier {
     salt: [u8; CLIENT_SECRET_SALT_BYTES],
     digest: Sha256Digest,
 }
-
 
 #[cfg(not(feature = "builtin-auth-server"))]
 impl ClientSecretVerifier {
@@ -5272,9 +5273,9 @@ impl OAuthServer {
             assertion.registration_epoch
         } else {
             authenticated
-                .ok_or_else(|| OAuthError::InvalidClient(
-                    OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
-                ))?
+                .ok_or_else(|| {
+                    OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string())
+                })?
                 .validate_current(&state)?
         };
         let client = state.clients.get(&request.client_id).ok_or_else(|| {
@@ -5991,7 +5992,10 @@ impl OAuthServer {
             OAuthError::TemporarilyUnavailable("OAuth issuer state is unavailable".to_string())
         })?;
         let caller_epoch = authenticated.validate_current(&state)?;
-        let caller = state.clients.get(client_id).ok_or_else(authentication_failed)?;
+        let caller = state
+            .clients
+            .get(client_id)
+            .ok_or_else(authentication_failed)?;
         if caller.registration_epoch != caller_epoch
             || caller.metadata.client_type != ClientType::Confidential
             || method != TokenEndpointAuthMethod::ClientSecretBasic
@@ -6632,7 +6636,6 @@ fn derive_grant_id(
         .map_err(|error| OAuthError::ServerError(error.to_string()))?;
     Ok(OAuthGrantId::from_bytes(digest.into_bytes()))
 }
-
 
 #[cfg(not(feature = "builtin-auth-server"))]
 fn client_secret_digest(
