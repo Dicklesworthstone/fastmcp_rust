@@ -1273,11 +1273,7 @@ impl FilesystemResourceHandler {
     }
 }
 
-async fn run_filesystem_blocking<T, F>(
-    ctx: &McpContext,
-    request_cx: &Cx,
-    work: F,
-) -> McpOutcome<T>
+async fn run_filesystem_blocking<T, F>(ctx: &McpContext, request_cx: &Cx, work: F) -> McpOutcome<T>
 where
     T: Send + 'static,
     F: FnOnce(&McpContext) -> McpResult<T> + Send + 'static,
@@ -1327,11 +1323,9 @@ where
                 let reason = if context.deadline_expired() || ctx.deadline_expired() {
                     asupersync::CancelReason::deadline()
                 } else {
-                    admitted
-                        .cancel_reason()
-                        .unwrap_or_else(|| {
-                            asupersync::CancelReason::user("filesystem request ended")
-                        })
+                    admitted.cancel_reason().unwrap_or_else(|| {
+                        asupersync::CancelReason::user("filesystem request ended")
+                    })
                 };
                 worker.abort_with_reason(reason);
                 // A cancelled request does not terminate an in-progress
@@ -1445,11 +1439,9 @@ impl ResourceHandler for FilesystemResourceHandler {
         ctx: &'a McpContext,
     ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
         let handler = self.clone();
-        Box::pin(
-            async move {
-                run_filesystem_blocking(ctx, ctx.cx(), move |child| handler.read(child)).await
-            },
-        )
+        Box::pin(async move {
+            run_filesystem_blocking(ctx, ctx.cx(), move |child| handler.read(child)).await
+        })
     }
 
     fn read_async_with_uri<'a>(
@@ -2477,7 +2469,10 @@ mod tests {
             if observed() {
                 return Poll::Ready(());
             }
-            assert!(Instant::now() < deadline, "filesystem worker barrier timed out");
+            assert!(
+                Instant::now() < deadline,
+                "filesystem worker barrier timed out"
+            );
             if tick.as_mut().poll(task).is_ready() {
                 tick = Box::pin(asupersync::time::Sleep::new(
                     cx.now().saturating_add_nanos(1_000_000),
@@ -2522,7 +2517,10 @@ mod tests {
             assert_eq!(content[0].text.as_deref(), Some("async content"));
             let Outcome::Ok(FinalMethodOutcome::Complete(result)) = handler
                 .read_final_outcome_async_with_uri_in_request(
-                    &ctx, &cx, "file:///notes.md", &params,
+                    &ctx,
+                    &cx,
+                    "file:///notes.md",
+                    &params,
                 )
                 .await
             else {
@@ -2598,29 +2596,46 @@ mod tests {
             let unavailable = McpErrorCode::InternalError;
             filesystem_error(handler.read_async(&ctx).await, unavailable);
             filesystem_error(
-                handler.read_async_with_uri(&ctx, "file:///notes.md", &params).await,
+                handler
+                    .read_async_with_uri(&ctx, "file:///notes.md", &params)
+                    .await,
                 unavailable,
             );
             filesystem_error(handler.read_final_async(&ctx).await, unavailable);
             filesystem_error(
-                handler.read_final_async_with_uri(&ctx, "file:///notes.md", &params).await,
+                handler
+                    .read_final_async_with_uri(&ctx, "file:///notes.md", &params)
+                    .await,
                 unavailable,
             );
             filesystem_error(handler.read_final_outcome_async(&ctx).await, unavailable);
             filesystem_error(
-                handler.read_final_outcome_async_with_uri(&ctx, "file:///notes.md", &params).await,
+                handler
+                    .read_final_outcome_async_with_uri(&ctx, "file:///notes.md", &params)
+                    .await,
                 unavailable,
             );
             filesystem_error(
-                handler.read_async_with_uri_in_request(&ctx, &cx, "file:///notes.md", &params).await,
+                handler
+                    .read_async_with_uri_in_request(&ctx, &cx, "file:///notes.md", &params)
+                    .await,
                 unavailable,
             );
             filesystem_error(
-                handler.read_final_async_with_uri_in_request(&ctx, &cx, "file:///notes.md", &params).await,
+                handler
+                    .read_final_async_with_uri_in_request(&ctx, &cx, "file:///notes.md", &params)
+                    .await,
                 unavailable,
             );
             filesystem_error(
-                handler.read_final_outcome_async_with_uri_in_request(&ctx, &cx, "file:///notes.md", &params).await,
+                handler
+                    .read_final_outcome_async_with_uri_in_request(
+                        &ctx,
+                        &cx,
+                        "file:///notes.md",
+                        &params,
+                    )
+                    .await,
                 unavailable,
             );
             let calls = Arc::new(AtomicUsize::new(0));
@@ -2636,7 +2651,11 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             // The explicitly synchronous API remains available to a caller
             // that owns its blocking execution; this change adds no runtime.
-            assert!(handler.read_with_uri(&ctx, "file:///notes.md", &params).is_ok());
+            assert!(
+                handler
+                    .read_with_uri(&ctx, "file:///notes.md", &params)
+                    .is_ok()
+            );
         });
 
         filesystem_runtime(true).block_on(async {
@@ -2644,16 +2663,26 @@ mod tests {
             let ctx = McpContext::new(cx.clone(), 14);
             let explicit = cx.with_blocking_pool_handle(None);
             filesystem_error(
-                handler.read_async_with_uri_in_request(&ctx, &explicit, "file:///notes.md", &params).await,
+                handler
+                    .read_async_with_uri_in_request(&ctx, &explicit, "file:///notes.md", &params)
+                    .await,
                 McpErrorCode::InternalError,
             );
             filesystem_error(
-                handler.read_final_outcome_async_with_uri_in_request(
-                    &ctx, &explicit, "file:///notes.md", &params,
-                ).await,
+                handler
+                    .read_final_outcome_async_with_uri_in_request(
+                        &ctx,
+                        &explicit,
+                        "file:///notes.md",
+                        &params,
+                    )
+                    .await,
                 McpErrorCode::InternalError,
             );
-            assert!(ctx.ensure_live().is_ok(), "a wider ambient pool grants no authority");
+            assert!(
+                ctx.ensure_live().is_ok(),
+                "a wider ambient pool grants no authority"
+            );
         });
     }
 
@@ -2664,13 +2693,16 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
         filesystem_runtime(false).block_on(async {
-            let cx = Cx::current().unwrap().with_blocking_pool_handle(Some(pool.handle()));
+            let cx = Cx::current()
+                .unwrap()
+                .with_blocking_pool_handle(Some(pool.handle()));
             let ctx = McpContext::new(cx.clone(), 15);
             filesystem_error(
                 run_filesystem_blocking(&ctx, &cx, move |_| {
                     observed.fetch_add(1, Ordering::SeqCst);
                     Ok(())
-                }).await,
+                })
+                .await,
                 McpErrorCode::InternalError,
             );
             assert!(ctx.ensure_live().is_ok());
@@ -2697,13 +2729,20 @@ mod tests {
             let ctx = McpContext::new(parent.clone(), 16);
             for explicit in [&cancelled, &expired] {
                 filesystem_error(
-                    handler.read_async_with_uri_in_request(&ctx, explicit, "file:///notes.md", &params).await,
+                    handler
+                        .read_async_with_uri_in_request(&ctx, explicit, "file:///notes.md", &params)
+                        .await,
                     McpErrorCode::RequestCancelled,
                 );
                 filesystem_error(
-                    handler.read_final_outcome_async_with_uri_in_request(
-                        &ctx, explicit, "file:///notes.md", &params,
-                    ).await,
+                    handler
+                        .read_final_outcome_async_with_uri_in_request(
+                            &ctx,
+                            explicit,
+                            "file:///notes.md",
+                            &params,
+                        )
+                        .await,
                     McpErrorCode::RequestCancelled,
                 );
             }
@@ -2725,7 +2764,9 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicBool::new(false));
         filesystem_runtime(false).block_on(async {
-            let cx = Cx::current().unwrap().with_blocking_pool_handle(Some(pool.handle()));
+            let cx = Cx::current()
+                .unwrap()
+                .with_blocking_pool_handle(Some(pool.handle()));
             let ctx = McpContext::new(cx.clone(), 17);
             let sibling = McpContext::new(cx.clone(), 18);
             let observed = Arc::clone(&calls);
@@ -2740,7 +2781,8 @@ mod tests {
             let cancelled_at = Instant::now();
             filesystem_pending_until(&cx, call.as_mut(), || {
                 cancelled_at.elapsed() >= Duration::from_millis(50)
-            }).await;
+            })
+            .await;
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert!(!dropped.load(Ordering::SeqCst));
             assert!(sibling.ensure_live().is_ok());
@@ -2786,18 +2828,23 @@ mod tests {
                     worker = Some(entered);
                 }
                 worker.is_some()
-            }).await;
+            })
+            .await;
             ctx.request_cancellation().cancel();
             filesystem_pending_until(&cx, call.as_mut(), || {
                 worker.as_ref().unwrap().is_cancel_requested()
-            }).await;
+            })
+            .await;
             assert_eq!(read.load(Ordering::SeqCst), 0);
             assert!(!dropped.load(Ordering::SeqCst));
             assert!(sibling.ensure_live().is_ok());
             release.send(()).unwrap();
             filesystem_error(call.await, McpErrorCode::RequestCancelled);
             assert_eq!(read.load(Ordering::SeqCst), 1);
-            assert!(dropped.load(Ordering::SeqCst), "late bytes are discarded before completion");
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "late bytes are discarded before completion"
+            );
             assert!(cx.checkpoint().is_ok());
         });
     }
