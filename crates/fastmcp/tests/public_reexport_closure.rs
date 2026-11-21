@@ -973,3 +973,219 @@ fn facade_exposes_enterprise_exchange_driver_types() {
     let _: Option<EnterpriseBoundAccessToken> = None;
     let _: Option<EnterpriseExchangeObservation> = None;
 }
+
+/// Live consumer-position proof that `fastmcp_rust::modern::ServerBuilder`
+/// (and `auto` / `legacy_2024` builders when compiled) expose first-class
+/// `transformed_tool`, `response_caching`, `rate_limiting`, logging/console
+/// toggles, and builder inspection getters through the facade alone.
+#[test]
+fn facade_server_builders_expose_middleware_transforms_and_logging_live() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use fastmcp_rust::memory::create_memory_transport_pair;
+    use fastmcp_rust::modern::{
+        ArgTransform, ClientInfo, FinalCoreResult, MemoryClient, RateLimitingMiddleware,
+        ResponseCachingMiddleware, ServerBuilder, ToolHandler, TransformedTool,
+    };
+    use fastmcp_rust::{
+        Content, CoreResult, LoggingConfig, McpContext, McpError, McpRequestCancellation,
+        McpResult, Tool, json,
+    };
+
+    struct RawLookupTool {
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for RawLookupTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "raw_lookup".to_owned(),
+                description: Some("raw search".to_owned()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "q": { "type": "string" },
+                        "n": { "type": "integer" }
+                    },
+                    "required": ["q", "n"]
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            let q = arguments
+                .get("q")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| McpError::invalid_params("missing q"))?;
+            let n = arguments
+                .get("n")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| McpError::invalid_params("missing n"))?;
+            Ok(vec![Content::Text {
+                text: format!("{q}:{n}"),
+            }])
+        }
+    }
+
+    let builder = ServerBuilder::new("parity-live", "1.0.0")
+        .logging(LoggingConfig::default())
+        .mask_error_details(true)
+        .strict_input_validation(true)
+        .log_timestamps(false)
+        .log_targets(false)
+        .log_file_line(false)
+        .plain_mode();
+    assert!(builder.is_error_masking_enabled());
+    assert!(builder.is_strict_input_validation_enabled());
+    assert!(!builder.console_config().log_timestamps);
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let transformed = TransformedTool::from_tool(RawLookupTool {
+        invocations: Arc::clone(&invocations),
+    })
+    .name("search")
+    .description("Friendly renamed lookup")
+    .transform_arg("q", ArgTransform::new().name("query"))
+    .transform_arg("n", ArgTransform::new().name("limit").default(5))
+    .build();
+
+    let server = builder
+        .rate_limiting(RateLimitingMiddleware::new(0.001).burst_capacity(2))
+        .response_caching(
+            ResponseCachingMiddleware::new()
+                .list_ttl_secs(60)
+                .call_ttl_secs(60)
+                .include_tools(vec!["search".to_owned()]),
+        )
+        .transformed_tool(transformed)
+        .build();
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    {
+        let auto_builder = fastmcp_rust::auto::ServerBuilder::new("parity-auto", "1.0.0")
+            .logging(LoggingConfig::default())
+            .log_timestamps(false)
+            .log_targets(false)
+            .log_file_line(false)
+            .mask_error_details(false)
+            .strict_input_validation(false)
+            .plain_mode()
+            .force_color()
+            .rate_limiting(RateLimitingMiddleware::new(10.0))
+            .response_caching(ResponseCachingMiddleware::new())
+            .transformed_tool(
+                TransformedTool::from_tool(RawLookupTool {
+                    invocations: Arc::new(AtomicUsize::new(0)),
+                })
+                .name("auto_search")
+                .build(),
+            );
+        assert!(!auto_builder.is_error_masking_enabled());
+        assert!(!auto_builder.is_strict_input_validation_enabled());
+        let _ = auto_builder.console_config();
+        let _ = auto_builder.build();
+
+        let legacy_builder = fastmcp_rust::legacy_2024::ServerBuilder::new("parity-2024", "1.0.0")
+            .logging(LoggingConfig::default())
+            .log_timestamps(false)
+            .log_targets(false)
+            .log_file_line(false)
+            .mask_error_details(true)
+            .strict_input_validation(true)
+            .plain_mode()
+            .force_color()
+            .rate_limiting(RateLimitingMiddleware::new(10.0))
+            .response_caching(ResponseCachingMiddleware::new())
+            .transformed_tool(
+                TransformedTool::from_tool(RawLookupTool {
+                    invocations: Arc::new(AtomicUsize::new(0)),
+                })
+                .name("legacy_search")
+                .build(),
+            );
+        assert!(legacy_builder.is_error_masking_enabled());
+        assert!(legacy_builder.is_strict_input_validation_enabled());
+        let _ = legacy_builder.console_config();
+        let _ = legacy_builder.build();
+    }
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("current-thread runtime");
+    runtime.block_on(async {
+        let cx = fastmcp_rust::Cx::current().expect("runtime Cx");
+        let (client_transport, server_transport) = create_memory_transport_pair();
+        let mut server_task = cx
+            .spawn(move |server_cx| async move { server.serve_memory(&server_cx, server_transport).await })
+            .expect("spawn server");
+
+        // Initial discovery on `server/discover` (its own per-method bucket).
+        let mut client = MemoryClient::builder(ClientInfo {
+            name: "parity-client".to_owned(),
+            version: "1.0.0".to_owned(),
+        })
+        .connect(&cx, client_transport)
+        .await
+        .expect("connect modern client");
+        let cancellation = McpRequestCancellation::new();
+
+        // Request 1 of burst 2 on `tools/call` (POSITIVE): renamed tool + renamed arg + default injection.
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = client
+            .call_tool(&cx, &cancellation, "search", json!({"query": "rust"}))
+            .await
+            .expect("first transformed tool call must succeed")
+        else {
+            panic!("expected FinalCoreResult::ToolsCall");
+        };
+        assert_eq!(
+            serde_json::to_value(result.payload).expect("serialize result")["content"][0]["text"],
+            "rust:5"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+        // Request 2 of burst 2 on `tools/call` (POSITIVE): identical call served from ResponseCachingMiddleware.
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = client
+            .call_tool(&cx, &cancellation, "search", json!({"query": "rust"}))
+            .await
+            .expect("second identical call must succeed from cache")
+        else {
+            panic!("expected FinalCoreResult::ToolsCall");
+        };
+        assert_eq!(
+            serde_json::to_value(result.payload).expect("serialize cached result")["content"][0]
+                ["text"],
+            "rust:5"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "response_caching must serve the second identical call without re-invoking the tool"
+        );
+
+        // Request 3 on `tools/call` (PLANTED NEGATIVE RH-5): per-method burst capacity 2 exhausted.
+        let err = client
+            .call_tool(&cx, &cancellation, "search", json!({"query": "rust"}))
+            .await
+            .expect_err("third tools/call beyond burst 2 must be rejected by rate_limiting");
+        assert_eq!(
+            i32::from(err.code),
+            fastmcp_rust::rate_limiting::RATE_LIMIT_ERROR_CODE,
+            "expected RATE_LIMIT_ERROR_CODE (-32005), got {err:?}"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+        client.close(&cx).expect("close client");
+        server_task
+            .join(&cx)
+            .await
+            .expect("join server task")
+            .expect("server settles cleanly");
+    });
+}

@@ -643,6 +643,12 @@ pub async fn probe_secured_http_and_https_facade_closure(cx: &Cx) -> McpResult<(
     .with_handshake_timeout(std::time::Duration::from_secs(5))?;
 
     let bound: SecuredHttpServer = ServerBuilder::new("secured-probe", "0.13.0")
+        .rate_limiting(fastmcp_rust::modern::RateLimitingMiddleware::new(10.0))
+        .response_caching(fastmcp_rust::modern::ResponseCachingMiddleware::new())
+        .log_timestamps(false)
+        .log_targets(false)
+        .log_file_line(false)
+        .plain_mode()
         .build()
         .bind_secured_http(cx, "127.0.0.1:0", policy)
         .await?

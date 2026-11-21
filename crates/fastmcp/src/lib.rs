@@ -2308,6 +2308,38 @@ pub mod auto {
             }
         }
 
+        /// Sets logging behavior without changing the Auto protocol policy.
+        #[must_use]
+        pub fn logging(self, config: crate::LoggingConfig) -> Self {
+            Self {
+                inner: self.inner.logging(config),
+            }
+        }
+
+        /// Sets whether to include timestamps in server log output.
+        #[must_use]
+        pub fn log_timestamps(self, show: bool) -> Self {
+            Self {
+                inner: self.inner.log_timestamps(show),
+            }
+        }
+
+        /// Sets whether to include target/module paths in server log output.
+        #[must_use]
+        pub fn log_targets(self, show: bool) -> Self {
+            Self {
+                inner: self.inner.log_targets(show),
+            }
+        }
+
+        /// Sets whether to include source file and line numbers in server log output.
+        #[must_use]
+        pub fn log_file_line(self, show: bool) -> Self {
+            Self {
+                inner: self.inner.log_file_line(show),
+            }
+        }
+
         #[must_use]
         pub fn auth_provider<P: crate::AuthProvider + 'static>(self, provider: P) -> Self {
             Self {
@@ -2408,11 +2440,23 @@ pub mod auto {
             }
         }
 
+        /// Returns whether internal-error detail masking is currently enabled.
+        #[must_use]
+        pub fn is_error_masking_enabled(&self) -> bool {
+            self.inner.is_error_masking_enabled()
+        }
+
         #[must_use]
         pub fn strict_input_validation(self, enabled: bool) -> Self {
             Self {
                 inner: self.inner.strict_input_validation(enabled),
             }
+        }
+
+        /// Returns whether strict tool-input validation is currently enabled.
+        #[must_use]
+        pub fn is_strict_input_validation_enabled(&self) -> bool {
+            self.inner.is_strict_input_validation_enabled()
         }
 
         /// Configures both the modern MCP path and exact-2024 SSE/message paths.
@@ -2439,6 +2483,22 @@ pub mod auto {
         pub fn middleware<M: crate::Middleware + 'static>(self, middleware: M) -> Self {
             Self {
                 inner: self.inner.middleware(middleware),
+            }
+        }
+
+        /// Registers response caching middleware without changing the Auto protocol policy.
+        #[must_use]
+        pub fn response_caching(self, caching: crate::ResponseCachingMiddleware) -> Self {
+            Self {
+                inner: self.inner.response_caching(caching),
+            }
+        }
+
+        /// Registers token-bucket rate limiting middleware without changing the Auto protocol policy.
+        #[must_use]
+        pub fn rate_limiting(self, rate_limiting: crate::RateLimitingMiddleware) -> Self {
+            Self {
+                inner: self.inner.rate_limiting(rate_limiting),
             }
         }
 
@@ -2648,6 +2708,14 @@ pub mod auto {
             }
         }
 
+        /// Registers a dynamically transformed tool handler.
+        #[must_use]
+        pub fn transformed_tool(self, tool: crate::TransformedTool) -> Self {
+            Self {
+                inner: self.inner.transformed_tool(tool),
+            }
+        }
+
         #[must_use]
         pub fn resource<H: crate::ResourceHandler + 'static>(self, handler: H) -> Self {
             Self {
@@ -2827,6 +2895,28 @@ pub mod auto {
             Self {
                 inner: self.inner.with_traffic_logging(verbosity),
             }
+        }
+
+        /// Forces plain-text console output without colors or styling.
+        #[must_use]
+        pub fn plain_mode(self) -> Self {
+            Self {
+                inner: self.inner.plain_mode(),
+            }
+        }
+
+        /// Forces ANSI color output even when stderr is not a TTY.
+        #[must_use]
+        pub fn force_color(self) -> Self {
+            Self {
+                inner: self.inner.force_color(),
+            }
+        }
+
+        /// Returns a reference to the current console configuration.
+        #[must_use]
+        pub fn console_config(&self) -> &crate::ConsoleConfig {
+            self.inner.console_config()
         }
 
         #[must_use]
@@ -3379,6 +3469,11 @@ pub mod modern {
         MrtrInputRequired, MrtrInputResponse, MrtrInputResponses as ServerMrtrInputResponses,
         MrtrRequestState, MrtrRetry,
     };
+    pub use fastmcp_server::caching::ResponseCachingMiddleware;
+    pub use fastmcp_server::rate_limiting::{
+        RateLimitingMiddleware, SlidingWindowRateLimitingMiddleware,
+    };
+    pub use fastmcp_server::transform::{ArgTransform, TransformedTool, TransformedToolBuilder};
     pub use fastmcp_server::{
         AuthProvider, AuthRequest, BannerStyle, BoxFuture, CompletionHandler, ConsoleConfig,
         DuplicateBehavior, ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
@@ -8614,6 +8709,30 @@ pub mod modern {
             }
         }
 
+        /// Sets whether to include timestamps in server log output.
+        #[must_use]
+        pub fn log_timestamps(self, show: bool) -> Self {
+            Self {
+                inner: self.inner.log_timestamps(show),
+            }
+        }
+
+        /// Sets whether to include target/module paths in server log output.
+        #[must_use]
+        pub fn log_targets(self, show: bool) -> Self {
+            Self {
+                inner: self.inner.log_targets(show),
+            }
+        }
+
+        /// Sets whether to include source file and line numbers in server log output.
+        #[must_use]
+        pub fn log_file_line(self, show: bool) -> Self {
+            Self {
+                inner: self.inner.log_file_line(show),
+            }
+        }
+
         /// Installs an authentication provider without changing the modern-only policy.
         #[must_use]
         pub fn auth_provider<P: AuthProvider + 'static>(self, provider: P) -> Self {
@@ -8693,12 +8812,24 @@ pub mod modern {
             }
         }
 
+        /// Returns whether internal-error detail masking is currently enabled.
+        #[must_use]
+        pub fn is_error_masking_enabled(&self) -> bool {
+            self.inner.is_error_masking_enabled()
+        }
+
         /// Enables or disables strict tool-input validation.
         #[must_use]
         pub fn strict_input_validation(self, enabled: bool) -> Self {
             Self {
                 inner: self.inner.strict_input_validation(enabled),
             }
+        }
+
+        /// Returns whether strict tool-input validation is currently enabled.
+        #[must_use]
+        pub fn is_strict_input_validation_enabled(&self) -> bool {
+            self.inner.is_strict_input_validation_enabled()
         }
 
         /// Configures HTTP listener paths, connection capacity, diagnostic
@@ -8727,6 +8858,22 @@ pub mod modern {
         pub fn middleware<M: Middleware + 'static>(self, middleware: M) -> Self {
             Self {
                 inner: self.inner.middleware(middleware),
+            }
+        }
+
+        /// Registers response caching middleware without exposing a legacy dispatcher.
+        #[must_use]
+        pub fn response_caching(self, caching: ResponseCachingMiddleware) -> Self {
+            Self {
+                inner: self.inner.response_caching(caching),
+            }
+        }
+
+        /// Registers token-bucket rate limiting middleware without exposing a legacy dispatcher.
+        #[must_use]
+        pub fn rate_limiting(self, rate_limiting: RateLimitingMiddleware) -> Self {
+            Self {
+                inner: self.inner.rate_limiting(rate_limiting),
             }
         }
 
@@ -8985,6 +9132,14 @@ pub mod modern {
             }
         }
 
+        /// Registers one dynamically transformed tool handler.
+        #[must_use]
+        pub fn transformed_tool(self, tool: TransformedTool) -> Self {
+            Self {
+                inner: self.inner.transformed_tool(tool),
+            }
+        }
+
         /// Registers one resource handler.
         #[must_use]
         pub fn resource<H: ResourceHandler + 'static>(self, handler: H) -> Self {
@@ -9166,6 +9321,28 @@ pub mod modern {
             Self {
                 inner: self.inner.with_traffic_logging(verbosity),
             }
+        }
+
+        /// Forces plain-text console output without colors or styling.
+        #[must_use]
+        pub fn plain_mode(self) -> Self {
+            Self {
+                inner: self.inner.plain_mode(),
+            }
+        }
+
+        /// Forces ANSI color output even when stderr is not a TTY.
+        #[must_use]
+        pub fn force_color(self) -> Self {
+            Self {
+                inner: self.inner.force_color(),
+            }
+        }
+
+        /// Returns a reference to the current console configuration.
+        #[must_use]
+        pub fn console_config(&self) -> &ConsoleConfig {
+            self.inner.console_config()
         }
 
         /// Builds a server with no facade-exposed legacy dispatcher.
@@ -9849,6 +10026,38 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Sets logging behavior without changing the exact-2024 policy.
+        #[must_use]
+        pub fn logging(self, config: crate::LoggingConfig) -> Self {
+            Self {
+                inner: self.inner.logging(config),
+            }
+        }
+
+        /// Sets whether to include timestamps in server log output.
+        #[must_use]
+        pub fn log_timestamps(self, show: bool) -> Self {
+            Self {
+                inner: self.inner.log_timestamps(show),
+            }
+        }
+
+        /// Sets whether to include target/module paths in server log output.
+        #[must_use]
+        pub fn log_targets(self, show: bool) -> Self {
+            Self {
+                inner: self.inner.log_targets(show),
+            }
+        }
+
+        /// Sets whether to include source file and line numbers in server log output.
+        #[must_use]
+        pub fn log_file_line(self, show: bool) -> Self {
+            Self {
+                inner: self.inner.log_file_line(show),
+            }
+        }
+
         /// Installs an authentication provider.
         #[must_use]
         pub fn auth_provider<P: AuthProvider + 'static>(self, provider: P) -> Self {
@@ -9904,12 +10113,24 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Returns whether internal-error detail masking is currently enabled.
+        #[must_use]
+        pub fn is_error_masking_enabled(&self) -> bool {
+            self.inner.is_error_masking_enabled()
+        }
+
         /// Enables or disables strict tool-input validation.
         #[must_use]
         pub fn strict_input_validation(self, enabled: bool) -> Self {
             Self {
                 inner: self.inner.strict_input_validation(enabled),
             }
+        }
+
+        /// Returns whether strict tool-input validation is currently enabled.
+        #[must_use]
+        pub fn is_strict_input_validation_enabled(&self) -> bool {
+            self.inner.is_strict_input_validation_enabled()
         }
 
         /// Configures HTTP listener paths, connection capacity, diagnostic
@@ -9938,6 +10159,22 @@ pub mod legacy_2024 {
         pub fn middleware<M: Middleware + 'static>(self, middleware: M) -> Self {
             Self {
                 inner: self.inner.middleware(middleware),
+            }
+        }
+
+        /// Registers response caching middleware.
+        #[must_use]
+        pub fn response_caching(self, caching: crate::ResponseCachingMiddleware) -> Self {
+            Self {
+                inner: self.inner.response_caching(caching),
+            }
+        }
+
+        /// Registers token-bucket rate limiting middleware.
+        #[must_use]
+        pub fn rate_limiting(self, rate_limiting: crate::RateLimitingMiddleware) -> Self {
+            Self {
+                inner: self.inner.rate_limiting(rate_limiting),
             }
         }
 
@@ -10014,6 +10251,14 @@ pub mod legacy_2024 {
         pub fn tool<H: ToolHandler + 'static>(self, handler: H) -> Self {
             Self {
                 inner: self.inner.legacy_tool(handler),
+            }
+        }
+
+        /// Registers a dynamically transformed exact-2024-only tool handler.
+        #[must_use]
+        pub fn transformed_tool(self, tool: crate::TransformedTool) -> Self {
+            Self {
+                inner: self.inner.legacy_tool(tool),
             }
         }
 
@@ -10147,6 +10392,28 @@ pub mod legacy_2024 {
             Self {
                 inner: self.inner.with_traffic_logging(verbosity),
             }
+        }
+
+        /// Forces plain-text console output without colors or styling.
+        #[must_use]
+        pub fn plain_mode(self) -> Self {
+            Self {
+                inner: self.inner.plain_mode(),
+            }
+        }
+
+        /// Forces ANSI color output even when stderr is not a TTY.
+        #[must_use]
+        pub fn force_color(self) -> Self {
+            Self {
+                inner: self.inner.force_color(),
+            }
+        }
+
+        /// Returns a reference to the current console configuration.
+        #[must_use]
+        pub fn console_config(&self) -> &ConsoleConfig {
+            self.inner.console_config()
         }
 
         /// Runs once when the bound listener begins serving.
