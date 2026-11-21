@@ -1250,7 +1250,7 @@ fn main() -> ExitCode {
 
     let outcome = runtime.block_on(async {
         let cx = Cx::current().ok_or("conformance server: no ambient context")?;
-        let server = ServerBuilder::new("fastmcp-rust-conformance", "0.10.0")
+        let server = ServerBuilder::new("fastmcp-rust-conformance", env!("CARGO_PKG_VERSION"))
             .tool(TestSimpleText)
             .tool(TestImageContent)
             .tool(TestAudioContent)

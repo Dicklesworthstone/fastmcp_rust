@@ -4,7 +4,7 @@
 //! - CRUD operations (Create, Read, Update, Delete)
 //! - State management with thread-safe collections
 //! - Complex data structures
-//! - Dynamic resource URIs
+//! - Static catalog resources
 //! - Search and filtering
 //!
 //! Run with:

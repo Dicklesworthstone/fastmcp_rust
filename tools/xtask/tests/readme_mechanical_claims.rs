@@ -1263,6 +1263,13 @@ fn strip_cfg_test_blocks(text: &str) -> String {
     out.into_iter().collect()
 }
 
+/// Counts inline HTTPS enforcement sites in already-stripped production Rust source.
+fn count_https_enforcement_sites(production: &str) -> usize {
+    production.matches("scheme() != \"https\"").count()
+        + production.matches("starts_with(\"https://\")").count()
+        + production.matches("scheme().is(\"https\")").count()
+}
+
 /// Inline HTTPS refusals per repository-relative file under
 /// `crates/fastmcp-client/src`, production code only.
 fn https_enforcement_sites() -> BTreeMap<String, usize> {
@@ -1273,13 +1280,36 @@ fn https_enforcement_sites() -> BTreeMap<String, usize> {
             continue;
         }
         let production = strip_cfg_test_blocks(text);
-        let count = production.matches("scheme() != \"https\"").count()
-            + production.matches("starts_with(\"https://\")").count();
+        let count = count_https_enforcement_sites(&production);
         if count > 0 {
             per_file.insert(path.clone(), count);
         }
     }
     per_file
+}
+
+/// Checks that every inline reference to `these N (enforcement )?points` in the
+/// README's client-auth HTTPS census paragraph agrees with the authoritative
+/// `sites` count. Prevents internal prose drift (such as a paragraph stating
+/// `31` in one sentence and `these 23 points` two paragraphs later).
+fn https_inline_count_mismatches(readme: &str, expected_sites: usize) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    let expected = expected_sites.to_string();
+    for suffix in [" enforcement points refuse", " points protect credential transport"] {
+        let mut cursor = 0usize;
+        while let Some(pos) = readme[cursor..].find(suffix) {
+            let absolute = cursor + pos;
+            let prefix = &readme[..absolute];
+            if let Some(word) = prefix.split_whitespace().last()
+                && word.chars().all(|c| c.is_ascii_digit())
+                && word != expected
+            {
+                mismatches.push(format!("found `{word}{suffix}`, expected `{expected}{suffix}`"));
+            }
+            cursor = absolute + suffix.len();
+        }
+    }
+    mismatches
 }
 
 #[test]
@@ -1305,6 +1335,13 @@ fn readme_https_gate_census_matches_the_tree() {
          finds {sites} enforcement points across {files} files. This row \
          prices an open owner decision, so fix the row rather than this \
          check.\nper file: {per_file:#?}"
+    );
+
+    let inline_mismatches = https_inline_count_mismatches(&readme, sites);
+    assert!(
+        inline_mismatches.is_empty(),
+        "the README's client-auth HTTPS census contradicts itself:\n  {}",
+        inline_mismatches.join("\n  ")
     );
 }
 
@@ -1369,4 +1406,113 @@ fn planted_cfg_test_stripper_handles_a_compound_predicate() {
         source.len(),
         "the stripper preserves length so line numbers stay true"
     );
+}
+
+#[test]
+fn planted_https_scheme_is_and_inline_count_consistency_are_detected() {
+    // Positive + near-identical negative for `scheme().is("https")` counting.
+    let with_wire_scheme =
+        "fn check(w: &Uri) -> bool { !w.scheme().is(\"https\") || w.query().is_some() }";
+    let without_wire_scheme = "fn check(w: &Uri) -> bool { w.query().is_some() }";
+    assert_eq!(count_https_enforcement_sites(with_wire_scheme), 1);
+    assert_eq!(count_https_enforcement_sites(without_wire_scheme), 0);
+
+    // Positive + planted negative for internal README prose count consistency.
+    let consistent =
+        "URLs these 32 enforcement points refuse ... where these 32 points protect credential transport";
+    let drifted =
+        "URLs these 32 enforcement points refuse ... where these 23 points protect credential transport";
+    assert!(https_inline_count_mismatches(consistent, 32).is_empty());
+    assert_eq!(
+        https_inline_count_mismatches(drifted, 32),
+        vec!["found `23 points protect credential transport`, expected `32 points protect credential transport`"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Claim 8: subcrate README license, pinned asupersync version in README
+// limitations, and conformance example crate-version derivation stay true.
+// ---------------------------------------------------------------------------
+
+fn pinned_workspace_dependency_version(root_manifest: &str, dep: &str) -> String {
+    let parsed: toml::Value =
+        toml::from_str(root_manifest).expect("root Cargo.toml must parse as TOML");
+    let raw = parsed
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.get(dep))
+        .and_then(|v| match v {
+            toml::Value::String(s) => Some(s.as_str()),
+            other => other.get("version").and_then(toml::Value::as_str),
+        })
+        .unwrap_or_else(|| panic!("workspace.dependencies.{dep} must declare a version"));
+    raw.trim_start_matches('=').to_owned()
+}
+
+fn console_readme_contradicts_license(console_readme: &str) -> bool {
+    console_readme.contains("Dual-licensed under MIT or Apache-2.0")
+}
+
+fn uses_hardcoded_stale_conformance_version(source: &str) -> bool {
+    source.contains("\"0.10.0\"")
+}
+
+#[test]
+fn readme_asupersync_pin_console_license_and_conformance_versions_match_workspace() {
+    let root = repo_root();
+    let root_manifest = read(&root.join("Cargo.toml"));
+    let asupersync_version = pinned_workspace_dependency_version(&root_manifest, "asupersync");
+    assert!(
+        !asupersync_version.is_empty(),
+        "pinned asupersync version must be non-empty"
+    );
+
+    let readme = read(&root.join("README.md"));
+    let expected_phrase = format!("asupersync {asupersync_version} exposes that budget");
+    assert!(
+        readme.contains(expected_phrase.as_str()),
+        "README Limitations poll-quota row must cite pinned `asupersync {asupersync_version}`"
+    );
+
+    let console_readme = read(&root.join("crates/fastmcp-console/README.md"));
+    assert!(
+        !console_readme_contradicts_license(&console_readme),
+        "crates/fastmcp-console/README.md must not claim dual MIT/Apache-2.0 when Cargo.toml uses license-file = \"LICENSE\""
+    );
+    assert!(
+        console_readme.contains("LICENSE"),
+        "crates/fastmcp-console/README.md must point readers to the repository LICENSE file"
+    );
+
+    for example in [
+        "crates/fastmcp/examples/conformance_server.rs",
+        "crates/fastmcp/examples/conformance_client.rs",
+    ] {
+        let src = read(&root.join(example));
+        assert!(
+            !uses_hardcoded_stale_conformance_version(&src),
+            "{example} must not hardcode stale version \"0.10.0\""
+        );
+        assert!(
+            src.contains("env!(\"CARGO_PKG_VERSION\")"),
+            "{example} must derive its reported version from CARGO_PKG_VERSION"
+        );
+    }
+}
+
+#[test]
+fn planted_console_license_and_conformance_version_drifts_are_detected() {
+    assert!(console_readme_contradicts_license(
+        "Dual-licensed under MIT or Apache-2.0."
+    ));
+    assert!(!console_readme_contradicts_license(
+        "Licensed under the MIT License with OpenAI/Anthropic Rider (see LICENSE)."
+    ));
+
+    assert!(uses_hardcoded_stale_conformance_version(
+        r#"Server::new("fastmcp-conformance", "0.10.0")"#
+    ));
+    assert!(!uses_hardcoded_stale_conformance_version(
+        r#"Server::new("fastmcp-conformance", env!("CARGO_PKG_VERSION"))"#
+    ));
 }

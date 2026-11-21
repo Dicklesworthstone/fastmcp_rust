@@ -32,10 +32,11 @@
 //! nothing about the shipped path, which is why the split is recorded here
 //! rather than left to be inferred from a passing test.
 //!
-//! Measured against the pinned `asupersync =0.5.0` registry archive, whose
-//! `Cargo.lock` checksum is
-//! `f34b1a19ffd6b74570339a156912436335bb09c594c675c62ea164b19a1f2511`. Upstream
-//! paths are relative to that archive's `src/`.
+//! Originally measured against `asupersync =0.5.0` (historical `Cargo.lock`
+//! checksum `f34b1a19ffd6b74570339a156912436335bb09c594c675c62ea164b19a1f2511`);
+//! the workspace now pins `asupersync =0.6.2` (`Cargo.lock` checksum
+//! `e5b2e20bf4312b9fedbc06d6c7244e994119b987946f44f82a447e3bc3c9bb03`). Upstream
+//! paths below are relative to the asupersync crate's `src/`.
 //!
 //! - **Mask direction** (client MUST mask, server MUST NOT): asupersync, in
 //!   `net/websocket/frame.rs:602-606`, keyed on the codec's `Role`. Both

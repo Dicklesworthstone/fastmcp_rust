@@ -111,8 +111,6 @@ See `crates/fastmcp-console/examples`:
 
 ## License
 
-The workspace release-license representation is unresolved: Cargo metadata,
-the root `LICENSE`, and the root `LICENSE-MIT` do not currently describe one
-consistent set of terms. Do not infer authoritative release terms from this
-crate page; publication remains blocked pending the explicit license decision
-required by the implementation plan.
+MIT License (with OpenAI/Anthropic Rider). Every workspace crate inherits the
+root `LICENSE` file through Cargo's `license-file = "LICENSE"` workspace
+metadata; see the repository root `LICENSE` for the exact terms.

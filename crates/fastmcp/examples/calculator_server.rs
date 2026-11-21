@@ -3,7 +3,6 @@
 //! A mathematical calculator MCP server demonstrating various tool patterns:
 //! - Multiple parameter types (integers, floats, strings)
 //! - Error handling and validation
-//! - Progress reporting for long operations
 //! - Complex computations
 //!
 //! Run with:

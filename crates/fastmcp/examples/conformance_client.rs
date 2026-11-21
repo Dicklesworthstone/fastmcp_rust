@@ -359,7 +359,7 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
     .map_err(|error| format!("HTTP protocol plan: {error}"))?;
     let builder = ClientBuilder::new()
         .protocol_plan(plan)
-        .client_info("fastmcp-rust-conformance-client", "0.10.0")
+        .client_info("fastmcp-rust-conformance-client", env!("CARGO_PKG_VERSION"))
         .capabilities(capabilities)
         .reverse_request_handlers(handlers());
     if managed_refresh {

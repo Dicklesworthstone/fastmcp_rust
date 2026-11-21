@@ -2,7 +2,7 @@
 //!
 //! A mock weather service MCP server demonstrating:
 //! - Multiple related tools working together
-//! - Resource templates and dynamic URIs
+//! - Static catalog resources
 //! - Real-world data patterns (JSON responses)
 //! - Progress reporting for "slow" operations
 //! - Error handling for invalid inputs
