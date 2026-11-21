@@ -4302,9 +4302,10 @@ pub struct HttpServerConfig {
     /// not a reservation or a claim about authentication, Tasks, or upstreams.
     /// Both diagnostic routes are GET-only, contain no peer data, and never
     /// invoke MCP authentication or handlers. Their configured paths must be
-    /// distinct from all protocol and OAuth routes. Secured HTTP/HTTPS wrappers
-    /// retain their own route policies; this option does not install a
-    /// diagnostic route on those listeners.
+    /// distinct from all protocol and OAuth routes. Native secured HTTP/HTTPS
+    /// listeners install the same paths behind their Host/Origin checks and
+    /// reject overlap with protected-resource metadata. Embedding adapters
+    /// without a bound listener cannot claim connection readiness.
     pub readiness_path: String,
     /// Maximum number of concurrent connections (default: 64).
     pub max_connections: usize,

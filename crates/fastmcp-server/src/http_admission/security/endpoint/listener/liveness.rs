@@ -533,6 +533,7 @@ mod tests {
                     let mut child = cx
                         .spawn(move |child_cx| async move {
                             let subscription_drain = SubscriptionDrain::default();
+                            let mut admission = None;
                             let connection = connection::serve(
                                 &child_cx,
                                 ConnectionIo::Plain(stream),
@@ -542,6 +543,7 @@ mod tests {
                                 policy,
                                 io,
                                 &subscription_drain,
+                                &mut admission,
                             );
                             let mut driving = Box::pin(drive(&child_cx, connection));
                             let mut sender = Some(sender);
@@ -618,6 +620,7 @@ mod tests {
                 // explicit `Pin<Box<dyn Future>>`. This was the only site
                 // keeping it on the stack.
                 let subscription_drain = SubscriptionDrain::default();
+                let mut admission = None;
                 let connection = Box::pin(connection::serve(
                     &cx,
                     ConnectionIo::Plain(stream),
@@ -627,6 +630,7 @@ mod tests {
                     Arc::clone(&bound.policy),
                     bound.io,
                     &subscription_drain,
+                    &mut admission,
                 ));
                 let result = drive(&cx, connection).await;
                 assert_eq!(result, Err(SecuredHttpEndpointError::TimerUnavailable));
@@ -672,6 +676,7 @@ mod tests {
                         std::net::TcpStream::connect(bound.local_addr().unwrap()).unwrap();
                     let (stream, _) = bound.inner.listener.accept().await.unwrap();
                     let subscription_drain = SubscriptionDrain::default();
+                    let mut admission = None;
                     let connection = Box::pin(connection::serve(
                         &cx,
                         ConnectionIo::Plain(stream),
@@ -681,6 +686,7 @@ mod tests {
                         Arc::clone(&bound.policy),
                         io,
                         &subscription_drain,
+                        &mut admission,
                     ));
                     // The outer bound runs on the driver-owning runtime Cx, so
                     // an inner timeout that never wakes fails here, not hangs.

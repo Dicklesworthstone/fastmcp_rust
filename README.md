@@ -809,8 +809,8 @@ described above.
 
 ### Native HTTP readiness and draining (current source tree)
 
-`BoundHttpServer` exposes `GET /health` for listener liveness and `GET /ready`
-for connection readiness. Configure their paths with
+`BoundHttpServer` and `BoundSecuredHttpServer` expose `GET /health` for listener
+liveness and `GET /ready` for connection readiness. Configure their paths with
 `HttpServerConfig::health_path` and `HttpServerConfig::readiness_path`.
 Diagnostic paths must be distinct absolute paths and cannot overlap MCP,
 legacy SSE, or installed OAuth routes; invalid configurations fail before bind.
@@ -837,9 +837,16 @@ remains available so a load balancer can observe the draining listener.
 Draining is irreversible for that listener generation; the call does not wait
 for requests to finish. A busy admission cell returns a retryable `Busy` error.
 
-These diagnostics apply to the native bound HTTP listener. Secured HTTP/HTTPS
-wrappers retain their existing route policies. Readiness does not establish
-upstream availability, durable Tasks, or OAuth security qualification.
+Native secured HTTP/HTTPS diagnostics retain the configured Host and Origin
+checks and support the corresponding GET preflight. They reject bodies,
+queries, duplicate security headers, and collisions with protected-resource
+metadata. TLS handshakes consume admission capacity; the extra diagnostic
+slot also has a one-second handshake allowance and retains its permit through
+bounded TLS shutdown. Its admission cannot become MCP or OAuth work later.
+The same `operator_handle()` and `begin_drain()` workflow applies to both
+listeners. Embedding adapters without a bound listener cannot report live
+connection readiness. These observations do not establish upstream
+availability, durable Tasks, or OAuth security qualification.
 
 ### Modern subscription admission (current source tree)
 

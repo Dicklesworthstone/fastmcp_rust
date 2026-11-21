@@ -27,11 +27,12 @@ use super::{
 };
 use crate::{
     AuthDispatchCustody, DualEraHttpEndpointError, DualEraHttpSseResponse,
-    FinalSubscriptionTerminalDelivery, Framed, HttpListenerShutdown, InboundRequestContext,
-    InboundRequestTransport, JsonRpcRequest, LiveModernHttpSession, LiveModernHttpSessionRegistry,
-    ModernSseDispatchElection, ModernSseOutcomeGate, NativeHttp1Codec, OwnedModernHttpDispatch,
-    Server, ServerHttpEndpoint, ServerHttpEndpointError, TransportAuthorization,
-    admit_modern_http_post, await_modern_sse_dispatch_election, close_detached_modern_http_session,
+    FinalSubscriptionTerminalDelivery, Framed, HttpListenerShutdown, HttpNativeConnectionAdmission,
+    InboundRequestContext, InboundRequestTransport, JsonRpcRequest, LiveModernHttpSession,
+    LiveModernHttpSessionRegistry, ModernSseDispatchElection, ModernSseOutcomeGate,
+    NativeHttp1Codec, OwnedModernHttpDispatch, Server, ServerHttpEndpoint, ServerHttpEndpointError,
+    TransportAuthorization, admit_modern_http_post, await_modern_sse_dispatch_election,
+    close_detached_modern_http_session,
     dispatch_modern_http_request_with_cancellation_and_transport_authorization,
     final_subscription_terminal_event, final_subscription_terminal_response_event, finish_sse_body,
     guard_subscription_sse_write, h1_request_to_transport, h1_transport_authorization,
@@ -50,12 +51,20 @@ pub(super) async fn serve(
     policy: Arc<HttpSecurityPolicy>,
     io: SecuredHttpIoLimits,
     subscription_drain: &SubscriptionDrain,
+    admission: &mut Option<HttpNativeConnectionAdmission>,
 ) {
     let body_limit = endpoint.server.http_config.handler_config.max_body_size;
     let mut framed = Framed::new(
         stream,
         SecuredCodec::new(Arc::clone(&policy), body_limit)
-            .with_oauth_routes(endpoint.server.oauth_http_routes.as_ref()),
+            .with_oauth_routes(endpoint.server.oauth_http_routes.as_ref())
+            .with_diagnostics(
+                &endpoint.server.http_config.health_path,
+                &endpoint.server.http_config.readiness_path,
+                admission
+                    .as_ref()
+                    .is_some_and(HttpNativeConnectionAdmission::health_only),
+            ),
     );
     let mut writing_continue = false;
     let read = super::ingress::receive(
@@ -107,6 +116,32 @@ pub(super) async fn serve(
             return;
         }
         Ingress::Request { request, cors } => (request, cors),
+        Ingress::Diagnostic { readiness, cors } => {
+            let Some(current) = admission.take() else {
+                return;
+            };
+            let Some(control) = current.into_health(&endpoint.health_control_active) else {
+                // No second diagnostic writer can outlive its data slot. The
+                // outer owner sees no permit and closes without a TLS drain.
+                return;
+            };
+            *admission = Some(HttpNativeConnectionAdmission::Health(control));
+            let response = if readiness {
+                crate::http_readiness_response(endpoint.http_operator.as_ref())
+            } else {
+                HttpResponse::ok().with_json(&serde_json::json!({ "status": "ok" }))
+            };
+            buffered(
+                cx,
+                &shutdown,
+                &mut framed,
+                response.with_header("cache-control", "no-store"),
+                Some(&cors),
+                io.diagnostic(),
+            )
+            .await;
+            return;
+        }
         // The ingress driver consumes interim decisions without dispatching.
         Ingress::Continue => return,
     };
