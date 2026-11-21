@@ -470,6 +470,12 @@ pub mod server {
     pub use fastmcp_server::ProxyWebSocketClient;
     pub use fastmcp_server::ResourceSubscriptionMatcher;
     pub use fastmcp_server::bidirectional;
+    pub use fastmcp_server::http_admission;
+    pub use fastmcp_server::http_admission::HttpAdmissionLimits;
+    pub use fastmcp_server::http_admission::security::HttpSecurityPolicy;
+    pub use fastmcp_server::http_admission::security::endpoint::listener::{
+        BoundSecuredHttpServer, SecuredHttpIoLimits,
+    };
     #[cfg(feature = "legacy-2024-11-05")]
     pub use fastmcp_server::legacy_2024;
     pub use fastmcp_server::{
@@ -1119,6 +1125,12 @@ pub use fastmcp_server::rate_limiting::{
 // runtime identity types, which only became reachable without tripping
 // FND-01's `forbid=runtime` rule in the repair that removed the whole-module
 // forward. Until then this gap was blocked twice over.
+pub use fastmcp_server::http_admission;
+pub use fastmcp_server::http_admission::HttpAdmissionLimits;
+pub use fastmcp_server::http_admission::security::HttpSecurityPolicy;
+pub use fastmcp_server::http_admission::security::endpoint::listener::{
+    BoundSecuredHttpServer, SecuredHttpIoLimits,
+};
 pub use fastmcp_server::transform::{ArgTransform, TransformedTool, TransformedToolBuilder};
 pub use fastmcp_server::{
     ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
@@ -3482,6 +3494,11 @@ pub mod modern {
         ProxyTaskCleanupOutcome, ProxyTaskLimits, ProxyTaskOrphanAudit, ProxyTaskOrphanReason,
         ProxyTaskRetentionPolicy,
     };
+
+    pub use fastmcp_server::http_admission;
+    pub use fastmcp_server::http_admission::HttpAdmissionLimits;
+    pub use fastmcp_server::http_admission::security::HttpSecurityPolicy;
+    pub use fastmcp_server::http_admission::security::endpoint::listener::SecuredHttpIoLimits;
 
     /// A non-resettable marker for the modern facade's sole protocol policy.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8598,6 +8615,15 @@ pub mod modern {
             }
         }
 
+        /// Configures HTTP listener paths, connection capacity, diagnostic
+        /// routes (`health_path`, `readiness_path`), and I/O bounds.
+        #[must_use]
+        pub fn http_config(self, config: crate::HttpServerConfig) -> Self {
+            Self {
+                inner: self.inner.http_config(config),
+            }
+        }
+
         /// Installs the configured OAuth authorization, token, and revocation
         /// routes on the native HTTP listener.
         ///
@@ -9115,6 +9141,49 @@ pub mod modern {
         }
     }
 
+    /// A bound final-only secured HTTP or native HTTPS listener.
+    ///
+    /// Enforces configured `Host`, browser `Origin`/CORS preflight, header/body
+    /// bounds, optional native TLS, and bounded `/health` + `/ready` diagnostics
+    /// with graceful draining via [`Self::operator_handle`].
+    #[must_use = "serve the bound secured listener on its caller-owned context"]
+    pub struct SecuredHttpServer {
+        inner: fastmcp_server::http_admission::security::endpoint::listener::BoundSecuredHttpServer,
+    }
+
+    impl SecuredHttpServer {
+        /// Retains bounded observations, connection admission, and graceful
+        /// drain control (`begin_drain()`) for this secured listener.
+        #[must_use]
+        pub fn operator_handle(&self) -> crate::HttpOperatorHandle {
+            self.inner.operator_handle()
+        }
+
+        /// Returns the local socket address selected for this secured listener.
+        pub fn local_addr(&self) -> McpResult<std::net::SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        /// Whether this bound listener requires native TLS on every accepted socket.
+        #[must_use]
+        pub fn is_https(&self) -> bool {
+            self.inner.is_https()
+        }
+
+        /// Sets finite TLS-handshake, request-read, and response-write bounds
+        /// before serving begins.
+        #[must_use]
+        pub fn with_io_limits(mut self, limits: SecuredHttpIoLimits) -> Self {
+            self.inner = self.inner.with_io_limits(limits);
+            self
+        }
+
+        /// Serves secured HTTP/HTTPS requests until caller cancellation or listener error.
+        pub async fn serve(self, cx: &Cx) -> McpResult<HttpServerShutdown> {
+            self.inner.serve(cx).await
+        }
+    }
+
     impl Server {
         /// Returns the sole policy admitted by this facade server.
         #[must_use]
@@ -9200,6 +9269,63 @@ pub mod modern {
             addr: impl Into<String>,
         ) -> McpResult<HttpServerShutdown> {
             self.inner.serve_http(cx, addr).await
+        }
+
+        /// Binds this final-only server to an origin-guarded secured HTTP listener.
+        ///
+        /// Enforces the configured public authority (`Host`), explicit browser
+        /// `Origin`/CORS policy, body/header admission bounds, and bounded
+        /// `/health` + `/ready` diagnostics with graceful drain control.
+        pub async fn bind_secured_http(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+            policy: HttpSecurityPolicy,
+        ) -> McpResult<SecuredHttpServer> {
+            self.inner
+                .bind_secured_http(cx, addr, policy)
+                .await
+                .map(|inner| SecuredHttpServer { inner })
+        }
+
+        /// Binds and serves this final-only server over origin-guarded secured HTTP.
+        pub async fn serve_secured_http(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+            policy: HttpSecurityPolicy,
+        ) -> McpResult<HttpServerShutdown> {
+            self.inner.serve_secured_http(cx, addr, policy).await
+        }
+
+        /// Binds this final-only server behind native TLS (`asupersync::tls::TlsAcceptor`).
+        ///
+        /// Rejects non-HTTP/1.1 ALPN or TLS early data before binding any socket
+        /// and retains one bounded diagnostic lane during saturation or drain.
+        pub async fn bind_secured_https(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+            policy: HttpSecurityPolicy,
+            acceptor: asupersync::tls::TlsAcceptor,
+        ) -> McpResult<SecuredHttpServer> {
+            self.inner
+                .bind_secured_https(cx, addr, policy, acceptor)
+                .await
+                .map(|inner| SecuredHttpServer { inner })
+        }
+
+        /// Binds and serves this final-only server behind native TLS.
+        pub async fn serve_secured_https(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+            policy: HttpSecurityPolicy,
+            acceptor: asupersync::tls::TlsAcceptor,
+        ) -> McpResult<HttpServerShutdown> {
+            self.inner
+                .serve_secured_https(cx, addr, policy, acceptor)
+                .await
         }
 
         /// Binds this final-only server to a WebSocket listener.
@@ -9698,6 +9824,15 @@ pub mod legacy_2024 {
         pub fn strict_input_validation(self, enabled: bool) -> Self {
             Self {
                 inner: self.inner.strict_input_validation(enabled),
+            }
+        }
+
+        /// Configures HTTP listener paths, connection capacity, diagnostic
+        /// routes (`health_path`, `readiness_path`), and I/O bounds.
+        #[must_use]
+        pub fn http_config(self, config: crate::HttpServerConfig) -> Self {
+            Self {
+                inner: self.inner.http_config(config),
             }
         }
 

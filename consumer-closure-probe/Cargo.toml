@@ -46,6 +46,7 @@ apps = ["fastmcp-rust/apps"]
 proxy = ["fastmcp-rust/proxy"]
 websocket = ["fastmcp-rust/websocket-experimental"]
 auth-server = ["fastmcp-rust/builtin-auth-server"]
+enterprise-auth = ["fastmcp-rust/enterprise-auth"]
 
 # OFF by default, and every positive profile build must stay green. Checking
 # with this feature on MUST FAIL: that failure is the only evidence this crate

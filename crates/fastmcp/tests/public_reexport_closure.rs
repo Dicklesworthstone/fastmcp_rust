@@ -787,3 +787,186 @@ fn facade_names_and_builds_the_proxy_legacy_notifications_a_backend_returns() {
     assert_eq!(notifications.log_messages.len(), 1);
     assert!(notifications.progress.is_empty());
 }
+
+/// Live consumer-position proof that `fastmcp_rust::modern::Server` exposes
+/// origin-guarded secured HTTP (and native HTTPS signatures) with live `/ready`
+/// and graceful `operator_handle().begin_drain()` through the facade alone.
+#[test]
+fn facade_modern_server_binds_secured_http_with_readiness_and_drain_positive_and_planted_negative()
+{
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    use fastmcp_rust::http_admission::HttpEndpointConfig as AdmissionEndpointConfig;
+    use fastmcp_rust::modern::{
+        HttpAdmissionLimits, HttpSecurityPolicy, SecuredHttpIoLimits, ServerBuilder,
+    };
+    use fastmcp_rust::{HttpServerConfig, HttpServerShutdown, OperatorLifecycle};
+
+    fn exchange_http(addr: std::net::SocketAddr, request: &str) -> String {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+            .expect("connect to secured HTTP listener");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("set write timeout");
+        stream
+            .write_all(request.as_bytes())
+            .expect("write HTTP request");
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        String::from_utf8(buf).expect("UTF-8 HTTP response")
+    }
+
+    let limits = HttpAdmissionLimits::new(32, 16 * 1024, 64 * 1024).expect("admission limits");
+    let endpoint = AdmissionEndpointConfig::new("/mcp", limits).expect("endpoint config");
+    let policy = HttpSecurityPolicy::new(endpoint, "http://mcp.example.test", vec![])
+        .expect("security policy");
+    let io_limits = SecuredHttpIoLimits::new(Duration::from_secs(5), Duration::from_secs(5))
+        .expect("io limits")
+        .with_handshake_timeout(Duration::from_secs(5))
+        .expect("handshake timeout");
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("current-thread runtime");
+
+    runtime.block_on(async {
+        let cx = fastmcp_rust::Cx::current().expect("current runtime Cx");
+
+        // PLANTED NEGATIVE 1 (RH-5): mismatched policy MCP path fails before binding.
+        let wrong_endpoint =
+            AdmissionEndpointConfig::new("/other", limits).expect("mismatched endpoint");
+        let wrong_policy =
+            HttpSecurityPolicy::new(wrong_endpoint, "http://mcp.example.test", vec![])
+                .expect("mismatched policy");
+        assert!(
+            ServerBuilder::new("secured-facade-mismatch", "1.0.0")
+                .build()
+                .bind_secured_http(&cx, "127.0.0.1:0", wrong_policy)
+                .await
+                .is_err(),
+            "mismatched MCP path must fail before binding a socket"
+        );
+
+        let bound = ServerBuilder::new("secured-facade-live", "1.0.0")
+            .http_config(HttpServerConfig::new().max_connections(2))
+            .build()
+            .bind_secured_http(&cx, "127.0.0.1:0", policy)
+            .await
+            .expect("bind secured HTTP through facade")
+            .with_io_limits(io_limits);
+        assert!(!bound.is_https());
+        let addr = bound.local_addr().expect("bound local addr");
+        let operator = bound.operator_handle();
+        let cancel_cx = cx.clone();
+
+        let probe = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !operator
+                .operator_snapshot()
+                .is_ok_and(|snap| snap.lifecycle() == OperatorLifecycle::Running)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "secured listener did not reach Running"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            // POSITIVE: matching configured Host gets 200 ready JSON with no-store.
+            let ready = exchange_http(
+                addr,
+                "GET /ready HTTP/1.1\r\nHost: mcp.example.test\r\nConnection: close\r\n\r\n",
+            );
+            assert!(
+                ready.starts_with("HTTP/1.1 200 "),
+                "expected 200 ready, got: {ready}"
+            );
+            assert!(
+                ready.to_ascii_lowercase().contains("cache-control: no-store"),
+                "readiness must be uncacheable: {ready}"
+            );
+            assert!(
+                ready.contains("\"status\":\"ready\""),
+                "expected ready status: {ready}"
+            );
+
+            // PLANTED NEGATIVE 2 (RH-5): same request differing only in Host is rejected 403.
+            let wrong_host = exchange_http(
+                addr,
+                "GET /ready HTTP/1.1\r\nHost: evil.example.test\r\nConnection: close\r\n\r\n",
+            );
+            assert!(
+                wrong_host.starts_with("HTTP/1.1 403 "),
+                "mismatched Host must be rejected 403, got: {wrong_host}"
+            );
+
+            // PLANTED NEGATIVE 3 (RH-5): untrusted browser Origin is rejected 403.
+            let wrong_origin = exchange_http(
+                addr,
+                "GET /ready HTTP/1.1\r\nHost: mcp.example.test\r\nOrigin: https://evil.example.test\r\nConnection: close\r\n\r\n",
+            );
+            assert!(
+                wrong_origin.starts_with("HTTP/1.1 403 "),
+                "untrusted Origin must be rejected 403, got: {wrong_origin}"
+            );
+
+            // POSITIVE: begin_drain() flips /ready to 503 stopping while /health stays 200.
+            operator.begin_drain().expect("begin graceful drain");
+            let draining = exchange_http(
+                addr,
+                "GET /ready HTTP/1.1\r\nHost: mcp.example.test\r\nConnection: close\r\n\r\n",
+            );
+            assert!(
+                draining.starts_with("HTTP/1.1 503 "),
+                "draining listener must return 503 on /ready, got: {draining}"
+            );
+            assert!(
+                draining.contains("\"lifecycle\":\"stopping\""),
+                "expected stopping lifecycle: {draining}"
+            );
+            let health = exchange_http(
+                addr,
+                "GET /health HTTP/1.1\r\nHost: mcp.example.test\r\nConnection: close\r\n\r\n",
+            );
+            assert!(
+                health.starts_with("HTTP/1.1 200 "),
+                "/health liveness must remain 200 during drain, got: {health}"
+            );
+
+            cancel_cx.set_cancel_requested(true);
+        });
+
+        let shutdown = bound.serve(&cx).await.expect("serve secured HTTP");
+        probe.join().expect("probe thread succeeded");
+        assert!(matches!(shutdown, HttpServerShutdown::Quiescent));
+    });
+}
+
+#[cfg(feature = "enterprise-auth")]
+#[test]
+fn facade_exposes_enterprise_exchange_driver_types() {
+    use fastmcp_rust::http_auth::enterprise::response::{
+        EnterpriseBoundAccessToken, EnterpriseClientSecret, EnterpriseExchangeDriver,
+        EnterpriseExchangeError, EnterpriseExchangeObservation,
+    };
+
+    let secret = EnterpriseClientSecret::try_new("facade-enterprise-secret")
+        .expect("non-empty ASCII enterprise secret must succeed");
+    assert!(!format!("{secret:?}").contains("facade-enterprise-secret"));
+    // PLANTED NEGATIVE (RH-5): empty and newline-bearing secrets are rejected.
+    assert_eq!(
+        EnterpriseClientSecret::try_new("").unwrap_err(),
+        EnterpriseExchangeError::InvalidConfiguration
+    );
+    assert_eq!(
+        EnterpriseClientSecret::try_new("bad\nsecret").unwrap_err(),
+        EnterpriseExchangeError::InvalidConfiguration
+    );
+    let _driver_type: Option<EnterpriseExchangeDriver> = None;
+    let _token_type: Option<EnterpriseBoundAccessToken> = None;
+    let _obs_type: Option<EnterpriseExchangeObservation> = None;
+}

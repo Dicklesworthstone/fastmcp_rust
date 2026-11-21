@@ -556,7 +556,9 @@ pub async fn websocket_server_and_client_closure_through_the_facade(
     let _: Option<AsyncWsServerTransport<()>> = None;
     let _: Option<WebSocketClient<()>> = None;
 
-    build_modern_server().bind_websocket(cx, "127.0.0.1:0").await
+    build_modern_server()
+        .bind_websocket(cx, "127.0.0.1:0")
+        .await
 }
 
 /// POSITIVE (`auth-server`) — real `impl OidcJwksReadBackVerifier` using
@@ -616,6 +618,57 @@ pub fn auth_server_oidc_readback_verifier_and_jose_closure() {
     let _: Option<JwsSigningError> = None;
     let _: Option<OidcSigningActivationStatus> = None;
     let _: Option<OidcSigningActivationStoreRecord> = None;
+}
+
+/// Unconditional external consumer closure for origin-guarded secured HTTP and
+/// native HTTPS server surfaces (`modern::SecuredHttpServer`, `HttpSecurityPolicy`,
+/// `SecuredHttpIoLimits`, and `HttpOperatorHandle::begin_drain`).
+pub async fn probe_secured_http_and_https_facade_closure(cx: &Cx) -> McpResult<()> {
+    use fastmcp_rust::http_admission::HttpEndpointConfig as AdmissionEndpointConfig;
+    use fastmcp_rust::modern::{
+        HttpAdmissionLimits, HttpSecurityPolicy, SecuredHttpIoLimits, SecuredHttpServer,
+        ServerBuilder,
+    };
+
+    let limits =
+        HttpAdmissionLimits::new(32, 16 * 1024, 64 * 1024).expect("bounded admission limits");
+    let endpoint = AdmissionEndpointConfig::new("/mcp", limits).expect("admission endpoint");
+    let policy = HttpSecurityPolicy::new(endpoint, "http://mcp.example.test", vec![])
+        .expect("security policy");
+    let io_limits = SecuredHttpIoLimits::new(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(5),
+    )?
+    .with_handshake_timeout(std::time::Duration::from_secs(5))?;
+
+    let bound: SecuredHttpServer = ServerBuilder::new("secured-probe", "0.13.0")
+        .build()
+        .bind_secured_http(cx, "127.0.0.1:0", policy)
+        .await?
+        .with_io_limits(io_limits);
+    let _is_https: bool = bound.is_https();
+    let _addr = bound.local_addr()?;
+    let operator = bound.operator_handle();
+    let _ = operator.begin_drain();
+    let _shutdown = bound.serve(cx).await?;
+    Ok(())
+}
+
+/// External consumer closure for the opt-in `enterprise-auth` profile:
+/// verifies `EnterpriseExchangeDriver` and its companion secret/token/observation
+/// types are nameable through `fastmcp_rust` alone.
+#[cfg(feature = "enterprise-auth")]
+pub fn probe_enterprise_auth_facade_closure() {
+    use fastmcp_rust::http_auth::enterprise::response::{
+        EnterpriseBoundAccessToken, EnterpriseClientSecret, EnterpriseExchangeDriver,
+        EnterpriseExchangeError, EnterpriseExchangeObservation,
+    };
+
+    let _secret_ctor: fn(String) -> Result<EnterpriseClientSecret, EnterpriseExchangeError> =
+        EnterpriseClientSecret::try_new;
+    let _: Option<EnterpriseExchangeDriver> = None;
+    let _: Option<EnterpriseBoundAccessToken> = None;
+    let _: Option<EnterpriseExchangeObservation> = None;
 }
 
 /// NEGATIVE 1 — the EXTERN PRELUDE half. Differs from the positive above in
