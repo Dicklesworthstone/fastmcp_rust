@@ -3770,11 +3770,7 @@ pub mod modern {
         ) -> McpResult<extensions::authoring::ExtensionWebSocketUpstream<IO>>
         where
             ClientSettings: serde::Serialize + Sync + ?Sized,
-            IO: asupersync::io::AsyncRead
-                + asupersync::io::AsyncWrite
-                + Unpin
-                + Send
-                + 'static,
+            IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send + 'static,
         {
             Box::pin(registration.connect_websocket_upstream(
                 cx,

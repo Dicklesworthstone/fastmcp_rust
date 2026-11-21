@@ -19702,7 +19702,8 @@ IFS= read -r end
                     );
                     assert_eq!(allowlisted_test_timeout_source(&peer), Some(expected));
                     let error = http_test_error(fastmcp_client::HttpClientError::CoreResult(peer));
-                    let result = failed_test_result("list_tools", std::time::Duration::ZERO, &error);
+                    let result =
+                        failed_test_result("list_tools", std::time::Duration::ZERO, &error);
                     assert_eq!(result.timeout_source, None);
                     assert!(
                         !serde_json::to_string(&result)

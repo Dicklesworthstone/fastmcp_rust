@@ -14,6 +14,169 @@ mod request_notifications;
 mod websocket_proxy {
     use super::*;
 
+    struct HeldScaleHandler {
+        started: Arc<AtomicUsize>,
+        release: Arc<asupersync::sync::Notify>,
+    }
+
+    impl
+        fastmcp_rust::extensions::authoring::ExtensionHandler<ScaleRequest, ScaleResponse, Settings>
+        for HeldScaleHandler
+    {
+        fn handle<'a>(
+            &'a self,
+            context: ExtensionContext<'a, Settings>,
+            request: ScaleRequest,
+        ) -> fastmcp_rust::BoxFuture<'a, McpResult<ScaleResponse>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                context.checkpoint()?;
+                Ok(ScaleResponse {
+                    value: request.value * context.settings().multiplier,
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn typed_websocket_proxy_cancelled_close_bounds_contention_and_retries_after_release() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(asupersync::sync::Notify::new());
+        let upstream_registration = builder()
+            .typed_request(
+                METHOD,
+                "scale-params-v1",
+                "scale-result-v1",
+                HeldScaleHandler {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        with_upstream(upstream_registration, move |cx, address| async move {
+            let declaration_calls = Arc::new(AtomicUsize::new(0));
+            let transport =
+                fastmcp_rust::AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp"))
+                    .await
+                    .unwrap();
+            let upstream = modern::ClientBuilder::new()
+                .connect_extension_websocket_upstream_with_cx(
+                    &cx,
+                    transport,
+                    registration(Arc::clone(&declaration_calls)),
+                    &ClientSettings { version: 1 },
+                )
+                .await
+                .unwrap();
+            let gateway_registration = builder()
+                .typed_websocket_proxy_request::<ScaleRequest, ScaleResponse, _>(
+                    METHOD,
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    upstream.clone(),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let server = modern::ServerBuilder::new("typed-websocket-close-gateway", "1")
+                .extension(gateway_registration)
+                .unwrap()
+                .try_build()
+                .unwrap();
+            let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+            let mut serving =
+                cx.spawn(move |server_cx| async move {
+                    server.serve_memory(&server_cx, transport).await
+                })
+                .unwrap();
+            peer.send_async(&cx, &request(906, Some(json!({"version": 1})), json!(7)))
+                .await
+                .unwrap();
+            while started.load(Ordering::SeqCst) == 0 {
+                asupersync::runtime::yield_now().await;
+            }
+            let closing = cx
+                .open_child_region(asupersync::cx::child_region::ChildRegionSpec::inherit())
+                .await
+                .unwrap();
+            closing.cx().cancel_with(
+                asupersync::types::CancelKind::Shutdown,
+                Some("close while a forwarded request holds the connection"),
+            );
+            let error = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(2),
+                upstream.close(closing.cx()),
+            )
+            .await
+            .expect("busy cleanup acquisition must retain its finite bound")
+            .unwrap_err();
+            assert_eq!(
+                error.message,
+                "WebSocket extension upstream close acquisition timed out"
+            );
+            assert!(closing.cx().is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+
+            let mut retry = Box::pin(upstream.close(closing.cx()));
+            assert!(
+                std::future::poll_fn(|task| Poll::Ready(retry.as_mut().poll(task)))
+                    .await
+                    .is_pending(),
+                "the cancelled caller must retain a cleanup waiter while busy"
+            );
+            release.notify_one();
+            let (reply, closed) = {
+                let mut incoming = Box::pin(response(&cx, &mut peer, 906));
+                let mut reply = None;
+                let mut closed = None;
+                std::future::poll_fn(|task| {
+                    if reply.is_none()
+                        && let Poll::Ready(value) = incoming.as_mut().poll(task)
+                    {
+                        reply = Some(value);
+                    }
+                    if closed.is_none()
+                        && let Poll::Ready(value) = retry.as_mut().poll(task)
+                    {
+                        closed = Some(value);
+                    }
+                    if reply.is_some() && closed.is_some() {
+                        Poll::Ready((reply.take().unwrap(), closed.take().unwrap()))
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await
+            };
+            drop(retry);
+            assert!(
+                reply.error.is_none(),
+                "cleanup must not cancel the active request: {reply:?}"
+            );
+            assert_eq!(reply.result.as_ref().unwrap()["value"], 21);
+            closed.unwrap();
+            assert!(closing.cx().is_cancel_requested());
+            closing.close().await.unwrap();
+            upstream.close(&cx).await.unwrap();
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            assert_eq!(declaration_calls.load(Ordering::SeqCst), 0);
+            let (mut input, output) = peer.into_split();
+            drop(output);
+            assert!(matches!(
+                input.recv_async(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            serving.join(&cx).await.unwrap().unwrap();
+        });
+    }
+
     fn with_upstream<F, Fut>(registration: ExtensionRegistration, exercise: F)
     where
         F: FnOnce(Cx, std::net::SocketAddr) -> Fut,
