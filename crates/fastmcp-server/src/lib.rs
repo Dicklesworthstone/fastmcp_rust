@@ -4282,8 +4282,12 @@ pub enum DuplicateBehavior {
 /// ```
 #[derive(Debug, Clone)]
 pub struct HttpServerConfig {
-    /// Path for the health-check endpoint (default: `"/health"`).
+    /// Path for the liveness health-check endpoint (default: `"/health"`).
     pub health_path: String,
+    /// Path for the `OperatorSnapshot`-backed readiness endpoint (default: `"/ready"`).
+    ///
+    /// Setting this to the same path as `health_path` serves live readiness on that route.
+    pub readiness_path: String,
     /// Maximum number of concurrent connections (default: 64).
     pub max_connections: usize,
     /// Time allowed to receive one complete request on an accepted
@@ -4392,6 +4396,7 @@ impl Default for HttpServerConfig {
     fn default() -> Self {
         Self {
             health_path: "/health".to_string(),
+            readiness_path: "/ready".to_string(),
             max_connections: 64,
             request_read_timeout: DEFAULT_HTTP_REQUEST_READ_TIMEOUT,
             response_write_timeout: DEFAULT_HTTP_RESPONSE_WRITE_TIMEOUT,
@@ -4422,10 +4427,17 @@ impl HttpServerConfig {
         self
     }
 
-    /// Sets the health-check endpoint path.
+    /// Sets the liveness health-check endpoint path.
     #[must_use]
     pub fn health_path(mut self, path: impl Into<String>) -> Self {
         self.health_path = path.into();
+        self
+    }
+
+    /// Sets the `OperatorSnapshot`-backed readiness endpoint path.
+    #[must_use]
+    pub fn readiness_path(mut self, path: impl Into<String>) -> Self {
+        self.readiness_path = path.into();
         self
     }
 
@@ -4574,6 +4586,7 @@ pub struct ServerHttpEndpoint {
     server: Arc<Server>,
     #[cfg(feature = "legacy-2024-11-05")]
     legacy_origin: String,
+    operator_handle: Option<HttpOperatorHandle>,
 }
 
 fn validate_server_http_route_configuration(
@@ -4585,6 +4598,7 @@ fn validate_server_http_route_configuration(
     let occupied = vec![
         server.http_config.handler_config.base_path.as_str(),
         server.http_config.health_path.as_str(),
+        server.http_config.readiness_path.as_str(),
     ];
     #[cfg(feature = "legacy-2024-11-05")]
     let occupied = {
@@ -4608,6 +4622,7 @@ fn validate_server_http_route_configuration(
 pub struct ServerHttpSession {
     server: Arc<Server>,
     endpoint_session: Arc<Mutex<DualEraHttpSession>>,
+    operator_handle: Option<HttpOperatorHandle>,
     #[cfg(feature = "legacy-2024-11-05")]
     legacy_session_id: String,
     #[cfg(feature = "legacy-2024-11-05")]
@@ -8773,6 +8788,125 @@ impl OperatorSnapshotSource for HttpOperatorHandle {
     }
 }
 
+const fn operator_lifecycle_token(lifecycle: OperatorLifecycle) -> &'static str {
+    match lifecycle {
+        OperatorLifecycle::Starting => "starting",
+        OperatorLifecycle::Running => "running",
+        OperatorLifecycle::Stopping => "stopping",
+        OperatorLifecycle::Stopped => "stopped",
+    }
+}
+
+const fn operator_readiness_token(readiness: fastmcp_core::OperatorReadiness) -> &'static str {
+    match readiness {
+        fastmcp_core::OperatorReadiness::Starting => "starting",
+        fastmcp_core::OperatorReadiness::Ready => "ready",
+        fastmcp_core::OperatorReadiness::NotReady => "not_ready",
+        fastmcp_core::OperatorReadiness::Stopping => "stopping",
+    }
+}
+
+const fn operator_reason_token(reason: fastmcp_core::OperatorReason) -> &'static str {
+    match reason {
+        fastmcp_core::OperatorReason::StartupPending => "startup_pending",
+        fastmcp_core::OperatorReason::ConnectionCapacityDisabled => "connection_capacity_disabled",
+        fastmcp_core::OperatorReason::ConnectionCapacitySaturated => {
+            "connection_capacity_saturated"
+        }
+        fastmcp_core::OperatorReason::ListenerStopping => "listener_stopping",
+        fastmcp_core::OperatorReason::ListenerStopped => "listener_stopped",
+        fastmcp_core::OperatorReason::RequestCapacityDisabled => "request_capacity_disabled",
+        fastmcp_core::OperatorReason::RequestCapacitySaturated => "request_capacity_saturated",
+        fastmcp_core::OperatorReason::CorrelationCapacityDisabled => {
+            "correlation_capacity_disabled"
+        }
+        fastmcp_core::OperatorReason::CorrelationCapacitySaturated => {
+            "correlation_capacity_saturated"
+        }
+        fastmcp_core::OperatorReason::ExecutorGenerationExhausted => {
+            "executor_generation_exhausted"
+        }
+        fastmcp_core::OperatorReason::ExecutorFailed => "executor_failed",
+        fastmcp_core::OperatorReason::ExecutorStopped => "executor_stopped",
+        fastmcp_core::OperatorReason::OutputCapacityDisabled => "output_capacity_disabled",
+        fastmcp_core::OperatorReason::OutputFrameCapacitySaturated => {
+            "output_frame_capacity_saturated"
+        }
+        fastmcp_core::OperatorReason::OutputByteCapacitySaturated => {
+            "output_byte_capacity_saturated"
+        }
+        fastmcp_core::OperatorReason::OutputStopping => "output_stopping",
+        fastmcp_core::OperatorReason::OutputStopped => "output_stopped",
+        fastmcp_core::OperatorReason::OutputFailed => "output_failed",
+    }
+}
+
+const fn operator_snapshot_error_token(error: OperatorSnapshotError) -> &'static str {
+    match error {
+        OperatorSnapshotError::Busy => "busy",
+        OperatorSnapshotError::GenerationExhausted => "generation_exhausted",
+        OperatorSnapshotError::Poisoned => "poisoned",
+    }
+}
+
+/// Builds a bounded, privacy-safe HTTP readiness response directly from
+/// [`HttpOperatorHandle::operator_snapshot`] without blocking or echoing any
+/// request headers, credentials, peer addresses, or dynamic labels (`OPS-01`).
+fn http_readiness_response(operator_handle: Option<&HttpOperatorHandle>) -> HttpResponse {
+    let Some(handle) = operator_handle else {
+        return HttpResponse::ok().with_json(&serde_json::json!({
+            "status": "ready",
+            "schemaVersion": OperatorSnapshot::<fastmcp_core::OperatorHttpConnections>::SCHEMA_VERSION,
+            "lifecycle": "running",
+            "readiness": "ready",
+            "saturated": false,
+            "reasons": [],
+        }));
+    };
+
+    match handle.operator_snapshot() {
+        Ok(snapshot) => {
+            let connections = snapshot.connections();
+            let saturated = connections.is_saturated();
+            let ready =
+                snapshot.readiness() == fastmcp_core::OperatorReadiness::Ready && !saturated;
+            let status = if ready {
+                HttpStatus::OK
+            } else {
+                HttpStatus::SERVICE_UNAVAILABLE
+            };
+            let reasons: Vec<&'static str> = snapshot
+                .reasons()
+                .iter()
+                .flatten()
+                .map(|reason| operator_reason_token(*reason))
+                .collect();
+            HttpResponse::new(status).with_json(&serde_json::json!({
+                "status": if ready { "ready" } else { "not_ready" },
+                "schemaVersion": snapshot.schema_version(),
+                "lifecycle": operator_lifecycle_token(snapshot.lifecycle()),
+                "readiness": operator_readiness_token(snapshot.readiness()),
+                "saturated": saturated,
+                "reasons": reasons,
+                "connections": {
+                    "active": connections.active,
+                    "reserved": connections.reserved,
+                    "limit": connections.limit,
+                },
+            }))
+        }
+        Err(error) => HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE).with_json(
+            &serde_json::json!({
+                "status": "not_ready",
+                "schemaVersion": OperatorSnapshot::<fastmcp_core::OperatorHttpConnections>::SCHEMA_VERSION,
+                "readiness": "not_ready",
+                "saturated": false,
+                "reasons": [operator_snapshot_error_token(error)],
+            }),
+        ),
+    }
+}
+
 /// Optional one-shot connection admission, distinct from an observational snapshot.
 ///
 /// A successful acquisition charges one slot in the live native listener. It
@@ -10676,6 +10810,7 @@ impl Server {
         validate_server_http_route_configuration(&self)?;
         let endpoint = ServerHttpEndpoint {
             server: Arc::new(self),
+            operator_handle: None,
         };
         let _ = endpoint
             .transport_endpoint()
@@ -10696,6 +10831,7 @@ impl Server {
         let endpoint = ServerHttpEndpoint {
             server: Arc::new(self),
             legacy_origin: legacy_origin.into(),
+            operator_handle: None,
         };
         let _ = endpoint
             .transport_endpoint(&endpoint.legacy_origin)
@@ -10722,6 +10858,9 @@ impl Server {
             max_connections,
             self.protocol_policy,
         )?);
+        let operator_handle = HttpOperatorHandle {
+            limiter: Arc::clone(&connection_limiter),
+        };
         #[cfg(feature = "legacy-2024-11-05")]
         let local_addr = listener.local_addr().map_err(|error| {
             McpError::internal_error(format!("HTTP listener address unavailable: {error}"))
@@ -10731,11 +10870,15 @@ impl Server {
             .into_http_endpoint(format!("http://{local_addr}"))
             .map_err(|error| {
                 McpError::internal_error(format!("HTTP endpoint setup failed: {error}"))
-            })?;
+            })?
+            .with_operator_handle(operator_handle);
         #[cfg(not(feature = "legacy-2024-11-05"))]
-        let endpoint = self.into_http_endpoint().map_err(|error| {
-            McpError::internal_error(format!("HTTP endpoint setup failed: {error}"))
-        })?;
+        let endpoint = self
+            .into_http_endpoint()
+            .map_err(|error| {
+                McpError::internal_error(format!("HTTP endpoint setup failed: {error}"))
+            })?
+            .with_operator_handle(operator_handle);
         Ok(BoundHttpServer {
             listener,
             endpoint: Arc::new(endpoint),
@@ -10758,6 +10901,14 @@ impl Server {
 }
 
 impl ServerHttpEndpoint {
+    /// Attaches an [`HttpOperatorHandle`] so the endpoint's readiness route
+    /// reports live, non-blocking [`OperatorSnapshot`] state (`OPS-01`).
+    #[must_use]
+    pub fn with_operator_handle(mut self, handle: HttpOperatorHandle) -> Self {
+        self.operator_handle = Some(handle);
+        self
+    }
+
     /// Opens one independently bounded live HTTP session.
     ///
     /// Repeated calls through the returned embedding handle share modern
@@ -10874,6 +11025,7 @@ impl ServerHttpEndpoint {
         Ok(ServerHttpSession {
             server: Arc::clone(&self.server),
             endpoint_session,
+            operator_handle: self.operator_handle.clone(),
             #[cfg(feature = "legacy-2024-11-05")]
             legacy_session_id,
             #[cfg(feature = "legacy-2024-11-05")]
@@ -11218,6 +11370,13 @@ impl ServerHttpSession {
             return Ok(ServerHttpEndpointResponse::Immediate(response));
         }
         let mut request = request;
+        if request.path == self.server.http_config.readiness_path
+            && request.method == HttpMethod::Get
+        {
+            return Ok(ServerHttpEndpointResponse::Immediate(
+                http_readiness_response(self.operator_handle.as_ref()),
+            ));
+        }
         if request.path == self.server.http_config.health_path && request.method == HttpMethod::Get
         {
             return Ok(ServerHttpEndpointResponse::Immediate(
@@ -56892,6 +57051,223 @@ mod lib_unit_tests {
                 .join()
                 .map_err(|_| "JSON write controller panicked")??;
             require_quiescent_http_shutdown(shutdown, "JSON write timeout").await
+        });
+    }
+
+    #[test]
+    fn live_http_readiness_endpoint_reflects_operator_snapshot_and_conserves_permits() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("readiness-probe-live", "1.0.0")
+                .http_config(HttpServerConfig::new().max_connections(2))
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let operator = bound.operator_handle();
+            let limiter = Arc::clone(&bound.connection_limiter);
+            let caller_cx = cx.clone();
+            let controller = thread::spawn(move || -> Result<(), String> {
+                let _cancel = NativeHttpWriteProbeCancellation(caller_cx.clone());
+                native_http_write_probe_wait("listener running", || {
+                    operator
+                        .operator_snapshot()
+                        .is_ok_and(|snap| snap.lifecycle() == OperatorLifecycle::Running)
+                })?;
+
+                // POSITIVE: healthy listener returns 200 ready JSON without echoing
+                // hostile/secret request headers, and /health liveness stays 200 ok.
+                let ready_req = format!(
+                    "GET /ready HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer top-secret-readiness-token-999\r\nX-Secret-Header: leak-me-not\r\nConnection: close\r\n\r\n"
+                );
+                let ready_raw = native_http_write_probe_exchange(address, ready_req.as_bytes())?;
+                let ready_text =
+                    std::str::from_utf8(&ready_raw).map_err(|error| error.to_string())?;
+                if !ready_text.starts_with("HTTP/1.1 200 ") {
+                    return Err(format!("expected 200 on healthy /ready, got: {ready_text}"));
+                }
+                for forbidden in [
+                    "top-secret-readiness-token-999",
+                    "leak-me-not",
+                    "127.0.0.1",
+                    "Authorization",
+                ] {
+                    if ready_text.contains(forbidden) {
+                        return Err(format!(
+                            "readiness response leaked forbidden token {forbidden:?}: {ready_text}"
+                        ));
+                    }
+                }
+                let ready_json: serde_json::Value =
+                    serde_json::from_slice(live_http_response_body(&ready_raw)?)
+                        .map_err(|error| error.to_string())?;
+                assert_eq!(ready_json["status"], "ready");
+                assert_eq!(
+                    ready_json["schemaVersion"],
+                    OperatorSnapshot::<fastmcp_core::OperatorHttpConnections>::SCHEMA_VERSION
+                );
+                assert_eq!(ready_json["lifecycle"], "running");
+                assert_eq!(ready_json["readiness"], "ready");
+                assert_eq!(ready_json["saturated"], false);
+                assert_eq!(ready_json["connections"]["limit"], 2);
+                assert_eq!(ready_json["reasons"], serde_json::json!([]));
+
+                native_http_write_probe_health(address)?;
+                native_http_write_probe_wait("baseline permit release", || {
+                    limiter.active.load(Ordering::Acquire) == 0
+                })?;
+
+                // NEAR-IDENTICAL PLANTED NEGATIVE (RH-5): occupy 1 of 2 slots with a
+                // real admission probe reservation so the incoming /ready probe hits
+                // saturation (active 1 + reserved 1 == limit 2) and must return 503.
+                let probe_permit = operator
+                    .admission_probe()
+                    .acquire(&caller_cx, Instant::now() + Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                let sat_raw = native_http_write_probe_exchange(address, ready_req.as_bytes())?;
+                let sat_text =
+                    std::str::from_utf8(&sat_raw).map_err(|error| error.to_string())?;
+                if !sat_text.starts_with("HTTP/1.1 503 ") {
+                    return Err(format!("expected 503 on saturated /ready, got: {sat_text}"));
+                }
+                let sat_json: serde_json::Value =
+                    serde_json::from_slice(live_http_response_body(&sat_raw)?)
+                        .map_err(|error| error.to_string())?;
+                assert_eq!(sat_json["status"], "not_ready");
+                assert_eq!(sat_json["lifecycle"], "running");
+                assert_eq!(sat_json["saturated"], true);
+                assert_eq!(sat_json["connections"]["reserved"], 1);
+                assert_eq!(sat_json["connections"]["limit"], 2);
+                assert!(
+                    sat_json["reasons"]
+                        .as_array()
+                        .is_some_and(|reasons| reasons
+                            .iter()
+                            .any(|r| r == "connection_capacity_saturated")),
+                    "saturated readiness must report connection_capacity_saturated: {sat_json}"
+                );
+
+                // Releasing the reservation restores 200 ready and conserves permits.
+                drop(probe_permit);
+                let recovered_raw =
+                    native_http_write_probe_exchange(address, ready_req.as_bytes())?;
+                let recovered_text =
+                    std::str::from_utf8(&recovered_raw).map_err(|error| error.to_string())?;
+                if !recovered_text.starts_with("HTTP/1.1 200 ") {
+                    return Err(format!(
+                        "expected 200 after saturation cleared, got: {recovered_text}"
+                    ));
+                }
+                native_http_write_probe_wait("final permit release", || {
+                    limiter.active.load(Ordering::Acquire) == 0
+                })?;
+                let final_snap = operator
+                    .operator_snapshot()
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(final_snap.connections().active, 0);
+                assert_eq!(final_snap.connections().reserved, 0);
+                assert_eq!(
+                    final_snap.counters().accepted + final_snap.counters().probes_acquired,
+                    final_snap.counters().released,
+                    "readiness probes must obey exact permit conservation"
+                );
+                Ok(())
+            });
+            let shutdown = bound.serve(&cx).await.map_err(|error| error.to_string())?;
+            controller
+                .join()
+                .map_err(|_| "readiness probe controller panicked")??;
+            require_quiescent_http_shutdown(shutdown, "readiness probe").await
+        });
+    }
+
+    #[test]
+    fn http_readiness_response_returns_503_on_starting_stopping_stopped_and_busy() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("current runtime Cx");
+            let limiter = Arc::new(
+                HttpConnectionLimiter::for_http(4, ProtocolPolicy::ModernOnly)
+                    .expect("valid connection limiter"),
+            );
+            let handle = HttpOperatorHandle {
+                limiter: Arc::clone(&limiter),
+            };
+
+            // Opt-in readiness on `/health` overrides the static liveness route.
+            #[cfg(feature = "legacy-2024-11-05")]
+            let endpoint = Server::new("readiness-states", "1.0.0")
+                .http_config(HttpServerConfig::new().readiness_path("/health"))
+                .build()
+                .into_http_endpoint("http://127.0.0.1:0")
+                .expect("endpoint")
+                .with_operator_handle(handle.clone());
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            let endpoint = Server::new("readiness-states", "1.0.0")
+                .http_config(HttpServerConfig::new().readiness_path("/health"))
+                .build()
+                .into_http_endpoint()
+                .expect("endpoint")
+                .with_operator_handle(handle.clone());
+            let mut session = endpoint.open_session(&cx).expect("open session");
+
+            async fn probe_once(
+                cx: &Cx,
+                session: &mut ServerHttpSession,
+            ) -> (HttpStatus, serde_json::Value) {
+                let req = HttpRequest::new(HttpMethod::Get, "/health");
+                match session.handle_async(cx, req).await.expect("handle /health") {
+                    ServerHttpEndpointResponse::Immediate(resp) => {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&resp.body).expect("json body");
+                        (resp.status, body)
+                    }
+                    _ => panic!("expected Immediate readiness response"),
+                }
+            }
+
+            // Starting -> 503
+            let (status, body) = probe_once(&cx, &mut session).await;
+            assert_eq!(status, HttpStatus::SERVICE_UNAVAILABLE);
+            assert_eq!(body["status"], "not_ready");
+            assert_eq!(body["lifecycle"], "starting");
+            assert_eq!(body["reasons"], serde_json::json!(["startup_pending"]));
+
+            // Running -> 200
+            limiter.start_serving(&cx);
+            let (status, body) = probe_once(&cx, &mut session).await;
+            assert_eq!(status, HttpStatus::OK);
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["lifecycle"], "running");
+
+            // Busy mutex -> non-blocking 503 (never deadlocks or waits)
+            {
+                let _lock = limiter.state.lock().expect("lock limiter state");
+                let busy = http_readiness_response(Some(&handle));
+                assert_eq!(busy.status, HttpStatus::SERVICE_UNAVAILABLE);
+                let busy_body: serde_json::Value =
+                    serde_json::from_slice(&busy.body).expect("busy json");
+                assert_eq!(busy_body["status"], "not_ready");
+                assert_eq!(busy_body["reasons"], serde_json::json!(["busy"]));
+            }
+
+            // Stopping -> 503
+            limiter.set_lifecycle(OperatorLifecycle::Stopping);
+            let (status, body) = probe_once(&cx, &mut session).await;
+            assert_eq!(status, HttpStatus::SERVICE_UNAVAILABLE);
+            assert_eq!(body["lifecycle"], "stopping");
+            assert_eq!(body["reasons"], serde_json::json!(["listener_stopping"]));
+
+            // Stopped -> 503
+            limiter.set_lifecycle(OperatorLifecycle::Stopped);
+            let (status, body) = probe_once(&cx, &mut session).await;
+            assert_eq!(status, HttpStatus::SERVICE_UNAVAILABLE);
+            assert_eq!(body["lifecycle"], "stopped");
+            assert_eq!(body["reasons"], serde_json::json!(["listener_stopped"]));
+
+            session.close(&cx).await;
         });
     }
 
