@@ -411,13 +411,17 @@ pub fn jwt_resource_providers_install_through_the_facade() {
 // ---------------------------------------------------------------------------
 
 /// POSITIVE (`apps`) — real `impl McpAppsWireHostEffects` OVERRIDING `progress`
-/// and `cancelled` through the facade alone.
+/// and `cancelled`, plus real `impl McpAppsWireHostPolicy` OVERRIDING
+/// `initialize` by delegating to `McpAppsWireHostConfiguration::initialize_result`
+/// through the facade alone (`bd-ajunk`).
 ///
-/// Mirrors `crates/fastmcp/tests/public_reexport_closure.rs:367-426` in a
+/// Mirrors `crates/fastmcp/tests/public_reexport_closure.rs:367-485` in a
 /// single-dependency consumer where `fastmcp-protocol` is absent from the
 /// extern prelude. Importing the trait alone is insufficient: the defect fixed
 /// in `fe6bbdab` was that overriding these defaulted methods was unwritable
-/// without naming six types in `fastmcp_rust::mcp_apps_bridge`.
+/// without naming six types in `fastmcp_rust::mcp_apps_bridge`, and the defect
+/// fixed in `bd-ajunk` was that `McpAppsWireHostConfiguration::initialize_result`
+/// was private so external `initialize` overrides could not delegate to it.
 #[cfg(feature = "apps")]
 #[allow(clippy::unused_async_trait_impl, clippy::no_effect_underscore_binding)]
 pub fn apps_embedder_hooks_override_through_the_facade() {
@@ -426,7 +430,10 @@ pub fn apps_embedder_hooks_override_through_the_facade() {
         McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
         McpAppsProgressControlParams,
     };
-    use fastmcp_rust::{Cx, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostEffects};
+    use fastmcp_rust::{
+        Cx, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostConfiguration,
+        McpAppsWireHostEffects, McpAppsWireHostPolicy,
+    };
 
     struct ProbeAppsEffects;
 
@@ -449,19 +456,26 @@ pub fn apps_embedder_hooks_override_through_the_facade() {
         }
     }
 
-    fn initialize_override_shape(
-        _params: &McpAppsPinnedInitializeParams,
-        prepared: McpAppsPinnedInitializeResult,
-    ) -> McpAppsPinnedInitializeResult {
-        prepared
+    struct ProbeAppsPolicy;
+
+    impl McpAppsWireHostPolicy for ProbeAppsPolicy {
+        async fn initialize(
+            &mut self,
+            _params: &McpAppsPinnedInitializeParams,
+            configuration: &McpAppsWireHostConfiguration,
+        ) -> McpAppsPinnedInitializeResult {
+            configuration.initialize_result()
+        }
     }
-    let _shape: fn(
-        &McpAppsPinnedInitializeParams,
-        McpAppsPinnedInitializeResult,
-    ) -> McpAppsPinnedInitializeResult = initialize_override_shape;
+
+    let _init_result: fn(&McpAppsWireHostConfiguration) -> McpAppsPinnedInitializeResult =
+        McpAppsWireHostConfiguration::initialize_result;
 
     fn effects_impl_is_accepted<E: McpAppsWireHostEffects>() {}
     effects_impl_is_accepted::<ProbeAppsEffects>();
+
+    fn policy_impl_is_accepted<P: McpAppsWireHostPolicy>() {}
+    policy_impl_is_accepted::<ProbeAppsPolicy>();
 
     let _peer_error = |outcome: McpAppsHostRequestOutcome| -> Option<McpAppsJsonRpcError> {
         match outcome {

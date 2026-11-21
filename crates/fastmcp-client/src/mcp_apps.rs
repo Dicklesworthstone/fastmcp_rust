@@ -803,7 +803,14 @@ pub struct McpAppsWireHostConfiguration {
 }
 
 impl McpAppsWireHostConfiguration {
-    fn initialize_result(&self) -> McpAppsPinnedInitializeResult {
+    /// Builds the pinned `ui/initialize` response for this Host configuration.
+    ///
+    /// External [`McpAppsWireHostPolicy::initialize`] overrides can delegate to
+    /// this read-only helper instead of reconstructing the pinned protocol
+    /// envelope by hand, then adjust allowed host capabilities or context while
+    /// keeping the wire Host's admission validation intact.
+    #[must_use]
+    pub fn initialize_result(&self) -> McpAppsPinnedInitializeResult {
         McpAppsPinnedInitializeResult {
             protocol_version: MCP_APPS_HOST_VIEW_PROTOCOL_VERSION.to_owned(),
             host_info: self.host_info.clone(),
@@ -12955,6 +12962,126 @@ exec sleep 10
             host.admission
                 .complete_error(McpAppsBridgeDirection::ViewToHost, &request_id)
                 .expect("the unmatched control preserves the original correlation");
+        });
+    }
+
+    #[test]
+    fn wire_host_configuration_initialize_result_delegation_positive_and_planted_negative() {
+        struct DelegatingInitPolicy {
+            tamper_protocol_version: bool,
+        }
+
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "McpAppsWireHostPolicy::initialize is async even for immediate embedder delegation"
+        )]
+        impl McpAppsWireHostPolicy for DelegatingInitPolicy {
+            async fn initialize(
+                &mut self,
+                _params: &McpAppsPinnedInitializeParams,
+                configuration: &McpAppsWireHostConfiguration,
+            ) -> McpAppsPinnedInitializeResult {
+                let mut response = configuration.initialize_result();
+                response.host_capabilities.logging = Some(json!({}));
+                if self.tamper_protocol_version {
+                    response.protocol_version = "1999-01-01".to_owned();
+                }
+                response
+            }
+        }
+
+        let init_frame = r#"{"jsonrpc":"2.0","id":"init-1","method":"ui/initialize","params":{"appInfo":{"name":"view","version":"1"},"appCapabilities":{},"protocolVersion":"2026-01-26"}}"#;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller-owned current-thread runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("current runtime Cx");
+
+            // POSITIVE: external policy delegates to `configuration.initialize_result()`
+            // and augments an allowed host capability; Host accepts and commits state.
+            let config = wire_configuration();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                config.clone(),
+                DelegatingInitPolicy {
+                    tamper_protocol_version: false,
+                },
+                activation_proof(),
+            );
+            view.send_to_host(&cx, init_frame.to_owned())
+                .await
+                .expect("View ui/initialize reaches Host");
+            host.process_next(&cx)
+                .await
+                .expect("delegated ui/initialize completes cleanly");
+
+            let raw_reply = view
+                .receive_from_host(&cx)
+                .await
+                .expect("View receives ui/initialize response");
+            let reply: Value = serde_json::from_str(&raw_reply).expect("valid JSON-RPC frame");
+            assert_eq!(reply["id"], json!("init-1"));
+            assert!(
+                reply.get("error").is_none(),
+                "delegated initialize must return result, got {reply}"
+            );
+            assert_eq!(
+                reply["result"]["protocolVersion"],
+                json!(MCP_APPS_HOST_VIEW_PROTOCOL_VERSION)
+            );
+            assert_eq!(reply["result"]["hostInfo"]["name"], json!(config.host_info.name));
+            assert_eq!(reply["result"]["hostCapabilities"]["logging"], json!({}));
+            assert_eq!(
+                host.state
+                    .capabilities
+                    .as_ref()
+                    .and_then(|caps| caps.logging.as_ref()),
+                Some(&json!({})),
+                "Host must commit delegated + augmented capabilities"
+            );
+
+            // NEAR-IDENTICAL PLANTED NEGATIVE (RH-5): identical delegation differing
+            // ONLY in a forbidden protocolVersion mutation is rejected by wire
+            // validation, returns an error frame, and leaves Host state uncommitted.
+            let (neg_transport, mut neg_view) = mcp_apps_in_memory_wire_pair(4);
+            let mut neg_host = McpAppsWireHost::new_negotiated(
+                neg_transport,
+                config,
+                DelegatingInitPolicy {
+                    tamper_protocol_version: true,
+                },
+                activation_proof(),
+            );
+            neg_view
+                .send_to_host(&cx, init_frame.to_owned())
+                .await
+                .expect("View ui/initialize reaches negative Host");
+            neg_host
+                .process_next(&cx)
+                .await
+                .expect("negative Host replies with sanitized bridge error frame");
+
+            let neg_raw_reply = neg_view
+                .receive_from_host(&cx)
+                .await
+                .expect("View receives error frame");
+            let neg_reply: Value =
+                serde_json::from_str(&neg_raw_reply).expect("valid JSON-RPC error frame");
+            assert_eq!(neg_reply["id"], json!("init-1"));
+            assert!(
+                neg_reply.get("result").is_none(),
+                "tampered protocolVersion must never return a result: {neg_reply}"
+            );
+            assert!(
+                neg_reply.get("error").is_some(),
+                "tampered protocolVersion must return a JSON-RPC error: {neg_reply}"
+            );
+            assert!(
+                neg_host.state.capabilities.is_none(),
+                "rejected initialize must leave Host capabilities uncommitted"
+            );
         });
     }
 

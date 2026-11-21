@@ -366,11 +366,16 @@ fn facade_sampling_effect_is_implementable_and_consent_is_explicit() {
 #[test]
 fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
     use fastmcp_rust::mcp_apps_bridge::{
-        McpAppsCancelledControlParams, McpAppsJsonRpcError, McpAppsJsonRpcRequestId,
+        MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeImplementation,
+        McpAppsCancelledControlParams, McpAppsJsonRpcEnvelope, McpAppsJsonRpcError,
+        McpAppsJsonRpcRequestId, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext,
         McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
-        McpAppsProgressControlParams,
+        McpAppsPinnedViewCapabilities, McpAppsProgressControlParams, McpAppsRoutedMethod,
     };
-    use fastmcp_rust::{Cx, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostEffects};
+    use fastmcp_rust::{
+        Cx, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostConfiguration,
+        McpAppsWireHostEffects, McpAppsWireHostPolicy,
+    };
 
     #[derive(Default)]
     struct RecordingEffects {
@@ -406,23 +411,31 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
         }
     }
 
-    // The `initialize` override's exact shape. That hook additionally requires
-    // CONSTRUCTING its result, because
-    // `McpAppsWireHostConfiguration::initialize_result`
-    // (crates/fastmcp-client/src/mcp_apps.rs:794) is private, so an embedder
-    // cannot delegate to the default behaviour it replaces. That is a separate
-    // gap, recorded on the bead and deliberately not fixed here; this binding
-    // proves only that both names now resolve.
-    fn initialize_override_shape(
-        _params: &McpAppsPinnedInitializeParams,
-        prepared: McpAppsPinnedInitializeResult,
-    ) -> McpAppsPinnedInitializeResult {
-        prepared
+    // External embedders overriding `McpAppsWireHostPolicy::initialize` can
+    // delegate directly to `McpAppsWireHostConfiguration::initialize_result`
+    // through the facade alone (`bd-ajunk`), then customize allowed host
+    // capabilities without reconstructing the pinned wire envelope by hand.
+    struct DelegatingInitPolicy {
+        tamper_protocol_version: bool,
     }
-    let _shape: fn(
-        &McpAppsPinnedInitializeParams,
-        McpAppsPinnedInitializeResult,
-    ) -> McpAppsPinnedInitializeResult = initialize_override_shape;
+
+    impl McpAppsWireHostPolicy for DelegatingInitPolicy {
+        async fn initialize(
+            &mut self,
+            _params: &McpAppsPinnedInitializeParams,
+            configuration: &McpAppsWireHostConfiguration,
+        ) -> McpAppsPinnedInitializeResult {
+            let mut prepared = configuration.initialize_result();
+            prepared.host_capabilities.logging = Some(serde_json::json!({}));
+            if self.tamper_protocol_version {
+                prepared.protocol_version = "1999-01-01".to_owned();
+            }
+            prepared
+        }
+    }
+
+    let _init_result_fn: fn(&McpAppsWireHostConfiguration) -> McpAppsPinnedInitializeResult =
+        McpAppsWireHostConfiguration::initialize_result;
 
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
@@ -463,6 +476,77 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
         ().cancelled(&cx, &request_id, &cancel_params).unwrap();
         assert_eq!(effects.progress_seen, 1);
         assert_eq!(effects.cancels_seen, 1);
+
+        // POSITIVE (`bd-ajunk`): overriding `McpAppsWireHostPolicy::initialize`
+        // through the facade delegates to `configuration.initialize_result()`,
+        // preserves pinned protocol metadata, augments allowed capabilities,
+        // and passes wire response validation.
+        let configuration = McpAppsWireHostConfiguration {
+            host_info: McpAppsBridgeImplementation {
+                name: "facade-host".to_owned(),
+                version: "1.0.0".to_owned(),
+                unknown: std::collections::BTreeMap::new(),
+            },
+            host_capabilities: McpAppsPinnedHostCapabilities::default(),
+            host_context: McpAppsPinnedHostContext::default(),
+        };
+        let init_params = McpAppsPinnedInitializeParams {
+            app_info: McpAppsBridgeImplementation {
+                name: "facade-view".to_owned(),
+                version: "1.0.0".to_owned(),
+                unknown: std::collections::BTreeMap::new(),
+            },
+            app_capabilities: McpAppsPinnedViewCapabilities::default(),
+            protocol_version: MCP_APPS_HOST_VIEW_PROTOCOL_VERSION.to_owned(),
+        };
+        let mut positive_policy = DelegatingInitPolicy {
+            tamper_protocol_version: false,
+        };
+        let delegated = positive_policy
+            .initialize(&init_params, &configuration)
+            .await;
+        assert_eq!(
+            delegated.protocol_version,
+            MCP_APPS_HOST_VIEW_PROTOCOL_VERSION
+        );
+        assert_eq!(delegated.host_info.name, "facade-host");
+        assert_eq!(
+            delegated.host_capabilities.logging,
+            Some(serde_json::json!({}))
+        );
+        assert!(
+            configuration.initialize_result().host_capabilities.logging.is_none(),
+            "delegation must not mutate the source configuration"
+        );
+        let delegated_value = serde_json::to_value(&delegated).unwrap();
+        McpAppsJsonRpcEnvelope::validate_response_for(
+            McpAppsRoutedMethod::Initialize,
+            &delegated_value,
+        )
+        .expect("delegated initialize result satisfies wire response admission");
+
+        // NEAR-IDENTICAL PLANTED NEGATIVE (RH-5): identical delegation differing
+        // only in a forbidden protocolVersion mutation is rejected by wire
+        // response validation while leaving the source configuration unchanged.
+        let mut tampered_policy = DelegatingInitPolicy {
+            tamper_protocol_version: true,
+        };
+        let tampered = tampered_policy
+            .initialize(&init_params, &configuration)
+            .await;
+        let tampered_value = serde_json::to_value(&tampered).unwrap();
+        assert!(
+            McpAppsJsonRpcEnvelope::validate_response_for(
+                McpAppsRoutedMethod::Initialize,
+                &tampered_value,
+            )
+            .is_err(),
+            "tampered protocolVersion must be rejected by wire response validation"
+        );
+        assert!(
+            configuration.initialize_result().host_capabilities.logging.is_none(),
+            "rejected delegation must leave the source configuration unchanged"
+        );
     });
 
     // A peer error must be nameable to be PROPAGATED, not merely matched: the
