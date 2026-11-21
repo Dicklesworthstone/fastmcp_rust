@@ -3562,28 +3562,33 @@ fn e2e_cli_test_http_auto_reports_bounded_peer_failure_without_downgrade() {
         "HTTP test forbidden fallback",
     );
     let fixture = spawn_loopback_fixture("HTTP test peer failure", move |deadline| {
-        for method in ["server/discover", "server/discover", "tools/list"] {
-            let mut stream =
-                accept_h1_fixture_connection(&modern_listener, deadline, "HTTP test error probe");
-            let (_, request) = read_h1_json_request(&mut stream, deadline);
-            assert_eq!(request["method"], method);
-            let response = if method == "tools/list" {
-                serde_json::json!({
-                    "jsonrpc": "2.0", "id": request["id"], "error": {
-                        "code": -32603,
-                        "message": format!("catalog failed\u{1b}[31m{}", "x".repeat(10_000)),
-                        "data": {"secret": "never-print-this-peer-payload", "timeoutSource": "idle"},
-                    },
-                })
-            } else {
-                serde_json::json!({
-                    "jsonrpc": "2.0", "id": request["id"], "result": {
-                        "resultType": "complete", "supportedVersions": ["2026-07-28"],
-                        "capabilities": {"tools": {}}, "ttlMs": 0, "cacheScope": "private",
-                    },
-                })
-            };
-            write_h1_json_response(&mut stream, deadline, &response.to_string());
+        for _ in 0..2 {
+            for method in ["server/discover", "server/discover", "tools/list"] {
+                let mut stream = accept_h1_fixture_connection(
+                    &modern_listener,
+                    deadline,
+                    "HTTP test error probe",
+                );
+                let (_, request) = read_h1_json_request(&mut stream, deadline);
+                assert_eq!(request["method"], method);
+                let response = if method == "tools/list" {
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "error": {
+                            "code": -32603,
+                            "message": format!("catalog failed\u{1b}[31m{}", "x".repeat(10_000)),
+                            "data": {"secret": "never-print-this-peer-payload", "timeoutSource": "idle"},
+                        },
+                    })
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": {
+                            "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                            "capabilities": {"tools": {}}, "ttlMs": 0, "cacheScope": "private",
+                        },
+                    })
+                };
+                write_h1_json_response(&mut stream, deadline, &response.to_string());
+            }
         }
     });
     let output = run_cli(&[
@@ -3598,27 +3603,51 @@ fn e2e_cli_test_http_auto_reports_bounded_peer_failure_without_downgrade() {
         "auto",
         "--json",
     ]);
+    let verbose_output = run_cli(&[
+        "test",
+        "--http-url",
+        &modern,
+        "--legacy-sse-url",
+        &sse,
+        "--legacy-message-url",
+        &messages,
+        "--protocol-policy",
+        "auto",
+        "--verbose",
+    ]);
     wait_for_loopback_fixture(fixture, "HTTP test peer failure");
     stop_forbidden_http_contact_observer(observer, "HTTP test forbidden fallback");
     assert_eq!(contacts.load(Ordering::SeqCst), 0);
     assert!(!output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "fastmcp.cli.test/v1");
     assert_eq!(report["success"], false);
     assert_eq!(report["tests"][0]["success"], true);
     assert_eq!(report["tests"][1]["success"], true);
     assert_eq!(report["tests"][2]["name"], "list_tools");
     assert_eq!(report["tests"][2]["success"], false);
     assert!(report["tests"][2]["timeout_source"].is_null());
-    assert!(
-        report["tests"][2]["error"]
-            .as_str()
-            .unwrap()
-            .contains("catalog failed")
+    // Oversized peer error strings are omitted as explicit JSON null under
+    // `fastmcp.cli.test/v1` (`truncated: true`) rather than sliced across a
+    // potential secret boundary.
+    assert_eq!(
+        report["tests"][2].get("error"),
+        Some(&serde_json::Value::Null)
     );
     assert!(!stdout_str(&output).contains("never-print-this-peer-payload"));
     assert!(!stdout_str(&output).contains('\u{1b}'));
     assert!(output.stdout.len() < 16 * 1024);
     assert_eq!(report["truncated"], true);
+
+    assert!(!verbose_output.status.success());
+    let verbose_stdout = stdout_str(&verbose_output);
+    assert!(
+        verbose_stdout.contains("[-32603] catalog failed"),
+        "verbose terminal output must preserve bounded sanitized failure text: {verbose_stdout}"
+    );
+    assert!(!verbose_stdout.contains("never-print-this-peer-payload"));
+    assert!(!verbose_stdout.contains('\u{1b}'));
+    assert!(verbose_output.stdout.len() < 16 * 1024);
 }
 
 #[test]

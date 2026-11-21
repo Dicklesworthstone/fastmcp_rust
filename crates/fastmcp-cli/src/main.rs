@@ -635,7 +635,12 @@ enum Commands {
     /// then displays them in a formatted output.
     Inspect {
         /// Server command or path. Omit when using explicit HTTP endpoints.
-        #[arg(conflicts_with_all = ["http_url", "legacy_sse_url", "legacy_message_url"])]
+        #[arg(conflicts_with_all = [
+            "http_url",
+            "bearer_token_file",
+            "legacy_sse_url",
+            "legacy_message_url",
+        ])]
         server: Option<String>,
 
         /// Explicit modern Streamable HTTP MCP POST endpoint.
@@ -796,7 +801,12 @@ enum Commands {
     /// cleanup and is Unix-only; HTTP testing does not spawn a process.
     Test {
         /// Server command or path. Omit when using explicit HTTP endpoints.
-        #[arg(conflicts_with_all = ["http_url", "legacy_sse_url", "legacy_message_url"])]
+        #[arg(conflicts_with_all = [
+            "http_url",
+            "bearer_token_file",
+            "legacy_sse_url",
+            "legacy_message_url",
+        ])]
         server: Option<String>,
 
         /// Explicit modern Streamable HTTP MCP POST endpoint.
@@ -955,7 +965,12 @@ impl Commands {
 #[derive(clap::Args)]
 struct OperationConnection {
     /// Stdio executable (Unix only); choose this or explicit HTTP endpoints.
-    #[arg(long, conflicts_with_all = ["http_url", "legacy_sse_url", "legacy_message_url"])]
+    #[arg(long, conflicts_with_all = [
+        "http_url",
+        "bearer_token_file",
+        "legacy_sse_url",
+        "legacy_message_url",
+    ])]
     server: Option<String>,
     /// Argument passed literally to the stdio server (repeatable).
     #[arg(long, requires = "server", allow_hyphen_values = true)]
@@ -1050,7 +1065,7 @@ struct OperationArguments {
 #[derive(clap::Args, Clone)]
 struct TaskConnection {
     /// Stdio server executable; choose this or --http-url.
-    #[arg(long, global = true, conflicts_with = "http_url")]
+    #[arg(long, global = true, conflicts_with_all = ["http_url", "bearer_token_file"])]
     server: Option<String>,
     /// Argument passed literally to the stdio server (repeatable).
     #[arg(long, global = true, requires = "server", allow_hyphen_values = true)]
@@ -1471,6 +1486,11 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             protocol_policy,
         } => match server.as_deref() {
             Some(server) => {
+                if bearer_token_file.is_some() {
+                    return Err(fastmcp_core::McpError::invalid_params(
+                        "--bearer-token-file requires an HTTPS --http-url",
+                    ));
+                }
                 Box::pin(cmd_inspect(
                     cx,
                     server,
@@ -1543,6 +1563,11 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             json,
         } => match server {
             Some(server) => {
+                if bearer_token_file.is_some() {
+                    return Err(fastmcp_core::McpError::invalid_params(
+                        "--bearer-token-file requires an HTTPS --http-url",
+                    ));
+                }
                 Box::pin(cmd_test(
                     cx,
                     &server,
@@ -7925,6 +7950,11 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
         _ => None,
     };
     if let Some(server) = &connection.server {
+        if connection.bearer_token_file.is_some() {
+            return Err(fastmcp_core::McpError::invalid_params(
+                "--bearer-token-file requires an HTTPS --http-url",
+            ));
+        }
         let duration = budget.remaining()?;
         let args = connection
             .server_arg
@@ -17443,6 +17473,42 @@ IFS= read -r end
                     "--bearer-token-file",
                     "token.txt",
                     "./server",
+                ])
+                .is_err()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "fastmcp",
+                    "inspect",
+                    "--bearer-token-file",
+                    "token.txt",
+                    "./server",
+                ])
+                .is_err()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "fastmcp",
+                    "call",
+                    "tool",
+                    "--server",
+                    "./server",
+                    "--bearer-token-file",
+                    "token.txt",
+                ])
+                .is_err()
+            );
+            #[cfg(feature = "tasks")]
+            assert!(
+                Cli::try_parse_from([
+                    "fastmcp",
+                    "tasks",
+                    "get",
+                    "task-1",
+                    "--server",
+                    "./server",
+                    "--bearer-token-file",
+                    "token.txt",
                 ])
                 .is_err()
             );
