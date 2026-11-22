@@ -237,6 +237,21 @@ impl DpopHttpClient {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(DpopHttpError::Cancelled.into());
         }
+        // Reject stale or foreign saved controls before requiring a native
+        // runtime. Retain this first monotonic bound throughout admission so a
+        // later wall-clock adjustment cannot replenish the record's lifetime.
+        // Admit effects before reading retention clocks, without requiring a
+        // native driver until after invalid saved controls have been rejected.
+        let retention = crate::http_auth::caller::with_caller(cx, || {
+            if !Cx::current().is_some_and(|active| {
+                let capabilities = active.capabilities();
+                capabilities.time && capabilities.io
+            }) {
+                return Err(DpopTaskResumeError::from(DpopHttpError::RuntimeUnavailable));
+            }
+            resume_read_deadline(cx, current, record, self.resource().as_str())
+                .map_err(DpopTaskResumeError::from)
+        })?;
         let mut state = WatchState::new(id_prefix, DpopTaskWatchPolicy::new(1)?, limits)?;
         let owner = WaitBounds::new(
             cx,
@@ -251,6 +266,7 @@ impl DpopHttpClient {
             current,
             record,
             owner,
+            retention,
             &mut state,
             None,
             &mut notify,
@@ -270,6 +286,7 @@ impl DpopHttpClient {
         current: &TaskResumeBinding,
         record: &TaskResumeRecord,
         owner: WaitBounds,
+        retention: Time,
         state: &mut WatchState,
         budget: Option<SharedStreamBudget>,
         notify: &mut N,
@@ -277,7 +294,6 @@ impl DpopHttpClient {
     where
         N: FnMut(&ServerNotification) -> bool,
     {
-        let retention = resume_read_deadline(cx, current, record, self.resource().as_str())?;
         if let Some(budget) = &budget {
             state.usage = budget.usage().map_err(DpopTaskWatchError::from)?;
         }
@@ -523,6 +539,72 @@ mod tests {
             }
             drop(future);
             assert!(!client.revocation_handle().is_revoked());
+        }
+    }
+
+    #[test]
+    fn resume_rejects_denied_effects_before_retention_admission() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        let cx = Cx::for_testing();
+        let (mut client, credential) = super::super::tests::client();
+        let current = binding("owner", client.resource().as_str());
+        let valid = record(&cx, &current);
+        let owner = binding("other", client.resource().as_str());
+        let endpoint = binding("owner", "https://mcp.example/mcp?tenant=other");
+        let mut expired = valid.encode().unwrap();
+        let n = expired.len();
+        expired[n - 16..].copy_from_slice(&1_577_836_810_000_000_000_i128.to_be_bytes());
+        let expired = TaskResumeRecord::decode(&expired).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        for denied in [
+            CapSet::<true, false, true, true, true>::MASK,
+            CapSet::<true, true, true, false, true>::MASK,
+        ] {
+            let restricted = {
+                let _caller = Cx::set_current(Some(cx.clone()));
+                let _restriction = Cx::push_restriction(denied);
+                Cx::current().unwrap()
+            };
+            for ambient_only in [false, true] {
+                let caller = if ambient_only { &cx } else { &restricted };
+                let ambient = if ambient_only { &restricted } else { &cx };
+                for (binding, saved) in [
+                    (&owner, &valid),
+                    (&endpoint, &valid),
+                    (&current, &expired),
+                    (&current, &valid),
+                ] {
+                    let mut future = Box::pin(client.reconcile_task_resume(
+                        caller,
+                        &cancellation,
+                        &credential,
+                        FinalRequestMeta::new(ClientCapabilities::default()),
+                        binding,
+                        saved,
+                        "protected",
+                        DpopStreamLimits::default(),
+                    ));
+                    let result = {
+                        let _ambient = Cx::set_current(Some(ambient.clone()));
+                        future
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                    };
+                    assert!(matches!(
+                        result,
+                        Poll::Ready(Err(DpopTaskResumeError::Checkpoint(
+                            DpopTaskCheckpointError::Watch(DpopTaskWatchError::Stream(
+                                DpopStreamError::Core(DpopCoreError::Transport(
+                                    DpopHttpError::RuntimeUnavailable
+                                ))
+                            ))
+                        )))
+                    ));
+                    drop(future);
+                    assert!(!client.revocation_handle().is_revoked());
+                }
+            }
         }
     }
 
