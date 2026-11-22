@@ -1707,6 +1707,101 @@ fn ready_legacy_http_request_original_context_cancellation_retires_waiter() {
 }
 
 #[test]
+fn ready_legacy_http_request_cancellation_preserves_effect_ceiling() {
+    use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+    for (mask, expected) in [
+        (CapSet::<true, true, true, false, true>::MASK, "IO"),
+        (CapSet::<true, false, true, true, true>::MASK, "TIME"),
+    ] {
+        for ambient_only in [false, true] {
+            let clock = Arc::new(VirtualClock::new());
+            let (late, late_ready) = mpsc::channel();
+            let peer = Peer::serve(move |message| {
+                let mut steps = ready_peer_steps(message, ProtocolPolicy::LegacyOnly);
+                steps.extend([
+                    Step::Post {
+                        status: 202,
+                        extra_headers: &[],
+                    },
+                    Step::Await(late_ready),
+                    Step::Write(message_event(r#"{"jsonrpc":"2.0","id":91,"result":{}}"#)),
+                    Step::Post {
+                        status: 202,
+                        extra_headers: &[],
+                    },
+                    Step::Write(message_event(r#"{"jsonrpc":"2.0","id":92,"result":{}}"#)),
+                    Step::ExpectHeldClosed,
+                ]);
+                steps
+            });
+            virtual_runtime(&clock).block_on(Box::pin(async {
+                let cx = Cx::current().expect("runtime context");
+                let mut connection = open_configured_ready_legacy(
+                    &cx,
+                    &peer,
+                    ProtocolPolicy::LegacyOnly,
+                    short_legacy_request_policy(),
+                )
+                .await;
+                let mut request = connection
+                    .start_legacy_request(&cx, "ping", serde_json::json!({}), RequestId::Number(91))
+                    .await
+                    .expect("the original request commits");
+                let restricted = {
+                    let _restriction = Cx::push_restriction(mask);
+                    Cx::current().expect("restricted caller")
+                };
+                let supplied = if ambient_only { &cx } else { &restricted };
+                let mut cancel = Box::pin(request.cancel(supplied, None));
+                let result = {
+                    let _ambient = ambient_only.then(|| Cx::set_current(Some(restricted.clone())));
+                    cancel
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                };
+                assert!(
+                    matches!(
+                        result,
+                        Poll::Ready(Err(ClientHttpConnectionError::Legacy(
+                            LegacySseHttpClientError::Executor(
+                                ModernHttpExecutorError::CapabilityDenied { capability }
+                            )
+                        ))) if capability == expected
+                    ),
+                    "{expected} denial must precede control I/O: {result:?}"
+                );
+                drop(cancel);
+                late.send(())
+                    .expect("release the retired request's late response");
+                let mut next = connection
+                    .start_legacy_request(&cx, "ping", serde_json::json!({}), RequestId::Number(92))
+                    .await
+                    .expect("denying a control preserves the sibling connection");
+                assert_response_id(bounded_ready(next.wait(&cx)).await.unwrap(), 92);
+                drop(connection);
+                advance_after_yield(&clock, 0).await;
+            }));
+            let log = peer.finish();
+            assert_eq!(
+                log.posts.len(),
+                4,
+                "no denied cancellation reaches the wire"
+            );
+            assert!(log.posts.iter().all(|(_, body)| {
+                serde_json::from_str::<serde_json::Value>(body).unwrap()["method"]
+                    != "notifications/cancelled"
+            }));
+            assert_eq!(log.held_closed_by_client, Some(true));
+            log.assert_legacy_hygiene_for(
+                "cancellation effect ceiling",
+                ProtocolPolicy::LegacyOnly,
+            );
+        }
+    }
+}
+
+#[test]
 fn ready_legacy_http_request_late_response_cannot_win_delayed_wait() {
     let clock = Arc::new(VirtualClock::new());
     let (late, late_ready) = mpsc::channel();
