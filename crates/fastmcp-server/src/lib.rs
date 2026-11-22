@@ -18263,7 +18263,7 @@ impl Server {
         // itself. Its request lease and cancellation remain shared with dispatch.
         let frame_context = context.clone();
         context.with_request_extension_notification_sender(Arc::new(move |mut parameters| {
-            frame_context.ensure_live()?;
+            Self::enforce_request_context(&frame_context)?;
             if cancellation.is_cancel_requested() || cancellation.is_finalizing() {
                 return Err(McpError::request_cancelled());
             }
@@ -18328,13 +18328,13 @@ impl Server {
             // Serialization and schema validation can run application code.
             // Recheck immediately before entering the transport's bounded,
             // request-owned output gate. That gate performs the final race check.
-            frame_context.ensure_live()?;
+            Self::enforce_request_context(&frame_context)?;
             if cancellation.is_cancel_requested() || cancellation.is_finalizing() {
                 return Err(McpError::request_cancelled());
             }
             catch_extension_unwind(|| sender(notification))
                 .map_err(|_| extension_panic_error("request_extension_notification_sender"))?;
-            frame_context.ensure_live()?;
+            Self::enforce_request_context(&frame_context)?;
             Ok(())
         }))
     }
@@ -19325,8 +19325,10 @@ impl Server {
                         // cancellation from winning, but an ordinary peer or
                         // body-drop cancellation must suppress every queued
                         // progress frame at the callback boundary.
+                        // Queue admission cannot extend the retained
+                        // authentication verdict through a later flush.
                         if !frame_cancellation.is_cancel_requested()
-                            && frame_context.ensure_live().is_ok()
+                            && Self::request_context_error(&frame_context).is_none()
                         {
                             sender(notification);
                         }
@@ -19612,7 +19614,7 @@ impl Server {
         if let Some(stats) = &self.stats {
             stats.record_request(&method, started_at.elapsed(), result.is_ok());
         }
-        if finalization_won {
+        if finalization_won && Self::request_context_error(&request_ctx).is_none() {
             self.maybe_emit_final_log_notification(&request, &notification_sender, result.is_ok());
         }
         if is_notification {
@@ -64657,6 +64659,161 @@ mod lib_unit_tests {
                 .response(201)
                 .is_some_and(|response| response.error.is_none())
         );
+    }
+
+    #[test]
+    fn owned_dispatch_rechecks_auth_before_flushing_progress_and_final_logs() {
+        #[derive(Debug)]
+        struct RevocableAuth(McpRequestCancellation);
+
+        impl AuthProvider for RevocableAuth {
+            fn authenticate(
+                &self,
+                _ctx: &McpContext,
+                _request: AuthRequest<'_>,
+            ) -> McpResult<AuthContext> {
+                Ok(AuthContext::with_subject("progress-owner")
+                    .with_verification_cancellation(self.0.clone()))
+            }
+        }
+
+        struct QueuedProgress {
+            revocation: McpRequestCancellation,
+            revoke: bool,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for QueuedProgress {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "queued_auth_progress".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn execution_mode(&self) -> ToolExecutionMode {
+                ToolExecutionMode::Async
+            }
+
+            fn call(
+                &self,
+                ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Admission occurs while authentication is current. The
+                // request owner flushes this slot only after the tool returns.
+                ctx.report_progress(1.0, Some("private queued progress"));
+                if self.revoke {
+                    assert!(self.revocation.cancel());
+                }
+                assert!(ctx.ensure_live().is_ok());
+                Ok(vec![Content::text("finished")])
+            }
+
+            fn call_final_outcome_async_in_request<'a>(
+                &'a self,
+                ctx: &'a McpContext,
+                _request_cx: &'a Cx,
+                arguments: serde_json::Value,
+            ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
+                Box::pin(async move {
+                    match self
+                        .call(ctx, arguments)
+                        .and_then(crate::handler::promote_legacy_tool_content)
+                    {
+                        Ok(result) => {
+                            fastmcp_core::Outcome::Ok(FinalToolOutcome::Complete(result))
+                        }
+                        Err(error) => fastmcp_core::Outcome::Err(error),
+                    }
+                })
+            }
+        }
+
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for revoke in [false, true] {
+                let cx = Cx::current().unwrap();
+                let revocation = McpRequestCancellation::new();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let server = Arc::new(
+                    Server::new("queued-progress-auth", "1")
+                        .log_level(Level::Debug)
+                        .auth_provider(RevocableAuth(revocation.clone()))
+                        .tool(QueuedProgress {
+                            revocation,
+                            revoke,
+                            calls: Arc::clone(&calls),
+                        })
+                        .build(),
+                );
+                let inbound =
+                    InboundRequestContext::new(cx.clone(), 701, InboundRequestTransport::Memory);
+                let request = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "queued_auth_progress",
+                        "arguments": {},
+                        "_meta": {
+                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            "progressToken": "auth-progress",
+                            "io.modelcontextprotocol/logLevel": "info",
+                        },
+                    })),
+                    701_i64,
+                );
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let callback_seen = Arc::clone(&seen);
+                let response = server
+                    .dispatch_stateless_owned_with_cancellation(
+                        &inbound,
+                        request,
+                        None,
+                        None,
+                        None,
+                        None,
+                        McpRequestCancellation::new(),
+                        None,
+                        Arc::new(move |notification| {
+                            callback_seen.lock().unwrap().push(notification);
+                        }),
+                        None,
+                    )
+                    .await
+                    .expect("an id-bearing tool call returns its terminal response");
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(cx.checkpoint().is_ok());
+                let notifications = seen.lock().unwrap();
+                if revoke {
+                    assert_eq!(
+                        response.error.unwrap().code,
+                        i32::from(McpErrorCode::ResourceForbidden).into()
+                    );
+                    assert!(notifications.is_empty());
+                } else {
+                    assert!(response.error.is_none(), "{response:?}");
+                    assert_eq!(
+                        notifications
+                            .iter()
+                            .map(|notification| notification.method.as_str())
+                            .collect::<Vec<_>>(),
+                        vec!["notifications/progress", "notifications/message"]
+                    );
+                    assert_eq!(
+                        notifications[0].params.as_ref().unwrap()["message"],
+                        "private queued progress"
+                    );
+                }
+            }
+        });
     }
 
     #[test]

@@ -1679,7 +1679,8 @@ impl std::fmt::Debug for ProgressReporter {
 ///
 /// Client requests and cross-component calls check the current authentication
 /// verdict before invoking their provider and before returning its result.
-/// Expiry or policy revocation denies those capabilities without cancelling
+/// Request-owned notifications and shared catalog changes also require a
+/// current verdict. Expiry or policy revocation denies these effects without cancelling
 /// the caller's runtime or granting a cancellation mask new authority.
 ///
 /// # Example
@@ -2313,7 +2314,7 @@ impl McpContext {
     /// Returns an error if the request is no longer live or has no output sink.
     #[doc(hidden)]
     pub fn ensure_request_extension_notifications_available(&self) -> McpResult<()> {
-        self.ensure_live()?;
+        self.ensure_capability_live()?;
         if self.request_extension_notification_sender.is_none() {
             return Err(McpError::invalid_request(
                 "Request-owned extension notifications are unavailable",
@@ -2329,7 +2330,7 @@ impl McpContext {
         &self,
         parameters: serde_json::Value,
     ) -> McpResult<()> {
-        self.ensure_live()?;
+        self.ensure_capability_live()?;
         let sender = self
             .request_extension_notification_sender
             .as_ref()
@@ -2339,9 +2340,9 @@ impl McpContext {
         // A streamed notification must never be replayed through response caching.
         // Mark before calling the sink because it can fail after publication.
         self.note_notification_emission();
-        sender(parameters)?;
-        self.ensure_live()?;
-        Ok(())
+        let result = sender(parameters);
+        self.ensure_capability_live()?;
+        result
     }
 
     /// Sets the client-selected minimum log level for this request.
@@ -2736,7 +2737,7 @@ impl McpContext {
     /// }
     /// ```
     pub fn report_progress(&self, progress: f64, message: Option<&str>) {
-        if self.ensure_live().is_ok()
+        if self.ensure_capability_live().is_ok()
             && let Some(ref reporter) = self.progress_reporter
         {
             self.note_notification_emission();
@@ -2767,7 +2768,7 @@ impl McpContext {
     /// }
     /// ```
     pub fn report_progress_with_total(&self, progress: f64, total: f64, message: Option<&str>) {
-        if self.ensure_live().is_ok()
+        if self.ensure_capability_live().is_ok()
             && let Some(ref reporter) = self.progress_reporter
         {
             self.note_notification_emission();
@@ -2786,7 +2787,7 @@ impl McpContext {
         total: Option<serde_json::Number>,
         message: Option<&str>,
     ) {
-        if self.ensure_live().is_ok()
+        if self.ensure_capability_live().is_ok()
             && let Some(ref reporter) = self.progress_reporter
         {
             self.note_notification_emission();
@@ -3280,8 +3281,8 @@ impl McpContext {
 
     /// Emits one MCP log notification if the client floor admits `level`.
     ///
-    /// Missing floor, missing sender, or a cancelled request are silent
-    /// no-ops so handlers can log without branching on transport wiring.
+    /// Missing floor, missing sender, cancellation, or stale authentication are
+    /// silent no-ops so handlers can log without branching on transport wiring.
     pub fn log(&self, level: McpLogLevel, message: impl AsRef<str>) {
         self.log_data(
             level,
@@ -3291,7 +3292,7 @@ impl McpContext {
 
     /// Emits one MCP log notification with caller-owned JSON data.
     pub fn log_data(&self, level: McpLogLevel, data: serde_json::Value) {
-        if self.ensure_live().is_err() {
+        if self.ensure_capability_live().is_err() {
             return;
         }
         let Some(min_level) = self.min_log_level else {
@@ -3312,7 +3313,7 @@ impl McpContext {
     /// `notifications/resources/updated` or at least one modern
     /// `subscriptions/listen` stream accepted the event.
     pub fn notify_resource_updated(&self, uri: impl AsRef<str>) -> bool {
-        if self.ensure_live().is_err() {
+        if self.ensure_capability_live().is_err() {
             return false;
         }
         let uri = uri.as_ref();
@@ -3327,7 +3328,10 @@ impl McpContext {
             sender.send_resource_updated(uri);
             delivered = true;
         }
-        if let Some(publisher) = self.catalog_publisher.as_ref() {
+        if self.ensure_capability_live().is_ok()
+            && let Some(publisher) = self.catalog_publisher.as_ref()
+        {
+            // A preceding session sender may have revoked this request.
             // Mark before calling a user-supplied sink: it may deliver an
             // event before returning, or fail after partial delivery.
             self.note_notification_emission();
@@ -4023,7 +4027,7 @@ impl McpContext {
 
     // Helper: Add a name to a disabled set
     fn add_to_disabled_set(&self, key: &str, name: String, kind: McpCatalogKind) -> bool {
-        if self.ensure_live().is_err() {
+        if self.ensure_capability_live().is_err() {
             return false;
         }
         let Some(state) = self.state.as_ref() else {
@@ -4040,7 +4044,7 @@ impl McpContext {
 
     // Helper: Remove a name from a disabled set
     fn remove_from_disabled_set(&self, key: &str, name: &str, kind: McpCatalogKind) -> bool {
-        if self.ensure_live().is_err() {
+        if self.ensure_capability_live().is_err() {
             return false;
         }
         let Some(state) = self.state.as_ref() else {
@@ -4056,6 +4060,9 @@ impl McpContext {
     }
 
     fn emit_catalog_changed(&self, kind: McpCatalogKind) {
+        if self.ensure_capability_live().is_err() {
+            return;
+        }
         // Both sinks are notified: a session may install a notification
         // sender, a `subscriptions/listen` catalog publisher, or both, and
         // each owns its own delivery decision. Suppressing either one here
@@ -4064,7 +4071,11 @@ impl McpContext {
             self.note_notification_emission();
             sender.send_catalog_changed(kind);
         }
-        if let Some(publisher) = self.catalog_publisher.as_ref() {
+        // The first callback can revoke the producer's authority before
+        // this independent publication enters a different installed sink.
+        if self.ensure_capability_live().is_ok()
+            && let Some(publisher) = self.catalog_publisher.as_ref()
+        {
             self.note_notification_emission();
             let _ = publisher.publish_catalog_changed(kind);
         }
@@ -7183,6 +7194,272 @@ mod tests {
             error.message,
             "Roots not available: client does not support roots capability"
         );
+    }
+
+    struct NotificationAuthorityProbe {
+        events: Mutex<Vec<&'static str>>,
+        revocation: McpRequestCancellation,
+        revoke_on_send: bool,
+        fail_extension: bool,
+    }
+
+    impl NotificationAuthorityProbe {
+        fn record(&self, event: &'static str) {
+            self.events.lock().unwrap().push(event);
+            if self.revoke_on_send {
+                self.revocation.cancel();
+            }
+        }
+
+        fn context(self: &Arc<Self>, auth: Option<AuthContext>) -> (McpContext, SessionState) {
+            let state = SessionState::new();
+            for key in [
+                McpContext::DISABLED_TOOLS_KEY,
+                McpContext::DISABLED_RESOURCES_KEY,
+                McpContext::DISABLED_PROMPTS_KEY,
+            ] {
+                assert!(state.set(
+                    key,
+                    std::collections::HashSet::from(["blocked".to_owned()]),
+                ));
+            }
+            let extension = self.clone();
+            let context = McpContext::with_state(Cx::for_testing(), 1, state.clone())
+                .with_progress_reporter(ProgressReporter::new(self.clone()))
+                .with_log_sender(self.clone())
+                .with_min_log_level(Some(McpLogLevel::Info))
+                .with_resource_subscriptions(["file:///private"])
+                .with_catalog_publisher(self.clone())
+                .with_request_extension_notification_sender(Arc::new(move |_| {
+                    extension.record("extension");
+                    if extension.fail_extension {
+                        Err(McpError::invalid_params("private-extension-error"))
+                    } else {
+                        Ok(())
+                    }
+                }));
+            let context = match auth {
+                Some(auth) => context.with_auth(auth),
+                None => {
+                    assert!(context.commit_anonymous_auth());
+                    context
+                }
+            };
+            (context, state)
+        }
+    }
+
+    impl NotificationSender for NotificationAuthorityProbe {
+        fn send_progress(&self, _progress: f64, _total: Option<f64>, _message: Option<&str>) {
+            self.record("progress");
+        }
+
+        fn send_progress_exact(
+            &self,
+            _progress: serde_json::Number,
+            _total: Option<serde_json::Number>,
+            _message: Option<&str>,
+        ) {
+            self.record("exact_progress");
+        }
+
+        fn send_log(&self, _level: McpLogLevel, _logger: Option<&str>, _data: serde_json::Value) {
+            self.record("log");
+        }
+
+        fn send_catalog_changed(&self, _kind: McpCatalogKind) {
+            self.record("catalog_sender");
+        }
+
+        fn send_resource_updated(&self, _uri: &str) {
+            self.record("resource_sender");
+        }
+    }
+
+    impl CatalogChangePublisher for NotificationAuthorityProbe {
+        fn publish_catalog_changed(&self, _kind: McpCatalogKind) -> bool {
+            self.record("catalog_publisher");
+            true
+        }
+
+        fn publish_resource_updated(&self, _uri: &str) -> bool {
+            self.record("resource_publisher");
+            true
+        }
+    }
+
+    fn notification_authority_probe(
+        revoke_on_send: bool,
+        fail_extension: bool,
+    ) -> Arc<NotificationAuthorityProbe> {
+        Arc::new(NotificationAuthorityProbe {
+            events: Mutex::new(Vec::new()),
+            revocation: McpRequestCancellation::new(),
+            revoke_on_send,
+            fail_extension,
+        })
+    }
+
+    fn exercise_notification_authority(context: &McpContext, allowed: bool) {
+        context.report_progress(0.5, Some("private progress"));
+        context.report_progress_with_total(1.0, 2.0, Some("private progress"));
+        context.report_progress_exact(1_u64.into(), Some(2_u64.into()), Some("private progress"));
+        context.log_data(McpLogLevel::Info, serde_json::json!({"private": "log"}));
+        assert_eq!(context.notify_resource_updated("file:///private"), allowed);
+        assert_eq!(context.disable_tool("later"), allowed);
+        assert_eq!(context.enable_tool("blocked"), allowed);
+        assert_eq!(context.disable_resource("later"), allowed);
+        assert_eq!(context.enable_resource("blocked"), allowed);
+        assert_eq!(context.disable_prompt("later"), allowed);
+        assert_eq!(context.enable_prompt("blocked"), allowed);
+        assert_eq!(
+            context
+                .ensure_request_extension_notifications_available()
+                .is_ok(),
+            allowed
+        );
+        let result =
+            context.emit_request_extension_notification(serde_json::json!({"private": "event"}));
+        if allowed {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, crate::McpErrorCode::ResourceForbidden);
+            assert_eq!(error.message, "Authentication failed");
+        }
+    }
+
+    #[test]
+    fn notification_authority_preserves_current_and_anonymous_effects() {
+        for authenticated in [false, true] {
+            let probe = notification_authority_probe(false, false);
+            let auth = authenticated.then(|| {
+                AuthContext::with_subject("approved")
+                    .with_verification_cancellation(probe.revocation.clone())
+            });
+            let (context, state) = probe.context(auth);
+            exercise_notification_authority(&context, true);
+            let mut expected = vec![
+                "progress",
+                "progress",
+                "exact_progress",
+                "log",
+                "resource_sender",
+                "resource_publisher",
+            ];
+            for _ in 0..6 {
+                expected.extend(["catalog_sender", "catalog_publisher"]);
+            }
+            expected.push("extension");
+            assert_eq!(*probe.events.lock().unwrap(), expected);
+            for key in [
+                McpContext::DISABLED_TOOLS_KEY,
+                McpContext::DISABLED_RESOURCES_KEY,
+                McpContext::DISABLED_PROMPTS_KEY,
+            ] {
+                assert_eq!(
+                    state.get::<std::collections::HashSet<String>>(key),
+                    Some(std::collections::HashSet::from(["later".to_owned()]))
+                );
+            }
+            assert!(context.response_has_notifications());
+            assert!(context.ensure_live().is_ok());
+        }
+    }
+
+    #[test]
+    fn notification_authority_refuses_stale_clones_even_inside_a_mask() {
+        for expired in [false, true] {
+            for masked in [false, true] {
+                let probe = notification_authority_probe(false, false);
+                let mut auth = AuthContext::with_subject("approved")
+                    .with_verification_cancellation(probe.revocation.clone());
+                if expired {
+                    auth = auth.with_verification_valid_until(std::time::Instant::now());
+                }
+                let (context, state) = probe.context(Some(auth));
+                let retained = context.clone();
+                if !expired {
+                    probe.revocation.cancel();
+                }
+                if masked {
+                    retained
+                        .masked(|| exercise_notification_authority(&retained, false))
+                        .unwrap();
+                } else {
+                    exercise_notification_authority(&retained, false);
+                }
+                assert!(probe.events.lock().unwrap().is_empty());
+                assert!(!context.response_has_notifications());
+                for key in [
+                    McpContext::DISABLED_TOOLS_KEY,
+                    McpContext::DISABLED_RESOURCES_KEY,
+                    McpContext::DISABLED_PROMPTS_KEY,
+                ] {
+                    assert_eq!(
+                        state.get::<std::collections::HashSet<String>>(key),
+                        Some(std::collections::HashSet::from(["blocked".to_owned()]))
+                    );
+                }
+                // Revocation stops new external effects without changing the
+                // caller's runtime or its admitted local cleanup authority.
+                assert!(context.ensure_live().is_ok());
+                assert!(!context.cx().is_cancel_requested());
+                assert!(context.set_state("cleanup", true));
+                assert_eq!(context.remove_state("cleanup"), Some(serde_json::json!(true)));
+            }
+        }
+    }
+
+    #[test]
+    fn notification_authority_rechecks_before_a_second_installed_sink() {
+        for resource_update in [false, true] {
+            let probe = notification_authority_probe(true, false);
+            let (context, state) = probe.context(Some(
+                AuthContext::with_subject("approved")
+                    .with_verification_cancellation(probe.revocation.clone()),
+            ));
+            if resource_update {
+                assert!(context.notify_resource_updated("file:///private"));
+                assert_eq!(*probe.events.lock().unwrap(), vec!["resource_sender"]);
+            } else {
+                assert!(context.disable_tool("later"));
+                assert_eq!(*probe.events.lock().unwrap(), vec!["catalog_sender"]);
+                assert_eq!(
+                    state.get::<std::collections::HashSet<String>>(
+                        McpContext::DISABLED_TOOLS_KEY
+                    ),
+                    Some(std::collections::HashSet::from([
+                        "blocked".to_owned(),
+                        "later".to_owned(),
+                    ]))
+                );
+            }
+            assert!(!context.disable_prompt("after-revocation"));
+            assert!(context.response_has_notifications());
+            assert!(context.ensure_live().is_ok());
+            assert!(!context.cx().is_cancel_requested());
+        }
+    }
+
+    #[test]
+    fn notification_authority_withholds_extension_success_and_error_after_revocation() {
+        for fail_extension in [false, true] {
+            let probe = notification_authority_probe(true, fail_extension);
+            let (context, _) = probe.context(Some(
+                AuthContext::with_subject("approved")
+                    .with_verification_cancellation(probe.revocation.clone()),
+            ));
+            let error = context
+                .emit_request_extension_notification(serde_json::json!({"private": "event"}))
+                .unwrap_err();
+            assert_eq!(error.code, crate::McpErrorCode::ResourceForbidden);
+            assert_eq!(error.message, "Authentication failed");
+            assert_eq!(*probe.events.lock().unwrap(), vec!["extension"]);
+            assert!(context.response_has_notifications());
+            assert!(context.ensure_live().is_ok());
+            assert!(!context.cx().is_cancel_requested());
+        }
     }
 
     struct CapabilityAuthorityProbe {
