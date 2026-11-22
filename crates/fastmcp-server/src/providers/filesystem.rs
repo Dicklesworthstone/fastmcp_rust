@@ -1077,20 +1077,22 @@ impl FilesystemProvider {
         Ok(uri)
     }
 
+    /// Returns the concrete resource URI of this provider's root listing.
+    fn root_uri(&self) -> String {
+        match &self.prefix {
+            Some(prefix) => format!("file:///{prefix}/"),
+            None => "file:///".to_string(),
+        }
+    }
+
     /// Returns the URI template for this provider.
     fn uri_template(&self) -> String {
-        match &self.prefix {
-            Some(prefix) => format!("file:///{prefix}/{{+path}}"),
-            None => "file:///{+path}".to_string(),
-        }
+        format!("{}{{+path}}", self.root_uri())
     }
 
     /// Extracts the relative path from a URI.
     fn path_from_uri(&self, uri: &str) -> Result<String, FilesystemProviderError> {
-        let expected_prefix = match &self.prefix {
-            Some(p) => format!("file:///{p}/"),
-            None => "file:///".to_string(),
-        };
+        let expected_prefix = self.root_uri();
         if uri.len()
             > expected_prefix
                 .len()
@@ -1385,9 +1387,9 @@ fn filesystem_blocking_unavailable() -> McpError {
 
 impl ResourceHandler for FilesystemResourceHandler {
     fn definition(&self) -> Resource {
-        // Return a synthetic "root" resource for the provider
+        // The concrete root identifies the listing; file paths use template().
         Resource {
-            uri: self.provider.uri_template(),
+            uri: self.provider.root_uri(),
             name: self
                 .provider
                 .prefix
@@ -1489,6 +1491,17 @@ impl ResourceHandler for FilesystemResourceHandler {
         })
     }
 
+    fn read_final_outcome_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &UriParams,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        // An empty parameter map does not waive resource identity validation.
+        self.read_final_with_uri(ctx, uri, params)
+            .map(FinalMethodOutcome::Complete)
+    }
+
     fn read_final_async_with_uri<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -1532,11 +1545,7 @@ impl ResourceHandler for FilesystemResourceHandler {
         let params = params.clone();
         Box::pin(async move {
             run_filesystem_blocking(ctx, request_cx, move |child| {
-                if params.is_empty() {
-                    handler.read_final(child)
-                } else {
-                    handler.read_final_with_uri(child, &uri, &params)
-                }
+                handler.read_final_with_uri(child, &uri, &params)
             })
             .await
         })
@@ -1590,7 +1599,7 @@ impl ResourceHandler for FilesystemResourceHandler {
         }
 
         Ok(vec![ResourceContent {
-            uri: self.provider.uri_template(),
+            uri: self.provider.root_uri(),
             mime_type: Some("application/json".to_string()),
             text: Some(listing),
             blob: None,
@@ -1605,6 +1614,14 @@ impl ResourceHandler for FilesystemResourceHandler {
     ) -> McpResult<Vec<ResourceContent>> {
         // The URI is the resource identity. Template parameters may repeat
         // that identity, but they cannot select a different path.
+        if uri == self.provider.root_uri() {
+            if params.get("path").is_some_and(|path| !path.is_empty()) {
+                return Err(McpError::invalid_params(
+                    "URI path and template path parameter do not match",
+                ));
+            }
+            return self.read(ctx);
+        }
         let relative_path = self.provider.path_from_uri(uri)?;
         if let Some(path) = params.get("path")
             && path != &relative_path
@@ -2300,7 +2317,7 @@ mod tests {
         let ctx = McpContext::new(asupersync::Cx::for_testing(), 1);
 
         let definition = handler.definition();
-        assert_eq!(definition.uri, "file:///docs/{+path}");
+        assert_eq!(definition.uri, "file:///docs/");
         assert_eq!(definition.name, "docs");
         assert_eq!(definition.description.as_deref(), Some("Documentation"));
 
@@ -2308,6 +2325,7 @@ mod tests {
         assert_eq!(template.uri_template, "file:///docs/{+path}");
 
         let listing = handler.read(&ctx).expect("read listing");
+        assert_eq!(listing[0].uri, "file:///docs/");
         assert_eq!(listing[0].mime_type.as_deref(), Some("application/json"));
         let listing_text = listing[0].text.as_deref().expect("listing text");
         let listing_json: serde_json::Value =
@@ -2347,6 +2365,111 @@ mod tests {
                 .code,
             fastmcp_core::McpErrorCode::InvalidParams
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn filesystem_listing_and_file_uris_preserve_identity_across_final_reads() {
+        for (prefix, root_uri, file_uri) in [
+            (None, "file:///", "file:///notes.md"),
+            (Some("docs"), "file:///docs/", "file:///docs/notes.md"),
+        ] {
+            let root = TestDir::new("listing-uri-identity");
+            write_text(&root.join("notes.md"), "notes");
+            let provider = FilesystemProvider::new(root.path());
+            let provider = match prefix {
+                Some(prefix) => provider.with_prefix(prefix),
+                None => provider,
+            };
+            let handler = provider.build().expect("public filesystem provider");
+            let ctx = test_context();
+            let listing = handler.read(&ctx).expect("legacy listing");
+            assert_eq!(handler.definition().uri, root_uri);
+            assert_eq!(listing[0].uri, root_uri);
+            let listing_text = listing[0].text.as_deref().unwrap();
+            let entries: serde_json::Value = serde_json::from_str(listing_text).unwrap();
+            assert_eq!(
+                entries,
+                serde_json::json!([{
+                    "uri": file_uri,
+                    "mimeType": "text/markdown",
+                    "size": 5
+                }])
+            );
+            let final_listing = serde_json::to_value(
+                handler.read_final(&ctx).expect("final listing").payload,
+            )
+            .unwrap();
+            assert_eq!(final_listing["contents"][0]["uri"], root_uri);
+            assert_eq!(final_listing["contents"][0]["text"], listing_text);
+
+            for params in [
+                UriParams::new(),
+                UriParams::from([("path".to_owned(), String::new())]),
+            ] {
+                let listing_by_uri = handler
+                    .read_with_uri(&ctx, root_uri, &params)
+                    .expect("canonical root URI must list");
+                assert_eq!(listing_by_uri[0].uri, root_uri);
+                assert_eq!(listing_by_uri[0].text.as_deref(), Some(listing_text));
+                let result = handler
+                    .read_final_with_uri(&ctx, root_uri, &params)
+                    .expect("canonical root must promote to final contents");
+                assert_eq!(serde_json::to_value(result.payload).unwrap(), final_listing);
+                let FinalMethodOutcome::Complete(result) = handler
+                    .read_final_outcome_with_uri(&ctx, root_uri, &params)
+                    .expect("canonical root must preserve complete outcome")
+                else {
+                    panic!("filesystem listing cannot require input");
+                };
+                assert_eq!(serde_json::to_value(result.payload).unwrap(), final_listing);
+            }
+
+            let empty = UriParams::new();
+            let file = handler
+                .read_final_with_uri(&ctx, file_uri, &empty)
+                .expect("file URI must read without duplicated template params");
+            let file = serde_json::to_value(file.payload).unwrap();
+            assert_eq!(file["contents"][0]["uri"], file_uri);
+            assert_eq!(file["contents"][0]["text"], "notes");
+            let FinalMethodOutcome::Complete(result) = handler
+                .read_final_outcome_with_uri(&ctx, file_uri, &empty)
+                .expect("empty params must not relabel a file as the root")
+            else {
+                panic!("filesystem read cannot require input");
+            };
+            assert_eq!(serde_json::to_value(result.payload).unwrap(), file);
+
+            // Planted negatives keep the valid URI and change only the
+            // duplicated path. Neither form may select another resource.
+            for (uri, path) in [(root_uri, "notes.md"), (file_uri, "")] {
+                let params = UriParams::from([("path".to_owned(), path.to_owned())]);
+                assert_eq!(
+                    handler.read_with_uri(&ctx, uri, &params).unwrap_err().code,
+                    McpErrorCode::InvalidParams,
+                );
+                assert_eq!(
+                    handler
+                        .read_final_with_uri(&ctx, uri, &params)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams,
+                );
+                assert_eq!(
+                    handler
+                        .read_final_outcome_with_uri(&ctx, uri, &params)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams,
+                );
+            }
+            assert_eq!(
+                handler.read_with_uri(&ctx, file_uri, &empty).unwrap()[0]
+                    .text
+                    .as_deref(),
+                Some("notes"),
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2535,8 +2658,8 @@ mod tests {
                 serde_json::from_str(listing[0].text.as_deref().unwrap()).unwrap();
             assert_eq!(entries[0]["uri"], "file:///notes.md");
 
-            // An empty parameter map means a listing on every final async
-            // surface, including the complete-only URI compatibility path.
+            // The canonical root URI remains a listing with an empty map on
+            // every final async surface, including complete-only reads.
             let empty = UriParams::new();
             let Outcome::Ok(complete) = handler
                 .read_final_async_with_uri(&ctx, "file:///", &empty)
@@ -2561,6 +2684,7 @@ mod tests {
             let outcome = serde_json::to_value(outcome.payload).unwrap();
             assert_eq!(complete, in_request);
             assert_eq!(complete, outcome);
+            assert_eq!(complete["contents"][0]["uri"], "file:///");
             let final_entries: serde_json::Value =
                 serde_json::from_str(complete["contents"][0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(final_entries, entries);
@@ -2578,6 +2702,95 @@ mod tests {
             })
             .await;
             assert!(matches!(outcome, Outcome::Ok(_)));
+            assert!(ctx.ensure_live().is_ok());
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn filesystem_async_empty_params_do_not_bypass_uri_identity() {
+        let root = TestDir::new("async-uri-identity");
+        write_text(&root.join("notes.md"), "notes");
+        let handler = FilesystemProvider::new(root.path())
+            .with_prefix("docs")
+            .build()
+            .expect("public filesystem provider");
+        let empty = UriParams::new();
+        let listing =
+            r#"[{"uri":"file:///docs/notes.md","mimeType":"text/markdown","size":5}]"#;
+
+        filesystem_runtime(true).block_on(async {
+            let cx = Cx::current().unwrap();
+            let ctx = McpContext::new(cx.clone(), 10);
+            for (uri, text) in [
+                ("file:///docs/", listing),
+                ("file:///docs/notes.md", "notes"),
+            ] {
+                for read in [
+                    handler.read_async_with_uri(&ctx, uri, &empty),
+                    handler.read_async_with_uri_in_request(&ctx, &cx, uri, &empty),
+                ] {
+                    let Outcome::Ok(contents) = read.await else {
+                        panic!("canonical filesystem URI must read on every legacy surface");
+                    };
+                    assert_eq!(contents.len(), 1);
+                    assert_eq!(contents[0].uri, uri);
+                    assert_eq!(contents[0].text.as_deref(), Some(text));
+                }
+                for read in [
+                    handler.read_final_async_with_uri(&ctx, uri, &empty),
+                    handler.read_final_async_with_uri_in_request(&ctx, &cx, uri, &empty),
+                ] {
+                    let Outcome::Ok(result) = read.await else {
+                        panic!("canonical filesystem URI must read on every final surface");
+                    };
+                    let payload = serde_json::to_value(result.payload).unwrap();
+                    assert_eq!(payload["contents"][0]["uri"], uri);
+                    assert_eq!(payload["contents"][0]["text"], text);
+                }
+                for read in [
+                    handler.read_final_outcome_async_with_uri(&ctx, uri, &empty),
+                    handler.read_final_outcome_async_with_uri_in_request(&ctx, &cx, uri, &empty),
+                ] {
+                    let Outcome::Ok(FinalMethodOutcome::Complete(result)) = read.await else {
+                        panic!("canonical filesystem URI must preserve complete outcome");
+                    };
+                    let payload = serde_json::to_value(result.payload).unwrap();
+                    assert_eq!(payload["contents"][0]["uri"], uri);
+                    assert_eq!(payload["contents"][0]["text"], text);
+                }
+            }
+
+            // An empty map must not turn a different authority, prefix,
+            // noncanonical spelling, query, or fragment into the root listing.
+            for uri in [
+                "file://foreign/docs/",
+                "file:///wrong/",
+                "file:///docs",
+                "file:///docs//",
+                "file:///docs/?query",
+                "file:///docs/#fragment",
+                "file:///docs/{+path}",
+            ] {
+                for read in [
+                    handler.read_async_with_uri(&ctx, uri, &empty),
+                    handler.read_async_with_uri_in_request(&ctx, &cx, uri, &empty),
+                ] {
+                    filesystem_error(read.await, McpErrorCode::InvalidRequest);
+                }
+                for read in [
+                    handler.read_final_async_with_uri(&ctx, uri, &empty),
+                    handler.read_final_async_with_uri_in_request(&ctx, &cx, uri, &empty),
+                ] {
+                    filesystem_error(read.await, McpErrorCode::InvalidRequest);
+                }
+                for read in [
+                    handler.read_final_outcome_async_with_uri(&ctx, uri, &empty),
+                    handler.read_final_outcome_async_with_uri_in_request(&ctx, &cx, uri, &empty),
+                ] {
+                    filesystem_error(read.await, McpErrorCode::InvalidRequest);
+                }
+            }
             assert!(ctx.ensure_live().is_ok());
         });
     }
@@ -3611,7 +3824,7 @@ mod tests {
             .expect("valid filesystem provider");
         let def = handler.definition();
         assert_eq!(def.name, "files");
-        assert_eq!(def.uri, "file:///{+path}");
+        assert_eq!(def.uri, "file:///");
         assert!(def.description.is_none());
     }
 
