@@ -1373,6 +1373,205 @@ fn enterprise_oidc_code_redemption_cancellation_and_deadline_retain_dispatch_cus
     }
 }
 
+enum VerifiedExchangeGrant {
+    Identity(EnterpriseIdentityAssertion),
+    IdJag(EnterpriseIdJagResponse),
+    Access(EnterpriseAccessTokenResponse),
+}
+
+impl VerifiedExchangeGrant {
+    fn decode(stage: usize) -> Result<Self, EnterpriseExchangeError> {
+        let selected = profile(&["read"]);
+        if stage == 0 {
+            return Ok(Self::Identity(identity_for_exchange(&selected)));
+        }
+        let (_, keys) = keys();
+        let id_jag = success(
+            jag(&selected, &keys, &jag_body(), now())
+                .map_err(EnterpriseExchangeError::ResponseRejected)?,
+        );
+        if stage == 1 {
+            Ok(Self::IdJag(id_jag))
+        } else {
+            finish(id_jag, &access_body(), now() + Duration::from_secs(1))
+                .map(success)
+                .map(Self::Access)
+                .map_err(EnterpriseExchangeError::ResponseRejected)
+        }
+    }
+
+    fn assert_signed_authority(&self) {
+        match self {
+            Self::Identity(value) => {
+                assert_eq!(value.identity().subject().as_str(), "client-subject");
+                assert_eq!(value.identity().client_id(), "native-idp");
+            }
+            Self::IdJag(value) => {
+                assert_eq!(value.assertion().subject().as_str(), "resource-facing");
+                assert_eq!(value.granted_scopes(), ["read"]);
+            }
+            Self::Access(value) => {
+                assert_eq!(value.resource(), "https://mcp.example/mcp");
+                assert_eq!(value.granted_scopes(), ["read"]);
+            }
+        }
+    }
+}
+
+/// Tracks destruction of the actual protected response, not a replacement
+/// token. The contained grant's own Drop/zeroization still runs on every path.
+struct ObservedExchangeGrant {
+    value: VerifiedExchangeGrant,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for ObservedExchangeGrant {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+#[test]
+fn enterprise_exchange_response_admission_keeps_live_verified_grants() {
+    let virtual_clock = Arc::new(asupersync::time::VirtualClock::new());
+    let timer =
+        asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&virtual_clock));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_timer_driver(timer)
+        .build()
+        .unwrap();
+    for stage in 0..3 {
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let clock = ExchangeClock::new(now(), cx.now());
+        let deadline = ExchangeDeadline::new(
+            &cx,
+            &clock,
+            clock.monotonic + Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let grant = deadline
+            .admit_response(&cx, || {
+                let value = VerifiedExchangeGrant::decode(stage)?;
+                value.assert_signed_authority();
+                virtual_clock.advance(1_000_000_000);
+                Ok(ObservedExchangeGrant {
+                    value,
+                    dropped: Arc::clone(&dropped),
+                })
+            })
+            .unwrap();
+        grant.value.assert_signed_authority();
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(grant);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn enterprise_exchange_response_admission_discards_verified_grants_after_cancellation_or_expiry() {
+    // Same signed inputs and decoder as the positive. Only a terminal event
+    // after successful verification changes: caller cancellation, policy
+    // deadline, earlier caller budget, or earlier protected-input expiry.
+    for stage in 0..3 {
+        for terminal in 0..4 {
+            let virtual_clock = Arc::new(asupersync::time::VirtualClock::new());
+            let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(
+                &virtual_clock,
+            ));
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_timer_driver(timer)
+                .build()
+                .unwrap();
+            let budget = if terminal == 2 {
+                asupersync::Budget::INFINITE.with_deadline(Time::from_nanos(2_000_000_000))
+            } else {
+                asupersync::Budget::INFINITE
+            };
+            let cx = runtime.request_cx_with_budget(budget);
+            let clock = ExchangeClock::new(now(), cx.now());
+            let input_lifetime = if terminal == 3 { 2 } else { 60 };
+            let deadline = ExchangeDeadline::new(
+                &cx,
+                &clock,
+                clock.monotonic + Duration::from_secs(input_lifetime),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let decoded = AtomicBool::new(false);
+            let result = deadline.admit_response(&cx, || {
+                let value = VerifiedExchangeGrant::decode(stage)?;
+                value.assert_signed_authority();
+                decoded.store(true, Ordering::Release);
+                if terminal == 0 {
+                    cx.set_cancel_requested(true);
+                } else {
+                    virtual_clock.advance(if terminal == 1 {
+                        6_000_000_000
+                    } else {
+                        3_000_000_000
+                    });
+                }
+                Ok(ObservedExchangeGrant {
+                    value,
+                    dropped: Arc::clone(&dropped),
+                })
+            });
+            assert_eq!(
+                result.err(),
+                // asupersync delivers caller-budget exhaustion through its
+                // checkpoint cancellation channel; this preserves that
+                // existing public classification for terminal == 2.
+                Some(if terminal == 0 || terminal == 2 {
+                    EnterpriseExchangeError::Cancelled
+                } else {
+                    EnterpriseExchangeError::TimedOut
+                }),
+                "stage {stage}, terminal {terminal}"
+            );
+            assert!(decoded.load(Ordering::Acquire));
+            assert!(dropped.load(Ordering::Acquire));
+        }
+    }
+}
+
+#[test]
+fn enterprise_exchange_response_deadline_does_not_restart_after_preparation() {
+    for expired in [false, true] {
+        let virtual_clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer =
+            asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&virtual_clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_timer_driver(timer)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let clock = ExchangeClock::new(now(), cx.now());
+        // Preparation consumes four seconds before HTTP can start. The same
+        // absolute five-second policy must still govern response verification.
+        virtual_clock.advance(4_000_000_000);
+        let deadline = ExchangeDeadline::new(
+            &cx,
+            &clock,
+            clock.monotonic + Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let result = deadline.admit_response(&cx, || {
+            let value = VerifiedExchangeGrant::decode(1)?;
+            virtual_clock.advance(if expired { 2_000_000_000 } else { 500_000_000 });
+            Ok(value)
+        });
+        if expired {
+            assert_eq!(result.err(), Some(EnterpriseExchangeError::TimedOut));
+        } else {
+            result.unwrap().assert_signed_authority();
+        }
+    }
+}
+
 #[test]
 fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives() {
     let selected = profile(&["read"]);

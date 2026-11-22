@@ -958,8 +958,8 @@ impl EnterpriseExchangeDriver {
         ),
         EnterpriseExchangeError,
     > {
-        let clock = ExchangeClock::new(received_at);
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
+        let clock = ExchangeClock::new(received_at, admitted.now());
         let expires_at = grant.expires_at();
         let (request, response_admission) = grant.into_token_request(
             &self.inner.profile,
@@ -969,13 +969,19 @@ impl EnterpriseExchangeDriver {
             clock.wall_now()?,
         )?;
         let input_deadline = clock.deadline(expires_at)?;
+        let deadline = ExchangeDeadline::new(
+            &admitted,
+            &clock,
+            input_deadline,
+            self.inner.fetcher.policy().deadline(),
+        )?;
         let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
         let response = self
             .dispatch_post(
                 &admitted,
                 &self.inner.idp_token_url,
                 &request,
-                input_deadline,
+                deadline,
                 Arc::clone(&permit),
                 // No identity assertion exists until this response is verified.
                 // Replay reservation is mandatory in the subsequent stage.
@@ -986,25 +992,19 @@ impl EnterpriseExchangeDriver {
             endpoint: self.inner.profile.idp_token_endpoint().to_owned(),
             provenance: response.provenance,
         };
-        let outcome = response_admission
-            .admit_token_response(
-                EnterpriseTokenResponse {
-                    status: response.status,
-                    headers: &response.headers,
-                    body: &response.body,
-                },
-                oidc_keys,
-                clock.wall_now()?,
-            )
-            .map_err(EnterpriseExchangeError::CodeFlowRejected)?;
-        // Signature validation is bounded synchronous work. A caller cancellation
-        // or deadline reached during that work must still prevent identity release.
-        crate::http_auth::caller::with_caller(&admitted, admit_exchange_caller)?;
-        if Instant::now() >= input_deadline
-            || clock.monotonic.elapsed() >= self.inner.fetcher.policy().deadline()
-        {
-            return Err(EnterpriseExchangeError::TimedOut);
-        }
+        let outcome = deadline.admit_response(&admitted, || {
+            response_admission
+                .admit_token_response(
+                    EnterpriseTokenResponse {
+                        status: response.status,
+                        headers: &response.headers,
+                        body: &response.body,
+                    },
+                    oidc_keys,
+                    clock.wall_now()?,
+                )
+                .map_err(EnterpriseExchangeError::CodeFlowRejected)
+        })?;
         if let EnterpriseResponseOutcome::Success {
             value: assertion, ..
         } = &outcome
@@ -1040,8 +1040,8 @@ impl EnterpriseExchangeDriver {
         ),
         EnterpriseExchangeError,
     > {
-        let clock = ExchangeClock::new(received_at);
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
+        let clock = ExchangeClock::new(received_at, admitted.now());
         let profile = &self.inner.profile;
         let (assertion, reservation) = reserved
             .into_exchange(profile)
@@ -1062,9 +1062,12 @@ impl EnterpriseExchangeDriver {
         let input_deadline = clock
             .input_deadline(assertion.received_at, assertion.identity.expires_at())?
             .min(reservation.identity_deadline());
-        if Instant::now() >= input_deadline {
-            return Err(EnterpriseExchangeError::TimedOut);
-        }
+        let deadline = ExchangeDeadline::new(
+            &admitted,
+            &clock,
+            input_deadline,
+            self.inner.fetcher.policy().deadline(),
+        )?;
         let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
         let scope_wire = profile.requested_scopes().as_wire_value();
         let mut fields: Vec<(&str, &str)> = vec![
@@ -1089,7 +1092,7 @@ impl EnterpriseExchangeDriver {
                 &admitted,
                 &self.inner.idp_token_url,
                 &request,
-                input_deadline,
+                deadline,
                 Arc::clone(&permit),
                 || reservation.check().map_err(map_reservation_error),
             )
@@ -1098,20 +1101,22 @@ impl EnterpriseExchangeDriver {
             endpoint: profile.idp_token_endpoint().to_owned(),
             provenance: response.provenance,
         };
-        let outcome = profile
-            .admit_id_jag_response(
-                EnterpriseTokenResponse {
-                    status: response.status,
-                    headers: &response.headers,
-                    body: &response.body,
-                },
-                id_jag_keys,
-                idp_tenant,
-                resource_tenant,
-                self.inner.response_policy,
-                clock.wall_now()?,
-            )
-            .map_err(EnterpriseExchangeError::ResponseRejected)?;
+        let outcome = deadline.admit_response(&admitted, || {
+            profile
+                .admit_id_jag_response(
+                    EnterpriseTokenResponse {
+                        status: response.status,
+                        headers: &response.headers,
+                        body: &response.body,
+                    },
+                    id_jag_keys,
+                    idp_tenant,
+                    resource_tenant,
+                    self.inner.response_policy,
+                    clock.wall_now()?,
+                )
+                .map_err(EnterpriseExchangeError::ResponseRejected)
+        })?;
         reservation.check().map_err(map_reservation_error)?;
         let outcome = match outcome {
             EnterpriseResponseOutcome::Success { value, cache } => {
@@ -1158,8 +1163,8 @@ impl EnterpriseExchangeDriver {
         ),
         EnterpriseExchangeError,
     > {
-        let clock = ExchangeClock::new(received_at);
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
+        let clock = ExchangeClock::new(received_at, admitted.now());
         let profile = &self.inner.profile;
         let EnterpriseExchangedIdJag {
             response: id_jag,
@@ -1175,9 +1180,12 @@ impl EnterpriseExchangeDriver {
         let input_deadline = clock
             .input_deadline(id_jag.received_at, id_jag.effective_expires_at)?
             .min(expires_at_monotonic);
-        if Instant::now() >= input_deadline {
-            return Err(EnterpriseExchangeError::TimedOut);
-        }
+        let deadline = ExchangeDeadline::new(
+            &admitted,
+            &clock,
+            input_deadline,
+            self.inner.fetcher.policy().deadline(),
+        )?;
         let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
         let mut fields: Vec<(&str, &str)> = vec![
             ("grant_type", JWT_BEARER_GRANT),
@@ -1194,7 +1202,7 @@ impl EnterpriseExchangeDriver {
                 &admitted,
                 &self.inner.resource_as_token_url,
                 &request,
-                input_deadline,
+                deadline,
                 Arc::clone(&permit),
                 || reservation.check().map_err(map_reservation_error),
             )
@@ -1204,16 +1212,18 @@ impl EnterpriseExchangeDriver {
             provenance: response.provenance,
         };
         let received_at = clock.wall_now()?;
-        let outcome = id_jag
-            .admit_access_token_response(
-                EnterpriseTokenResponse {
-                    status: response.status,
-                    headers: &response.headers,
-                    body: &response.body,
-                },
-                received_at,
-            )
-            .map_err(EnterpriseExchangeError::ResponseRejected)?;
+        let outcome = deadline.admit_response(&admitted, || {
+            id_jag
+                .admit_access_token_response(
+                    EnterpriseTokenResponse {
+                        status: response.status,
+                        headers: &response.headers,
+                        body: &response.body,
+                    },
+                    received_at,
+                )
+                .map_err(EnterpriseExchangeError::ResponseRejected)
+        })?;
         reservation.check().map_err(map_reservation_error)?;
         let mapped = match outcome {
             EnterpriseResponseOutcome::Success { value, cache } => {
@@ -1246,26 +1256,13 @@ impl EnterpriseExchangeDriver {
         cx: &Cx,
         url: &GuardedHttpsUrl,
         request: &GuardedHttpRequest,
-        input_deadline: Instant,
+        deadline: ExchangeDeadline,
         permit: Arc<ExchangePermit>,
         check_reservation: impl Fn() -> Result<(), EnterpriseExchangeError>,
     ) -> Result<GuardedHttpFetchResponse, EnterpriseExchangeError> {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let response = CallerContextFuture::new(&admitted, async {
-            let started = Instant::now();
-            let remaining = input_deadline
-                .checked_duration_since(started)
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or(EnterpriseExchangeError::TimedOut)?;
-            let timeout = self.inner.fetcher.policy().deadline().min(remaining);
-            let nanos = u64::try_from(timeout.as_nanos())
-                .map_err(|_| EnterpriseExchangeError::InvalidPolicy)?;
-            let deadline = admitted.now().saturating_add_nanos(nanos);
-            let deadline = admitted
-                .budget()
-                .deadline
-                .map_or(deadline, |limit| limit.min(deadline));
-            let mut timer = std::pin::pin!(Sleep::new(deadline));
+            let mut timer = std::pin::pin!(Sleep::new(deadline.runtime));
             let (_sender, mut receiver) = oneshot::channel::<()>();
             let mut cancelled = std::pin::pin!(receiver.recv(&admitted));
             let mut call = std::pin::pin!(async {
@@ -1274,17 +1271,17 @@ impl EnterpriseExchangeDriver {
             });
             poll_fn(|task| {
                 check_reservation()?;
-                exchange_checkpoint(&admitted, deadline, started, timeout)?;
+                deadline.check(&admitted)?;
                 if cancelled.as_mut().poll(task).is_ready() {
                     return Poll::Ready(Err(EnterpriseExchangeError::Cancelled));
                 }
                 if timer.as_mut().poll(task).is_ready() {
-                    exchange_checkpoint(&admitted, deadline, started, timeout)?;
+                    deadline.check(&admitted)?;
                     return Poll::Ready(Err(EnterpriseExchangeError::TimedOut));
                 }
                 let res = call.as_mut().poll(task);
                 check_reservation()?;
-                exchange_checkpoint(&admitted, deadline, started, timeout)?;
+                deadline.check(&admitted)?;
                 res
             })
             .await
@@ -1335,13 +1332,15 @@ impl EnterpriseExchangeDriver {
 struct ExchangeClock {
     wall: SystemTime,
     monotonic: Instant,
+    runtime: Time,
 }
 
 impl ExchangeClock {
-    fn new(wall: SystemTime) -> Self {
+    fn new(wall: SystemTime, runtime: Time) -> Self {
         Self {
             wall,
             monotonic: Instant::now(),
+            runtime,
         }
     }
 
@@ -1373,6 +1372,74 @@ impl ExchangeClock {
             ));
         }
         self.deadline(expires_at)
+    }
+}
+
+/// One absolute bound covers preparation, transport, and response verification.
+/// Neither receiving the HTTP response nor entering synchronous signature work
+/// restarts the caller's runtime clock or the monotonic policy deadline.
+#[derive(Clone, Copy)]
+struct ExchangeDeadline {
+    monotonic: Instant,
+    runtime: Time,
+}
+
+impl ExchangeDeadline {
+    fn new(
+        admitted: &Cx,
+        clock: &ExchangeClock,
+        input_deadline: Instant,
+        timeout: Duration,
+    ) -> Result<Self, EnterpriseExchangeError> {
+        let remaining = input_deadline
+            .checked_duration_since(clock.monotonic)
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(EnterpriseExchangeError::TimedOut)?;
+        let timeout = timeout.min(remaining);
+        let nanos = u64::try_from(timeout.as_nanos())
+            .map_err(|_| EnterpriseExchangeError::InvalidPolicy)?;
+        let runtime = clock.runtime.saturating_add_nanos(nanos);
+        let deadline = Self {
+            monotonic: clock
+                .monotonic
+                .checked_add(timeout)
+                .ok_or(EnterpriseExchangeError::InvalidPolicy)?,
+            runtime: admitted
+                .budget()
+                .deadline
+                .map_or(runtime, |limit| limit.min(runtime)),
+        };
+        deadline.check(admitted)?;
+        Ok(deadline)
+    }
+
+    fn check(self, admitted: &Cx) -> Result<(), EnterpriseExchangeError> {
+        crate::http_auth::caller::with_caller(admitted, || {
+            let current = admit_exchange_caller()?;
+            let held = admitted.capabilities();
+            let active = current.capabilities();
+            if (held.entropy && !active.entropy) || (held.remote && !active.remote) {
+                return Err(EnterpriseExchangeError::RuntimeUnavailable);
+            }
+            if current.now() >= self.runtime || Instant::now() >= self.monotonic {
+                return Err(EnterpriseExchangeError::TimedOut);
+            }
+            Ok(())
+        })
+    }
+
+    /// A validated token is still private until the caller and original
+    /// deadline are re-admitted. Cancellation or expiry during synchronous
+    /// decoding drops the protected outcome instead of releasing authority.
+    fn admit_response<T>(
+        self,
+        admitted: &Cx,
+        decode: impl FnOnce() -> Result<T, EnterpriseExchangeError>,
+    ) -> Result<T, EnterpriseExchangeError> {
+        self.check(admitted)?;
+        let outcome = decode()?;
+        self.check(admitted)?;
+        Ok(outcome)
     }
 }
 
@@ -1424,24 +1491,6 @@ fn admit_exchange_caller() -> Result<Cx, EnterpriseExchangeError> {
         return Err(EnterpriseExchangeError::TimedOut);
     }
     Ok(current)
-}
-
-fn exchange_checkpoint(
-    admitted: &Cx,
-    deadline: Time,
-    started: Instant,
-    timeout: Duration,
-) -> Result<(), EnterpriseExchangeError> {
-    let current = admit_exchange_caller()?;
-    let held = admitted.capabilities();
-    let active = current.capabilities();
-    if (held.entropy && !active.entropy) || (held.remote && !active.remote) {
-        return Err(EnterpriseExchangeError::RuntimeUnavailable);
-    }
-    if current.now() >= deadline || started.elapsed() >= timeout {
-        return Err(EnterpriseExchangeError::TimedOut);
-    }
-    Ok(())
 }
 
 fn map_exchange_fetch_error(error: GuardedHttpFetchError) -> EnterpriseExchangeError {
