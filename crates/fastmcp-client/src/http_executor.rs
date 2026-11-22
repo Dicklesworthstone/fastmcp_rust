@@ -5810,7 +5810,25 @@ impl LegacyHttpRequest {
             fastmcp_protocol::methods::NOTIFICATIONS_CANCELLED,
             Some(params),
         ));
-        let io_cx = if cx.has_io() || !cx.capabilities().io || cx.checkpoint().is_err() {
+        // Retirement above is unconditional, but denied cleanup must not read
+        // a retained clock or recover effects from the original request owner.
+        if cx.checkpoint().is_err() {
+            return Err(ClientHttpConnectionError::Legacy(
+                LegacySseHttpClientError::Cancelled,
+            ));
+        }
+        modern_http_capability_ceiling(cx)
+            .map_err(LegacySseHttpClientError::Executor)
+            .map_err(ClientHttpConnectionError::Legacy)?;
+        // Native runtime contexts carry a reactor/timer without necessarily
+        // carrying the separate IoCap reported by has_io(). Keep that live
+        // cleanup owner: substituting the original request context after its
+        // cancellation would prevent the cancellation control from being sent.
+        let io_cx = if cx.timer_driver().is_some()
+            || cx.has_io()
+            || !cx.capabilities().io
+            || cx.checkpoint().is_err()
+        {
             cx
         } else {
             &self.request_cx
@@ -5837,17 +5855,22 @@ impl LegacyHttpRequest {
                     LegacySseHttpClientError::Cancelled,
                 ))));
             }
-            let poll_send = {
-                let _caller = Cx::set_current(Some(io_cx.clone()));
-                send.as_mut().poll(task_cx)
-            };
+            if let Err(error) = modern_http_capability_ceiling(cx) {
+                return Poll::Ready(Ok(Err(LegacySseOutboundSendError::not_submitted(
+                    LegacySseHttpClientError::Executor(error),
+                ))));
+            }
+            let poll_send = crate::http_auth::caller::with_caller(cx, || {
+                crate::http_auth::caller::with_caller(io_cx, || send.as_mut().poll(task_cx))
+            });
             if let Poll::Ready(output) = poll_send {
                 return Poll::Ready(Ok(output));
             }
-            let timed_out = {
-                let _clock = Cx::set_current(Some(clock_cx.clone()));
-                Pin::new(&mut sleep).poll(task_cx).is_ready()
-            };
+            let timed_out = crate::http_auth::caller::with_caller(cx, || {
+                crate::http_auth::caller::with_caller(&clock_cx, || {
+                    Pin::new(&mut sleep).poll(task_cx).is_ready()
+                })
+            });
             if timed_out {
                 return Poll::Ready(Err(()));
             }
