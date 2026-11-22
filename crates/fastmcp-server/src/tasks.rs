@@ -1968,6 +1968,55 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Atomically updates only a working Task's status message and freshness
+    /// timestamp under the exact live elected owner and dispatch fence.
+    ///
+    /// Compare the complete current record generation. A winning write must
+    /// advance that generation, retain the immutable claim generation and
+    /// update its live record-generation binding in the same transaction.
+    /// Preserve the work descriptor, accepted inputs, execution permit,
+    /// attempt/total/retention deadlines, lease expiry, owner and dispatch
+    /// fence. Cancellation, a stale snapshot, or a lost lease returns None
+    /// without changing the Task or notification. Return the exact committed
+    /// snapshot before releasing the transaction.
+    ///
+    /// Stores that do not implement this optional working-status operation
+    /// keep their existing lifecycle behavior and refuse before mutation.
+    fn update_working_status_for_handoff_if_current(
+        &self,
+        _expected: &FinalTaskSnapshot,
+        _owner_id: &str,
+        _dispatch_fence: u64,
+        _task: FinalTask,
+        _notification: FinalTaskStatusNotification,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        Err(McpError::internal_error(
+            "Final task store does not implement working status updates",
+        ))
+    }
+
+    /// Returns payload-free current metadata for this exact elected claim.
+    ///
+    /// A store supporting working-status updates must prove the immutable
+    /// claim generation, owner and dispatch fence still identify the same
+    /// live working invocation, then return its current record generation.
+    /// Metadata updates may advance that record generation but cannot extend
+    /// or replace the claim. Other transitions and lease loss end continuity.
+    /// This lookup never opens or clones application payload.
+    ///
+    /// None supplies no continuity proof. The runtime then retains the old
+    /// exact-generation behavior; this default does not attest an owner or
+    /// fence and never permits adoption of a newer generation.
+    fn get_handoff_access_metadata(
+        &self,
+        _task_id: &FinalTaskId,
+        _claim_generation: u64,
+        _owner_id: &str,
+        _dispatch_fence: u64,
+    ) -> McpResult<Option<FinalTaskAccessMetadata>> {
+        Ok(None)
+    }
+
     /// Legacy raw accepted-input claim.
     ///
     /// New task-service code must use
@@ -3330,7 +3379,10 @@ impl Drop for InMemoryFinalTaskExecutionPermit {
 /// advances the task generation before another runner can recover the payload,
 /// fencing every late finish or restoration from the former owner.
 struct InMemoryFinalTaskHandoffLease {
+    /// Immutable generation that admitted this invocation and its permit.
     generation: u64,
+    /// Current record CAS generation, advanced only by working-status writes.
+    current_generation: u64,
     kind: InMemoryFinalTaskHandoffKind,
     dispatch_elected: bool,
     owner_id: String,
@@ -4323,6 +4375,47 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         }))
     }
 
+    fn get_handoff_access_metadata(
+        &self,
+        task_id: &FinalTaskId,
+        claim_generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
+    ) -> McpResult<Option<FinalTaskAccessMetadata>> {
+        self.process.verify()?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock()?;
+        let Some(lease) = state.handoff_leases.get(task_id) else {
+            return Ok(None);
+        };
+        if lease.generation != claim_generation
+            || !lease.dispatch_elected
+            || lease.owner_id != owner_id
+            || lease.dispatch_fence != Some(dispatch_fence)
+            || lease
+                .recovery_expires_at
+                .is_none_or(|deadline| deadline <= now)
+            || state.generations.get(task_id) != Some(&lease.current_generation)
+            || state
+                .expires_at
+                .get(task_id)
+                .is_some_and(|deadline| *deadline <= now)
+            || !matches!(state.tasks.get(task_id), Some(FinalTask::Working(_)))
+        {
+            return Ok(None);
+        }
+        Ok(Some(FinalTaskAccessMetadata::new(
+            task_id.clone(),
+            lease.current_generation,
+            in_memory_task_creation_generation(&state, task_id)?,
+            state.authenticated_principals.get(task_id).copied(),
+            state.original_operations.get(task_id).cloned(),
+        )))
+    }
+
     fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
         self.process.verify()?;
         let mut state = self
@@ -4531,7 +4624,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_exact_dispatch = state.handoff_leases.get(&task_id).is_some_and(|lease| {
-            lease.generation == expected.generation()
+            lease.current_generation == expected.generation()
                 && lease.dispatch_elected
                 && lease.owner_id == owner_id
                 && lease.dispatch_fence == Some(dispatch_fence)
@@ -4552,6 +4645,103 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             now,
             InMemoryFinalTaskInputMutation::Clear,
         )?;
+        committed_in_memory_final_task_snapshot(&state, &task_id).map(Some)
+    }
+
+    fn update_working_status_for_handoff_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        owner_id: &str,
+        dispatch_fence: u64,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.process.verify()?;
+        let task_id = task.base().task_id.clone();
+        if owner_id.is_empty()
+            || expected.task().base().task_id != task_id
+            || !matches!(expected.task(), FinalTask::Working(_))
+            || !matches!(&task, FinalTask::Working(_))
+        {
+            return Err(McpError::invalid_params(
+                "Working status updates require the same working Task and an elected owner",
+            ));
+        }
+        final_task_payload_bytes(
+            task.base(),
+            MAX_FINAL_TASK_METADATA_BYTES - FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES,
+            "metadata",
+        )?;
+        ensure_final_task_notification_matches_task(&task, &notification)?;
+        validate_final_task_runtime_durations(&task)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.sample_clock()?;
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        let owns_exact_dispatch = state.handoff_leases.get(&task_id).is_some_and(|lease| {
+            lease.current_generation == expected.generation()
+                && lease.dispatch_elected
+                && lease.owner_id == owner_id
+                && lease.dispatch_fence == Some(dispatch_fence)
+                && lease
+                    .recovery_expires_at
+                    .is_some_and(|deadline| deadline > now)
+        });
+        if state.generations.get(&task_id) != Some(&expected.generation())
+            || !owns_exact_dispatch
+            || state.cancellation_requests.contains(&task_id)
+            || in_memory_final_task_execution_exhaustion(&state, &task_id, now).is_some()
+        {
+            return Ok(None);
+        }
+        let current = state.tasks.get(&task_id).ok_or_else(|| {
+            McpError::internal_error("In-memory final task store lost a working task")
+        })?;
+        if !matches!(current, FinalTask::Working(_)) {
+            return Ok(None);
+        }
+        // Both variants are Working. The transition validator preserves every
+        // other base field, so only statusMessage and lastUpdatedAt can change.
+        validate_final_task_transition(current, &task)?;
+        let accepted_input_bytes = state
+            .accepted_inputs
+            .get(&task_id)
+            .map(|inputs| {
+                final_task_payload_bytes(inputs, MAX_FINAL_TASK_INPUT_BYTES, "accepted input")
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let charge = prepare_in_memory_final_task_payload_charge(
+            &task,
+            &notification,
+            state.work_descriptors.get(&task_id),
+            state.initial_work.contains_key(&task_id),
+            accepted_input_bytes,
+            state.input_key_history.get(&task_id),
+            state.original_operations.get(&task_id),
+        )?;
+        let retained_bytes = state.payload_accounting.admit(
+            &task_id,
+            charge,
+            state.authenticated_principals.get(&task_id).copied(),
+        )?;
+        let generation = next_in_memory_final_task_generation(&mut state)?;
+        // All fallible validation and admission precedes this commit. Keep
+        // the permit, inputs and every deadline owned by the same invocation.
+        let lease = state.handoff_leases.get_mut(&task_id).ok_or_else(|| {
+            McpError::internal_error("In-memory final task store lost a live dispatch")
+        })?;
+        lease.current_generation = generation;
+        state
+            .payload_accounting
+            .commit(task_id.clone(), charge, retained_bytes);
+        state.tasks.insert(task_id.clone(), task);
+        state
+            .latest_notifications
+            .insert(task_id.clone(), notification);
+        state.generations.insert(task_id.clone(), generation);
         committed_in_memory_final_task_snapshot(&state, &task_id).map(Some)
     }
 
@@ -4825,16 +5015,20 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
-        let owns_matching_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
-            lease.generation == generation
-                && lease.kind == InMemoryFinalTaskHandoffKind::Initial
-                && lease.owner_id == owner_id
-                && lease.dispatch_fence == dispatch_fence
-                && lease
-                    .recovery_expires_at
-                    .is_some_and(|expires_at| expires_at > now)
-        });
-        if !owns_matching_lease
+        let current_generation = state
+            .handoff_leases
+            .get(task_id)
+            .filter(|lease| {
+                lease.generation == generation
+                    && lease.kind == InMemoryFinalTaskHandoffKind::Initial
+                    && lease.owner_id == owner_id
+                    && lease.dispatch_fence == dispatch_fence
+                    && lease
+                        .recovery_expires_at
+                        .is_some_and(|expires_at| expires_at > now)
+            })
+            .map(|lease| lease.current_generation);
+        if current_generation.is_none()
             || in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
         {
             return Ok(false);
@@ -4843,7 +5037,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         // retirement. Releasing it here would strand a `working` task with
         // cancellation intent after a supervisor error/drop race.
         if state.cancellation_requests.contains(task_id)
-            || state.generations.get(task_id) != Some(&generation)
+            || state.generations.get(task_id).copied() != current_generation
             || !state
                 .tasks
                 .get(task_id)
@@ -4949,16 +5143,20 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.sample_clock()?;
         reclaim_expired_in_memory_final_tasks(&mut state, now);
-        let owns_matching_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
-            lease.generation == generation
-                && lease.kind == InMemoryFinalTaskHandoffKind::Resumed
-                && lease.owner_id == owner_id
-                && lease.dispatch_fence == dispatch_fence
-                && lease
-                    .recovery_expires_at
-                    .is_some_and(|expires_at| expires_at > now)
-        });
-        if !owns_matching_lease
+        let current_generation = state
+            .handoff_leases
+            .get(task_id)
+            .filter(|lease| {
+                lease.generation == generation
+                    && lease.kind == InMemoryFinalTaskHandoffKind::Resumed
+                    && lease.owner_id == owner_id
+                    && lease.dispatch_fence == dispatch_fence
+                    && lease
+                        .recovery_expires_at
+                        .is_some_and(|expires_at| expires_at > now)
+            })
+            .map(|lease| lease.current_generation);
+        if current_generation.is_none()
             || in_memory_final_task_execution_exhaustion(&state, task_id, now).is_some()
         {
             return Ok(false);
@@ -4967,7 +5165,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         // must retain this exact fence until the runner records the terminal
         // cancellation outcome.
         if state.cancellation_requests.contains(task_id)
-            || state.generations.get(task_id) != Some(&generation)
+            || state.generations.get(task_id).copied() != current_generation
             || !state
                 .tasks
                 .get(task_id)
@@ -5074,7 +5272,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             || lease
                 .recovery_expires_at
                 .is_none_or(|expires_at| expires_at <= now)
-            || state.generations.get(task_id) != Some(&generation)
+            || state.generations.get(task_id) != Some(&lease.current_generation)
             || !state
                 .tasks
                 .get(task_id)
@@ -5141,7 +5339,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         if state.cancellation_requests.contains(task_id) {
             return Ok(false);
         }
-        let still_dispatchable = state.generations.get(task_id) == Some(&generation)
+        let still_dispatchable = state.generations.get(task_id) == Some(&lease.current_generation)
             && state
                 .tasks
                 .get(task_id)
@@ -5242,7 +5440,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             return Ok(None);
         }
         let dispatch_elected = state.handoff_leases.get(task_id).is_some_and(|lease| {
-            lease.generation == expected.generation() && lease.dispatch_elected
+            lease.current_generation == expected.generation() && lease.dispatch_elected
         });
         if dispatch_elected {
             record_in_memory_final_task_cancellation(&mut state, task_id)?;
@@ -5605,7 +5803,7 @@ fn record_in_memory_final_task_cancellation(
     let dispatch_elected = state
         .handoff_leases
         .get(task_id)
-        .is_some_and(|lease| lease.generation == generation && lease.dispatch_elected);
+        .is_some_and(|lease| lease.current_generation == generation && lease.dispatch_elected);
     let needs_generation_fence =
         !dispatch_elected && !state.cancellation_requests.contains(task_id);
     let next_generation = needs_generation_fence
@@ -5765,7 +5963,7 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
         let Some(lease_generation) = state
             .handoff_leases
             .get(&task_id)
-            .map(|lease| lease.generation)
+            .map(|lease| lease.current_generation)
         else {
             continue;
         };
@@ -5916,6 +6114,7 @@ fn insert_in_memory_final_task_handoff_lease(
             task_id,
             InMemoryFinalTaskHandoffLease {
                 generation,
+                current_generation: generation,
                 kind,
                 dispatch_elected: false,
                 owner_id: owner_id.to_owned(),
@@ -6187,7 +6386,11 @@ impl FinalTaskHandoffAuthority {
         if !self.execution_revoked.load(TaskServiceOrdering::Acquire)
             && self
                 .runtime
-                .revalidate_task_execution(&self.execution_authorization)
+                .revalidate_handoff_execution(
+                    &self.execution_authorization,
+                    &self.owner_id,
+                    self.dispatch_fence,
+                )
                 .is_ok()
         {
             return Ok(());
@@ -6276,9 +6479,24 @@ impl FinalTaskHandoffAuthority {
         Ok(task)
     }
 
+    fn update_status_message(&self, status_message: Option<String>) -> McpResult<FinalTask> {
+        self.ensure_execution_authorized()?;
+        self.runtime.fenced_update_status_message(
+            &self.task_id,
+            self.generation,
+            &self.owner_id,
+            self.dispatch_fence,
+            status_message,
+        )
+    }
+
     fn is_cancellation_requested(&self) -> McpResult<bool> {
-        self.runtime
-            .fenced_cancellation_requested(&self.task_id, self.generation)
+        self.runtime.fenced_cancellation_requested(
+            &self.task_id,
+            self.generation,
+            &self.owner_id,
+            self.dispatch_fence,
+        )
     }
 }
 
@@ -6319,6 +6537,18 @@ impl FinalTaskInitialWork {
     #[must_use]
     pub const fn work_descriptor(&self) -> &FinalTaskWorkDescriptor {
         &self.work_descriptor
+    }
+
+    /// Publishes a working status message while this invocation continues.
+    ///
+    /// None clears the message. The record generation advances and
+    /// lastUpdatedAt is refreshed; the claim generation, lease and deadlines
+    /// do not. Cancellation or a lost fence rejects the update.
+    pub fn update_status_message(
+        &mut self,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.authority()?.update_status_message(status_message)
     }
 
     /// Enters `input_required` under this handoff's exact elected fence.
@@ -6427,6 +6657,17 @@ impl FinalTaskAcceptedInput {
     #[must_use]
     pub const fn input_responses(&self) -> &FinalTaskInputResponses {
         &self.input_responses
+    }
+
+    /// Publishes a working status message while this invocation continues.
+    ///
+    /// None clears the message. The accepted input and execution claim remain
+    /// owned by this invocation; the update neither consumes nor renews them.
+    pub fn update_status_message(
+        &mut self,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        self.authority()?.update_status_message(status_message)
     }
 
     /// Splits this one-shot supervisor handoff into its task ID and input map.
@@ -8283,6 +8524,124 @@ impl FinalTaskRuntime {
         })
     }
 
+    /// Revalidates a still-running invocation without treating a working
+    /// metadata write as a new execution grant. Only the store's exact
+    /// owner/fence proof can advance the original authorization record.
+    fn revalidate_handoff_execution(
+        &self,
+        expected: &FinalTaskAccessMetadata,
+        owner_id: &str,
+        dispatch_fence: u64,
+    ) -> McpResult<()> {
+        let Some(current) = self.store.get_handoff_access_metadata(
+            expected.task_id(),
+            expected.generation(),
+            owner_id,
+            dispatch_fence,
+        )? else {
+            return self.revalidate_task_execution(expected);
+        };
+        if current.task_id() != expected.task_id()
+            || current.generation() < expected.generation()
+            || current.creation_generation() != expected.creation_generation()
+            || current.authenticated_principal() != expected.authenticated_principal()
+            || current.original_operation() != expected.original_operation()
+        {
+            return Err(authorization::task_execution_denied());
+        }
+        self.authorize_task_execution(&current)
+    }
+
+    fn handoff_snapshot_is_current(
+        &self,
+        current: &FinalTaskSnapshot,
+        claim_generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
+    ) -> McpResult<bool> {
+        if current.generation() == claim_generation {
+            // Preserve the original exact-generation path for stores that do
+            // not implement working-status continuity. Their existing fenced
+            // mutation/renewal still validates the owner and dispatch fence.
+            return Ok(true);
+        }
+        let Some(metadata) = self.store.get_handoff_access_metadata(
+            &current.task().base().task_id,
+            claim_generation,
+            owner_id,
+            dispatch_fence,
+        )? else {
+            return Ok(false);
+        };
+        Ok(metadata.generation() == current.generation()
+            && metadata.generation() > claim_generation
+            && metadata.admits_snapshot(current))
+    }
+
+    fn load_handoff_snapshot(
+        &self,
+        task_id: &FinalTaskId,
+        claim_generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
+    ) -> McpResult<FinalTaskSnapshot> {
+        let current = self.load_task_snapshot(task_id)?;
+        if !self.handoff_snapshot_is_current(
+            &current,
+            claim_generation,
+            owner_id,
+            dispatch_fence,
+        )? {
+            return Err(stale_final_task_handoff_error());
+        }
+        Ok(current)
+    }
+
+    fn fenced_update_status_message(
+        &self,
+        task_id: &FinalTaskId,
+        claim_generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
+        status_message: Option<String>,
+    ) -> McpResult<FinalTask> {
+        final_task_payload_bytes(
+            &status_message,
+            MAX_FINAL_TASK_METADATA_BYTES - FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES,
+            "status message",
+        )?;
+        let current =
+            self.load_handoff_snapshot(task_id, claim_generation, owner_id, dispatch_fence)?;
+        let FinalTask::Working(base) = current.task() else {
+            return Err(McpError::invalid_params(
+                "only a working task can publish a status message",
+            ));
+        };
+        let task = FinalTask::Working(transition_final_task_base(
+            base.clone(),
+            FinalTaskStatus::Working,
+            status_message,
+        )?);
+        let notification = final_task_notification(&task);
+        self.validate_task_transition_write(&current, &task, &notification)?;
+        let result = self.store.update_working_status_for_handoff_if_current(
+            &current,
+            owner_id,
+            dispatch_fence,
+            task.clone(),
+            notification.clone(),
+        );
+        if !matches!(&result, Ok(Some(_))) {
+            self.expire_execution_snapshot(&current)?;
+        }
+        let Some(committed) = result? else {
+            return Err(stale_final_task_handoff_error());
+        };
+        let committed = self.validate_committed_transition(&current, &task, committed)?;
+        self.emit_committed(notification, &committed);
+        Ok(task)
+    }
+
     fn fenced_require_input(
         &self,
         task_id: &FinalTaskId,
@@ -8299,10 +8658,7 @@ impl FinalTaskRuntime {
         }
         FinalTaskInputLedger::from_requests(&input_requests)
             .map_err(|error| McpError::invalid_params(error.to_string()))?;
-        let current = self.load_task_snapshot(task_id)?;
-        if current.generation() != generation {
-            return Err(stale_final_task_handoff_error());
-        }
+        let current = self.load_handoff_snapshot(task_id, generation, owner_id, dispatch_fence)?;
         let FinalTask::Working(base) = current.task() else {
             return Err(McpError::invalid_params(
                 "only a working task can require client input",
@@ -8335,10 +8691,7 @@ impl FinalTaskRuntime {
         result: FinalTaskCallToolResult,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        let current = self.load_task_snapshot(task_id)?;
-        if current.generation() != generation {
-            return Err(stale_final_task_handoff_error());
-        }
+        let current = self.load_handoff_snapshot(task_id, generation, owner_id, dispatch_fence)?;
         let FinalTask::Working(base) = current.task() else {
             return Err(McpError::invalid_params("only a working task can complete"));
         };
@@ -8369,10 +8722,7 @@ impl FinalTaskRuntime {
         error: FinalTaskError,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        let current = self.load_task_snapshot(task_id)?;
-        if current.generation() != generation {
-            return Err(stale_final_task_handoff_error());
-        }
+        let current = self.load_handoff_snapshot(task_id, generation, owner_id, dispatch_fence)?;
         if matches!(
             current.task(),
             FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
@@ -8409,8 +8759,12 @@ impl FinalTaskRuntime {
         let Some(current) = self.load_optional_task_snapshot(expected.task_id())? else {
             return Ok(false);
         };
-        if current.generation() != expected.generation()
-            || !expected.admits_snapshot(&current)
+        if !self.handoff_snapshot_is_current(
+            &current,
+            expected.generation(),
+            owner_id,
+            dispatch_fence,
+        )? || !expected.admits_snapshot(&current)
             || !matches!(current.task(), FinalTask::Working(_))
         {
             return Ok(false);
@@ -8444,10 +8798,20 @@ impl FinalTaskRuntime {
                 // A race lost to another fenced transition is already settled.
                 // A failure on the same record remains a real backend error.
                 let current = self.load_optional_task_snapshot(expected.task_id())?;
-                if current.as_ref().is_none_or(|current| {
-                    current.generation() != expected.generation()
-                        || !expected.admits_snapshot(current)
-                }) {
+                let same_handoff = current
+                    .as_ref()
+                    .map(|current| {
+                        self.handoff_snapshot_is_current(
+                            current,
+                            expected.generation(),
+                            owner_id,
+                            dispatch_fence,
+                        )
+                        .map(|same| same && expected.admits_snapshot(current))
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                if !same_handoff {
                     Ok(false)
                 } else if self.store.is_cancellation_requested(expected.task_id())? {
                     // Cancellation intent preserves the elected generation.
@@ -8464,10 +8828,20 @@ impl FinalTaskRuntime {
                         Ok(_) => Ok(true),
                         Err(cancellation_error) => {
                             let current = self.load_optional_task_snapshot(expected.task_id())?;
-                            if current.as_ref().is_none_or(|current| {
-                                current.generation() != expected.generation()
-                                    || !expected.admits_snapshot(current)
-                            }) {
+                            let same_handoff = current
+                                .as_ref()
+                                .map(|current| {
+                                    self.handoff_snapshot_is_current(
+                                        current,
+                                        expected.generation(),
+                                        owner_id,
+                                        dispatch_fence,
+                                    )
+                                    .map(|same| same && expected.admits_snapshot(current))
+                                })
+                                .transpose()?
+                                .unwrap_or(false);
+                            if !same_handoff {
                                 Ok(false)
                             } else {
                                 Err(cancellation_error)
@@ -8489,10 +8863,7 @@ impl FinalTaskRuntime {
         dispatch_fence: u64,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        let current = self.load_task_snapshot(task_id)?;
-        if current.generation() != generation {
-            return Err(stale_final_task_handoff_error());
-        }
+        let current = self.load_handoff_snapshot(task_id, generation, owner_id, dispatch_fence)?;
         if matches!(
             current.task(),
             FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
@@ -8520,11 +8891,10 @@ impl FinalTaskRuntime {
         &self,
         task_id: &FinalTaskId,
         generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
     ) -> McpResult<bool> {
-        let current = self.load_task_snapshot(task_id)?;
-        if current.generation() != generation {
-            return Err(stale_final_task_handoff_error());
-        }
+        self.load_handoff_snapshot(task_id, generation, owner_id, dispatch_fence)?;
         self.store.is_cancellation_requested(task_id)
     }
 
@@ -11237,6 +11607,18 @@ impl FinalTaskExecutionGuard {
         store_now >= deadline
     }
 
+    fn snapshot_is_current(&self, current: &FinalTaskSnapshot) -> McpResult<bool> {
+        match self.dispatch_fence {
+            Some(fence) => self.runtime.handoff_snapshot_is_current(
+                current,
+                self.generation,
+                &self.owner_id,
+                fence,
+            ),
+            None => Ok(current.generation() == self.generation),
+        }
+    }
+
     fn is_cancellation_requested(&self) -> McpResult<bool> {
         if self.is_authoritatively_expired() {
             return Ok(false);
@@ -11247,9 +11629,9 @@ impl FinalTaskExecutionGuard {
             }
             return Err(McpError::invalid_params("Task not found"));
         };
-        if current.generation() != self.generation {
-            // A terminal or newer fenced transition already consumed this
-            // handoff. It is not this guard's cancellation to retire.
+        if !self.snapshot_is_current(&current)? {
+            // A terminal or different fenced invocation already consumed this
+            // handoff. Working status writes preserve its exact lease.
             return Ok(false);
         }
         self.runtime.store.is_cancellation_requested(&self.task_id)
@@ -11314,6 +11696,9 @@ impl FinalTaskExecutionGuard {
         // policy; never use a successor's generation to authorize old work.
         let result = if self.transition_committed.load(TaskServiceOrdering::Acquire) {
             self.runtime.authorize_task_execution(expected)
+        } else if let Some(fence) = self.dispatch_fence {
+            self.runtime
+                .revalidate_handoff_execution(expected, &self.owner_id, fence)
         } else {
             self.runtime.revalidate_task_execution(expected)
         };
@@ -11393,7 +11778,7 @@ impl FinalTaskExecutionGuard {
             }
             return Err(McpError::invalid_params("Task not found"));
         };
-        Ok(current.generation() == self.generation
+        Ok(self.snapshot_is_current(&current)?
             && matches!(current.task(), FinalTask::Working(_))
             && !self
                 .runtime
@@ -16938,6 +17323,614 @@ mod tests {
         task_id
     }
 
+    mod working_status_updates {
+        use super::*;
+
+        struct Fixture {
+            store: Arc<InMemoryFinalTaskStore>,
+            clock: Arc<Mutex<Instant>>,
+            runtime: FinalTaskRuntime,
+            events: Arc<Mutex<Vec<FinalTask>>>,
+            task_id: FinalTaskId,
+            handoff: FinalTaskSupervisorHandoff,
+            guard: Option<FinalTaskExecutionGuard>,
+        }
+
+        impl Fixture {
+            fn new(resumed: bool) -> Self {
+                Self::with_store(resumed, in_memory_store_with_test_clock(2))
+            }
+
+            fn with_store(
+                resumed: bool,
+                (store, clock): (Arc<InMemoryFinalTaskStore>, Arc<Mutex<Instant>>),
+            ) -> Self {
+                let events: Arc<Mutex<Vec<FinalTask>>> = Arc::new(Mutex::new(Vec::new()));
+                let sink = Arc::clone(&events);
+                let runtime = FinalTaskRuntime::new(
+                    store.clone(),
+                    FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+                    Arc::new(move |notification| {
+                        sink.lock().unwrap().push(notification.params.task);
+                    }),
+                );
+                let task_id = if resumed {
+                    create_accepted_final_input(&runtime, roots_input())
+                } else {
+                    create_final_task_state_fixture(&runtime, None)
+                        .task
+                        .base()
+                        .task_id
+                        .clone()
+                };
+                let mut handoff = recover(&runtime, resumed);
+                let mut guard = FinalTaskExecutionGuard::new(
+                    &runtime,
+                    FINAL_TASK_TEST_DIRECT_OWNER,
+                    &handoff,
+                );
+                assert!(guard.elect().unwrap());
+                handoff.attach_authority(guard.authority().unwrap());
+                events.lock().unwrap().clear();
+                Self {
+                    store,
+                    clock,
+                    runtime,
+                    events,
+                    task_id,
+                    handoff,
+                    guard: Some(guard),
+                }
+            }
+
+            fn update(&mut self, message: Option<&str>) -> McpResult<FinalTask> {
+                update(&mut self.handoff, message)
+            }
+
+            fn snapshot(&self) -> FinalTaskSnapshot {
+                self.store.get_task_snapshot(&self.task_id).unwrap().unwrap()
+            }
+
+            fn facts(&self) -> InvocationFacts {
+                let state = self.store.state.lock().unwrap();
+                let lease = state.handoff_leases.get(&self.task_id).unwrap();
+                let task = state.tasks.get(&self.task_id).unwrap();
+                InvocationFacts {
+                    claim_generation: lease.generation,
+                    owner: lease.owner_id.clone(),
+                    fence: lease.dispatch_fence,
+                    lease_expiry: lease.recovery_expires_at,
+                    permit: Arc::as_ptr(&lease._execution_permit) as usize,
+                    retention: state.expires_at.get(&self.task_id).copied(),
+                    budget: state.execution_budgets[&self.task_id],
+                    immutable_task: serde_json::json!({
+                        "id": task.base().task_id,
+                        "created": task.base().created_at,
+                        "ttl": task.base().ttl_ms,
+                        "poll": task.base().poll_interval_ms,
+                        "creationGeneration": state.creation_generations.get(&self.task_id),
+                    }),
+                    private_payload: serde_json::json!({
+                        "work": state.work_descriptors.get(&self.task_id)
+                            .map(FinalTaskWorkDescriptor::as_value),
+                        "initial": state.initial_work.get(&self.task_id)
+                            .map(FinalTaskWorkDescriptor::as_value),
+                        "inputs": state.accepted_inputs.get(&self.task_id),
+                        "keys": state.input_key_history.get(&self.task_id)
+                            .map(|history| &history.keys),
+                    }),
+                }
+            }
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct InvocationFacts {
+            claim_generation: u64,
+            owner: String,
+            fence: Option<u64>,
+            lease_expiry: Option<Instant>,
+            permit: usize,
+            retention: Option<Instant>,
+            budget: FinalTaskExecutionBudget,
+            immutable_task: serde_json::Value,
+            private_payload: serde_json::Value,
+        }
+
+        fn roots_input() -> FinalTaskInputResponses {
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap()
+        }
+
+        fn recover(runtime: &FinalTaskRuntime, resumed: bool) -> FinalTaskSupervisorHandoff {
+            if resumed {
+                FinalTaskSupervisorHandoff::Resumed(
+                    runtime.recover_accepted_input().unwrap().unwrap(),
+                )
+            } else {
+                FinalTaskSupervisorHandoff::Initial(
+                    runtime.recover_initial_work().unwrap().unwrap(),
+                )
+            }
+        }
+
+        fn update(
+            handoff: &mut FinalTaskSupervisorHandoff,
+            message: Option<&str>,
+        ) -> McpResult<FinalTask> {
+            let message = message.map(str::to_owned);
+            match handoff {
+                FinalTaskSupervisorHandoff::Initial(initial) => {
+                    initial.update_status_message(message)
+                }
+                FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                    accepted.update_status_message(message)
+                }
+            }
+        }
+
+        fn complete(handoff: &FinalTaskSupervisorHandoff) -> McpResult<FinalTask> {
+            let result = serde_json::from_value(serde_json::json!({"content": []})).unwrap();
+            match handoff {
+                FinalTaskSupervisorHandoff::Initial(initial) => {
+                    initial.complete_task(result, Some("finished".to_owned()))
+                }
+                FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                    accepted.complete_task(result, Some("finished".to_owned()))
+                }
+            }
+        }
+
+        #[test]
+        fn working_status_updates_preserve_invocation_and_publish_exact_snapshots() {
+            for resumed in [false, true] {
+                let mut fixture = Fixture::new(resumed);
+                let initial = fixture.snapshot();
+                let mut previous_generation = initial.generation();
+                for message in [Some("preparing"), Some("processing"), None] {
+                    let facts = fixture.facts();
+                    *fixture.clock.lock().unwrap() += StdDuration::from_millis(1);
+                    let published = fixture.update(message).unwrap();
+                    let current = fixture.snapshot();
+                    assert!(matches!(current.task(), FinalTask::Working(_)));
+                    assert!(current.generation() > previous_generation);
+                    assert_eq!(current.creation_generation(), initial.creation_generation());
+                    assert_eq!(current.task().base().status_message.as_deref(), message);
+                    assert!(final_tasks_match_exactly(current.task(), &published).unwrap());
+                    assert_eq!(fixture.facts(), facts);
+                    assert_eq!(
+                        fixture.store.state.lock().unwrap().handoff_leases[&fixture.task_id]
+                            .current_generation,
+                        current.generation(),
+                    );
+                    assert!(!fixture.guard.as_ref().unwrap().transition_committed
+                        .load(TaskServiceOrdering::Acquire));
+                    assert!(fixture.guard.as_ref().unwrap().renew().unwrap());
+                    assert_final_task_payload_accounting(&fixture.store);
+                    previous_generation = current.generation();
+                }
+                let events = fixture.events.lock().unwrap().clone();
+                assert_eq!(events.len(), 3);
+                assert_eq!(
+                    events.iter().map(|task| task.base().status_message.as_deref())
+                        .collect::<Vec<_>>(),
+                    vec![Some("preparing"), Some("processing"), None],
+                );
+                let completed = complete(&fixture.handoff).unwrap();
+                assert!(matches!(completed, FinalTask::Completed { .. }));
+                assert!(fixture.snapshot().generation() > previous_generation);
+                assert_eq!(fixture.events.lock().unwrap().len(), 4);
+                assert!(
+                    fixture.guard.as_ref().unwrap().renew().unwrap(),
+                    "own terminal commit still permits bounded cleanup",
+                );
+                let terminal = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
+                assert!(fixture.update(Some("after-terminal")).is_err());
+                assert_eq!(
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), terminal,
+                );
+                assert_eq!(fixture.events.lock().unwrap().len(), 4);
+                assert_eq!(fixture.store.active_task_count(), 1,
+                    "the invocation keeps its permit through cleanup");
+                drop(fixture.guard.take());
+                assert_eq!(fixture.store.active_task_count(), 0);
+                assert_final_task_payload_accounting(&fixture.store);
+            }
+        }
+
+        #[test]
+        fn working_status_rejects_stale_foreign_and_oversized_writes_without_mutation() {
+            for resumed in [false, true] {
+                let mut fixture = Fixture::new(resumed);
+                let stale = fixture.snapshot();
+                fixture.update(Some("accepted")).unwrap();
+                let current = fixture.snapshot();
+                let fence = fixture.guard.as_ref().unwrap().dispatch_fence.unwrap();
+                let candidate = FinalTask::Working(transition_final_task_base(
+                    current.task().base().clone(),
+                    FinalTaskStatus::Working,
+                    Some("forbidden".to_owned()),
+                ).unwrap());
+                let before = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
+                let facts = fixture.facts();
+                for (expected, owner, dispatch_fence) in [
+                    (&stale, FINAL_TASK_TEST_DIRECT_OWNER, fence),
+                    (&current, "another-owner", fence),
+                    (&current, FINAL_TASK_TEST_DIRECT_OWNER, fence + 1),
+                ] {
+                    assert!(fixture.store.update_working_status_for_handoff_if_current(
+                        expected, owner, dispatch_fence,
+                        candidate.clone(), final_task_notification(&candidate),
+                    ).unwrap().is_none());
+                    assert_eq!(
+                        final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
+                        before,
+                    );
+                    assert_eq!(fixture.facts(), facts);
+                }
+                assert!(!fixture.store.replace_task_if_current(
+                    &stale, candidate.clone(), final_task_notification(&candidate),
+                ).unwrap(), "a status write must invalidate every old record CAS token");
+                let mut changed_retention = candidate;
+                if let FinalTask::Working(base) = &mut changed_retention {
+                    base.ttl_ms = Some(final_task_duration(60_001).unwrap());
+                }
+                assert!(fixture.store.update_working_status_for_handoff_if_current(
+                    &current, FINAL_TASK_TEST_DIRECT_OWNER, fence,
+                    changed_retention.clone(), final_task_notification(&changed_retention),
+                ).is_err());
+                let too_large = "x".repeat(MAX_FINAL_TASK_METADATA_BYTES);
+                assert!(fixture.update(Some(&too_large)).is_err());
+                assert_eq!(
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), before,
+                );
+                assert_eq!(fixture.facts(), facts);
+                assert_eq!(fixture.events.lock().unwrap().len(), 1);
+                assert_final_task_payload_accounting(&fixture.store);
+            }
+        }
+
+        #[test]
+        fn working_status_quota_and_generation_exhaustion_preserve_the_live_claim() {
+            for resumed in [false, true] {
+                let clock = Arc::new(Mutex::new(Instant::now()));
+                let reader = Arc::clone(&clock);
+                let store = Arc::new(InMemoryFinalTaskStore::with_clock_and_payload_capacity(
+                    2, 8_192, Arc::new(move || *reader.lock().unwrap()),
+                ).unwrap().with_owner_capacity(2, 8_192).unwrap());
+                let mut fixture = Fixture::with_store(resumed, (store, clock));
+                fixture.update(Some("small")).unwrap();
+                let before = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
+                let facts = fixture.facts();
+                let large = "x".repeat(8_192);
+                assert!(fixture.update(Some(&large)).is_err(),
+                    "the message fits metadata bounds but exceeds retained payload capacity");
+                assert_eq!(
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), before,
+                );
+                assert_eq!(fixture.facts(), facts);
+                fixture.update(Some("small-again")).unwrap();
+                fixture.store.state.lock().unwrap().next_generation = u64::MAX;
+                let exhausted = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
+                assert!(fixture.update(Some("no-generation")).is_err());
+                assert_eq!(
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), exhausted,
+                );
+                assert!(fixture.guard.as_ref().unwrap().renew().unwrap());
+                assert_final_task_payload_accounting(&fixture.store);
+            }
+        }
+
+        #[test]
+        fn working_status_keeps_active_cancellation_attached_to_latest_record() {
+            for resumed in [false, true] {
+                let mut fixture = Fixture::new(resumed);
+                fixture.update(Some("first")).unwrap();
+                fixture.update(Some("second")).unwrap();
+                let generation = fixture.snapshot().generation();
+                fixture.runtime.cancel_task(&fixture.task_id).unwrap();
+                assert!(matches!(fixture.snapshot().task(), FinalTask::Working(_)));
+                assert_eq!(fixture.snapshot().generation(), generation);
+                let before = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
+                assert!(fixture.update(Some("after-cancel")).is_err());
+                assert_eq!(
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), before,
+                );
+                assert!(fixture.guard.as_ref().unwrap().is_cancellation_requested().unwrap());
+                assert!(fixture.guard.as_mut().unwrap()
+                    .retire_if_cancellation_requested().unwrap());
+                assert!(matches!(fixture.snapshot().task(), FinalTask::Cancelled(_)));
+                assert!(fixture.snapshot().generation() > generation);
+                assert_eq!(fixture.events.lock().unwrap().len(), 3);
+                assert_final_task_payload_accounting(&fixture.store);
+            }
+        }
+
+        #[test]
+        fn working_status_composes_with_async_task_get_and_cancellation() {
+            for resumed in [false, true] {
+                let mut fixture = Fixture::new(resumed);
+                let ctx = McpContext::new(Cx::for_testing(), 71);
+                fixture.update(Some("visible-through-get")).unwrap();
+                let visible = ready_task_control(fixture.runtime.task_for_request_with_cx(
+                    &ctx,
+                    &fixture.task_id,
+                    TaskAccessAction::Get,
+                ))
+                .unwrap();
+                assert_eq!(
+                    visible.task().base().status_message.as_deref(),
+                    Some("visible-through-get"),
+                );
+                fixture.update(Some("current-at-cancel")).unwrap();
+                let current_generation = fixture.snapshot().generation();
+                ready_task_control(fixture.runtime.cancel_task_for_request_with_cx(
+                    &ctx,
+                    &fixture.task_id,
+                ))
+                .unwrap();
+                assert_eq!(fixture.snapshot().generation(), current_generation);
+                assert!(matches!(fixture.snapshot().task(), FinalTask::Working(_)));
+                assert!(fixture.update(Some("after-async-cancel")).is_err());
+                assert!(fixture.guard.as_mut().unwrap()
+                    .retire_if_cancellation_requested().unwrap());
+                let cancelled = ready_task_control(fixture.runtime.task_for_request_with_cx(
+                    &ctx,
+                    &fixture.task_id,
+                    TaskAccessAction::Get,
+                ))
+                .unwrap();
+                assert!(matches!(cancelled.task(), FinalTask::Cancelled(_)));
+                assert!(cancelled.generation() > current_generation);
+                assert_final_task_payload_accounting(&fixture.store);
+            }
+        }
+
+        #[test]
+        fn working_status_preserves_restore_finish_and_recovery_payloads() {
+            for resumed in [false, true] {
+                for finish in [false, true] {
+                    let mut fixture = Fixture::new(resumed);
+                    fixture.update(Some("checkpoint")).unwrap();
+                    let latest = fixture.snapshot();
+                    let original_budget = fixture.facts().budget;
+                    if finish {
+                        assert!(fixture.guard.as_ref().unwrap().finish().unwrap());
+                    } else {
+                        assert!(fixture.guard.as_mut().unwrap().restore().unwrap());
+                    }
+                    assert!(final_tasks_match_exactly(
+                        fixture.snapshot().task(), latest.task(),
+                    ).unwrap());
+                    assert_eq!(fixture.snapshot().generation(), latest.generation());
+                    drop(fixture.guard.take());
+                    if finish {
+                        assert!(fixture.runtime.recover_initial_work().unwrap().is_none());
+                        assert!(fixture.runtime.recover_accepted_input().unwrap().is_none());
+                    } else {
+                        let mut successor = recover(&fixture.runtime, resumed);
+                        let mut guard = FinalTaskExecutionGuard::new(
+                            &fixture.runtime, FINAL_TASK_TEST_DIRECT_OWNER, &successor,
+                        );
+                        assert!(guard.elect().unwrap());
+                        successor.attach_authority(guard.authority().unwrap());
+                        let budget = successor.execution_budget().unwrap();
+                        assert_eq!(budget.total_deadline(), original_budget.total_deadline());
+                        assert_eq!(budget.attempts(), original_budget.attempts() + 1);
+                        if let FinalTaskSupervisorHandoff::Resumed(accepted) = &successor {
+                            assert_eq!(accepted.input_responses(), &roots_input());
+                        }
+                        let before = final_task_restoration_snapshot(
+                            &fixture.store, &fixture.task_id,
+                        );
+                        assert!(fixture.update(Some("stale-owner")).is_err());
+                        assert_eq!(
+                            final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
+                            before,
+                        );
+                        update(&mut successor, Some("recovered")).unwrap();
+                        complete(&successor).unwrap();
+                    }
+                    assert_final_task_payload_accounting(&fixture.store);
+                }
+            }
+        }
+
+        #[test]
+        fn working_status_cannot_renew_or_adopt_an_expired_dispatch() {
+            for resumed in [false, true] {
+                let mut fixture = Fixture::new(resumed);
+                fixture.update(Some("retained")).unwrap();
+                let last_generation = fixture.snapshot().generation();
+                let deadline = fixture.facts().lease_expiry.unwrap();
+                *fixture.clock.lock().unwrap() = deadline;
+                assert!(fixture.update(Some("late")).is_err());
+                let reclaimed = fixture.snapshot();
+                assert!(reclaimed.generation() > last_generation);
+                assert_eq!(reclaimed.task().base().status_message.as_deref(), Some("retained"));
+                assert!(!matches!(
+                    fixture.guard.as_ref().unwrap().renew(),
+                    Ok(true)
+                ));
+                drop(fixture.guard.take());
+                let mut successor = recover(&fixture.runtime, resumed);
+                let mut guard = FinalTaskExecutionGuard::new(
+                    &fixture.runtime, FINAL_TASK_TEST_DIRECT_OWNER, &successor,
+                );
+                assert!(guard.elect().unwrap());
+                successor.attach_authority(guard.authority().unwrap());
+                let before = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
+                assert!(fixture.update(Some("late-again")).is_err());
+                assert_eq!(
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), before,
+                );
+                update(&mut successor, Some("new-invocation")).unwrap();
+                complete(&successor).unwrap();
+                assert_final_task_payload_accounting(&fixture.store);
+            }
+        }
+
+        #[test]
+        fn working_status_does_not_extend_the_execution_deadline() {
+            for resumed in [false, true] {
+                let mut fixture = Fixture::with_store(resumed, execution_test_store(1_000, 100, 8));
+                let budget = fixture.facts().budget;
+                fixture.update(Some("started")).unwrap();
+                *fixture.clock.lock().unwrap() =
+                    budget.attempt_deadline().unwrap() - StdDuration::from_millis(1);
+                fixture.update(Some("still-working")).unwrap();
+                assert_eq!(fixture.facts().budget, budget);
+                *fixture.clock.lock().unwrap() = budget.attempt_deadline().unwrap();
+                assert!(fixture.update(Some("too-late")).is_err());
+                let failed = fixture.snapshot();
+                assert!(matches!(failed.task(), FinalTask::Failed { .. }));
+                assert_ne!(failed.task().base().status_message.as_deref(), Some("too-late"));
+                assert_final_task_payload_accounting(&fixture.store);
+            }
+        }
+
+        #[test]
+        fn working_status_can_enter_input_required_and_continue_a_resumed_invocation() {
+            let mut fixture = Fixture::new(false);
+            fixture.update(Some("initial-work")).unwrap();
+            fixture.update(Some("requesting-input")).unwrap();
+            let FinalTaskSupervisorHandoff::Initial(initial) = &fixture.handoff else {
+                unreachable!();
+            };
+            initial.require_input(final_roots_request(), Some("need-roots".to_owned())).unwrap();
+            assert!(matches!(fixture.snapshot().task(), FinalTask::InputRequired { .. }));
+            drop(fixture.guard.take());
+            fixture.runtime.update_task(&fixture.task_id, &roots_input()).unwrap();
+            let mut resumed = recover(&fixture.runtime, true);
+            let mut guard = FinalTaskExecutionGuard::new(
+                &fixture.runtime, FINAL_TASK_TEST_DIRECT_OWNER, &resumed,
+            );
+            assert!(guard.elect().unwrap());
+            resumed.attach_authority(guard.authority().unwrap());
+            update(&mut resumed, Some("using-roots")).unwrap();
+            update(&mut resumed, Some("almost-finished")).unwrap();
+            complete(&resumed).unwrap();
+            assert!(matches!(fixture.snapshot().task(), FinalTask::Completed { .. }));
+            let events = fixture.events.lock().unwrap();
+            assert!(events.iter().any(|task| matches!(task, FinalTask::InputRequired { .. })));
+            assert_eq!(events.last().unwrap().base().status_message.as_deref(), Some("finished"));
+            assert_final_task_payload_accounting(&fixture.store);
+        }
+
+        struct ReportingSupervisor;
+
+        impl ApplicationTaskSupervisor for ReportingSupervisor {
+            fn resume<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                mut handoff: FinalTaskSupervisorHandoff,
+            ) -> FinalTaskSupervisorFuture<'a> {
+                Box::pin(async move {
+                    update(&mut handoff, Some("before-yield"))?;
+                    let mut yielded = false;
+                    std::future::poll_fn(|context| {
+                        if yielded {
+                            std::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            context.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    }).await;
+                    update(&mut handoff, Some("after-yield"))?;
+                    complete(&handoff)?;
+                    Ok(())
+                })
+            }
+        }
+
+        #[test]
+        fn working_status_public_supervisor_survives_pending_poll_and_finishes() {
+            with_task_test_runtime(async {
+                for resumed in [false, true] {
+                    let (store, _clock) = in_memory_store_with_test_clock(2);
+                    let events: Arc<Mutex<Vec<FinalTask>>> = Arc::new(Mutex::new(Vec::new()));
+                    let sink = Arc::clone(&events);
+                    let runtime = FinalTaskRuntime::new(
+                        store.clone(),
+                        FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+                        Arc::new(move |notification| {
+                            sink.lock().unwrap().push(notification.params.task);
+                        }),
+                    );
+                    let task_id = if resumed {
+                        create_accepted_final_input(&runtime, roots_input())
+                    } else {
+                        create_final_task_state_fixture(&runtime, None).task.base().task_id.clone()
+                    };
+                    let handoff = recover(&runtime, resumed);
+                    let runner = runtime
+                        .install_task_service(1, Arc::new(ReportingSupervisor))
+                        .unwrap();
+                    events.lock().unwrap().clear();
+                    let cx = Cx::current().unwrap();
+                    runner.resume_handoff(&cx, handoff).await.unwrap();
+                    assert!(matches!(
+                        store.get_task(&task_id).unwrap(),
+                        Some(FinalTask::Completed { .. })
+                    ));
+                    assert_eq!(
+                        events.lock().unwrap().iter()
+                            .map(|task| task.base().status_message.clone()).collect::<Vec<_>>(),
+                        vec![
+                            Some("before-yield".to_owned()),
+                            Some("after-yield".to_owned()),
+                            Some("finished".to_owned()),
+                        ],
+                    );
+                    assert_eq!(store.active_task_count(), 0);
+                    assert_final_task_payload_accounting(&store);
+                }
+            });
+        }
+
+        struct CurrentGrant {
+            allowed: AtomicBool,
+            generations: Mutex<Vec<u64>>,
+        }
+
+        impl TaskExecutionAuthorizer for CurrentGrant {
+            fn authorize(&self, task: &FinalTaskAccessMetadata) -> McpResult<()> {
+                self.generations.lock().unwrap().push(task.generation());
+                if self.allowed.load(AtomicOrdering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(McpError::invalid_request("revoked"))
+                }
+            }
+        }
+
+        #[test]
+        fn working_status_rechecks_current_execution_grants_after_each_revision() {
+            for resumed in [false, true] {
+                let mut fixture = Fixture::new(resumed);
+                let policy = Arc::new(CurrentGrant {
+                    allowed: AtomicBool::new(true),
+                    generations: Mutex::new(Vec::new()),
+                });
+                fixture
+                    .runtime
+                    .install_execution_authorizer(policy.clone())
+                    .unwrap();
+                fixture.update(Some("first")).unwrap();
+                fixture.update(Some("second")).unwrap();
+                let generations = policy.generations.lock().unwrap().clone();
+                assert!(generations.windows(2).any(|pair| pair[1] > pair[0]),
+                    "current authorization observes the newly committed record");
+                policy.allowed.store(false, AtomicOrdering::SeqCst);
+                assert!(fixture.update(Some("revoked-message")).is_err());
+                assert!(matches!(fixture.snapshot().task(), FinalTask::Failed { .. }));
+                assert!(fixture.events.lock().unwrap().iter().all(|task| {
+                    task.base().status_message.as_deref() != Some("revoked-message")
+                }));
+                assert_final_task_payload_accounting(&fixture.store);
+            }
+        }
+    }
+
     fn final_working_task_without_ttl(task_id: &str) -> FinalTask {
         let timestamp = FinalTaskTimestamp::parse("2026-07-28T12:00:00.000Z")
             .expect("fixed test timestamp is valid");
@@ -17035,6 +18028,7 @@ mod tests {
                 "cancellation": state.cancellation_requests.contains(task_id),
                 "lease": lease.map(|lease| serde_json::json!({
                     "generation": lease.generation,
+                    "currentGeneration": lease.current_generation,
                     "initial": lease.kind == InMemoryFinalTaskHandoffKind::Initial,
                     "elected": lease.dispatch_elected,
                     "owner": lease.owner_id,

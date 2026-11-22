@@ -395,6 +395,16 @@ scenarios, including every input-required one, so a measurement taken without
   Descendants must cooperate with cancellation; dropping the service requests
   cleanup owned by the caller's runtime, and abrupt runtime destruction does not
   prove cleanup completed.
+- **Running Tasks can publish status messages.** An elected mutable
+  `FinalTaskInitialWork` or `FinalTaskAcceptedInput` can call
+  `update_status_message(Some("Processing the next batch".into()))` while
+  continuing its work. Passing `None` clears the message. Each accepted update
+  advances the record version, refreshes `lastUpdatedAt`, and publishes the
+  matching Tasks status notification. It preserves the invocation's input,
+  execution permit, lease and deadlines, so the same worker can later request
+  input or finish. Current authorization, cancellation and the elected fence
+  are checked before a write. The built-in store supports this path; custom
+  stores must implement the atomic working-status and handoff-continuity hooks.
 - **Authenticated local Tasks retain their caller:** task creation atomically
   stores a private principal binding, original tool registration, and immutable
   creation generation. Protected task-producing tools require both
