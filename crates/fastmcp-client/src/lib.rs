@@ -15356,7 +15356,11 @@ impl FinalTaskHandle {
     /// returns an exhausted watcher without opening a subscription. A live
     /// watcher stops after yielding its first terminal Task snapshot. An
     /// acknowledgement accepting no Task IDs is yielded once and exhausts
-    /// the watcher without changing its retained snapshot.
+    /// the watcher without changing its retained snapshot. Finite Task
+    /// retention bounds opening, ingress and reconciliation. An expired
+    /// nonterminal handle returns an exhausted watcher without allocating a
+    /// request ID. The opening caller's cancellation and deadline remain
+    /// authoritative for every later read.
     pub async fn watch<'client, 'handle>(
         &'handle mut self,
         cx: &Cx,
@@ -15366,6 +15370,23 @@ impl FinalTaskHandle {
         if self.is_terminal() {
             return Ok(FinalTaskWatch {
                 listener: None,
+                observation: None,
+                stop_reason: task_wait::ready_outcome(self.task()),
+                handle: self,
+                client,
+            });
+        }
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let observation = task_wait::HttpTaskWatchObservation::new(cx, self.task())
+            .map_err(HttpClientError::CoreResult)?;
+        let caller = observation.caller_for(cx);
+        if let Some(reason) = observation.stop(&caller, cx) {
+            return Ok(FinalTaskWatch {
+                listener: None,
+                observation: Some(observation),
+                stop_reason: Some(reason),
                 handle: self,
                 client,
             });
@@ -15380,11 +15401,40 @@ impl FinalTaskHandle {
                 "final task handle could not compose its task subscription filter",
             ))
         })?;
-        let listener = client
-            .open_final_task_watch_listener(cx, notifications, limits)
-            .await?;
+        let mut listener = None;
+        let opened = observation
+            .guard(&caller, cx, async {
+                listener = Some(
+                    client
+                        .open_final_task_watch_listener(&caller, notifications, limits)
+                        .await?,
+                );
+                Ok::<(), HttpClientError>(())
+            })
+            .await;
+        let stop_reason = match opened {
+            Ok(result) => {
+                result?;
+                None
+            }
+            Err(reason) => {
+                if let Some(mut listener) = listener.take() {
+                    listener.cancel();
+                }
+                if matches!(
+                    reason,
+                    FinalTaskWaitOutcome::ObservationCancelled
+                        | FinalTaskWaitOutcome::DeadlineElapsed
+                ) {
+                    return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+                }
+                Some(reason)
+            }
+        };
         Ok(FinalTaskWatch {
-            listener: Some(listener),
+            listener,
+            observation: Some(observation),
+            stop_reason,
             handle: self,
             client,
         })
@@ -15444,23 +15494,44 @@ pub enum FinalTaskWatchEvent {
 #[cfg(feature = "tasks")]
 pub struct FinalTaskWatch<'client, 'handle> {
     listener: Option<ModernHttpSubscriptionListener>,
+    observation: Option<task_wait::HttpTaskWatchObservation>,
+    stop_reason: Option<FinalTaskWaitOutcome>,
     handle: &'handle mut FinalTaskHandle,
     client: &'client mut HttpClient,
 }
 
 #[cfg(feature = "tasks")]
 impl FinalTaskWatch<'_, '_> {
+    /// Returns the latest admitted Task without relinquishing the watch.
+    #[must_use]
+    pub fn task(&self) -> &FinalTask {
+        self.handle.task()
+    }
+
+    /// Returns a local observation limit or admitted terminal Task outcome.
+    ///
+    /// Stream completion, server cancellation, an empty acknowledgement and
+    /// protocol or transport errors do not imply a durable Task outcome.
+    #[must_use]
+    pub const fn stop_reason(&self) -> Option<FinalTaskWaitOutcome> {
+        self.stop_reason
+    }
+
     /// Reads one task watcher event, skipping exact repeated Task snapshots.
     ///
     /// `None` is returned after a terminal Task snapshot or subscription result
     /// was yielded, after an acknowledgement accepted no Task IDs, or
-    /// immediately when the handle was already terminal when the watcher
-    /// opened. A Task terminal or empty acknowledgement closes only this
+    /// when Task retention expires, or immediately when the handle was
+    /// already terminal or expired when the watcher opened. Inspect
+    /// [`Self::stop_reason`] to distinguish these local outcomes. A Task
+    /// terminal, expiry or empty acknowledgement closes only this
     /// response body; buffered later snapshots cannot change the handle.
     ///
     /// A changed notification with an equal or older update instant triggers
-    /// one `tasks/get` under this same caller context and the client's request
-    /// timeout policy. That read produces [`FinalTaskWatchEvent::TaskReconciled`]
+    /// one `tasks/get` under the opening caller context and the client's request
+    /// timeout policy. This read also meets Task retention and the current
+    /// waiter's cancellation and deadline without replacing the opening clock.
+    /// That read produces [`FinalTaskWatchEvent::TaskReconciled`]
     /// instead of treating the notification as authoritative. Failed or
     /// cancelled reconciliation closes this watch and preserves its previous
     /// snapshot. Dropping the reconciliation future also closes this watch;
@@ -15486,13 +15557,35 @@ impl FinalTaskWatch<'_, '_> {
         &mut self,
         cx: &Cx,
     ) -> Result<Option<FinalTaskWatchEvent>, HttpClientError> {
+        if self.listener.is_none() {
+            return Ok(None);
+        }
+        let waiter = http_auth::caller::with_caller(cx, || {
+            Cx::current().expect("HTTP Task watch waiter is installed")
+        });
+        let caller = self
+            .observation
+            .as_ref()
+            .expect("a live HTTP Task watch has an observation budget")
+            .caller_for(&waiter);
         loop {
             let Some(listener) = self.listener.as_mut() else {
                 return Ok(None);
             };
-            let event = listener.next_event(cx).await.map_err(|error| {
-                HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(error))
-            })?;
+            let event = match self
+                .observation
+                .as_ref()
+                .expect("a live HTTP Task watch has an observation budget")
+                .guard(&caller, &waiter, listener.next_event(&caller))
+                .await
+            {
+                Ok(result) => result.map_err(|error| {
+                    HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(
+                        error,
+                    ))
+                })?,
+                Err(reason) => return self.stop_observing(reason, false),
+            };
             match event {
                 None => {
                     self.listener = None;
@@ -15535,35 +15628,68 @@ impl FinalTaskWatch<'_, '_> {
                         asupersync::runtime::yield_now().await;
                         continue;
                     }
-                    if self
+                    let reconcile = self
                         .handle
-                        .notification_needs_reconciliation(&notification.params.task)?
-                    {
+                        .notification_needs_reconciliation(&notification.params.task)?;
+                    let mut retained_listener = None;
+                    let task = if reconcile {
                         // Retain ownership in this future while awaiting the
                         // read: cancellation/drop cannot forget the conflict
                         // and silently resume the old notification stream.
-                        let listener = self.listener.take();
-                        let task = self
-                            .client
-                            .get_final_task_snapshot(cx, self.handle.task_id().clone())
-                            .await?;
-                        self.handle.admit_snapshot(task)?;
-                        if !self.handle.is_terminal() {
-                            self.listener = listener;
+                        retained_listener = self.listener.take();
+                        match self
+                            .observation
+                            .as_ref()
+                            .expect("a live HTTP Task watch has an observation budget")
+                            .guard(
+                                &caller,
+                                &waiter,
+                                self.client.get_final_task_snapshot(
+                                    &caller,
+                                    self.handle.task_id().clone(),
+                                ),
+                            )
+                            .await
+                        {
+                            Ok(result) => result?,
+                            Err(reason) => return self.stop_observing(reason, true),
                         }
-                        return Ok(Some(FinalTaskWatchEvent::TaskReconciled {
+                    } else {
+                        notification.params.task.clone()
+                    };
+                    task_wait::admit_identity(self.handle.task(), &task)
+                        .map_err(HttpClientError::CoreResult)?;
+                    let observation = self
+                        .observation
+                        .as_mut()
+                        .expect("a live HTTP Task watch has an observation budget");
+                    observation
+                        .refresh_retention(&caller, &task)
+                        .map_err(HttpClientError::CoreResult)?;
+                    if let Some(reason) = observation.stop(&caller, &waiter) {
+                        return self.stop_observing(reason, reconcile);
+                    }
+                    // Identity, exact-repeat suppression and the refreshed
+                    // lifetime have already been admitted. Commit immediately
+                    // after the final fence instead of serializing the two
+                    // snapshots again while their retention clock advances.
+                    self.handle.task = task;
+                    if self.handle.is_terminal() {
+                        self.stop_reason = task_wait::ready_outcome(self.handle.task());
+                        if let Some(mut listener) = self.listener.take() {
+                            listener.cancel();
+                        }
+                    } else if reconcile {
+                        self.listener = retained_listener;
+                    }
+                    return Ok(Some(if reconcile {
+                        FinalTaskWatchEvent::TaskReconciled {
                             observed: Box::new(notification),
                             authoritative: self.handle.task().clone(),
-                        }));
-                    }
-                    self.handle
-                        .admit_snapshot(notification.params.task.clone())?;
-                    if self.handle.is_terminal()
-                        && let Some(mut listener) = self.listener.take()
-                    {
-                        listener.cancel();
-                    }
-                    return Ok(Some(FinalTaskWatchEvent::TaskUpdated(notification)));
+                        }
+                    } else {
+                        FinalTaskWatchEvent::TaskUpdated(notification)
+                    }));
                 }
                 Some(ModernHttpSubscriptionListenEvent::Terminal {
                     subscription_id,
@@ -15592,6 +15718,48 @@ impl FinalTaskWatch<'_, '_> {
                 }
             }
         }
+    }
+
+    fn stop_observing(
+        &mut self,
+        reason: FinalTaskWaitOutcome,
+        reconciling: bool,
+    ) -> Result<Option<FinalTaskWatchEvent>, HttpClientError> {
+        use http_executor::{ModernHttpExecutorError, ModernHttpSubscriptionListenError};
+
+        self.stop_reason = Some(reason);
+        let subscription_id = self
+            .listener
+            .as_ref()
+            .map(|listener| listener.request_id().clone());
+        if let Some(mut listener) = self.listener.take() {
+            listener.cancel();
+        }
+        // Preserve the native HTTP API's distinct cancellation receipts for a
+        // stream and its one authoritative read. Expiry only stops observation.
+        let error = match reason {
+            FinalTaskWaitOutcome::ObservationCancelled if !reconciling => {
+                return Err(HttpClientError::Connection(
+                    ClientHttpConnectionError::SubscriptionsListen(
+                        ModernHttpSubscriptionListenError::CallerCancelled {
+                            request_id: subscription_id.expect("a stopped stream has an owner"),
+                        },
+                    ),
+                ));
+            }
+            FinalTaskWaitOutcome::ObservationCancelled => ModernHttpExecutorError::Cancelled,
+            FinalTaskWaitOutcome::DeadlineElapsed => ModernHttpExecutorError::Transport(
+                asupersync::http::h1::ClientError::DeadlineExceeded,
+            ),
+            _ => return Ok(None),
+        };
+        Err(HttpClientError::Connection(if reconciling {
+            ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
+        } else {
+            ClientHttpConnectionError::SubscriptionsListen(
+                ModernHttpSubscriptionListenError::Executor(error),
+            )
+        }))
     }
 }
 

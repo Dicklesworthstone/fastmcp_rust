@@ -1574,6 +1574,371 @@ fn public_http_task_poll_and_watch_accept_authoritative_retention_changes() {
 }
 
 #[test]
+fn public_http_task_watch_preflight_refuses_expiry_and_denied_time_without_request_ids() {
+    use asupersync::cx::{CapSet, CapSetRuntimeMask};
+
+    for (status, reason, deny_time) in [
+        ("working", FinalTaskWaitOutcome::TaskExpired, false),
+        ("completed", FinalTaskWaitOutcome::Completed, false),
+        ("working", FinalTaskWaitOutcome::TimerUnavailable, true),
+    ] {
+        let mut initial = task(status, None);
+        initial["createdAt"] = json!("1970-01-01T00:00:00Z");
+        initial["ttlMs"] = if deny_time { Value::Null } else { json!(1) };
+        let created = creation_receipt(initial);
+        let mut handle = FinalTaskHandle::from_created(&created).unwrap();
+        let retained = serde_json::to_vec(handle.task()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            let mut discover = accept(&listener);
+            assert_eq!(read(&mut discover)["method"], "server/discover");
+            write(&mut discover, &discovery()).unwrap();
+            let mut sibling = accept(&listener);
+            let request = read(&mut sibling);
+            assert_eq!(request["method"], "tools/list");
+            assert_eq!(request["id"], 2, "a refused watch allocates no request ID");
+            write(
+                &mut sibling,
+                &json!({"jsonrpc":"2.0", "id":2,
+                    "result":{"resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"}}),
+            )
+            .unwrap();
+        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut client = HttpClient::connect(
+                    &cx,
+                    plan(&target),
+                    ClientInfo {
+                        name: "expired-task-watch".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                )
+                .await
+                .unwrap();
+                let driverless = Cx::for_request();
+                let opening_caller = if deny_time {
+                    with_caller(&driverless, || {
+                        let _denied = Cx::push_restriction(
+                            <CapSet<true, false, true, true, true> as CapSetRuntimeMask>::MASK,
+                        );
+                        Cx::current().unwrap()
+                    })
+                } else {
+                    driverless.clone()
+                };
+                assert_eq!(opening_caller.capabilities().time, !deny_time);
+                let mut watch = handle
+                    .watch(
+                        &opening_caller,
+                        &mut client,
+                        crate::sse::SseLimits::new(4096, 8192, 8).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(watch.stop_reason(), Some(reason));
+                assert!(watch.next_event(&cx).await.unwrap().is_none());
+                assert_eq!(serde_json::to_vec(watch.task()).unwrap(), retained);
+                drop(watch);
+                assert!(driverless.checkpoint().is_ok());
+                client.list_tools(&cx, None).await.unwrap();
+            });
+        peer.join().unwrap();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpTaskWatchRetentionCase {
+    Silent,
+    Shortened,
+    Renewed,
+    Removed,
+    ExpiredNotification,
+    ExpiredReconciliation,
+    ReconciliationExpires,
+    OpeningCallerCancelled,
+}
+
+fn write_http_task_watch_event(stream: &mut TcpStream, event: Value) {
+    write!(stream, "data: {event}\n\n").unwrap();
+    stream.flush().unwrap();
+}
+
+fn http_task_watch_notification(mut task: Value) -> Value {
+    task["_meta"] = json!({"io.modelcontextprotocol/subscriptionId":3});
+    json!({"jsonrpc":"2.0", "method":"notifications/tasks", "params":task})
+}
+
+fn assert_http_task_watch_socket_closed(stream: &mut TcpStream) {
+    let mut byte = [0_u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("stopping Task observation must close its owned socket: {other:?}"),
+    }
+}
+
+fn run_http_task_watch_retention_case(case: HttpTaskWatchRetentionCase) {
+    use HttpTaskWatchRetentionCase as Case;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let opening_caller = Cx::for_request();
+    let stopped_caller = opening_caller.clone();
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+    let reconcile = matches!(
+        case,
+        Case::ExpiredReconciliation | Case::ReconciliationExpires | Case::OpeningCallerCancelled
+    );
+    let peer = std::thread::spawn(move || {
+        let mut discover = accept(&listener);
+        assert_eq!(read(&mut discover)["method"], "server/discover");
+        write(&mut discover, &discovery()).unwrap();
+        let mut attach = accept(&listener);
+        assert_eq!(read(&mut attach)["method"], "tasks/get");
+        let mut initial = task("working", None);
+        initial["createdAt"] = json!("1970-01-01T00:00:00Z");
+        if matches!(
+            case,
+            Case::Silent | Case::Renewed | Case::Removed | Case::ReconciliationExpires
+        ) {
+            initial["ttlMs"] = json!(u64::try_from(wall_now_nanos() / 1_000_000).unwrap() + 2_000);
+        }
+        write(&mut attach, &response(2, initial.clone())).unwrap();
+        let mut stream = accept(&listener);
+        let request = read(&mut stream);
+        assert_eq!(request["method"], "subscriptions/listen");
+        assert_eq!(request["id"], 3);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n").unwrap();
+        write_http_task_watch_event(
+            &mut stream,
+            json!({
+                "jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
+                "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}, "notifications":{"taskIds":["wait-task"]}}
+            }),
+        );
+        match case {
+            Case::Silent => {}
+            Case::Shortened | Case::Renewed | Case::Removed => {
+                let mut updated = initial.clone();
+                updated["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+                updated["ttlMs"] = match case {
+                    Case::Shortened => {
+                        json!(u64::try_from(wall_now_nanos() / 1_000_000).unwrap() + 1_000)
+                    }
+                    Case::Renewed => {
+                        json!(u64::try_from(wall_now_nanos() / 1_000_000).unwrap() + 60_000)
+                    }
+                    Case::Removed => Value::Null,
+                    _ => unreachable!(),
+                };
+                write_http_task_watch_event(
+                    &mut stream,
+                    http_task_watch_notification(updated.clone()),
+                );
+                if case != Case::Shortened {
+                    release_receiver
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    let mut completed = task("completed", None);
+                    completed["createdAt"] = updated["createdAt"].clone();
+                    completed["ttlMs"] = updated["ttlMs"].clone();
+                    completed["lastUpdatedAt"] = json!("2026-07-28T12:00:03Z");
+                    write_http_task_watch_event(
+                        &mut stream,
+                        http_task_watch_notification(completed),
+                    );
+                }
+            }
+            Case::ExpiredNotification => {
+                let mut completed = task("completed", None);
+                completed["createdAt"] = initial["createdAt"].clone();
+                completed["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+                completed["ttlMs"] = json!(1);
+                write_http_task_watch_event(&mut stream, http_task_watch_notification(completed));
+            }
+            Case::ExpiredReconciliation
+            | Case::ReconciliationExpires
+            | Case::OpeningCallerCancelled => {
+                let mut ambiguous = initial.clone();
+                ambiguous["status"] = json!("cancelled");
+                write_http_task_watch_event(&mut stream, http_task_watch_notification(ambiguous));
+                let mut get = accept(&listener);
+                let request = read(&mut get);
+                assert_eq!(request["method"], "tasks/get");
+                assert_eq!(request["id"], 4);
+                let mut completed = task("completed", None);
+                completed["createdAt"] = initial["createdAt"].clone();
+                completed["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+                if case == Case::ExpiredReconciliation {
+                    completed["ttlMs"] = json!(1);
+                    write(&mut get, &response(4, completed)).unwrap();
+                } else {
+                    if case == Case::OpeningCallerCancelled {
+                        stopped_caller.set_cancel_requested(true);
+                    }
+                    assert_http_task_watch_socket_closed(&mut get);
+                    // A late terminal, even one removing the TTL, cannot
+                    // resurrect the exhausted observation or replace state.
+                    let _ = write(&mut get, &response(4, completed));
+                }
+            }
+        }
+        assert_http_task_watch_socket_closed(&mut stream);
+        let mut sibling = accept(&listener);
+        let request = read(&mut sibling);
+        let expected_id = if reconcile { 5 } else { 4 };
+        assert_eq!(request["method"], "tools/list");
+        assert_eq!(request["id"], expected_id);
+        write(
+            &mut sibling,
+            &json!({"jsonrpc":"2.0", "id":expected_id,
+                "result":{"resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"}}),
+        )
+        .unwrap();
+    });
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = HttpClient::connect(
+                &cx,
+                plan(&target),
+                ClientInfo {
+                    name: "retained-http-task-watch".to_owned(),
+                    version: "1".to_owned(),
+                },
+                ClientCapabilities::default(),
+            )
+            .await
+            .unwrap();
+            let mut handle = client
+                .attach_final_task(&cx, FinalTaskId::parse("wait-task").unwrap())
+                .await
+                .unwrap();
+            let original_expiry = retention_deadline(handle.task()).unwrap();
+            let initial = serde_json::to_vec(handle.task()).unwrap();
+            assert!(opening_caller.timer_driver().is_none());
+            let mut watch = handle
+                .watch(
+                    &opening_caller,
+                    &mut client,
+                    crate::sse::SseLimits::new(4096, 8192, 8).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                watch.next_event(&cx).await.unwrap(),
+                Some(FinalTaskWatchEvent::Acknowledged { .. })
+            ));
+            let mut expected = initial;
+            if matches!(case, Case::Shortened | Case::Renewed | Case::Removed) {
+                assert!(matches!(
+                    watch.next_event(&cx).await.unwrap(),
+                    Some(FinalTaskWatchEvent::TaskUpdated(_))
+                ));
+                assert!(matches!(watch.task(), FinalTask::Working(_)));
+                expected = serde_json::to_vec(watch.task()).unwrap();
+                if case != Case::Shortened {
+                    let delay = original_expiry
+                        .unwrap()
+                        .saturating_sub(wall_now_nanos())
+                        .max(0)
+                        + 50_000_000;
+                    asupersync::time::sleep(
+                        cx.now(),
+                        Duration::from_nanos(u64::try_from(delay).unwrap()),
+                    )
+                    .await;
+                    release_sender.send(()).unwrap();
+                }
+            }
+            let observed = watch.next_event(&cx).await;
+            if matches!(case, Case::Renewed | Case::Removed) {
+                assert!(matches!(
+                    observed.unwrap(),
+                    Some(FinalTaskWatchEvent::TaskUpdated(_))
+                ));
+                assert!(matches!(watch.task(), FinalTask::Completed { .. }));
+                assert_eq!(watch.stop_reason(), Some(FinalTaskWaitOutcome::Completed));
+            } else if case == Case::OpeningCallerCancelled {
+                assert!(matches!(
+                    observed,
+                    Err(HttpClientError::Connection(
+                        crate::ClientHttpConnectionError::Modern(
+                            crate::ModernHttpClientError::Executor(
+                                crate::http_executor::ModernHttpExecutorError::Cancelled
+                            )
+                        )
+                    ))
+                ));
+                assert_eq!(
+                    watch.stop_reason(),
+                    Some(FinalTaskWaitOutcome::ObservationCancelled)
+                );
+                assert_eq!(serde_json::to_vec(watch.task()).unwrap(), expected);
+            } else {
+                assert!(
+                    observed.unwrap().is_none(),
+                    "expired observation must not yield a late event: {case:?}"
+                );
+                assert_eq!(watch.stop_reason(), Some(FinalTaskWaitOutcome::TaskExpired));
+                assert_eq!(serde_json::to_vec(watch.task()).unwrap(), expected);
+            }
+            assert!(watch.next_event(&cx).await.unwrap().is_none());
+            drop(watch);
+            assert!(
+                cx.checkpoint().is_ok(),
+                "stopping observation must preserve the healthy waiter"
+            );
+            client.list_tools(&cx, None).await.unwrap();
+        });
+    peer.join().unwrap();
+}
+
+#[test]
+fn public_http_task_watch_silent_stream_stops_at_retention() {
+    run_http_task_watch_retention_case(HttpTaskWatchRetentionCase::Silent);
+}
+
+#[test]
+fn public_http_task_watch_authoritative_ttl_changes_adjust_retention() {
+    for case in [
+        HttpTaskWatchRetentionCase::Shortened,
+        HttpTaskWatchRetentionCase::Renewed,
+        HttpTaskWatchRetentionCase::Removed,
+    ] {
+        run_http_task_watch_retention_case(case);
+    }
+}
+
+#[test]
+fn public_http_task_watch_expired_updates_cannot_publish_terminal_state() {
+    for case in [
+        HttpTaskWatchRetentionCase::ExpiredNotification,
+        HttpTaskWatchRetentionCase::ExpiredReconciliation,
+        HttpTaskWatchRetentionCase::ReconciliationExpires,
+    ] {
+        run_http_task_watch_retention_case(case);
+    }
+}
+
+#[test]
+fn public_http_task_watch_reconciliation_retains_opening_caller_cancellation() {
+    run_http_task_watch_retention_case(HttpTaskWatchRetentionCase::OpeningCallerCancelled);
+}
+
+#[test]
 fn public_http_task_input_expiry_refuses_before_request_allocation() {
     let live_expiry_ms = u64::try_from(wall_now_nanos() / 1_000_000).unwrap() + 300_000;
     for ttl_ms in [None, Some(live_expiry_ms), Some(1)] {

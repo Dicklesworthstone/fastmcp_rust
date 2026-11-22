@@ -1873,7 +1873,7 @@ where
     }
 }
 
-fn ready_outcome(task: &FinalTask) -> Option<FinalTaskWaitOutcome> {
+pub(super) fn ready_outcome(task: &FinalTask) -> Option<FinalTaskWaitOutcome> {
     Some(match task {
         FinalTask::Working(_) => return None,
         FinalTask::InputRequired { .. } => FinalTaskWaitOutcome::InputRequired,
@@ -1929,6 +1929,116 @@ fn retention_deadline(task: &FinalTask) -> McpResult<Option<i128>> {
         .checked_add(i128::from(millis) * 1_000_000)
         .map(Some)
         .ok_or_else(invalid)
+}
+
+/// HTTP retains its opening caller even when another context drives later
+/// reads. Its native transport also accepts driverless wall-clock callers;
+/// keep that established timer behavior without relaxing the stream APIs.
+pub(super) struct HttpTaskWatchObservation {
+    caller: Cx,
+    cancellation: McpRequestCancellation,
+    budget: WaitBudget,
+}
+
+impl HttpTaskWatchObservation {
+    pub(super) fn new(cx: &Cx, task: &FinalTask) -> McpResult<Self> {
+        let caller = with_caller(cx, || {
+            Cx::current().expect("HTTP Task watch caller is installed")
+        });
+        let budget = WaitBudget::new(
+            &caller,
+            crate::MAX_CLIENT_SUBSCRIPTION_ABSOLUTE_TIMEOUT,
+            task,
+        )?;
+        Ok(Self {
+            caller,
+            cancellation: McpRequestCancellation::new(),
+            budget,
+        })
+    }
+
+    pub(super) fn caller_for(&self, waiter: &Cx) -> Cx {
+        with_caller(waiter, || {
+            with_caller(&self.caller, || {
+                Cx::current().expect("HTTP Task watch caller is installed")
+            })
+        })
+    }
+
+    pub(super) fn stop(&self, caller: &Cx, waiter: &Cx) -> Option<FinalTaskWaitOutcome> {
+        let time_allowed = with_caller(caller, || {
+            Cx::current()
+                .expect("HTTP Task watch caller is installed")
+                .capabilities()
+                .time
+        }) && waiter.capabilities().time;
+        if !time_allowed {
+            return Some(FinalTaskWaitOutcome::TimerUnavailable);
+        }
+        self.budget
+            .stop(caller, &self.cancellation)
+            .or_else(|| task_watch_waiter_stop(waiter, &self.cancellation))
+    }
+
+    pub(super) fn refresh_retention(&mut self, caller: &Cx, task: &FinalTask) -> McpResult<()> {
+        self.budget.refresh_retention(caller, task)
+    }
+
+    pub(super) async fn guard<T>(
+        &self,
+        caller: &Cx,
+        waiter: &Cx,
+        operation: impl Future<Output = T>,
+    ) -> Result<T, FinalTaskWaitOutcome> {
+        let slice = Duration::from_millis(20);
+        let waiter_delay = || {
+            waiter.budget().deadline.map_or(slice, |deadline| {
+                slice.min(Duration::from_nanos(deadline.duration_since(waiter.now())))
+            })
+        };
+        let mut operation = std::pin::pin!(operation);
+        let mut wake = Box::pin(asupersync::time::sleep(
+            caller.now(),
+            self.budget.remaining(caller).min(slice),
+        ));
+        let mut waiter_wake = Box::pin(asupersync::time::sleep(waiter.now(), waiter_delay()));
+        std::future::poll_fn(|task_cx| {
+            with_caller(caller, || {
+                if let Some(reason) = self.stop(caller, waiter) {
+                    return Poll::Ready(Err(reason));
+                }
+                // Admit TIME before polling the operation: native HTTP may
+                // itself register a Sleep before it first returns Pending.
+                // A missing driver remains valid for native wall-clock HTTP.
+                let result = operation.as_mut().poll(task_cx);
+                // Ingress and reconciliation may finish in the same poll as
+                // expiration. No successful late result may reach admission.
+                if let Some(reason) = self.stop(caller, waiter) {
+                    return Poll::Ready(Err(reason));
+                }
+                if result.is_pending() {
+                    if wake.as_mut().poll(task_cx).is_ready() {
+                        wake.set(asupersync::time::sleep(
+                            caller.now(),
+                            self.budget.remaining(caller).min(slice),
+                        ));
+                        task_cx.waker().wake_by_ref();
+                    }
+                    // Never compare absolute timestamps across runtimes. A
+                    // separate timer keeps a stricter waiter's own deadline
+                    // live even when the opening clock does not advance.
+                    with_caller(waiter, || {
+                        if waiter_wake.as_mut().poll(task_cx).is_ready() {
+                            waiter_wake.set(asupersync::time::sleep(waiter.now(), waiter_delay()));
+                            task_cx.waker().wake_by_ref();
+                        }
+                    });
+                }
+                result.map(Ok)
+            })
+        })
+        .await
+    }
 }
 
 struct WaitBudget {
