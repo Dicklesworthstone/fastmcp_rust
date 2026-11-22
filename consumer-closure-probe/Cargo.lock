@@ -434,7 +434,7 @@ checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
 
 [[package]]
 name = "consumer-closure-probe"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "fastmcp-rust",
 ]
@@ -773,9 +773,9 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
-version = "0.18.0"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
+checksum = "0a2e16b9a584b602f1e0e5e22c30ca0906786088c27500653e432d086def8b53"
 dependencies = [
  "bit-set",
  "regex-automata",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "asupersync",
  "dirs",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "asupersync",
  "chacha20poly1305",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "fastmcp-protocol",
  "proc-macro-crate",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64",
  "fastmcp-core",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "argon2",
  "asupersync",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "asupersync",
  "fastmcp-core",
@@ -905,6 +905,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -1377,9 +1378,9 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lru"
-version = "0.18.5"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+checksum = "83be4da409554841af087163ad187608824ad8ca8713d8e124c8e0f704a2f92f"
 dependencies = [
  "hashbrown",
 ]
@@ -1969,9 +1970,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.13.1"
+version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+checksum = "9807af0e638c12e753aa1b4e601791bf2a8f71274023c8bbeec12fc149950857"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -1998,9 +1999,9 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
 name = "rich_rust"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d49c27580d13ba376b565cbaa1af2de2ee320a93789c66d54c0478c53f11dcfe"
+checksum = "72e015f48c6658ba6b493933695fb75f06e4b9af37f5c3ecc730761b28b59ed4"
 dependencies = [
  "bitflags",
  "crossterm",
@@ -2572,9 +2573,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.2.1+spec-1.1.0"
+version = "1.2.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5755c51863cdac711f1956baf8eb9588e060755f7d3c4c979e70ea1e1f32cd7"
+checksum = "5426cb1b964690d913f6c5c1a1ae0b42f428ec506bb4d452876d7a209c9bca3b"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -2608,9 +2609,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.5+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
+checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
 dependencies = [
  "winnow",
 ]
@@ -3294,9 +3295,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.1"
+version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 dependencies = [
  "zeroize_derive",
 ]

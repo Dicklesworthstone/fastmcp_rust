@@ -6,6 +6,166 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
+## [v0.14.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.14.0) -- 2026-11-22 (GitHub Release)
+
+1,100 commits since v0.13.0. Pre-1.0 minor release delivering native enterprise
+authorization and resource-server policy enforcement, end-to-end MCP Apps and
+WebSocket transport/proxy support, caller-owned async Task control storage and
+fenced worker status updates, operator readiness and Prometheus diagnostics,
+headless server embeddings, supervised stdio/Task recovery, dependency security
+hardening (0 `cargo audit` vulnerabilities), and fixes for GitHub issues #81,
+#101, and #107 (plus partial #88).
+
+### Breaking changes
+
+- **`asupersync` dependency bumped to `=0.6.2`** (`asupersync = "=0.6.2"`).
+  Callers passing `asupersync::Cx` across crate boundaries must align on
+  `asupersync 0.6.2`
+  ([f0264c96](https://github.com/Dicklesworthstone/fastmcp_rust/commit/f0264c96)).
+- **`TestClient::new_modern` and `TestClient::new_auto`** now take an explicit
+  caller `cx: Cx` as their first parameter to satisfy the `Cx`-first public
+  signature contract
+  ([04040fc5](https://github.com/Dicklesworthstone/fastmcp_rust/commit/04040fc5)).
+- **RFC 9112 section 9.6 HTTP request half-close semantics**: clean TCP
+  write-half-close (`FIN`) after a complete request body no longer cancels a
+  pending secured HTTP response; abortive closes (`RST`), pipelined extra bytes,
+  deadlines, and write errors cancel the request-local domain immediately while
+  isolating siblings. Incomplete client SSE streams reset with zero linger on
+  cancellation/timeout/drop so servers distinguish abandonment from legal
+  half-close
+  ([01344f57](https://github.com/Dicklesworthstone/fastmcp_rust/commit/01344f57),
+  [fd28990b](https://github.com/Dicklesworthstone/fastmcp_rust/commit/fd28990b),
+  [bf803253](https://github.com/Dicklesworthstone/fastmcp_rust/commit/bf803253),
+  [cc48d0c0](https://github.com/Dicklesworthstone/fastmcp_rust/commit/cc48d0c0)).
+
+### Enterprise authorization & OAuth/DPoP (`enterprise-auth`, `jwt-resource-auth`, `builtin-auth-server`)
+
+- **Resource-server enterprise policy & managed JWKS refresh**:
+  `EnterpriseResourceConfiguration`, `EnterpriseResourcePolicy`,
+  `EnterpriseAuthProvider`, and `EnterpriseResourceError` enforce bounded
+  AS/IdP metadata admission, RS256 RFC 9068 access-token verification via
+  `JwtResourceVerifier`, managed JWKS refresh integration, request-local
+  enterprise declaration overlays, and lease invalidation across policy/key
+  rotation and revocation
+  ([c21b59aa](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c21b59aa),
+  [440e6ef3](https://github.com/Dicklesworthstone/fastmcp_rust/commit/440e6ef3),
+  [c807755b](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c807755b),
+  [04040fc5](https://github.com/Dicklesworthstone/fastmcp_rust/commit/04040fc5)).
+- **Client enterprise exchange, subject continuity & HTTP binding**: guarded
+  two-stage RFC 8693 + RFC 7523 OIDC-to-ID-JAG-to-access-token exchange with
+  replay reservation, reviewed subject-mapping continuity across exchange and
+  HTTP policy binding, purpose-bound key fetching, strict deadline enforcement,
+  and live grant authority retention
+  ([5adbf02f](https://github.com/Dicklesworthstone/fastmcp_rust/commit/5adbf02f),
+  [d1478264](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d1478264),
+  [acfaf284](https://github.com/Dicklesworthstone/fastmcp_rust/commit/acfaf284),
+  [1e871677](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1e871677),
+  [690b1520](https://github.com/Dicklesworthstone/fastmcp_rust/commit/690b1520)).
+- **Downstream OAuth input continuations & DPoP Task resume**: downstream
+  input resumption through authenticated `ManagedOAuthProvider` gateways,
+  in-place DPoP grant renewal, owner-bound Task checkpoint persistence, and
+  pre-runtime validation of wrong owner/endpoint/expiry records
+  ([2455300a](https://github.com/Dicklesworthstone/fastmcp_rust/commit/2455300a),
+  [4e79eabf](https://github.com/Dicklesworthstone/fastmcp_rust/commit/4e79eabf),
+  [2f55878b](https://github.com/Dicklesworthstone/fastmcp_rust/commit/2f55878b),
+  [f7d53ac4](https://github.com/Dicklesworthstone/fastmcp_rust/commit/f7d53ac4)).
+- **Argon2id verification**: bounded password/secret verification outside
+  issuer locks under `builtin-auth-server`
+  ([15ec899e](https://github.com/Dicklesworthstone/fastmcp_rust/commit/15ec899e),
+  [8e32529a](https://github.com/Dicklesworthstone/fastmcp_rust/commit/8e32529a)).
+
+### MCP Apps, WebSocket, Tasks, and Extensions
+
+- **MCP Apps & `html5ever` UI validation** (`apps` feature): one-shot
+  authorized cancellation of owned server Tasks, host-delegated `ui/initialize`,
+  bounded HTML validation, and hardened View cancellation cleanup
+  ([570c96c8](https://github.com/Dicklesworthstone/fastmcp_rust/commit/570c96c8),
+  [19706ba2](https://github.com/Dicklesworthstone/fastmcp_rust/commit/19706ba2),
+  [e849e0b7](https://github.com/Dicklesworthstone/fastmcp_rust/commit/e849e0b7),
+  [06f08a28](https://github.com/Dicklesworthstone/fastmcp_rust/commit/06f08a28)).
+- **Native WebSocket transport & proxy** (`websocket` / `websocket-experimental`):
+  full protocol-policy dispatch on native async WebSocket servers, upstream
+  WebSocket proxy forwarding with catalog subscription relay and preserved
+  cancellation cleanup, request-owned typed WebSocket extension notifications,
+  and cancellable WebSocket tool calls preserving Task receipts
+  ([b3f8f4f4](https://github.com/Dicklesworthstone/fastmcp_rust/commit/b3f8f4f4),
+  [c6169c52](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c6169c52),
+  [f293d738](https://github.com/Dicklesworthstone/fastmcp_rust/commit/f293d738),
+  [ebd8b2f2](https://github.com/Dicklesworthstone/fastmcp_rust/commit/ebd8b2f2),
+  [56057af3](https://github.com/Dicklesworthstone/fastmcp_rust/commit/56057af3),
+  [04040fc5](https://github.com/Dicklesworthstone/fastmcp_rust/commit/04040fc5)).
+- **Tasks & Subscriptions**: caller-owned async storage futures for `tasks/get`,
+  `tasks/update`, and `tasks/cancel` with private mutation receipts; fenced
+  working status updates from running workers; bounded subscription fanout for
+  large Task events across HTTP, Memory, stdio, and WebSocket; explicit
+  caller-owned stdio and `MemoryClient` continuation responders; and supervised
+  stdio restart recovery with catalog subscription restoration
+  ([42f6b007](https://github.com/Dicklesworthstone/fastmcp_rust/commit/42f6b007),
+  [bd89e766](https://github.com/Dicklesworthstone/fastmcp_rust/commit/bd89e766),
+  [ca462363](https://github.com/Dicklesworthstone/fastmcp_rust/commit/ca462363),
+  [3441ced0](https://github.com/Dicklesworthstone/fastmcp_rust/commit/3441ced0),
+  [1a1a0219](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1a1a0219),
+  [04040fc5](https://github.com/Dicklesworthstone/fastmcp_rust/commit/04040fc5)).
+- **Extensions, W3C trace & capability fencing**: composable sealed typed
+  extension registrations on one server, bounded inbound/outbound W3C trace
+  recovery and propagation, capability fencing after authorization revocation,
+  and revocable forwarding wakers under caller capability ceilings
+  ([5acec625](https://github.com/Dicklesworthstone/fastmcp_rust/commit/5acec625),
+  [0a3517a4](https://github.com/Dicklesworthstone/fastmcp_rust/commit/0a3517a4),
+  [cb302512](https://github.com/Dicklesworthstone/fastmcp_rust/commit/cb302512),
+  [4139128f](https://github.com/Dicklesworthstone/fastmcp_rust/commit/4139128f),
+  [04040fc5](https://github.com/Dicklesworthstone/fastmcp_rust/commit/04040fc5)).
+
+### Server, Facade, Operator Diagnostics, and CLI
+
+- **Operational readiness, draining & Prometheus metrics**: live HTTP/secured
+  HTTP readiness endpoints, graceful admission draining, Task store pressure
+  reporting, and independently authorized bounded Prometheus metric export
+  ([4c078523](https://github.com/Dicklesworthstone/fastmcp_rust/commit/4c078523),
+  [bffce1fb](https://github.com/Dicklesworthstone/fastmcp_rust/commit/bffce1fb),
+  [9673af48](https://github.com/Dicklesworthstone/fastmcp_rust/commit/9673af48),
+  [eac5a7c3](https://github.com/Dicklesworthstone/fastmcp_rust/commit/eac5a7c3),
+  [b30bc26d](https://github.com/Dicklesworthstone/fastmcp_rust/commit/b30bc26d)).
+- **Headless `fastmcp-server` embeddings** (#88 item 1): `fastmcp-console` is
+  now optional behind the default-on `console` feature, enabling headless
+  embeddings without rich terminal dependencies
+  ([01556357](https://github.com/Dicklesworthstone/fastmcp_rust/commit/01556357)).
+- **Secured HTTP Origin policy** (#81): opt-out control for automatic loopback
+  `Origin` admission and origin-guarded secured HTTP/HTTPS builders on the
+  modern facade
+  ([3e9eeb1a](https://github.com/Dicklesworthstone/fastmcp_rust/commit/3e9eeb1a),
+  [3c634289](https://github.com/Dicklesworthstone/fastmcp_rust/commit/3c634289)).
+- **Facade ergonomics, filesystem URI identity & JSON Schema safety** (#101):
+  middleware, transforms, and logging exposed on modern/auto server builders;
+  canonical filesystem resource URI validation on final reads; bundled custom
+  meta-schema enforcement; and integer schema bounds kept safe across
+  JavaScript JSON round trips
+  ([e2cb4215](https://github.com/Dicklesworthstone/fastmcp_rust/commit/e2cb4215),
+  [3e781ade](https://github.com/Dicklesworthstone/fastmcp_rust/commit/3e781ade),
+  [3b4383ab](https://github.com/Dicklesworthstone/fastmcp_rust/commit/3b4383ab),
+  [c65517e7](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c65517e7)).
+- **CLI improvements**: explicit modern and legacy HTTP endpoint testing
+  (`fastmcp test`), bounded HTTP inspect setup and multi-page catalog
+  acquisition (`fastmcp inspect`), atomic no-symlink `--output` publication,
+  and `--wait` for tool-created Tasks
+  ([c81fa765](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c81fa765),
+  [a4a5f34e](https://github.com/Dicklesworthstone/fastmcp_rust/commit/a4a5f34e),
+  [48cd7e2e](https://github.com/Dicklesworthstone/fastmcp_rust/commit/48cd7e2e),
+  [7323b243](https://github.com/Dicklesworthstone/fastmcp_rust/commit/7323b243),
+  [885d5312](https://github.com/Dicklesworthstone/fastmcp_rust/commit/885d5312)).
+
+### Dependencies & Security
+
+- Updated `rich_rust` (`=0.2.4`), `clap` (`=4.6.9`), `regex` (`=1.13.2`),
+  `toml` (`=1.2.2`), and `zeroize` (`=1.9.2`) and refreshed 84 transitive
+  packages in `Cargo.lock` (`ctutils 0.4.8`, `pulldown-cmark 0.13.6`,
+  `rustls 0.23.46`, `rustls-webpki 0.103.17`, `webpki-roots 1.0.12`,
+  `tokio 1.54.1`), clearing all 9 `cargo audit` vulnerabilities and 1 unsound
+  warning
+  ([04040fc5](https://github.com/Dicklesworthstone/fastmcp_rust/commit/04040fc5)).
+
+---
+
 ## [v0.13.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.13.0) -- 2026-10-12 (GitHub Release)
 
 151 commits since v0.12.0. Pre-1.0 minor release: official Tasks through
