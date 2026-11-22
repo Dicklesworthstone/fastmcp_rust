@@ -3121,6 +3121,39 @@ the View's request ID, and carry no modern MCP `resultType`. This is a
 browser-neutral Host capability: the embedder still supplies its model provider
 and rendering environment.
 
+### MCP Apps Task cancellation and input lifetime
+
+With `apps` and `tasks`, a Host can override
+`McpAppsWireHostEffects::approve_server_task_cancellation` to authorize one
+remote `tasks/cancel` when a matching View cancellation stops observation of an
+approved, nonterminal server Task. The default returns `false`, so existing
+Hosts retain local-only cancellation. The synchronous hook checks the current
+View, origin, principal and consent policy; ordinary cancellation observers run
+first. When effects are composed, only the most recently installed effects can
+grant remote cancellation.
+
+The framework supplies the original View parameters and the last approved Task
+snapshot to that hook. It obtains the Task ID from the authenticated MCP peer,
+never from the View's cancellation frame. HTTP, Unix stdio, WebSocket and Memory
+use their existing typed Task methods, including the independently negotiated
+`tasks/cancel` permission, a fresh MCP request ID, and the original caller's
+authority. The grant expires within five seconds and cannot extend the original
+request deadline. Native transport cleanup retires the abandoned observation
+before dispatch where necessary.
+
+An authorized cancellation is attempted once. Losing its response or dropping
+cleanup does not replay the mutation; acknowledgement does not establish that
+the Task has reached a terminal state. Arbitrary future drop, timeout and View
+disconnect do not grant cancellation. Denial or an approval-hook error leaves
+cancellation local. A failure during authorized native cleanup closes that
+View through the existing transport-failure path.
+
+For `input_required` Tasks, the Host checks retention before invoking consent,
+sampling or elicitation effects. A finite remaining lifetime shortens the
+operation's monotonic deadline, including pending Host callbacks and subsequent
+updates or reads. An expired snapshot cannot disclose input to a Host callback,
+and later wall-clock rollback cannot extend an already admitted deadline.
+
 ---
 
 ## FAQ

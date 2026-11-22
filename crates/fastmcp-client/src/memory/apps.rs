@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
-use fastmcp_protocol::{CoreResult, McpAppsRoutedMethod};
+use fastmcp_protocol::{
+    CoreResult, McpAppsCancelledControlParams, McpAppsJsonRpcRequestId, McpAppsRoutedMethod,
+};
 use serde_json::Value;
 
 use super::{
@@ -16,22 +18,25 @@ use super::{
 };
 use crate::McpAppsClientSettings;
 use crate::mcp_apps::{
-    McpAppsActivationProof, McpAppsBridgeTransport, McpAppsHost, McpAppsHostConfiguration,
-    McpAppsHostError, McpAppsHostPolicy, McpAppsServerInputClient, McpAppsWireBridgeTransport,
-    McpAppsWireHost, McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
-    McpAppsWireHostPolicy, dispatch_apps_server_input, project_reused_core_result,
+    AppsServerTaskCancellationState, McpAppsActivationProof, McpAppsBridgeTransport, McpAppsHost,
+    McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsServerInputClient,
+    McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
+    McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
+    dispatch_apps_server_input, project_reused_core_result,
 };
 
 /// Forwards one negotiated Apps View through an existing memory client.
 ///
 /// The policy borrows the client without creating a runtime or background
-/// reader. View cancellation retires only its current core request. Deferred
-/// cancellation controls use the caller-supplied cleanup context and a fixed
-/// bounded deadline; interrupted cleanup remains available to a later drive.
+/// reader. View cancellation retires its current core request; a separate
+/// explicit Host grant can also cancel its admitted server Task. Deferred
+/// request controls use the caller-supplied cleanup context and a fixed bounded
+/// deadline; interrupted cleanup remains available to a later drive.
 pub struct McpAppsMemoryClientWirePolicy<'client> {
     client: &'client mut MemoryClient,
     cleanup_cx: Cx,
     cleanup_deadline: Option<Instant>,
+    task_cancellation: AppsServerTaskCancellationState,
 }
 
 impl MemoryClientBuilder {
@@ -127,6 +132,7 @@ impl MemoryClient {
                 client: self,
                 cleanup_cx: cx.clone(),
                 cleanup_deadline: None,
+                task_cancellation: AppsServerTaskCancellationState::default(),
             },
             activation_proof,
         ))
@@ -253,6 +259,24 @@ impl McpAppsServerInputClient for MemoryClient {
             .await?;
         crate::check_mrtr_operation(cx, Some(cancellation), deadline)
     }
+
+    #[cfg(feature = "tasks")]
+    async fn cancel_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        task_id: crate::FinalTaskId,
+    ) -> McpResult<()> {
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        if !self.mcp_apps_active() {
+            return Err(McpError::invalid_request(
+                "Apps memory connection is inactive",
+            ));
+        }
+        self.cancel_task_final(cx, cancellation, task_id).await?;
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)
+    }
 }
 
 impl McpAppsMemoryClientWirePolicy<'_> {
@@ -293,8 +317,37 @@ impl McpAppsMemoryClientWirePolicy<'_> {
 }
 
 impl McpAppsWireHostPolicy for McpAppsMemoryClientWirePolicy<'_> {
+    fn cancelled_with_effects<E: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        request_id: &McpAppsJsonRpcRequestId,
+        params: &McpAppsCancelledControlParams,
+        effects: &mut E,
+    ) -> Result<(), McpAppsHostError> {
+        self.cancelled(cx, request_id, params)?;
+        effects.cancelled(cx, request_id, params)?;
+        #[cfg(feature = "tasks")]
+        self.task_cancellation.authorize(cx, effects);
+        Ok(())
+    }
+
     fn transport_cleanup(&mut self) -> McpAppsWireHostCleanup<'_> {
-        McpAppsWireHostCleanup::native(self.settle_apps_transport())
+        McpAppsWireHostCleanup::native(async {
+            // Flush the abandoned read before allocating a distinct Task
+            // cancellation. A full bounded queue cannot reorder these owners.
+            self.settle_apps_transport().await?;
+            #[cfg(feature = "tasks")]
+            {
+                let result = self.task_cancellation.settle(self.client).await;
+                let cleanup = self.settle_apps_transport().await;
+                result.and(cleanup)
+            }
+            #[cfg(not(feature = "tasks"))]
+            {
+                self.task_cancellation.clear();
+                Ok(())
+            }
+        })
     }
 
     async fn dispatch_reused_request(
@@ -328,6 +381,7 @@ impl McpAppsWireHostPolicy for McpAppsMemoryClientWirePolicy<'_> {
                 method,
                 parameters,
                 effects,
+                &mut self.task_cancellation,
             )
             .await;
         }
@@ -1300,6 +1354,8 @@ mod tests {
             creation: bool,
             input: InputEffects,
             snapshots: Arc<AtomicUsize>,
+            cancellation_allowed: bool,
+            cancellation_reviews: Arc<Mutex<Vec<Value>>>,
         }
 
         #[allow(
@@ -1350,6 +1406,173 @@ mod tests {
                     .resolve_server_input(cx, cancellation, method, params, required)
                     .await
             }
+
+            fn approve_server_task_cancellation(
+                &mut self,
+                cx: &Cx,
+                params: &Value,
+                task: &crate::FinalTask,
+            ) -> Result<bool, McpAppsHostError> {
+                cx.checkpoint()
+                    .map_err(|_| McpAppsHostError::Core(McpError::request_cancelled()))?;
+                self.cancellation_reviews.lock().unwrap().push(json!({
+                    "params": params, "taskId": task.base().task_id,
+                    "status": task.base().status,
+                }));
+                Ok(self.cancellation_allowed)
+            }
+        }
+
+        async fn request_while_pending<F: Future>(
+            operation: &mut Pin<Box<F>>,
+            peer: &mut MemoryTransport,
+            cx: &Cx,
+        ) -> JsonRpcRequest {
+            let mut receive = Box::pin(peer.recv_async(cx));
+            let message = poll_fn(|task| {
+                assert!(operation.as_mut().poll(task).is_pending());
+                receive.as_mut().poll(task)
+            })
+            .await
+            .unwrap();
+            let JsonRpcMessage::Request(request) = message else {
+                panic!("expected one request from the pending Apps operation");
+            };
+            request
+        }
+
+        #[test]
+        fn memory_apps_task_cancel_is_approved_once_after_owned_read_cleanup() {
+            run(|cx| async move {
+                for (allowed, abandon_ack) in [(false, false), (true, false), (true, true)] {
+                    let (mut client, mut peer, _) = connect(
+                        &cx,
+                        builder().with_tasks(),
+                        json!({(APPS): {}, (TASKS): {}}),
+                        1,
+                    )
+                    .await;
+                    let reviews = Arc::new(Mutex::new(Vec::new()));
+                    let effects = TaskEffects {
+                        creation: true,
+                        input: InputEffects {
+                            allowed: true,
+                            calls: Arc::new(Mutex::new(Vec::new())),
+                        },
+                        snapshots: Arc::new(AtomicUsize::new(0)),
+                        cancellation_allowed: allowed,
+                        cancellation_reviews: Arc::clone(&reviews),
+                    };
+                    let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                    let mut host = client
+                        .mcp_apps_wire_host(&cx, transport, configuration())
+                        .unwrap()
+                        .with_effects(effects);
+                    activate(&mut host, &mut view, &cx).await;
+                    let original = json!({
+                        "name": "job", "arguments": {"taskId": "view-cannot-select-task"},
+                    });
+                    enqueue(
+                        &mut view,
+                        &cx,
+                        "owned-view-task",
+                        "tools/call",
+                        original.clone(),
+                    )
+                    .await;
+                    let mut drive = Box::pin(host.process_next(&cx));
+                    let catalog = request_while_pending(&mut drive, &mut peer, &cx).await;
+                    assert_eq!(catalog.method, "tools/list");
+                    assert_eq!(catalog.id, Some(RequestId::Number(2)));
+                    respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
+                    let tool = request_while_pending(&mut drive, &mut peer, &cx).await;
+                    assert_eq!(tool.method, "tools/call");
+                    assert_eq!(tool.id, Some(RequestId::Number(3)));
+                    respond(&mut peer, &cx, 3, snapshot("working", true)).await;
+                    let held = request_while_pending(&mut drive, &mut peer, &cx).await;
+                    assert_eq!(held.method, "tasks/get");
+                    assert_eq!(held.id, Some(RequestId::Number(4)));
+                    cancel_view(&mut view, &cx, "owned-view-task").await;
+
+                    if allowed {
+                        let control = request_while_pending(&mut drive, &mut peer, &cx).await;
+                        assert_eq!(control.method, "notifications/cancelled");
+                        assert_eq!(control.params.unwrap()["requestId"], 4);
+                        let cancel = request_while_pending(&mut drive, &mut peer, &cx).await;
+                        assert_eq!(cancel.method, "tasks/cancel");
+                        assert_eq!(cancel.id, Some(RequestId::Number(5)));
+                        assert_eq!(cancel.params.unwrap()["taskId"], "private-server-task");
+                        if abandon_ack {
+                            // The mutation is already on the peer's wire.
+                            // Later cleanup may retire only its request ID.
+                            drop(drive);
+                            enqueue(&mut view, &cx, "cleanup", "ping", json!({})).await;
+                            host.process_next(&cx).await.unwrap();
+                            assert!(view_response(&mut view, &cx).await.get("result").is_some());
+                            let cleanup = next_request(&mut peer, &cx).await;
+                            assert_eq!(cleanup.method, "notifications/cancelled");
+                            assert_eq!(cleanup.params.unwrap()["requestId"], 5);
+                        } else {
+                            respond(&mut peer, &cx, 5, json!({"resultType": "complete"})).await;
+                            drive.await.unwrap();
+                        }
+                    } else {
+                        drive.await.unwrap();
+                        let control = next_request(&mut peer, &cx).await;
+                        assert_eq!(control.method, "notifications/cancelled");
+                        assert_eq!(control.params.unwrap()["requestId"], 4);
+                    }
+                    assert_eq!(
+                        reviews.lock().unwrap().as_slice(),
+                        &[json!({
+                            "params": original, "taskId": "private-server-task",
+                            "status": "working",
+                        })]
+                    );
+                    cancel_view(&mut view, &cx, "owned-view-task").await;
+                    assert!(host.process_next(&cx).await.is_err());
+                    assert_eq!(reviews.lock().unwrap().len(), 1);
+
+                    // A late native reply cannot resume the View or repeat
+                    // its Task cancellation. Reuse its View ID independently.
+                    if abandon_ack {
+                        respond(&mut peer, &cx, 5, json!({"resultType": "complete"})).await;
+                    } else {
+                        respond(&mut peer, &cx, 4, snapshot("completed", false)).await;
+                    }
+                    enqueue(
+                        &mut view,
+                        &cx,
+                        "owned-view-task",
+                        "tools/call",
+                        json!({"name": "healthy"}),
+                    )
+                    .await;
+                    let next = if allowed { 6 } else { 5 };
+                    let mut drive = Box::pin(host.process_next(&cx));
+                    let catalog = request_while_pending(&mut drive, &mut peer, &cx).await;
+                    assert_eq!(catalog.method, "tools/list");
+                    assert_eq!(catalog.id, Some(RequestId::Number(next)));
+                    respond(&mut peer, &cx, next, callable_tools(&["healthy"])).await;
+                    let healthy = request_while_pending(&mut drive, &mut peer, &cx).await;
+                    assert_eq!(healthy.method, "tools/call");
+                    assert_eq!(healthy.id, Some(RequestId::Number(next + 1)));
+                    respond(&mut peer, &cx, next + 1, complete("healthy")).await;
+                    drive.await.unwrap();
+                    assert_eq!(
+                        view_response(&mut view, &cx).await["result"]["content"][0]["text"],
+                        "healthy"
+                    );
+                    assert_eq!(reviews.lock().unwrap().len(), 1);
+                    assert!(cx.checkpoint().is_ok());
+                    drop(host);
+                    client.close(&cx).unwrap();
+                    assert!(
+                        peer.recv_async(&cx).await.is_err(),
+                        "no denied or duplicate Task cancellation"
+                    );
+                }
+            });
         }
 
         #[test]
@@ -1371,6 +1594,8 @@ mod tests {
                         calls: Arc::clone(&calls),
                     },
                     snapshots: Arc::clone(&snapshots),
+                    cancellation_allowed: false,
+                    cancellation_reviews: Arc::new(Mutex::new(Vec::new())),
                 };
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
                 let mut host = client
@@ -1509,6 +1734,8 @@ mod tests {
                             calls: Arc::clone(&calls),
                         },
                         snapshots: Arc::clone(&snapshots),
+                        cancellation_allowed: false,
+                        cancellation_reviews: Arc::new(Mutex::new(Vec::new())),
                     };
                     let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
                     let mut host = client

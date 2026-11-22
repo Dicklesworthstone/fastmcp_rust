@@ -483,6 +483,25 @@ impl<E: McpAppsWireHostEffects> McpAppsWireHostEffects for GuardedEffects<'_, E>
         })
         .await?
     }
+    #[cfg(feature = "tasks")]
+    fn approve_server_task_cancellation(
+        &mut self,
+        cx: &Cx,
+        params: &Value,
+        task: &crate::FinalTask,
+    ) -> Result<bool, McpAppsHostError> {
+        self.boundary.check(cx).map_err(McpAppsHostError::Core)?;
+        if !self.tasks_enabled {
+            return Ok(false);
+        }
+        let approved = self
+            .inner
+            .approve_server_task_cancellation(cx, params, task);
+        // A Host callback may revoke its own login. Such a grant must never
+        // survive into the retained remote cancellation operation.
+        self.boundary.check(cx).map_err(McpAppsHostError::Core)?;
+        approved
+    }
     async fn update_model_context(
         &mut self,
         cx: &Cx,

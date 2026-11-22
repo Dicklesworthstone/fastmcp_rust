@@ -949,6 +949,9 @@ mod tasks {
         creation: bool,
         revoke_after: Option<usize>,
         delay: Duration,
+        cancel_allowed: bool,
+        cancellation_reviews: Arc<Mutex<Vec<Value>>>,
+        pending_input_dropped: Option<Arc<AtomicBool>>,
         snapshots: Arc<Mutex<Vec<Value>>>,
         input: InputEffects,
     }
@@ -959,6 +962,9 @@ mod tasks {
                 creation: true,
                 revoke_after: None,
                 delay: Duration::ZERO,
+                cancel_allowed: false,
+                cancellation_reviews: Arc::new(Mutex::new(Vec::new())),
+                pending_input_dropped: None,
                 snapshots: Arc::new(Mutex::new(Vec::new())),
                 input: InputEffects::new(),
             }
@@ -1020,10 +1026,531 @@ mod tasks {
             params: &Value,
             required: &fastmcp_protocol::InputRequiredResult,
         ) -> Result<fastmcp_protocol::FinalInputResponses, McpAppsHostError> {
-            self.input
+            let responses = self
+                .input
                 .resolve_server_input(cx, cancellation, method, params, required)
-                .await
+                .await?;
+            if let Some(dropped) = self.pending_input_dropped.as_ref() {
+                struct PendingInput(Arc<AtomicBool>);
+                impl Drop for PendingInput {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::Release);
+                    }
+                }
+                let _input = PendingInput(Arc::clone(dropped));
+                std::future::pending::<()>().await;
+            }
+            Ok(responses)
         }
+
+        fn approve_server_task_cancellation(
+            &mut self,
+            cx: &Cx,
+            params: &Value,
+            task: &crate::FinalTask,
+        ) -> Result<bool, McpAppsHostError> {
+            cx.checkpoint()
+                .map_err(|_| McpAppsHostError::Core(fastmcp_core::McpError::request_cancelled()))?;
+            self.cancellation_reviews.lock().unwrap().push(json!({
+                "params": params,
+                "taskId": task.base().task_id,
+                "status": task.base().status,
+            }));
+            Ok(self.cancel_allowed)
+        }
+    }
+
+    async fn task_cancellation_probe(allowed: bool, foreign_control_first: bool) {
+        let cx = Cx::current().unwrap();
+        let (stream, server) = streams();
+        let mut peer = Peer::from_upgraded(server);
+        let mut client = connect(
+            &cx,
+            stream,
+            &mut peer,
+            Options {
+                tasks: true,
+                ..Options::default()
+            },
+        )
+        .await;
+        let mut effects = TaskEffects::new();
+        effects.cancel_allowed = allowed;
+        let reviews = Arc::clone(&effects.cancellation_reviews);
+        let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+        let mut host = client
+            .mcp_apps_wire_host(transport, configuration())
+            .unwrap()
+            .with_effects(effects);
+        activate(&mut host, &mut view, &cx).await;
+        let original = json!({"name": "job", "arguments": {"taskId": "view-supplied-task"}});
+        enqueue(
+            &mut view,
+            &cx,
+            "owned-view-task",
+            "tools/call",
+            original.clone(),
+        )
+        .await;
+        respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
+        respond(&mut peer, &cx, 3, task_snapshot("working", true)).await;
+        let mut drive = Box::pin(host.process_next(&cx));
+        assert_eq!(
+            request_while_pending(&mut drive, &mut peer, &cx)
+                .await
+                .method,
+            "tools/list"
+        );
+        assert_eq!(
+            request_while_pending(&mut drive, &mut peer, &cx)
+                .await
+                .method,
+            "tools/call"
+        );
+        let held = request_while_pending(&mut drive, &mut peer, &cx).await;
+        assert_eq!(held.method, "tasks/get");
+        assert_eq!(held.id, Some(RequestId::Number(4)));
+
+        if foreign_control_first {
+            cancel_view(&mut view, &cx, "another-view-task").await;
+            poll_fn(|task| {
+                assert!(drive.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(reviews.lock().unwrap().is_empty());
+            let mut receive = Box::pin(peer.recv(&cx));
+            assert!(
+                poll_fn(|task| Poll::Ready(receive.as_mut().poll(task)))
+                    .await
+                    .is_pending()
+            );
+        }
+
+        cancel_view(&mut view, &cx, "owned-view-task").await;
+        if allowed {
+            let retired = request_while_pending(&mut drive, &mut peer, &cx).await;
+            assert_eq!(retired.method, "notifications/cancelled");
+            assert_eq!(retired.params.unwrap()["requestId"], 4);
+            let cancel = request_while_pending(&mut drive, &mut peer, &cx).await;
+            assert_eq!(cancel.method, "tasks/cancel");
+            assert_eq!(cancel.id, Some(RequestId::Number(5)));
+            let params = cancel.params.unwrap();
+            assert_eq!(params["taskId"], "private-server-task");
+            assert!(!params.to_string().contains("owned-view-task"));
+            assert!(!params.to_string().contains("view-supplied-task"));
+            respond(&mut peer, &cx, 5, json!({"resultType": "complete"})).await;
+        }
+        drive.await.unwrap();
+        if !allowed {
+            let retired = next_request(&mut peer, &cx).await;
+            assert_eq!(retired.method, "notifications/cancelled");
+            assert_eq!(retired.params.unwrap()["requestId"], 4);
+        }
+        assert_eq!(
+            reviews.lock().unwrap().as_slice(),
+            &[json!({
+                "params": original, "taskId": "private-server-task", "status": "working"
+            })]
+        );
+        assert_eq!(
+            host.admission.admit_control(
+                McpAppsBridgeDirection::ViewToHost,
+                McpAppsRoutedMethod::Cancelled,
+                Some(&json!({"requestId": "owned-view-task"})),
+            ),
+            Err(McpAppsBridgeError::UnknownCorrelation),
+        );
+        {
+            let mut receive = Box::pin(view.receive_from_host(&cx));
+            assert!(
+                poll_fn(|task| Poll::Ready(receive.as_mut().poll(task)))
+                    .await
+                    .is_pending()
+            );
+        }
+
+        // A duplicate View control cannot acquire another cancellation grant.
+        cancel_view(&mut view, &cx, "owned-view-task").await;
+        assert!(host.process_next(&cx).await.is_err());
+        assert_eq!(reviews.lock().unwrap().len(), 1);
+
+        // A late reply to the retired read cannot overwrite the cancellation
+        // or poison the next operation, even if the View reuses its own ID.
+        respond(&mut peer, &cx, 4, task_snapshot("completed", false)).await;
+        let next = if allowed { 6 } else { 5 };
+        respond(&mut peer, &cx, next, callable_tools(&["healthy"])).await;
+        respond(
+            &mut peer,
+            &cx,
+            next + 1,
+            complete("after Task cancellation"),
+        )
+        .await;
+        let response = request(
+            &mut host,
+            &mut view,
+            &cx,
+            "owned-view-task",
+            "tools/call",
+            json!({"name": "healthy"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "after Task cancellation"
+        );
+        assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
+        let successor = next_request(&mut peer, &cx).await;
+        assert_eq!(successor.method, "tools/call");
+        assert_eq!(successor.id, Some(RequestId::Number(next + 1)));
+        assert_eq!(reviews.lock().unwrap().len(), 1);
+        drop(host);
+        client.close(&cx).await.unwrap();
+        assert!(
+            peer.recv(&cx).await.is_err(),
+            "no duplicate Task cancellation or replay"
+        );
+    }
+
+    #[test]
+    fn public_websocket_apps_matching_view_cancel_reaches_only_host_approved_task() {
+        run_test(|| task_cancellation_probe(true, false));
+    }
+
+    #[test]
+    fn public_websocket_apps_task_cancel_requires_separate_host_approval() {
+        run_test(|| task_cancellation_probe(false, false));
+    }
+
+    #[test]
+    fn public_websocket_apps_foreign_view_cancel_cannot_acquire_task_cancellation() {
+        run_test(|| task_cancellation_probe(true, true));
+    }
+
+    #[test]
+    fn public_websocket_apps_dropped_task_cancel_ack_never_replays_the_mutation() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (stream, server) = streams();
+            let mut peer = Peer::from_upgraded(server);
+            let mut client = connect(
+                &cx,
+                stream,
+                &mut peer,
+                Options {
+                    tasks: true,
+                    ..Options::default()
+                },
+            )
+            .await;
+            let mut effects = TaskEffects::new();
+            effects.cancel_allowed = true;
+            let reviews = Arc::clone(&effects.cancellation_reviews);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client
+                .mcp_apps_wire_host(transport, configuration())
+                .unwrap()
+                .with_effects(effects);
+            activate(&mut host, &mut view, &cx).await;
+            respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
+            respond(&mut peer, &cx, 3, task_snapshot("working", true)).await;
+            enqueue(
+                &mut view,
+                &cx,
+                "cancel-uncertain",
+                "tools/call",
+                json!({"name":"job"}),
+            )
+            .await;
+            let mut drive = Box::pin(host.process_next(&cx));
+            assert_eq!(
+                request_while_pending(&mut drive, &mut peer, &cx)
+                    .await
+                    .method,
+                "tools/list"
+            );
+            assert_eq!(
+                request_while_pending(&mut drive, &mut peer, &cx)
+                    .await
+                    .method,
+                "tools/call"
+            );
+            let get = request_while_pending(&mut drive, &mut peer, &cx).await;
+            assert_eq!(get.method, "tasks/get");
+            assert_eq!(get.id, Some(RequestId::Number(4)));
+            cancel_view(&mut view, &cx, "cancel-uncertain").await;
+            let retired = request_while_pending(&mut drive, &mut peer, &cx).await;
+            assert_eq!(retired.method, "notifications/cancelled");
+            assert_eq!(retired.params.unwrap()["requestId"], 4);
+            let cancel = request_while_pending(&mut drive, &mut peer, &cx).await;
+            assert_eq!(cancel.method, "tasks/cancel");
+            assert_eq!(cancel.id, Some(RequestId::Number(5)));
+            assert_eq!(cancel.params.unwrap()["taskId"], "private-server-task");
+            // The request frame reached the peer, but no acknowledgement has
+            // reached this owner. Losing the wait cannot authorize a retry.
+            drop(drive);
+            assert_eq!(reviews.lock().unwrap().len(), 1);
+            assert_eq!(
+                host.admission.admit_control(
+                    McpAppsBridgeDirection::ViewToHost,
+                    McpAppsRoutedMethod::Cancelled,
+                    Some(&json!({"requestId": "cancel-uncertain"})),
+                ),
+                Err(McpAppsBridgeError::UnknownCorrelation),
+            );
+            enqueue(&mut view, &cx, "alive", "ping", json!({})).await;
+            host.process_next(&cx).await.unwrap();
+            assert_eq!(view_response(&mut view, &cx).await["result"], json!({}));
+            let retired = next_request(&mut peer, &cx).await;
+            assert_eq!(retired.method, "notifications/cancelled");
+            assert_eq!(retired.params.unwrap()["requestId"], 5);
+            assert_eq!(reviews.lock().unwrap().len(), 1);
+            // Late ACKs only settle retired request identities. They cannot
+            // resurrect the consumed cancellation grant or rewrite View state.
+            respond(&mut peer, &cx, 4, task_snapshot("completed", false)).await;
+            respond(&mut peer, &cx, 5, json!({"resultType":"complete"})).await;
+            respond(&mut peer, &cx, 6, callable_tools(&["healthy"])).await;
+            respond(&mut peer, &cx, 7, complete("after uncertain Task cancel")).await;
+            let response = request(
+                &mut host,
+                &mut view,
+                &cx,
+                "cancel-uncertain",
+                "tools/call",
+                json!({"name":"healthy"}),
+            )
+            .await;
+            assert_eq!(
+                response["result"]["content"][0]["text"],
+                "after uncertain Task cancel"
+            );
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
+            let successor = next_request(&mut peer, &cx).await;
+            assert_eq!(successor.method, "tools/call");
+            assert_eq!(successor.id, Some(RequestId::Number(7)));
+            drop(host);
+            client.close(&cx).await.unwrap();
+            assert!(
+                peer.recv(&cx).await.is_err(),
+                "only one tasks/cancel was emitted"
+            );
+        });
+    }
+
+    #[test]
+    fn public_websocket_apps_terminal_task_retires_cancellation_authority() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (stream, server) = streams();
+            let mut peer = Peer::from_upgraded(server);
+            let mut client = connect(
+                &cx,
+                stream,
+                &mut peer,
+                Options {
+                    tasks: true,
+                    ..Options::default()
+                },
+            )
+            .await;
+            let mut effects = TaskEffects::new();
+            effects.cancel_allowed = true;
+            let reviews = Arc::clone(&effects.cancellation_reviews);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client
+                .mcp_apps_wire_host(transport, configuration())
+                .unwrap()
+                .with_effects(effects);
+            activate(&mut host, &mut view, &cx).await;
+            respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
+            respond(&mut peer, &cx, 3, task_snapshot("completed", true)).await;
+            let response = request(
+                &mut host,
+                &mut view,
+                &cx,
+                "completed",
+                "tools/call",
+                json!({"name":"job"}),
+            )
+            .await;
+            assert_eq!(response["result"]["content"][0]["text"], "Task completed");
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/call");
+            cancel_view(&mut view, &cx, "completed").await;
+            assert!(host.process_next(&cx).await.is_err());
+            assert!(reviews.lock().unwrap().is_empty());
+            drop(host);
+            client.close(&cx).await.unwrap();
+            assert!(
+                peer.recv(&cx).await.is_err(),
+                "terminal Task never receives tasks/cancel"
+            );
+        });
+    }
+
+    #[test]
+    fn public_websocket_apps_task_retention_precedes_host_consent_and_input() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for expired in [false, true] {
+                let (stream, server) = streams();
+                let mut peer = Peer::from_upgraded(server);
+                let mut client = connect(
+                    &cx,
+                    stream,
+                    &mut peer,
+                    Options {
+                        tasks: true,
+                        ..Options::default()
+                    },
+                )
+                .await;
+                let effects = TaskEffects::new();
+                let input = Arc::clone(&effects.input.calls);
+                let snapshots = Arc::clone(&effects.snapshots);
+                let reviews = Arc::clone(&effects.cancellation_reviews);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, configuration())
+                    .unwrap()
+                    .with_effects(effects);
+                activate(&mut host, &mut view, &cx).await;
+                let mut task = task_snapshot("input_required", true);
+                task["createdAt"] = json!("1970-01-01T00:00:00Z");
+                task["ttlMs"] = if expired { json!(1) } else { Value::Null };
+                respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
+                respond(&mut peer, &cx, 3, task).await;
+                if !expired {
+                    respond(&mut peer, &cx, 4, json!({"resultType":"complete"})).await;
+                    let mut terminal = task_snapshot("completed", false);
+                    terminal["createdAt"] = json!("1970-01-01T00:00:00Z");
+                    respond(&mut peer, &cx, 5, terminal).await;
+                }
+                enqueue(
+                    &mut view,
+                    &cx,
+                    "retained-input",
+                    "tools/call",
+                    json!({"name":"job"}),
+                )
+                .await;
+                asupersync::time::timeout(cx.now(), Duration::from_secs(2), host.process_next(&cx))
+                    .await
+                    .expect("expired Task stops before input while unlimited Task completes")
+                    .unwrap();
+                let response = view_response(&mut view, &cx).await;
+                assert_eq!(response.get("error").is_some(), expired);
+                assert_eq!(input.lock().unwrap().len(), usize::from(!expired));
+                assert_eq!(snapshots.lock().unwrap().is_empty(), expired);
+                assert!(
+                    reviews.lock().unwrap().is_empty(),
+                    "expiry cannot authorize remote cancellation"
+                );
+                assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
+                assert_eq!(next_request(&mut peer, &cx).await.method, "tools/call");
+                if !expired {
+                    assert_eq!(next_request(&mut peer, &cx).await.method, "tasks/update");
+                    assert_eq!(next_request(&mut peer, &cx).await.method, "tasks/get");
+                }
+                drop(host);
+                client.close(&cx).await.unwrap();
+                assert!(
+                    peer.recv(&cx).await.is_err(),
+                    "expired Task cannot start a get, update or cancel"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn public_websocket_apps_task_retention_drops_pending_host_input_without_update() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (stream, server) = streams();
+            let mut peer = Peer::from_upgraded(server);
+            let mut client = connect(
+                &cx,
+                stream,
+                &mut peer,
+                Options {
+                    tasks: true,
+                    ..Options::default()
+                },
+            )
+            .await;
+            let mut effects = TaskEffects::new();
+            let dropped = Arc::new(AtomicBool::new(false));
+            effects.pending_input_dropped = Some(Arc::clone(&dropped));
+            let input = Arc::clone(&effects.input.calls);
+            let reviews = Arc::clone(&effects.cancellation_reviews);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client
+                .mcp_apps_wire_host(transport, configuration())
+                .unwrap()
+                .with_effects(effects);
+            activate(&mut host, &mut view, &cx).await;
+            respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
+            let mut task = task_snapshot("input_required", true);
+            task["createdAt"] = json!("1970-01-01T00:00:00Z");
+            let expires = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .checked_add(Duration::from_secs(2))
+                .unwrap();
+            task["ttlMs"] = json!(u64::try_from(expires.as_millis()).unwrap());
+            respond(&mut peer, &cx, 3, task).await;
+            enqueue(
+                &mut view,
+                &cx,
+                "expiring-input",
+                "tools/call",
+                json!({"name":"job"}),
+            )
+            .await;
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), host.process_next(&cx))
+                .await
+                .expect("Task retention wakes a silent Host callback")
+                .unwrap();
+            assert!(view_response(&mut view, &cx).await.get("error").is_some());
+            assert_eq!(
+                input.lock().unwrap().len(),
+                1,
+                "the callback started while retention was valid"
+            );
+            assert!(
+                dropped.load(Ordering::Acquire),
+                "expiry destroys the request-owned callback future"
+            );
+            assert!(reviews.lock().unwrap().is_empty());
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/call");
+            respond(&mut peer, &cx, 4, callable_tools(&["healthy"])).await;
+            respond(&mut peer, &cx, 5, complete("after input expiry")).await;
+            let response = request(
+                &mut host,
+                &mut view,
+                &cx,
+                "expiring-input",
+                "tools/call",
+                json!({"name":"healthy"}),
+            )
+            .await;
+            assert_eq!(
+                response["result"]["content"][0]["text"],
+                "after input expiry"
+            );
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
+            let successor = next_request(&mut peer, &cx).await;
+            assert_eq!(
+                successor.method, "tools/call",
+                "expired input never reaches tasks/update"
+            );
+            assert_eq!(successor.id, Some(RequestId::Number(5)));
+            drop(host);
+            client.close(&cx).await.unwrap();
+            assert!(peer.recv(&cx).await.is_err());
+        });
     }
 
     #[test]

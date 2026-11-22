@@ -9,11 +9,11 @@ use asupersync::io::{AsyncRead, AsyncWrite};
 use fastmcp_protocol::{CoreRequest, JsonRpcRequest};
 
 use super::{
-    CoreResult, Cx, McpAppsActivationProof, McpAppsHostError, McpAppsRoutedMethod,
-    McpAppsServerInputClient, McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
-    McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy, McpError,
-    McpRequestCancellation, McpResult, Value, dispatch_apps_server_input,
-    project_reused_core_result, wire_policy_checkpoint,
+    AppsServerTaskCancellationState, CoreResult, Cx, McpAppsActivationProof, McpAppsHostError,
+    McpAppsRoutedMethod, McpAppsServerInputClient, McpAppsWireBridgeTransport, McpAppsWireHost,
+    McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
+    McpAppsWireHostPolicy, McpError, McpRequestCancellation, McpResult, Value,
+    dispatch_apps_server_input, project_reused_core_result, wire_policy_checkpoint,
 };
 use crate::{ProtocolEra, WebSocketClient};
 
@@ -29,6 +29,7 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     client: &'client mut WebSocketClient<IO>,
+    task_cancellation: AppsServerTaskCancellationState,
 }
 
 impl<IO> WebSocketClient<IO>
@@ -87,7 +88,10 @@ where
         Ok(McpAppsWireHost::new_negotiated(
             transport,
             configuration,
-            McpAppsWebSocketClientWirePolicy { client: self },
+            McpAppsWebSocketClientWirePolicy {
+                client: self,
+                task_cancellation: AppsServerTaskCancellationState::default(),
+            },
             activation_proof,
         ))
     }
@@ -267,14 +271,60 @@ where
             .await
             .map(|_| ())
     }
+
+    #[cfg(feature = "tasks")]
+    async fn cancel_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        task_id: crate::FinalTaskId,
+    ) -> McpResult<()> {
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        if !self.mcp_apps_active() {
+            return Err(McpError::invalid_request(
+                "Apps WebSocket connection is inactive",
+            ));
+        }
+        self.cancel_task_final(cx, task_id).await.map(|_| ())
+    }
 }
 
 impl<IO> McpAppsWireHostPolicy for McpAppsWebSocketClientWirePolicy<'_, IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    fn cancelled_with_effects<E: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        request_id: &super::McpAppsJsonRpcRequestId,
+        params: &super::McpAppsCancelledControlParams,
+        effects: &mut E,
+    ) -> Result<(), McpAppsHostError> {
+        self.cancelled(cx, request_id, params)?;
+        effects.cancelled(cx, request_id, params)?;
+        #[cfg(feature = "tasks")]
+        self.task_cancellation.authorize(cx, effects);
+        Ok(())
+    }
+
     fn transport_cleanup(&mut self) -> McpAppsWireHostCleanup<'_> {
-        McpAppsWireHostCleanup::native(self.client.settle_apps_transport())
+        McpAppsWireHostCleanup::native(async {
+            // Retire the cancelled observation first. Its native request
+            // cannot share correlation or a pending write with tasks/cancel.
+            self.client.settle_apps_transport().await?;
+            #[cfg(feature = "tasks")]
+            {
+                let result = self.task_cancellation.settle(self.client).await;
+                let cleanup = self.client.settle_apps_transport().await;
+                result.and(cleanup)
+            }
+            #[cfg(not(feature = "tasks"))]
+            {
+                self.task_cancellation.clear();
+                Ok(())
+            }
+        })
     }
 
     async fn dispatch_reused_request(
@@ -308,6 +358,7 @@ where
                 method,
                 params,
                 effects,
+                &mut self.task_cancellation,
             )
             .await;
         }

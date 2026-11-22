@@ -1224,6 +1224,20 @@ pub trait McpAppsWireHostPolicy {
         Ok(())
     }
 
+    /// Applies cancellation bookkeeping before any separately authorized
+    /// server Task cleanup. Wrappers delegate the originating View's effects
+    /// here; custom policies retain the ordinary local-only cancellation.
+    fn cancelled_with_effects<E: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        request_id: &McpAppsJsonRpcRequestId,
+        params: &McpAppsCancelledControlParams,
+        effects: &mut E,
+    ) -> Result<(), McpAppsHostError> {
+        self.cancelled(cx, request_id, params)?;
+        effects.cancelled(cx, request_id, params)
+    }
+
     /// Returns retained native transport cleanup after request work is dropped.
     ///
     /// This immediate hook cannot perform asynchronous work itself. Only a
@@ -1254,8 +1268,8 @@ pub trait McpAppsWireHostPolicy {
 
     /// Forwards with this View's own server-input consent policy.
     ///
-    /// The ready HTTP and Unix stdio policies use this hook to finish bounded
-    /// core MRTR continuations before projecting a terminal Apps response.
+    /// Ready native forwarding policies use this hook to finish bounded core
+    /// MRTR continuations before projecting a terminal Apps response.
     /// Custom forwarding policies keep their existing dispatch behavior unless
     /// they explicitly implement this composition seam.
     async fn dispatch_reused_request_with_effects<E: McpAppsWireHostEffects>(
@@ -1373,8 +1387,8 @@ pub trait McpAppsWireHostEffects {
     /// Resolves one server-input round belonging to this View's admitted
     /// `tools/call` or `resources/read` operation.
     ///
-    /// The ready HTTP and Unix stdio forwarding policies call this only after
-    /// every embedded request has passed the capabilities actually advertised
+    /// Ready native forwarding policies call this only after every embedded
+    /// request has passed the capabilities actually advertised
     /// by the MCP client. Configure those capabilities with
     /// [`crate::ClientBuilder::capabilities`]. Advertising a capability grants
     /// no consent: the default refuses every round, including state-only
@@ -1413,8 +1427,9 @@ pub trait McpAppsWireHostEffects {
     ///
     /// All observation stays inside the original request future. Cancelling
     /// or timing out that future stops reads, updates and pending effects; it
-    /// does not implicitly cancel the durable server Task. Remote cancellation
-    /// requires separate Host authorization and is not performed by this API.
+    /// does not implicitly cancel the durable server Task. Matching View
+    /// cancellation can request remote cancellation only through the separate
+    /// [`Self::approve_server_task_cancellation`] hook.
     #[cfg(feature = "tasks")]
     async fn server_task_policy(
         &mut self,
@@ -1439,6 +1454,35 @@ pub trait McpAppsWireHostEffects {
         _task: &crate::FinalTask,
     ) -> Result<(), McpAppsHostError> {
         Err(wire_policy_denied())
+    }
+
+    /// Authorizes one `tasks/cancel` for this View's last admitted, approved
+    /// nonterminal server Task after matching View cancellation has won.
+    ///
+    /// The default refuses. This immediate hook runs after ordinary
+    /// cancellation bookkeeping and must only check current View, origin,
+    /// principal and consent policy; it must not perform I/O or detach work.
+    /// An error also denies remote cancellation without reopening the local
+    /// request. The Task ID comes from this operation's MCP peer, never from
+    /// the View's cancellation frame. Terminal Tasks and unapproved snapshots
+    /// do not reach this hook.
+    ///
+    /// A true result authorizes one attempt on the same authenticated client,
+    /// under the original caller's effects and deadline. The grant expires
+    /// no later than five seconds after approval; native transport settlement
+    /// keeps its existing bounds. A stopped Host, expired authorization,
+    /// deadline or failed transport can still prevent that attempt. Dropping
+    /// cleanup or losing its response never repeats it. Success acknowledges
+    /// cancellation only; it does not prove terminal Task state. Timeout,
+    /// arbitrary future drop and View disconnect do not invoke this hook.
+    #[cfg(feature = "tasks")]
+    fn approve_server_task_cancellation(
+        &mut self,
+        _cx: &Cx,
+        _params: &Value,
+        _task: &crate::FinalTask,
+    ) -> Result<bool, McpAppsHostError> {
+        Ok(false)
     }
 
     /// Atomically accepts one complete model-context replacement, including
@@ -1512,6 +1556,38 @@ impl McpAppsWireHostEffects for () {}
 pub struct McpAppsWireHostWithEffects<P, E> {
     forwarding: P,
     effects: E,
+}
+
+// Cancellation keeps prior observers, but only the currently installed
+// effects owner may grant a new remote Task cancellation attempt.
+struct McpAppsCancellationEffects<'a, E, E2> {
+    previous: &'a mut E,
+    current: &'a mut E2,
+}
+
+impl<E: McpAppsWireHostEffects, E2: McpAppsWireHostEffects> McpAppsWireHostEffects
+    for McpAppsCancellationEffects<'_, E, E2>
+{
+    fn cancelled(
+        &mut self,
+        cx: &Cx,
+        request_id: &McpAppsJsonRpcRequestId,
+        params: &McpAppsCancelledControlParams,
+    ) -> Result<(), McpAppsHostError> {
+        self.previous.cancelled(cx, request_id, params)?;
+        self.current.cancelled(cx, request_id, params)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn approve_server_task_cancellation(
+        &mut self,
+        cx: &Cx,
+        params: &Value,
+        task: &crate::FinalTask,
+    ) -> Result<bool, McpAppsHostError> {
+        self.current
+            .approve_server_task_cancellation(cx, params, task)
+    }
 }
 
 impl<P: McpAppsWireHostPolicy, E: McpAppsWireHostEffects> McpAppsWireHostPolicy
@@ -1598,8 +1674,26 @@ impl<P: McpAppsWireHostPolicy, E: McpAppsWireHostEffects> McpAppsWireHostPolicy
         request_id: &McpAppsJsonRpcRequestId,
         params: &McpAppsCancelledControlParams,
     ) -> Result<(), McpAppsHostError> {
-        self.forwarding.cancelled(cx, request_id, params)?;
-        self.effects.cancelled(cx, request_id, params)
+        self.forwarding
+            .cancelled_with_effects(cx, request_id, params, &mut self.effects)
+    }
+
+    fn cancelled_with_effects<E2: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        request_id: &McpAppsJsonRpcRequestId,
+        params: &McpAppsCancelledControlParams,
+        effects: &mut E2,
+    ) -> Result<(), McpAppsHostError> {
+        self.forwarding.cancelled_with_effects(
+            cx,
+            request_id,
+            params,
+            &mut McpAppsCancellationEffects {
+                previous: &mut self.effects,
+                current: effects,
+            },
+        )
     }
 
     fn transport_cleanup(&mut self) -> McpAppsWireHostCleanup<'_> {
@@ -2645,7 +2739,9 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     /// to future effects; already accepted host state remains unchanged.
     /// When composed repeatedly, ordinary effects use the latest callbacks,
     /// while cancellation retains every prior cleanup and observer in order
-    /// before invoking the new observer.
+    /// before invoking the new observer. Only the latest effects can grant a
+    /// new remote Task cancellation; a previously committed grant retains its
+    /// original caller and bounded cleanup until settlement.
     #[must_use]
     pub fn with_effects<E: McpAppsWireHostEffects>(
         self,
@@ -4448,6 +4544,121 @@ pub(crate) fn project_reused_core_result(
     Ok(result)
 }
 
+// One serial View operation may retain one already-approved nonterminal Task.
+// Dropping observation alone never grants cancellation: only the exact View
+// control and its separate, current Host policy can arm this retained state.
+#[derive(Default)]
+pub(crate) struct AppsServerTaskCancellationState {
+    #[cfg(feature = "tasks")]
+    pending: Option<AppsServerTaskCancellation>,
+}
+
+#[cfg(feature = "tasks")]
+struct AppsServerTaskCancellation {
+    owner: Cx,
+    cancellation: McpRequestCancellation,
+    deadline: std::time::Instant,
+    params: Value,
+    task: crate::FinalTask,
+    approved: bool,
+}
+
+impl AppsServerTaskCancellationState {
+    pub(crate) fn clear(&mut self) {
+        #[cfg(feature = "tasks")]
+        {
+            self.pending = None;
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn retain(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        params: &Value,
+        task: &crate::FinalTask,
+    ) {
+        self.pending = matches!(
+            task,
+            crate::FinalTask::Working(_) | crate::FinalTask::InputRequired { .. }
+        )
+        .then(|| AppsServerTaskCancellation {
+            owner: wire_caller_snapshot(cx),
+            cancellation: cancellation.clone(),
+            deadline,
+            params: params.clone(),
+            task: task.clone(),
+            approved: false,
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    pub(crate) fn authorize<E: McpAppsWireHostEffects>(&mut self, cx: &Cx, effects: &mut E) {
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        // An abandoned drive can leave a snapshot, but not the request-local
+        // cancellation election. A later/foreign control cannot adopt it.
+        if pending.approved || !pending.cancellation.is_cancel_requested() {
+            return;
+        }
+        let owner = with_caller_context(cx, || wire_caller_snapshot(&pending.owner));
+        let allowed = with_caller_context(&owner, || {
+            if crate::check_mrtr_operation(&owner, None, pending.deadline).is_err()
+                || crate::task_wait::admit_input_retention(&pending.task).is_err()
+            {
+                return false;
+            }
+            matches!(
+                effects.approve_server_task_cancellation(&owner, &pending.params, &pending.task),
+                Ok(true)
+            ) && crate::check_mrtr_operation(&owner, None, pending.deadline).is_ok()
+                && crate::task_wait::admit_input_retention(&pending.task).is_ok()
+        });
+        if allowed {
+            let Some(cleanup_deadline) =
+                std::time::Instant::now().checked_add(std::time::Duration::from_secs(5))
+            else {
+                return;
+            };
+            pending.owner = owner;
+            pending.deadline = pending.deadline.min(cleanup_deadline);
+            pending.approved = true;
+            self.pending = Some(pending);
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    pub(crate) async fn settle<C: McpAppsServerInputClient + Send>(
+        &mut self,
+        client: &mut C,
+    ) -> Result<(), McpAppsHostError> {
+        // Consume before any asynchronous dispatch. Cancellation/response loss
+        // cannot recreate this Task request; native request cleanup owns only
+        // its transport correlation, never a second tasks/cancel attempt.
+        let Some(pending) = self.pending.take().filter(|pending| pending.approved) else {
+            return Ok(());
+        };
+        let owner = wire_caller_snapshot(&pending.owner);
+        let cancellation = McpRequestCancellation::new();
+        crate::wait_for_mrtr_operation(&owner, Some(&cancellation), pending.deadline, async {
+            crate::task_wait::admit_input_retention(&pending.task)?;
+            client
+                .cancel_apps_task(
+                    &owner,
+                    &cancellation,
+                    pending.deadline,
+                    pending.task.base().task_id.clone(),
+                )
+                .await
+                .map_err(McpAppsHostError::Core)
+        })
+        .await
+    }
+}
+
 // This adapter keeps the composition on the existing client request paths:
 // they own fresh IDs, exact selected-era decoding, and transport cleanup on
 // drop. The Host owns consent and one bounded MRTR/Task observation operation.
@@ -4490,6 +4701,15 @@ pub(crate) trait McpAppsServerInputClient {
         task: &crate::FinalTask,
         responses: crate::FinalTaskInputResponses,
     ) -> McpResult<()>;
+
+    #[cfg(feature = "tasks")]
+    fn cancel_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        task_id: crate::FinalTaskId,
+    ) -> impl Future<Output = McpResult<()>> + Send;
 }
 
 #[cfg(feature = "tasks")]
@@ -4609,6 +4829,25 @@ impl McpAppsServerInputClient for crate::Client {
     ) -> McpResult<()> {
         crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
         self.update_task_final_with_cx(cx, cancellation, task, responses)
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn cancel_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        task_id: crate::FinalTaskId,
+    ) -> McpResult<()> {
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        if !self.mcp_apps_active() {
+            return Err(McpError::invalid_request(
+                "Apps stdio connection is inactive",
+            ));
+        }
+        self.cancel_task_final_with_cx(cx, cancellation, task_id)
             .await
             .map(|_| ())
     }
@@ -4789,6 +5028,26 @@ impl McpAppsServerInputClient for crate::HttpClient {
             .map(|_| ())
             .map_err(|error| McpError::invalid_request(error.to_string()))
     }
+
+    #[cfg(feature = "tasks")]
+    async fn cancel_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        task_id: crate::FinalTaskId,
+    ) -> McpResult<()> {
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        if !self.mcp_apps_active() {
+            return Err(McpError::invalid_request(
+                "Apps HTTP connection is inactive",
+            ));
+        }
+        self.cancel_final_task(cx, task_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| McpError::invalid_request(error.to_string()))
+    }
 }
 
 struct AppsServerInputOperation<'operation, E> {
@@ -4801,6 +5060,8 @@ struct AppsServerInputOperation<'operation, E> {
     driver: crate::MrtrDriver<'operation>,
     response_bytes: usize,
     effects: &'operation mut E,
+    #[cfg(feature = "tasks")]
+    task_cancellation: &'operation mut AppsServerTaskCancellationState,
 }
 
 impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
@@ -4822,16 +5083,23 @@ impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
         // Admit the complete batch before any consent or model effect. Never
         // dispatch this View's embedded input to connection-wide callbacks.
         crate::admit_mrtr_input_required(&self.capabilities, input_required)?;
-        let responses = self
-            .effects
-            .resolve_server_input(
-                self.cx,
-                self.cancellation,
-                self.method,
-                self.params,
-                input_required,
-            )
-            .await?;
+        let responses = crate::wait_for_mrtr_operation(
+            self.cx,
+            Some(self.cancellation),
+            self.deadline,
+            async {
+                self.effects
+                    .resolve_server_input(
+                        self.cx,
+                        self.cancellation,
+                        self.method,
+                        self.params,
+                        input_required,
+                    )
+                    .await
+            },
+        )
+        .await?;
         self.checkpoint()?;
         if input_required.input_requests().is_some() {
             responses
@@ -4861,11 +5129,23 @@ impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
 
     #[cfg(feature = "tasks")]
     async fn approve_task(&mut self, task: &crate::FinalTask) -> Result<(), McpAppsHostError> {
+        self.task_cancellation.clear();
         self.checkpoint()?;
-        self.effects
-            .approve_server_task(self.cx, self.cancellation, self.params, task)
-            .await?;
+        if matches!(task, crate::FinalTask::InputRequired { .. }) {
+            crate::task_wait::admit_input_retention(task)?;
+        }
+        crate::wait_for_mrtr_operation(self.cx, Some(self.cancellation), self.deadline, async {
+            self.effects
+                .approve_server_task(self.cx, self.cancellation, self.params, task)
+                .await
+        })
+        .await?;
         self.checkpoint()?;
+        if matches!(task, crate::FinalTask::InputRequired { .. }) {
+            crate::task_wait::admit_input_retention(task)?;
+        }
+        self.task_cancellation
+            .retain(self.cx, self.cancellation, self.deadline, self.params, task);
         Ok(())
     }
 
@@ -4884,6 +5164,7 @@ impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
         // the same input key cannot repeat an effect or resend its response.
         let mut answered = BTreeMap::<String, Value>::new();
         loop {
+            self.task_cancellation.clear();
             self.checkpoint()?;
             if task.base().task_id != task_id || task.base().created_at != created_at {
                 return Err(McpError::invalid_request(
@@ -4924,6 +5205,19 @@ impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
                 .map_err(|_| McpError::invalid_request("Apps Task poll interval is too large"))?;
             let next_poll = self.cx.now().saturating_add_nanos(interval_nanos);
             if let crate::FinalTask::InputRequired { input_requests, .. } = &task {
+                // A stale input snapshot grants no Host consent or model
+                // effect. Freeze finite retention into this operation's
+                // monotonic deadline so a silent callback cannot outlive it
+                // or gain more time from a later wall-clock rollback.
+                if let Some(remaining) = crate::task_wait::input_retention_remaining(&task)? {
+                    let now = std::time::Instant::now();
+                    let remaining = remaining.min(self.deadline.saturating_duration_since(now));
+                    self.deadline = now.checked_add(remaining).ok_or_else(|| {
+                        McpError::invalid_request(
+                            "Apps Task retention deadline is not representable",
+                        )
+                    })?;
+                }
                 // Capability admission precedes even the Host consent hook;
                 // a forbidden sibling cannot hide behind an answered key.
                 let all = apps_task_input_required(input_requests)?;
@@ -4970,15 +5264,19 @@ impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
                             McpError::invalid_params("Invalid Apps Task input responses")
                         })?;
                         self.approve_task(&task).await?;
-                        client
-                            .update_apps_task(
+                        crate::wait_for_mrtr_operation(
+                            self.cx,
+                            Some(self.cancellation),
+                            self.deadline,
+                            client.update_apps_task(
                                 self.cx,
                                 self.cancellation,
                                 self.deadline,
                                 &task,
                                 responses,
-                            )
-                            .await?;
+                            ),
+                        )
+                        .await?;
                         self.checkpoint()?;
                         answered.extend(descriptors);
                     }
@@ -4992,13 +5290,26 @@ impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
                 if self.cx.timer_driver().is_none() {
                     return Err(McpAppsHostError::TimerUnavailable);
                 }
-                Sleep::new(next_poll).await;
+                crate::wait_for_mrtr_operation(
+                    self.cx,
+                    Some(self.cancellation),
+                    self.deadline,
+                    async {
+                        Sleep::new(next_poll).await;
+                        Ok::<(), McpError>(())
+                    },
+                )
+                .await?;
             }
             self.approve_task(&task).await?;
             polls += 1;
-            task = client
-                .get_apps_task(self.cx, self.cancellation, self.deadline, task_id.clone())
-                .await?;
+            task = crate::wait_for_mrtr_operation(
+                self.cx,
+                Some(self.cancellation),
+                self.deadline,
+                client.get_apps_task(self.cx, self.cancellation, self.deadline, task_id.clone()),
+            )
+            .await?;
         }
     }
 }
@@ -5112,7 +5423,9 @@ pub(crate) async fn dispatch_apps_server_input<
     method: McpAppsRoutedMethod,
     params: Option<Value>,
     effects: &mut E,
+    task_cancellation: &mut AppsServerTaskCancellationState,
 ) -> Result<Value, McpAppsHostError> {
+    task_cancellation.clear();
     wire_policy_checkpoint(cx, cancellation)?;
     let params = params.ok_or_else(|| McpError::invalid_params("Apps request needs parameters"))?;
     let invalid = || McpError::invalid_params("Invalid Apps server-input request parameters");
@@ -5140,7 +5453,7 @@ pub(crate) async fn dispatch_apps_server_input<
             crate::MAX_MRTR_TOTAL_INPUT_RESPONSES,
         )?,
     )?;
-    crate::wait_for_mrtr_operation(cx, Some(cancellation), deadline, async {
+    let result = crate::wait_for_mrtr_operation(cx, Some(cancellation), deadline, async {
         if method == McpAppsRoutedMethod::ToolsCall {
             let request: fastmcp_protocol::McpAppsToolCallParams =
                 serde_json::from_value(params.clone()).map_err(|_| invalid())?;
@@ -5164,6 +5477,8 @@ pub(crate) async fn dispatch_apps_server_input<
             driver,
             response_bytes: 0,
             effects,
+            #[cfg(feature = "tasks")]
+            task_cancellation: &mut *task_cancellation,
         };
         #[cfg(feature = "tasks")]
         let task_policy = if method == McpAppsRoutedMethod::ToolsCall {
@@ -5217,7 +5532,12 @@ pub(crate) async fn dispatch_apps_server_input<
             )?;
         }
     })
-    .await
+    .await;
+    // Only abandonment after an admitted Task preserves the snapshot for the
+    // immediate, matching View-cancellation hook. Every ordinary completion,
+    // refusal or expiry destroys it before another request can adopt it.
+    task_cancellation.clear();
+    result
 }
 
 /// Concrete policy that forwards only standard-reused View methods through a
@@ -5232,11 +5552,15 @@ pub(crate) async fn dispatch_apps_server_input<
 /// other platforms refuse these calls before contacting the server.
 pub struct McpAppsClientWirePolicy<'client> {
     client: &'client mut crate::Client,
+    task_cancellation: AppsServerTaskCancellationState,
 }
 
 impl<'client> McpAppsClientWirePolicy<'client> {
     pub(crate) fn new(client: &'client mut crate::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            task_cancellation: AppsServerTaskCancellationState::default(),
+        }
     }
 }
 
@@ -5254,6 +5578,32 @@ impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
         self.client
             .service_multiplexed_stdio(cx)
             .map_err(McpAppsHostError::Core)
+    }
+
+    fn cancelled_with_effects<E: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        request_id: &McpAppsJsonRpcRequestId,
+        params: &McpAppsCancelledControlParams,
+        effects: &mut E,
+    ) -> Result<(), McpAppsHostError> {
+        self.cancelled(cx, request_id, params)?;
+        effects.cancelled(cx, request_id, params)?;
+        #[cfg(feature = "tasks")]
+        self.task_cancellation.authorize(cx, effects);
+        Ok(())
+    }
+
+    fn transport_cleanup(&mut self) -> McpAppsWireHostCleanup<'_> {
+        #[cfg(all(unix, feature = "tasks"))]
+        {
+            McpAppsWireHostCleanup::native(self.task_cancellation.settle(self.client))
+        }
+        #[cfg(not(all(unix, feature = "tasks")))]
+        {
+            self.task_cancellation.clear();
+            McpAppsWireHostCleanup::default()
+        }
     }
 
     async fn dispatch_reused_request(
@@ -5275,6 +5625,7 @@ impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
                 method,
                 params,
                 &mut (),
+                &mut self.task_cancellation,
             )
             .await;
         }
@@ -5303,7 +5654,16 @@ impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
             method,
             McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
         ) {
-            dispatch_apps_server_input(self.client, cx, cancellation, method, params, effects).await
+            dispatch_apps_server_input(
+                self.client,
+                cx,
+                cancellation,
+                method,
+                params,
+                effects,
+                &mut self.task_cancellation,
+            )
+            .await
         } else {
             self.dispatch_reused_request(cx, cancellation, method, params)
                 .await
@@ -5315,15 +5675,45 @@ impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
 /// the ready connection's fresh request-ID allocator and selected-era decoder.
 pub struct McpAppsHttpClientWirePolicy<'client> {
     client: &'client mut crate::HttpClient,
+    task_cancellation: AppsServerTaskCancellationState,
 }
 
 impl<'client> McpAppsHttpClientWirePolicy<'client> {
     pub(crate) fn new(client: &'client mut crate::HttpClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            task_cancellation: AppsServerTaskCancellationState::default(),
+        }
     }
 }
 
 impl McpAppsWireHostPolicy for McpAppsHttpClientWirePolicy<'_> {
+    fn cancelled_with_effects<E: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        request_id: &McpAppsJsonRpcRequestId,
+        params: &McpAppsCancelledControlParams,
+        effects: &mut E,
+    ) -> Result<(), McpAppsHostError> {
+        self.cancelled(cx, request_id, params)?;
+        effects.cancelled(cx, request_id, params)?;
+        #[cfg(feature = "tasks")]
+        self.task_cancellation.authorize(cx, effects);
+        Ok(())
+    }
+
+    fn transport_cleanup(&mut self) -> McpAppsWireHostCleanup<'_> {
+        #[cfg(feature = "tasks")]
+        {
+            McpAppsWireHostCleanup::native(self.task_cancellation.settle(self.client))
+        }
+        #[cfg(not(feature = "tasks"))]
+        {
+            self.task_cancellation.clear();
+            McpAppsWireHostCleanup::default()
+        }
+    }
+
     async fn dispatch_reused_request(
         &mut self,
         cx: &Cx,
@@ -5342,6 +5732,7 @@ impl McpAppsWireHostPolicy for McpAppsHttpClientWirePolicy<'_> {
                 method,
                 params,
                 &mut (),
+                &mut self.task_cancellation,
             )
             .await;
         }
@@ -5363,7 +5754,16 @@ impl McpAppsWireHostPolicy for McpAppsHttpClientWirePolicy<'_> {
             method,
             McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
         ) {
-            dispatch_apps_server_input(self.client, cx, cancellation, method, params, effects).await
+            dispatch_apps_server_input(
+                self.client,
+                cx,
+                cancellation,
+                method,
+                params,
+                effects,
+                &mut self.task_cancellation,
+            )
+            .await
         } else {
             self.dispatch_reused_request(cx, cancellation, method, params)
                 .await
@@ -6767,6 +7167,10 @@ exec sleep 10
         revoke_after: Option<usize>,
         snapshots: Arc<Mutex<Vec<Value>>>,
         input: ServerInputEffects,
+        cancellation_allowed: bool,
+        cancellation_error: bool,
+        revoke_cancellation: bool,
+        cancellation_reviews: Arc<Mutex<Vec<Value>>>,
     }
 
     #[cfg(feature = "tasks")]
@@ -6788,6 +7192,10 @@ exec sleep 10
                     server_input_response(),
                     ServerInputDecision::Respond,
                 ),
+                cancellation_allowed: false,
+                cancellation_error: false,
+                revoke_cancellation: false,
+                cancellation_reviews: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -6842,6 +7250,35 @@ exec sleep 10
             self.input
                 .resolve_server_input(cx, cancellation, method, params, input_required)
                 .await
+        }
+
+        fn cancelled(
+            &mut self,
+            _cx: &Cx,
+            _request_id: &McpAppsJsonRpcRequestId,
+            _params: &McpAppsCancelledControlParams,
+        ) -> Result<(), McpAppsHostError> {
+            if self.revoke_cancellation {
+                self.cancellation_allowed = false;
+            }
+            Ok(())
+        }
+
+        fn approve_server_task_cancellation(
+            &mut self,
+            cx: &Cx,
+            params: &Value,
+            task: &crate::FinalTask,
+        ) -> Result<bool, McpAppsHostError> {
+            assert!(cx.checkpoint().is_ok());
+            self.cancellation_reviews.lock().unwrap().push(json!({
+                "params": params, "taskId": task.base().task_id, "status": task.base().status
+            }));
+            if self.cancellation_error {
+                Err(wire_policy_denied())
+            } else {
+                Ok(self.cancellation_allowed)
+            }
         }
     }
 
@@ -7165,6 +7602,110 @@ exec sleep 10
         assert_eq!(requests[2]["method"], "tools/call");
         assert_eq!(requests[2]["params"]["name"], "healthy");
         assert_eq!(sibling_peer.join().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_apps_remote_task_cancellation_requires_current_outer_host_grant() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for decision in ["allow", "deny", "error", "revoke", "abandon"] {
+                let mut results = vec![server_task_snapshot("input_required", true)];
+                if decision == "allow" {
+                    results.push(json!({"resultType": "complete"}));
+                }
+                results.push(server_input_complete());
+                let (address, peer) =
+                    server_input_http_peer_with_extensions(results, true, false);
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client(&cx, address).await;
+                let mut inner = ServerTaskEffects::new();
+                inner.cancellation_allowed = true;
+                let inner_reviews = Arc::clone(&inner.cancellation_reviews);
+                let mut effects = ServerTaskEffects::new();
+                effects.input.decision = ServerInputDecision::Pending;
+                effects.cancellation_allowed = decision != "deny";
+                effects.cancellation_error = decision == "error";
+                effects.revoke_cancellation = decision == "revoke";
+                let reviews = Arc::clone(&effects.cancellation_reviews);
+                let calls = Arc::clone(&effects.input.calls);
+                let dropped = Arc::clone(&effects.input.dropped);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap()
+                    .with_effects(inner)
+                    .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let params = json!({"name": "needs-task-input", "arguments": {"value": 7}});
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc": "2.0", "id": "private-view-cancel", "method": "tools/call", "params": params}).to_string(),
+                )
+                .await
+                .unwrap();
+                let mut pending = Box::pin(host.process_next(&cx));
+                poll_fn(|task| {
+                    assert!(pending.as_mut().poll(task).is_pending());
+                    if calls.lock().unwrap().is_empty() {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
+                })
+                .await;
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "private-view-cancel"}}).to_string(),
+                )
+                .await
+                .unwrap();
+                if decision == "abandon" {
+                    // Dropping an arbitrary drive does not preserve remote
+                    // cancellation authority for a later control frame.
+                    drop(pending);
+                    host.process_next(&cx).await.unwrap();
+                } else {
+                    pending.await.unwrap();
+                }
+                assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+                if decision == "abandon" {
+                    assert!(reviews.lock().unwrap().is_empty());
+                } else {
+                    assert_eq!(reviews.lock().unwrap().as_slice(), &[json!({
+                        "params": params, "taskId": "private-server-task", "status": "input_required"
+                    })]);
+                }
+                assert!(inner_reviews.lock().unwrap().is_empty());
+                let successor = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "private-view-cancel",
+                    "tools/call",
+                    json!({"name": "healthy"}),
+                )
+                .await;
+                assert!(successor.get("result").is_some(), "{decision}");
+                let requests = peer.join().unwrap();
+                let cancellations: Vec<_> = requests
+                    .iter()
+                    .filter(|request| request["method"] == "tasks/cancel")
+                    .collect();
+                assert_eq!(cancellations.len(), usize::from(decision == "allow"));
+                if let Some(request) = cancellations.first() {
+                    assert_eq!(request["params"]["taskId"], "private-server-task");
+                    assert_eq!(request["id"], 4);
+                }
+                assert!(requests.iter().all(|request| {
+                    request["method"] != "tasks/update"
+                        && !request.to_string().contains("private-view-cancel")
+                }));
+                assert_eq!(requests.last().unwrap()["params"]["name"], "healthy");
+            }
+        });
     }
 
     #[cfg(feature = "tasks")]
@@ -7620,6 +8161,130 @@ exec sleep 10
                 .unwrap();
             assert_eq!(fallback["content"][0]["text"], "fallback call completed");
             client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_stdio_apps_remote_task_cancellation_uses_private_handle_and_fresh_request() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for allowed in [false, true] {
+                let cx = Cx::current().unwrap();
+                let script = r#"
+IFS= read -r discovery || exit 91
+case "$discovery" in *server/discover*io.modelcontextprotocol/ui*) ;; *) exit 92 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/ui":{},"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"apps-cancel-stdio","version":"1"}}}}'
+IFS= read -r catalog || exit 93
+case "$catalog" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 94 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"server_task","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}'
+IFS= read -r call || exit 95
+case "$call" in *'"method":"tools/call"'*'"id":3'*) ;; *) exit 96 ;; esac
+case "$call" in *'"io.modelcontextprotocol/tasks":{}'*) ;; *) exit 97 ;; esac
+case "$call" in *private-view-cancel*) exit 98 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"task","taskId":"private-server-task","status":"input_required","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:01.000Z","ttlMs":null,"pollIntervalMs":1,"inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Review this View"}}],"maxTokens":32}}}}}'
+catalog_id=4
+call_id=5
+if [ "$1" = yes ]; then
+    IFS= read -r cancel || exit 99
+    case "$cancel" in *'"method":"tasks/cancel"'*'"id":4'*) ;; *) exit 100 ;; esac
+    case "$cancel" in *'"taskId":"private-server-task"'*) ;; *) exit 101 ;; esac
+    case "$cancel" in *private-view-cancel*|*inputResponses*) exit 102 ;; esac
+    printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}'
+    catalog_id=5
+    call_id=6
+fi
+IFS= read -r healthy_catalog || exit 103
+case "$healthy_catalog" in *'"method":"tools/list"'*"\"id\":$catalog_id"*) ;; *) exit 104 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[{"name":"healthy","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}\n' "$catalog_id"
+IFS= read -r healthy || exit 105
+case "$healthy" in *'"method":"tools/call"'*"\"id\":$call_id"*) ;; *) exit 106 ;; esac
+case "$healthy" in *'"name":"healthy"'*) ;; *) exit 107 ;; esac
+case "$healthy" in *private-server-task*|*inputResponses*) exit 108 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","content":[{"type":"text","text":"healthy after cancellation"}]}}\n' "$call_id"
+exec sleep 10
+"#;
+                let mut client = crate::ClientBuilder::new()
+                    .protocol_plan(crate::ClientProtocolPlan::stdio(
+                        fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+                    ))
+                    .capabilities(fastmcp_protocol::ClientCapabilities {
+                        sampling: Some(fastmcp_protocol::SamplingCapability::default()),
+                        ..fastmcp_protocol::ClientCapabilities::default()
+                    })
+                    .mcp_apps(
+                        fastmcp_protocol::extensions::McpAppsClientSettings::new(vec![
+                            fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.into(),
+                        ])
+                        .unwrap(),
+                    )
+                    .request_timeout_policy(
+                        crate::RequestTimeoutPolicy::new(
+                            std::time::Duration::from_secs(5),
+                            std::time::Duration::from_secs(5),
+                        )
+                        .unwrap(),
+                    )
+                    .connect_stdio_with_cx(
+                        &cx,
+                        "sh",
+                        &["-c", script, "apps-cancel-peer", if allowed { "yes" } else { "no" }],
+                    )
+                    .await
+                    .unwrap();
+                let mut effects = ServerTaskEffects::new();
+                effects.input.decision = ServerInputDecision::Pending;
+                effects.cancellation_allowed = allowed;
+                let calls = Arc::clone(&effects.input.calls);
+                let reviews = Arc::clone(&effects.cancellation_reviews);
+                let dropped = Arc::clone(&effects.input.dropped);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap()
+                    .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc":"2.0","id":"private-view-cancel","method":"tools/call","params":{"name":"server_task"}}).to_string(),
+                )
+                .await
+                .unwrap();
+                let mut pending = Box::pin(host.process_next(&cx));
+                poll_fn(|task| {
+                    assert!(pending.as_mut().poll(task).is_pending());
+                    if calls.lock().unwrap().is_empty() {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
+                })
+                .await;
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"private-view-cancel"}}).to_string(),
+                )
+                .await
+                .unwrap();
+                pending.await.unwrap();
+                assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+                assert_eq!(reviews.lock().unwrap().len(), 1);
+                let successor = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "private-view-cancel",
+                    "tools/call",
+                    json!({"name":"healthy"}),
+                )
+                .await;
+                assert_eq!(successor["result"]["content"][0]["text"], "healthy after cancellation");
+                assert_eq!(reviews.lock().unwrap().len(), 1);
+                drop(host);
+                client.close_with_cx(&cx).await.unwrap();
+            }
         });
     }
 
