@@ -98,6 +98,21 @@ fn main() {
         });
         #[cfg(feature = "websocket-experimental")]
         if let Some(ready_file) = websocket_ready {
+            #[cfg(feature = "tasks")]
+            {
+                let task_runtime = server
+                    .final_task_runtime()
+                    .expect("WebSocket fixture installs its Task runtime");
+                asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), async {
+                    while !task_runtime.is_task_service_ready() {
+                        cx.checkpoint().expect("Task fixture startup was cancelled");
+                        asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(10))
+                            .await;
+                    }
+                })
+                .await
+                .expect("WebSocket Task service must enter its region before readiness");
+            }
             let bound = server
                 .bind_websocket(&cx, "127.0.0.1:0")
                 .await

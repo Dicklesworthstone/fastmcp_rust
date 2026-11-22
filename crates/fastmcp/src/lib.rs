@@ -356,6 +356,8 @@ pub mod client {
     };
     #[cfg(feature = "websocket-experimental")]
     pub use crate::{WebSocketCatalogSubscriptionOwner, WebSocketResponse};
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    pub use crate::WebSocketTaskSubscriptionOwner;
     #[cfg(feature = "apps")]
     pub use fastmcp_client::mcp_apps;
     pub use fastmcp_client::{http_auth, http_executor, mcp_config, sse};
@@ -1181,6 +1183,8 @@ pub use fastmcp_client::{
 };
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_client::{WebSocketCatalogSubscriptionOwner, WebSocketClient, WebSocketResponse};
+#[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+pub use fastmcp_client::WebSocketTaskSubscriptionOwner;
 
 #[cfg(feature = "tasks")]
 pub use fastmcp_client::FinalTaskStreamWatch;
@@ -5354,6 +5358,40 @@ pub mod modern {
         {
             self.inner
                 .open_final_task_subscription_listener(cx, notifications)
+                .await
+        }
+
+        /// Opens one Tasks listener with request-local identity and capabilities.
+        /// Dropping the returned owner retires only this listener when native
+        /// ingress next runs; other requests and catalog listeners stay live.
+        #[cfg(feature = "tasks")]
+        pub async fn open_owned_final_task_subscription_listener(
+            &mut self,
+            cx: &Cx,
+            notifications: SubscriptionFilter,
+            metadata: fastmcp_protocol::FinalRequestMeta,
+        ) -> McpResult<crate::WebSocketTaskSubscriptionOwner>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .open_owned_final_task_subscription_listener(cx, notifications, metadata)
+                .await
+        }
+
+        /// Drives one bounded Tasks receive turn, returning `None` when an
+        /// idle listener yields so its connection can serve another request.
+        #[cfg(feature = "tasks")]
+        pub async fn poll_final_task_subscription_event(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<Option<StdioTaskSubscriptionEvent>>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .poll_final_task_subscription_event(cx, cancellation)
                 .await
         }
 
@@ -14088,6 +14126,8 @@ pub mod prelude {
         BoundWebSocketServer, WebSocketCatalogSubscriptionOwner, WebSocketClient,
         WebSocketNonquiescentShutdown, WebSocketResponse, WebSocketServerShutdown,
     };
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    pub use crate::WebSocketTaskSubscriptionOwner;
     pub use crate::{
         CachePartitionKey, ClientCapabilityInfo, ClientImplementationInfo,
         ContextNotificationSender, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,

@@ -6256,6 +6256,35 @@ struct LiveWebSocketTaskSubscription {
     /// A dropped high-level watch leaves this exact owner for the next
     /// connection operation to cancel before allocating or reading again.
     abandoned: bool,
+    /// A detached proxy owner can retire this exact listen without borrowing
+    /// the connection or cancelling an unrelated catalog listener.
+    abandonment: Option<McpRequestCancellation>,
+}
+
+/// Owns one incrementally driven official Tasks WebSocket subscription.
+///
+/// Dropping this handle marks only its original listen for cancellation. The
+/// active receive or next connection operation completes the native bounded
+/// cancellation write; no background task or separate receive owner is used.
+#[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+pub struct WebSocketTaskSubscriptionOwner {
+    abandonment: McpRequestCancellation,
+}
+
+#[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+impl std::fmt::Debug for WebSocketTaskSubscriptionOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebSocketTaskSubscriptionOwner")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+impl Drop for WebSocketTaskSubscriptionOwner {
+    fn drop(&mut self) {
+        self.abandonment.cancel();
+    }
 }
 
 /// The committed listen request owns these clocks across every receive owner.
@@ -7771,7 +7800,12 @@ where
             .is_some_and(|subscription| {
                 subscription.terminal_response.is_none()
                     && subscription.terminal_error.is_none()
-                    && subscription.lifetime.expired().is_some()
+                    && (subscription.lifetime.expired().is_some()
+                        || subscription.abandoned
+                        || subscription
+                            .abandonment
+                            .as_ref()
+                            .is_some_and(McpRequestCancellation::is_cancel_requested))
             });
         #[cfg(not(feature = "tasks"))]
         let tasks = false;
@@ -7822,6 +7856,8 @@ where
         IO: Send + 'static,
     {
         self.settle_abandoned_catalog_subscription().await?;
+        #[cfg(feature = "tasks")]
+        self.settle_abandoned_task_subscription().await?;
         let mut expired = Vec::new();
         if let Some(subscription) = self.live_catalog_subscription.as_ref()
             && subscription.terminal_response.is_none()
@@ -11470,6 +11506,60 @@ where
     where
         IO: Send + 'static,
     {
+        self.open_task_subscriptions_listener(cx, notifications, None, None)
+            .await
+    }
+
+    /// Opens a Tasks listener with request-scoped identity and capabilities.
+    ///
+    /// The metadata must explicitly activate the official Tasks extension.
+    /// It changes neither the negotiated session nor sibling requests. Keep
+    /// the returned owner until completion; dropping it retires this listen
+    /// before the connection admits further work.
+    #[cfg(feature = "tasks")]
+    pub async fn open_owned_final_task_subscription_listener(
+        &mut self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+        metadata: FinalRequestMeta,
+    ) -> McpResult<WebSocketTaskSubscriptionOwner>
+    where
+        IO: Send + 'static,
+    {
+        if !metadata
+            .client_capabilities
+            .extensions
+            .as_ref()
+            .is_some_and(|extensions| extensions.contains_key(fastmcp_protocol::TASKS_EXTENSION))
+        {
+            return Err(McpError::invalid_params(
+                "An owned Tasks subscription requires explicit Tasks client capability",
+            ));
+        }
+        let owner = WebSocketTaskSubscriptionOwner {
+            abandonment: McpRequestCancellation::new(),
+        };
+        self.open_task_subscriptions_listener(
+            cx,
+            notifications,
+            Some(metadata),
+            Some(owner.abandonment.clone()),
+        )
+        .await?;
+        Ok(owner)
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn open_task_subscriptions_listener(
+        &mut self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+        metadata: Option<FinalRequestMeta>,
+        abandonment: Option<McpRequestCancellation>,
+    ) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
         if cx.checkpoint().is_err()
             || cx
                 .budget()
@@ -11501,9 +11591,15 @@ where
             TASK_STATUS_NOTIFICATION,
             ExtensionDirection::ServerToClient,
         )?;
-        let parameters = self.with_final_tasks_client_capability(serde_json::json!({
-            "notifications": notifications.clone(),
-        }))?;
+        let parameters = match metadata {
+            Some(metadata) => serde_json::json!({
+                "notifications": notifications.clone(),
+                "_meta": metadata,
+            }),
+            None => self.with_final_tasks_client_capability(serde_json::json!({
+                "notifications": notifications.clone(),
+            }))?,
+        };
         let core_request = CoreRequest::decode(
             ProtocolEra::Modern2026,
             "subscriptions/listen",
@@ -11538,6 +11634,7 @@ where
             ),
             terminal_error: None,
             abandoned: false,
+            abandonment,
         });
         self.finish_websocket_request(&request_id);
         Ok(())
@@ -11563,20 +11660,66 @@ where
     where
         IO: Send + 'static,
     {
+        self.next_task_subscription_event(cx, cancellation, None)
+            .await?
+            .ok_or_else(|| {
+                McpError::internal_error("WebSocket Tasks receive ended without an event")
+            })
+    }
+
+    /// Drives one bounded receive turn for the active Tasks listener.
+    ///
+    /// Returns `None` after at most 20 milliseconds of waiting, preserving
+    /// partial frames and the original listener deadlines. Selected native
+    /// cancellation or timeout cleanup finishes before returning, so sharing
+    /// a connection lock never interrupts a partially written control frame.
+    #[cfg(feature = "tasks")]
+    pub async fn poll_final_task_subscription_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<Option<StdioTaskSubscriptionEvent>>
+    where
+        IO: Send + 'static,
+    {
+        let turn_deadline = cx
+            .now()
+            .saturating_add_nanos(WEBSOCKET_CANCELLED_RECV_POLL_NANOS);
+        self.next_task_subscription_event(cx, cancellation, Some(turn_deadline))
+            .await
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn next_task_subscription_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        turn_deadline: Option<asupersync::types::Time>,
+    ) -> McpResult<Option<StdioTaskSubscriptionEvent>>
+    where
+        IO: Send + 'static,
+    {
         if self
             .live_task_subscription
             .as_ref()
             .is_some_and(|subscription| {
                 !subscription.abandoned
+                    && !subscription
+                        .abandonment
+                        .as_ref()
+                        .is_some_and(McpRequestCancellation::is_cancel_requested)
                     && (subscription.terminal_error.is_some()
                         || subscription.terminal_response.is_some())
             })
         {
-            return self.take_ready_task_subscription_event()?.ok_or_else(|| {
-                McpError::internal_error(
-                    "WebSocket Tasks listener lost its selected terminal outcome",
-                )
-            });
+            return self
+                .take_ready_task_subscription_event()?
+                .ok_or_else(|| {
+                    McpError::internal_error(
+                        "WebSocket Tasks listener lost its selected terminal outcome",
+                    )
+                })
+                .map(Some);
         }
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
@@ -11603,10 +11746,13 @@ where
                 return Err(McpError::request_cancelled());
             }
             if let Some(event) = self.take_ready_task_subscription_event()? {
-                return Ok(event);
+                return Ok(Some(event));
             }
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
+            }
+            if turn_deadline.is_some_and(|deadline| cx.now() >= deadline) {
+                return Ok(None);
             }
             let owner_deadline = self
                 .live_task_subscription
@@ -11619,6 +11765,8 @@ where
                 .budget()
                 .deadline
                 .map_or(receive_deadline, |deadline| deadline.min(receive_deadline));
+            let receive_deadline =
+                turn_deadline.map_or(receive_deadline, |deadline| deadline.min(receive_deadline));
             let received = match asupersync::time::timeout_at(
                 receive_deadline,
                 self.recv_with_callback_terminal(cx, Some(cancellation)),
@@ -11886,6 +12034,29 @@ where
         }
     }
 
+    #[cfg(feature = "tasks")]
+    async fn settle_abandoned_task_subscription(&mut self) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        let Some(subscription) = self.live_task_subscription.as_ref() else {
+            return Ok(());
+        };
+        if !subscription.abandoned
+            && !subscription
+                .abandonment
+                .as_ref()
+                .is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
+            return Ok(());
+        }
+        if subscription.terminal_response.is_some() || subscription.terminal_error.is_some() {
+            self.live_task_subscription = None;
+            return Ok(());
+        }
+        self.cancel_live_task_subscription().await
+    }
+
     /// Calls a Tasks-capable modern tool without projecting its result algebra.
     #[cfg(feature = "tasks")]
     pub async fn call_tool_final_outcome(
@@ -12043,6 +12214,102 @@ where
             None,
         )
         .await
+    }
+
+    /// Reads a Task with request-local identity, capabilities and cancellation.
+    /// Requested logs are delivered live without changing the shared session.
+    #[cfg(feature = "tasks")]
+    pub async fn get_task_final_with_metadata(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+        metadata: FinalRequestMeta,
+        cancellation: &McpRequestCancellation,
+        on_log: &mut (dyn FnMut(FinalLogMessageParams) + Send),
+    ) -> McpResult<FinalGetTaskResult>
+    where
+        IO: Send + 'static,
+    {
+        self.require_final_tasks_method(TASK_GET)?;
+        let result: FinalGetTaskResult = self.request_final_tasks_with_callbacks(
+            cx, TASK_GET,
+            FinalGetTaskParams {
+                request: Self::explicit_final_task_request_meta(metadata)?,
+                task_id: task_id.clone(),
+            }, None, Some(cancellation),
+            WebSocketRequestCallbacks { on_log: Some(on_log), ..WebSocketRequestCallbacks::default() },
+        ).await?;
+        if result.task.base().task_id != task_id {
+            return Err(self.close_after_protocol_error(cx,
+                "WebSocket tasks/get response taskId does not match its request").await);
+        }
+        Ok(result)
+    }
+
+    /// Updates an input-required Task with request-local metadata.
+    /// Phase, response kinds and retention are checked before publication and
+    /// again after abandoned connection work has finished settling.
+    #[cfg(feature = "tasks")]
+    pub async fn update_task_final_with_metadata(
+        &mut self,
+        cx: &Cx,
+        task: &FinalTask,
+        input_responses: FinalTaskInputResponses,
+        metadata: FinalRequestMeta,
+        cancellation: &McpRequestCancellation,
+        on_log: &mut (dyn FnMut(FinalLogMessageParams) + Send),
+    ) -> McpResult<FinalUpdateTaskResult>
+    where
+        IO: Send + 'static,
+    {
+        self.require_final_tasks_method(TASK_UPDATE)?;
+        task_wait::admit_task_input(task, &input_responses)?;
+        self.request_final_tasks_with_callbacks(
+            cx, TASK_UPDATE,
+            FinalUpdateTaskParams {
+                request: Self::explicit_final_task_request_meta(metadata)?,
+                task_id: task.base().task_id.clone(), input_responses,
+            }, Some(task), Some(cancellation),
+            WebSocketRequestCallbacks { on_log: Some(on_log), ..WebSocketRequestCallbacks::default() },
+        ).await
+    }
+
+    /// Cancels a Task with request-local metadata and native bounded cleanup.
+    #[cfg(feature = "tasks")]
+    pub async fn cancel_task_final_with_metadata(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+        metadata: FinalRequestMeta,
+        cancellation: &McpRequestCancellation,
+        on_log: &mut (dyn FnMut(FinalLogMessageParams) + Send),
+    ) -> McpResult<FinalCancelTaskResult>
+    where
+        IO: Send + 'static,
+    {
+        self.require_final_tasks_method(TASK_CANCEL)?;
+        self.request_final_tasks_with_callbacks(
+            cx, TASK_CANCEL,
+            FinalCancelTaskParams {
+                request: Self::explicit_final_task_request_meta(metadata)?, task_id,
+            }, None, Some(cancellation),
+            WebSocketRequestCallbacks { on_log: Some(on_log), ..WebSocketRequestCallbacks::default() },
+        ).await
+    }
+
+    #[cfg(feature = "tasks")]
+    fn explicit_final_task_request_meta(metadata: FinalRequestMeta) -> McpResult<TaskRequestMeta> {
+        if metadata.protocol_version != MODERN_PROTOCOL_VERSION
+            || !metadata.client_capabilities.extensions.as_ref()
+                .is_some_and(|extensions| extensions.contains_key(fastmcp_protocol::TASKS_EXTENSION))
+        {
+            return Err(McpError::invalid_params(
+                "Explicit Tasks metadata requires the final protocol and Tasks client capability",
+            ));
+        }
+        serde_json::from_value(serde_json::to_value(metadata).map_err(McpError::from)?)
+            .map(|meta| TaskRequestMeta { meta })
+            .map_err(|_| McpError::invalid_params("Explicit Tasks metadata is invalid"))
     }
 
     fn require_modern(&self, method: &str) -> McpResult<()> {
@@ -12332,6 +12599,29 @@ where
         R: serde::de::DeserializeOwned,
         IO: Send + 'static,
     {
+        self.request_final_tasks_with_callbacks(
+            cx, method, parameters, input_task, None, WebSocketRequestCallbacks::default(),
+        ).await
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn request_final_tasks_with_callbacks<P, R>(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        parameters: P,
+        input_task: Option<&FinalTask>,
+        cancellation: Option<&McpRequestCancellation>,
+        callbacks: WebSocketRequestCallbacks<'_>,
+    ) -> McpResult<R>
+    where
+        P: serde::Serialize,
+        R: serde::de::DeserializeOwned,
+        IO: Send + 'static,
+    {
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
+            return Err(McpError::request_cancelled());
+        }
         if cx.checkpoint().is_err() {
             return Err(self.terminal_cancellation(cx).await);
         }
@@ -12347,10 +12637,12 @@ where
         }
         let request_id = self.allocate_request_id().await?;
         let received = self
-            .request_admitted_with_raw_result(
+            .request_admitted_with_raw_result_with_deadline_and_callbacks(
                 cx,
                 JsonRpcRequest::new(method, Some(params), request_id),
+                cancellation,
                 None,
+                callbacks,
             )
             .await?;
         if let Some(error) = received.response.error {
@@ -12567,16 +12859,32 @@ where
             .map(|subscription| subscription.lifetime.context.clone());
         #[cfg(not(feature = "tasks"))]
         let tasks_cx: Option<Cx> = None;
+        #[cfg(feature = "tasks")]
+        let task_abandonment = self
+            .live_task_subscription
+            .as_ref()
+            .filter(|subscription| {
+                subscription.terminal_response.is_none() && subscription.terminal_error.is_none()
+            })
+            .and_then(|subscription| subscription.abandonment.clone());
+        #[cfg(not(feature = "tasks"))]
+        let task_abandonment: Option<McpRequestCancellation> = None;
         let listener_cancelled = || {
             catalog_cx.as_ref().is_some_and(Cx::is_cancel_requested)
                 || tasks_cx.as_ref().is_some_and(Cx::is_cancel_requested)
                 || catalog_abandonment
                     .as_ref()
                     .is_some_and(McpRequestCancellation::is_cancel_requested)
+                || task_abandonment
+                    .as_ref()
+                    .is_some_and(McpRequestCancellation::is_cancel_requested)
         };
         let receiver = self.receiver.as_mut().ok_or(TransportError::Closed)?;
         let mut cancelled = cancellation.map(|signal| Box::pin(signal.cancelled()));
         let mut catalog_abandoned = catalog_abandonment
+            .as_ref()
+            .map(|signal| Box::pin(signal.cancelled()));
+        let mut task_abandoned = task_abandonment
             .as_ref()
             .map(|signal| Box::pin(signal.cancelled()));
         loop {
@@ -12598,6 +12906,9 @@ where
                 if cx.checkpoint().is_err()
                     || listener_cancelled()
                     || catalog_abandoned
+                        .as_mut()
+                        .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready())
+                    || task_abandoned
                         .as_mut()
                         .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready())
                     || cancelled
@@ -12789,13 +13100,7 @@ where
         // Its Drop marks the retained slot; settle any abandoned RPC first so
         // an uncertain frame can never be followed by a cancellation write.
         #[cfg(feature = "tasks")]
-        if self
-            .live_task_subscription
-            .as_ref()
-            .is_some_and(|subscription| subscription.abandoned)
-        {
-            self.cancel_live_task_subscription().await?;
-        }
+        self.settle_abandoned_task_subscription().await?;
         Ok(())
     }
 

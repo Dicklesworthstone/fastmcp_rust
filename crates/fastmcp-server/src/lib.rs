@@ -20443,6 +20443,10 @@ impl Server {
             proxy::finish_proxy_catalog_listener(listener.as_mut()).await;
         }
         #[cfg(all(feature = "proxy", feature = "tasks"))]
+        if let Some(listener) = relay_listener.as_mut() {
+            proxy::finish_proxy_task_listener(listener.as_mut()).await;
+        }
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
         if let Some(listener) = mixed_relay_listener.as_mut() {
             listener.finish_native_cleanup().await;
         }

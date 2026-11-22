@@ -1,5 +1,8 @@
 //! Native cancellation writes must outlive an individual downstream wait.
 
+#[cfg(feature = "tasks")]
+mod tasks;
+
 use std::io;
 use std::pin::Pin;
 use std::sync::Mutex as StdMutex;

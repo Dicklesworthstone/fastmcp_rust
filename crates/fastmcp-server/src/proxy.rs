@@ -9,6 +9,8 @@ mod websocket;
 pub use websocket::ProxyWebSocketClient;
 #[cfg(feature = "websocket")]
 use websocket::{PreparedProxyWebSocketCatalogListener, PreparedProxyWebSocketRequest};
+#[cfg(all(feature = "websocket", feature = "tasks"))]
+use websocket::{PreparedProxyWebSocketTaskListener, PreparedProxyWebSocketTaskRequest};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(feature = "tasks")]
@@ -267,10 +269,19 @@ pub enum ProxyFinalTaskOperation {
 #[doc(hidden)]
 #[cfg(feature = "tasks")]
 pub struct ProxyFinalTaskRequest {
-    client: ModernHttpClient,
-    request_id: RequestId,
-    operation: ProxyFinalTaskOperation,
-    maximum_response_bytes: usize,
+    kind: ProxyFinalTaskRequestKind,
+}
+
+#[cfg(feature = "tasks")]
+enum ProxyFinalTaskRequestKind {
+    Http {
+        client: ModernHttpClient,
+        request_id: RequestId,
+        operation: ProxyFinalTaskOperation,
+        maximum_response_bytes: usize,
+    },
+    #[cfg(feature = "websocket")]
+    WebSocket(PreparedProxyWebSocketTaskRequest),
 }
 
 #[cfg(feature = "tasks")]
@@ -288,12 +299,16 @@ impl ProxyFinalTaskRequest {
         ctx: &McpContext,
         on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
     ) -> McpResult<ProxyFinalTaskResponse> {
-        let Self {
-            mut client,
-            request_id,
-            operation,
-            maximum_response_bytes,
-        } = self;
+        let (mut client, request_id, operation, maximum_response_bytes) = match self.kind {
+            ProxyFinalTaskRequestKind::Http {
+                client,
+                request_id,
+                operation,
+                maximum_response_bytes,
+            } => (client, request_id, operation, maximum_response_bytes),
+            #[cfg(feature = "websocket")]
+            ProxyFinalTaskRequestKind::WebSocket(request) => return request.execute(ctx, on_progress).await,
+        };
         overlay_inbound_identity_on_detached_client(&mut client, ctx);
         match operation {
             ProxyFinalTaskOperation::CallTool { name, arguments } => {
@@ -477,24 +492,40 @@ impl ProxyFinalTaskRequest {
 #[doc(hidden)]
 #[cfg(feature = "tasks")]
 pub struct ProxyFinalTaskListenerRequest {
-    client: ModernHttpClient,
-    request_id: RequestId,
-    notifications: SubscriptionFilter,
-    limits: SseLimits,
+    kind: ProxyFinalTaskListenerRequestKind,
+}
+
+#[cfg(feature = "tasks")]
+enum ProxyFinalTaskListenerRequestKind {
+    Http {
+        client: ModernHttpClient,
+        request_id: RequestId,
+        notifications: SubscriptionFilter,
+        limits: SseLimits,
+    },
+    #[cfg(feature = "websocket")]
+    WebSocket(PreparedProxyWebSocketTaskListener),
 }
 
 #[cfg(feature = "tasks")]
 impl ProxyFinalTaskListenerRequest {
     async fn open(self, ctx: &McpContext) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
+        let (client, request_id, notifications, limits) = match self.kind {
+            ProxyFinalTaskListenerRequestKind::Http { client, request_id, notifications, limits } => {
+                (client, request_id, notifications, limits)
+            }
+            #[cfg(feature = "websocket")]
+            ProxyFinalTaskListenerRequestKind::WebSocket(request) => return request.open(ctx).await,
+        };
         let listener = await_proxy_request_or_cancellation(
             ctx,
             Box::pin(async move {
-                self.client
+                client
                     .open_subscriptions_listener(
                         ctx.cx(),
-                        self.request_id,
-                        self.notifications,
-                        self.limits,
+                        request_id,
+                        notifications,
+                        limits,
                     )
                     .await
                     .map_err(|error| {
@@ -787,6 +818,43 @@ pub trait ProxyFinalTaskListener: Send {
         let result = self.next(cx, request_cancellation);
         Box::pin(async move { result })
     }
+
+    /// Identifies bounded native control cleanup owned by this listener.
+    #[doc(hidden)]
+    #[cfg(feature = "websocket")]
+    fn native_cleanup(&self) -> Option<ProxyNativeCatalogCleanup> {
+        None
+    }
+
+    /// Finishes native work retained across downstream event deliveries.
+    #[doc(hidden)]
+    #[cfg(feature = "websocket")]
+    fn finish_native_cleanup(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
+
+#[cfg(feature = "tasks")]
+fn task_listener_has_native_cleanup(listener: &dyn ProxyFinalTaskListener) -> bool {
+    #[cfg(feature = "websocket")]
+    {
+        listener.native_cleanup().is_some()
+    }
+    #[cfg(not(feature = "websocket"))]
+    {
+        let _ = listener;
+        false
+    }
+}
+
+#[cfg(feature = "tasks")]
+pub(crate) async fn finish_proxy_task_listener(listener: &mut dyn ProxyFinalTaskListener) {
+    #[cfg(feature = "websocket")]
+    if listener.native_cleanup().is_some() {
+        listener.finish_native_cleanup().await;
+    }
+    #[cfg(not(feature = "websocket"))]
+    let _ = listener;
 }
 
 /// One live upstream catalog `subscriptions/listen` owned by a downstream
@@ -1472,6 +1540,16 @@ pub trait ProxyBackend: Send {
     #[doc(hidden)]
     #[cfg(feature = "websocket")]
     fn prepare_native_websocket_request(
+        &mut self,
+    ) -> McpResult<Option<PreparedProxyWebSocketRequest>> {
+        Ok(None)
+    }
+
+    /// Prepares a native WebSocket core call with official Tasks enabled.
+    /// This separate sealed hook also owns resumed tools/call outcomes.
+    #[doc(hidden)]
+    #[cfg(all(feature = "websocket", feature = "tasks"))]
+    fn prepare_native_websocket_tasks_core_request(
         &mut self,
     ) -> McpResult<Option<PreparedProxyWebSocketRequest>> {
         Ok(None)
@@ -5478,7 +5556,7 @@ pub(crate) enum ProxyMixedSubscriptionEvent {
 #[cfg(feature = "tasks")]
 pub(crate) struct ProxyMixedSubscriptionListener {
     catalog: Option<ProxyCatalogListenerOwner>,
-    tasks: Option<Box<dyn ProxyFinalTaskListener>>,
+    tasks: Option<ProxyFinalTaskListenerOwner>,
     catalog_turn: Option<ProxyCatalogListenTurn>,
     task_turn: Option<ProxyFinalTaskListenTurn>,
     cleanup: ProxyCatalogCleanup,
@@ -5495,7 +5573,7 @@ impl ProxyMixedSubscriptionListener {
     ) -> Self {
         Self {
             catalog: Some(ProxyCatalogListenerOwner::new(catalog)),
-            tasks: Some(tasks),
+            tasks: Some(ProxyFinalTaskListenerOwner::new(tasks)),
             catalog_turn: None,
             task_turn: None,
             cleanup: ProxyCatalogCleanup::default(),
@@ -5506,8 +5584,9 @@ impl ProxyMixedSubscriptionListener {
 
     pub(crate) async fn finish_native_cleanup(&mut self) {
         self.terminated = true;
-        self.task_turn = None;
-        self.tasks = None;
+        let mut task_turns = vec![self.task_turn.take()];
+        let mut task_listeners = vec![self.tasks.take()];
+        self.cleanup.begin_tasks(&mut task_turns, &mut task_listeners);
         let mut turns = vec![self.catalog_turn.take()];
         let mut listeners = vec![self.catalog.take()];
         self.cleanup.begin(&mut turns, &mut listeners);
@@ -5536,16 +5615,11 @@ impl ProxyMixedSubscriptionListener {
             self.catalog_turn = Some(ProxyCatalogListenTurn::new(listener, cx));
         }
         if self.task_turn.is_none() {
-            let mut listener = self
+            let listener = self
                 .tasks
                 .take()
                 .expect("Tasks listener or read owns the leg");
-            let owned_cx = cx.clone();
-            let owned_cancellation = cancellation.clone();
-            self.task_turn = Some(Box::pin(async move {
-                let event = listener.next_async(&owned_cx, &owned_cancellation).await;
-                (listener, event)
-            }));
+            self.task_turn = Some(ProxyFinalTaskListenTurn::new(listener, cx));
         }
         let event = await_proxy_operation_or_cancellation(
             cx,
@@ -5554,7 +5628,7 @@ impl ProxyMixedSubscriptionListener {
                 for tasks in [self.tasks_first, !self.tasks_first] {
                     if tasks {
                         let turn = self.task_turn.as_mut().expect("Tasks read is retained");
-                        if let Poll::Ready((listener, event)) = turn.as_mut().poll(task_cx) {
+                        if let Poll::Ready((listener, event)) = turn.poll(task_cx) {
                             self.task_turn = None;
                             self.tasks = Some(listener);
                             self.tasks_first = false;
@@ -6169,6 +6243,21 @@ impl AdmittedProxyFinalTaskListener {
 
 #[cfg(feature = "tasks")]
 impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
+    #[cfg(feature = "websocket")]
+    fn native_cleanup(&self) -> Option<ProxyNativeCatalogCleanup> {
+        self.inner.as_ref().and_then(|inner| inner.native_cleanup())
+    }
+
+    #[cfg(feature = "websocket")]
+    fn finish_native_cleanup(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {
+            if let Some(inner) = self.inner.as_mut() {
+                finish_proxy_task_listener(inner.as_mut()).await;
+            }
+            self.terminate();
+        })
+    }
+
     fn next(
         &mut self,
         cx: &Cx,
@@ -6187,24 +6276,115 @@ impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
 }
 
 #[cfg(feature = "tasks")]
-type ProxyFinalTaskListenTurn = Pin<
+type ProxyFinalTaskListenFuture = Pin<
     Box<
         dyn Future<
                 Output = (
-                    Box<dyn ProxyFinalTaskListener>,
+                    ProxyFinalTaskListenerOwner,
                     McpResult<ProxyFinalTaskListenerEvent>,
                 ),
             > + Send,
     >,
 >;
 
+#[cfg(feature = "tasks")]
+struct ProxyFinalTaskListenerOwner {
+    listener: Box<dyn ProxyFinalTaskListener>,
+    cancellation: fastmcp_core::McpRequestCancellation,
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyFinalTaskListenerOwner {
+    fn new(listener: Box<dyn ProxyFinalTaskListener>) -> Self {
+        Self { listener, cancellation: fastmcp_core::McpRequestCancellation::new() }
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl Drop for ProxyFinalTaskListenerOwner {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+#[cfg(feature = "tasks")]
+struct ProxyFinalTaskListenTurn {
+    future: ProxyFinalTaskListenFuture,
+    cancellation: fastmcp_core::McpRequestCancellation,
+    #[cfg(feature = "websocket")]
+    native_cleanup: Option<ProxyNativeCatalogCleanup>,
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyFinalTaskListenTurn {
+    fn new(mut owner: ProxyFinalTaskListenerOwner, cx: &Cx) -> Self {
+        let cancellation = owner.cancellation.clone();
+        let owned_cancellation = cancellation.clone();
+        let owned_cx = cx.clone();
+        #[cfg(feature = "websocket")]
+        let native_cleanup = owner.listener.native_cleanup();
+        Self {
+            future: Box::pin(async move {
+                let event = owner.listener.next_async(&owned_cx, &owned_cancellation).await;
+                (owner, event)
+            }),
+            cancellation,
+            #[cfg(feature = "websocket")]
+            native_cleanup,
+        }
+    }
+
+    fn has_native_cleanup(&self) -> bool {
+        #[cfg(feature = "websocket")]
+        { self.native_cleanup.is_some() }
+        #[cfg(not(feature = "websocket"))]
+        { false }
+    }
+
+    fn poll(&mut self, task_cx: &mut std::task::Context<'_>) -> Poll<(ProxyFinalTaskListenerOwner, McpResult<ProxyFinalTaskListenerEvent>)> {
+        self.future.as_mut().poll(task_cx)
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyCatalogCleanup {
+    fn begin_tasks(
+        &mut self,
+        turns: &mut Vec<Option<ProxyFinalTaskListenTurn>>,
+        listeners: &mut Vec<Option<ProxyFinalTaskListenerOwner>>,
+    ) {
+        for turn in std::mem::take(turns).into_iter().flatten() {
+            turn.cancellation.cancel();
+            if turn.has_native_cleanup() {
+                #[cfg(feature = "websocket")]
+                { self.native_cleanup = self.native_cleanup.or(turn.native_cleanup); }
+                self.futures.push(Some(Box::pin(async move {
+                    let (mut owner, _) = turn.future.await;
+                    finish_proxy_task_listener(owner.listener.as_mut()).await;
+                })));
+            }
+        }
+        for mut owner in std::mem::take(listeners).into_iter().flatten() {
+            owner.cancellation.cancel();
+            if task_listener_has_native_cleanup(owner.listener.as_ref()) {
+                #[cfg(feature = "websocket")]
+                { self.native_cleanup = self.native_cleanup.or(owner.listener.native_cleanup()); }
+                self.futures.push(Some(Box::pin(async move {
+                    finish_proxy_task_listener(owner.listener.as_mut()).await;
+                })));
+            }
+        }
+    }
+}
+
 /// A downstream Tasks stream owns every upstream read until it completes.
 /// Keeping the losing reads here, rather than recreating borrowed next()
 /// futures on each selection, preserves partial HTTP/stdio frame state.
 #[cfg(feature = "tasks")]
 struct MultiplexedProxyFinalTaskListener {
-    listeners: Vec<Option<Box<dyn ProxyFinalTaskListener>>>,
+    listeners: Vec<Option<ProxyFinalTaskListenerOwner>>,
     turns: Vec<Option<ProxyFinalTaskListenTurn>>,
+    cleanup: ProxyCatalogCleanup,
     acknowledgement: Option<SubscriptionFilter>,
     context: McpContext,
     selections: Vec<(Arc<ProxyFinalTaskRelay>, Vec<FinalTaskId>)>,
@@ -6222,7 +6402,8 @@ impl MultiplexedProxyFinalTaskListener {
     ) -> Self {
         Self {
             turns: (0..listeners.len()).map(|_| None).collect(),
-            listeners: listeners.into_iter().map(Some).collect(),
+            listeners: listeners.into_iter().map(|listener| Some(ProxyFinalTaskListenerOwner::new(listener))).collect(),
+            cleanup: ProxyCatalogCleanup::default(),
             acknowledgement: Some(acknowledgement),
             context,
             selections,
@@ -6231,11 +6412,11 @@ impl MultiplexedProxyFinalTaskListener {
         }
     }
 
-    fn terminate(&mut self) {
+    async fn terminate(&mut self) {
         self.terminated = true;
         self.acknowledgement = None;
-        self.turns.clear();
-        self.listeners.clear();
+        self.cleanup.begin_tasks(&mut self.turns, &mut self.listeners);
+        self.cleanup.finish().await;
         self.selections.clear();
     }
 
@@ -6266,7 +6447,7 @@ impl MultiplexedProxyFinalTaskListener {
             ));
         }
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.terminate();
+            self.terminate().await;
             return Err(McpError::request_cancelled());
         }
         let ctx = self
@@ -6275,14 +6456,14 @@ impl MultiplexedProxyFinalTaskListener {
             .with_request_cx(cx.clone())
             .with_request_cancellation(cancellation.clone());
         if let Err(error) = self.authorize_selection(&ctx) {
-            self.terminate();
+            self.terminate().await;
             return Err(error);
         }
         if let Some(filter) = self.acknowledgement.take() {
             return Ok(ProxyFinalTaskListenerEvent::Acknowledged(filter));
         }
         if self.listeners.is_empty() {
-            self.terminate();
+            self.terminate().await;
             return Ok(ProxyFinalTaskListenerEvent::Terminal);
         }
         let event = await_proxy_operation_or_cancellation(
@@ -6296,20 +6477,15 @@ impl MultiplexedProxyFinalTaskListener {
                 for offset in 0..route_count {
                     let index = (self.next_route + offset) % route_count;
                     if self.turns[index].is_none() {
-                        let mut listener = self.listeners[index]
+                        let listener = self.listeners[index]
                             .take()
                             .expect("each route is retained by its listener or its read turn");
-                        let owned_cx = cx.clone();
-                        let owned_cancellation = cancellation.clone();
-                        self.turns[index] = Some(Box::pin(async move {
-                            let event = listener.next_async(&owned_cx, &owned_cancellation).await;
-                            (listener, event)
-                        }));
+                        self.turns[index] = Some(ProxyFinalTaskListenTurn::new(listener, cx));
                     }
                     let turn = self.turns[index]
                         .as_mut()
                         .expect("route read was installed");
-                    if let Poll::Ready((listener, event)) = turn.as_mut().poll(task_cx) {
+                    if let Poll::Ready((listener, event)) = turn.poll(task_cx) {
                         self.turns[index] = None;
                         self.listeners[index] = Some(listener);
                         self.next_route = (index + 1) % route_count;
@@ -6321,7 +6497,7 @@ impl MultiplexedProxyFinalTaskListener {
         )
         .await;
         if let Err(error) = self.authorize_selection(&ctx) {
-            self.terminate();
+            self.terminate().await;
             return Err(error);
         }
         match event {
@@ -6331,17 +6507,17 @@ impl MultiplexedProxyFinalTaskListener {
             Ok(ProxyFinalTaskListenerEvent::Terminal) => {
                 // A combined stream cannot promise updates after any leg is
                 // lost. Close every leg and require a new downstream listen.
-                self.terminate();
+                self.terminate().await;
                 Ok(ProxyFinalTaskListenerEvent::Terminal)
             }
             Ok(ProxyFinalTaskListenerEvent::Acknowledged(_)) => {
-                self.terminate();
+                self.terminate().await;
                 Err(McpError::invalid_request(
                     "Proxy upstream Tasks listener acknowledged more than once",
                 ))
             }
             Err(error) => {
-                self.terminate();
+                self.terminate().await;
                 Err(error)
             }
         }
@@ -6350,6 +6526,18 @@ impl MultiplexedProxyFinalTaskListener {
 
 #[cfg(feature = "tasks")]
 impl ProxyFinalTaskListener for MultiplexedProxyFinalTaskListener {
+    #[cfg(feature = "websocket")]
+    fn native_cleanup(&self) -> Option<ProxyNativeCatalogCleanup> {
+        self.cleanup.native_cleanup
+            .or_else(|| self.listeners.iter().flatten().find_map(|owner| owner.listener.native_cleanup()))
+            .or_else(|| self.turns.iter().flatten().find_map(|turn| turn.native_cleanup))
+    }
+
+    #[cfg(feature = "websocket")]
+    fn finish_native_cleanup(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.terminate())
+    }
+
     fn next(
         &mut self,
         cx: &Cx,
@@ -6579,10 +6767,7 @@ impl ProxyFinalTaskRelay {
 
     fn ensure_modern_route(&self) -> McpResult<()> {
         if self.binding.era() == ProtocolEra::Modern2026
-            && matches!(
-                self.binding.adapter(),
-                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio
-            )
+            && proxy_adapter_supports_final_tasks(self.binding.adapter())
         {
             Ok(())
         } else {
@@ -7887,7 +8072,16 @@ impl ProxyFinalTaskRelay {
             }
         }
         ctx.ensure_live()?;
-        if groups.len() == 1 {
+        // Native WebSocket listeners need the retained read-turn owner even
+        // for one route: a server-side revalidation guard can drop an event
+        // wait while the subscription epilogue still owns native cleanup.
+        #[cfg(feature = "websocket")]
+        let retain_single_route = groups.first().is_some_and(|(route, _)| {
+            route.binding.adapter() == ProxyUpstreamAdapter::ModernWebSocket
+        });
+        #[cfg(not(feature = "websocket"))]
+        let retain_single_route = false;
+        if groups.len() == 1 && !retain_single_route {
             let (route, _) = groups.pop().expect("one admitted route");
             return route.open_route_listener_async(ctx, notifications).await;
         }
@@ -7898,12 +8092,16 @@ impl ProxyFinalTaskRelay {
         for (route, handles) in groups {
             let filter = relayed_task_filter(notifications.clone(), handles)?;
             let mut listener = route.open_route_listener_async(ctx, filter.clone()).await?;
-            let acknowledgement = await_proxy_operation_or_cancellation(
-                ctx.cx(),
-                &cancellation,
-                listener.next_async(ctx.cx(), &cancellation),
-            )
-            .await?;
+            let acknowledgement = if task_listener_has_native_cleanup(listener.as_ref()) {
+                listener.next_async(ctx.cx(), &cancellation).await?
+            } else {
+                await_proxy_operation_or_cancellation(
+                    ctx.cx(),
+                    &cancellation,
+                    listener.next_async(ctx.cx(), &cancellation),
+                )
+                .await?
+            };
             ctx.ensure_live()?;
             match acknowledgement {
                 ProxyFinalTaskListenerEvent::Acknowledged(accepted) => {
@@ -8088,6 +8286,16 @@ pub enum ProxyUpstreamAdapter {
     ModernWebSocket,
     /// Exact MCP 2024-11-05 advertised-POST plus SSE transport.
     LegacyHttpSse,
+}
+
+#[cfg(feature = "tasks")]
+fn proxy_adapter_supports_final_tasks(adapter: ProxyUpstreamAdapter) -> bool {
+    match adapter {
+        ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio => true,
+        #[cfg(feature = "websocket")]
+        ProxyUpstreamAdapter::ModernWebSocket => true,
+        ProxyUpstreamAdapter::LegacyStdio | ProxyUpstreamAdapter::LegacyHttpSse => false,
+    }
 }
 
 /// Immutable route-local selection made before upstream lifecycle traffic.
@@ -10037,12 +10245,12 @@ impl ProxyBackend for ProxyHttpClient {
         let Some(client) = modern_http_client(&self.connection) else {
             return Ok(None);
         };
-        Ok(Some(ProxyFinalTaskRequest {
+        Ok(Some(ProxyFinalTaskRequest { kind: ProxyFinalTaskRequestKind::Http {
             client: client.clone(),
             request_id: self.next_request_id()?,
             operation,
             maximum_response_bytes: Self::MAX_RESPONSE_BYTES,
-        }))
+        }}))
     }
 
     #[cfg(feature = "tasks")]
@@ -10058,12 +10266,12 @@ impl ProxyBackend for ProxyHttpClient {
         let Some(client) = modern_http_client(&self.connection) else {
             return Ok(None);
         };
-        Ok(Some(ProxyFinalTaskListenerRequest {
+        Ok(Some(ProxyFinalTaskListenerRequest { kind: ProxyFinalTaskListenerRequestKind::Http {
             client: client.clone(),
             request_id: self.next_request_id()?,
             notifications,
             limits: Self::sse_limits(),
-        }))
+        }}))
     }
 
     fn start_catalog_listener_request(
@@ -11949,8 +12157,9 @@ impl ProxyClient {
     /// Use [`Self::catalog_typed_with_cx`] and asynchronous proxy handlers; the
     /// backend runs exclusively on the caller's context and owns the sole
     /// receive driver. Core request results and MRTR continuations retain their
-    /// exact upstream representation. Tasks and catalog subscriptions are not
-    /// activated by this core transport adapter.
+    /// exact upstream representation. Catalog subscriptions share bounded
+    /// receive turns with calls. Tasks additionally require full upstream
+    /// discovery admission and a configured positive retention ceiling.
     #[cfg(feature = "websocket")]
     pub fn from_websocket<IO>(
         client: fastmcp_client::WebSocketClient<IO>,
@@ -12216,10 +12425,7 @@ impl ProxyClient {
             return Ok(None);
         };
         if binding.era() != ProtocolEra::Modern2026
-            || !matches!(
-                binding.adapter(),
-                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio
-            )
+            || !proxy_adapter_supports_final_tasks(binding.adapter())
         {
             return Ok(None);
         }
@@ -13405,10 +13611,7 @@ impl ProxyClient {
             )
         })?;
         if binding.era() != ProtocolEra::Modern2026
-            || !matches!(
-                binding.adapter(),
-                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio
-            )
+            || !proxy_adapter_supports_final_tasks(binding.adapter())
         {
             return Err(McpError::invalid_request(
                 "Proxy final Tasks relay is unavailable for this upstream route",
@@ -13521,6 +13724,14 @@ impl ProxyClient {
         } else {
             serde_json::json!({"name": name, "arguments": arguments.clone()})
         };
+        #[cfg(all(feature = "websocket", feature = "tasks"))]
+        if tasks_negotiated
+            && let Some(result) = self
+                .try_native_websocket_tasks_core_request(ctx, parameters.clone())
+                .await?
+        {
+            return Ok(result);
+        }
         if !tasks_negotiated
             && let Some(result) = self
                 .try_custom_async_request(
@@ -13582,6 +13793,47 @@ impl ProxyClient {
         }
         ctx.checkpoint()?;
         Ok(result)
+    }
+
+    #[cfg(all(feature = "websocket", feature = "tasks"))]
+    async fn try_native_websocket_tasks_core_request(
+        &self,
+        ctx: &McpContext,
+        mut parameters: serde_json::Value,
+    ) -> McpResult<Option<CoreResult>> {
+        let Some(prepared) = self.with_backend(|backend| {
+            backend.prepare_native_websocket_tasks_core_request()
+        })? else {
+            return Ok(None);
+        };
+        parameters
+            .as_object_mut()
+            .ok_or_else(|| McpError::invalid_params("Proxy tools/call parameters must be an object"))?
+            .insert(
+                "_meta".to_owned(),
+                serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default()))
+                    .map_err(McpError::from)?,
+            );
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&parameters))
+            .map_err(|error| McpError::invalid_params(format!("Invalid resumed proxy call: {error}")))?;
+        let mut progress_error = None;
+        let mut forward_progress = |progress| {
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                progress_error = Some(error);
+            }
+        };
+        let result = prepared
+            .into_execution()
+            .execute(ctx, request, &mut forward_progress)
+            .await?;
+        let result = self.admit_upstream_result("tools/call", result)?;
+        if !final_result_retains_task(&result) {
+            if let Some(error) = progress_error {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
+        }
+        Ok(Some(result))
     }
 
     #[cfg(feature = "tasks")]

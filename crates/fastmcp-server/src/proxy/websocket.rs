@@ -7,6 +7,10 @@
 
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "tasks")]
+mod tasks;
+#[cfg(feature = "tasks")]
+pub use tasks::{PreparedProxyWebSocketTaskListener, PreparedProxyWebSocketTaskRequest};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -49,7 +53,8 @@ use crate::handler::BoxFuture;
 /// never mutate the shared client session. Catalog and resource subscriptions
 /// share bounded receive turns with ordinary requests; dropping their owner
 /// retires only that listen before the connection's next operation. This
-/// adapter does not advertise Tasks relay support.
+/// adapter relays Tasks only when the upstream admits the full official
+/// extension and the gateway configures a positive Task retention ceiling.
 pub struct ProxyWebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
@@ -293,6 +298,7 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     backend: ProxyWebSocketClient<IO>,
+    allow_tasks: bool,
 }
 
 impl<IO> ProxyAsyncRequest for WebSocketCoreRequest<IO>
@@ -315,7 +321,8 @@ where
     ) -> BoxFuture<'a, McpResult<CoreResult>> {
         Box::pin(async move {
             ctx.checkpoint()?;
-            let (request, parameters) = self.backend.prepare_parameters(ctx, request)?;
+            let (request, parameters) =
+                self.backend.prepare_parameters(ctx, request, self.allow_tasks)?;
 
             // A waiter owns no wire state yet, so cancellation may drop this
             // acquisition immediately. Once acquired, the native client owns
@@ -335,7 +342,7 @@ where
             let _ = client.take_final_progress_notifications();
             let cancellation = McpRequestCancellation::new();
             let mut forward_log = |message| relay_upstream_log_message(ctx, &message);
-            let outcome = drive_native_request(
+            let outcome = drive_native_request_with_priority(
                 ctx,
                 &cancellation,
                 client.request_with_raw_result_and_progress_and_logs(
@@ -346,6 +353,16 @@ where
                     on_progress,
                     &mut forward_log,
                 ),
+                |outcome| {
+                    self.allow_tasks
+                        && outcome.as_ref().is_ok_and(|response| {
+                            response.response.error.is_none()
+                                && response.response.result.as_ref().is_some_and(|result| {
+                                    result.get("resultType").and_then(serde_json::Value::as_str)
+                                        == Some("task")
+                                })
+                        })
+                },
             )
             .await;
             // Live callbacks consume matching progress and requested logs as
@@ -411,6 +428,7 @@ where
         &self,
         ctx: &McpContext,
         request: CoreRequest,
+        allow_tasks: bool,
     ) -> McpResult<(CoreRequest, Option<serde_json::Value>)> {
         if request.era() != ProtocolEra::Modern2026 {
             return Err(McpError::invalid_request(
@@ -443,9 +461,18 @@ where
                 McpError::invalid_params("Proxy WebSocket request parameters must be an object")
             })?;
 
+        let metadata = self.request_metadata(ctx)?;
+        #[cfg(feature = "tasks")]
+        let metadata = if allow_tasks {
+            self.task_request_metadata(ctx)?
+        } else {
+            metadata
+        };
+        #[cfg(not(feature = "tasks"))]
+        let _ = allow_tasks;
         object.insert(
             "_meta".to_owned(),
-            serde_json::to_value(self.request_metadata(ctx)?).map_err(McpError::from)?,
+            serde_json::to_value(metadata).map_err(McpError::from)?,
         );
         let request = CoreRequest::decode(ProtocolEra::Modern2026, method, parameters.as_ref())
             .map_err(|error| {
@@ -475,7 +502,52 @@ where
         Ok(Some(PreparedProxyWebSocketRequest {
             execution: Box::new(WebSocketCoreRequest {
                 backend: self.clone(),
+                allow_tasks: false,
             }),
+        }))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn prepare_native_websocket_tasks_core_request(
+        &mut self,
+    ) -> McpResult<Option<PreparedProxyWebSocketRequest>> {
+        super::discovery_admits_final_tasks_relay(&self.discovery)?;
+        Ok(Some(PreparedProxyWebSocketRequest {
+            execution: Box::new(WebSocketCoreRequest {
+                backend: self.clone(),
+                allow_tasks: true,
+            }),
+        }))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn supports_final_tasks_relay(&mut self) -> McpResult<bool> {
+        Ok(super::discovery_admits_final_tasks_relay(&self.discovery).is_ok())
+    }
+
+    #[cfg(feature = "tasks")]
+    fn start_final_task_request(
+        &mut self,
+        operation: super::ProxyFinalTaskOperation,
+    ) -> McpResult<Option<super::ProxyFinalTaskRequest>> {
+        super::discovery_admits_final_tasks_relay(&self.discovery)?;
+        Ok(Some(super::ProxyFinalTaskRequest {
+            kind: super::ProxyFinalTaskRequestKind::WebSocket(
+                PreparedProxyWebSocketTaskRequest::new(self.clone(), operation),
+            ),
+        }))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn start_final_task_listener(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Option<super::ProxyFinalTaskListenerRequest>> {
+        super::discovery_admits_final_tasks_relay(&self.discovery)?;
+        Ok(Some(super::ProxyFinalTaskListenerRequest {
+            kind: super::ProxyFinalTaskListenerRequestKind::WebSocket(
+                PreparedProxyWebSocketTaskListener::new(self.clone(), notifications),
+            ),
         }))
     }
 
@@ -575,6 +647,15 @@ async fn drive_native_request<T>(
     wire_cancellation: &McpRequestCancellation,
     operation: impl Future<Output = McpResult<T>>,
 ) -> McpResult<T> {
+    drive_native_request_with_priority(ctx, wire_cancellation, operation, |_| false).await
+}
+
+async fn drive_native_request_with_priority<T>(
+    ctx: &McpContext,
+    wire_cancellation: &McpRequestCancellation,
+    operation: impl Future<Output = McpResult<T>>,
+    keep_committed_result: impl Fn(&McpResult<T>) -> bool,
+) -> McpResult<T> {
     let mut operation = std::pin::pin!(operation);
     let request_cancellation = ctx.request_cancellation();
     let mut cancelled = std::pin::pin!(request_cancellation.cancelled());
@@ -589,6 +670,12 @@ async fn drive_native_request<T>(
         }
 
         if let Poll::Ready(result) = operation.as_mut().poll(task_cx) {
+            // A committed Task must reach the route registry even when its
+            // creation response races downstream cancellation. Otherwise the
+            // gateway would lose authority to clean up live upstream work.
+            if keep_committed_result(&result) {
+                return Poll::Ready(result);
+            }
             if cancellation_error.is_none()
                 && (ctx.ensure_live().is_err() || cancelled.as_mut().poll(task_cx).is_ready())
             {
