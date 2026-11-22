@@ -288,8 +288,6 @@ pub mod client {
     /// MCP Apps client APIs are available only with the Apps extension.
     #[cfg(all(feature = "apps", feature = "websocket-experimental"))]
     pub use crate::McpAppsWebSocketClientWirePolicy;
-    #[cfg(feature = "websocket-experimental")]
-    pub use crate::WebSocketResponse;
     pub use crate::{
         BearerBindingError, BoundBearerCredential, ConfigError, ConfigLoader, HttpEndpointConfig,
         HttpEndpointConfigError, MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT,
@@ -356,6 +354,8 @@ pub mod client {
         StdioInterruptedRequest, StdioProcessExit, StdioRecovery, StdioRestartError,
         StdioRestartPolicy, StdioSubscriptionRecovery, SupervisedStdioClient,
     };
+    #[cfg(feature = "websocket-experimental")]
+    pub use crate::{WebSocketCatalogSubscriptionOwner, WebSocketResponse};
     #[cfg(feature = "apps")]
     pub use fastmcp_client::mcp_apps;
     pub use fastmcp_client::{http_auth, http_executor, mcp_config, sse};
@@ -1179,7 +1179,7 @@ pub use fastmcp_client::{
     StdioRestartPolicy, StdioSubscriptionRecovery, SupervisedStdioClient,
 };
 #[cfg(feature = "websocket-experimental")]
-pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
+pub use fastmcp_client::{WebSocketCatalogSubscriptionOwner, WebSocketClient, WebSocketResponse};
 
 #[cfg(feature = "tasks")]
 pub use fastmcp_client::FinalTaskStreamWatch;
@@ -14083,8 +14083,8 @@ pub mod prelude {
     };
     #[cfg(feature = "websocket-experimental")]
     pub use crate::{
-        BoundWebSocketServer, WebSocketClient, WebSocketNonquiescentShutdown, WebSocketResponse,
-        WebSocketServerShutdown,
+        BoundWebSocketServer, WebSocketCatalogSubscriptionOwner, WebSocketClient,
+        WebSocketNonquiescentShutdown, WebSocketResponse, WebSocketServerShutdown,
     };
     pub use crate::{
         CachePartitionKey, ClientCapabilityInfo, ClientImplementationInfo,

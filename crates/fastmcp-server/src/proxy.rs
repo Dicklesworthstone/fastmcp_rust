@@ -6,9 +6,9 @@
 #[cfg(feature = "websocket")]
 mod websocket;
 #[cfg(feature = "websocket")]
-use websocket::PreparedProxyWebSocketRequest;
-#[cfg(feature = "websocket")]
 pub use websocket::ProxyWebSocketClient;
+#[cfg(feature = "websocket")]
+use websocket::{PreparedProxyWebSocketCatalogListener, PreparedProxyWebSocketRequest};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(feature = "tasks")]
@@ -791,7 +791,8 @@ pub trait ProxyFinalTaskListener: Send {
 
 /// One live upstream catalog `subscriptions/listen` owned by a downstream
 /// request. HTTP uses an independent SSE POST so the route mutex stays free;
-/// stdio drives the incremental listener under a brief lock.
+/// stdio drives the incremental listener under a brief lock, and WebSocket
+/// releases its asynchronous connection lock between bounded receive turns.
 pub trait ProxyCatalogListener: Send {
     /// Awaits the next upstream catalog listener event on the caller's `Cx`.
     fn next_async<'a>(
@@ -2049,6 +2050,18 @@ pub trait ProxyBackend: Send {
         &mut self,
         _notifications: SubscriptionFilter,
     ) -> McpResult<Option<ProxyCatalogListenerRequest>> {
+        Ok(None)
+    }
+
+    /// Prepares a request-owned native WebSocket catalog listener without I/O
+    /// or retaining the route mutex. Only the native backend can construct
+    /// this opening; its listener preserves the connection's sole reader.
+    #[doc(hidden)]
+    #[cfg(feature = "websocket")]
+    fn prepare_native_websocket_catalog_listener(
+        &mut self,
+        _notifications: SubscriptionFilter,
+    ) -> McpResult<Option<PreparedProxyWebSocketCatalogListener>> {
         Ok(None)
     }
 
@@ -11916,11 +11929,14 @@ impl ProxyClient {
         let Some(binding) = self.upstream_binding else {
             return Ok(None);
         };
+        let native_catalog_adapter = match binding.adapter() {
+            ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio => true,
+            #[cfg(feature = "websocket")]
+            ProxyUpstreamAdapter::ModernWebSocket => true,
+            _ => false,
+        };
         if binding.era() != ProtocolEra::Modern2026
-            || !matches!(
-                binding.adapter(),
-                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio
-            )
+            || !native_catalog_adapter
             || !self.with_backend(|backend| backend.supports_catalog_listener())?
         {
             return Ok(None);
@@ -13513,6 +13529,12 @@ impl ProxyClient {
         if let Some(request) = self
             .with_backend(|backend| backend.start_catalog_listener_request(notifications.clone()))?
         {
+            return request.open(ctx).await;
+        }
+        #[cfg(feature = "websocket")]
+        if let Some(request) = self.with_backend(|backend| {
+            backend.prepare_native_websocket_catalog_listener(notifications.clone())
+        })? {
             return request.open(ctx).await;
         }
         if self.with_backend(|backend| backend.supports_incremental_catalog_listener())? {

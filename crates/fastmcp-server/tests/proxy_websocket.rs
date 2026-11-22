@@ -1,7 +1,7 @@
 //! Native WebSocket upstreams exercised through the public typed proxy gateway.
 //!
-//! These regressions cover the opt-in core proxy surface, not Tasks, subscription
-//! relays, or standards-track WebSocket transport conformance.
+//! These regressions cover the opt-in core proxy and catalog subscription
+//! surfaces, not Tasks relay or standards-track WebSocket conformance.
 
 #![cfg(all(feature = "proxy", feature = "websocket"))]
 #![forbid(unsafe_code)]
@@ -22,7 +22,10 @@ use asupersync::runtime::{RuntimeBuilder, TaskHandle, reactor::create_reactor};
 use asupersync::sync::Notify;
 use asupersync::types::CancelKind;
 use asupersync::{Cx, Outcome};
-use fastmcp_client::{ClientBuilder, ClientProtocolPlan, WebSocketClient};
+use fastmcp_client::{
+    ClientBuilder, ClientProtocolPlan, StdioSubscriptionEvent, SubscriptionTimeoutPolicy,
+    WebSocketClient,
+};
 use fastmcp_core::{
     ClientCapabilityInfo, McpContext, McpError, McpErrorCode, McpLogLevel, McpOutcome,
     McpRequestCancellation, McpResult, NotificationSender, ProgressReporter,
@@ -31,9 +34,10 @@ use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
 use fastmcp_protocol::{
     CompleteResult, CompletionValues, Content, FINAL_CLIENT_CAPABILITIES_META_KEY,
     FINAL_LOG_LEVEL_META_KEY, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
-    FinalCompletionParams, FinalCompletionValues, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    LegacyCompletionParams, Prompt, PromptArgument, PromptMessage, Resource, ResourceContent,
-    ResourceTemplate, ResultMeta, Role, Tool,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCompletionParams, FinalCompletionValues, JsonRpcMessage,
+    JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams, Prompt, PromptArgument, PromptMessage,
+    Resource, ResourceContent, ResourceTemplate, ResultMeta, Role, ServerNotification,
+    SubscriptionFilter, Tool,
 };
 use fastmcp_server::{
     BoxFuture, CompletionHandler, FinalToolOutcome, InboundRequestContext, InboundRequestTransport,
@@ -492,6 +496,315 @@ fn assert_opaque(result: &Value, method: &str) {
         json!({"nextCursor": "inert", "ttlMs": 999})
     );
     assert_eq!(result["_meta"]["com.example/upstream-method"], method);
+}
+
+#[test]
+fn native_websocket_proxy_relays_catalog_and_resource_events_without_blocking_calls() {
+    run(|cx| async move {
+        let effects = Arc::new(Effects::default());
+        let server = upstream(&effects, ProtocolPolicy::ModernOnly);
+        let publisher = server.subscription_publisher();
+        let running = Running::start(&cx, server).await;
+        let proxy = connect(&cx, running.address, 41).await;
+        let catalog = proxy.catalog_typed_with_cx(&cx).await.unwrap();
+        let gateway = Server::new("websocket-subscription-gateway", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .as_proxy_typed("ws", proxy, catalog)
+            .unwrap()
+            .build();
+        let gateway = Running::start(&cx, gateway).await;
+        let mut downstream = client(&cx, gateway.address, ProtocolPolicy::ModernOnly).await;
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            resources_list_changed: Some(true),
+            prompts_list_changed: Some(true),
+            resource_subscriptions: Some(vec![RESOURCE.to_owned()]),
+            ..Default::default()
+        };
+        let cancellation = McpRequestCancellation::new();
+        downstream
+            .open_subscriptions_listener(&cx, filter.clone())
+            .await
+            .unwrap();
+        match downstream
+            .next_subscription_event(&cx, &cancellation)
+            .await
+            .unwrap()
+        {
+            StdioSubscriptionEvent::Acknowledged(accepted) => assert_eq!(accepted, filter),
+            event => {
+                panic!("the upstream must accept the complete filter before events: {event:?}")
+            }
+        }
+
+        // A pending downstream receive owns no additional listener. Dropping
+        // that wait preserves the route while the gateway is still waiting
+        // on its silent upstream subscription.
+        let mut pending = Box::pin(downstream.next_subscription_event(&cx, &cancellation));
+        let first_poll =
+            std::future::poll_fn(|task| Poll::Ready(pending.as_mut().poll(task))).await;
+        assert!(first_poll.is_pending());
+        drop(pending);
+
+        let called = downstream
+            .call_tool(
+                &cx,
+                "ws/echo",
+                json!({"value": "call while listener is idle"}),
+            )
+            .await
+            .unwrap();
+        let called: Value = serde_json::from_str(&called.encode().unwrap()).unwrap();
+        assert_eq!(called["content"][0]["text"], "call while listener is idle");
+
+        for notification in [
+            ServerNotification::ToolsListChanged(None),
+            ServerNotification::ResourcesListChanged(None),
+            ServerNotification::PromptsListChanged(None),
+            ServerNotification::ResourceUpdated(
+                serde_json::from_value(json!({"uri": RESOURCE})).unwrap(),
+            ),
+        ] {
+            assert_eq!(publisher.publish(notification).unwrap(), 1);
+        }
+        for method in [
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+            "notifications/resources/updated",
+        ] {
+            let StdioSubscriptionEvent::Notification(notification) = downstream
+                .next_subscription_event(&cx, &cancellation)
+                .await
+                .unwrap()
+            else {
+                panic!("each published change must cross the native proxy stream");
+            };
+            let wire = notification.encode().unwrap();
+            assert_eq!(wire.method, method);
+            let parameters = wire.params.unwrap();
+            // Discovery consumed downstream ID 1; the upstream additionally
+            // collected four catalogs before opening its own listen request.
+            assert_eq!(parameters["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY], 2);
+            if method == "notifications/resources/updated" {
+                assert_eq!(parameters["uri"], RESOURCE);
+            }
+        }
+
+        cancellation.cancel();
+        assert_eq!(
+            downstream
+                .next_subscription_event(&cx, &cancellation)
+                .await
+                .unwrap_err()
+                .code,
+            McpErrorCode::RequestCancelled,
+        );
+        let reused = downstream
+            .call_tool(
+                &cx,
+                "ws/echo",
+                json!({"value": "after listener cancellation"}),
+            )
+            .await
+            .unwrap();
+        let reused: Value = serde_json::from_str(&reused.encode().unwrap()).unwrap();
+        assert_eq!(reused["content"][0]["text"], "after listener cancellation");
+
+        // Completing a subsequent native request settles the abandoned
+        // listener, so its capacity is available to a fresh owner.
+        let replacement = McpRequestCancellation::new();
+        downstream
+            .open_subscriptions_listener(&cx, filter.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            downstream.next_subscription_event(&cx, &replacement).await.unwrap(),
+            StdioSubscriptionEvent::Acknowledged(accepted) if accepted == filter
+        ));
+        assert_eq!(
+            publisher
+                .publish(ServerNotification::ToolsListChanged(None))
+                .unwrap(),
+            1
+        );
+        let StdioSubscriptionEvent::Notification(notification) = downstream
+            .next_subscription_event(&cx, &replacement)
+            .await
+            .unwrap()
+        else {
+            panic!("the replacement listener must receive its own event");
+        };
+        assert_ne!(
+            notification.encode().unwrap().params.unwrap()["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY],
+            2,
+            "a replacement listener must not inherit the retired request ID",
+        );
+        assert_eq!(effects.calls.load(Ordering::Acquire), 2);
+        downstream.close(&cx).await.unwrap();
+        gateway.stop(&cx).await;
+        running.stop(&cx).await;
+    });
+}
+
+#[test]
+fn native_websocket_proxy_duplicate_listener_does_not_replace_the_active_owner() {
+    run(|cx| async move {
+        let effects = Arc::new(Effects::default());
+        let server = upstream(&effects, ProtocolPolicy::ModernOnly);
+        let publisher = server.subscription_publisher();
+        let running = Running::start(&cx, server).await;
+        let proxy = connect(&cx, running.address, 42).await;
+        let catalog = proxy.catalog_typed_with_cx(&cx).await.unwrap();
+        let gateway = Server::new("websocket-listener-owner-gateway", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .as_proxy_typed("ws", proxy, catalog)
+            .unwrap()
+            .build();
+        let gateway = Running::start(&cx, gateway).await;
+        let mut first = client(&cx, gateway.address, ProtocolPolicy::ModernOnly).await;
+        let mut second = client(&cx, gateway.address, ProtocolPolicy::ModernOnly).await;
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..Default::default()
+        };
+        let first_owner = McpRequestCancellation::new();
+        first
+            .open_subscriptions_listener(&cx, filter.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first.next_subscription_event(&cx, &first_owner).await.unwrap(),
+            StdioSubscriptionEvent::Acknowledged(accepted) if accepted == filter
+        ));
+
+        let second_owner = McpRequestCancellation::new();
+        second
+            .open_subscriptions_listener(&cx, filter)
+            .await
+            .unwrap();
+        let refused = second
+            .next_subscription_event(&cx, &second_owner)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            publisher
+                .publish(ServerNotification::ToolsListChanged(None))
+                .unwrap(),
+            1
+        );
+        let StdioSubscriptionEvent::Notification(notification) = first
+            .next_subscription_event(&cx, &first_owner)
+            .await
+            .unwrap()
+        else {
+            panic!("a rejected owner must not cancel or consume the first listener");
+        };
+        assert_eq!(
+            notification.encode().unwrap().method,
+            "notifications/tools/list_changed"
+        );
+        let result = second
+            .call_tool(
+                &cx,
+                "ws/echo",
+                json!({"value": "refused listener still has a usable client"}),
+            )
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_str(&result.encode().unwrap()).unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            "refused listener still has a usable client"
+        );
+        assert_eq!(effects.calls.load(Ordering::Acquire), 1);
+        first.close(&cx).await.unwrap();
+        second.close(&cx).await.unwrap();
+        gateway.stop(&cx).await;
+        running.stop(&cx).await;
+    });
+}
+
+#[test]
+fn native_websocket_proxy_listener_idle_timeout_preserves_ordinary_requests() {
+    run(|cx| async move {
+        let effects = Arc::new(Effects::default());
+        let server = upstream(&effects, ProtocolPolicy::ModernOnly);
+        let publisher = server.subscription_publisher();
+        let running = Running::start(&cx, server).await;
+        let transport =
+            AsyncWsClientTransport::connect(&cx, &format!("ws://{}/mcp", running.address))
+                .await
+                .unwrap();
+        let upstream = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+            .subscription_timeout_policy(
+                SubscriptionTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(5))
+                    .unwrap(),
+            )
+            .connect_websocket_with_cx(&cx, transport)
+            .await
+            .unwrap();
+        let proxy = ProxyClient::from_websocket(upstream, 43).unwrap();
+        let catalog = proxy.catalog_typed_with_cx(&cx).await.unwrap();
+        let gateway = Server::new("websocket-listener-timeout-gateway", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .as_proxy_typed("ws", proxy, catalog)
+            .unwrap()
+            .build();
+        let gateway = Running::start(&cx, gateway).await;
+        let mut downstream = client(&cx, gateway.address, ProtocolPolicy::ModernOnly).await;
+        let cancellation = McpRequestCancellation::new();
+        downstream
+            .open_subscriptions_listener(
+                &cx,
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            downstream
+                .next_subscription_event(&cx, &cancellation)
+                .await
+                .unwrap(),
+            StdioSubscriptionEvent::Acknowledged(_)
+        ));
+        let timeout = downstream
+            .next_subscription_event(&cx, &cancellation)
+            .await
+            .unwrap_err();
+        assert_eq!(timeout.code, McpErrorCode::InternalError);
+        assert_eq!(timeout.data.as_ref().unwrap()["timeoutSource"], "idle");
+        assert!(!cancellation.is_cancel_requested());
+
+        // The receive-turn limit must never drop the selected timeout's
+        // cancellation write. Both the downstream and upstream connection
+        // remain usable after the retired listener reports its outcome.
+        let result = downstream
+            .call_tool(&cx, "ws/echo", json!({"value": "after idle timeout"}))
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_str(&result.encode().unwrap()).unwrap();
+        assert_eq!(result["content"][0]["text"], "after idle timeout");
+        assert_eq!(effects.calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            publisher
+                .publish(ServerNotification::ToolsListChanged(None))
+                .unwrap(),
+            0,
+            "the upstream subscription must release its route after timeout",
+        );
+        downstream.close(&cx).await.unwrap();
+        gateway.stop(&cx).await;
+        running.stop(&cx).await;
+    });
 }
 
 #[test]

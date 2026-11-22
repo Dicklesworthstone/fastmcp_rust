@@ -13,18 +13,19 @@ use std::task::Poll;
 use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
-use fastmcp_client::WebSocketClient;
+use fastmcp_client::{StdioSubscriptionEvent, WebSocketCatalogSubscriptionOwner, WebSocketClient};
 use fastmcp_core::{McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult};
 use fastmcp_protocol::common_types::Implementation;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     ClientCapabilities, Content, CoreRequest, CoreResult, FINAL_LOG_LEVEL_META_KEY,
     FinalProgressNotificationParams, FinalRequestMeta, JsonRpcError, Prompt, PromptMessage,
-    Resource, ResourceContent, ResourceTemplate, ServerDiscoverResult, Tool,
+    Resource, ResourceContent, ResourceTemplate, ServerDiscoverResult, SubscriptionFilter, Tool,
 };
 
 use super::{
-    ProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyPollTimer,
+    ProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalogListener,
+    ProxyCatalogListenerEvent, ProxyPollTimer, await_proxy_operation_or_cancellation,
     await_proxy_request_or_cancellation, catalog_capability, discovery_supports_final_capability,
     discovery_supports_final_completion, inbound_client_capabilities,
     inbound_identity_implementation, inbound_logging_level, relay_upstream_log_message,
@@ -41,8 +42,10 @@ use crate::handler::BoxFuture;
 /// Clones share one connection and serialize its receive turns with a
 /// cancellation-aware mutex. Per-request identity, capabilities, logging, and
 /// progress metadata are reconstructed from the current [`McpContext`]; they
-/// never mutate the shared client session. This core adapter does not advertise
-/// catalog subscriptions or Tasks relay support.
+/// never mutate the shared client session. Catalog and resource subscriptions
+/// share bounded receive turns with ordinary requests; dropping their owner
+/// retires only that listen before the connection's next operation. This
+/// adapter does not advertise Tasks relay support.
 pub struct ProxyWebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
@@ -115,8 +118,8 @@ where
         })?;
         let client_implementation = session.modern_client_implementation();
         let mut client_capabilities = session.client_capabilities().clone();
-        // This adapter owns only core requests. A locally configured client
-        // extension must not implicitly activate an unsupported proxy relay.
+        // This adapter owns core requests and catalog subscriptions. A locally
+        // configured extension must not implicitly activate another relay.
         client_capabilities.extensions = None;
         let instructions = session.instructions().map(str::to_owned);
         Ok(Self {
@@ -154,6 +157,125 @@ pub struct PreparedProxyWebSocketRequest {
 impl PreparedProxyWebSocketRequest {
     pub(super) fn into_execution(self) -> Box<dyn ProxyAsyncRequest> {
         self.execution
+    }
+}
+
+/// Sealed opening for a request-owned native WebSocket catalog listener.
+#[doc(hidden)]
+pub struct PreparedProxyWebSocketCatalogListener {
+    opening: Box<dyn WebSocketCatalogOpening>,
+}
+
+impl PreparedProxyWebSocketCatalogListener {
+    pub(super) async fn open(self, ctx: &McpContext) -> McpResult<Box<dyn ProxyCatalogListener>> {
+        self.opening.open(ctx).await
+    }
+}
+
+trait WebSocketCatalogOpening: Send {
+    fn open<'a>(
+        self: Box<Self>,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpResult<Box<dyn ProxyCatalogListener>>>;
+}
+
+struct WebSocketCatalogRequest<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    backend: ProxyWebSocketClient<IO>,
+    notifications: SubscriptionFilter,
+}
+
+impl<IO> WebSocketCatalogOpening for WebSocketCatalogRequest<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    fn open<'a>(
+        self: Box<Self>,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpResult<Box<dyn ProxyCatalogListener>>> {
+        Box::pin(async move {
+            ctx.ensure_live()?;
+            let metadata = self.backend.request_metadata(ctx)?;
+            let mut client = await_proxy_request_or_cancellation(ctx, async {
+                OwnedMutexGuard::lock(Arc::clone(&self.backend.client), ctx.cx())
+                    .await
+                    .map_err(websocket_lock_error)
+            })
+            .await?;
+            ctx.ensure_live()?;
+            // A dropped send retains the native client's uncertainty guard;
+            // after commitment the returned owner marks this exact listen for
+            // retirement if cancellation wins before its acknowledgement.
+            let owner = await_proxy_request_or_cancellation(ctx, async {
+                client
+                    .open_owned_subscriptions_listener(ctx.cx(), self.notifications, metadata)
+                    .await
+            })
+            .await?;
+            drop(client);
+            ctx.ensure_live()?;
+            Ok(Box::new(WebSocketCatalogListener {
+                client: Arc::clone(&self.backend.client),
+                _owner: owner,
+            }) as Box<dyn ProxyCatalogListener>)
+        })
+    }
+}
+
+struct WebSocketCatalogListener<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    client: Arc<Mutex<WebSocketClient<IO>>>,
+    _owner: WebSocketCatalogSubscriptionOwner,
+}
+
+impl<IO> ProxyCatalogListener for WebSocketCatalogListener<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        request_cancellation: &'a McpRequestCancellation,
+    ) -> BoxFuture<'a, McpResult<ProxyCatalogListenerEvent>> {
+        Box::pin(async move {
+            loop {
+                let mut client = await_proxy_operation_or_cancellation(
+                    cx,
+                    request_cancellation,
+                    Box::pin(async {
+                        OwnedMutexGuard::lock(Arc::clone(&self.client), cx)
+                            .await
+                            .map_err(websocket_lock_error)
+                    }),
+                )
+                .await?;
+                // Only the native receive is time-sliced. A selected timeout
+                // or cancellation retains its bounded control-write cleanup;
+                // dropping that write just to yield the mutex is not safe.
+                let event = client
+                    .poll_subscription_event(cx, request_cancellation)
+                    .await?;
+                drop(client);
+                if let Some(event) = event {
+                    return Ok(match event {
+                        StdioSubscriptionEvent::Acknowledged(filter) => {
+                            ProxyCatalogListenerEvent::Acknowledged(filter)
+                        }
+                        StdioSubscriptionEvent::Notification(notification) => {
+                            ProxyCatalogListenerEvent::Notification(notification)
+                        }
+                        StdioSubscriptionEvent::Terminal => ProxyCatalogListenerEvent::Terminal,
+                    });
+                }
+                // Let queued ordinary requests acquire the sole receive owner
+                // before the listener begins another bounded ingress turn.
+                asupersync::runtime::yield_now().await;
+            }
+        })
     }
 }
 
@@ -218,8 +340,9 @@ where
             )
             .await;
             // Live callbacks consume matching progress and requested logs as
-            // they are admitted. This core-only adapter owns no downstream
-            // subscription for the remaining connection notifications.
+            // they are admitted. Native listener events use their separate
+            // owned queue, so discarding these unowned notifications cannot
+            // steal a catalog or resource update from its downstream request.
             let _ = client.take_final_server_notifications();
             let _ = client.take_final_progress_notifications();
             drop(client);
@@ -252,6 +375,29 @@ impl<IO> ProxyWebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    fn request_metadata(&self, ctx: &McpContext) -> McpResult<FinalRequestMeta> {
+        let mut capabilities =
+            inbound_client_capabilities(ctx).unwrap_or_else(|| self.client_capabilities.clone());
+        capabilities.extensions = None;
+        let mut metadata = FinalRequestMeta::new(capabilities);
+        metadata.client_info = Some(
+            inbound_identity_implementation(ctx)
+                .unwrap_or_else(|| self.client_implementation.clone()),
+        );
+        if let Some(marker) = ctx.progress_marker() {
+            metadata
+                .additional_metadata
+                .insert("progressToken".to_owned(), marker.clone());
+        }
+        if let Some(level) = inbound_logging_level(ctx) {
+            metadata.additional_metadata.insert(
+                FINAL_LOG_LEVEL_META_KEY.to_owned(),
+                serde_json::to_value(level).map_err(McpError::from)?,
+            );
+        }
+        Ok(metadata)
+    }
+
     fn prepare_parameters(
         &self,
         ctx: &McpContext,
@@ -288,28 +434,9 @@ where
                 McpError::invalid_params("Proxy WebSocket request parameters must be an object")
             })?;
 
-        let mut capabilities =
-            inbound_client_capabilities(ctx).unwrap_or_else(|| self.client_capabilities.clone());
-        capabilities.extensions = None;
-        let mut metadata = FinalRequestMeta::new(capabilities);
-        metadata.client_info = Some(
-            inbound_identity_implementation(ctx)
-                .unwrap_or_else(|| self.client_implementation.clone()),
-        );
-        if let Some(marker) = ctx.progress_marker() {
-            metadata
-                .additional_metadata
-                .insert("progressToken".to_owned(), marker.clone());
-        }
-        if let Some(level) = inbound_logging_level(ctx) {
-            metadata.additional_metadata.insert(
-                FINAL_LOG_LEVEL_META_KEY.to_owned(),
-                serde_json::to_value(level).map_err(McpError::from)?,
-            );
-        }
         object.insert(
             "_meta".to_owned(),
-            serde_json::to_value(metadata).map_err(McpError::from)?,
+            serde_json::to_value(self.request_metadata(ctx)?).map_err(McpError::from)?,
         );
         let request = CoreRequest::decode(ProtocolEra::Modern2026, method, parameters.as_ref())
             .map_err(|error| {
@@ -339,6 +466,22 @@ where
         Ok(Some(PreparedProxyWebSocketRequest {
             execution: Box::new(WebSocketCoreRequest {
                 backend: self.clone(),
+            }),
+        }))
+    }
+
+    fn supports_catalog_listener(&mut self) -> McpResult<bool> {
+        Ok(true)
+    }
+
+    fn prepare_native_websocket_catalog_listener(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Option<PreparedProxyWebSocketCatalogListener>> {
+        Ok(Some(PreparedProxyWebSocketCatalogListener {
+            opening: Box::new(WebSocketCatalogRequest {
+                backend: self.clone(),
+                notifications,
             }),
         }))
     }
