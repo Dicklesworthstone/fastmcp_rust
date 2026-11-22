@@ -10,6 +10,7 @@ use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::sync::{Mutex, OwnedMutexGuard, TryLockError};
 use fastmcp_client::{ClientBuilder, WebSocketClient};
 use fastmcp_core::{McpErrorCode, McpRequestCancellation};
+use fastmcp_protocol::JsonRpcRequest;
 use fastmcp_protocol::extensions::ClientExtensionDiscovery;
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_transport::websocket::AsyncWsClientTransport;
@@ -21,8 +22,9 @@ use super::{
     HandlerBinding, JsonSchemaType, MAX_AUTHORING_SETTINGS_BYTES, MAX_SCHEMA_INSTANCE_BYTES,
     MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES, McpContext, McpError, McpResult,
     NegotiatedExtension, NotificationBinding, PendingMethod, PendingNotification, PhantomData,
-    ProtocolDescriptor, Serialize, SettingsResolver, Value, encode_bytes, encode_value,
-    ensure_live, notification_authorizer, poll_live, retain_schema_identity, unbound_handler,
+    ProtocolDescriptor, Serialize, SettingsResolver, Value, compile_schema, encode_bytes,
+    encode_value, ensure_live, notification_authorizer, poll_live, retain_schema_identity,
+    unbound_handler,
 };
 
 const MAX_PENDING_OPERATIONS: usize = 64;
@@ -37,10 +39,11 @@ const CLOSE_LOCK_TIMEOUT_NANOS: u64 = 350_000_000;
 /// a fresh upstream ID and the upstream client's own metadata. Client
 /// notifications receive fresh message-local activation proof and allocate no ID.
 ///
-/// This adapter supports finite request/result exchanges and standalone client
-/// notifications. Contracts declaring request-owned server notifications are
-/// rejected before discovery; use the HTTP or stdio notification-aware routes
-/// for those contracts. Tasks and catalog subscriptions are not enabled here.
+/// This adapter supports finite request/result exchanges, typed request-owned
+/// server notifications and standalone client notifications. Server events
+/// require the explicit notification-aware request route; their upstream
+/// correlation and metadata are consumed before the downstream sink rebuilds
+/// its own envelope. Tasks and catalog subscriptions are not enabled here.
 ///
 /// An awaited request cancellation is settled by the native client before the
 /// connection is reused. Dropping a sent request retains its native retirement
@@ -215,12 +218,14 @@ impl ExtensionRegistration {
     /// The builder must select modern-only WebSocket operation and have no
     /// extension registry. The caller owns Upgrade/TLS and supplies the actual
     /// transport; its identity, credentials and timeout policy are retained.
-    /// Local settings and unsupported server-notification declarations are
-    /// checked before the first discovery frame. No declaration handler runs.
+    /// Local settings are checked before the first discovery frame.
+    /// No declaration handler runs.
     ///
     /// Build a second registration with the same complete contract using
-    /// [ExtensionBuilder::typed_websocket_proxy_request] and, when declared,
-    /// [ExtensionBuilder::typed_websocket_proxy_notification]. Both legs must
+    /// [ExtensionBuilder::typed_websocket_proxy_request] or
+    /// [ExtensionBuilder::typed_websocket_proxy_request_with_notifications],
+    /// plus [ExtensionBuilder::typed_websocket_proxy_notification] when declared.
+    /// Both legs must
     /// independently admit identical effective settings and schema identities.
     pub async fn connect_websocket_upstream<ClientSettings, IO>(
         self,
@@ -236,11 +241,6 @@ impl ExtensionRegistration {
         if builder.selected_protocol_plan().policy() != ProtocolPolicy::ModernOnly {
             return Err(McpError::invalid_params(
                 "WebSocket extension proxy requires a modern-only client plan",
-            ));
-        }
-        if self.descriptor.request_notification.is_some() {
-            return Err(McpError::invalid_params(
-                "WebSocket extension proxy does not relay request-owned server notifications",
             ));
         }
         let value = encode_value(client_settings, MAX_AUTHORING_SETTINGS_BYTES)?;
@@ -319,7 +319,7 @@ where
     /// cannot inject upstream metadata. Requests share a bounded native
     /// connection, with cancellation-aware admission and native retirement.
     pub fn typed_websocket_proxy_request<Request, Response, IO>(
-        mut self,
+        self,
         method: impl Into<String>,
         parameter_schema_id: impl Into<String>,
         result_schema_id: impl Into<String>,
@@ -330,14 +330,93 @@ where
         Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let method = method.into();
         if self.descriptor.request_notification.is_some()
             || upstream.descriptor.request_notification.is_some()
         {
             return Err(McpError::invalid_params(
-                "WebSocket extension proxy does not relay request-owned server notifications",
+                "WebSocket request-owned notifications require the notification-aware proxy route",
             ));
         }
+        self.register_websocket_proxy_request::<Request, Response, IO>(
+            method.into(),
+            parameter_schema_id.into(),
+            result_schema_id.into(),
+            upstream,
+            None,
+        )
+    }
+
+    /// Registers a typed request with its request-owned server notifications.
+    ///
+    /// Both legs must declare identical notification schema and correlation
+    /// identities. Native ingress admits the exact upstream request owner;
+    /// typed decoding and schema validation precede downstream emission, whose
+    /// sink reconstructs correlation and metadata from the downstream request.
+    /// Missing sink support fails before an upstream operation is admitted.
+    pub fn typed_websocket_proxy_request_with_notifications<Request, Response, Notification, IO>(
+        self,
+        method: impl Into<String>,
+        parameter_schema_id: impl Into<String>,
+        result_schema_id: impl Into<String>,
+        upstream: ExtensionWebSocketUpstream<IO>,
+    ) -> McpResult<Self>
+    where
+        Request: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+        Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+        Notification: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let declaration = self
+            .descriptor
+            .request_notification
+            .as_ref()
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "WebSocket notification proxy requires a typed notification declaration",
+                )
+            })?;
+        if upstream.descriptor.request_notification.as_ref() != Some(declaration) {
+            return Err(McpError::invalid_params(
+                "WebSocket notification proxy requires matching notification declarations",
+            ));
+        }
+        let schema = self.request_notification_schema.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "WebSocket notification proxy requires an admitted notification schema",
+            )
+        })?;
+        if compile_schema::<Notification>()?.digest != schema.digest {
+            return Err(McpError::invalid_params(
+                "WebSocket notification proxy type does not match its declared schema",
+            ));
+        }
+        let notification = WebSocketProxyNotification {
+            method: declaration.name.clone(),
+            schema: Arc::clone(&schema.admitted),
+            codec: reencode_notification::<Notification>,
+        };
+        self.register_websocket_proxy_request::<Request, Response, IO>(
+            method.into(),
+            parameter_schema_id.into(),
+            result_schema_id.into(),
+            upstream,
+            Some(notification),
+        )
+    }
+
+    fn register_websocket_proxy_request<Request, Response, IO>(
+        mut self,
+        method: String,
+        parameter_schema_id: String,
+        result_schema_id: String,
+        upstream: ExtensionWebSocketUpstream<IO>,
+        notification: Option<WebSocketProxyNotification>,
+    ) -> McpResult<Self>
+    where
+        Request: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+        Response: DeserializeOwned + Serialize + JsonSchemaType + Send + 'static,
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         if upstream.descriptor.id != self.descriptor.id
             || !upstream
                 .descriptor
@@ -352,8 +431,8 @@ where
         let (method, parameter_schema, result_schema, total) = self
             .prepare_method::<Request, Response>(
                 method,
-                parameter_schema_id.into(),
-                result_schema_id.into(),
+                parameter_schema_id,
+                result_schema_id,
             )?;
         let index = self.pending.len();
         let effective_schema = Arc::clone(&self.effective_schema.admitted);
@@ -382,6 +461,7 @@ where
                             effective_schema,
                         },
                         upstream,
+                        notification,
                         marker: PhantomData,
                     },
                 )
@@ -416,9 +496,7 @@ where
             parameter_schema_id.into(),
             activation_metadata_key.into(),
         )?;
-        if self.descriptor.request_notification.is_some()
-            || upstream.descriptor.request_notification.is_some()
-            || upstream.descriptor.id != self.descriptor.id
+        if upstream.descriptor.id != self.descriptor.id
             || upstream.descriptor.notification.as_ref() != Some(&notification)
         {
             return Err(McpError::invalid_params(
@@ -470,16 +548,20 @@ fn admit_settings(
     Ok(())
 }
 
+fn encode_application_value<T: Serialize>(value: &T, limit: usize) -> McpResult<Value> {
+    let source = encode_bytes(value, limit)?;
+    fastmcp_protocol::admit_raw_jsonrpc_document(&source, limit)
+        .map_err(|_| McpError::invalid_params("typed proxy serialization is invalid JSON"))?;
+    serde_json::from_slice(&source)
+        .map_err(|_| McpError::invalid_params("typed proxy serialization is invalid JSON"))
+}
+
 fn application_parameters<T: Serialize>(
     value: &T,
     limit: usize,
     schema: &AdmittedSchema,
 ) -> McpResult<Value> {
-    let source = encode_bytes(value, limit)?;
-    fastmcp_protocol::admit_raw_jsonrpc_document(&source, limit)
-        .map_err(|_| McpError::invalid_params("typed proxy serialization is invalid JSON"))?;
-    let value: Value = serde_json::from_slice(&source)
-        .map_err(|_| McpError::invalid_params("typed proxy serialization is invalid JSON"))?;
+    let value = encode_application_value(value, limit)?;
     if !value.is_object() || value.get("_meta").is_some() {
         return Err(McpError::invalid_params(
             "typed proxy serialization cannot supply framework metadata",
@@ -491,12 +573,65 @@ fn application_parameters<T: Serialize>(
     Ok(value)
 }
 
+struct WebSocketProxyNotification {
+    method: String,
+    schema: Arc<AdmittedSchema>,
+    codec: fn(Value) -> McpResult<Value>,
+}
+
+impl WebSocketProxyNotification {
+    fn relay(&self, context: &McpContext, notification: JsonRpcRequest) -> McpResult<()> {
+        ensure_live(context)?;
+        if notification.id.is_some() || notification.method != self.method {
+            return Err(McpError::invalid_request(
+                "WebSocket notification proxy received another owner or method",
+            ));
+        }
+        // Native ingress already admitted exact JSON and request-ID ownership.
+        // Consume leg-local metadata before applying the application schema.
+        let parameters = notification.params.ok_or_else(|| {
+            McpError::invalid_request(
+                "WebSocket notification proxy requires notification parameters",
+            )
+        })?;
+        let mut parameters =
+            encode_application_value(&parameters, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)?;
+        let object = parameters.as_object_mut().ok_or_else(|| {
+            McpError::invalid_request("WebSocket upstream notification parameters must be an object")
+        })?;
+        object.remove("_meta");
+        self.schema.validate(&parameters).map_err(|_| {
+            McpError::invalid_request(
+                "WebSocket upstream notification does not satisfy its typed schema",
+            )
+        })?;
+        let parameters = (self.codec)(parameters)?;
+        let parameters = application_parameters(
+            &parameters,
+            MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
+            &self.schema,
+        )?;
+        ensure_live(context)?;
+        context.emit_request_extension_notification(parameters)
+    }
+}
+
+fn reencode_notification<Notification: DeserializeOwned + Serialize>(
+    parameters: Value,
+) -> McpResult<Value> {
+    let notification: Notification = serde_json::from_value(parameters).map_err(|_| {
+        McpError::invalid_request("WebSocket upstream notification typed decoding failed")
+    })?;
+    encode_application_value(&notification, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)
+}
+
 struct TypedWebSocketProxyHandler<Request, Response, Settings, IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     binding: HandlerBinding,
     upstream: ExtensionWebSocketUpstream<IO>,
+    notification: Option<WebSocketProxyNotification>,
     marker: PhantomData<fn(Request, Settings) -> Response>,
 }
 
@@ -517,6 +652,9 @@ where
             .binding
             .decode::<Request, Settings>(context, negotiated, parameters)?;
         admit_settings(negotiated, &self.upstream.negotiated)?;
+        if self.notification.is_some() {
+            context.ensure_request_extension_notifications_available()?;
+        }
         application_parameters(
             &request,
             MAX_SCHEMA_INSTANCE_BYTES,
@@ -536,19 +674,36 @@ where
         ensure_live(context)?;
         let cancellation = McpRequestCancellation::default();
         let method = &self.binding.descriptor.methods[self.binding.method_index];
-        let mut result = settle_native_request(
-            context,
-            &cancellation,
-            client.request_final_extension_with_cancellation(
-                context.cx(),
+        let result = if let Some(notification) = self.notification.as_ref() {
+            let mut relay = |event| notification.relay(context, event);
+            settle_native_request(
+                context,
                 &cancellation,
-                &self.binding.descriptor.id,
-                &method.name,
-                parameters,
-            ),
-        )
-        .await
-        .map_err(safe_upstream_error)?;
+                client.request_final_extension_with_notifications(
+                    context.cx(),
+                    &cancellation,
+                    &self.binding.descriptor.id,
+                    &method.name,
+                    parameters,
+                    &mut relay,
+                ),
+            )
+            .await
+        } else {
+            settle_native_request(
+                context,
+                &cancellation,
+                client.request_final_extension_with_cancellation(
+                    context.cx(),
+                    &cancellation,
+                    &self.binding.descriptor.id,
+                    &method.name,
+                    parameters,
+                ),
+            )
+            .await
+        };
+        let mut result = result.map_err(safe_upstream_error)?;
         drop(client);
         let object = result.as_object_mut().ok_or_else(|| {
             McpError::invalid_request("WebSocket extension upstream result must be an object")
@@ -750,6 +905,123 @@ async fn settle_native_request<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_proxy_notifications_revalidate_before_the_downstream_sink() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = Arc::clone(&emitted);
+        let context = McpContext::new(Cx::for_testing(), 41)
+            .with_request_extension_notification_sender(Arc::new(move |parameters| {
+                output.lock().unwrap().push(parameters);
+                Ok(())
+            }));
+        let relay = WebSocketProxyNotification {
+            method: "com.example/events".to_owned(),
+            schema: compile_schema::<BTreeMap<String, u64>>().unwrap().admitted,
+            codec: reencode_notification::<BTreeMap<String, u64>>,
+        };
+        let parameters = serde_json::json!({
+            "value": 7,
+            "_meta": {
+                "com.example/request": 2,
+                "com.example/private-proof": "upstream-only",
+            },
+        });
+        let admitted = JsonRpcRequest::notification(
+            "com.example/events",
+            Some(parameters.clone()),
+        );
+        relay.relay(&context, admitted.clone()).unwrap();
+        assert_eq!(
+            *emitted.lock().unwrap(),
+            [serde_json::json!({"value": 7})],
+            "only typed application data reaches the downstream-owned sink"
+        );
+        for rejected in [
+            JsonRpcRequest::notification("com.example/other", Some(parameters.clone())),
+            JsonRpcRequest::new(
+                "com.example/events",
+                Some(parameters),
+                fastmcp_protocol::RequestId::Number(2),
+            ),
+            JsonRpcRequest::notification(
+                "com.example/events",
+                Some(serde_json::json!({"value": "7"})),
+            ),
+        ] {
+            assert!(relay.relay(&context, rejected).is_err());
+            assert_eq!(emitted.lock().unwrap().len(), 1);
+        }
+        context.request_cancellation().cancel();
+        assert_eq!(
+            relay.relay(&context, admitted).unwrap_err().code,
+            McpErrorCode::RequestCancelled
+        );
+        assert_eq!(emitted.lock().unwrap().len(), 1);
+        assert!(context.cx().checkpoint().is_ok());
+    }
+
+    #[test]
+    fn websocket_proxy_notification_serialization_cannot_inject_or_collapse_metadata() {
+        #[derive(serde::Deserialize)]
+        struct RewrittenNotification {
+            value: u64,
+        }
+
+        impl Serialize for RewrittenNotification {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+
+                let mut object = serializer.serialize_map(None)?;
+                if self.value == 4 {
+                    object.serialize_entry("value", "changed-type")?;
+                } else {
+                    object.serialize_entry("value", &self.value)?;
+                }
+                if self.value == 2 {
+                    object.serialize_entry("value", &self.value)?;
+                }
+                if self.value == 3 {
+                    object.serialize_entry(
+                        "_meta",
+                        &serde_json::json!({"com.example/request": "forged"}),
+                    )?;
+                }
+                object.end()
+            }
+        }
+
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = Arc::clone(&emitted);
+        let context = McpContext::new(Cx::for_testing(), 41)
+            .with_request_extension_notification_sender(Arc::new(move |parameters| {
+                output.lock().unwrap().push(parameters);
+                Ok(())
+            }));
+        let relay = WebSocketProxyNotification {
+            method: "com.example/events".to_owned(),
+            schema: compile_schema::<BTreeMap<String, u64>>().unwrap().admitted,
+            codec: reencode_notification::<RewrittenNotification>,
+        };
+        for value in 1..=4 {
+            let result = relay.relay(
+                &context,
+                JsonRpcRequest::notification(
+                    "com.example/events",
+                    Some(serde_json::json!({"value": value})),
+                ),
+            );
+            if value == 1 {
+                result.unwrap();
+            } else {
+                assert!(
+                    result.is_err(),
+                    "custom serialization cannot collapse duplicate keys, inject metadata or change its schema"
+                );
+            }
+            assert_eq!(*emitted.lock().unwrap(), [serde_json::json!({"value": 1})]);
+        }
+    }
 
     #[test]
     fn websocket_proxy_operation_capacity_is_shared_and_released_exactly_once() {

@@ -496,6 +496,500 @@ mod websocket_proxy {
         assert_eq!(retained.completed.load(Ordering::SeqCst), 1);
         assert_eq!(retained.total.load(Ordering::SeqCst), 21);
     }
+    const REQUEST_EVENT: &str = "com.example/request-scaled";
+    const REQUEST_OWNER: &str = "com.example/request-id";
+
+    fn request_notification_registration(calls: Arc<AtomicUsize>) -> ExtensionRegistration {
+        builder()
+            .typed_request_notification::<ScaleResponse>(
+                REQUEST_EVENT,
+                "request-scaled-v1",
+                REQUEST_OWNER,
+            )
+            .unwrap()
+            .typed_request_sync(
+                METHOD,
+                "scale-params-v1",
+                "scale-result-v1",
+                move |context: ExtensionContext<'_, Settings>, request: ScaleRequest| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let value = request.value * context.settings().multiplier;
+                    context.notify(&ScaleResponse { value })?;
+                    context.notify(&ScaleResponse { value: value + 1 })?;
+                    Ok(ScaleResponse { value })
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn request_notification_gateway<IO>(
+        upstream: fastmcp_rust::extensions::authoring::ExtensionWebSocketUpstream<IO>,
+    ) -> ExtensionRegistration
+    where
+        IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        builder()
+            .typed_request_notification::<ScaleResponse>(
+                REQUEST_EVENT,
+                "request-scaled-v1",
+                REQUEST_OWNER,
+            )
+            .unwrap()
+            .typed_websocket_proxy_request_with_notifications::<
+                ScaleRequest,
+                ScaleResponse,
+                ScaleResponse,
+                IO,
+            >(
+                METHOD,
+                "scale-params-v1",
+                "scale-result-v1",
+                upstream,
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn typed_websocket_proxy_recorrelates_request_notifications_and_preserves_order() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        with_upstream(
+            request_notification_registration(calls),
+            move |cx, address| async move {
+                let declarations = Arc::new(AtomicUsize::new(0));
+                let transport = fastmcp_rust::AsyncWsClientTransport::connect(
+                    &cx,
+                    &format!("ws://{address}/mcp"),
+                )
+                .await
+                .unwrap();
+                let upstream = modern::ClientBuilder::new()
+                    .connect_extension_websocket_upstream_with_cx(
+                        &cx,
+                        transport,
+                        request_notification_registration(Arc::clone(&declarations)),
+                        &ClientSettings { version: 1 },
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    builder()
+                        .typed_request_notification::<ScaleResponse>(
+                            REQUEST_EVENT,
+                            "request-scaled-v1",
+                            REQUEST_OWNER,
+                        )
+                        .unwrap()
+                        .typed_websocket_proxy_request::<ScaleRequest, ScaleResponse, _>(
+                            METHOD,
+                            "scale-params-v1",
+                            "scale-result-v1",
+                            upstream.clone(),
+                        )
+                        .is_err(),
+                    "notifications require the explicit notification-aware forwarding route"
+                );
+
+                let server = modern::ServerBuilder::new("typed-websocket-event-gateway", "1")
+                    .extension(request_notification_gateway(upstream.clone()))
+                    .unwrap()
+                    .try_build()
+                    .unwrap();
+                let (mut peer, transport) = create_memory_transport_pair_with_capacity(8);
+                let mut serving = cx
+                    .spawn(move |server_cx| async move {
+                        server.serve_memory(&server_cx, transport).await
+                    })
+                    .unwrap();
+                for (id, value) in [(900, 7), (901, 9)] {
+                    peer.send_async(
+                        &cx,
+                        &request(id, Some(json!({"version": 1})), json!(value)),
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                let mut events = std::collections::BTreeMap::<i64, Vec<u64>>::new();
+                let mut results = std::collections::BTreeMap::new();
+                for _ in 0..6 {
+                    match peer.recv_async(&cx).await.unwrap() {
+                        JsonRpcMessage::Request(notification) => {
+                            assert!(notification.id.is_none());
+                            assert_eq!(notification.method, REQUEST_EVENT);
+                            let parameters = notification.params.unwrap();
+                            let owner = parameters["_meta"][REQUEST_OWNER].as_i64().unwrap();
+                            assert!(
+                                matches!(owner, 900 | 901),
+                                "the upstream request ID must not escape the gateway"
+                            );
+                            assert!(
+                                !results.contains_key(&owner),
+                                "a request cannot publish after its terminal response"
+                            );
+                            assert_eq!(parameters["_meta"], json!({REQUEST_OWNER: owner}));
+                            events
+                                .entry(owner)
+                                .or_default()
+                                .push(parameters["value"].as_u64().unwrap());
+                        }
+                        JsonRpcMessage::Response(response) => {
+                            assert!(response.error.is_none(), "{response:?}");
+                            let Some(RequestId::Number(owner)) = response.id else {
+                                panic!("the downstream numeric request owner is retained");
+                            };
+                            let value = response.result.unwrap()["value"].as_u64().unwrap();
+                            assert_eq!(events.get(&owner), Some(&vec![value, value + 1]));
+                            assert!(results.insert(owner, value).is_none());
+                        }
+                    }
+                }
+                assert_eq!(
+                    results,
+                    std::collections::BTreeMap::from([(900, 21), (901, 27)])
+                );
+                assert_eq!(observed.load(Ordering::SeqCst), 2);
+                assert_eq!(declarations.load(Ordering::SeqCst), 0);
+
+                let (mut input, output) = peer.into_split();
+                drop(output);
+                assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+                serving.join(&cx).await.unwrap().unwrap();
+                upstream.close(&cx).await.unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn typed_websocket_proxy_rejects_invalid_notification_payload_before_downstream_emission() {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(10), async {
+                let (client_io, peer_io) = asupersync::net::tcp::VirtualTcpStream::pair(
+                    "127.0.0.1:46201".parse().unwrap(),
+                    "127.0.0.1:46202".parse().unwrap(),
+                );
+                let mut upstream_peer = fastmcp_rust::AsyncWsServerTransport::from_upgraded(peer_io);
+                let mut scripted = cx
+                    .spawn(move |peer_cx| async move {
+                        let JsonRpcMessage::Request(discovery) =
+                            upstream_peer.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("the native client discovers before forwarding");
+                        };
+                        assert_eq!(discovery.method, "server/discover");
+                        upstream_peer
+                            .send(
+                                &peer_cx,
+                                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    discovery.id.unwrap(),
+                                    json!({
+                                        "resultType": "complete",
+                                        "supportedVersions": ["2026-07-28"],
+                                        "capabilities": {
+                                            "extensions": {
+                                                (EXTENSION): {"version": 1, "multiplier": 3}
+                                            }
+                                        },
+                                        "ttlMs": 0,
+                                        "cacheScope": "private"
+                                    }),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                        for malformed in [true, false] {
+                            let invocation = loop {
+                                let JsonRpcMessage::Request(request) =
+                                    upstream_peer.recv(&peer_cx).await.unwrap()
+                                else {
+                                    panic!("the upstream expects a forwarded request");
+                                };
+                                if request.method == "notifications/cancelled" {
+                                    assert!(request.id.is_none());
+                                    continue;
+                                }
+                                assert_eq!(request.method, METHOD);
+                                break request;
+                            };
+                            let id = invocation.id.unwrap();
+                            let value = invocation.params.unwrap()["value"].as_u64().unwrap() * 3;
+                            let payload = if malformed {
+                                json!("peer-private-invalid-value")
+                            } else {
+                                json!(value)
+                            };
+                            upstream_peer
+                                .send(
+                                    &peer_cx,
+                                    &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                        REQUEST_EVENT,
+                                        Some(json!({
+                                            "value": payload,
+                                            "_meta": {
+                                                REQUEST_OWNER: id,
+                                                "com.example/upstream-only": "peer-private-metadata"
+                                            }
+                                        })),
+                                    )),
+                                )
+                                .await
+                                .unwrap();
+                            upstream_peer
+                                .send(
+                                    &peer_cx,
+                                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                        id,
+                                        json!({"value": value}),
+                                    )),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        assert!(matches!(
+                            upstream_peer.recv(&peer_cx).await,
+                            Err(TransportError::Closed)
+                        ));
+                    })
+                    .unwrap();
+                let declaration_calls = Arc::new(AtomicUsize::new(0));
+                let upstream = modern::ClientBuilder::new()
+                    .connect_extension_websocket_upstream_with_cx(
+                        &cx,
+                        fastmcp_rust::AsyncWsClientTransport::from_upgraded(client_io),
+                        request_notification_registration(Arc::clone(&declaration_calls)),
+                        &ClientSettings { version: 1 },
+                    )
+                    .await
+                    .unwrap();
+                let server = modern::ServerBuilder::new("typed-websocket-rejection-gateway", "1")
+                    .extension(request_notification_gateway(upstream.clone()))
+                    .unwrap()
+                    .try_build()
+                    .unwrap();
+                let (mut peer, transport) = create_memory_transport_pair_with_capacity(4);
+                let mut serving = cx
+                    .spawn(move |server_cx| async move {
+                        server.serve_memory(&server_cx, transport).await
+                    })
+                    .unwrap();
+
+                peer.send_async(&cx, &request(950, Some(json!({"version": 1})), json!(7)))
+                    .await
+                    .unwrap();
+                let rejected = response(&cx, &mut peer, 950).await;
+                assert!(rejected.result.is_none());
+                let error = rejected.error.expect("the notification schema rejects this payload");
+                assert!(!error.message.contains("peer-private"));
+                assert!(
+                    !fastmcp_rust::serde_json::to_string(&error).unwrap().contains("peer-private"),
+                    "neither upstream payload nor metadata belongs in downstream diagnostics"
+                );
+
+                peer.send_async(&cx, &request(951, Some(json!({"version": 1})), json!(9)))
+                    .await
+                    .unwrap();
+                let JsonRpcMessage::Request(notification) = peer.recv_async(&cx).await.unwrap() else {
+                    panic!("a valid sibling notification still crosses the reused connection");
+                };
+                assert!(notification.id.is_none());
+                assert_eq!(notification.method, REQUEST_EVENT);
+                assert_eq!(
+                    notification.params.unwrap(),
+                    json!({"value": 27, "_meta": {REQUEST_OWNER: 951}})
+                );
+                let completed = response(&cx, &mut peer, 951).await;
+                assert!(completed.error.is_none(), "{completed:?}");
+                assert_eq!(completed.result.unwrap(), json!({"value": 27}));
+                assert_eq!(declaration_calls.load(Ordering::SeqCst), 0);
+
+                let (mut input, output) = peer.into_split();
+                drop(output);
+                assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+                serving.join(&cx).await.unwrap().unwrap();
+                upstream.close(&cx).await.unwrap();
+                scripted.join(&cx).await.unwrap();
+                assert!(cx.checkpoint().is_ok());
+            })
+            .await
+            .expect("malformed notification retirement and sibling reuse are bounded");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    struct RequestNotificationDrop<'a> {
+        context: ExtensionContext<'a, Settings>,
+        dropped: Arc<AtomicUsize>,
+        late_refused: Arc<AtomicUsize>,
+    }
+
+    impl Drop for RequestNotificationDrop<'_> {
+        fn drop(&mut self) {
+            if self.context.notify(&ScaleResponse { value: 999 }).is_err() {
+                self.late_refused.fetch_add(1, Ordering::SeqCst);
+            }
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingNotifyingScale {
+        dropped: Arc<AtomicUsize>,
+        late_refused: Arc<AtomicUsize>,
+    }
+
+    impl
+        fastmcp_rust::extensions::authoring::ExtensionHandler<ScaleRequest, ScaleResponse, Settings>
+        for PendingNotifyingScale
+    {
+        fn handle<'a>(
+            &'a self,
+            context: ExtensionContext<'a, Settings>,
+            request: ScaleRequest,
+        ) -> fastmcp_rust::BoxFuture<'a, McpResult<ScaleResponse>> {
+            Box::pin(async move {
+                let value = request.value * context.settings().multiplier;
+                context.notify(&ScaleResponse { value })?;
+                if request.value == 7 {
+                    let _guard = RequestNotificationDrop {
+                        context,
+                        dropped: Arc::clone(&self.dropped),
+                        late_refused: Arc::clone(&self.late_refused),
+                    };
+                    std::future::pending::<()>().await;
+                }
+                Ok(ScaleResponse { value })
+            })
+        }
+    }
+
+    #[test]
+    fn typed_websocket_proxy_request_notification_cancellation_keeps_sibling_usable() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let late_refused = Arc::new(AtomicUsize::new(0));
+        let observed_dropped = Arc::clone(&dropped);
+        let observed_refused = Arc::clone(&late_refused);
+        let producer = builder()
+            .typed_request_notification::<ScaleResponse>(
+                REQUEST_EVENT,
+                "request-scaled-v1",
+                REQUEST_OWNER,
+            )
+            .unwrap()
+            .typed_request(
+                METHOD,
+                "scale-params-v1",
+                "scale-result-v1",
+                PendingNotifyingScale {
+                    dropped,
+                    late_refused,
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        with_upstream(producer, move |cx, address| async move {
+            let transport =
+                fastmcp_rust::AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp"))
+                    .await
+                    .unwrap();
+            let upstream = modern::ClientBuilder::new()
+                .connect_extension_websocket_upstream_with_cx(
+                    &cx,
+                    transport,
+                    request_notification_registration(Arc::new(AtomicUsize::new(0))),
+                    &ClientSettings { version: 1 },
+                )
+                .await
+                .unwrap();
+            let server = modern::ServerBuilder::new("typed-websocket-cancel-event-gateway", "1")
+                .extension(request_notification_gateway(upstream.clone()))
+                .unwrap()
+                .try_build()
+                .unwrap();
+            let (mut peer, transport) = create_memory_transport_pair_with_capacity(4);
+            let mut serving = cx
+                .spawn(move |server_cx| async move {
+                    server.serve_memory(&server_cx, transport).await
+                })
+                .unwrap();
+
+            peer.send_async(&cx, &request(970, Some(json!({"version": 1})), json!(7)))
+                .await
+                .unwrap();
+            let JsonRpcMessage::Request(first) = peer.recv_async(&cx).await.unwrap() else {
+                panic!("the pending request must publish before cancellation");
+            };
+            assert!(first.id.is_none());
+            assert_eq!(first.method, REQUEST_EVENT);
+            assert_eq!(
+                first.params.unwrap(),
+                json!({"value": 21, "_meta": {REQUEST_OWNER: 970}})
+            );
+            peer.send_async(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/cancelled",
+                    Some(json!({"requestId": 970})),
+                )),
+            )
+            .await
+            .unwrap();
+            peer.send_async(&cx, &request(971, Some(json!({"version": 1})), json!(9)))
+                .await
+                .unwrap();
+
+            let mut sibling_events = 0;
+            loop {
+                match peer.recv_async(&cx).await.unwrap() {
+                    JsonRpcMessage::Request(notification) => {
+                        assert!(notification.id.is_none());
+                        assert_eq!(notification.method, REQUEST_EVENT);
+                        assert_eq!(
+                            notification.params.unwrap(),
+                            json!({"value": 27, "_meta": {REQUEST_OWNER: 971}}),
+                            "the cancelled owner cannot publish into a sibling execution"
+                        );
+                        sibling_events += 1;
+                        assert_eq!(sibling_events, 1);
+                    }
+                    JsonRpcMessage::Response(response) => match response.id {
+                        Some(RequestId::Number(970)) => {
+                            assert!(response.result.is_none());
+                            assert!(response.error.is_some());
+                        }
+                        Some(RequestId::Number(971)) => {
+                            assert!(response.error.is_none(), "{response:?}");
+                            assert_eq!(response.result.unwrap(), json!({"value": 27}));
+                            assert_eq!(sibling_events, 1);
+                            break;
+                        }
+                        _ => panic!("unexpected downstream response owner"),
+                    },
+                }
+            }
+            while observed_dropped.load(Ordering::SeqCst) == 0 {
+                asupersync::runtime::yield_now().await;
+            }
+            assert_eq!(observed_dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(observed_refused.load(Ordering::SeqCst), 1);
+            assert!(cx.checkpoint().is_ok());
+
+            let (mut input, output) = peer.into_split();
+            drop(output);
+            assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+            serving.join(&cx).await.unwrap().unwrap();
+            upstream.close(&cx).await.unwrap();
+        });
+    }
+
 }
 
 use std::sync::Arc;

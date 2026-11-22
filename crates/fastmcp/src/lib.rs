@@ -3892,9 +3892,10 @@ pub mod modern {
         ///
         /// The caller supplies the upgraded transport and owns its TLS policy.
         /// Discovery independently negotiates the complete declaration before
-        /// returning the shared upstream handle. Install it with the typed
-        /// WebSocket proxy request or client-notification routes; request-owned
-        /// server notifications are not supported by this adapter.
+        /// returning the shared upstream handle. Install it with a typed
+        /// WebSocket proxy request, notification-aware request, or
+        /// client-notification route. Notification-aware routes validate each
+        /// server event and rebuild its downstream request correlation.
         #[cfg(all(
             feature = "extension-authoring",
             feature = "proxy",

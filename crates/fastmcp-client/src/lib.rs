@@ -8237,6 +8237,10 @@ where
         };
         if self.selected_protocol_era() == ProtocolEra::Modern2026 {
             if self.discard_retired_websocket_extension_notification(frame)? {
+                // A peer can keep retired frames immediately ready. Yield
+                // after each admitted discard so sibling cancellation and
+                // caller-clock deadlines can advance before another frame.
+                asupersync::runtime::yield_now().await;
                 return Ok(());
             }
             if self.discard_retired_websocket_subscription_notification(request)? {
@@ -44464,6 +44468,108 @@ exec sleep 2
             })
             .await
             .expect("64 accepted events and the rejected 65th retain bounded native ownership");
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
+    fn clt_ext_websocket_request_notification_retirement_yields_one_receive_turn() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+                let (client_io, server_io) = async_websocket_pair();
+                let mut peer = cx
+                    .spawn(move |peer_cx| async move {
+                        let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                        websocket_extension_notification_discovery(&peer_cx, &mut server).await;
+                        assert!(matches!(
+                            server.recv(&peer_cx).await,
+                            Err(TransportError::Closed)
+                        ));
+                    })
+                    .unwrap();
+                let (id, builder) = websocket_extension_notification_builder();
+                let mut client = builder
+                    .connect_websocket_with_cx(
+                        &cx,
+                        AsyncWsClientTransport::from_upgraded(client_io),
+                    )
+                    .await
+                    .unwrap();
+                // Isolate the ready-frame dispatch boundary using the actual
+                // bilateral frozen admission retained by native retirement.
+                let admission = client
+                    .session
+                    .admit_final_extension_method(&id, "example/echo")
+                    .unwrap();
+                client.retired_requests.push_back(RetiredWebSocketRequest {
+                    key: RequestId::Number(2).correlation_key().unwrap(),
+                    subscription: false,
+                    extension_admission: Some(admission),
+                });
+                let frame = ReceivedTransportFrame::admit(
+                    serde_json::to_vec(&websocket_extension_event(
+                        serde_json::json!(2),
+                        "late",
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                {
+                    let mut dispatch = Box::pin(client.handle_unsolicited_websocket_request(
+                        &cx,
+                        &frame,
+                        cx.now(),
+                    ));
+                    let first_poll = std::future::poll_fn(|task| {
+                        std::task::Poll::Ready(dispatch.as_mut().poll(task))
+                    })
+                    .await;
+                    assert!(
+                        first_poll.is_pending(),
+                        "one ready retired event must release the caller's receive turn"
+                    );
+                    dispatch.await.unwrap();
+                }
+                assert_eq!(client.retired_requests.len(), 1);
+                assert!(client.final_server_notifications.is_empty());
+                assert!(client.final_progress_notifications.is_empty());
+
+                // A near-identical frame with another exact owner acquires
+                // neither discard authority nor a cooperative-drain loop.
+                let foreign = ReceivedTransportFrame::admit(
+                    serde_json::to_vec(&websocket_extension_event(
+                        serde_json::json!(3),
+                        "unowned",
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                {
+                    let mut dispatch = Box::pin(client.handle_unsolicited_websocket_request(
+                        &cx,
+                        &foreign,
+                        cx.now(),
+                    ));
+                    let first_poll = std::future::poll_fn(|task| {
+                        std::task::Poll::Ready(dispatch.as_mut().poll(task))
+                    })
+                    .await;
+                    assert!(matches!(
+                        first_poll,
+                        std::task::Poll::Ready(Err(McpError {
+                            code: McpErrorCode::InvalidRequest,
+                            ..
+                        }))
+                    ));
+                }
+                assert_eq!(client.retired_requests.len(), 1);
+                assert!(cx.checkpoint().is_ok());
+                client.close(&cx).await.unwrap();
+                peer.join(&cx).await.unwrap();
+            })
+            .await
+            .expect("retired-frame fairness does not depend on a peer or timer wake");
         });
     }
 
