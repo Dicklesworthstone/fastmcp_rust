@@ -1208,10 +1208,11 @@ pub trait McpAppsWireHostPolicy {
 
     /// Observes one exact View-originated request cancellation.
     ///
-    /// Returning success commits the bridge-side cancellation by releasing
-    /// that request correlation. This is deliberately a synchronous immediate
-    /// hook: the bridge has already dropped the request-owned forwarding
-    /// future and must not suspend before committing its cancellation control.
+    /// The bridge releases the exact request correlation before this hook:
+    /// the request-owned forwarding future has already been dropped, so a
+    /// bookkeeping error cannot leave it pending or replay this callback.
+    /// This is deliberately a synchronous immediate hook; returning an error
+    /// reports cleanup failure without undoing the local cancellation.
     /// Implementations may perform only immediate, bounded bookkeeping here.
     /// An absent-ID cancellation remains the protocol's explicit inert no-op
     /// and never reaches this hook.
@@ -1234,8 +1235,9 @@ pub trait McpAppsWireHostPolicy {
         params: &McpAppsCancelledControlParams,
         effects: &mut E,
     ) -> Result<(), McpAppsHostError> {
-        self.cancelled(cx, request_id, params)?;
-        effects.cancelled(cx, request_id, params)
+        let forwarding = self.cancelled(cx, request_id, params);
+        let observation = effects.cancelled(cx, request_id, params);
+        forwarding.and(observation)
     }
 
     /// Returns retained native transport cleanup after request work is dropped.
@@ -1574,8 +1576,11 @@ impl<E: McpAppsWireHostEffects, E2: McpAppsWireHostEffects> McpAppsWireHostEffec
         request_id: &McpAppsJsonRpcRequestId,
         params: &McpAppsCancelledControlParams,
     ) -> Result<(), McpAppsHostError> {
-        self.previous.cancelled(cx, request_id, params)?;
-        self.current.cancelled(cx, request_id, params)
+        // Every owner has already lost its request future. An earlier
+        // observer's failure cannot skip a later owner's bounded cleanup.
+        let previous = self.previous.cancelled(cx, request_id, params);
+        let current = self.current.cancelled(cx, request_id, params);
+        previous.and(current)
     }
 
     #[cfg(feature = "tasks")]
@@ -3916,11 +3921,13 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         request_id: &McpAppsJsonRpcRequestId,
         params: &McpAppsCancelledControlParams,
     ) -> Result<(), McpAppsHostError> {
-        self.policy.cancelled(cx, request_id, params)?;
+        // The forwarding future is already gone. Retire its correlation
+        // before calling embedder code, including when that code fails or
+        // unwinds, so later controls cannot repeat cancellation bookkeeping.
         self.admission
             .complete_error(McpAppsBridgeDirection::ViewToHost, request_id)
-            .map_err(McpAppsHostError::Bridge)
-            .map(|_| ())
+            .map_err(McpAppsHostError::Bridge)?;
+        self.policy.cancelled(cx, request_id, params)
     }
 
     async fn handle_view_notification(
@@ -5587,8 +5594,9 @@ impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
         params: &McpAppsCancelledControlParams,
         effects: &mut E,
     ) -> Result<(), McpAppsHostError> {
-        self.cancelled(cx, request_id, params)?;
-        effects.cancelled(cx, request_id, params)?;
+        let forwarding = self.cancelled(cx, request_id, params);
+        let observation = effects.cancelled(cx, request_id, params);
+        forwarding.and(observation)?;
         #[cfg(feature = "tasks")]
         self.task_cancellation.authorize(cx, effects);
         Ok(())
@@ -5695,8 +5703,9 @@ impl McpAppsWireHostPolicy for McpAppsHttpClientWirePolicy<'_> {
         params: &McpAppsCancelledControlParams,
         effects: &mut E,
     ) -> Result<(), McpAppsHostError> {
-        self.cancelled(cx, request_id, params)?;
-        effects.cancelled(cx, request_id, params)?;
+        let forwarding = self.cancelled(cx, request_id, params);
+        let observation = effects.cancelled(cx, request_id, params);
+        forwarding.and(observation)?;
         #[cfg(feature = "tasks")]
         self.task_cancellation.authorize(cx, effects);
         Ok(())
@@ -7710,6 +7719,137 @@ exec sleep 10
 
     #[cfg(feature = "tasks")]
     #[test]
+    fn public_http_apps_cancellation_observer_error_denies_task_mutation_and_retires_view() {
+        struct CancellationObserver {
+            fail: bool,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl McpAppsWireHostEffects for CancellationObserver {
+            fn cancelled(
+                &mut self,
+                _cx: &Cx,
+                _request_id: &McpAppsJsonRpcRequestId,
+                _params: &McpAppsCancelledControlParams,
+            ) -> Result<(), McpAppsHostError> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fail {
+                    Err(McpError::invalid_request("cancellation observer failed").into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for fail in [false, true] {
+                let mut results = vec![server_task_snapshot("input_required", true)];
+                if !fail {
+                    results.push(json!({"resultType": "complete"}));
+                }
+                results.push(server_input_complete());
+                let (address, peer) =
+                    server_input_http_peer_with_extensions(results, true, false);
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client(&cx, address).await;
+                let observer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut effects = ServerTaskEffects::new();
+                effects.input.decision = ServerInputDecision::Pending;
+                effects.cancellation_allowed = true;
+                let input_calls = Arc::clone(&effects.input.calls);
+                let dropped = Arc::clone(&effects.input.dropped);
+                let reviews = Arc::clone(&effects.cancellation_reviews);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap()
+                    .with_effects(CancellationObserver {
+                        fail,
+                        calls: Arc::clone(&observer_calls),
+                    })
+                    .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                view.send_to_host(
+                    &cx,
+                    json!({
+                        "jsonrpc": "2.0", "id": "view-call", "method": "tools/call",
+                        "params": {"name": "needs-task-input"}
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+                let mut pending = Box::pin(host.process_next(&cx));
+                poll_fn(|task| {
+                    assert!(pending.as_mut().poll(task).is_pending());
+                    if input_calls.lock().unwrap().is_empty() {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
+                })
+                .await;
+                let cancelled = json!({
+                    "jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": {"requestId": "view-call"}
+                })
+                .to_string();
+                view.send_to_host(&cx, cancelled.clone()).await.unwrap();
+                let result = pending.await;
+                if fail {
+                    assert!(matches!(
+                        result,
+                        Err(McpAppsHostError::Core(error))
+                            if error.message == "cancellation observer failed"
+                    ));
+                } else {
+                    result.unwrap();
+                }
+                assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+                assert_eq!(reviews.lock().unwrap().len(), usize::from(!fail));
+                view.send_to_host(&cx, cancelled).await.unwrap();
+                assert!(matches!(
+                    host.process_next(&cx).await,
+                    Err(McpAppsHostError::Bridge(McpAppsBridgeError::UnknownCorrelation))
+                ));
+                assert_eq!(observer_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(
+                    stateful_wire_request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "view-call",
+                        "tools/call",
+                        json!({"name": "healthy"})
+                    )
+                    .await
+                    .get("result")
+                    .is_some()
+                );
+                let requests = peer.join().unwrap();
+                let cancellations: Vec<_> = requests
+                    .iter()
+                    .filter(|request| request["method"] == "tasks/cancel")
+                    .collect();
+                assert_eq!(cancellations.len(), usize::from(!fail));
+                if let Some(request) = cancellations.first() {
+                    assert_eq!(request["params"]["taskId"], "private-server-task");
+                }
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| request["method"] != "tasks/update")
+                );
+                assert_eq!(requests.last().unwrap()["params"]["name"], "healthy");
+            }
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
     fn public_http_apps_server_task_keeps_original_deadline_during_wait_and_input() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -8714,6 +8854,176 @@ exec sleep 10
                     "the subprocess must observe exact core cancellation before its next request",
                 );
             client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn closed_wire_cancellation_errors_retire_once_and_notify_every_owner() {
+        struct CancellationStep {
+            name: &'static str,
+            fail: bool,
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl McpAppsWireHostEffects for CancellationStep {
+            fn cancelled(
+                &mut self,
+                _cx: &Cx,
+                _request_id: &McpAppsJsonRpcRequestId,
+                _params: &McpAppsCancelledControlParams,
+            ) -> Result<(), McpAppsHostError> {
+                self.events.lock().unwrap().push(self.name);
+                if self.fail {
+                    Err(McpError::invalid_request(self.name).into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        struct PendingCancellationPolicy {
+            cancellation: CancellationStep,
+            entered: Arc<std::sync::atomic::AtomicBool>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl McpAppsWireHostPolicy for PendingCancellationPolicy {
+            async fn dispatch_reused_request(
+                &mut self,
+                _cx: &Cx,
+                _cancellation: &McpRequestCancellation,
+                _method: McpAppsRoutedMethod,
+                _params: Option<Value>,
+            ) -> Result<Value, McpAppsHostError> {
+                let _drop = ServerInputDrop(Arc::clone(&self.dropped));
+                self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending().await
+            }
+
+            fn cancelled(
+                &mut self,
+                cx: &Cx,
+                request_id: &McpAppsJsonRpcRequestId,
+                params: &McpAppsCancelledControlParams,
+            ) -> Result<(), McpAppsHostError> {
+                assert!(self.dropped.load(std::sync::atomic::Ordering::SeqCst));
+                self.cancellation.cancelled(cx, request_id, params)
+            }
+        }
+
+        run_view_operation_deadline_lab(async {
+            let cx = Cx::current().unwrap();
+            for failures in [0_u8, 1, 2, 4, 8, 15] {
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let step = |name, bit| CancellationStep {
+                    name,
+                    fail: failures & bit != 0,
+                    events: Arc::clone(&events),
+                };
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    wire_configuration(),
+                    PendingCancellationPolicy {
+                        cancellation: step("forwarding", 1),
+                        entered: Arc::clone(&entered),
+                        dropped: Arc::clone(&dropped),
+                    },
+                    activation_proof(),
+                )
+                .with_effects(step("first", 2))
+                .with_effects(step("second", 4))
+                .with_effects(step("outer", 8));
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let sibling = host
+                    .send_host_request(
+                        &cx,
+                        McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let _ = view.receive_from_host(&cx).await.unwrap();
+                view.send_to_host(
+                    &cx,
+                    json!({
+                        "jsonrpc": "2.0", "id": "view-call", "method": "tools/call",
+                        "params": {"name": "pending"}
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+                let mut pending = Box::pin(host.process_next(&cx));
+                poll_fn(|task| {
+                    assert!(pending.as_mut().poll(task).is_pending());
+                    if entered.load(std::sync::atomic::Ordering::SeqCst) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                let cancelled = json!({
+                    "jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": {"requestId": "view-call"}
+                })
+                .to_string();
+                view.send_to_host(&cx, cancelled.clone()).await.unwrap();
+                let result = pending.await;
+                if failures == 0 {
+                    result.unwrap();
+                } else {
+                    let expected = ["forwarding", "first", "second", "outer"]
+                        [failures.trailing_zeros() as usize];
+                    assert!(matches!(
+                        result,
+                        Err(McpAppsHostError::Core(error)) if error.message == expected
+                    ));
+                }
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    ["forwarding", "first", "second", "outer"],
+                    "one failed observer must not suppress any later owner"
+                );
+                assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+                // A repeated control has no live correlation and cannot repeat
+                // bookkeeping, even if every previous hook failed.
+                view.send_to_host(&cx, cancelled).await.unwrap();
+                assert!(matches!(
+                    host.process_next(&cx).await,
+                    Err(McpAppsHostError::Bridge(McpAppsBridgeError::UnknownCorrelation))
+                ));
+                assert_eq!(events.lock().unwrap().len(), 4);
+                assert_eq!(
+                    stateful_wire_request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "view-call",
+                        "ping",
+                        json!({})
+                    )
+                    .await["result"],
+                    json!({}),
+                    "the retired View ID is reusable and has no late response"
+                );
+
+                // A failure in this direction cannot retire a sibling Host
+                // request or make the otherwise healthy View unusable.
+                view.send_to_host(
+                    &cx,
+                    json!({"jsonrpc": "2.0", "id": sibling, "result": {}}).to_string(),
+                )
+                .await
+                .unwrap();
+                host.process_next(&cx).await.unwrap();
+                assert!(host.take_host_response(&sibling).is_some());
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            }
         });
     }
 
