@@ -73,7 +73,7 @@
 extern crate self as fastmcp_server;
 
 mod async_stdio;
-mod auth;
+pub mod auth;
 pub mod bidirectional;
 mod builder;
 pub mod caching;
@@ -212,12 +212,11 @@ pub use tasks::{
     FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskStoreFuture,
     FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    InMemoryFinalTaskStore,
-    MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
-    TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskOperatorHandle,
-    TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
-    TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
-    TaskRetentionTarget,
+    InMemoryFinalTaskStore, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES,
+    MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS, TaskAccessAction, TaskAccessAuthorizer,
+    TaskExecutionAuthorizer, TaskOperatorHandle, TaskRetentionAdministrator,
+    TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
+    TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
 };
 #[cfg(all(test, feature = "tasks"))]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
@@ -1282,10 +1281,8 @@ impl ServerExtensionRuntime {
                       receipt: extensions::TaskControlReceipt| {
                     let runtime = update_runtime.clone();
                     Box::pin(async move {
-                        tasks::dispatch_final_tasks_update(
-                            &runtime, context, parameters, receipt,
-                        )
-                        .await
+                        tasks::dispatch_final_tasks_update(&runtime, context, parameters, receipt)
+                            .await
                     })
                 },
             )
@@ -1301,10 +1298,8 @@ impl ServerExtensionRuntime {
                       receipt: extensions::TaskControlReceipt| {
                     let runtime = cancel_runtime.clone();
                     Box::pin(async move {
-                        tasks::dispatch_final_tasks_cancel(
-                            &runtime, context, parameters, receipt,
-                        )
-                        .await
+                        tasks::dispatch_final_tasks_cancel(&runtime, context, parameters, receipt)
+                            .await
                     })
                 },
             )
@@ -7093,11 +7088,9 @@ impl FinalSubscriptionRegistry {
         // metadata contract, no recipient observes a partial publication.
         let mut deliveries = Vec::with_capacity(targets.len());
         for entry in targets {
-            if entry
-                .resource_admission
-                .as_ref()
-                .is_some_and(|admission| Server::request_context_error(&admission.context).is_some())
-            {
+            if entry.resource_admission.as_ref().is_some_and(|admission| {
+                Server::request_context_error(&admission.context).is_some()
+            }) {
                 self.retire_guarded_subscription(&entry);
                 continue;
             }
@@ -7251,11 +7244,9 @@ impl FinalSubscriptionRegistry {
     ) -> usize {
         let mut count = 0;
         for (entry, event) in deliveries {
-            if entry
-                .resource_admission
-                .as_ref()
-                .is_some_and(|admission| Server::request_context_error(&admission.context).is_some())
-            {
+            if entry.resource_admission.as_ref().is_some_and(|admission| {
+                Server::request_context_error(&admission.context).is_some()
+            }) {
                 self.retire_guarded_subscription(&entry);
                 continue;
             }
@@ -18739,7 +18730,7 @@ impl Server {
         )
     }
 
-    fn maybe_dispatch_extension_fallback(
+    async fn maybe_dispatch_extension_fallback(
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
@@ -18752,12 +18743,19 @@ impl Server {
                     && modern_protocol_version(request) == Some(MODERN_PROTOCOL_VERSION) =>
             {
                 match admission {
-                    Some(admission) => self.invoke_negotiated_extension(
-                        request_ctx,
-                        &admission.negotiated,
-                        &admission.extension_id,
-                        request,
-                    ),
+                    Some(admission) => {
+                        let receipt = extensions::TaskControlReceipt::default();
+                        let mut retained_response = None;
+                        self.dispatch_admitted_extension_fallback_async(
+                            request_ctx,
+                            request,
+                            Some(admission),
+                            &mut retained_response,
+                            None,
+                            &receipt,
+                        )
+                        .await
+                    }
                     None => Err(error),
                 }
             }
@@ -25733,12 +25731,14 @@ impl Server {
             }
         }
         .await;
-        let result = self.maybe_dispatch_extension_fallback(
-            &mw_ctx,
-            &request,
-            extension_admission.as_ref(),
-            result,
-        );
+        let result = self
+            .maybe_dispatch_extension_fallback(
+                &mw_ctx,
+                &request,
+                extension_admission.as_ref(),
+                result,
+            )
+            .await;
         let final_result = self.finalize_middleware_result_with_extension(
             request_cancellation,
             &entered_middleware,
@@ -35950,10 +35950,24 @@ mod lib_unit_tests {
         let runner = runtime
             .install_task_service(1, Arc::new(FinalTasksTestSupervisor))
             .expect("test final Tasks service must install");
-        // Readiness-only fixtures may stay detached. Tests that execute work
-        // enter with_final_tasks_test_runtime before calling this helper.
-        let service_cx = Cx::current().unwrap_or_else(Cx::for_testing);
-        let mut service = Box::pin(async move { runner.run(&service_cx).await });
+        // Task services require a caller timer driver; synthesize a dedicated
+        // current-thread runtime when called from a synchronous test outside
+        // `with_final_tasks_test_runtime`.
+        let (owned_runtime, service_cx) = match Cx::current() {
+            Some(cx) if cx.timer_driver().is_some() => (None, cx),
+            _ => {
+                let rt = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .build()
+                    .expect("build current-thread runtime for final Tasks test service");
+                let cx = rt.block_on(async { Cx::current().unwrap() });
+                (Some(rt), cx)
+            }
+        };
+        let mut service = Box::pin(async move {
+            let _keep_runtime_alive = owned_runtime;
+            runner.run(&service_cx).await
+        });
         let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(
             Future::poll(service.as_mut(), &mut poll_cx).is_pending(),
@@ -36130,7 +36144,11 @@ mod lib_unit_tests {
                 }),
             )
             .expect("test task service installs");
-        let service_cx = Cx::for_testing();
+        let service_runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("build current-thread runtime for final Tasks test service");
+        let service_cx = service_runtime.block_on(async { Cx::current().unwrap() });
         let mut service = Box::pin(runner.run(&service_cx));
 
         assert!(matches!(
@@ -59540,8 +59558,19 @@ mod lib_unit_tests {
                 assert_eq!(error.message, "Authentication failed");
                 assert!(error.data.is_none());
                 assert_eq!(seen.load(Ordering::SeqCst), 0);
-                assert!(server.final_subscriptions.inner.lock().unwrap().entries.is_empty());
-                assert_eq!(server.final_subscriptions.admission.lock().unwrap().total, 0);
+                assert!(
+                    server
+                        .final_subscriptions
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .is_empty()
+                );
+                assert_eq!(
+                    server.final_subscriptions.admission.lock().unwrap().total,
+                    0
+                );
                 assert!(ctx.ensure_live().is_ok());
                 assert!(cx.checkpoint().is_ok());
             }
@@ -59589,7 +59618,16 @@ mod lib_unit_tests {
             );
             assert_eq!(seen[0].load(Ordering::SeqCst), 2);
             assert_eq!(seen[1].load(Ordering::SeqCst), 3);
-            assert_eq!(server.final_subscriptions.inner.lock().unwrap().entries.len(), 1);
+            assert_eq!(
+                server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .len(),
+                1
+            );
             assert!(contexts.iter().all(|ctx| ctx.ensure_live().is_ok()));
             assert!(cx.checkpoint().is_ok());
             assert!(!healthy.is_cancel_requested());
@@ -59654,7 +59692,15 @@ mod lib_unit_tests {
                     );
                     drop(opened.unwrap());
                 }
-                assert!(server.final_subscriptions.inner.lock().unwrap().entries.is_empty());
+                assert!(
+                    server
+                        .final_subscriptions
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .is_empty()
+                );
                 let admission = server.final_subscriptions.admission.lock().unwrap();
                 assert_eq!(admission.total, 0);
                 assert!(admission.principals.is_empty());
@@ -64969,9 +65015,7 @@ mod lib_unit_tests {
                         .call(ctx, arguments)
                         .and_then(crate::handler::promote_legacy_tool_content)
                     {
-                        Ok(result) => {
-                            fastmcp_core::Outcome::Ok(FinalToolOutcome::Complete(result))
-                        }
+                        Ok(result) => fastmcp_core::Outcome::Ok(FinalToolOutcome::Complete(result)),
                         Err(error) => fastmcp_core::Outcome::Err(error),
                     }
                 })

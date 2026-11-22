@@ -437,7 +437,7 @@ impl EnterpriseAuthProvider {
     fn snapshot(&self) -> McpResult<Arc<PolicySnapshot>> {
         self.process.verify().map_err(|_| denied())?;
         let policy = self.policy.upgrade().ok_or_else(denied)?;
-        let snapshot = Arc::clone(&policy.read().map_err(|_| denied())?);
+        let snapshot = Arc::clone(&*policy.read().map_err(|_| denied())?);
         snapshot.check().map_err(|_| denied())?;
         Ok(snapshot)
     }

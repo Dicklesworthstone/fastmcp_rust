@@ -1,6 +1,28 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-11-20 | **Project:** fastmcp_rust | **Language:** Rust
+**Date:** 2026-11-22 | **Project:** fastmcp_rust | **Language:** Rust
+
+## 2026-11-22 upgrade run (v0.14.0 release)
+
+Audited all exact direct registry pins in `Cargo.toml` and member manifests against the crates.io
+index and refreshed transitive lockfile entries while preserving the FND-01 declaration ratchet
+(`tools/xtask/tests/fnd_01_declaration_drift.rs`) and banned-dependency fence
+(`crates/fastmcp/tests/banned_dependency_fence.rs`).
+
+| Dependency | Previous | Updated | Status |
+|---|---|---|---|
+| `rich_rust` | `=0.2.3` | `=0.2.4` | Moved. Latest compatible release; clears upstream syntax-highlighting advisories |
+| `clap` | `=4.6.7` | `=4.6.9` | Moved. Not policy-bound |
+| `regex` | `=1.13.1` | `=1.13.2` | Moved. Not policy-bound |
+| `toml` | `=1.2.1` | `=1.2.2` | Moved. Not policy-bound |
+| `zeroize` | `=1.9.1` | `=1.9.2` | Moved. Policy-bound (`dependency.zeroize`), already in `KNOWN_DRIFTS` |
+| `asupersync` | `=0.6.2` | `=0.6.2` | Held: `0.7.0` introduces an optional direct `tokio` edge that violates `banned_dependency_fence` and changes the `Cx` API boundary shared across sibling crates |
+| `url` | `=2.5.8` | `=2.5.8` | Held: policy-bound (`dependency.url`, not in `KNOWN_DRIFTS`); no security advisory |
+| `notify` | `=8.2.2` | `=8.2.2` | Held: `9.0.0` adds an optional `tokio` dependency forbidden by `banned_dependency_fence` |
+| `trybuild` | `=1.0.122` | `=1.0.122` | Held: `1.0.125` breaks the synthetic `features.json` harness in `trybuild_tests` |
+| lockfile | — | — | `cargo update` refreshed 84 transitive packages (`ctutils 0.4.8`, `pulldown-cmark 0.13.6`, `rustls 0.23.46`, `rustls-webpki 0.103.17`, `webpki-roots 1.0.12`, `tokio 1.54.1`, `fancy-regex 0.20.2`, `lru 0.19.1`, `libc 0.2.191`, etc.) |
+
+Security audit (`cargo audit`): **9 vulnerabilities + 1 unsound warning → 0 vulnerabilities, 0 unsound warnings** (4 pre-existing upstream unmaintained warnings remain: `bincode 1.3.3` and `yaml-rust 0.4.5` via `syntect`, `chrono 0.4.45`, and `unsafe-libyaml 0.2.11` via `serde_yaml`).
 
 ## 2026-11-20 FND-01 declaration-ratchet disposition for `serde_json =1.0.154` and `zeroize =1.9.1` (`bd-oi73c`)
 

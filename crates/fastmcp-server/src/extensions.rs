@@ -87,8 +87,7 @@ impl TaskControlReceipt {
     /// Reconstruct only the fixed reviewed uncertainty body after ordinary
     /// error masking. Provider and middleware text is never unmasked.
     pub(crate) fn fixed_uncertainty_error(&self) -> Option<McpError> {
-        (self.state.load(std::sync::atomic::Ordering::Acquire) == 3)
-            .then(Self::uncertainty_error)
+        (self.state.load(std::sync::atomic::Ordering::Acquire) == 3).then(Self::uncertainty_error)
     }
 
     fn uncertainty_error() -> McpError {
@@ -383,7 +382,6 @@ where
         })
     }
 }
-
 
 /// Only the server's local Task update/cancel installation can register this
 /// adapter. The receipt is separate from wire values and user error data.
@@ -890,7 +888,7 @@ impl ExtensionHandlerRegistry {
         Ok(())
     }
 
-/// Returns the mutable descriptor registry before handler freeze.
+    /// Returns the mutable descriptor registry before handler freeze.
     ///
     /// Builder-only composition must add every descriptor before typed handlers
     /// are frozen under their shared receipt. Once frozen, neither descriptor

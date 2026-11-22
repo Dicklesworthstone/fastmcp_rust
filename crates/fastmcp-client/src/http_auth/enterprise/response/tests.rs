@@ -1518,7 +1518,7 @@ impl VerifiedExchangeGrant {
     fn assert_signed_authority(&self) {
         match self {
             Self::Identity(value) => {
-                assert_eq!(value.identity().subject().as_str(), "client-subject");
+                assert_eq!(value.identity().subject().as_str(), "client-facing");
                 assert_eq!(value.identity().client_id(), "native-idp");
             }
             Self::IdJag(value) => {
@@ -2186,7 +2186,10 @@ fn enterprise_exchange_requires_reviewed_pairwise_subject_binding_before_redempt
                 let (outcome, _) = result.unwrap();
                 let token = success(outcome);
                 let binding = token.subject_binding();
-                assert_eq!(binding.local_subject().as_str(), "preexisting-local-account");
+                assert_eq!(
+                    binding.local_subject().as_str(),
+                    "preexisting-local-account"
+                );
                 assert_eq!(binding.snapshot(), &original_snapshot);
                 assert_eq!(binding.oidc_digest(), oidc_digest);
                 assert_eq!(binding.id_jag_digest(), id_jag_digest);
@@ -2197,10 +2200,7 @@ fn enterprise_exchange_requires_reviewed_pairwise_subject_binding_before_redempt
                 assert!(token.expires_at_monotonic <= original_oidc_deadline);
                 assert!(token.expires_at_monotonic <= mappings.review_deadline());
                 let credential = token
-                    .into_bound_bearer_credential(
-                        Instant::now(),
-                        now() + Duration::from_secs(2),
-                    )
+                    .into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(2))
                     .unwrap();
                 assert_eq!(
                     credential
@@ -2283,7 +2283,9 @@ fn enterprise_exchange_refuses_missing_stale_or_noncurrent_mapping_before_post()
                     )
                     .await
                     .err(),
-                Some(EnterpriseExchangeError::SubjectMappingRejected(expected_error))
+                Some(EnterpriseExchangeError::SubjectMappingRejected(
+                    expected_error
+                ))
             );
             assert!(poster.take_recorded().is_empty());
             assert_eq!(poster.responses.lock().unwrap().len(), 1);
@@ -3330,13 +3332,9 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
             ),
         ] {
             let other_snapshot = subject_mappings(&wrong_profile).snapshot().clone();
-            let other_owner = EnterpriseHttpPolicy::new(
-                wrong_profile,
-                other_snapshot,
-                idp_expiry,
-                as_expiry,
-            )
-            .unwrap();
+            let other_owner =
+                EnterpriseHttpPolicy::new(wrong_profile, other_snapshot, idp_expiry, as_expiry)
+                    .unwrap();
             let token = final_token_for_http_binding(&cx, &selected).await;
             assert_eq!(
                 token
@@ -3368,15 +3366,15 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
         let token = final_token_for_http_binding(&cx, &selected).await;
         assert_eq!(
             token
-                .into_http_credential(
-                    &other_owner,
-                    Instant::now(),
-                    now() + Duration::from_secs(1),
-                )
+                .into_http_credential(&other_owner, Instant::now(), now() + Duration::from_secs(1),)
                 .err(),
             Some(EnterpriseHttpPolicyError::IdentitySnapshotMismatch)
         );
-        assert!(has_enterprise_header(&request));
+        assert!(
+            request.headers().iter().any(
+                |(name, value)| name == "Authorization" && value == "Bearer final-opaque-token"
+            )
+        );
         assert_eq!(owner.identity_snapshot(), &current_snapshot);
 
         let token = final_token_for_http_binding(&cx, &selected).await;
@@ -3402,11 +3400,7 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
         replay.quarantine(&cx).await;
         assert_eq!(
             token
-                .into_http_credential(
-                    &owner,
-                    Instant::now(),
-                    now() + Duration::from_secs(1),
-                )
+                .into_http_credential(&owner, Instant::now(), now() + Duration::from_secs(1),)
                 .err(),
             Some(EnterpriseHttpPolicyError::CredentialUnavailable)
         );
@@ -3417,11 +3411,7 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
         );
         let (token, replay) = final_token_and_replay_for_http_binding(&cx, &selected).await;
         let guarded = token
-            .into_http_credential(
-                &owner,
-                Instant::now(),
-                now() + Duration::from_secs(1),
-            )
+            .into_http_credential(&owner, Instant::now(), now() + Duration::from_secs(1))
             .unwrap();
         let guarded_request = enterprise_raw_request(
             "https://mcp.example/mcp",
@@ -3453,11 +3443,7 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
         let token = final_token_for_http_binding(&cx, &selected).await;
         assert_eq!(
             token
-                .into_http_credential(
-                    &owner,
-                    Instant::now(),
-                    now() + Duration::from_secs(1),
-                )
+                .into_http_credential(&owner, Instant::now(), now() + Duration::from_secs(1),)
                 .err(),
             Some(EnterpriseHttpPolicyError::Revoked)
         );

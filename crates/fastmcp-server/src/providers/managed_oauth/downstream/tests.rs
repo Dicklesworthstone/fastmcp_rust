@@ -378,11 +378,21 @@ fn downstream_capability_drift_and_pre_cancelled_retry_refuse_before_upstream_ef
             retry.params.as_mut().unwrap()["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY] = json!({});
             context(&cx, &connection, 2).with_client_capabilities(ClientCapabilityInfo::new())
         };
-        let error = dispatch(&router, &ctx, &retry).unwrap_err();
         if cancel {
+            let error = dispatch(&router, &ctx, &retry).unwrap_err();
             assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert!(!error.message.contains("UPSTREAM"));
+        } else {
+            // Router::handle_tools_call maps tool-handler InvalidParams refusals
+            // into a tool-level error result (`isError: true`) without leaking
+            // upstream continuation state.
+            let refused = dispatch(&router, &ctx, &retry).unwrap();
+            assert_eq!(refused["resultType"], "complete");
+            assert_eq!(refused["isError"], true);
+            let message = refused["content"][0]["text"].as_str().unwrap();
+            assert_eq!(message, CONTINUATION_REJECTED);
+            assert!(!message.contains("UPSTREAM"));
         }
-        assert!(!error.message.contains("UPSTREAM"));
         assert_eq!(backend.calls.lock().unwrap().len(), 1);
     }
 }

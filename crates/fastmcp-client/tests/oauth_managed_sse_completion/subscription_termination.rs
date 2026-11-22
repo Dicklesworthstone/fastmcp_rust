@@ -270,7 +270,7 @@ fn managed_listen_core_buffered_terminals_cannot_outlive_their_original_authorit
                         .expect("retired authority cannot publish a terminal");
                     match retire {
                         Retire::CallerCancellation => {
-                            assert!(matches!(error, ManagedCoreError::Cancelled))
+                            assert!(matches!(error, ManagedCoreError::Cancelled));
                         }
                         Retire::Logout => assert!(matches!(
                             error,

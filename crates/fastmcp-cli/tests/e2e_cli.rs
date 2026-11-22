@@ -882,7 +882,7 @@ fn e2e_cli_test_help() {
     assert!(normalized.contains("peer traffic does not reset their idle timers."));
     assert!(normalized.contains("It does not bound the whole CLI or subprocess lifetime."));
     assert!(normalized.contains(
-        "This command is currently Unix-only: other platforms fail before spawning because no Job Object equivalent is implemented yet."
+        "Subprocess testing also verifies cleanup and is Unix-only; HTTP testing does not spawn a process."
     ));
     assert!(
         normalized.contains(

@@ -120,7 +120,10 @@ impl FinalTaskStore for AsyncControlStore {
         self.metadata_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             self.metadata_gate.wait().await;
-            assert!(Cx::current().is_some(), "provider polls keep caller context");
+            assert!(
+                Cx::current().is_some(),
+                "provider polls keep caller context"
+            );
             self.inner.get_task_access_metadata(task_id)
         })
     }
@@ -167,7 +170,8 @@ impl FinalTaskStore for AsyncControlStore {
         Box::pin(async move {
             if self.wait_for_request_cancellation.load(Ordering::SeqCst) {
                 ctx.request_cancelled().await;
-                self.request_cancellation_observed.store(true, Ordering::SeqCst);
+                self.request_cancellation_observed
+                    .store(true, Ordering::SeqCst);
                 return Err(McpError::request_cancelled());
             }
             self.write_gate.wait().await;
@@ -207,9 +211,11 @@ impl FinalTaskStore for AsyncControlStore {
                 self.after_write();
                 return Ok(Some(expected.clone()));
             }
-            let committed = self
-                .inner
-                .request_cancellation_and_clear_input_if_current(expected, task, notification)?;
+            let committed = self.inner.request_cancellation_and_clear_input_if_current(
+                expected,
+                task,
+                notification,
+            )?;
             if committed.is_some() {
                 self.committed_writes.fetch_add(1, Ordering::SeqCst);
                 self.after_write();
@@ -409,7 +415,9 @@ impl Fixture {
                 observer_count.fetch_add(1, Ordering::SeqCst);
             }),
         );
-        runtime.install_access_authorizer(Arc::new(AllowAccess)).unwrap();
+        runtime
+            .install_access_authorizer(Arc::new(AllowAccess))
+            .unwrap();
         Self {
             store,
             runtime,
@@ -421,7 +429,11 @@ impl Fixture {
     }
 
     fn snapshot(&self) -> FinalTaskSnapshot {
-        self.store.inner.get_task_snapshot(&self.task_id).unwrap().unwrap()
+        self.store
+            .inner
+            .get_task_snapshot(&self.task_id)
+            .unwrap()
+            .unwrap()
     }
 
     fn elect_worker(&self) -> (FinalTaskSnapshot, u64) {
@@ -621,7 +633,12 @@ fn async_control_update_preserves_commit_after_caller_cancels_while_write_is_pen
     fixture.ctx.request_cancellation().cancel();
     fixture.store.write_gate.release();
     ready(poll_once(request.as_mut())).expect("the exact accepted input receipt wins cancellation");
-    assert!(fixture.store.request_cancellation_observed.load(Ordering::SeqCst));
+    assert!(
+        fixture
+            .store
+            .request_cancellation_observed
+            .load(Ordering::SeqCst)
+    );
     assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
     fixture.assert_accepted_roots();
@@ -643,8 +660,17 @@ fn async_control_cancel_preserves_mutation_but_reports_unverifiable_outcome_afte
     let error = ready(poll_once(request.as_mut())).err().unwrap();
     assert_eq!(error.code, McpError::internal_error("").code);
     assert!(error.message.contains("may have committed"));
-    assert!(error.message.contains("Reconcile Task state before retrying"));
-    assert!(fixture.store.request_cancellation_observed.load(Ordering::SeqCst));
+    assert!(
+        error
+            .message
+            .contains("Reconcile Task state before retrying")
+    );
+    assert!(
+        fixture
+            .store
+            .request_cancellation_observed
+            .load(Ordering::SeqCst)
+    );
     assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.store.cancel_calls.load(Ordering::SeqCst), 1);
     assert!(matches!(fixture.snapshot().task(), FinalTask::Cancelled(_)));
@@ -680,7 +706,13 @@ fn async_control_fabricated_cancel_receipt_cannot_use_caller_cancellation_to_ski
         }
         assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.snapshot().generation(), original_generation);
-        assert!(!fixture.store.inner.is_cancellation_requested(&fixture.task_id).unwrap());
+        assert!(
+            !fixture
+                .store
+                .inner
+                .is_cancellation_requested(&fixture.task_id)
+                .unwrap()
+        );
         fixture.store.assert_async_only();
     }
 }
@@ -704,7 +736,11 @@ fn async_control_provider_cancellation_after_write_admission_is_an_unknown_outco
     ));
     let error = ready(poll_once(request.as_mut())).err().unwrap();
     assert_eq!(error.code, McpError::internal_error("").code);
-    assert!(error.message.contains("Task input update may have committed"));
+    assert!(
+        error
+            .message
+            .contains("Task input update may have committed")
+    );
     assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
     fixture.store.assert_async_only();
 }
@@ -732,7 +768,12 @@ fn async_control_write_provider_receives_request_cancellation_and_wakes_to_settl
     let error = ready(request.as_mut().poll(&mut poll)).err().unwrap();
     assert_eq!(error.code, McpError::internal_error("").code);
     assert!(error.message.contains("may have committed"));
-    assert!(fixture.store.request_cancellation_observed.load(Ordering::SeqCst));
+    assert!(
+        fixture
+            .store
+            .request_cancellation_observed
+            .load(Ordering::SeqCst)
+    );
     assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
     fixture.store.assert_async_only();
 }
@@ -748,7 +789,13 @@ fn async_control_elected_worker_cancellation_retains_and_verifies_intent() {
     );
     ready(poll_once(request.as_mut())).expect("cooperative cancellation is retained");
     assert!(matches!(fixture.snapshot().task(), FinalTask::Working(_)));
-    assert!(fixture.store.inner.is_cancellation_requested(&fixture.task_id).unwrap());
+    assert!(
+        fixture
+            .store
+            .inner
+            .is_cancellation_requested(&fixture.task_id)
+            .unwrap()
+    );
     assert_eq!(fixture.store.intent_reads.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
     fixture.store.assert_async_only();
@@ -788,7 +835,13 @@ fn async_control_worker_consuming_intent_before_readback_keeps_cancellation_acce
     );
     ready(poll_once(request.as_mut())).expect("a newer terminal cancellation proves acceptance");
     assert!(matches!(fixture.snapshot().task(), FinalTask::Cancelled(_)));
-    assert!(!fixture.store.inner.is_cancellation_requested(&fixture.task_id).unwrap());
+    assert!(
+        !fixture
+            .store
+            .inner
+            .is_cancellation_requested(&fixture.task_id)
+            .unwrap()
+    );
     assert_eq!(fixture.store.intent_reads.load(Ordering::SeqCst), 1);
     fixture.store.assert_async_only();
 }
@@ -807,7 +860,9 @@ fn async_control_notification_fence_does_not_retain_a_dropped_observer_while_pen
             store.metadata_gate.close();
         }),
     );
-    runtime.install_access_authorizer(Arc::new(AllowAccess)).unwrap();
+    runtime
+        .install_access_authorizer(Arc::new(AllowAccess))
+        .unwrap();
     let deliveries = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&deliveries);
     let observer: OwnedTaskNotificationEmitter = Arc::new(move |_, _| {
@@ -820,13 +875,19 @@ fn async_control_notification_fence_does_not_retain_a_dropped_observer_while_pen
         .unwrap()
         .push(weak.clone());
     let responses = roots_response();
-    let mut request =
-        Box::pin(runtime.update_task_for_request_with_cx(&fixture.ctx, &fixture.task_id, &responses));
+    let mut request = Box::pin(runtime.update_task_for_request_with_cx(
+        &fixture.ctx,
+        &fixture.task_id,
+        &responses,
+    ));
     assert!(poll_once(request.as_mut()).is_pending());
     assert_eq!(applications.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
     drop(observer);
-    assert!(weak.upgrade().is_none(), "pending metadata must not retain the observer");
+    assert!(
+        weak.upgrade().is_none(),
+        "pending metadata must not retain the observer"
+    );
     fixture.store.metadata_gate.release();
     ready(poll_once(request.as_mut())).unwrap();
     assert_eq!(deliveries.load(Ordering::SeqCst), 0);

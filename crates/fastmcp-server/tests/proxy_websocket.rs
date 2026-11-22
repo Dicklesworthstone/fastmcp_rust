@@ -776,12 +776,15 @@ fn native_websocket_proxy_listener_idle_timeout_preserves_ordinary_requests() {
                 .unwrap(),
             StdioSubscriptionEvent::Acknowledged(_)
         ));
-        let timeout = downstream
+        // When the upstream subscription's 1s idle timeout fires, the gateway
+        // terminates the downstream subscription lease cleanly (without
+        // exposing internal upstream timeout details or tripping downstream
+        // cancellation).
+        let terminated = downstream
             .next_subscription_event(&cx, &cancellation)
             .await
             .unwrap_err();
-        assert_eq!(timeout.code, McpErrorCode::InternalError);
-        assert_eq!(timeout.data.as_ref().unwrap()["timeoutSource"], "idle");
+        assert_eq!(terminated.code, McpErrorCode::RequestCancelled);
         assert!(!cancellation.is_cancel_requested());
 
         // The receive-turn limit must never drop the selected timeout's

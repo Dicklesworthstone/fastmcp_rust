@@ -1569,8 +1569,7 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 /// cancellation. Dropping a future must not leave detached writes or borrowed
 /// buffers in use. A possibly committed write must retain its original recovery
 /// identity; cancellation is not evidence that the mutation did not commit.
-pub type FinalTaskStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = McpResult<T>> + Send + 'a>>;
+pub type FinalTaskStoreFuture<'a, T> = Pin<Box<dyn Future<Output = McpResult<T>> + Send + 'a>>;
 
 /// Application-owned durable storage for final Tasks.
 ///
@@ -1609,7 +1608,8 @@ pub trait FinalTaskStore: Send + Sync {
         task_id: &'a FinalTaskId,
     ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAccessMetadata>> {
         Box::pin(async move {
-            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             self.get_task_access_metadata(task_id)
         })
     }
@@ -1622,7 +1622,8 @@ pub trait FinalTaskStore: Send + Sync {
         task_id: &'a FinalTaskId,
     ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
         Box::pin(async move {
-            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             self.get_task_snapshot(task_id)
         })
     }
@@ -1636,7 +1637,8 @@ pub trait FinalTaskStore: Send + Sync {
         expected: &'a FinalTaskSnapshot,
     ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
         Box::pin(async move {
-            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             self.expire_task_execution_if_current(expected)
         })
     }
@@ -1653,7 +1655,8 @@ pub trait FinalTaskStore: Send + Sync {
         input_responses: FinalTaskInputResponses,
     ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
         Box::pin(async move {
-            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             self.replace_task_and_append_input_if_current(
                 expected,
                 task,
@@ -1674,7 +1677,8 @@ pub trait FinalTaskStore: Send + Sync {
         cancelled_notification: FinalTaskStatusNotification,
     ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
         Box::pin(async move {
-            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             self.request_cancellation_and_clear_input_if_current(
                 expected,
                 cancelled_task,
@@ -1690,7 +1694,8 @@ pub trait FinalTaskStore: Send + Sync {
         task_id: &'a FinalTaskId,
     ) -> FinalTaskStoreFuture<'a, bool> {
         Box::pin(async move {
-            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             self.is_cancellation_requested(task_id)
         })
     }
@@ -8538,7 +8543,8 @@ impl FinalTaskRuntime {
             expected.generation(),
             owner_id,
             dispatch_fence,
-        )? else {
+        )?
+        else {
             return self.revalidate_task_execution(expected);
         };
         if current.task_id() != expected.task_id()
@@ -8570,7 +8576,8 @@ impl FinalTaskRuntime {
             claim_generation,
             owner_id,
             dispatch_fence,
-        )? else {
+        )?
+        else {
             return Ok(false);
         };
         Ok(metadata.generation() == current.generation()
@@ -9256,6 +9263,7 @@ impl FinalTaskRuntime {
             .ok_or_else(|| McpError::invalid_params("Task not found"))
     }
 
+    #[cfg(test)]
     pub(crate) fn task_for_request(
         &self,
         ctx: &McpContext,
@@ -11984,11 +11992,7 @@ fn prepare_task_input_update(
         )?)
     } else {
         FinalTask::InputRequired {
-            base: transition_final_task_base(
-                base.clone(),
-                FinalTaskStatus::InputRequired,
-                None,
-            )?,
+            base: transition_final_task_base(base.clone(), FinalTaskStatus::InputRequired, None)?,
             input_requests,
         }
     };
@@ -17364,11 +17368,8 @@ mod tests {
                         .clone()
                 };
                 let mut handoff = recover(&runtime, resumed);
-                let mut guard = FinalTaskExecutionGuard::new(
-                    &runtime,
-                    FINAL_TASK_TEST_DIRECT_OWNER,
-                    &handoff,
-                );
+                let mut guard =
+                    FinalTaskExecutionGuard::new(&runtime, FINAL_TASK_TEST_DIRECT_OWNER, &handoff);
                 assert!(guard.elect().unwrap());
                 handoff.attach_authority(guard.authority().unwrap());
                 events.lock().unwrap().clear();
@@ -17388,19 +17389,24 @@ mod tests {
             }
 
             fn snapshot(&self) -> FinalTaskSnapshot {
-                self.store.get_task_snapshot(&self.task_id).unwrap().unwrap()
+                self.store
+                    .get_task_snapshot(&self.task_id)
+                    .unwrap()
+                    .unwrap()
             }
 
             fn facts(&self) -> InvocationFacts {
                 let state = self.store.state.lock().unwrap();
                 let lease = state.handoff_leases.get(&self.task_id).unwrap();
                 let task = state.tasks.get(&self.task_id).unwrap();
+                #[allow(clippy::used_underscore_binding)]
+                let permit = Arc::as_ptr(&lease._execution_permit) as usize;
                 InvocationFacts {
                     claim_generation: lease.generation,
                     owner: lease.owner_id.clone(),
                     fence: lease.dispatch_fence,
                     lease_expiry: lease.recovery_expires_at,
-                    permit: Arc::as_ptr(&lease._execution_permit) as usize,
+                    permit,
                     retention: state.expires_at.get(&self.task_id).copied(),
                     budget: state.execution_budgets[&self.task_id],
                     immutable_task: serde_json::json!({
@@ -17501,8 +17507,14 @@ mod tests {
                             .current_generation,
                         current.generation(),
                     );
-                    assert!(!fixture.guard.as_ref().unwrap().transition_committed
-                        .load(TaskServiceOrdering::Acquire));
+                    assert!(
+                        !fixture
+                            .guard
+                            .as_ref()
+                            .unwrap()
+                            .transition_committed
+                            .load(TaskServiceOrdering::Acquire)
+                    );
                     assert!(fixture.guard.as_ref().unwrap().renew().unwrap());
                     assert_final_task_payload_accounting(&fixture.store);
                     previous_generation = current.generation();
@@ -17510,7 +17522,9 @@ mod tests {
                 let events = fixture.events.lock().unwrap().clone();
                 assert_eq!(events.len(), 3);
                 assert_eq!(
-                    events.iter().map(|task| task.base().status_message.as_deref())
+                    events
+                        .iter()
+                        .map(|task| task.base().status_message.as_deref())
                         .collect::<Vec<_>>(),
                     vec![Some("preparing"), Some("processing"), None],
                 );
@@ -17525,11 +17539,15 @@ mod tests {
                 let terminal = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
                 assert!(fixture.update(Some("after-terminal")).is_err());
                 assert_eq!(
-                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), terminal,
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
+                    terminal,
                 );
                 assert_eq!(fixture.events.lock().unwrap().len(), 4);
-                assert_eq!(fixture.store.active_task_count(), 1,
-                    "the invocation keeps its permit through cleanup");
+                assert_eq!(
+                    fixture.store.active_task_count(),
+                    1,
+                    "the invocation keeps its permit through cleanup"
+                );
                 drop(fixture.guard.take());
                 assert_eq!(fixture.store.active_task_count(), 0);
                 assert_final_task_payload_accounting(&fixture.store);
@@ -17544,11 +17562,14 @@ mod tests {
                 fixture.update(Some("accepted")).unwrap();
                 let current = fixture.snapshot();
                 let fence = fixture.guard.as_ref().unwrap().dispatch_fence.unwrap();
-                let candidate = FinalTask::Working(transition_final_task_base(
-                    current.task().base().clone(),
-                    FinalTaskStatus::Working,
-                    Some("forbidden".to_owned()),
-                ).unwrap());
+                let candidate = FinalTask::Working(
+                    transition_final_task_base(
+                        current.task().base().clone(),
+                        FinalTaskStatus::Working,
+                        Some("forbidden".to_owned()),
+                    )
+                    .unwrap(),
+                );
                 let before = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
                 let facts = fixture.facts();
                 for (expected, owner, dispatch_fence) in [
@@ -17556,31 +17577,57 @@ mod tests {
                     (&current, "another-owner", fence),
                     (&current, FINAL_TASK_TEST_DIRECT_OWNER, fence + 1),
                 ] {
-                    assert!(fixture.store.update_working_status_for_handoff_if_current(
-                        expected, owner, dispatch_fence,
-                        candidate.clone(), final_task_notification(&candidate),
-                    ).unwrap().is_none());
+                    assert!(
+                        fixture
+                            .store
+                            .update_working_status_for_handoff_if_current(
+                                expected,
+                                owner,
+                                dispatch_fence,
+                                candidate.clone(),
+                                final_task_notification(&candidate),
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
                     assert_eq!(
                         final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
                         before,
                     );
                     assert_eq!(fixture.facts(), facts);
                 }
-                assert!(!fixture.store.replace_task_if_current(
-                    &stale, candidate.clone(), final_task_notification(&candidate),
-                ).unwrap(), "a status write must invalidate every old record CAS token");
+                assert!(
+                    !fixture
+                        .store
+                        .replace_task_if_current(
+                            &stale,
+                            candidate.clone(),
+                            final_task_notification(&candidate),
+                        )
+                        .unwrap(),
+                    "a status write must invalidate every old record CAS token"
+                );
                 let mut changed_retention = candidate;
                 if let FinalTask::Working(base) = &mut changed_retention {
                     base.ttl_ms = Some(final_task_duration(60_001).unwrap());
                 }
-                assert!(fixture.store.update_working_status_for_handoff_if_current(
-                    &current, FINAL_TASK_TEST_DIRECT_OWNER, fence,
-                    changed_retention.clone(), final_task_notification(&changed_retention),
-                ).is_err());
+                assert!(
+                    fixture
+                        .store
+                        .update_working_status_for_handoff_if_current(
+                            &current,
+                            FINAL_TASK_TEST_DIRECT_OWNER,
+                            fence,
+                            changed_retention.clone(),
+                            final_task_notification(&changed_retention),
+                        )
+                        .is_err()
+                );
                 let too_large = "x".repeat(MAX_FINAL_TASK_METADATA_BYTES);
                 assert!(fixture.update(Some(&too_large)).is_err());
                 assert_eq!(
-                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), before,
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
+                    before,
                 );
                 assert_eq!(fixture.facts(), facts);
                 assert_eq!(fixture.events.lock().unwrap().len(), 1);
@@ -17593,18 +17640,28 @@ mod tests {
             for resumed in [false, true] {
                 let clock = Arc::new(Mutex::new(Instant::now()));
                 let reader = Arc::clone(&clock);
-                let store = Arc::new(InMemoryFinalTaskStore::with_clock_and_payload_capacity(
-                    2, 8_192, Arc::new(move || *reader.lock().unwrap()),
-                ).unwrap().with_owner_capacity(2, 8_192).unwrap());
+                let store = Arc::new(
+                    InMemoryFinalTaskStore::with_clock_and_payload_capacity(
+                        2,
+                        8_192,
+                        Arc::new(move || *reader.lock().unwrap()),
+                    )
+                    .unwrap()
+                    .with_owner_capacity(2, 8_192)
+                    .unwrap(),
+                );
                 let mut fixture = Fixture::with_store(resumed, (store, clock));
                 fixture.update(Some("small")).unwrap();
                 let before = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
                 let facts = fixture.facts();
                 let large = "x".repeat(8_192);
-                assert!(fixture.update(Some(&large)).is_err(),
-                    "the message fits metadata bounds but exceeds retained payload capacity");
+                assert!(
+                    fixture.update(Some(&large)).is_err(),
+                    "the message fits metadata bounds but exceeds retained payload capacity"
+                );
                 assert_eq!(
-                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), before,
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
+                    before,
                 );
                 assert_eq!(fixture.facts(), facts);
                 fixture.update(Some("small-again")).unwrap();
@@ -17612,7 +17669,8 @@ mod tests {
                 let exhausted = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
                 assert!(fixture.update(Some("no-generation")).is_err());
                 assert_eq!(
-                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), exhausted,
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
+                    exhausted,
                 );
                 assert!(fixture.guard.as_ref().unwrap().renew().unwrap());
                 assert_final_task_payload_accounting(&fixture.store);
@@ -17632,11 +17690,25 @@ mod tests {
                 let before = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
                 assert!(fixture.update(Some("after-cancel")).is_err());
                 assert_eq!(
-                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), before,
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
+                    before,
                 );
-                assert!(fixture.guard.as_ref().unwrap().is_cancellation_requested().unwrap());
-                assert!(fixture.guard.as_mut().unwrap()
-                    .retire_if_cancellation_requested().unwrap());
+                assert!(
+                    fixture
+                        .guard
+                        .as_ref()
+                        .unwrap()
+                        .is_cancellation_requested()
+                        .unwrap()
+                );
+                assert!(
+                    fixture
+                        .guard
+                        .as_mut()
+                        .unwrap()
+                        .retire_if_cancellation_requested()
+                        .unwrap()
+                );
                 assert!(matches!(fixture.snapshot().task(), FinalTask::Cancelled(_)));
                 assert!(fixture.snapshot().generation() > generation);
                 assert_eq!(fixture.events.lock().unwrap().len(), 3);
@@ -17662,16 +17734,23 @@ mod tests {
                 );
                 fixture.update(Some("current-at-cancel")).unwrap();
                 let current_generation = fixture.snapshot().generation();
-                ready_task_control(fixture.runtime.cancel_task_for_request_with_cx(
-                    &ctx,
-                    &fixture.task_id,
-                ))
+                ready_task_control(
+                    fixture
+                        .runtime
+                        .cancel_task_for_request_with_cx(&ctx, &fixture.task_id),
+                )
                 .unwrap();
                 assert_eq!(fixture.snapshot().generation(), current_generation);
                 assert!(matches!(fixture.snapshot().task(), FinalTask::Working(_)));
                 assert!(fixture.update(Some("after-async-cancel")).is_err());
-                assert!(fixture.guard.as_mut().unwrap()
-                    .retire_if_cancellation_requested().unwrap());
+                assert!(
+                    fixture
+                        .guard
+                        .as_mut()
+                        .unwrap()
+                        .retire_if_cancellation_requested()
+                        .unwrap()
+                );
                 let cancelled = ready_task_control(fixture.runtime.task_for_request_with_cx(
                     &ctx,
                     &fixture.task_id,
@@ -17697,9 +17776,10 @@ mod tests {
                     } else {
                         assert!(fixture.guard.as_mut().unwrap().restore().unwrap());
                     }
-                    assert!(final_tasks_match_exactly(
-                        fixture.snapshot().task(), latest.task(),
-                    ).unwrap());
+                    assert!(
+                        final_tasks_match_exactly(fixture.snapshot().task(), latest.task(),)
+                            .unwrap()
+                    );
                     assert_eq!(fixture.snapshot().generation(), latest.generation());
                     drop(fixture.guard.take());
                     if finish {
@@ -17708,7 +17788,9 @@ mod tests {
                     } else {
                         let mut successor = recover(&fixture.runtime, resumed);
                         let mut guard = FinalTaskExecutionGuard::new(
-                            &fixture.runtime, FINAL_TASK_TEST_DIRECT_OWNER, &successor,
+                            &fixture.runtime,
+                            FINAL_TASK_TEST_DIRECT_OWNER,
+                            &successor,
                         );
                         assert!(guard.elect().unwrap());
                         successor.attach_authority(guard.authority().unwrap());
@@ -17718,9 +17800,8 @@ mod tests {
                         if let FinalTaskSupervisorHandoff::Resumed(accepted) = &successor {
                             assert_eq!(accepted.input_responses(), &roots_input());
                         }
-                        let before = final_task_restoration_snapshot(
-                            &fixture.store, &fixture.task_id,
-                        );
+                        let before =
+                            final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
                         assert!(fixture.update(Some("stale-owner")).is_err());
                         assert_eq!(
                             final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
@@ -17745,22 +17826,25 @@ mod tests {
                 assert!(fixture.update(Some("late")).is_err());
                 let reclaimed = fixture.snapshot();
                 assert!(reclaimed.generation() > last_generation);
-                assert_eq!(reclaimed.task().base().status_message.as_deref(), Some("retained"));
-                assert!(!matches!(
-                    fixture.guard.as_ref().unwrap().renew(),
-                    Ok(true)
-                ));
+                assert_eq!(
+                    reclaimed.task().base().status_message.as_deref(),
+                    Some("retained")
+                );
+                assert!(!matches!(fixture.guard.as_ref().unwrap().renew(), Ok(true)));
                 drop(fixture.guard.take());
                 let mut successor = recover(&fixture.runtime, resumed);
                 let mut guard = FinalTaskExecutionGuard::new(
-                    &fixture.runtime, FINAL_TASK_TEST_DIRECT_OWNER, &successor,
+                    &fixture.runtime,
+                    FINAL_TASK_TEST_DIRECT_OWNER,
+                    &successor,
                 );
                 assert!(guard.elect().unwrap());
                 successor.attach_authority(guard.authority().unwrap());
                 let before = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
                 assert!(fixture.update(Some("late-again")).is_err());
                 assert_eq!(
-                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id), before,
+                    final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
+                    before,
                 );
                 update(&mut successor, Some("new-invocation")).unwrap();
                 complete(&successor).unwrap();
@@ -17782,7 +17866,10 @@ mod tests {
                 assert!(fixture.update(Some("too-late")).is_err());
                 let failed = fixture.snapshot();
                 assert!(matches!(failed.task(), FinalTask::Failed { .. }));
-                assert_ne!(failed.task().base().status_message.as_deref(), Some("too-late"));
+                assert_ne!(
+                    failed.task().base().status_message.as_deref(),
+                    Some("too-late")
+                );
                 assert_final_task_payload_accounting(&fixture.store);
             }
         }
@@ -17795,23 +17882,43 @@ mod tests {
             let FinalTaskSupervisorHandoff::Initial(initial) = &fixture.handoff else {
                 unreachable!();
             };
-            initial.require_input(final_roots_request(), Some("need-roots".to_owned())).unwrap();
-            assert!(matches!(fixture.snapshot().task(), FinalTask::InputRequired { .. }));
+            initial
+                .require_input(final_roots_request(), Some("need-roots".to_owned()))
+                .unwrap();
+            assert!(matches!(
+                fixture.snapshot().task(),
+                FinalTask::InputRequired { .. }
+            ));
             drop(fixture.guard.take());
-            fixture.runtime.update_task(&fixture.task_id, &roots_input()).unwrap();
+            fixture
+                .runtime
+                .update_task(&fixture.task_id, &roots_input())
+                .unwrap();
             let mut resumed = recover(&fixture.runtime, true);
             let mut guard = FinalTaskExecutionGuard::new(
-                &fixture.runtime, FINAL_TASK_TEST_DIRECT_OWNER, &resumed,
+                &fixture.runtime,
+                FINAL_TASK_TEST_DIRECT_OWNER,
+                &resumed,
             );
             assert!(guard.elect().unwrap());
             resumed.attach_authority(guard.authority().unwrap());
             update(&mut resumed, Some("using-roots")).unwrap();
             update(&mut resumed, Some("almost-finished")).unwrap();
             complete(&resumed).unwrap();
-            assert!(matches!(fixture.snapshot().task(), FinalTask::Completed { .. }));
+            assert!(matches!(
+                fixture.snapshot().task(),
+                FinalTask::Completed { .. }
+            ));
             let events = fixture.events.lock().unwrap();
-            assert!(events.iter().any(|task| matches!(task, FinalTask::InputRequired { .. })));
-            assert_eq!(events.last().unwrap().base().status_message.as_deref(), Some("finished"));
+            assert!(
+                events
+                    .iter()
+                    .any(|task| matches!(task, FinalTask::InputRequired { .. }))
+            );
+            assert_eq!(
+                events.last().unwrap().base().status_message.as_deref(),
+                Some("finished")
+            );
             assert_final_task_payload_accounting(&fixture.store);
         }
 
@@ -17834,7 +17941,8 @@ mod tests {
                             context.waker().wake_by_ref();
                             std::task::Poll::Pending
                         }
-                    }).await;
+                    })
+                    .await;
                     update(&mut handoff, Some("after-yield"))?;
                     complete(&handoff)?;
                     Ok(())
@@ -17859,7 +17967,11 @@ mod tests {
                     let task_id = if resumed {
                         create_accepted_final_input(&runtime, roots_input())
                     } else {
-                        create_final_task_state_fixture(&runtime, None).task.base().task_id.clone()
+                        create_final_task_state_fixture(&runtime, None)
+                            .task
+                            .base()
+                            .task_id
+                            .clone()
                     };
                     let handoff = recover(&runtime, resumed);
                     let runner = runtime
@@ -17873,8 +17985,12 @@ mod tests {
                         Some(FinalTask::Completed { .. })
                     ));
                     assert_eq!(
-                        events.lock().unwrap().iter()
-                            .map(|task| task.base().status_message.clone()).collect::<Vec<_>>(),
+                        events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|task| task.base().status_message.clone())
+                            .collect::<Vec<_>>(),
                         vec![
                             Some("before-yield".to_owned()),
                             Some("after-yield".to_owned()),
@@ -17918,11 +18034,16 @@ mod tests {
                 fixture.update(Some("first")).unwrap();
                 fixture.update(Some("second")).unwrap();
                 let generations = policy.generations.lock().unwrap().clone();
-                assert!(generations.windows(2).any(|pair| pair[1] > pair[0]),
-                    "current authorization observes the newly committed record");
+                assert!(
+                    generations.windows(2).any(|pair| pair[1] > pair[0]),
+                    "current authorization observes the newly committed record"
+                );
                 policy.allowed.store(false, AtomicOrdering::SeqCst);
                 assert!(fixture.update(Some("revoked-message")).is_err());
-                assert!(matches!(fixture.snapshot().task(), FinalTask::Failed { .. }));
+                assert!(matches!(
+                    fixture.snapshot().task(),
+                    FinalTask::Failed { .. }
+                ));
                 assert!(fixture.events.lock().unwrap().iter().all(|task| {
                     task.base().status_message.as_deref() != Some("revoked-message")
                 }));
@@ -30845,7 +30966,7 @@ mod tests {
             .build()
             .expect("build application-owned structured runtime");
         application_runtime
-            .block_on(runner.resume_task(&Cx::for_testing(), &task_id))
+            .block_on(async { runner.resume_task(&Cx::current().unwrap(), &task_id).await })
             .expect("cancelled task wakeup does not invoke the supervisor");
 
         assert!(

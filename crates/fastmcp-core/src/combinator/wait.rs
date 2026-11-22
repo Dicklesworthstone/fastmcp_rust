@@ -73,6 +73,16 @@ pub(super) async fn cancellable<T>(
     let mut cancelled = pin!(receiver.recv(cx));
     let mut future = pin!(future);
 
+    struct RevokeWakeOnDrop(std::sync::Arc<crate::runtime::CallerWakeRegistration>);
+    impl Drop for RevokeWakeOnDrop {
+        fn drop(&mut self) {
+            self.0.replace(None);
+        }
+    }
+
+    let wake = std::sync::Arc::new(crate::runtime::CallerWakeRegistration::default());
+    let _revoke_wake = RevokeWakeOnDrop(std::sync::Arc::clone(&wake));
+
     poll_fn(|task| {
         checkpoint(cx)?;
         // Native timers and I/O must resolve the caller's drivers, not an
@@ -82,16 +92,30 @@ pub(super) async fn cancellable<T>(
         let ceiling = ambient_capability_ceiling();
         let _caller = Cx::set_current(Some(cx.clone()));
         let _restriction = Cx::push_restriction(ceiling);
-        if cancelled.as_mut().poll(task).is_ready() {
+        let current = Cx::current().expect("explicit caller context is installed");
+        wake.replace(Some(std::sync::Arc::new(
+            crate::runtime::CallerWakeTarget {
+                caller: current,
+                waker: Some(task.waker().clone()),
+            },
+        )));
+        let proxy_waker = std::task::Waker::from(std::sync::Arc::clone(&wake));
+        let mut proxy_task = Context::from_waker(&proxy_waker);
+        if cancelled.as_mut().poll(&mut proxy_task).is_ready() {
+            wake.replace(None);
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
         if deadline_timer
             .as_mut()
-            .is_some_and(|timer| Pin::new(timer).poll(task).is_ready())
+            .is_some_and(|timer| Pin::new(timer).poll(&mut proxy_task).is_ready())
         {
+            wake.replace(None);
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
-        let result = future.as_mut().poll(task);
+        let result = future.as_mut().poll(&mut proxy_task);
+        if result.is_ready() {
+            wake.replace(None);
+        }
         checkpoint(cx)?;
         result
     })

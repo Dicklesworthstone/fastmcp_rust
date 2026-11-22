@@ -850,9 +850,7 @@ fn exact_metadata_documents_bind_snapshot_and_resolution() {
         assert_ne!(revised.snapshot(), &snapshot);
         assert_ne!(revised.snapshot().digest(), snapshot.digest());
         assert_eq!(
-            table
-                .resolve(&changed, &oidc, &jag, &snapshot, now())
-                .err(),
+            table.resolve(&changed, &oidc, &jag, &snapshot, now()).err(),
             Some(EnterpriseIdentityError::ProfileMismatch)
         );
         assert_eq!(
@@ -864,7 +862,10 @@ fn exact_metadata_documents_bind_snapshot_and_resolution() {
         let resolved = revised
             .resolve(&changed, &oidc, &jag, revised.snapshot(), now())
             .unwrap();
-        assert_eq!(resolved.local_subject().as_str(), "preexisting-local-account");
+        assert_eq!(
+            resolved.local_subject().as_str(),
+            "preexisting-local-account"
+        );
         assert_eq!(table.snapshot(), &snapshot);
     }
     assert!(
@@ -908,7 +909,10 @@ fn configured_scope_allowances_bind_snapshot_and_resolution() {
             let changed = admit_profile(configured);
             assert_ne!(changed, original);
             assert_eq!(changed.requested_scopes(), original.requested_scopes());
-            assert_eq!(changed.permits_oidc_openid(), original.permits_oidc_openid());
+            assert_eq!(
+                changed.permits_oidc_openid(),
+                original.permits_oidc_openid()
+            );
             let revised = EnterpriseSubjectMappingTable::from_trusted_configuration(
                 &changed,
                 configuration(&changed),
@@ -919,9 +923,7 @@ fn configured_scope_allowances_bind_snapshot_and_resolution() {
             assert_ne!(revised.snapshot(), &snapshot);
             assert_ne!(revised.snapshot().digest(), snapshot.digest());
             assert_eq!(
-                table
-                    .resolve(&changed, &oidc, &jag, &snapshot, now())
-                    .err(),
+                table.resolve(&changed, &oidc, &jag, &snapshot, now()).err(),
                 Some(EnterpriseIdentityError::ProfileMismatch)
             );
             assert_eq!(
@@ -969,9 +971,7 @@ fn imported_review_deadline_cannot_be_renewed_by_a_stale_wall_sample() {
     // sample and reviewed snapshot must not revive an expired imported owner.
     table.review_expires_at_monotonic = Instant::now();
     assert_eq!(
-        table
-            .resolve(&profile, &oidc, &jag, &snapshot, now())
-            .err(),
+        table.resolve(&profile, &oidc, &jag, &snapshot, now()).err(),
         Some(EnterpriseIdentityError::ExpiredSnapshot)
     );
     assert_eq!(table.snapshot(), &snapshot);

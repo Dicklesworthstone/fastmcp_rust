@@ -1265,7 +1265,9 @@ fn validate_schema_dialect_checks<'a>(
             || context.pattern_input_exceeded
             || context.recursion_limit_exceeded.is_some()
             || result.as_ref().err().is_some_and(|issues| {
-                issues.iter().any(|issue| issue.code() == "SchemaResourceLimit")
+                issues
+                    .iter()
+                    .any(|issue| issue.code() == "SchemaResourceLimit")
             });
         if limited {
             return Err(SchemaAdmissionError::new(
@@ -8467,7 +8469,10 @@ mod tests {
             .expect_err("an annotation that violates the declared meta-schema must not admit");
         assert_eq!(error.code(), "InvalidSchema");
         assert_eq!(error.path(), "$.$schema");
-        assert_eq!(error.reason(), "schema does not satisfy its declared dialect");
+        assert_eq!(
+            error.reason(),
+            "schema does not satisfy its declared dialect"
+        );
         assert!(!format!("{error} {error:?}").contains(secret));
         assert_eq!(admitted.schema(), &source);
         assert!(admitted.validate(&json!({"value": 3})).is_ok());
@@ -8697,7 +8702,10 @@ mod tests {
             .expect_err("a meta-schema evaluation cycle cannot become successful admission");
         assert_eq!(error.code(), "SchemaResourceLimit");
         assert_eq!(error.path(), "$.$schema");
-        assert_eq!(error.reason(), "schema meta-validation resource limit exceeded");
+        assert_eq!(
+            error.reason(),
+            "schema meta-validation resource limit exceeded"
+        );
         assert!(admitted.validate(&json!({})).is_ok());
     }
 

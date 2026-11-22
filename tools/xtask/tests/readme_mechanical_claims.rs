@@ -136,7 +136,6 @@ fn feature_mentions(krate: &str, feature: &str) -> usize {
 /// simply never named it, found by sweeping all 72 declared features across the
 /// eight crates that declare any rather than by reading the row.
 const README_INERT: &[(&str, &str)] = &[
-    ("fastmcp-server", "enterprise-auth"),
     ("fastmcp-server", "websocket-experimental"),
     ("fastmcp-console", "enterprise-auth"),
     ("fastmcp-console", "oauth-client-credentials"),
@@ -152,6 +151,7 @@ const README_INERT: &[(&str, &str)] = &[
 /// this direction the check is satisfiable by making everything inert, and the
 /// defect it was written for was a false *inertness* claim.
 const README_NOT_INERT: &[(&str, &str)] = &[
+    ("fastmcp-server", "enterprise-auth"),
     ("fastmcp-server", "oauth-client-credentials"),
     ("fastmcp-server", "websocket"),
     ("fastmcp-server", "jwt-resource-auth"),

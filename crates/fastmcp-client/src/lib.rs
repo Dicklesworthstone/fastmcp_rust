@@ -5555,6 +5555,7 @@ struct WebSocketExtensionNotificationObserver<'a> {
 
 #[cfg(feature = "websocket-experimental")]
 #[derive(Default)]
+#[allow(clippy::struct_field_names)]
 struct WebSocketRequestCallbacks<'a> {
     on_progress: Option<&'a mut (dyn FnMut(FinalProgressNotificationParams) + Send)>,
     on_log: Option<&'a mut (dyn FnMut(FinalLogMessageParams) + Send)>,
@@ -7136,14 +7137,14 @@ where
         .await
     }
 
-    async fn request_with_raw_result_with_callbacks(
+    async fn request_with_raw_result_with_callbacks<'a>(
         &mut self,
         cx: &Cx,
         method: impl Into<String>,
         mut params: Option<serde_json::Value>,
         cancellation: &McpRequestCancellation,
-        on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
-        on_log: Option<&mut (dyn FnMut(FinalLogMessageParams) + Send)>,
+        on_progress: &'a mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+        on_log: Option<&'a mut (dyn FnMut(FinalLogMessageParams) + Send)>,
     ) -> McpResult<WebSocketResponse>
     where
         IO: Send + 'static,
@@ -31747,7 +31748,10 @@ mod tests {
                 // pending poll, then deliver all remaining frames from a
                 // broader host so subsequent phases must retain that ceiling.
                 assert!(connecting.as_mut().poll(&mut task).is_pending());
-                assert_eq!(timer.pending_count(), 1);
+                // One timer from WebSocketConnectDeadline::wait and one from
+                // the underlying WebSocket heartbeat read deadline, both on
+                // the caller's timer driver.
+                assert_eq!(timer.pending_count(), 2);
                 let restriction =
                     Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
                 assert!(connecting.as_mut().poll(&mut task).is_pending());

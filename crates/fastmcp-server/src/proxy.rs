@@ -4935,12 +4935,15 @@ impl ProxyCatalogRoute {
     }
 
     fn ensure_binding(&self) -> McpResult<()> {
+        let supported_adapter = match self.binding.adapter() {
+            ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio => true,
+            #[cfg(feature = "websocket")]
+            ProxyUpstreamAdapter::ModernWebSocket => true,
+            ProxyUpstreamAdapter::LegacyStdio | ProxyUpstreamAdapter::LegacyHttpSse => false,
+        };
         if self.client.upstream_binding() == Some(self.binding)
             && self.binding.era() == ProtocolEra::Modern2026
-            && matches!(
-                self.binding.adapter(),
-                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio
-            )
+            && supported_adapter
         {
             Ok(())
         } else {

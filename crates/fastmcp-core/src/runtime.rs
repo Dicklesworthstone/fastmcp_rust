@@ -687,12 +687,12 @@ pub fn with_caller_context<T>(cx: &asupersync::Cx, operation: impl FnOnce() -> T
 /// Give it a revocable forwarding target instead of the caller's own waker so
 /// abandoning a request releases that caller without waiting for the driver.
 #[derive(Default)]
-struct CallerWakeRegistration {
+pub(crate) struct CallerWakeRegistration {
     target: std::sync::Mutex<Option<std::sync::Arc<CallerWakeTarget>>>,
 }
 
 impl CallerWakeRegistration {
-    fn replace(&self, target: Option<std::sync::Arc<CallerWakeTarget>>) {
+    pub(crate) fn replace(&self, target: Option<std::sync::Arc<CallerWakeTarget>>) {
         let previous = std::mem::replace(
             &mut *self
                 .target
@@ -733,9 +733,9 @@ impl std::task::Wake for CallerWakeRegistration {
     }
 }
 
-struct CallerWakeTarget {
-    caller: asupersync::Cx,
-    waker: Option<std::task::Waker>,
+pub(crate) struct CallerWakeTarget {
+    pub(crate) caller: asupersync::Cx,
+    pub(crate) waker: Option<std::task::Waker>,
 }
 
 impl Drop for CallerWakeTarget {

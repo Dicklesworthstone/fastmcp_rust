@@ -224,7 +224,7 @@ fn call(probe: &Probe, id: i64) -> HttpRequest {
 }
 async fn dispatch(cx: &Cx, endpoint: &ServerHttpEndpoint, request: HttpRequest) -> HttpResponse {
     let mut session = endpoint.open_session(cx).unwrap();
-    let response = session.handle_async(cx, request).await.unwrap();
+    let response = Box::pin(session.handle_async(cx, request)).await.unwrap();
     session.close(cx).await;
     match response {
         ServerHttpEndpointResponse::Immediate(response) => response,

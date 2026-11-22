@@ -7218,10 +7218,7 @@ mod tests {
                 McpContext::DISABLED_RESOURCES_KEY,
                 McpContext::DISABLED_PROMPTS_KEY,
             ] {
-                assert!(state.set(
-                    key,
-                    std::collections::HashSet::from(["blocked".to_owned()]),
-                ));
+                assert!(state.set(key, std::collections::HashSet::from(["blocked".to_owned()]),));
             }
             let extension = self.clone();
             let context = McpContext::with_state(Cx::for_testing(), 1, state.clone())
@@ -7406,7 +7403,10 @@ mod tests {
                 assert!(context.ensure_live().is_ok());
                 assert!(!context.cx().is_cancel_requested());
                 assert!(context.set_state("cleanup", true));
-                assert_eq!(context.remove_state("cleanup"), Some(serde_json::json!(true)));
+                assert_eq!(
+                    context.remove_state("cleanup"),
+                    Some(serde_json::json!(true))
+                );
             }
         }
     }
@@ -7426,9 +7426,7 @@ mod tests {
                 assert!(context.disable_tool("later"));
                 assert_eq!(*probe.events.lock().unwrap(), vec!["catalog_sender"]);
                 assert_eq!(
-                    state.get::<std::collections::HashSet<String>>(
-                        McpContext::DISABLED_TOOLS_KEY
-                    ),
+                    state.get::<std::collections::HashSet<String>>(McpContext::DISABLED_TOOLS_KEY),
                     Some(std::collections::HashSet::from([
                         "blocked".to_owned(),
                         "later".to_owned(),
@@ -7623,7 +7621,11 @@ mod tests {
                         .call_tool_text("private", serde_json::json!({}))
                         .await
                 }
-                Self::Prompt => context.get_prompt_text("private", Default::default()).await,
+                Self::Prompt => {
+                    context
+                        .get_prompt_text("private", std::collections::HashMap::default())
+                        .await
+                }
             }
         }
     }

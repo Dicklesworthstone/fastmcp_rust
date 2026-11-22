@@ -281,7 +281,18 @@ pub(super) async fn scenario(cx: Cx, case: Case) {
     .await;
 
     if matches!(case, Case::Unadvertised | Case::PolicyDenied) {
-        assert!(downstream.get("error").is_some(), "{downstream}");
+        // Router::handle_tools_call turns tool-handler refusals into a
+        // completed CallToolResult with `isError: true`.
+        assert_eq!(
+            downstream["result"]["resultType"], "complete",
+            "{downstream}"
+        );
+        assert_eq!(downstream["result"]["isError"], true, "{downstream}");
+        assert_eq!(
+            downstream["result"]["content"][0]["text"],
+            "Authenticated upstream input is not permitted",
+            "{downstream}"
+        );
         assert_eq!(peer.probe.effects.load(Ordering::SeqCst), 0);
         let seen = peer.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
@@ -311,7 +322,22 @@ pub(super) async fn scenario(cx: Cx, case: Case) {
                 false,
             )
             .await;
-        assert_refused(&reply, &upstream_state, &peer);
+        assert_eq!(reply["result"]["resultType"], "complete", "{reply}");
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Managed OAuth continuation is invalid or no longer authorized",
+            "{reply}"
+        );
+        let diagnostic = reply.to_string();
+        assert!(!diagnostic.contains(&peer.token));
+        assert!(!diagnostic.contains(upstream_state.as_str().unwrap()));
+        assert!(!diagnostic.contains("fastmcp.managed-oauth.mrtr/v1"));
+        assert!(!diagnostic.contains("handler-private-state"));
+        for credential in [ALICE, BOB, RESTRICTED] {
+            assert!(!diagnostic.contains(credential));
+        }
+        peer.quiet();
         assert_eq!(peer.seen.lock().unwrap().len(), 2);
         assert_eq!(peer.probe.effects.load(Ordering::SeqCst), 0);
         session.close();

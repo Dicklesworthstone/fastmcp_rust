@@ -591,6 +591,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn answer_roots(input: &InputRequiredResult) -> McpResult<MrtrInputResponses> {
         Ok(input
             .input_requests()
@@ -833,7 +834,7 @@ mod tests {
                     Stop::Error => assert_eq!(error.message, "host declined input"),
                     Stop::Cancel => assert_eq!(error.code, McpErrorCode::RequestCancelled),
                     Stop::MissingKey | Stop::WrongKey => {
-                        assert_eq!(error.code, McpErrorCode::InvalidParams)
+                        assert_eq!(error.code, McpErrorCode::InvalidParams);
                     }
                     Stop::Late => assert!(error.message.contains("deadline")),
                 }

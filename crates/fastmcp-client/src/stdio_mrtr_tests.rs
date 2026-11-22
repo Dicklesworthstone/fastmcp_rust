@@ -70,6 +70,7 @@ fn roots_input(count: usize, state: &str) -> Value {
     })
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn answer_roots(input: &InputRequiredResult) -> McpResult<MrtrInputResponses> {
     Ok(input
         .input_requests()

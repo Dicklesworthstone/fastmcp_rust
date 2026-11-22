@@ -2396,10 +2396,9 @@ mod tests {
                     "size": 5
                 }])
             );
-            let final_listing = serde_json::to_value(
-                handler.read_final(&ctx).expect("final listing").payload,
-            )
-            .unwrap();
+            let final_listing =
+                serde_json::to_value(handler.read_final(&ctx).expect("final listing").payload)
+                    .unwrap();
             assert_eq!(final_listing["contents"][0]["uri"], root_uri);
             assert_eq!(final_listing["contents"][0]["text"], listing_text);
 
@@ -2716,8 +2715,7 @@ mod tests {
             .build()
             .expect("public filesystem provider");
         let empty = UriParams::new();
-        let listing =
-            r#"[{"uri":"file:///docs/notes.md","mimeType":"text/markdown","size":5}]"#;
+        let listing = r#"[{"uri":"file:///docs/notes.md","mimeType":"text/markdown","size":5}]"#;
 
         filesystem_runtime(true).block_on(async {
             let cx = Cx::current().unwrap();

@@ -950,7 +950,7 @@ mod interactions {
                     .unwrap();
                 let calls = Arc::new(AtomicUsize::new(0));
                 let reverse = handlers(&calls);
-                let mut client = TestClient::new_modern(transport, cx.clone())
+                let mut client = TestClient::new_modern(cx.clone(), transport)
                     .with_client_info("testing-handoff-consumer", "1")
                     .connect_modern_with(|builder| Ok(builder.reverse_request_handlers(reverse)))
                     .await

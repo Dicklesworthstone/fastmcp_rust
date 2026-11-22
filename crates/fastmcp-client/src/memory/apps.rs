@@ -357,8 +357,14 @@ impl McpAppsWireHostPolicy for McpAppsMemoryClientWirePolicy<'_> {
         method: McpAppsRoutedMethod,
         parameters: Option<Value>,
     ) -> Result<Value, McpAppsHostError> {
-        self.dispatch_reused_request_with_effects(cx, cancellation, method, parameters, &mut ())
-            .await
+        Box::pin(self.dispatch_reused_request_with_effects(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            &mut (),
+        ))
+        .await
     }
 
     async fn dispatch_reused_request_with_effects<E: McpAppsWireHostEffects>(

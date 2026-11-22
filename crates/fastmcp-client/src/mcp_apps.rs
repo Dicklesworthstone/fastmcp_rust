@@ -7402,7 +7402,9 @@ exec sleep 10
             for oversized in [false, true] {
                 let result = large_apps_complete_result(McpAppsRoutedMethod::ToolsCall, oversized);
                 assert_large_apps_frame_admission(
-                    McpAppsRoutedMethod::ToolsCall, &result, oversized,
+                    McpAppsRoutedMethod::ToolsCall,
+                    &result,
+                    oversized,
                 );
                 let mut completed = server_task_snapshot("completed", false);
                 completed["result"] = result.clone();
@@ -7421,9 +7423,14 @@ exec sleep 10
                 let mut effects = ServerTaskEffects::new();
                 // Permit the complete snapshot so this exercises publication
                 // after actual Task completion, not the observation quota.
-                effects.policy = Some(McpAppsServerTaskPolicy::new(
-                    std::time::Duration::from_millis(10), 16, 4 * 1024 * 1024,
-                ).unwrap());
+                effects.policy = Some(
+                    McpAppsServerTaskPolicy::new(
+                        std::time::Duration::from_millis(10),
+                        16,
+                        4 * 1024 * 1024,
+                    )
+                    .unwrap(),
+                );
                 let calls = Arc::clone(&effects.input.calls);
                 let snapshots = Arc::clone(&effects.snapshots);
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
@@ -7433,35 +7440,62 @@ exec sleep 10
                     .with_effects(effects);
                 activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
                 let response = stateful_wire_request(
-                    &mut host, &mut view, &cx, "completed-operation", "tools/call",
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "completed-operation",
+                    "tools/call",
                     json!({"name": "server_task"}),
                 )
                 .await;
                 if oversized {
-                    assert_eq!(response, json!({
-                        "jsonrpc": "2.0", "id": "completed-operation",
-                        "error": {"code": -32000, "message": "MCP Apps request rejected"}
-                    }));
+                    assert_eq!(
+                        response,
+                        json!({
+                            "jsonrpc": "2.0", "id": "completed-operation",
+                            "error": {"code": -32000, "message": "MCP Apps request rejected"}
+                        })
+                    );
                 } else {
                     assert_eq!(response["result"], result);
                 }
                 assert!(!response.to_string().contains("private-server-task"));
                 assert_eq!(calls.lock().unwrap().len(), 1);
-                assert_eq!(snapshots.lock().unwrap().last().unwrap()["status"], "completed");
+                assert_eq!(
+                    snapshots.lock().unwrap().last().unwrap()["status"],
+                    "completed"
+                );
                 assert_eq!(
                     stateful_wire_request(
-                        &mut host, &mut view, &cx, "completed-operation", "ping", json!({}),
-                    ).await["result"],
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "completed-operation",
+                        "ping",
+                        json!({}),
+                    )
+                    .await["result"],
                     json!({})
                 );
                 assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
                 let requests = peer.join().unwrap();
                 assert_eq!(
-                    requests.iter().map(|request| request["method"].as_str().unwrap())
+                    requests
+                        .iter()
+                        .map(|request| request["method"].as_str().unwrap())
                         .collect::<Vec<_>>(),
-                    vec!["server/discover", "tools/call", "tasks/get", "tasks/update", "tasks/get"]
+                    vec![
+                        "server/discover",
+                        "tools/call",
+                        "tasks/get",
+                        "tasks/update",
+                        "tasks/get"
+                    ]
                 );
-                assert_eq!(requests[3]["params"]["inputResponses"], server_input_response());
+                assert_eq!(
+                    requests[3]["params"]["inputResponses"],
+                    server_input_response()
+                );
             }
         });
     }
@@ -7875,8 +7909,7 @@ exec sleep 10
                     results.push(json!({"resultType": "complete"}));
                 }
                 results.push(server_input_complete());
-                let (address, peer) =
-                    server_input_http_peer_with_extensions(results, true, false);
+                let (address, peer) = server_input_http_peer_with_extensions(results, true, false);
                 let cx = Cx::current().unwrap();
                 let mut client = server_input_http_client(&cx, address).await;
                 let observer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7937,7 +7970,9 @@ exec sleep 10
                 view.send_to_host(&cx, cancelled).await.unwrap();
                 assert!(matches!(
                     host.process_next(&cx).await,
-                    Err(McpAppsHostError::Bridge(McpAppsBridgeError::UnknownCorrelation))
+                    Err(McpAppsHostError::Bridge(
+                        McpAppsBridgeError::UnknownCorrelation
+                    ))
                 ));
                 assert_eq!(observer_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
                 assert!(
@@ -8084,20 +8119,33 @@ exec sleep 10
                 activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
 
                 let refused = stateful_wire_request(
-                    &mut host, &mut view, &cx, "completed-operation", wire_method, params.clone(),
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "completed-operation",
+                    wire_method,
+                    params.clone(),
                 )
                 .await;
-                assert_eq!(refused, json!({
-                    "jsonrpc": "2.0", "id": "completed-operation",
-                    "error": {"code": -32000, "message": "MCP Apps request rejected"}
-                }));
+                assert_eq!(
+                    refused,
+                    json!({
+                        "jsonrpc": "2.0", "id": "completed-operation",
+                        "error": {"code": -32000, "message": "MCP Apps request rejected"}
+                    })
+                );
                 assert!(!refused.to_string().contains("private-completed-operation"));
                 assert_eq!(calls.lock().unwrap().len(), 1);
 
                 // A new explicit request reuses the retired View correlation.
                 // The completed effect must not be retried by the Host.
                 let accepted = stateful_wire_request(
-                    &mut host, &mut view, &cx, "completed-operation", wire_method, params,
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "completed-operation",
+                    wire_method,
+                    params,
                 )
                 .await;
                 assert_eq!(accepted["result"], bounded);
@@ -8106,7 +8154,11 @@ exec sleep 10
                 let requests = peer.join().unwrap();
                 assert_eq!(requests.len(), 4);
                 assert_eq!(requests[0]["method"], "server/discover");
-                assert!(requests[1..].iter().all(|request| request["method"] == wire_method));
+                assert!(
+                    requests[1..]
+                        .iter()
+                        .all(|request| request["method"] == wire_method)
+                );
                 assert_eq!(requests[2]["params"]["requestState"], "private-round");
                 assert!(requests[3]["params"].get("requestState").is_none());
             }
@@ -9093,7 +9145,8 @@ exec sleep 10
                 _params: Option<Value>,
             ) -> Result<Value, McpAppsHostError> {
                 let _drop = ServerInputDrop(Arc::clone(&self.dropped));
-                self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.entered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending().await
             }
 
@@ -9192,7 +9245,9 @@ exec sleep 10
                 view.send_to_host(&cx, cancelled).await.unwrap();
                 assert!(matches!(
                     host.process_next(&cx).await,
-                    Err(McpAppsHostError::Bridge(McpAppsBridgeError::UnknownCorrelation))
+                    Err(McpAppsHostError::Bridge(
+                        McpAppsBridgeError::UnknownCorrelation
+                    ))
                 ));
                 assert_eq!(events.lock().unwrap().len(), 4);
                 assert_eq!(
@@ -13512,7 +13567,8 @@ exec sleep 10
     impl McpAppsWireBridgeTransport for DeliveredWireTransport {
         async fn send_to_view(&mut self, cx: &Cx, frame: String) -> Result<(), McpAppsHostError> {
             self.inner.send_to_view(cx, frame).await?;
-            self.delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.delivered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match self.disposition {
                 WireSendDisposition::Complete => Ok(()),
                 WireSendDisposition::FailAfterDelivery => Err(McpAppsHostError::Transport(
@@ -13565,14 +13621,16 @@ exec sleep 10
                     let request = json!({
                         "jsonrpc": "2.0", "id": "effect", "method": "ui/update-model-context",
                         "params": {"content": [{"type": "text", "text": "committed context"}]}
-                    }).to_string();
+                    })
+                    .to_string();
                     view.send_to_host(&cx, request.clone()).await.unwrap();
                     if disposition == WireSendDisposition::PendingAfterDelivery {
                         let mut sending = Box::pin(host.process_next(&cx));
                         poll_fn(|task| {
                             assert!(sending.as_mut().poll(task).is_pending());
                             Poll::Ready(())
-                        }).await;
+                        })
+                        .await;
                         // Prove the abandoned future had already published its
                         // terminal frame, not merely started receiving input.
                         assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -13593,8 +13651,14 @@ exec sleep 10
                     if disposition == WireSendDisposition::Complete {
                         assert_eq!(
                             stateful_wire_request(
-                                &mut host, &mut view, &cx, "effect", "ping", json!({}),
-                            ).await["result"],
+                                &mut host,
+                                &mut view,
+                                &cx,
+                                "effect",
+                                "ping",
+                                json!({}),
+                            )
+                            .await["result"],
                             json!({})
                         );
                         assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
@@ -13604,7 +13668,8 @@ exec sleep 10
                         assert!(host.process_next(&cx).await.is_err());
                         assert!(
                             host.send_notification(&cx, McpAppsHostNotification::ToolsListChanged)
-                                .await.is_err()
+                                .await
+                                .is_err()
                         );
                     }
                     assert_eq!(entries.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -13641,36 +13706,45 @@ exec sleep 10
                 activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
                 // A local encoding refusal has not touched the carrier and
                 // must leave the View usable.
-                assert!(host.send_notification(
-                    &cx,
-                    McpAppsHostNotification::ToolCancelled {
-                        reason: Some("x".repeat(
-                            fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES + 1,
-                        )),
-                    },
-                ).await.is_err());
+                assert!(
+                    host.send_notification(
+                        &cx,
+                        McpAppsHostNotification::ToolCancelled {
+                            reason: Some(
+                                "x".repeat(fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES + 1,)
+                            ),
+                        },
+                    )
+                    .await
+                    .is_err()
+                );
                 assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
                 assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-                let notification = McpAppsHostNotification::HostContextChanged(McpAppsHostContext {
-                    display_mode: Some(McpAppsDisplayMode::Fullscreen),
-                    available_display_modes: vec![
-                        McpAppsDisplayMode::Fullscreen, McpAppsDisplayMode::Pip,
-                    ],
-                    locale: None,
-                });
+                let notification =
+                    McpAppsHostNotification::HostContextChanged(McpAppsHostContext {
+                        display_mode: Some(McpAppsDisplayMode::Fullscreen),
+                        available_display_modes: vec![
+                            McpAppsDisplayMode::Fullscreen,
+                            McpAppsDisplayMode::Pip,
+                        ],
+                        locale: None,
+                    });
                 host.transport.disposition = disposition;
                 if disposition == WireSendDisposition::PendingAfterDelivery {
                     let mut sending = Box::pin(host.send_notification(&cx, notification.clone()));
                     poll_fn(|task| {
                         assert!(sending.as_mut().poll(task).is_pending());
                         Poll::Ready(())
-                    }).await;
+                    })
+                    .await;
                     assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 2);
                     drop(sending);
                 } else {
                     assert_eq!(
-                        host.send_notification(&cx, notification.clone()).await.is_ok(),
+                        host.send_notification(&cx, notification.clone())
+                            .await
+                            .is_ok(),
                         disposition == WireSendDisposition::Complete
                     );
                 }

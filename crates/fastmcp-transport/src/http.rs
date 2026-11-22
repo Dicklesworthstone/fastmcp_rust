@@ -1544,7 +1544,8 @@ pub struct GuardedHttpConfidentialResponse {
     // Struct fields drop in declaration order: retain phase capacity until
     // every protected response allocation above has been wiped, even when a
     // runtime-held completed result is discarded after its parent disappears.
-    _lifetime: Option<Arc<dyn Send + Sync>>,
+    #[allow(dead_code)]
+    lifetime_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl GuardedHttpConfidentialResponse {
@@ -1558,7 +1559,7 @@ impl GuardedHttpConfidentialResponse {
             body: Zeroizing::new(response.body),
             redirect: response.redirect.map(Zeroizing::new),
             provenance: response.provenance,
-            _lifetime: None,
+            lifetime_guard: None,
         }
     }
 
@@ -1925,7 +1926,7 @@ impl GuardedHttpFetcher {
             };
             let body_limit = self.policy.response_body_bytes;
             let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
-                let _lifetime = lifetime;
+                let lifetime_guard = lifetime;
                 let wire = exchange.exchange(phase_cx, request).await?;
                 let mut response = guarded_admit_owned_response(
                     wire.status,
@@ -1935,7 +1936,7 @@ impl GuardedHttpFetcher {
                     wire.provenance,
                     false,
                 )?;
-                response._lifetime = _lifetime;
+                response.lifetime_guard = lifetime_guard;
                 Ok(response)
             })
             .await?;
@@ -1950,7 +1951,7 @@ impl GuardedHttpFetcher {
         let policy = self.policy.clone();
         let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
             // Keep capacity until this child and all of its I/O resources drop.
-            let _lifetime = lifetime;
+            let lifetime_guard = lifetime;
             guarded_fetch_checkpoint(&phase_cx)?;
             let tcp = NativeTcpStream::connect(selected_address)
                 .await
@@ -1983,7 +1984,7 @@ impl GuardedHttpFetcher {
                 provenance,
                 false,
             )?;
-            response._lifetime = _lifetime;
+            response.lifetime_guard = lifetime_guard;
             Ok(response)
         })
         .await?;
@@ -2465,7 +2466,7 @@ impl GuardedHttpFetcher {
         let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
             // Declared before I/O resources so ordinary scope destruction
             // disposes the request/stream before releasing this capacity.
-            let _lifetime = lifetime;
+            let lifetime_guard = lifetime;
             let request = request;
             guarded_fetch_checkpoint(&phase_cx)?;
             let tcp = NativeTcpStream::connect(selected_address)
@@ -2505,7 +2506,7 @@ impl GuardedHttpFetcher {
                 provenance,
                 confidential,
             )?;
-            response._lifetime = _lifetime;
+            response.lifetime_guard = lifetime_guard;
             Ok(response)
         })
         .await?;

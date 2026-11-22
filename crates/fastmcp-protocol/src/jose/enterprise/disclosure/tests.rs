@@ -347,7 +347,7 @@ fn disclosure_configuration_requires_bounded_reviewed_identity_and_unique_purpos
             7 => config.review_expires_at = config.reviewed_at,
             8 => {
                 config.review_expires_at =
-                    config.reviewed_at + MAX_DISCLOSURE_REVIEW_LIFETIME + Duration::from_nanos(1)
+                    config.reviewed_at + MAX_DISCLOSURE_REVIEW_LIFETIME + Duration::from_nanos(1);
             }
             9 => config.rules.push(IdJagDisclosureRule {
                 claim: IdJagDisclosureClaim::Email,

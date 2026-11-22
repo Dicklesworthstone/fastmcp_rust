@@ -177,10 +177,10 @@ impl PreparedProxyWebSocketCatalogListener {
 }
 
 trait WebSocketCatalogOpening: Send {
-    fn open<'a>(
+    fn open(
         self: Box<Self>,
-        ctx: &'a McpContext,
-    ) -> BoxFuture<'a, McpResult<Box<dyn ProxyCatalogListener>>>;
+        ctx: &McpContext,
+    ) -> BoxFuture<'_, McpResult<Box<dyn ProxyCatalogListener>>>;
 }
 
 struct WebSocketCatalogRequest<IO>
@@ -195,15 +195,16 @@ impl<IO> WebSocketCatalogOpening for WebSocketCatalogRequest<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    fn open<'a>(
+    fn open(
         self: Box<Self>,
-        ctx: &'a McpContext,
-    ) -> BoxFuture<'a, McpResult<Box<dyn ProxyCatalogListener>>> {
+        ctx: &McpContext,
+    ) -> BoxFuture<'_, McpResult<Box<dyn ProxyCatalogListener>>> {
         Box::pin(async move {
             ctx.ensure_live()?;
             let metadata = self.backend.request_metadata(ctx)?;
+            let backend_client = Arc::clone(&self.backend.client);
             let mut client = await_proxy_request_or_cancellation(ctx, async {
-                OwnedMutexGuard::lock(Arc::clone(&self.backend.client), ctx.cx())
+                OwnedMutexGuard::lock(Arc::clone(&backend_client), ctx.cx())
                     .await
                     .map_err(websocket_lock_error)
             })
@@ -221,7 +222,7 @@ where
             drop(client);
             ctx.ensure_live()?;
             Ok(Box::new(WebSocketCatalogListener {
-                client: Arc::clone(&self.backend.client),
+                client: backend_client,
                 _owner: owner,
             }) as Box<dyn ProxyCatalogListener>)
         })

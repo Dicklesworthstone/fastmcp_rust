@@ -519,8 +519,8 @@ pub mod server {
         FinalTaskStoreFuture, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer,
         TaskExecutionAuthorizer, TaskOperatorHandle, TaskRetentionAdministrator,
-        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
-        TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy,
+        TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
     };
     /// WebSocket server listener and lifecycle APIs.
     #[cfg(feature = "websocket-experimental")]
@@ -1026,10 +1026,10 @@ pub use fastmcp_server::{
     FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskStoreFuture,
     FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    InMemoryFinalTaskStore, TaskAccessAction,
-    TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskOperatorHandle, TaskRetentionAdministrator,
-    TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
-    TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+    InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
+    TaskOperatorHandle, TaskRetentionAdministrator, TaskRetentionAuditPage,
+    TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
+    TaskRetentionReclamation, TaskRetentionTarget,
 };
 
 /// Proxy APIs are available only with the proxy profile.
@@ -3589,8 +3589,8 @@ pub mod modern {
         FinalTaskStoreFuture, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer,
         TaskExecutionAuthorizer, TaskOperatorHandle, TaskRetentionAdministrator,
-        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
-        TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy,
+        TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
     };
 
     #[cfg(all(feature = "apps", feature = "tasks"))]
@@ -14070,13 +14070,13 @@ pub mod prelude {
         FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStatusNotification,
         FinalTaskStore, FinalTaskStoreFuture, FinalTaskSupervisorFuture,
         FinalTaskSupervisorHandoff, FinalTaskWatch, FinalTaskWatchEvent, FinalTaskWorkDescriptor,
-        FinalToolCallOutcome, FinalUpdateTaskResult,
-        InMemoryFinalTaskStore, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
-        OfficialTasksNegotiationResolver, TASK_UPDATE, TaskAccessAction, TaskAccessAuthorizer,
-        TaskExecutionAuthorizer, TaskRetentionAdministrator, TaskRetentionAuditPage,
-        TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
-        TaskRetentionReclamation, TaskRetentionTarget, official_tasks_descriptor,
-        official_tasks_empty_settings, register_official_tasks_extension, tasks_extension,
+        FinalToolCallOutcome, FinalUpdateTaskResult, InMemoryFinalTaskStore,
+        OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver, TASK_UPDATE,
+        TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
+        TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
+        TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
+        TaskRetentionTarget, official_tasks_descriptor, official_tasks_empty_settings,
+        register_official_tasks_extension, tasks_extension,
     };
     pub use crate::{
         BaggageForwardingLimits, OutboundTraceDecision, OutboundTracePolicy, TraceContext,

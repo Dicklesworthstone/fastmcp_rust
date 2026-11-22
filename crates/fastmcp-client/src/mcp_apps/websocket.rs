@@ -334,8 +334,14 @@ where
         method: McpAppsRoutedMethod,
         params: Option<Value>,
     ) -> Result<Value, McpAppsHostError> {
-        self.dispatch_reused_request_with_effects(cx, cancellation, method, params, &mut ())
-            .await
+        Box::pin(self.dispatch_reused_request_with_effects(
+            cx,
+            cancellation,
+            method,
+            params,
+            &mut (),
+        ))
+        .await
     }
 
     async fn dispatch_reused_request_with_effects<E: McpAppsWireHostEffects>(

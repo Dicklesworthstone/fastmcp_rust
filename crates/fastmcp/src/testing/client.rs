@@ -85,7 +85,7 @@ pub enum TestClientProtocolMode {
 /// // higher-level E2E harness helpers in this crate which join threads on drop.
 ///
 /// // Create modern 2026-07-28 test client on the caller's context
-/// let mut client = TestClient::new_modern(client_transport, cx.clone());
+/// let mut client = TestClient::new_modern(cx.clone(), client_transport);
 /// client.initialize().unwrap();
 ///
 /// // Test operations
@@ -164,13 +164,13 @@ impl TestClient {
 
     /// Creates a test client configured strictly for MCP `2026-07-28` (`server/discover`).
     #[must_use]
-    pub fn new_modern(transport: MemoryTransport, cx: Cx) -> Self {
+    pub fn new_modern(cx: Cx, transport: MemoryTransport) -> Self {
         Self::new(transport, cx).with_protocol_mode(TestClientProtocolMode::Modern2026)
     }
 
     /// Creates a test client using modern-first (`2026-07-28` then `2024-11-05`) negotiation.
     #[must_use]
-    pub fn new_auto(transport: MemoryTransport, cx: Cx) -> Self {
+    pub fn new_auto(cx: Cx, transport: MemoryTransport) -> Self {
         Self::new(transport, cx).with_protocol_mode(TestClientProtocolMode::Auto)
     }
 
@@ -1247,7 +1247,7 @@ mod tests {
             )),
         )
         .unwrap();
-        let mut client = TestClient::new_modern(transport, cx.clone());
+        let mut client = TestClient::new_modern(cx.clone(), transport);
         assert!(matches!(
             client.initialize_core().unwrap(),
             CoreResult::Final(FinalCoreResult::Discover(_))
@@ -1402,7 +1402,7 @@ mod tests {
             .unwrap();
             let fallback_calls = Arc::new(AtomicUsize::new(0));
             let calls = Arc::clone(&fallback_calls);
-            let mut client = TestClient::new_auto(transport, cx.clone())
+            let mut client = TestClient::new_auto(cx.clone(), transport)
                 .with_legacy_transport_factory(move |_| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Err(McpError::internal_error(
@@ -1501,7 +1501,7 @@ mod tests {
             )
             .unwrap();
         }
-        let mut client = TestClient::new_modern(transport, cx);
+        let mut client = TestClient::new_modern(cx, transport);
         let error = client.initialize_core().unwrap_err();
         assert!(error.message.contains("interleaved-message limit"));
         assert!(client.transport().is_closed());
@@ -1747,7 +1747,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let mut client = TestClient::new_auto(client_transport, Cx::for_testing())
+            let mut client = TestClient::new_auto(Cx::for_testing(), client_transport)
                 .with_legacy_transport_factory(move |_| Ok(legacy_transport));
             let init = client.initialize().expect("Auto falls back to 2024-11-05");
             assert_eq!(init.protocol_version, PROTOCOL_VERSION);
@@ -1792,7 +1792,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let mut client = TestClient::new_modern(client_transport, Cx::for_testing());
+            let mut client = TestClient::new_modern(Cx::for_testing(), client_transport);
             let err = client
                 .initialize()
                 .expect_err("Modern2026 must refuse legacy-only peer without silent downgrade");
@@ -1842,7 +1842,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut client = TestClient::new_modern(client_transport, Cx::for_testing());
+        let mut client = TestClient::new_modern(Cx::for_testing(), client_transport);
         let debug_before = format!("{client:?}");
         assert!(debug_before.contains("protocol_mode: Modern2026"));
         assert!(debug_before.contains("negotiated_mode: None"));

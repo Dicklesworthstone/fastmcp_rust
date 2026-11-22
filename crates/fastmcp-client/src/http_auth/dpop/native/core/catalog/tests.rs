@@ -112,16 +112,16 @@ fn assert_views<T: Serialize>(catalog: &ManagedCatalog<T>, originals: &[CoreResu
         }
         match &mut rebuilt {
             CoreResult::Final(FinalCoreResult::ToolsList { result, diagnostic }) => {
-                check!(result, diagnostic, tools)
+                check!(result, diagnostic, tools);
             }
             CoreResult::Final(FinalCoreResult::ResourcesList { result, diagnostic }) => {
-                check!(result, diagnostic, resources)
+                check!(result, diagnostic, resources);
             }
             CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, diagnostic }) => {
-                check!(result, diagnostic, resource_templates)
+                check!(result, diagnostic, resource_templates);
             }
             CoreResult::Final(FinalCoreResult::PromptsList { result, diagnostic }) => {
-                check!(result, diagnostic, prompts)
+                check!(result, diagnostic, prompts);
             }
             _ => panic!("wrong result fixture"),
         }

@@ -703,6 +703,17 @@ mod tests {
     use crate::tasks::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn ready_task_control<T>(future: impl Future<Output = McpResult<T>>) -> McpResult<T> {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match Future::poll(future.as_mut(), &mut context) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                panic!("in-memory task control must be ready on its first poll")
+            }
+        }
+    }
+
     fn context(scopes: &[&str]) -> McpContext {
         let mut auth = fastmcp_core::AuthContext::with_subject("same-owner")
             .with_session_owner(Sha256Digest::from_bytes([17; 32]));
@@ -1470,13 +1481,28 @@ mod tests {
         let caller = context(&["manage"]);
         let missing = FinalTaskId::parse("missing-task").unwrap();
         for selected in [&id, &missing] {
-            let get =
-                dispatch_final_tasks_get(&runtime, &caller, parameters(selected)).unwrap_err();
+            let get = ready_task_control(dispatch_final_tasks_get(
+                &runtime,
+                &caller,
+                parameters(selected),
+            ))
+            .unwrap_err();
             let mut update = parameters(selected);
             update["inputResponses"] = serde_json::json!({});
-            let update = dispatch_final_tasks_update(&runtime, &caller, update).unwrap_err();
-            let cancel =
-                dispatch_final_tasks_cancel(&runtime, &caller, parameters(selected)).unwrap_err();
+            let update = ready_task_control(dispatch_final_tasks_update(
+                &runtime,
+                &caller,
+                update,
+                crate::extensions::TaskControlReceipt::default(),
+            ))
+            .unwrap_err();
+            let cancel = ready_task_control(dispatch_final_tasks_cancel(
+                &runtime,
+                &caller,
+                parameters(selected),
+                crate::extensions::TaskControlReceipt::default(),
+            ))
+            .unwrap_err();
             for error in [get, update, cancel] {
                 assert_eq!(error.code, task_access_denied().code);
                 assert_eq!(error.message, "Task not found");
@@ -1806,7 +1832,13 @@ mod tests {
                 .notification_matches_task_access(&caller, &current, &event)
                 .unwrap()
         );
-        dispatch_final_tasks_cancel(&runtime, &caller, parameters(id)).unwrap();
+        ready_task_control(dispatch_final_tasks_cancel(
+            &runtime,
+            &caller,
+            parameters(id),
+            crate::extensions::TaskControlReceipt::default(),
+        ))
+        .unwrap();
         let cancelled = store.get_task_snapshot(id).unwrap().unwrap();
         assert!(matches!(cancelled.task(), FinalTask::Cancelled(_)));
         assert_eq!(
@@ -2458,11 +2490,18 @@ mod tests {
                     operation,
                 )
                 .unwrap();
-            assert!(dispatch_final_tasks_get(&runtime, &owner, parameters(id)).is_ok());
+            assert!(
+                ready_task_control(dispatch_final_tasks_get(&runtime, &owner, parameters(id)))
+                    .is_ok()
+            );
             assert_eq!(
-                dispatch_final_tasks_get(&runtime, &context(&["manage"]), parameters(id))
-                    .unwrap_err()
-                    .message,
+                ready_task_control(dispatch_final_tasks_get(
+                    &runtime,
+                    &context(&["manage"]),
+                    parameters(id),
+                ))
+                .unwrap_err()
+                .message,
                 "Task not found"
             );
         }
@@ -2769,7 +2808,14 @@ mod tests {
             assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 0);
             let mut update = parameters(&id);
             update["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
-            dispatch_final_tasks_update(&fixture.runtime, &fixture.caller, update).unwrap();
+            dispatch_final_tasks_update(
+                &fixture.runtime,
+                &fixture.caller,
+                update,
+                crate::extensions::TaskControlReceipt::default(),
+            )
+            .await
+            .unwrap();
             wait_for_execution(&cx, "authorized resumed work completes", || {
                 fixture.status(&id) == FinalTaskStatus::Completed
             })
@@ -2779,6 +2825,7 @@ mod tests {
             assert!(fixture.policy.calls.load(Ordering::SeqCst) >= 4);
             assert!(
                 dispatch_final_tasks_get(&fixture.runtime, &fixture.caller, parameters(&id))
+                    .await
                     .is_ok()
             );
             assert!(fixture.runtime.is_task_service_ready());
@@ -3126,11 +3173,11 @@ mod tests {
         assert!(rejected.is_err());
         assert!(!runtime.has_installed_task_service());
         assert!(
-            dispatch_final_tasks_get(
+            ready_task_control(dispatch_final_tasks_get(
                 &runtime,
                 &context(&["invoke", "manage", "sensitive"]),
-                parameters(&id)
-            )
+                parameters(&id),
+            ))
             .is_ok()
         );
         let _runner = runtime
@@ -3145,11 +3192,11 @@ mod tests {
         assert!(rejected.is_err());
         assert!(runtime.has_installed_task_service());
         assert!(
-            dispatch_final_tasks_get(
+            ready_task_control(dispatch_final_tasks_get(
                 &runtime,
                 &context(&["invoke", "manage", "sensitive"]),
-                parameters(&id)
-            )
+                parameters(&id),
+            ))
             .is_ok()
         );
     }
@@ -3221,12 +3268,27 @@ mod tests {
             .unwrap();
         let mut update = parameters(id);
         update["inputResponses"] = serde_json::json!({"roots":{"roots":[]}});
-        dispatch_final_tasks_update(&runtime, &caller, update).unwrap();
+        ready_task_control(dispatch_final_tasks_update(
+            &runtime,
+            &caller,
+            update,
+            crate::extensions::TaskControlReceipt::default(),
+        ))
+        .unwrap();
         let completed: FinalTaskCallToolResult =
             serde_json::from_value(serde_json::json!({"content":[]})).unwrap();
         runtime.complete_task(id, completed, None).unwrap();
-        assert!(dispatch_final_tasks_get(&runtime, &caller, parameters(id)).is_ok());
-        assert!(dispatch_final_tasks_get(&runtime, &context(&["manage"]), parameters(id)).is_err());
+        assert!(
+            ready_task_control(dispatch_final_tasks_get(&runtime, &caller, parameters(id))).is_ok()
+        );
+        assert!(
+            ready_task_control(dispatch_final_tasks_get(
+                &runtime,
+                &context(&["manage"]),
+                parameters(id),
+            ))
+            .is_err()
+        );
         assert_eq!(
             store
                 .get_task_snapshot(id)

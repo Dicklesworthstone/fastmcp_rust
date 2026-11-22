@@ -4145,8 +4145,7 @@ impl Router {
                 let revision = crate::catch_extension_unwind(|| matcher.revision());
                 ctx.ensure_live()?;
                 crate::Server::enforce_authentication_freshness(ctx.auth().as_ref())?;
-                revision
-                    .map_err(|_| crate::extension_panic_error("resource_subscription_revision"))
+                revision.map_err(|_| crate::extension_panic_error("resource_subscription_revision"))
             })
             .transpose()?;
         let binding = ResourceSubscriptionBinding {
@@ -6313,9 +6312,8 @@ impl Router {
         } else {
             None
         };
-        let resources = crate::catch_extension_unwind(|| {
-            self.resources_filtered(session_state, tag_filters)
-        });
+        let resources =
+            crate::catch_extension_unwind(|| self.resources_filtered(session_state, tag_filters));
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
@@ -6675,9 +6673,8 @@ impl Router {
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
-        let prompts = prompts.map_err(|_payload| {
-            sanitized_handler_panic(request_ctx.cx(), "prompt_definition")
-        })?;
+        let prompts = prompts
+            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "prompt_definition"))?;
         let Some(page_size) = self.list_page_size else {
             return Ok(ListPromptsResult {
                 prompts,
@@ -8583,7 +8580,9 @@ impl ResourceSubscriptionBinding {
                 self.check_authority()?;
                 let matched = matched
                     .map_err(|_| crate::extension_panic_error("resource_subscription_matching"))?
-                    .map_err(|error| sanitize_handler_error(self.context.cx(), "resource", error))?;
+                    .map_err(|error| {
+                        sanitize_handler_error(self.context.cx(), "resource", error)
+                    })?;
                 self.check_revision()?;
                 if !self.context.is_resource_enabled(self.parent.as_str()) {
                     return Err(McpError::new(
@@ -19206,8 +19205,8 @@ mod router_tests {
             fn invoke_direct(&self, component: Component) -> McpResult<()> {
                 if self.ctx.is_final_request_surface() {
                     return match component {
-                        Component::Tool => {
-                            block_on(self.router.handle_tools_call_final_in_request(
+                        Component::Tool => block_on(
+                            self.router.handle_tools_call_final_in_request(
                                 &self.ctx,
                                 self.ctx.cx(),
                                 serde_json::from_value(serde_json::json!({
@@ -19219,11 +19218,11 @@ mod router_tests {
                                 None,
                                 None,
                                 None,
-                            ))
-                            .map(|_| ())
-                        }
-                        Component::Resource => {
-                            block_on(self.router.handle_resources_read_final_in_request(
+                            ),
+                        )
+                        .map(|_| ()),
+                        Component::Resource => block_on(
+                            self.router.handle_resources_read_final_in_request(
                                 &self.ctx,
                                 self.ctx.cx(),
                                 serde_json::from_value(serde_json::json!({
@@ -19235,11 +19234,11 @@ mod router_tests {
                                 None,
                                 None,
                                 None,
-                            ))
-                            .map(|_| ())
-                        }
-                        Component::Prompt => {
-                            block_on(self.router.handle_prompts_get_final_in_request(
+                            ),
+                        )
+                        .map(|_| ()),
+                        Component::Prompt => block_on(
+                            self.router.handle_prompts_get_final_in_request(
                                 &self.ctx,
                                 self.ctx.cx(),
                                 serde_json::from_value(serde_json::json!({
@@ -19251,9 +19250,9 @@ mod router_tests {
                                 None,
                                 None,
                                 None,
-                            ))
-                            .map(|_| ())
-                        }
+                            ),
+                        )
+                        .map(|_| ()),
                     };
                 }
 
@@ -19425,7 +19424,10 @@ mod router_tests {
                         Component::Tool => unreachable!(),
                     };
                     let definitions = fixture.handler.definition_calls.load(Ordering::SeqCst);
-                    assert_eq!(list().expect("live authority admits catalog definitions"), 1);
+                    assert_eq!(
+                        list().expect("live authority admits catalog definitions"),
+                        1
+                    );
                     assert_eq!(
                         fixture.handler.definition_calls.load(Ordering::SeqCst),
                         definitions + 1
@@ -23939,7 +23941,11 @@ mod router_tests {
         let service_runner = runtime
             .install_task_service(1, Arc::new(NoopFinalTaskSupervisor))
             .expect("a bounded application-owned task service is installed");
-        let service_cx = Cx::for_testing();
+        let service_runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("build current-thread runtime for task service");
+        let service_cx = service_runtime.block_on(async { Cx::current().unwrap() });
         let mut running_service = Box::pin(service_runner.run(&service_cx));
         let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(matches!(
@@ -24072,7 +24078,11 @@ mod router_tests {
         let runner = runtime
             .install_task_service(1, Arc::new(NoopFinalTaskSupervisor))
             .unwrap();
-        let service_cx = Cx::for_testing();
+        let service_runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("build current-thread runtime for task service");
+        let service_cx = service_runtime.block_on(async { Cx::current().unwrap() });
         let mut service = Box::pin(runner.run(&service_cx));
         let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(Future::poll(service.as_mut(), &mut poll).is_pending());
@@ -24270,7 +24280,11 @@ mod router_tests {
         let service_runner = runtime
             .install_task_service(1, Arc::new(NoopFinalTaskSupervisor))
             .expect("a bounded application-owned task service is installed");
-        let service_cx = Cx::for_testing();
+        let service_runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("build current-thread runtime for task service");
+        let service_cx = service_runtime.block_on(async { Cx::current().unwrap() });
         let mut running_service = Box::pin(service_runner.run(&service_cx));
         let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(matches!(

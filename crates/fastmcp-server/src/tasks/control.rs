@@ -4,6 +4,7 @@
 //! requests. Reads remain subject to live request authority on every poll;
 //! once an atomic write starts, its provider owns settling the commit receipt.
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 use crate::extensions::TaskControlReceipt;
 use std::task::Poll;
@@ -196,7 +197,9 @@ impl FinalTaskRuntime {
                 current.task(),
                 FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
             ) {
-                return Err(McpError::invalid_params("terminal tasks cannot be cancelled"));
+                return Err(McpError::invalid_params(
+                    "terminal tasks cannot be cancelled",
+                ));
             }
             let cancelled_task = FinalTask::Cancelled(transition_terminal_final_task_base(
                 current.task().base().clone(),
@@ -232,11 +235,8 @@ impl FinalTaskRuntime {
                     )
                 })?;
             let cancellation = self.validate_loaded_task_snapshot(cancellation, Some(task_id))?;
-            let terminal = validate_control_cancellation_receipt(
-                &current,
-                &cancelled_task,
-                &cancellation,
-            )?;
+            let terminal =
+                validate_control_cancellation_receipt(&current, &cancelled_task, &cancellation)?;
             self.signal_task_service_cancellation(task_id.clone());
             let retained = self
                 .verify_control_cancellation(ctx, &current, &cancellation, terminal)
