@@ -512,8 +512,8 @@ pub mod server {
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskExecutionBudget,
-        FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCreationAdmission,
+        FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskNotificationEmitter,
         FinalTaskOperation, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
         FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
         FinalTaskStoreFuture, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
@@ -1021,7 +1021,7 @@ pub use fastmcp_server::{
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
     FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskAccessMetadata,
-    FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
+    FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
     FinalTaskInitialWorkClaim, FinalTaskNotificationEmitter, FinalTaskOperation,
     FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskStoreFuture,
@@ -3582,8 +3582,8 @@ pub mod modern {
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskExecutionBudget,
-        FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskNotificationEmitter,
+        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCreationAdmission,
+        FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskNotificationEmitter,
         FinalTaskOperation, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
         FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
         FinalTaskStoreFuture, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
@@ -14064,7 +14064,7 @@ pub mod prelude {
     pub use crate::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTask, FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCallToolResult,
-        FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId,
+        FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId,
         FinalTaskInitialWork, FinalTaskInputResponses, FinalTaskNotificationEmitter,
         FinalTaskOperation, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
         FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStatusNotification,

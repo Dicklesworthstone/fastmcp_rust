@@ -45,10 +45,12 @@
 
 mod authorization;
 mod control;
+mod creation;
 pub use authorization::{
     FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
     TaskExecutionAuthorizer,
 };
+pub use creation::FinalTaskCreationAdmission;
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -1563,7 +1565,7 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 // Final MCP Tasks durable state machine (2026-07-28)
 // ============================================================================
 
-/// Caller-owned storage future used by the asynchronous Task control methods.
+/// Caller-owned storage future used by asynchronous Task creation and controls.
 ///
 /// A backend must retain its operation's resources until completion or correct
 /// cancellation. Dropping a future must not leave detached writes or borrowed
@@ -1593,8 +1595,8 @@ pub trait FinalTaskStore: Send + Sync {
     /// Reads redacted access metadata under the requesting caller's context.
     /// The framework authorizes this metadata before requesting any payload.
     ///
-    /// Override the asynchronous control methods for storage that must await
-    /// I/O. Defaults poll the existing bounded, synchronous implementation.
+    /// Override the asynchronous creation and control methods for storage
+    /// that must await I/O. Defaults poll the bounded, synchronous implementation.
     /// The request context preserves cancellation, its lease and effective
     /// budget; use `ctx.cx()` only for caller-owned I/O, and observe
     /// `ctx.request_cancelled()` when a pending operation must settle after
@@ -1866,6 +1868,47 @@ pub trait FinalTaskStore: Send + Sync {
         Err(McpError::internal_error(
             "Final task store does not implement atomic original-operation binding",
         ))
+    }
+
+    /// Atomically creates request-owned work under the caller's context.
+    ///
+    /// The framework retains a bounded service admission reservation until
+    /// this future settles. The complete task, notification, work, principal,
+    /// and original operation must become durable together, and the returned
+    /// snapshot must describe that exact commit as required by
+    /// [`Self::create_task_with_operation`]. Existing bounded synchronous
+    /// stores retain their behavior through the default implementation.
+    ///
+    /// An asynchronous backend must use the admission's request context for
+    /// I/O and call [`FinalTaskCreationAdmission::checkpoint_before_write`]
+    /// immediately before its first irreversible write, including after any
+    /// suspension. This revalidates the current authority and exact service
+    /// generation without discarding bounded custody. Once a write may have
+    /// committed, settle its original receipt instead of reporting ordinary
+    /// cancellation or retrying under another task ID. The framework keeps a
+    /// proven committed handle even if the caller or service exits while the
+    /// write is pending. Dropping this future must satisfy the resource and
+    /// recovery requirements of [`FinalTaskStoreFuture`].
+    #[allow(clippy::too_many_arguments)]
+    fn create_task_with_operation_with_context<'a>(
+        &'a self,
+        admission: FinalTaskCreationAdmission<'a>,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+        work_descriptor: FinalTaskWorkDescriptor,
+        principal: Option<Sha256Digest>,
+        operation: FinalTaskOperation,
+    ) -> FinalTaskStoreFuture<'a, FinalTaskSnapshot> {
+        Box::pin(async move {
+            admission.checkpoint_before_write()?;
+            self.create_task_with_operation(
+                task,
+                notification,
+                work_descriptor,
+                principal,
+                operation,
+            )
+        })
     }
 
     /// Reads only Task identity, generation, owner, and original operation.
@@ -8447,6 +8490,7 @@ impl FinalTaskRuntime {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn create_task_for_operation(
         &self,
         ctx: &McpContext,
@@ -8477,6 +8521,22 @@ impl FinalTaskRuntime {
         if let Some(ctx) = ctx {
             ctx.checkpoint()?;
         }
+        let task = self.new_task_for_creation(status_message)?;
+        self.persist_new_with_work_while_service_ready(
+            &task,
+            work_descriptor,
+            principal,
+            operation,
+            ctx,
+        )?;
+        Ok(CreateTaskResult {
+            task,
+            meta: None,
+            additional: BTreeMap::new(),
+        })
+    }
+
+    fn new_task_for_creation(&self, status_message: Option<String>) -> McpResult<FinalTask> {
         if self.config.ttl_ms.is_none()
             && self
                 .retention_administration
@@ -8491,7 +8551,7 @@ impl FinalTaskRuntime {
         }
         let task_id = generate_final_task_id()?;
         let now = final_task_timestamp()?;
-        let task = FinalTask::Working(FinalTaskBase {
+        Ok(FinalTask::Working(FinalTaskBase {
             task_id,
             status: FinalTaskStatus::Working,
             status_message,
@@ -8503,19 +8563,7 @@ impl FinalTaskRuntime {
                 .poll_interval_ms
                 .map(final_task_duration)
                 .transpose()?,
-        });
-        self.persist_new_with_work_while_service_ready(
-            &task,
-            work_descriptor,
-            principal,
-            operation,
-            ctx,
-        )?;
-        Ok(CreateTaskResult {
-            task,
-            meta: None,
-            additional: BTreeMap::new(),
-        })
+        }))
     }
 
     /// Returns the exact final `tasks/get` complete result.
@@ -9534,19 +9582,13 @@ impl FinalTaskRuntime {
         Ok(())
     }
 
-    /// Reserves bounded create custody from the exact entered service
-    /// generation before invoking an application-owned store. No service or
-    /// admission mutex crosses a provider call. Once the store proves its
-    /// commit, a concurrently exited generation cannot revoke the Task; the
-    /// next entered generation recovers it through the authoritative scan.
-    fn persist_new_with_work_while_service_ready(
+    fn prepare_task_creation(
         &self,
         task: &FinalTask,
-        work_descriptor: FinalTaskWorkDescriptor,
+        work_descriptor: &FinalTaskWorkDescriptor,
         principal: Option<Sha256Digest>,
-        operation: Option<FinalTaskOperation>,
         ctx: Option<&McpContext>,
-    ) -> McpResult<()> {
+    ) -> McpResult<(TaskServiceAdmissionPermit, FinalTaskStatusNotification)> {
         // Measure without materializing encoded JSON or cloning the task.
         // Four task copies and two notification copies conservatively cover
         // request storage, mutation arguments and receipt validation. Each
@@ -9564,15 +9606,33 @@ impl FinalTaskRuntime {
             .and_then(|bytes| bytes.checked_add(descriptor_bytes))
             .ok_or_else(|| McpError::invalid_params("Task admission payload size overflow"))?;
         let permit = self.reserve_task_creation(principal, payload_bytes, ctx)?;
-        let task_id = task.base().task_id.clone();
         let notification = final_task_notification(task);
         self.validate_new_task_write(task, &notification)?;
-        validate_final_task_work_descriptor(&work_descriptor)?;
+        validate_final_task_work_descriptor(work_descriptor)?;
         // Check the capability before any durable creation. Existing custom
         // stores must implement finite accounting before admitting new work.
         // A provider may re-enter readiness or cancel the ingress while this
         // permit keeps its bounded charge. Recheck both before the mutation.
         self.store.execution_limits()?;
+        Ok((permit, notification))
+    }
+
+    /// Reserves bounded create custody from the exact entered service
+    /// generation before invoking an application-owned store. No service or
+    /// admission mutex crosses a provider call. Once the store proves its
+    /// commit, a concurrently exited generation cannot revoke the Task; the
+    /// next entered generation recovers it through the authoritative scan.
+    fn persist_new_with_work_while_service_ready(
+        &self,
+        task: &FinalTask,
+        work_descriptor: FinalTaskWorkDescriptor,
+        principal: Option<Sha256Digest>,
+        operation: Option<FinalTaskOperation>,
+        ctx: Option<&McpContext>,
+    ) -> McpResult<()> {
+        let (permit, notification) =
+            self.prepare_task_creation(task, &work_descriptor, principal, ctx)?;
+        let task_id = task.base().task_id.clone();
         permit.admit_commit(self, ctx)?;
         let committed = if let Some(operation) = operation.as_ref() {
             self.store.create_task_with_operation(

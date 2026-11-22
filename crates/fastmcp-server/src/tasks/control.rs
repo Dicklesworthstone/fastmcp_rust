@@ -426,7 +426,7 @@ impl FinalTaskRuntime {
 
     /// Best-effort publication cannot change a committed request's receipt.
     /// Its metadata and payload probes use the asynchronous hooks too.
-    async fn emit_control_commit(
+    pub(super) async fn emit_control_commit(
         &self,
         ctx: &McpContext,
         action: TaskAccessAction,
@@ -572,7 +572,7 @@ fn control_outcome_unknown(operation: &str) -> McpError {
     ))
 }
 
-fn control_write_error(ctx: &McpContext, operation: &str, error: McpError) -> McpError {
+pub(super) fn control_write_error(ctx: &McpContext, operation: &str, error: McpError) -> McpError {
     if ctx.ensure_live().is_err() || error.code == McpError::request_cancelled().code {
         control_outcome_unknown(operation)
     } else {

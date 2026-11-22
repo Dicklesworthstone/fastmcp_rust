@@ -4778,12 +4778,32 @@ impl Router {
 
     /// Dispatches with connection-owned continuation cancellation and the
     /// exact admitted parameter source retained by transport ingress.
+    #[cfg(test)]
     pub(crate) async fn dispatch_stateless_with_continuation_cancellation_and_raw_params(
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
         raw_params: Option<&str>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<serde_json::Value> {
+        self.dispatch_stateless_with_task_receipt(
+            request_ctx,
+            request,
+            raw_params,
+            continuation_cancellation,
+            &crate::extensions::TaskControlReceipt::default(),
+        )
+        .await
+    }
+
+    /// Retains server-owned evidence that a Task creation entered storage.
+    pub(crate) async fn dispatch_stateless_with_task_receipt(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+        raw_params: Option<&str>,
+        continuation_cancellation: &fastmcp_core::McpRequestCancellation,
+        task_receipt: &crate::extensions::TaskControlReceipt,
     ) -> McpResult<serde_json::Value> {
         self.dispatch_stateless_in_request(
             request_ctx,
@@ -4792,6 +4812,7 @@ impl Router {
             raw_params,
             continuation_cancellation,
             None,
+            task_receipt,
         )
         .await
     }
@@ -4863,6 +4884,7 @@ impl Router {
     /// Carries a transport-owned admission signal to the actual final handler
     /// boundary. Middleware, raw decoding, target and capability admission
     /// remain ahead of any incremental response representation.
+    #[cfg(test)]
     pub(crate) async fn dispatch_stateless_owned_with_handler_admission(
         self: Arc<Self>,
         request_ctx: McpContext,
@@ -4870,6 +4892,27 @@ impl Router {
         raw_params: Option<Arc<str>>,
         continuation_cancellation: fastmcp_core::McpRequestCancellation,
         handler_admission: Option<crate::FinalHandlerAdmission>,
+    ) -> McpResult<serde_json::Value> {
+        self.dispatch_stateless_owned_with_task_receipt(
+            request_ctx,
+            request,
+            raw_params,
+            continuation_cancellation,
+            handler_admission,
+            crate::extensions::TaskControlReceipt::default(),
+        )
+        .await
+    }
+
+    /// Carries Task mutation evidence through the request-owned child task.
+    pub(crate) async fn dispatch_stateless_owned_with_task_receipt(
+        self: Arc<Self>,
+        request_ctx: McpContext,
+        request: JsonRpcRequest,
+        raw_params: Option<Arc<str>>,
+        continuation_cancellation: fastmcp_core::McpRequestCancellation,
+        handler_admission: Option<crate::FinalHandlerAdmission>,
+        task_receipt: crate::extensions::TaskControlReceipt,
     ) -> McpResult<serde_json::Value> {
         if let Some(error) = budget_error(&request_ctx) {
             return Err(error);
@@ -4884,6 +4927,7 @@ impl Router {
                     raw_params.as_deref(),
                     &continuation_cancellation,
                     handler_admission.as_ref(),
+                    &task_receipt,
                 )
                 .await;
         };
@@ -4913,6 +4957,7 @@ impl Router {
                             raw_params.as_deref(),
                             &continuation_cancellation,
                             handler_admission.as_ref(),
+                            &task_receipt,
                         ),
                     )
                 })
@@ -4925,6 +4970,7 @@ impl Router {
                 raw_params.as_deref(),
                 &continuation_cancellation,
                 handler_admission.as_ref(),
+                &task_receipt,
             )
             .await
         });
@@ -4991,6 +5037,7 @@ impl Router {
         raw_params: Option<&str>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
         handler_admission: Option<&crate::FinalHandlerAdmission>,
+        task_receipt: &crate::extensions::TaskControlReceipt,
     ) -> McpResult<serde_json::Value> {
         if request_cx_cancellation_is_visible(request_cx) {
             return Err(McpError::request_cancelled());
@@ -5076,6 +5123,7 @@ impl Router {
                             None,
                             continuation_cancellation,
                             handler_admission,
+                            task_receipt,
                         )
                         .await?
                     }
@@ -5088,6 +5136,7 @@ impl Router {
                             Some(resume_inputs),
                             continuation_cancellation,
                             handler_admission,
+                            task_receipt,
                         )
                         .await?
                     }
@@ -5388,7 +5437,10 @@ impl Router {
         resume_inputs: Option<MrtrCompletedInputs>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
         handler_admission: Option<&crate::FinalHandlerAdmission>,
+        task_receipt: &crate::extensions::TaskControlReceipt,
     ) -> McpResult<serde_json::Value> {
+        #[cfg(not(feature = "tasks"))]
+        let _ = task_receipt;
         #[cfg(feature = "tasks")]
         let request_metadata = params.meta.clone();
         #[cfg(feature = "tasks")]
@@ -5483,12 +5535,17 @@ impl Router {
                 // Tasks operations. Admit only the branch that can mutate the
                 // Tasks store, immediately before that mutation.
                 let runtime = self.admit_final_task_tool(&request_metadata)?;
-                encode_final_task_result(runtime.create_task_for_operation(
-                    request_ctx,
-                    original,
-                    work_descriptor,
-                    status_message,
-                )?)
+                encode_final_task_result(
+                    runtime
+                        .create_task_for_operation_with_receipt(
+                            request_ctx,
+                            original,
+                            work_descriptor,
+                            status_message,
+                            task_receipt.clone(),
+                        )
+                        .await?,
+                )
             }
         }
     }

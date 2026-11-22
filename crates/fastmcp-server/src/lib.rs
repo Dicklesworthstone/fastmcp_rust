@@ -207,7 +207,7 @@ use session::{
 pub use tasks::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
     FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskAccessMetadata,
-    FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
+    FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
     FinalTaskInitialWorkClaim, FinalTaskNotificationEmitter, FinalTaskOperation,
     FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskStoreFuture,
@@ -19131,7 +19131,7 @@ impl Server {
                     inbound.mrtr_continuation_cancellation().unwrap_or_default();
                 match self
                     .router
-                    .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                    .dispatch_stateless_with_task_receipt(
                         &request_ctx,
                         &admission_request,
                         retained_raw_params(
@@ -19140,6 +19140,7 @@ impl Server {
                             admission_request.params.as_ref(),
                         ),
                         &continuation_cancellation,
+                        &task_control_receipt,
                     )
                     .await
                 {
@@ -19586,7 +19587,7 @@ impl Server {
                     .await
                     .map(|()| None),
                 None => match Arc::clone(&self.router)
-                    .dispatch_stateless_owned_with_handler_admission(
+                    .dispatch_stateless_owned_with_task_receipt(
                         request_ctx.clone(),
                         request.clone(),
                         retained_raw_params(
@@ -19597,6 +19598,7 @@ impl Server {
                         .map(Arc::<str>::from),
                         inbound.mrtr_continuation_cancellation().unwrap_or_default(),
                         handler_admission.clone(),
+                        task_control_receipt.clone(),
                     )
                     .await
                 {

@@ -325,7 +325,8 @@ fn websocket_cli_call_wait_creates_and_observes_a_real_task() {
     assert_eq!(documents.len(), 2);
     assert_eq!(documents[0]["resultType"], "task");
     assert_eq!(documents[1]["status"], "completed");
-    assert_eq!(documents[0]["task"]["taskId"], documents[1]["taskId"]);
+    assert!(documents[0]["taskId"].is_string());
+    assert_eq!(documents[0]["taskId"], documents[1]["taskId"]);
     assert_eq!(
         documents[1]["result"]["content"][0]["text"],
         "work completed on its creating connection"
@@ -342,7 +343,8 @@ fn websocket_cli_call_wait_preserves_real_task_tool_errors() {
     assert_eq!(documents.len(), 2);
     assert_eq!(documents[1]["status"], "completed");
     assert_eq!(documents[1]["result"]["isError"], true);
-    assert_eq!(documents[0]["task"]["taskId"], documents[1]["taskId"]);
+    assert!(documents[0]["taskId"].is_string());
+    assert_eq!(documents[0]["taskId"], documents[1]["taskId"]);
     assert_single_task_creation(&fixture);
     fixture.stop();
 }
@@ -357,7 +359,8 @@ fn websocket_cli_call_wait_timeout_retains_the_task_receipt_without_cancelling_w
     assert_eq!(documents.len(), 2);
     assert_eq!(documents[0]["resultType"], "task");
     assert_eq!(documents[1]["status"], "working");
-    assert_eq!(documents[0]["task"]["taskId"], documents[1]["taskId"]);
+    assert!(documents[0]["taskId"].is_string());
+    assert_eq!(documents[0]["taskId"], documents[1]["taskId"]);
     assert_single_task_creation(&fixture);
     fixture.stop();
 }
