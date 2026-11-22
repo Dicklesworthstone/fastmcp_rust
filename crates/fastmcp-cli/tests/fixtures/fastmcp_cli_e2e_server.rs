@@ -33,6 +33,12 @@ fn greeting(_ctx: &McpContext, name: String) -> Vec<PromptMessage> {
 }
 
 fn main() {
+    #[cfg(any(feature = "tasks", feature = "websocket-experimental"))]
+    let websocket_ready = (std::env::args().nth(1).as_deref() == Some("--websocket-ready")).then(|| {
+        std::env::args()
+            .nth(2)
+            .expect("--websocket-ready requires an output path")
+    });
     let http_ready = (std::env::args().nth(1).as_deref() == Some("--http-ready")).then(|| {
         std::env::args()
             .nth(2)
@@ -43,9 +49,28 @@ fn main() {
         .tool(SizedOutput)
         .resource(StatusResource)
         .prompt(GreetingPrompt);
+    #[cfg(feature = "websocket-experimental")]
+    let builder = if let Some(ready) = websocket_ready.as_ref() {
+        builder
+            .tool(DelayedEcho)
+            .middleware(WebSocketObservations {
+                path: std::path::Path::new(ready).with_extension("requests.jsonl"),
+            })
+    } else {
+        builder
+    };
     #[cfg(feature = "tasks")]
     let (builder, runner) = if http_ready.is_some() {
         (builder, None)
+    } else if websocket_ready.is_some() {
+        #[cfg(feature = "websocket-experimental")]
+        {
+            install_websocket_task_fixture(builder)
+        }
+        #[cfg(not(feature = "websocket-experimental"))]
+        {
+            (builder, None)
+        }
     } else {
         install_task_fixture(builder)
     };
@@ -71,6 +96,24 @@ fn main() {
             })
             .expect("spawn task service runner")
         });
+        #[cfg(feature = "websocket-experimental")]
+        if let Some(ready_file) = websocket_ready {
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("bind real WebSocket server");
+            std::fs::write(
+                ready_file,
+                format!("ws://{}/mcp", bound.local_addr().expect("bound address")),
+            )
+            .expect("publish runtime-selected WebSocket endpoint");
+            if let fastmcp_server::WebSocketServerShutdown::Nonquiescent(shutdown) =
+                bound.serve(&cx).await.expect("serve real WebSocket clients")
+            {
+                shutdown.settle(&cx).await.expect("settle WebSocket children");
+            }
+            return;
+        }
         if let Some(ready_file) = http_ready {
             let bound = server
                 .bind_http(&cx, "127.0.0.1:0")
@@ -90,6 +133,99 @@ fn main() {
             server.run_stdio_with_cx(&cx).await;
         }
     });
+}
+
+#[cfg(feature = "websocket-experimental")]
+#[tool]
+async fn delayed_echo(ctx: &McpContext, message: String, delay_ms: u64) -> String {
+    asupersync::time::sleep(
+        ctx.cx().now(),
+        std::time::Duration::from_millis(delay_ms.min(10_000)),
+    )
+    .await;
+    message
+}
+
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketObservations {
+    path: std::path::PathBuf,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl fastmcp_rust::Middleware for WebSocketObservations {
+    fn on_request(
+        &self,
+        _ctx: &McpContext,
+        request: &fastmcp_protocol::JsonRpcRequest,
+    ) -> McpResult<fastmcp_rust::MiddlewareDecision> {
+        use std::io::Write as _;
+        let mut output = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .expect("open public WebSocket request observations");
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({"method": request.method, "id": request.id, "params": request.params}),
+        )
+        .expect("retain public WebSocket request observation");
+        Ok(fastmcp_rust::MiddlewareDecision::Continue)
+    }
+}
+
+#[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+#[tool(tasks)]
+fn background(message: String, is_error: bool, delay_ms: u64) -> McpResult<fastmcp_rust::FinalToolOutcome> {
+    Ok(fastmcp_rust::FinalToolOutcome::CreateTask {
+        work_descriptor: fastmcp_rust::FinalTaskWorkDescriptor::new(serde_json::json!({
+            "message": message, "is_error": is_error, "delay_ms": delay_ms,
+        }))?,
+        status_message: None,
+    })
+}
+
+#[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+struct WebSocketTaskSupervisor;
+
+#[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+impl fastmcp_rust::ApplicationTaskSupervisor for WebSocketTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        cx: &'a asupersync::Cx,
+        handoff: fastmcp_rust::FinalTaskSupervisorHandoff,
+    ) -> fastmcp_rust::FinalTaskSupervisorFuture<'a> {
+        Box::pin(async move {
+            let fastmcp_rust::FinalTaskSupervisorHandoff::Initial(work) = handoff else {
+                return Err(McpError::invalid_params("fixture work does not request input"));
+            };
+            let descriptor = work.work_descriptor().as_value().clone();
+            let delay_ms = descriptor["delay_ms"].as_u64().unwrap().min(10_000);
+            asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(delay_ms)).await;
+            let result = serde_json::from_value(serde_json::json!({
+                "content": [{"type": "text", "text": descriptor["message"]}],
+                "isError": descriptor["is_error"],
+            }))
+            .expect("typed fixture task result");
+            work.complete_task(result, None)?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+fn install_websocket_task_fixture(
+    builder: ServerBuilder,
+) -> (ServerBuilder, Option<fastmcp_rust::AuthorizedTaskServiceRunner>) {
+    use std::sync::Arc;
+    let runtime = fastmcp_rust::FinalTaskRuntime::new(
+        Arc::new(fastmcp_rust::InMemoryFinalTaskStore::default()),
+        fastmcp_rust::FinalTaskRuntimeConfig::new(60_000, Some(100)).unwrap(),
+        Arc::new(|_| {}),
+    );
+    let runner = runtime.install_task_service(16, Arc::new(WebSocketTaskSupervisor)).unwrap();
+    let builder = builder.tool(Background).final_tasks(runtime).unwrap();
+    (builder, Some(runner))
 }
 
 #[cfg(feature = "tasks")]

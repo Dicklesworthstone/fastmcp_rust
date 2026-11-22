@@ -88,6 +88,7 @@ websocket-experimental = [
     "fastmcp-client/websocket-experimental",
     "fastmcp-console/websocket-experimental",
     "fastmcp-server?/websocket-experimental",
+    "fastmcp-rust?/websocket-experimental",
 ]
 jwt-resource-auth = [
     "dep:fastmcp-server",

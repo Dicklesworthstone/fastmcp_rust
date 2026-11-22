@@ -25,6 +25,9 @@
 #![forbid(unsafe_code)]
 #![recursion_limit = "256"]
 
+#[cfg(feature = "websocket-experimental")]
+mod websocket;
+
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::env;
 #[cfg(test)]
@@ -637,6 +640,7 @@ enum Commands {
         /// Server command or path. Omit when using explicit HTTP endpoints.
         #[arg(conflicts_with_all = [
             "http_url",
+            "websocket_url",
             "bearer_token_file",
             "legacy_sse_url",
             "legacy_message_url",
@@ -646,6 +650,13 @@ enum Commands {
         /// Explicit modern Streamable HTTP MCP POST endpoint.
         #[arg(long, value_name = "URL")]
         http_url: Option<String>,
+
+        /// Explicit ws:// or wss:// MCP endpoint; requires modern-only and
+        /// the websocket-experimental feature. TLS uses WebPKI trust roots.
+        #[arg(long, value_name = "URL", conflicts_with_all = [
+            "server", "http_url", "bearer_token_file", "legacy_sse_url", "legacy_message_url",
+        ])]
+        websocket_url: Option<String>,
 
         /// Read a bearer token from a regular file (at most 16 KiB); HTTPS only.
         #[arg(long, value_name = "PATH", requires = "http_url")]
@@ -682,9 +693,9 @@ enum Commands {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         max_pages: u32,
 
-        /// Total HTTP connection and catalog acquisition budget in seconds (1-900).
+        /// Total network connection and catalog acquisition budget in seconds (1-900).
         /// Includes TCP/TLS setup and every page; no partial report is published
-        /// on expiry. Applies only to explicit HTTP endpoints.
+        /// on expiry. Applies to explicit HTTP and WebSocket endpoints.
         #[arg(long, default_value_t = 120, conflicts_with = "server",
             value_parser = clap::value_parser!(u64).range(1..=900))]
         timeout: u64,
@@ -971,9 +982,10 @@ impl Commands {
 /// A single selected-era operation owns its explicit connection and timeout.
 #[derive(clap::Args)]
 struct OperationConnection {
-    /// Stdio executable (Unix only); choose this or explicit HTTP endpoints.
+    /// Stdio executable (Unix only); choose one explicit transport.
     #[arg(long, conflicts_with_all = [
         "http_url",
+        "websocket_url",
         "bearer_token_file",
         "legacy_sse_url",
         "legacy_message_url",
@@ -985,6 +997,12 @@ struct OperationConnection {
     /// Explicit modern Streamable HTTP MCP POST endpoint.
     #[arg(long, value_name = "URL")]
     http_url: Option<String>,
+    /// Explicit ws:// or wss:// MCP endpoint; requires modern-only and
+    /// the websocket-experimental feature. TLS uses WebPKI trust roots.
+    #[arg(long, value_name = "URL", conflicts_with_all = [
+        "server", "http_url", "bearer_token_file", "legacy_sse_url", "legacy_message_url",
+    ])]
+    websocket_url: Option<String>,
     /// Read a bearer token from a regular file (at most 16 KiB); HTTPS only.
     #[arg(long, value_name = "PATH", requires = "http_url")]
     bearer_token_file: Option<PathBuf>,
@@ -1198,6 +1216,22 @@ fn cli_protocol_policy_refusal(policy: CliProtocolPolicy) -> Option<CliProtocolP
 
 fn validate_cli_protocol_policy(policy: CliProtocolPolicy) -> McpResult<()> {
     cli_protocol_policy_refusal(policy).map_or(Ok(()), |refusal| Err(refusal.error()))
+}
+
+/// Endpoint selection is immutable before opening a socket. A missing
+/// transport feature remains parseable for an actionable, no-contact error.
+fn validate_websocket_cli_policy(policy: CliProtocolPolicy) -> McpResult<()> {
+    if !cfg!(feature = "websocket-experimental") {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "FeatureUnavailable: --websocket-url requires --features websocket-experimental",
+        ));
+    }
+    if policy != CliProtocolPolicy::ModernOnly {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "--websocket-url requires --protocol-policy modern-only",
+        ));
+    }
+    Ok(())
 }
 
 /// The immutable policy selected by the CLI and the exact protocol revision
@@ -1483,6 +1517,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
         Commands::Inspect {
             server,
             http_url,
+            websocket_url,
             bearer_token_file,
             legacy_sse_url,
             legacy_message_url,
@@ -1510,6 +1545,27 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 ))
                 .await
             }
+            None if websocket_url.is_some() => {
+                let url = websocket_url.as_deref().expect("matched WebSocket endpoint");
+                validate_websocket_cli_policy(protocol_policy)?;
+                #[cfg(feature = "websocket-experimental")]
+                {
+                    Box::pin(websocket::inspect(
+                        cx,
+                        url,
+                        format,
+                        output.as_deref(),
+                        max_pages,
+                        timeout,
+                    ))
+                    .await
+                }
+                #[cfg(not(feature = "websocket-experimental"))]
+                {
+                    let _ = url;
+                    unreachable!("WebSocket feature admission returned an error")
+                }
+            }
             None if http_url.is_some()
                 || legacy_sse_url.is_some()
                 || legacy_message_url.is_some() =>
@@ -1532,7 +1588,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 .await
             }
             None => Err(fastmcp_core::McpError::invalid_params(
-                "inspect requires a server command or explicit HTTP endpoints",
+                "inspect requires a server command, explicit HTTP endpoints, or --websocket-url",
             )),
         },
         Commands::Install {
@@ -6894,6 +6950,9 @@ async fn cmd_operation(
     let budget = OperationBudget::new(connection.timeout)?;
     budget.remaining(cx)?;
     validate_cli_protocol_policy(connection.protocol_policy)?;
+    if connection.websocket_url.is_some() {
+        validate_websocket_cli_policy(connection.protocol_policy)?;
+    }
     validate_operation_input_policy(connection)?;
     #[cfg(not(unix))]
     if wait {
@@ -6917,9 +6976,13 @@ async fn cmd_operation(
     let has_http = connection.http_url.is_some()
         || connection.legacy_sse_url.is_some()
         || connection.legacy_message_url.is_some();
-    if connection.server.is_some() == has_http {
+    if usize::from(connection.server.is_some())
+        + usize::from(has_http)
+        + usize::from(connection.websocket_url.is_some())
+        != 1
+    {
         return Err(fastmcp_core::McpError::invalid_params(
-            "operation requires either --server or explicit HTTP endpoints",
+            "operation requires exactly one of --server, explicit HTTP endpoints, or --websocket-url",
         ));
     }
     apply_operation_resume(cx, connection, operation.method(), &mut parameters, budget)?;
@@ -6948,6 +7011,25 @@ async fn cmd_operation(
             return Err(fastmcp_core::McpError::invalid_params(
                 "owned stdio operations require Unix process-group cleanup; use explicit HTTP endpoints on this platform",
             ));
+        }
+    } else if let Some(url) = connection.websocket_url.as_deref() {
+        #[cfg(feature = "websocket-experimental")]
+        {
+            Box::pin(websocket::operation(
+                cx,
+                url,
+                connection,
+                operation,
+                parameters,
+                budget,
+                wait,
+            ))
+            .await?
+        }
+        #[cfg(not(feature = "websocket-experimental"))]
+        {
+            let _ = url;
+            unreachable!("WebSocket feature admission returned an error")
         }
     } else {
         Box::pin(http_operation(
@@ -9369,6 +9451,8 @@ async fn inspect_catalogs(
 enum InspectClient<'a> {
     Stdio(&'a mut Client),
     Http(&'a mut fastmcp_client::HttpClient),
+    #[cfg(feature = "websocket-experimental")]
+    WebSocket(&'a mut websocket::Connection),
 }
 
 impl InspectClient<'_> {
@@ -9414,6 +9498,8 @@ impl InspectClient<'_> {
                         ))
                     })
             }
+            #[cfg(feature = "websocket-experimental")]
+            Self::WebSocket(client) => client.page(cx, method, parameters).await,
         }
     }
 }

@@ -33,8 +33,34 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(unix)]
 const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
 static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(unix, feature = "e2e-fixture", feature = "websocket-experimental"))]
+#[path = "support/websocket_cli.rs"]
+mod websocket_cli;
 #[cfg(unix)]
 const STATIC_MCP_SERVER_FIXTURE: &str = include_str!("fixtures/static_mcp_server.sh");
+
+#[cfg(not(feature = "websocket-experimental"))]
+#[test]
+fn websocket_cli_without_feature_refuses_before_contact() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("ws://{}/mcp", listener.local_addr().unwrap());
+    for prefix in [
+        vec!["inspect", "--format", "json"],
+        vec!["call", "echo", "--json"],
+        vec!["read", "test://status", "--json"],
+        vec!["prompt", "greeting", "--json"],
+    ] {
+        let mut arguments = prefix;
+        arguments.extend(["--websocket-url", &endpoint, "--protocol-policy", "modern-only"]);
+        let output = run_cli(&arguments);
+        assert!(!output.status.success());
+        let diagnostics = format!("{}{}", stdout_str(&output), stderr_str(&output));
+        assert!(diagnostics.contains("FeatureUnavailable"), "{diagnostics}");
+        assert!(diagnostics.contains("websocket-experimental"), "{diagnostics}");
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+}
 
 struct TestTempDir {
     path: PathBuf,
