@@ -303,6 +303,16 @@ pub struct GuardedJwtResourceVerifier {
 }
 
 impl GuardedJwtResourceVerifier {
+    #[cfg(feature = "enterprise-auth")]
+    pub(crate) fn issuer(&self) -> &str {
+        self.managed.issuer()
+    }
+
+    #[cfg(feature = "enterprise-auth")]
+    pub(crate) fn resource(&self) -> &str {
+        self.managed.resource()
+    }
+
     #[must_use]
     pub fn new(
         policy: JwtResourcePolicy,

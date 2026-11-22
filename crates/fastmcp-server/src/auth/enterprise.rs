@@ -2,7 +2,7 @@
 //!
 //! An explicit owner admits the two authorization-server metadata overlays.
 //! Each MCP request must independently declare the exact official extension
-//! with empty settings. A provisioned [`JwtResourceVerifier`] still performs
+//! with empty settings. A provisioned or managed JWT verifier still performs
 //! the actual access-token signature, type, issuer, audience and expiry checks;
 //! neither an extension declaration nor metadata is token authority. ID Tokens
 //! and ID-JAGs cannot substitute for an RFC 9068 access token.
@@ -10,8 +10,9 @@
 //! This is the resource-side JWT subset, not an assertion-acquisition, token-
 //! exchange, SAML, built-in issuer or durable-deployment implementation. Metadata
 //! provenance and the match between this configured resource and the listener's
-//! public endpoint remain trusted deployment inputs. Nothing is fetched here,
-//! and no RPC extension descriptor is added to `server/discover`.
+//! public endpoint remain trusted deployment inputs. Guarded key refresh uses
+//! an independently configured trusted source; metadata cannot select it. No
+//! RPC extension descriptor is added to `server/discover`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -29,8 +30,10 @@ use fastmcp_protocol::{
 };
 use serde_json::{Map, Value};
 
-use super::{AuthProvider, AuthRequest, TokenAuthProvider};
-use crate::providers::JwtResourceVerifier;
+use super::{AuthFuture, AuthProvider, AuthRequest, TokenAuthProvider};
+use crate::providers::{
+    GuardedJwtResourceVerifier, JwtResourceVerifier, ManagedJwtResourceVerifier,
+};
 
 /// The official authentication-profile identifier; its settings are exactly `{}`.
 pub const ENTERPRISE_AUTHORIZATION_EXTENSION_ID: &str =
@@ -284,17 +287,60 @@ impl EnterpriseResourcePolicy {
         &self,
         verifier: JwtResourceVerifier,
     ) -> Result<EnterpriseAuthProvider, EnterpriseResourceError> {
-        self.current.check()?;
-        if verifier.issuer() != self.current.configuration.resource_as_issuer
-            || verifier.resource() != self.current.configuration.resource.as_str()
-        {
-            return Err(EnterpriseResourceError::VerifierMismatch);
-        }
+        self.admit_verifier_binding(verifier.issuer(), verifier.resource())?;
         Ok(EnterpriseAuthProvider {
             policy: Arc::downgrade(&self.shared),
             process: self.current.process,
             verifier: TokenAuthProvider::new(verifier),
         })
+    }
+
+    /// Installs a verifier whose administratively managed keys retain their
+    /// original hard expiry and live rotation/revocation guards. The exact
+    /// issuer/resource binding must match this policy. Metadata supplies no
+    /// keys and cannot renew their lifetime.
+    pub fn managed_provider(
+        &self,
+        verifier: ManagedJwtResourceVerifier,
+    ) -> Result<EnterpriseAuthProvider, EnterpriseResourceError> {
+        self.admit_verifier_binding(verifier.issuer(), verifier.resource())?;
+        Ok(EnterpriseAuthProvider {
+            policy: Arc::downgrade(&self.shared),
+            process: self.current.process,
+            verifier: TokenAuthProvider::new(verifier),
+        })
+    }
+
+    /// Installs automatic asynchronous key refresh from an independently
+    /// configured guarded HTTPS source with its own roots, freshness, backoff
+    /// and capacity policy. Request declarations are admitted before any fetch;
+    /// metadata replacement or revocation during refresh prevents final
+    /// authentication. The synchronous path uses installed fresh keys without
+    /// performing I/O.
+    pub fn guarded_provider(
+        &self,
+        verifier: GuardedJwtResourceVerifier,
+    ) -> Result<EnterpriseAuthProvider, EnterpriseResourceError> {
+        self.admit_verifier_binding(verifier.issuer(), verifier.resource())?;
+        Ok(EnterpriseAuthProvider {
+            policy: Arc::downgrade(&self.shared),
+            process: self.current.process,
+            verifier: TokenAuthProvider::new(verifier),
+        })
+    }
+
+    fn admit_verifier_binding(
+        &self,
+        issuer: &str,
+        resource: &str,
+    ) -> Result<(), EnterpriseResourceError> {
+        self.current.check()?;
+        if issuer != self.current.configuration.resource_as_issuer
+            || resource != self.current.configuration.resource.as_str()
+        {
+            return Err(EnterpriseResourceError::VerifierMismatch);
+        }
+        Ok(())
     }
 
     /// Stops new admission and invalidates retained facts without contacting an
@@ -430,6 +476,19 @@ impl AuthProvider for EnterpriseAuthProvider {
         admit_request(request)?;
         let auth = self.verifier.authenticate(ctx, request)?;
         self.finish(&snapshot, auth)
+    }
+
+    fn authenticate_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request: AuthRequest<'a>,
+    ) -> AuthFuture<'a> {
+        Box::pin(async move {
+            let snapshot = self.snapshot()?;
+            admit_request(request)?;
+            let auth = self.verifier.authenticate_async(ctx, request).await?;
+            self.finish(&snapshot, auth)
+        })
     }
 }
 

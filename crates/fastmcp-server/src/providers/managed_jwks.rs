@@ -194,6 +194,16 @@ impl fmt::Debug for ManagedJwtResourceVerifier {
 }
 
 impl ManagedJwtResourceVerifier {
+    #[cfg(feature = "enterprise-auth")]
+    pub(crate) fn issuer(&self) -> &str {
+        self.policy.issuer()
+    }
+
+    #[cfg(feature = "enterprise-auth")]
+    pub(crate) fn resource(&self) -> &str {
+        self.policy.resource()
+    }
+
     /// Creates an empty, enabled owner without I/O or runtime creation.
     pub fn new(policy: JwtResourcePolicy, refresh_policy: JwksRefreshPolicy) -> Self {
         Self::with_clock(policy, refresh_policy, Arc::new(Instant::now))

@@ -315,6 +315,16 @@ pub struct JwtResourcePolicy {
 }
 
 impl JwtResourcePolicy {
+    #[cfg(feature = "enterprise-auth")]
+    pub(crate) fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    #[cfg(feature = "enterprise-auth")]
+    pub(crate) fn resource(&self) -> &str {
+        &self.resource
+    }
+
     /// Requires a nonzero lifetime of at most 24 hours and skew of at most
     /// five minutes, both in whole seconds. Zero skew is allowed. Issuers
     /// cannot contain queries; neither URL may contain userinfo, fragments,

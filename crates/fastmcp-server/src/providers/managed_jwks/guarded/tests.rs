@@ -577,3 +577,367 @@ fn guarded_jwks_configuration_is_bounded_and_debug_redacts_destination() {
     assert!(!debug.contains("provider-private"));
     assert!(!debug.contains("deployment-private"));
 }
+
+#[cfg(feature = "enterprise-auth")]
+mod enterprise {
+    use super::*;
+    use crate::auth::enterprise::{
+        EnterpriseResourceConfiguration, EnterpriseResourceError, EnterpriseResourcePolicy,
+    };
+    use asupersync::Budget;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::time::{TimerDriverHandle, VirtualClock};
+    use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
+    use serde_json::Value;
+    use std::sync::atomic::AtomicBool;
+
+    fn configuration(generation: u64) -> EnterpriseResourceConfiguration {
+        let endpoint = CanonicalHttpUrl::parse("https://tools.example/mcp").unwrap();
+        EnterpriseResourceConfiguration {
+            idp_issuer: "https://idp.example".to_owned(),
+            idp_token_endpoint: "https://idp.example/token".to_owned(),
+            resource_as_issuer: "https://issuer.example".to_owned(),
+            resource_as_token_endpoint: "https://issuer.example/token".to_owned(),
+            resource: CanonicalResourceId::parse_for_endpoint(
+                endpoint.as_str(),
+                &endpoint,
+                CanonicalResourceIdPolicy::default(),
+            )
+            .unwrap(),
+            policy_generation: generation,
+            idp_metadata_generation: generation,
+            resource_as_metadata_generation: generation,
+        }
+    }
+
+    fn documents() -> [Vec<u8>; 2] {
+        [
+            serde_json::to_vec(&json!({
+                "issuer":"https://idp.example",
+                "token_endpoint":"https://idp.example/token",
+                "grant_types_supported":["urn:ietf:params:oauth:grant-type:token-exchange"],
+                "identity_chaining_requested_token_types_supported":["urn:ietf:params:oauth:token-type:id-jag"]
+            }))
+            .unwrap(),
+            serde_json::to_vec(&json!({
+                "issuer":"https://issuer.example",
+                "token_endpoint":"https://issuer.example/token",
+                "authorization_grant_profiles_supported":["urn:ietf:params:oauth:grant-profile:id-jag"],
+                "grant_types_supported":["urn:ietf:params:oauth:grant-type:jwt-bearer"]
+            }))
+            .unwrap(),
+        ]
+    }
+
+    fn owner() -> EnterpriseResourcePolicy {
+        let documents = documents();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        EnterpriseResourcePolicy::new(
+            configuration(1),
+            &documents[0],
+            &documents[1],
+            deadline,
+            deadline,
+        )
+        .unwrap()
+    }
+
+    fn params() -> Value {
+        json!({"_meta":{
+            "io.modelcontextprotocol/protocolVersion":fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities":{"extensions":{
+                "io.modelcontextprotocol/enterprise-managed-authorization":{}
+            }}
+        }})
+    }
+
+    fn request<'a>(params: &'a Value, authorization: &'a str) -> AuthRequest<'a> {
+        AuthRequest {
+            method: "tools/list",
+            params: Some(params),
+            transport_authorization: Some(authorization),
+            request_id: 1,
+        }
+    }
+
+    #[test]
+    fn enterprise_guarded_provider_refreshes_rotates_and_preserves_owner_identity() {
+        let (verifier, script, elapsed) =
+            fixture(vec![Ok(response(jwks("one"))), Ok(response(jwks("two")))]);
+        let owner = owner();
+        let provider = owner.guarded_provider(verifier.clone()).unwrap();
+        let context = ctx();
+        let params = params();
+        let first = format!("Bearer {}", token("one").token);
+        let second = format!("Bearer {}", token("two").token);
+        assert_eq!(
+            provider
+                .authenticate(&context, request(&params, &first))
+                .unwrap_err()
+                .code,
+            crate::auth::AUTH_PROVIDER_UNAVAILABLE_CODE
+        );
+        assert_eq!(script.calls.load(Ordering::SeqCst), 0);
+
+        let first_facts =
+            ready(provider.authenticate_async(&context, request(&params, &first))).unwrap();
+        assert_eq!(first_facts.subject.as_deref(), Some("alice"));
+        assert!(first_facts.verification_is_current());
+        assert_eq!(
+            provider
+                .authenticate(&context, request(&params, &first))
+                .unwrap()
+                .session_owner(),
+            first_facts.session_owner()
+        );
+        assert!(ready(provider.authenticate_async(&context, request(&params, &second))).is_err());
+        assert_eq!(script.calls.load(Ordering::SeqCst), 1);
+
+        elapsed.store(10, Ordering::SeqCst);
+        let second_facts =
+            ready(provider.authenticate_async(&context, request(&params, &second))).unwrap();
+        assert!(!first_facts.verification_is_current());
+        assert!(second_facts.verification_is_current());
+        assert_eq!(second_facts.session_owner(), first_facts.session_owner());
+        assert!(ready(provider.authenticate_async(&context, request(&params, &first))).is_err());
+        assert_eq!(script.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *script.urls.lock().unwrap(),
+            ["issuer.example/keys", "issuer.example/keys"]
+        );
+        owner.revoke();
+        assert!(!second_facts.verification_is_current());
+        assert!(ready(provider.authenticate_async(&context, request(&params, &second))).is_err());
+        assert_eq!(script.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn enterprise_managed_provider_preserves_rotation_and_hard_key_expiry() {
+        let (verifier, script, elapsed) = fixture(vec![]);
+        let managed = verifier.managed.clone();
+        let owner = owner();
+        let provider = owner.managed_provider(managed.clone()).unwrap();
+        let context = ctx();
+        let params = params();
+        let first = format!("Bearer {}", token("one").token);
+        let second = format!("Bearer {}", token("two").token);
+        assert!(ready(provider.authenticate_async(&context, request(&params, &first))).is_err());
+        managed.install_jwks(&jwks("one")).unwrap();
+        let first_facts = provider
+            .authenticate(&context, request(&params, &first))
+            .unwrap();
+        assert_eq!(
+            ready(provider.authenticate_async(&context, request(&params, &first)))
+                .unwrap()
+                .session_owner(),
+            first_facts.session_owner()
+        );
+        managed.install_jwks(&jwks("two")).unwrap();
+        assert!(!first_facts.verification_is_current());
+        let second_facts =
+            ready(provider.authenticate_async(&context, request(&params, &second))).unwrap();
+        assert_eq!(second_facts.session_owner(), first_facts.session_owner());
+        assert!(
+            provider
+                .authenticate(&context, request(&params, &first))
+                .is_err()
+        );
+
+        elapsed.store(20, Ordering::SeqCst);
+        assert!(
+            provider
+                .authenticate(&context, request(&params, &second))
+                .is_err()
+        );
+        assert!(ready(provider.authenticate_async(&context, request(&params, &second))).is_err());
+        managed.revoke_all().unwrap();
+        assert!(!second_facts.verification_is_current());
+        assert_eq!(script.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn enterprise_guarded_provider_rejects_wrong_binding_and_declaration_before_fetch() {
+        let (verifier, script, _) = fixture(vec![Ok(response(jwks("one")))]);
+        let owner = owner();
+        for (issuer, resource) in [
+            ("https://other-issuer.example", "https://tools.example/mcp"),
+            ("https://issuer.example", "https://other-tools.example/mcp"),
+        ] {
+            let policy =
+                JwtResourcePolicy::new(issuer, resource, Duration::from_secs(3600), Duration::ZERO)
+                    .unwrap();
+            assert_eq!(
+                owner
+                    .managed_provider(ManagedJwtResourceVerifier::new(
+                        policy.clone(),
+                        JwksRefreshPolicy::default(),
+                    ))
+                    .unwrap_err(),
+                EnterpriseResourceError::VerifierMismatch
+            );
+            assert_eq!(
+                owner
+                    .guarded_provider(GuardedJwtResourceVerifier::new(
+                        policy,
+                        JwksRefreshPolicy::default(),
+                        verifier.source.clone(),
+                    ))
+                    .unwrap_err(),
+                EnterpriseResourceError::VerifierMismatch
+            );
+        }
+        let provider = owner.guarded_provider(verifier).unwrap();
+        let context = ctx();
+        let authorization = format!("Bearer {}", token("one").token);
+        let valid = params();
+        for case in 0..6 {
+            let mut invalid = valid.clone();
+            match case {
+                1 => invalid = json!({}),
+                2 => {
+                    invalid["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"] =
+                        json!({});
+                }
+                3 => {
+                    invalid["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                        ["io.modelcontextprotocol/enterprise-managed-authorization"] =
+                        json!({"enabled":true});
+                }
+                4 => {
+                    invalid["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+                        json!("2025-11-25");
+                }
+                _ => {}
+            }
+            let mut request = request(&invalid, &authorization);
+            if case == 0 {
+                request.params = None;
+            } else if case == 5 {
+                request.transport_authorization = None;
+            }
+            assert!(ready(provider.authenticate_async(&context, request)).is_err());
+            assert_eq!(script.calls.load(Ordering::SeqCst), 0);
+        }
+        assert!(
+            ready(provider.authenticate_async(&context, request(&valid, &authorization))).is_ok()
+        );
+        assert_eq!(script.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct DelayedExchange {
+        released: AtomicBool,
+        calls: AtomicUsize,
+        waker: Mutex<Option<Waker>>,
+    }
+
+    impl DelayedExchange {
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+    }
+
+    impl Exchange for DelayedExchange {
+        fn get<'a>(
+            &'a self,
+            _: &'a McpContext,
+            _: &'a GuardedHttpsUrl,
+        ) -> Pin<Box<dyn Future<Output = McpResult<GuardedHttpFetchResponse>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                poll_fn(|task| {
+                    let mut waker = self.waker.lock().unwrap();
+                    if self.released.load(Ordering::SeqCst) {
+                        Poll::Ready(Ok(response(jwks("one"))))
+                    } else {
+                        *waker = Some(task.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await
+            })
+        }
+    }
+
+    #[test]
+    fn enterprise_guarded_provider_rechecks_policy_after_suspended_refresh() {
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(clock);
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+        runtime.block_on(async {
+            let _ambient = Cx::set_current(None);
+            let context = McpContext::new(caller.clone(), 1);
+            for change in ["replace", "revoke", "drop"] {
+                let (mut verifier, _, _) = fixture(vec![]);
+                let delayed = Arc::new(DelayedExchange {
+                    released: AtomicBool::new(false),
+                    calls: AtomicUsize::new(0),
+                    waker: Mutex::new(None),
+                });
+                verifier.source.test_exchange = Some(delayed.clone());
+                let mut owner = Some(owner());
+                let provider = owner
+                    .as_ref()
+                    .unwrap()
+                    .guarded_provider(verifier.clone())
+                    .unwrap();
+                let params = params();
+                let authorization = format!("Bearer {}", token("one").token);
+                let mut authentication =
+                    provider.authenticate_async(&context, request(&params, &authorization));
+                let mut task = Context::from_waker(Waker::noop());
+                assert!(authentication.as_mut().poll(&mut task).is_pending());
+                assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(verifier.source.admission.active.lock().unwrap().len(), 1);
+                assert_eq!(timer.pending_count(), 1);
+
+                match change {
+                    "replace" => {
+                        let documents = documents();
+                        let deadline = Instant::now() + Duration::from_secs(120);
+                        owner
+                            .as_mut()
+                            .unwrap()
+                            .replace(
+                                configuration(2),
+                                &documents[0],
+                                &documents[1],
+                                deadline,
+                                deadline,
+                            )
+                            .unwrap();
+                    }
+                    "revoke" => owner.as_ref().unwrap().revoke(),
+                    _ => drop(owner.take()),
+                }
+                delayed.release();
+                match authentication.as_mut().poll(&mut task) {
+                    Poll::Ready(Err(error)) => {
+                        assert_eq!(error.code, McpErrorCode::ResourceForbidden)
+                    }
+                    _ => {
+                        panic!("policy changed during fetch but authentication did not fail closed")
+                    }
+                }
+                drop(authentication);
+                assert!(verifier.source.admission.active.lock().unwrap().is_empty());
+                assert_eq!(timer.pending_count(), 0);
+                let next =
+                    ready(provider.authenticate_async(&context, request(&params, &authorization)));
+                assert_eq!(next.is_ok(), change == "replace");
+                assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+            }
+        });
+        assert_eq!(timer.pending_count(), 0);
+        drop(caller);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+}
