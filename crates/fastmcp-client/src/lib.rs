@@ -15277,6 +15277,10 @@ impl FinalTaskWatch<'_, '_> {
     /// cancelled reconciliation closes this watch and preserves its previous
     /// snapshot. Dropping the reconciliation future also closes this watch;
     /// a later attempt must explicitly poll or open a new watch.
+    ///
+    /// Exact repeated snapshots yield to the caller's executor before reading
+    /// another event, so a ready stream cannot starve cancellation or sibling
+    /// work while this operation waits for a changed snapshot.
     pub async fn next_event(
         &mut self,
         cx: &Cx,
@@ -15336,6 +15340,11 @@ impl FinalTaskWatch<'_, '_> {
                         .handle
                         .snapshot_is_identical(&notification.params.task)?
                     {
+                        // One body frame may contain many identical snapshots,
+                        // and a peer can keep subsequent frames ready. Discarding
+                        // them must still return control to the caller's executor
+                        // so sibling cancellation and deadlines can run.
+                        asupersync::runtime::yield_now().await;
                         continue;
                     }
                     if self

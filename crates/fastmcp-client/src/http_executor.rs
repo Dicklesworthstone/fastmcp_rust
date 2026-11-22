@@ -20309,6 +20309,254 @@ mod tests {
         server.join().expect("final core listener peer joins");
     }
 
+    #[cfg(feature = "tasks")]
+    fn assert_ready_task_watch_is_cooperative(stop: Option<CancelKind>) {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::{Budget, Time};
+
+        use super::{FinalTask, FinalTaskId};
+        use crate::{FinalTaskWatchEvent, HttpClient, HttpClientError};
+
+        // Drive the production futures without advancing their virtual clock.
+        // The wall-clock bound catches fixture stalls without a sleeping race.
+        fn poll_to_ready<F: std::future::Future>(future: F) -> F::Output {
+            let mut future = std::pin::pin!(future);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut task = Context::from_waker(Waker::noop());
+            loop {
+                if let Poll::Ready(result) = future.as_mut().poll(&mut task) {
+                    return result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "ready Task watcher fixture stalled"
+                );
+                thread::yield_now();
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let working = serde_json::json!({
+            "taskId": "task-ready",
+            "status": "working",
+            "createdAt": "2026-07-28T12:00:00Z",
+            "lastUpdatedAt": "2026-07-28T12:00:00Z",
+            "ttlMs": null
+        });
+        let peer_task = working.clone();
+        let server = thread::spawn(move || {
+            let mut probe = accept_notification_test_peer(&listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut probe).body).unwrap();
+            assert_eq!(request["method"], "server/discover");
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                &modern_tasks_discovery_body(),
+            );
+
+            let respond_to_get = |id| {
+                let mut get = accept_notification_test_peer(&listener);
+                let request: serde_json::Value =
+                    serde_json::from_slice(&read_request(&mut get).body).unwrap();
+                assert_eq!(request["id"], id);
+                assert_eq!(request["method"], "tasks/get");
+                assert_eq!(request["params"]["taskId"], "task-ready");
+                let mut result = peer_task.clone();
+                result["resultType"] = serde_json::json!("complete");
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": result
+                }))
+                .unwrap();
+                write_response(&mut get, 200, "application/json", &body);
+            };
+            respond_to_get(2);
+            let mut stream = accept_notification_test_peer(&listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["method"], "subscriptions/listen");
+            assert_eq!(
+                request["params"]["notifications"]["taskIds"],
+                serde_json::json!(["task-ready"])
+            );
+            begin_chunked_sse(&mut stream);
+            assert_sse_peer_closed(&mut stream);
+            // No implicit poll, reconnect, or remote Task cancellation may
+            // consume this ID before the caller explicitly reuses the client.
+            respond_to_get(4);
+        });
+
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(clock.clone());
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer)
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(Budget::INFINITE);
+        let interrupted = stop.is_some();
+        let expires = matches!(stop, Some(CancelKind::Deadline));
+        let observer = runtime.request_cx_with_budget(if expires {
+            Budget::INFINITE.with_deadline(Time::from_nanos(100_000_000))
+        } else {
+            Budget::INFINITE
+        });
+        let mut client = poll_to_ready(HttpClient::connect(
+            &healthy,
+            plan(
+                &target,
+                "http://127.0.0.1:9/unused-sse",
+                "http://127.0.0.1:9/unused-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "ready-task-watch-client".to_owned(),
+                version: "1".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .unwrap();
+        let task_id = FinalTaskId::parse("task-ready").unwrap();
+        let mut handle =
+            poll_to_ready(client.attach_final_task(&healthy, task_id.clone())).unwrap();
+        let before = serde_json::to_vec(handle.task()).unwrap();
+        let mut watch = poll_to_ready(handle.watch(
+            &healthy,
+            &mut client,
+            SseLimits::new(2_048, 8_192, 8).unwrap(),
+        ))
+        .unwrap();
+
+        let acknowledgement = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {
+                "_meta": {"io.modelcontextprotocol/subscriptionId": 3},
+                "notifications": {"taskIds": ["task-ready"]}
+            }
+        });
+        let mut duplicate = working;
+        duplicate["_meta"] = serde_json::json!({"io.modelcontextprotocol/subscriptionId": 3});
+        let mut terminal = duplicate.clone();
+        terminal["status"] = serde_json::json!("cancelled");
+        terminal["lastUpdatedAt"] = serde_json::json!("2026-07-28T12:00:01Z");
+        let notification = |params| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/tasks", "params": params
+            })
+            .to_string()
+        };
+        let mut payloads = vec![acknowledgement.to_string()];
+        payloads.extend(std::iter::repeat_n(notification(duplicate), 16));
+        payloads.push(notification(terminal));
+        // TCP may split an HTTP chunk into several body frames. Inject one
+        // exact frame through the production parser, as the pending-event
+        // boundary tests do, so every duplicate and terminal is already ready.
+        watch
+            .listener
+            .as_mut()
+            .unwrap()
+            .stream
+            .push_body_frame(one_frame_sse_body(&payloads).as_bytes())
+            .unwrap();
+        assert!(matches!(
+            poll_to_ready(watch.next_event(&observer)).unwrap(),
+            Some(FinalTaskWatchEvent::Acknowledged { .. })
+        ));
+
+        let wake = Arc::new(CountingWake::default());
+        let waker = Waker::from(wake.clone());
+        let mut next = Box::pin(watch.next_event(&observer));
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending(),
+            "a ready duplicate burst must yield before the queued terminal"
+        );
+        assert!(
+            wake.0.load(Ordering::SeqCst) > 0,
+            "the yielded watch must wake its caller"
+        );
+
+        // This is the sibling's turn. It must be possible while the same
+        // next_event future still has a fully buffered, readable response.
+        if expires {
+            clock.advance(100_000_000);
+        } else if let Some(kind) = stop {
+            observer.cancel_with(kind, Some("sibling cancelled Task observation"));
+        }
+        let result = poll_to_ready(next);
+        if interrupted {
+            if expires {
+                assert!(matches!(
+                    result,
+                    Err(HttpClientError::Connection(
+                        ClientHttpConnectionError::SubscriptionsListen(
+                            ModernHttpSubscriptionListenError::Executor(
+                                ModernHttpExecutorError::Transport(
+                                    asupersync::http::h1::ClientError::DeadlineExceeded
+                                )
+                            )
+                        )
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(HttpClientError::Connection(
+                        ClientHttpConnectionError::SubscriptionsListen(
+                            ModernHttpSubscriptionListenError::CallerCancelled {
+                                request_id: RequestId::Number(3)
+                            }
+                        )
+                    ))
+                ));
+            }
+            assert_eq!(serde_json::to_vec(watch.handle.task()).unwrap(), before);
+        } else {
+            assert!(matches!(
+                result,
+                Ok(Some(FinalTaskWatchEvent::TaskUpdated(ref notification)))
+                    if matches!(&notification.params.task, FinalTask::Cancelled(_))
+            ));
+            assert!(matches!(watch.handle.task(), FinalTask::Cancelled(_)));
+        }
+        assert!(
+            watch.listener.is_none(),
+            "completion releases the owned stream"
+        );
+        assert!(poll_to_ready(watch.next_event(&healthy)).unwrap().is_none());
+        drop(watch);
+        assert!(healthy.checkpoint().is_ok());
+        assert_eq!(client.next_id.load(Ordering::Relaxed), 4);
+        let reused = poll_to_ready(client.attach_final_task(&healthy, task_id)).unwrap();
+        assert!(matches!(reused.task(), FinalTask::Working(_)));
+        assert_eq!(client.next_id.load(Ordering::Relaxed), 5);
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_task_watch_ready_duplicates_yield_then_deliver_terminal() {
+        assert_ready_task_watch_is_cooperative(None);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_task_watch_ready_duplicates_allow_caller_cancellation() {
+        assert_ready_task_watch_is_cooperative(Some(CancelKind::User));
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_task_watch_ready_duplicates_allow_caller_deadline() {
+        assert_ready_task_watch_is_cooperative(Some(CancelKind::Deadline));
+    }
+
     fn read_one_frame_final_progress(
         payloads: Vec<String>,
         limits: SseLimits,
