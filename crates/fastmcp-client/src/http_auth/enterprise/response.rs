@@ -828,8 +828,8 @@ impl EnterpriseBoundAccessToken {
         use super::http::EnterpriseHttpPolicyError;
 
         policy.admit(&self.profile)?;
-        let (credential, reservation) = self
-            .into_bearer_and_guard(now_monotonic, received_at_wall)
+        let credential = self
+            .into_guarded_bearer_credential(now_monotonic, received_at_wall)
             .map_err(|_| EnterpriseHttpPolicyError::CredentialUnavailable)?;
         let mut credential = credential
             .for_owner(policy.cancellation())
@@ -841,9 +841,6 @@ impl EnterpriseBoundAccessToken {
                 .min(policy.metadata_valid_until()),
         );
         credential.enterprise_request_binding = true;
-        credential.enterprise_exchange_guard = Some(Arc::new(
-            super::http::EnterpriseHttpGrantGuard::new(reservation),
-        ));
         if credential.is_revoked()
             || credential
                 .expires_at
@@ -857,21 +854,23 @@ impl EnterpriseBoundAccessToken {
     /// Consumes this grant and binds it strictly to its exact HTTPS MCP resource
     /// with a monotonic deadline no later than the original response's deadline.
     /// A stale wall-clock sample cannot extend the grant or reset its lifetime.
+    /// The exchange's process and restore guard stays attached to this credential
+    /// and every clone, so later quarantine withholds future authorization headers.
+    /// Use [`Self::into_http_credential`] to also bind the deployment policy and
+    /// the request-local enterprise declaration.
     pub fn into_bound_bearer_credential(
         self,
         now_monotonic: Instant,
         received_at_wall: SystemTime,
     ) -> Result<BoundBearerCredential, EnterpriseExchangeError> {
-        self.into_bearer_and_guard(now_monotonic, received_at_wall)
-            .map(|(credential, _)| credential)
+        self.into_guarded_bearer_credential(now_monotonic, received_at_wall)
     }
 
-    fn into_bearer_and_guard(
+    fn into_guarded_bearer_credential(
         self,
         now_monotonic: Instant,
         received_at_wall: SystemTime,
-    ) -> Result<(BoundBearerCredential, IdentityAssertionExchangeGuard), EnterpriseExchangeError>
-    {
+    ) -> Result<BoundBearerCredential, EnterpriseExchangeError> {
         self.reservation.check().map_err(map_reservation_error)?;
         if received_at_wall < self.received_at || Instant::now() >= self.expires_at_monotonic {
             return Err(EnterpriseExchangeError::CredentialBindingFailed);
@@ -890,13 +889,19 @@ impl EnterpriseBoundAccessToken {
             .min(self.expires_at_monotonic);
         let resource = CanonicalHttpUrl::parse(self.response.resource())
             .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)?;
-        let credential = BoundBearerCredential::bind_with_expiry(
+        let mut credential = BoundBearerCredential::bind_with_expiry(
             resource,
             self.response.access_token.as_str(),
             deadline,
         )
         .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)?;
-        Ok((credential, self.reservation))
+        // Every public conversion retains the same sealed lineage. Attaching
+        // this only in the policy-owned path lets the lower-level conversion
+        // shed a later process/restore invalidation before cloning or dispatch.
+        credential.enterprise_exchange_guard = Some(Arc::new(
+            super::http::EnterpriseHttpGrantGuard::new(self.reservation),
+        ));
+        Ok(credential)
     }
 }
 

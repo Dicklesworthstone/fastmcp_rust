@@ -287,6 +287,19 @@ impl BoundBearerCredential {
         }
     }
 
+    /// Raw requests must retain every live enterprise authority, even when the
+    /// caller selected the lower-level conversion without an MCP policy owner.
+    pub(crate) fn requires_live_authorization(&self) -> bool {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+        {
+            self.enterprise_request_binding || self.enterprise_exchange_guard.is_some()
+        }
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "enterprise-auth")))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn authorization_for_http_request(
         &self,
         target: &CanonicalHttpUrl,

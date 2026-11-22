@@ -456,8 +456,8 @@ pub struct ModernHttpRequest {
     request_routing_headers: bool,
 }
 
-/// Retains an enterprise policy lease instead of freezing its bearer header
-/// when a caller prepares a raw request. Cloned requests share that lease;
+/// Retains enterprise policy and exchange authority instead of freezing a bearer
+/// header when a caller prepares a raw request. Cloned requests share that lease;
 /// equality denotes the same credential owner, not equal secret bytes.
 #[derive(Clone)]
 struct AttachedBearerCredential(Arc<crate::http_auth::BoundBearerCredential>);
@@ -588,15 +588,16 @@ impl ModernHttpRequest {
     /// and only when — this request's target is canonically identical to the credential's
     /// bound HTTPS resource. Any other target leaves the request
     /// credential-free rather than downgrading or redirecting the token.
-    /// Enterprise-policy credentials retain a live lease here: each header
-    /// construction checks the current policy and exact encoded declaration.
-    /// Native dispatch refuses a withheld enterprise credential before contact.
+    /// Enterprise credentials retain a live lease here: each header construction
+    /// checks the exchange's process/restore guard and, when configured, the
+    /// current policy and exact encoded declaration. Native dispatch refuses an
+    /// unavailable enterprise credential before contact.
     #[must_use]
     pub fn with_authorization(
         mut self,
         credential: &crate::http_auth::BoundBearerCredential,
     ) -> Self {
-        if credential.requires_enterprise_declaration() {
+        if credential.requires_live_authorization() {
             self.authorization = None;
             self.attached_credential = Some(AttachedBearerCredential(Arc::new(credential.clone())));
         } else {
@@ -8496,8 +8497,10 @@ async fn read_typed_http_jsonrpc_response(
 }
 
 impl ModernHttpClient {
-    /// Checks current authority before high-level metadata synthesis or a
-    /// typed-result cache lookup can hide a caller's invalid declaration.
+    /// Checks live enterprise authority before high-level metadata synthesis or
+    /// a typed-result cache lookup. Only policy-owned credentials also require
+    /// an exact caller declaration; lower-level exchange credentials retain
+    /// their process and restore guard without acquiring that requirement.
     #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
     pub(crate) fn admit_enterprise_parameters(
         &self,
@@ -8507,7 +8510,7 @@ impl ModernHttpClient {
             .executor
             .bearer_credential
             .as_deref()
-            .filter(|credential| credential.requires_enterprise_declaration())
+            .filter(|credential| credential.requires_live_authorization())
         {
             if credential.is_revoked()
                 || credential
@@ -8518,7 +8521,9 @@ impl ModernHttpClient {
                     ModernHttpExecutorError::CredentialUnavailable,
                 ));
             }
-            if !crate::http_auth::enterprise::http::admits_caller_parameters(parameters) {
+            if credential.requires_enterprise_declaration()
+                && !crate::http_auth::enterprise::http::admits_caller_parameters(parameters)
+            {
                 return Err(ModernHttpClientError::Executor(
                     ModernHttpExecutorError::InvalidRequestMetadata,
                 ));

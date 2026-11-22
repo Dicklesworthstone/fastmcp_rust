@@ -2644,6 +2644,162 @@ async fn final_token_and_replay_for_http_binding(
     (success(outcome), replay)
 }
 
+/// Retains the real exchange guard while a local TLS test exercises HTTP and
+/// cache admission. The scripted signed exchange still targets `mcp.example`;
+/// only the already-converted credential's test endpoint is localized here.
+/// This fixture does not claim that the IdP exchange ran against the TLS peer.
+pub(in crate::http_auth) struct HttpExchangeCredentialFixture {
+    credential: BoundBearerCredential,
+    replay: ExchangeReplayFixture,
+}
+
+impl HttpExchangeCredentialFixture {
+    pub(in crate::http_auth) fn credential(&self) -> BoundBearerCredential {
+        self.credential.clone()
+    }
+
+    pub(in crate::http_auth) async fn quarantine(&self, cx: &Cx) {
+        self.replay.quarantine(cx).await;
+    }
+}
+
+pub(in crate::http_auth) async fn http_exchange_credential_for_test(
+    cx: &Cx,
+    resource: &CanonicalHttpUrl,
+) -> HttpExchangeCredentialFixture {
+    let (token, replay) = final_token_and_replay_for_http_binding(cx, &profile(&["read"])).await;
+    let mut credential = token
+        .into_bound_bearer_credential(Instant::now(), now())
+        .unwrap();
+    credential.resource = resource.clone();
+    assert!(!credential.requires_enterprise_declaration());
+    HttpExchangeCredentialFixture { credential, replay }
+}
+
+#[test]
+fn enterprise_exchange_bearer_conversion_retains_restore_fence_across_clones() {
+    use crate::http_executor::{ModernHttpExecutor, ModernHttpExecutorError};
+
+    let selected = profile(&["read"]);
+    let resource = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
+    let other_resource = CanonicalHttpUrl::parse("https://other.example/mcp").unwrap();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let (token, replay) = final_token_and_replay_for_http_binding(&cx, &selected).await;
+        let original = token
+            .into_bound_bearer_credential(Instant::now(), now())
+            .unwrap();
+        let sibling = original.clone();
+        let owner = fastmcp_core::McpRequestCancellation::new();
+        let owned = original.for_owner(&owner).unwrap();
+        let prepared = enterprise_raw_request(
+            resource.as_str(),
+            enterprise_http_request_body(json!({})),
+            &original,
+        );
+        let prepared_clone = prepared.clone();
+        drop(original);
+
+        let (other_token, other_replay) =
+            final_token_and_replay_for_http_binding(&cx, &selected).await;
+        let independent = other_token
+            .into_bound_bearer_credential(Instant::now(), now())
+            .unwrap();
+        for credential in [&sibling, &owned, &independent] {
+            assert!(!credential.is_revoked());
+            assert_eq!(
+                credential.authorization_for_target(&resource).as_deref(),
+                Some("Bearer final-opaque-token")
+            );
+            assert!(
+                credential
+                    .authorization_for_target(&other_resource)
+                    .is_none()
+            );
+        }
+        assert!(
+            prepared.headers().iter().any(
+                |(name, value)| name == "Authorization" && value == "Bearer final-opaque-token"
+            )
+        );
+
+        // Change only the original reservation's restore state after conversion.
+        // Dropping the original credential must not detach any surviving lease.
+        replay.quarantine(&cx).await;
+        for credential in [&sibling, &owned] {
+            assert!(credential.is_revoked());
+            assert!(credential.authorization_for_target(&resource).is_none());
+            assert!(!format!("{credential:?}").contains("final-opaque-token"));
+        }
+        for request in [&prepared, &prepared_clone] {
+            assert!(
+                !request
+                    .headers()
+                    .iter()
+                    .any(|(name, _)| name == "Authorization")
+            );
+            assert!(matches!(
+                ModernHttpExecutor::new().execute(&cx, request).await,
+                Err(ModernHttpExecutorError::CredentialUnavailable)
+            ));
+        }
+        let cloned_after_quarantine = sibling.clone();
+        let owned_after_quarantine = sibling
+            .for_owner(&fastmcp_core::McpRequestCancellation::new())
+            .unwrap();
+        for credential in [&cloned_after_quarantine, &owned_after_quarantine] {
+            assert!(credential.is_revoked());
+            assert!(credential.authorization_for_target(&resource).is_none());
+        }
+        assert!(!independent.is_revoked());
+        assert_eq!(
+            independent.authorization_for_target(&resource).as_deref(),
+            Some("Bearer final-opaque-token")
+        );
+        assert_eq!(replay.reserved_aliases(), 2);
+        assert_eq!(other_replay.reserved_aliases(), 2);
+    });
+}
+
+#[test]
+fn enterprise_exchange_bearer_conversion_preserves_owner_isolation_and_redaction() {
+    let selected = profile(&["read"]);
+    let resource = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let (token, replay) = final_token_and_replay_for_http_binding(&cx, &selected).await;
+        assert!(!format!("{token:?}").contains("final-opaque-token"));
+        let credential = token
+            .into_bound_bearer_credential(Instant::now(), now())
+            .unwrap();
+        let owner = fastmcp_core::McpRequestCancellation::new();
+        let owned = credential.for_owner(&owner).unwrap();
+        let owned_clone = owned.clone();
+        assert!(owned.for_owner(&owner).is_none());
+        for lease in [&credential, &owned, &owned_clone] {
+            assert_eq!(
+                lease.authorization_for_target(&resource).as_deref(),
+                Some("Bearer final-opaque-token")
+            );
+            assert!(!format!("{lease:?}").contains("final-opaque-token"));
+        }
+
+        owner.cancel();
+        for lease in [&owned, &owned_clone] {
+            assert!(lease.is_revoked());
+            assert!(lease.authorization_for_target(&resource).is_none());
+        }
+        assert!(!credential.is_revoked());
+        assert_eq!(
+            credential.authorization_for_target(&resource).as_deref(),
+            Some("Bearer final-opaque-token")
+        );
+        credential.revoke();
+        assert!(credential.authorization_for_target(&resource).is_none());
+        assert_eq!(replay.reserved_aliases(), 2);
+    });
+}
+
 #[test]
 fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines() {
     use super::super::http::{EnterpriseHttpPolicy, EnterpriseHttpPolicyError};

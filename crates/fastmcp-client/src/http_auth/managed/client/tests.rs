@@ -524,6 +524,98 @@ fn enterprise_http_public_builder_stamps_every_request_and_observes_owner_revoca
     });
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+#[test]
+fn enterprise_exchange_bearer_conversion_fences_public_http_cache_after_quarantine() {
+    use crate::HttpClientError;
+    use crate::http_auth::enterprise::http::ENTERPRISE_AUTHORIZATION_EXTENSION_ID;
+    use crate::http_auth::enterprise::response::tests::http_exchange_credential_for_test;
+    use crate::http_executor::{
+        ClientHttpConnectionError, ModernHttpClientError, ModernHttpExecutorError,
+    };
+
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let primary = http_exchange_credential_for_test(&cx, &peer.resource()).await;
+        let independent = http_exchange_credential_for_test(&cx, &peer.resource()).await;
+        let mut clients = Vec::new();
+
+        for (fixture, name) in [(&primary, "primary"), (&independent, "independent")] {
+            let (client, ()) = Box::pin(pair(
+                peer.client_builder()
+                    .http_bearer_credential(fixture.credential())
+                    .connect_http_client_with_cx(&cx),
+                async {
+                    let (mut stream, request, _) = peer
+                        .mcp_request("server/discover", "final-opaque-token")
+                        .await;
+                    assert!(
+                        request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                            ["extensions"]
+                            .get(ENTERPRISE_AUTHORIZATION_EXTENSION_ID)
+                            .is_none(),
+                        "the lower-level grant must not acquire a policy-owned declaration"
+                    );
+                    reply(
+                        &mut stream,
+                        200,
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":discovery()}),
+                    )
+                    .await;
+                },
+            ))
+            .await;
+            let mut client = client.unwrap();
+            let (listed, ()) = Box::pin(pair(
+                client.list_tools(&cx, None),
+                peer.catalog("final-opaque-token", name),
+            ))
+            .await;
+            assert_catalog(listed.unwrap(), name);
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_catalog(client.list_tools(&cx, None).await.unwrap(), name);
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            clients.push(client);
+        }
+        peer.no_more(&cx).await;
+
+        primary.quarantine(&cx).await;
+        let refused = clients[0].list_tools(&cx, None).await.unwrap_err();
+        assert!(matches!(
+            refused,
+            HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                ModernHttpClientError::Executor(ModernHttpExecutorError::CredentialUnavailable)
+            ))
+        ));
+        assert_eq!(
+            clients[0].final_result_cache_stats().hits,
+            1,
+            "restore quarantine must be checked before a warm result is returned"
+        );
+
+        assert_catalog(
+            clients[1].list_tools(&cx, None).await.unwrap(),
+            "independent",
+        );
+        assert_eq!(clients[1].final_result_cache_stats().hits, 2);
+        let (resources, ()) = Box::pin(pair(clients[1].list_resources(&cx, None), async {
+            peer.mcp(
+                "resources/list",
+                "final-opaque-token",
+                json!({"resultType":"complete","resources":[],"ttlMs":0,"cacheScope":"private"}),
+            )
+            .await;
+        }))
+        .await;
+        assert!(
+            resources.is_ok(),
+            "the independent grant must still authorize a fresh POST"
+        );
+        peer.no_more(&cx).await;
+    });
+}
+
 fn managed_extension_builder(peer: &Peer) -> (ExtensionId, ClientBuilder, Arc<AtomicUsize>) {
     let id = ExtensionId::parse("com.example/raw").unwrap();
     let descriptor = ExtensionDescriptor {
