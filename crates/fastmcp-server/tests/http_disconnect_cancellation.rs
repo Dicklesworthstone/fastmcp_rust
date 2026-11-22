@@ -2,8 +2,8 @@
 //!
 //! These tests use the shipped secured listener, Bearer admission and blocking
 //! dispatch on a caller-owned runtime. No mock transport or client library can
-//! synthesize cancellation. The FIN-only case also pins the native listener's
-//! policy: write-half-closing before the response is complete abandons a request.
+//! synthesize cancellation. A reset abandons a response; clean FIN only closes
+//! request ingress, preserving the response on the still-open receive half.
 #![recursion_limit = "256"]
 
 use std::io::{Read, Write};
@@ -287,8 +287,9 @@ fn assert_success(mut peer: TcpStream, name: &str) {
     assert!(!response.contains("\"error\":"), "{response}");
 }
 
+#[cfg(unix)]
 #[test]
-fn raw_tcp_drop_cancels_sync_handler_before_deadline_and_preserves_sibling() {
+fn raw_tcp_reset_cancels_sync_handler_before_deadline_and_preserves_sibling() {
     for scoped in [false, true] {
         for accept in ACCEPTS {
             let server = RunningServer::start(scoped);
@@ -299,6 +300,10 @@ fn raw_tcp_drop_cancels_sync_handler_before_deadline_and_preserves_sibling() {
             assert!(!context.is_cancelled());
             assert!(!sibling.is_cancelled());
             let disconnected = Instant::now();
+            // An ordinary socket drop can send the same FIN as a legal
+            // request write-half-close. Use an actual abortive close to prove
+            // response abandonment without changing the HTTP half-close rule.
+            rustix::net::sockopt::set_socket_linger(&peer, Some(Duration::ZERO)).unwrap();
             drop(peer); // Actual socket drop, not an injected cancellation/error.
             wait_for("handler observing peer disconnect", || {
                 server.lost.observed_cancel.load(Ordering::Acquire)
@@ -333,23 +338,40 @@ fn raw_tcp_drop_cancels_sync_handler_before_deadline_and_preserves_sibling() {
 }
 
 #[test]
-fn raw_tcp_fin_without_reset_cancels_pending_sync_work() {
-    for accept in ACCEPTS {
-        let server = RunningServer::start(false);
-        let peer = server.request(LOST, accept);
-        let context = entered(&server.lost);
-        assert!(!context.is_cancelled());
-        // Keep the receive half alive: the kernel must deliver FIN/EOF rather
-        // than a reset caused by closing a socket with unread response bytes.
-        peer.shutdown(Shutdown::Write).unwrap();
-        wait_for("handler observing FIN", || {
-            server.lost.observed_cancel.load(Ordering::Acquire)
-        });
-        assert!(context.is_cancelled());
-        assert!(context.request_cancellation().is_cancel_requested());
-        assert!(!server.lost.watchdog_expired.load(Ordering::Acquire));
-        server.assert_listener_live();
-        drop(peer);
+fn raw_tcp_fin_preserves_pending_sync_work_and_response() {
+    for scoped in [false, true] {
+        for accept in ACCEPTS {
+            let server = RunningServer::start(scoped);
+            let peer = server.request(LOST, accept);
+            // Keep the receive half alive and deliver FIN before releasing any
+            // handler. The peer is still entitled to its complete response.
+            peer.shutdown(Shutdown::Write).unwrap();
+            let context = entered(&server.lost);
+            let sibling_peer = server.request(SURVIVOR, accept);
+            let sibling = entered(&server.survivor);
+            assert!(!context.is_cancelled());
+            assert!(!sibling.is_cancelled());
+
+            // Keep the half-closed request pending while another connection
+            // runs through the same listener and publishes its full response.
+            server.survivor.release.store(true, Ordering::Release);
+            assert_success(sibling_peer, SURVIVOR);
+            assert!(!context.is_cancelled());
+            assert!(!server.lost.exited.load(Ordering::Acquire));
+            assert!(!server.lost.observed_cancel.load(Ordering::Acquire));
+            assert!(!server.lost.watchdog_expired.load(Ordering::Acquire));
+            server.assert_listener_live();
+
+            server.lost.release.store(true, Ordering::Release);
+            assert_success(peer, LOST);
+            assert!(context.request_cancellation().is_finalizing());
+            assert!(!context.request_cancellation().is_cancel_requested());
+            assert!(sibling.request_cancellation().is_finalizing());
+            assert!(!sibling.request_cancellation().is_cancel_requested());
+            assert!(!server.lost.observed_cancel.load(Ordering::Acquire));
+            assert!(!server.lost.watchdog_expired.load(Ordering::Acquire));
+            server.assert_listener_live();
+        }
     }
 }
 
