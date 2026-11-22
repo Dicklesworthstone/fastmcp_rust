@@ -106,6 +106,8 @@ pub use stats::{
     OperatorHttpConnections, OperatorLifecycle, OperatorOutputCapacity, OperatorOutputCounters,
     OperatorProfile, OperatorReadiness, OperatorReason, OperatorRequestCapacity, OperatorSnapshot,
     OperatorSnapshotError, OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot,
+    OperatorTaskExecution, OperatorTaskRetention, OperatorTaskSnapshot, OperatorTaskStates,
+    OperatorTaskStorage, OperatorTaskStore,
 };
 
 /// Immutable protocol-limit snapshots and cumulative logical-exchange admission.

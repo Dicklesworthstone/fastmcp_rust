@@ -81,6 +81,11 @@ use fastmcp_core::crypto::Sha256Digest;
 use fastmcp_core::logging::{debug, info, targets, warn};
 use fastmcp_core::runtime::{CallerContextFuture, ProcessGeneration, ProcessGenerationGuard};
 use fastmcp_core::{McpContext, McpError, McpResult, draw_security_identifier};
+use fastmcp_core::{
+    OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource, OperatorTaskExecution,
+    OperatorTaskRetention, OperatorTaskSnapshot, OperatorTaskStates, OperatorTaskStorage,
+    OperatorTaskStore,
+};
 use fastmcp_protocol::tasks_extension::TaskStatusNotificationParams as FinalTaskStatusNotificationParams;
 use fastmcp_protocol::{
     CreateTaskResult, FINAL_PROTOCOL_VERSION, FinalCancelTaskParams, FinalCancelTaskResult,
@@ -1576,6 +1581,16 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 /// dispatch-lease state. This history survives recovery and terminal
 /// transitions and is removed only when the task is reclaimed.
 pub trait FinalTaskStore: Send + Sync {
+    /// Publishes an optional sealed, non-blocking operator observation handle.
+    ///
+    /// The runtime obtains this handle once during construction. Scraping it
+    /// never calls a provider, reads Task payloads, or performs store maintenance.
+    /// A wrapper may forward only the handle for its actual underlying store.
+    /// Custom stores without an appropriate observation source report absence.
+    fn operator_handle(&self) -> Option<TaskOperatorHandle> {
+        None
+    }
+
     /// Attests immutable support for terminal retention administration.
     /// The policy bounds the store's audit/idempotency journal independently
     /// of retained task payload. Stores lacking atomic reclamation must keep
@@ -2550,12 +2565,14 @@ pub struct InMemoryFinalTaskStore {
     execution_limits: FinalTaskExecutionLimits,
     execution_admission: Arc<InMemoryFinalTaskExecutionAdmission>,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
-    state: Mutex<InMemoryFinalTaskState>,
+    state: Arc<Mutex<InMemoryFinalTaskState>>,
+    operator_generation: Option<u64>,
 }
 
 #[derive(Default)]
 struct InMemoryFinalTaskState {
     tasks: BTreeMap<FinalTaskId, FinalTask>,
+    task_states: OperatorTaskStates,
     authenticated_principals: BTreeMap<FinalTaskId, Sha256Digest>,
     original_operations: BTreeMap<FinalTaskId, FinalTaskOperation>,
     generations: BTreeMap<FinalTaskId, u64>,
@@ -2635,6 +2652,7 @@ struct InMemoryFinalTaskPayloadAccounting {
     reserved: usize,
     records: BTreeMap<FinalTaskId, InMemoryFinalTaskPayloadCharge>,
     owners: BTreeMap<Option<[u8; 32]>, InMemoryFinalTaskOwnerCharge>,
+    saturated_owners: usize,
 }
 
 impl Default for InMemoryFinalTaskPayloadAccounting {
@@ -2647,6 +2665,7 @@ impl Default for InMemoryFinalTaskPayloadAccounting {
             reserved: 0,
             records: BTreeMap::new(),
             owners: BTreeMap::new(),
+            saturated_owners: 0,
         }
     }
 }
@@ -2721,11 +2740,24 @@ impl InMemoryFinalTaskPayloadAccounting {
         mut replacement: InMemoryFinalTaskPayloadCharge,
         admission: InMemoryFinalTaskPayloadAdmission,
     ) {
+        let old_owner = self
+            .owners
+            .get(&admission.owner)
+            .copied()
+            .unwrap_or_default();
+        let was_saturated = self.owner_is_saturated(old_owner);
+        let is_saturated = self.owner_is_saturated(admission.owner_charge);
+        self.saturated_owners =
+            self.saturated_owners - usize::from(was_saturated) + usize::from(is_saturated);
         replacement.owner = admission.owner;
         self.records.insert(task_id, replacement);
         self.owners.insert(admission.owner, admission.owner_charge);
         self.total = admission.total;
         self.reserved = admission.reserved;
+    }
+
+    fn owner_is_saturated(&self, owner: InMemoryFinalTaskOwnerCharge) -> bool {
+        owner.tasks >= self.max_tasks_per_owner || owner.bytes >= self.max_bytes_per_owner
     }
 
     fn release_handoff(&mut self, task_id: &FinalTaskId, initial: bool, accepted: bool) {
@@ -2742,7 +2774,13 @@ impl InMemoryFinalTaskPayloadAccounting {
             charge.total -= released;
             self.total -= released;
             if let Some(owner) = self.owners.get_mut(&charge.owner) {
+                let was_saturated = owner.tasks >= self.max_tasks_per_owner
+                    || owner.bytes >= self.max_bytes_per_owner;
                 owner.bytes -= released;
+                let is_saturated = owner.tasks >= self.max_tasks_per_owner
+                    || owner.bytes >= self.max_bytes_per_owner;
+                self.saturated_owners = self.saturated_owners - usize::from(was_saturated)
+                    + usize::from(is_saturated);
             }
         }
     }
@@ -2752,8 +2790,14 @@ impl InMemoryFinalTaskPayloadAccounting {
             self.total -= charge.total;
             self.reserved -= charge.cancellation_reserve;
             if let Some(owner) = self.owners.get_mut(&charge.owner) {
+                let was_saturated = owner.tasks >= self.max_tasks_per_owner
+                    || owner.bytes >= self.max_bytes_per_owner;
                 owner.tasks -= 1;
                 owner.bytes -= charge.total + charge.cancellation_reserve;
+                let is_saturated = owner.tasks >= self.max_tasks_per_owner
+                    || owner.bytes >= self.max_bytes_per_owner;
+                self.saturated_owners = self.saturated_owners - usize::from(was_saturated)
+                    + usize::from(is_saturated);
                 if owner.tasks == 0 {
                     self.owners.remove(&charge.owner);
                 }
@@ -3038,6 +3082,7 @@ struct InMemoryFinalTaskExecutionAdmissionState {
     next_permit_id: u64,
     reservations: BTreeMap<FinalTaskId, InMemoryFinalTaskExecutionReservation>,
     per_owner: BTreeMap<Option<[u8; 32]>, usize>,
+    saturated_owners: usize,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -3116,6 +3161,9 @@ impl InMemoryFinalTaskExecutionAdmission {
             .reservations
             .insert(task_id.clone(), reservation.clone());
         state.per_owner.insert(principal, active + 1);
+        if active + 1 == self.max_active_per_owner {
+            state.saturated_owners += 1;
+        }
         // Never construct or drop a last permit while holding its pool lock.
         // All fallible checks precede these mutations; only the RAII owner
         // created below can release this exact reservation.
@@ -3144,6 +3192,11 @@ impl Drop for InMemoryFinalTaskExecutionPermit {
             return;
         }
         state.reservations.remove(&self.task_id);
+        if state.per_owner.get(&self.reservation.principal)
+            == Some(&self.admission.max_active_per_owner)
+        {
+            state.saturated_owners -= 1;
+        }
         if let Some(active) = state.per_owner.get_mut(&self.reservation.principal) {
             debug_assert!(*active > 0);
             if *active > 1 {
@@ -3180,6 +3233,126 @@ enum InMemoryFinalTaskHandoffKind {
 
 const IN_MEMORY_FINAL_TASK_HANDOFF_LEASE: StdDuration = StdDuration::from_secs(30);
 const IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT: StdDuration = StdDuration::from_secs(10);
+
+static NEXT_TASK_OPERATOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_task_operator_generation() -> Option<u64> {
+    NEXT_TASK_OPERATOR_GENERATION
+        .try_update(
+            TaskServiceOrdering::Relaxed,
+            TaskServiceOrdering::Relaxed,
+            |value| value.checked_add(1),
+        )
+        .ok()
+}
+
+/// Read-only, fixed-cardinality observations of one configured Task store.
+///
+/// This sealed handle keeps only weak references. It neither keeps a retired
+/// store alive nor grants access to Task identities, principals or payloads.
+/// Capture uses non-waiting locks in the same order as admission and copies
+/// incrementally maintained gauges. It invokes no application/provider code,
+/// samples no custom clock, and does not prune expired records or reservations.
+/// A retained terminal Task and a still-cleaning-up executor remain charged
+/// until the corresponding real operation releases them.
+#[derive(Clone)]
+pub struct TaskOperatorHandle {
+    process: TaskProcessGuard,
+    generation: Option<u64>,
+    max_tasks: usize,
+    state: Weak<Mutex<InMemoryFinalTaskState>>,
+    execution: Weak<InMemoryFinalTaskExecutionAdmission>,
+}
+
+fn task_operator_lock<T>(
+    value: &Mutex<T>,
+) -> Result<std::sync::MutexGuard<'_, T>, OperatorSnapshotError> {
+    match value.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::WouldBlock) => Err(OperatorSnapshotError::Busy),
+        Err(std::sync::TryLockError::Poisoned(_)) => Err(OperatorSnapshotError::Poisoned),
+    }
+}
+
+impl OperatorSnapshotSource<OperatorTaskStore> for TaskOperatorHandle {
+    fn operator_snapshot(&self) -> Result<OperatorTaskSnapshot, OperatorSnapshotError> {
+        self.process
+            .verify()
+            .map_err(|_| OperatorSnapshotError::Unavailable)?;
+        let generation = self
+            .generation
+            .ok_or(OperatorSnapshotError::GenerationExhausted)?;
+        let state = self
+            .state
+            .upgrade()
+            .ok_or(OperatorSnapshotError::Unavailable)?;
+        let execution = self
+            .execution
+            .upgrade()
+            .ok_or(OperatorSnapshotError::Unavailable)?;
+        let state = task_operator_lock(&state)?;
+        let executions = task_operator_lock(&execution.state)?;
+        let payload = &state.payload_accounting;
+        let retention = &state.retention_journal;
+        self.process
+            .verify()
+            .map_err(|_| OperatorSnapshotError::Unavailable)?;
+        Ok(OperatorSnapshot::task_store(
+            Instant::now(),
+            generation,
+            OperatorTaskStore {
+                states: state.task_states,
+                storage: OperatorTaskStorage {
+                    task_limit: self.max_tasks,
+                    retained_tasks: state.tasks.len(),
+                    byte_limit: payload.limit,
+                    retained_bytes: payload.total,
+                    reserved_terminal_bytes: payload.reserved,
+                    owner_task_limit: payload.max_tasks_per_owner,
+                    owner_byte_limit: payload.max_bytes_per_owner,
+                    owner_partitions: payload.owners.len(),
+                    saturated_owner_partitions: payload.saturated_owners,
+                },
+                execution: OperatorTaskExecution {
+                    limit: execution.max_active,
+                    reserved: executions.reservations.len(),
+                    owner_limit: execution.max_active_per_owner,
+                    owner_partitions: executions.per_owner.len(),
+                    saturated_owner_partitions: executions.saturated_owners,
+                },
+                retention: OperatorTaskRetention {
+                    record_limit: retention.policy.max_records,
+                    retained_records: retention.entries.len(),
+                    byte_limit: retention.policy.max_bytes,
+                    retained_bytes: retention.retained_bytes,
+                },
+            },
+        ))
+    }
+}
+
+fn task_state_count(states: &mut OperatorTaskStates, status: FinalTaskStatus) -> &mut usize {
+    match status {
+        FinalTaskStatus::Working => &mut states.working,
+        FinalTaskStatus::InputRequired => &mut states.input_required,
+        FinalTaskStatus::Completed => &mut states.completed,
+        FinalTaskStatus::Failed => &mut states.failed,
+        FinalTaskStatus::Cancelled => &mut states.cancelled,
+    }
+}
+
+fn record_task_state_change(
+    states: &mut OperatorTaskStates,
+    previous: Option<FinalTaskStatus>,
+    next: Option<FinalTaskStatus>,
+) {
+    if let Some(previous) = previous {
+        *task_state_count(states, previous) -= 1;
+    }
+    if let Some(next) = next {
+        *task_state_count(states, next) += 1;
+    }
+}
 
 impl InMemoryFinalTaskStore {
     /// The clock is application code and may change process identity. Recheck
@@ -3231,8 +3404,12 @@ impl InMemoryFinalTaskStore {
         max_payload_bytes_per_owner: usize,
     ) -> McpResult<Self> {
         self.process.verify()?;
-        let state = self
-            .state
+        let state = Arc::get_mut(&mut self.state)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Task configuration requires an unpublished operator handle",
+                )
+            })?
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.next_generation != 0 || state.retention_journal.next_sequence != 0 {
@@ -3251,6 +3428,7 @@ impl InMemoryFinalTaskStore {
         }
         state.payload_accounting.max_tasks_per_owner = max_tasks_per_owner;
         state.payload_accounting.max_bytes_per_owner = max_payload_bytes_per_owner;
+        self.operator_generation = next_task_operator_generation();
         Ok(self)
     }
 
@@ -3286,8 +3464,12 @@ impl InMemoryFinalTaskStore {
         max_active_per_owner: usize,
     ) -> McpResult<Self> {
         self.process.verify()?;
-        let state = self
-            .state
+        let state = Arc::get_mut(&mut self.state)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Task configuration requires an unpublished operator handle",
+                )
+            })?
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.next_generation != 0 || state.retention_journal.next_sequence != 0 {
@@ -3309,6 +3491,7 @@ impl InMemoryFinalTaskStore {
             max_active,
             max_active_per_owner,
         ));
+        self.operator_generation = next_task_operator_generation();
         Ok(self)
     }
 
@@ -3345,8 +3528,12 @@ impl InMemoryFinalTaskStore {
     /// installed administrator or invalidate an existing idempotency window.
     pub fn with_retention_policy(mut self, policy: TaskRetentionPolicy) -> McpResult<Self> {
         self.process.verify()?;
-        let state = self
-            .state
+        let state = Arc::get_mut(&mut self.state)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Task configuration requires an unpublished operator handle",
+                )
+            })?
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.next_generation != 0 || state.retention_journal.next_sequence != 0 {
@@ -3355,6 +3542,7 @@ impl InMemoryFinalTaskStore {
             ));
         }
         state.retention_journal.policy = policy;
+        self.operator_generation = next_task_operator_generation();
         Ok(self)
     }
 
@@ -3443,7 +3631,7 @@ impl InMemoryFinalTaskStore {
                 max_active.min(Self::DEFAULT_MAX_ACTIVE_TASKS_PER_OWNER),
             )),
             clock,
-            state: Mutex::new(InMemoryFinalTaskState {
+            state: Arc::new(Mutex::new(InMemoryFinalTaskState {
                 payload_accounting: InMemoryFinalTaskPayloadAccounting {
                     limit: max_payload_bytes,
                     max_tasks_per_owner: (max_tasks / 2)
@@ -3453,8 +3641,23 @@ impl InMemoryFinalTaskStore {
                     ..InMemoryFinalTaskPayloadAccounting::default()
                 },
                 ..InMemoryFinalTaskState::default()
-            }),
+            })),
+            operator_generation: next_task_operator_generation(),
         })
+    }
+
+    /// Observes this store without retaining it or granting Task authority.
+    /// Finish configuration before publishing a handle. Capture is non-blocking
+    /// and expired records remain charged until real maintenance releases them.
+    #[must_use]
+    pub fn operator_handle(&self) -> TaskOperatorHandle {
+        TaskOperatorHandle {
+            process: self.process,
+            generation: self.operator_generation,
+            max_tasks: self.max_tasks,
+            state: Arc::downgrade(&self.state),
+            execution: Arc::downgrade(&self.execution_admission),
+        }
     }
 
     /// Returns the configured compact-JSON payload capacity.
@@ -3594,6 +3797,7 @@ impl InMemoryFinalTaskStore {
         state
             .latest_notifications
             .insert(task_id.clone(), notification);
+        record_task_state_change(&mut state.task_states, None, Some(task.base().status));
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
         state
@@ -3629,6 +3833,10 @@ impl Default for InMemoryFinalTaskStore {
 }
 
 impl FinalTaskStore for InMemoryFinalTaskStore {
+    fn operator_handle(&self) -> Option<TaskOperatorHandle> {
+        Some(InMemoryFinalTaskStore::operator_handle(self))
+    }
+
     fn retention_administration_policy(&self) -> McpResult<TaskRetentionPolicy> {
         self.process.verify()?;
         Ok(self
@@ -3918,6 +4126,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         state
             .latest_notifications
             .insert(task_id.clone(), notification);
+        record_task_state_change(&mut state.task_states, None, Some(task.base().status));
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
         state
@@ -5386,6 +5595,8 @@ fn replace_in_memory_final_task(
     state
         .latest_notifications
         .insert(task_id.clone(), notification);
+    let previous = state.tasks.get(&task_id).map(|task| task.base().status);
+    record_task_state_change(&mut state.task_states, previous, Some(task.base().status));
     state.tasks.insert(task_id.clone(), task);
     state.generations.insert(task_id.clone(), generation);
     state.handoff_leases.remove(&task_id);
@@ -5493,7 +5704,9 @@ fn remove_in_memory_final_task(state: &mut InMemoryFinalTaskState, task_id: &Fin
     state.payload_accounting.release_task(task_id);
     state.expires_at.remove(task_id);
     state.execution_budgets.remove(task_id);
-    state.tasks.remove(task_id);
+    if let Some(task) = state.tasks.remove(task_id) {
+        record_task_state_change(&mut state.task_states, Some(task.base().status), None);
+    }
     state.authenticated_principals.remove(task_id);
     state.original_operations.remove(task_id);
     state.creation_generations.remove(task_id);
@@ -7186,6 +7399,7 @@ impl std::task::Wake for FinalTaskHandoffWake {
 #[derive(Clone)]
 pub struct FinalTaskRuntime {
     store: Arc<dyn FinalTaskStore>,
+    operator_handle: Option<TaskOperatorHandle>,
     config: FinalTaskRuntimeConfig,
     application_notification_emitter: OwnedTaskNotificationEmitter,
     notification_emitters: Arc<Mutex<Vec<WeakTaskNotificationEmitter>>>,
@@ -7205,8 +7419,10 @@ impl FinalTaskRuntime {
         config: FinalTaskRuntimeConfig,
         notification_emitter: FinalTaskNotificationEmitter,
     ) -> Self {
+        let operator_handle = store.operator_handle();
         Self {
             store,
+            operator_handle,
             config,
             application_notification_emitter: Arc::new(move |notification, _principal| {
                 notification_emitter(notification);
@@ -7219,6 +7435,15 @@ impl FinalTaskRuntime {
             access_authorizers: Arc::new(Mutex::new(Vec::new())),
             execution_authorizers: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Returns the sealed store observation source captured at construction.
+    /// Custom stores may publish no source; absence is never reported as empty,
+    /// healthy storage. Calling this method or capturing its handle performs no
+    /// backend callback, Task maintenance, or admission reservation.
+    #[must_use]
+    pub fn task_operator_handle(&self) -> Option<TaskOperatorHandle> {
+        self.operator_handle.clone()
     }
 
     /// Installs a separate administrator after the backend attests bounded
@@ -11474,6 +11699,404 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
     use std::time::Duration;
+
+    mod task_operator_tests {
+        use super::*;
+
+        fn capture(handle: &TaskOperatorHandle) -> OperatorTaskStore {
+            *OperatorSnapshot::capture(handle).unwrap().contributor()
+        }
+
+        fn terminal(task: &FinalTask, status: FinalTaskStatus) -> FinalTask {
+            let base =
+                transition_terminal_final_task_base(task.base().clone(), status, None).unwrap();
+            match status {
+                FinalTaskStatus::Completed => FinalTask::Completed {
+                    base,
+                    result: serde_json::from_value(serde_json::json!({"content": [
+                        {"type": "text", "text": "private-result"}
+                    ]}))
+                    .unwrap(),
+                },
+                FinalTaskStatus::Failed => FinalTask::Failed {
+                    base,
+                    error: serde_json::from_value(serde_json::json!({
+                        "code": -32000, "message": "private-error"
+                    }))
+                    .unwrap(),
+                },
+                FinalTaskStatus::Cancelled => FinalTask::Cancelled(base),
+                _ => panic!("terminal fixture requires a terminal state"),
+            }
+        }
+
+        fn create(store: &InMemoryFinalTaskStore, name: &str) -> FinalTaskSnapshot {
+            let task = final_working_task_with_ttl(name, 60_000);
+            store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    final_test_work_descriptor(),
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn task_operator_tracks_all_states_bytes_and_real_expiry() {
+            let (store, now) = in_memory_store_with_test_clock(5);
+            let handle = store.operator_handle();
+            let initial: Vec<_> = (0..5)
+                .map(|index| create(&store, &format!("private-task-{index}")))
+                .collect();
+            let working = capture(&handle);
+            assert_eq!(working.states.working, 5);
+            assert_eq!(working.storage.retained_tasks, 5);
+            assert_eq!(working.storage.saturated_owner_partitions, 1);
+            assert!(working.storage.is_saturated());
+            assert_eq!(
+                working.storage.retained_bytes,
+                store.retained_payload_bytes()
+            );
+            let input = final_input_task_with_keys(initial[1].task(), &["private-key".into()]);
+            store
+                .replace_task(input.clone(), final_task_notification(&input))
+                .unwrap();
+            for (task, status) in initial[2..].iter().zip([
+                FinalTaskStatus::Completed,
+                FinalTaskStatus::Failed,
+                FinalTaskStatus::Cancelled,
+            ]) {
+                let next = terminal(task.task(), status);
+                assert!(
+                    store
+                        .replace_task_if_current(task, next.clone(), final_task_notification(&next))
+                        .unwrap()
+                );
+                assert!(
+                    !store
+                        .replace_task_if_current(task, next.clone(), final_task_notification(&next))
+                        .unwrap()
+                );
+            }
+            let observed = capture(&handle);
+            assert_eq!(
+                observed.states,
+                OperatorTaskStates {
+                    working: 1,
+                    input_required: 1,
+                    completed: 1,
+                    failed: 1,
+                    cancelled: 1,
+                }
+            );
+            assert_eq!(observed.storage.retained_tasks, 5);
+            assert!(
+                observed.storage.reserved_terminal_bytes < working.storage.reserved_terminal_bytes
+            );
+            assert_eq!(
+                observed.storage.retained_bytes,
+                store.retained_payload_bytes()
+            );
+            let encoded = serde_json::to_string(&observed).unwrap();
+            assert!(!encoded.contains("private"));
+            assert!(!encoded.contains("tasks-test"));
+            assert!(encoded.len() < 1_024);
+
+            *now.lock().unwrap() += Duration::from_secs(61);
+            assert_eq!(
+                capture(&handle),
+                observed,
+                "observation must not reap expired payloads"
+            );
+            assert_eq!(store.task_count(), 0);
+            let expired = capture(&handle);
+            assert_eq!(expired.states, OperatorTaskStates::default());
+            assert_eq!(expired.storage.retained_tasks, 0);
+            assert_eq!(expired.storage.charged_bytes(), 0);
+            assert_eq!(expired.storage.owner_partitions, 0);
+            assert_eq!(expired.storage.saturated_owner_partitions, 0);
+        }
+
+        #[test]
+        fn task_operator_keeps_execution_charged_through_cancel_and_cleanup() {
+            let store = InMemoryFinalTaskStore::new(2)
+                .unwrap()
+                .with_owner_capacity(2, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+                .unwrap()
+                .with_execution_capacity(1, 1)
+                .unwrap();
+            let handle = store.operator_handle();
+            let first = create(&store, "private-first");
+            let second = create(&store, "private-second");
+            let claim = store
+                .take_initial_work_handoff_for_owner_if_current(&first, "private-runner")
+                .unwrap()
+                .unwrap();
+            let cleanup = claim.execution_permit.as_ref().unwrap().upgrade().unwrap();
+            assert!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&second, "other-runner")
+                    .unwrap()
+                    .is_none()
+            );
+            let running = capture(&handle);
+            assert_eq!(running.execution.reserved, 1);
+            assert_eq!(running.execution.saturated_owner_partitions, 1);
+            let cancelled = terminal(first.task(), FinalTaskStatus::Cancelled);
+            store
+                .replace_task(cancelled.clone(), final_task_notification(&cancelled))
+                .unwrap();
+            drop(claim);
+            let cancelled = capture(&handle);
+            assert_eq!(cancelled.states.cancelled, 1);
+            assert_eq!(cancelled.storage.retained_tasks, 2);
+            assert_eq!(
+                cancelled.execution.reserved, 1,
+                "live executor cleanup still owns its charge"
+            );
+            drop(cleanup);
+            let released = capture(&handle);
+            assert_eq!(released.execution.reserved, 0);
+            assert_eq!(released.execution.owner_partitions, 0);
+            assert_eq!(released.execution.saturated_owner_partitions, 0);
+            assert_eq!(released.storage, cancelled.storage);
+            let resumed = store
+                .take_initial_work_handoff_for_owner_if_current(&second, "next-runner")
+                .unwrap()
+                .unwrap();
+            assert_eq!(capture(&handle).execution.reserved, 1);
+            assert!(
+                store
+                    .restore_initial_work_for_owner_if_current(
+                        second.task_id(),
+                        second.generation(),
+                        "next-runner",
+                        None,
+                        resumed.work_descriptor,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(capture(&handle).execution.reserved, 0);
+        }
+
+        #[test]
+        fn task_operator_never_calls_custom_clock_waits_or_keeps_store_alive() {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let observed_reads = Arc::clone(&reads);
+            let store = InMemoryFinalTaskStore::with_clock(
+                2,
+                Arc::new(move || {
+                    observed_reads.fetch_add(1, AtomicOrdering::SeqCst);
+                    Instant::now()
+                }),
+            )
+            .unwrap();
+            let handle = store.operator_handle();
+            let generation = OperatorSnapshot::capture(&handle)
+                .unwrap()
+                .configuration_generation();
+            assert_eq!(reads.load(AtomicOrdering::SeqCst), 0);
+            {
+                let _state = store.state.lock().unwrap();
+                assert_eq!(
+                    OperatorSnapshot::capture(&handle),
+                    Err(OperatorSnapshotError::Busy)
+                );
+                let mut inherited = handle.clone();
+                let generation = inherited.process.generation;
+                inherited.process.generation = ProcessGeneration::observed(
+                    generation.pid() ^ 1,
+                    *generation.nonce(),
+                    generation.generation(),
+                );
+                assert_eq!(
+                    OperatorSnapshot::capture(&inherited),
+                    Err(OperatorSnapshotError::Unavailable)
+                );
+                let mut exhausted = handle.clone();
+                exhausted.generation = None;
+                assert_eq!(
+                    OperatorSnapshot::capture(&exhausted),
+                    Err(OperatorSnapshotError::GenerationExhausted)
+                );
+            }
+            {
+                let _execution = store.execution_admission.state.lock().unwrap();
+                assert_eq!(
+                    OperatorSnapshot::capture(&handle),
+                    Err(OperatorSnapshotError::Busy)
+                );
+            }
+            assert_eq!(reads.load(AtomicOrdering::SeqCst), 0);
+            drop(store);
+            assert_eq!(
+                OperatorSnapshot::capture(&handle),
+                Err(OperatorSnapshotError::Unavailable)
+            );
+            let replacement = InMemoryFinalTaskStore::new(2).unwrap();
+            assert_ne!(
+                OperatorSnapshot::capture(&replacement.operator_handle())
+                    .unwrap()
+                    .configuration_generation(),
+                generation
+            );
+            let poisoned = replacement.operator_handle();
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _state = replacement.state.lock().unwrap();
+                    panic!("synthetic task observation failure");
+                }))
+                .is_err()
+            );
+            assert_eq!(
+                OperatorSnapshot::capture(&poisoned),
+                Err(OperatorSnapshotError::Poisoned)
+            );
+        }
+
+        #[test]
+        fn task_operator_reports_retention_pressure_and_releases_it_only_on_maintenance() {
+            let now = Arc::new(Mutex::new(Instant::now()));
+            let clock = Arc::clone(&now);
+            let store =
+                InMemoryFinalTaskStore::with_clock(2, Arc::new(move || *clock.lock().unwrap()))
+                    .unwrap()
+                    .with_owner_capacity(2, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+                    .unwrap()
+                    .with_retention_policy(
+                        TaskRetentionPolicy::new(1, 4_096, Duration::from_secs(1)).unwrap(),
+                    )
+                    .unwrap();
+            let handle = store.operator_handle();
+            let first = create(&store, "private-reclaimed");
+            let completed = terminal(first.task(), FinalTaskStatus::Completed);
+            store
+                .replace_task(completed.clone(), final_task_notification(&completed))
+                .unwrap();
+            let current = store.get_task_snapshot(first.task_id()).unwrap().unwrap();
+            let result = store
+                .reclaim_terminal_task_if_current(
+                    &Cx::for_testing(),
+                    current.task_id(),
+                    current.generation(),
+                    TaskRetentionReason::RetentionPolicy,
+                )
+                .unwrap();
+            assert!(matches!(result, TaskRetentionReclamation::Reclaimed(_)));
+            let reclaimed = capture(&handle);
+            assert_eq!(reclaimed.storage.retained_tasks, 0);
+            assert_eq!(reclaimed.storage.charged_bytes(), 0);
+            assert_eq!(reclaimed.retention.retained_records, 1);
+            assert!(reclaimed.retention.retained_bytes > 0);
+            assert!(reclaimed.retention.is_saturated());
+            assert_eq!(
+                OperatorSnapshot::capture(&handle).unwrap().reasons()[2],
+                Some(fastmcp_core::OperatorReason::TaskRetentionCapacitySaturated)
+            );
+            assert!(matches!(
+                store
+                    .reclaim_terminal_task_if_current(
+                        &Cx::for_testing(),
+                        current.task_id(),
+                        current.generation(),
+                        TaskRetentionReason::RetentionPolicy,
+                    )
+                    .unwrap(),
+                TaskRetentionReclamation::AlreadyReclaimed(_)
+            ));
+            assert_eq!(capture(&handle), reclaimed);
+            *now.lock().unwrap() += Duration::from_secs(2);
+            assert_eq!(capture(&handle).retention, reclaimed.retention);
+            store
+                .task_retention_audit(&Cx::for_testing(), None, 1)
+                .unwrap();
+            let retired = capture(&handle);
+            assert_eq!(retired.retention.retained_records, 0);
+            assert_eq!(retired.retention.retained_bytes, 0);
+            assert!(!retired.retention.is_saturated());
+        }
+
+        #[test]
+        fn task_operator_concurrent_owner_and_state_counts_are_conserved() {
+            let store = Arc::new(
+                InMemoryFinalTaskStore::new(64)
+                    .unwrap()
+                    .with_owner_capacity(16, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+                    .unwrap(),
+            );
+            let handle = store.operator_handle();
+            let start = Arc::new(std::sync::Barrier::new(5));
+            thread::scope(|scope| {
+                let mut workers = Vec::new();
+                for owner in 1_u8..=4 {
+                    let store = Arc::clone(&store);
+                    let start = Arc::clone(&start);
+                    workers.push(scope.spawn(move || {
+                        start.wait();
+                        for index in 0..16 {
+                            let task = final_working_task_without_ttl(&format!(
+                                "owner-{owner}-task-{index}"
+                            ));
+                            let initial = store
+                                .create_task_with_authenticated_work(
+                                    task.clone(),
+                                    final_task_notification(&task),
+                                    final_test_work_descriptor(),
+                                    Sha256Digest::from_bytes([owner; 32]),
+                                )
+                                .unwrap();
+                            let completed = terminal(&task, FinalTaskStatus::Completed);
+                            assert!(
+                                store
+                                    .replace_task_if_current(
+                                        &initial,
+                                        completed.clone(),
+                                        final_task_notification(&completed)
+                                    )
+                                    .unwrap()
+                            );
+                        }
+                    }));
+                }
+                start.wait();
+                for _ in 0..256 {
+                    match OperatorSnapshot::capture(&handle) {
+                        Ok(snapshot) => {
+                            let value = snapshot.contributor();
+                            let states = value.states;
+                            assert_eq!(
+                                states.working
+                                    + states.input_required
+                                    + states.completed
+                                    + states.failed
+                                    + states.cancelled,
+                                value.storage.retained_tasks
+                            );
+                            assert!(value.storage.retained_tasks <= value.storage.task_limit);
+                            assert!(value.storage.charged_bytes() <= value.storage.byte_limit);
+                            assert!(
+                                value.storage.saturated_owner_partitions
+                                    <= value.storage.owner_partitions
+                            );
+                        }
+                        Err(OperatorSnapshotError::Busy) => {}
+                        other => panic!("unexpected observation result: {other:?}"),
+                    }
+                    thread::yield_now();
+                }
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            });
+            let final_state = capture(&handle);
+            assert_eq!(final_state.states.completed, 64);
+            assert_eq!(final_state.states.working, 0);
+            assert_eq!(final_state.storage.retained_tasks, 64);
+            assert_eq!(final_state.storage.owner_partitions, 4);
+            assert_eq!(final_state.storage.saturated_owner_partitions, 4);
+            assert_eq!(final_state.storage.reserved_terminal_bytes, 0);
+        }
+    }
 
     mod cancellation_wake_custody_tests {
         use super::*;
@@ -18328,6 +18951,15 @@ mod tests {
                     | CancellationReadbackMutation::ActiveSuccessor => FinalTask::Working(base),
                     _ => FinalTask::Cancelled(base),
                 };
+                let previous = state
+                    .tasks
+                    .get(&task_for_worker)
+                    .map(|task| task.base().status);
+                record_task_state_change(
+                    &mut state.task_states,
+                    previous,
+                    Some(replacement.base().status),
+                );
                 state.tasks.insert(task_for_worker.clone(), replacement);
             }
             *retained_for_worker.lock().unwrap() = Some(input_key_store_snapshot(

@@ -120,7 +120,9 @@ pub use fastmcp_core::stats::{
     OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle,
     OperatorOutputCapacity, OperatorOutputCounters, OperatorProfile, OperatorReadiness,
     OperatorReason, OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource,
-    OperatorStdioOutput, OperatorStdioSnapshot, ServerStats, StatsSnapshot,
+    OperatorStdioOutput, OperatorStdioSnapshot, OperatorTaskExecution, OperatorTaskRetention,
+    OperatorTaskSnapshot, OperatorTaskStates, OperatorTaskStorage, OperatorTaskStore, ServerStats,
+    StatsSnapshot,
 };
 use fastmcp_protocol::{
     MAX_CLIENT_REGISTRATION_BYTES, SecurityDocumentKind, admit_security_document,
@@ -207,9 +209,10 @@ pub use tasks::{
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
     FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
     MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
-    TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskRetentionAdministrator,
-    TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
-    TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+    TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskOperatorHandle,
+    TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
+    TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
+    TaskRetentionTarget,
 };
 #[cfg(all(test, feature = "tasks"))]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
@@ -8969,6 +8972,9 @@ const fn operator_reason_token(reason: OperatorReason) -> &'static str {
         OperatorReason::OutputStopping => "output_stopping",
         OperatorReason::OutputStopped => "output_stopped",
         OperatorReason::OutputFailed => "output_failed",
+        OperatorReason::TaskStorageCapacitySaturated => "task_storage_capacity_saturated",
+        OperatorReason::TaskExecutionCapacitySaturated => "task_execution_capacity_saturated",
+        OperatorReason::TaskRetentionCapacitySaturated => "task_retention_capacity_saturated",
     }
 }
 
@@ -8977,6 +8983,7 @@ const fn operator_snapshot_error_token(error: OperatorSnapshotError) -> &'static
         OperatorSnapshotError::Busy => "busy",
         OperatorSnapshotError::GenerationExhausted => "generation_exhausted",
         OperatorSnapshotError::Poisoned => "poisoned",
+        OperatorSnapshotError::Unavailable => "unavailable",
     }
 }
 
@@ -8988,7 +8995,10 @@ const fn operator_snapshot_error_token(error: OperatorSnapshotError) -> &'static
 /// running listener that is not saturated. An unavailable snapshot fails
 /// closed. The body carries the readiness schema, `schemaVersion`, and the
 /// snapshot's reason tokens.
-fn http_readiness_response(operator: Option<&HttpOperatorHandle>) -> HttpResponse {
+fn http_readiness_response(
+    operator: Option<&HttpOperatorHandle>,
+    tasks: Option<serde_json::Value>,
+) -> HttpResponse {
     let snapshot = operator.map(OperatorSnapshot::capture);
     let snapshot = match snapshot {
         Some(Ok(snapshot)) => snapshot,
@@ -9004,6 +9014,9 @@ fn http_readiness_response(operator: Option<&HttpOperatorHandle>) -> HttpRespons
                     }
                     OperatorSnapshotError::GenerationExhausted => {
                         ("generation_exhausted", operator_snapshot_error_token(error))
+                    }
+                    OperatorSnapshotError::Unavailable => {
+                        ("snapshot_unavailable", operator_snapshot_error_token(error))
                     }
                 },
                 Some(Ok(_)) => unreachable!("successful capture returned above"),
@@ -9042,13 +9055,7 @@ fn http_readiness_response(operator: Option<&HttpOperatorHandle>) -> HttpRespons
         .collect();
     // Strings are local constants and numbers are fixed-width counters.
     // This exporter never serializes an application or peer value.
-    HttpResponse::new(if ready {
-        HttpStatus::OK
-    } else {
-        HttpStatus::SERVICE_UNAVAILABLE
-    })
-    .with_header("cache-control", "no-store")
-    .with_json(&serde_json::json!({
+    let mut body = serde_json::json!({
         "schema": "fastmcp.http.readiness/v1",
         "snapshotSchema": snapshot.schema_version(),
         "schemaVersion": snapshot.schema_version(),
@@ -9074,7 +9081,79 @@ fn http_readiness_response(operator: Option<&HttpOperatorHandle>) -> HttpRespons
             "shutdownRevoked": counters.shutdown_revoked,
             "overflowed": counters.overflowed,
         },
-    }))
+    });
+    if let Some(tasks) = tasks {
+        body["tasks"] = tasks;
+    }
+    HttpResponse::new(if ready {
+        HttpStatus::OK
+    } else {
+        HttpStatus::SERVICE_UNAVAILABLE
+    })
+    .with_header("cache-control", "no-store")
+    .with_json(&body)
+}
+
+/// Observes the configured store only. Task pressure does not prevent ordinary
+/// MCP requests, so it does not change the listener's readiness HTTP status.
+/// A custom provider without the sealed observation capability is explicit;
+/// there is no callback into a provider while serving diagnostics.
+fn http_task_store_observation(server: &Server) -> Option<serde_json::Value> {
+    #[cfg(feature = "tasks")]
+    {
+        let runtime = server.final_task_runtime.as_ref()?;
+        let Some(handle) = runtime.task_operator_handle() else {
+            return Some(serde_json::json!({
+                "schema": "fastmcp.tasks.store/v1",
+                "scope": "task_store",
+                "status": "unsupported",
+            }));
+        };
+        let snapshot = match OperatorSnapshot::capture(&handle) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Some(serde_json::json!({
+                    "schema": "fastmcp.tasks.store/v1",
+                    "scope": "task_store",
+                    "status": "unavailable",
+                    "reason": operator_snapshot_error_token(error),
+                }));
+            }
+        };
+        let contributor = snapshot.contributor();
+        let reasons: Vec<&str> = snapshot
+            .reasons()
+            .iter()
+            .flatten()
+            .map(|reason| operator_reason_token(*reason))
+            .collect();
+        Some(serde_json::json!({
+            "schema": "fastmcp.tasks.store/v1",
+            "schemaVersion": snapshot.schema_version(),
+            "scope": "task_store",
+            "status": "observed",
+            "generation": snapshot.configuration_generation(),
+            "profile": "modern",
+            "states": contributor.states,
+            "storage": contributor.storage,
+            "execution": contributor.execution,
+            "retention": contributor.retention,
+            "pressure": {
+                "storage": contributor.storage.is_saturated()
+                    || contributor.storage.saturated_owner_partitions > 0,
+                "execution": contributor.execution.is_saturated()
+                    || contributor.execution.saturated_owner_partitions > 0,
+                "retention": contributor.retention.is_saturated(),
+            },
+            "reasons": reasons,
+            "overflowed": contributor.storage.overflowed(),
+        }))
+    }
+    #[cfg(not(feature = "tasks"))]
+    {
+        let _ = server;
+        None
+    }
 }
 
 fn http_diagnostic_response(
@@ -9099,7 +9178,7 @@ fn http_diagnostic_response(
     } else if request.path == server.http_config.health_path {
         HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"}))
     } else {
-        http_readiness_response(operator)
+        http_readiness_response(operator, http_task_store_observation(server))
     };
     Some(response.with_header("cache-control", "no-store"))
 }
@@ -9265,7 +9344,7 @@ mod http_operator_tests {
         handle: &HttpOperatorHandle,
         expected_status: HttpStatus,
     ) -> serde_json::Value {
-        let response = http_readiness_response(Some(handle));
+        let response = http_readiness_response(Some(handle), None);
         assert_eq!(response.status, expected_status);
         assert_eq!(
             response.headers.get("cache-control").map(String::as_str),
@@ -9273,6 +9352,62 @@ mod http_operator_tests {
         );
         assert!(response.body.len() < 2048);
         serde_json::from_slice(&response.body).unwrap()
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn http_readiness_exposes_task_pressure_without_refusing_ordinary_requests() {
+        use fastmcp_protocol::{FinalTaskId, FinalTaskStatus, Task, TaskBase, TaskTimestamp};
+
+        let (_, handle) = running(2);
+        let mut server = Server::new("task-operator-test", "1").build();
+        assert_eq!(
+            http_task_store_observation(&server).unwrap()["storage"]["retainedTasks"],
+            0
+        );
+        let store = Arc::new(InMemoryFinalTaskStore::new(1).unwrap());
+        let timestamp = TaskTimestamp::parse("2026-07-28T12:00:00Z").unwrap();
+        let task = Task::Working(TaskBase {
+            task_id: FinalTaskId::parse("private-task-id").unwrap(),
+            status: FinalTaskStatus::Working,
+            status_message: Some("private-status-message".to_owned()),
+            created_at: timestamp.clone(),
+            last_updated_at: timestamp,
+            ttl_ms: None,
+            poll_interval_ms: None,
+        });
+        store
+            .create_task(task.clone(), tasks::final_task_notification(&task))
+            .unwrap();
+        server.final_task_runtime = Some(FinalTaskRuntime::new(
+            store,
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(|_| {}),
+        ));
+        let before = capture(&handle);
+        let response = http_readiness_response(Some(&handle), http_task_store_observation(&server));
+        assert_eq!(response.status, HttpStatus::OK);
+        assert!(response.body.len() < 2_048);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["schemaVersion"], 3);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["tasks"]["schemaVersion"], 4);
+        assert_eq!(body["tasks"]["scope"], "task_store");
+        assert_eq!(body["tasks"]["status"], "observed");
+        assert_eq!(body["tasks"]["states"]["working"], 1);
+        assert_eq!(body["tasks"]["storage"]["retainedTasks"], 1);
+        assert_eq!(body["tasks"]["pressure"]["storage"], true);
+        assert_eq!(
+            body["tasks"]["reasons"][0],
+            "task_storage_capacity_saturated"
+        );
+        assert!(
+            !String::from_utf8(response.body)
+                .unwrap()
+                .contains("private")
+        );
+        assert_eq!(capture(&handle).counters(), before.counters());
+        assert_eq!(capture(&handle).connections(), before.connections());
     }
 
     #[test]
@@ -9351,7 +9486,7 @@ mod http_operator_tests {
             "snapshot_poisoned",
         );
         assert_eq!(handle.begin_drain(), Err(OperatorSnapshotError::Poisoned));
-        let unbound = http_readiness_response(None);
+        let unbound = http_readiness_response(None, None);
         assert_eq!(unbound.status, HttpStatus::SERVICE_UNAVAILABLE);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&unbound.body).unwrap()["reason"],
@@ -58278,7 +58413,7 @@ mod lib_unit_tests {
             // Busy mutex -> non-blocking 503 (never deadlocks or waits)
             {
                 let _lock = limiter.state.lock().expect("lock limiter state");
-                let busy = http_readiness_response(Some(&handle));
+                let busy = http_readiness_response(Some(&handle), None);
                 assert_eq!(busy.status, HttpStatus::SERVICE_UNAVAILABLE);
                 let busy_body: serde_json::Value =
                     serde_json::from_slice(&busy.body).expect("busy json");

@@ -80,6 +80,12 @@ pub enum OperatorReason {
     OutputStopped,
     /// A serving or output failure has made this output contributor unavailable.
     OutputFailed,
+    /// A deployment or owner bound on retained Tasks or charged bytes is exhausted.
+    TaskStorageCapacitySaturated,
+    /// A shared or individual-owner application execution limit is exhausted.
+    TaskExecutionCapacitySaturated,
+    /// The separate terminal-reclamation journal cannot retain another receipt.
+    TaskRetentionCapacitySaturated,
 }
 
 /// Fixed-size connection gauges from the same admission critical section.
@@ -194,6 +200,136 @@ pub struct OperatorStdioOutput {
     pub failed: bool,
 }
 
+/// Counts of the five official Task states, without identifiers or payloads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorTaskStates {
+    /// Retained records in the `working` state, including queued work.
+    pub working: usize,
+    /// Retained records waiting for peer input.
+    pub input_required: usize,
+    /// Completed results still held by retention policy.
+    pub completed: usize,
+    /// Failed results still held by retention policy.
+    pub failed: usize,
+    /// Cancelled records still held by retention policy.
+    pub cancelled: usize,
+}
+
+/// Retained Task storage, including capacity reserved for mandatory retirement.
+///
+/// Terminal results remain charged until ordinary expiry or authorized reclamation.
+/// Owner observations are aggregate counts; no principal or Task identity is exposed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorTaskStorage {
+    /// Deployment-wide retained-record ceiling.
+    pub task_limit: usize,
+    /// Actual retained records, including terminal and not-yet-reclaimed records.
+    pub retained_tasks: usize,
+    /// Deployment-wide compact-JSON byte ceiling, including reservations.
+    pub byte_limit: usize,
+    /// Charged encoded payload bytes, excluding unused terminal reservations.
+    pub retained_bytes: usize,
+    /// Charged headroom for mandatory cancellation or execution-limit retirement.
+    pub reserved_terminal_bytes: usize,
+    /// Retained-record ceiling for each immutable principal partition.
+    pub owner_task_limit: usize,
+    /// Encoded-byte ceiling for each partition, including reservations.
+    pub owner_byte_limit: usize,
+    /// Partitions with retained records; unbound embedding tasks share one.
+    pub owner_partitions: usize,
+    /// Partitions at either their count or charged-byte ceiling.
+    pub saturated_owner_partitions: usize,
+}
+
+impl OperatorTaskStorage {
+    /// Includes reservation bytes unavailable to new or expanding Tasks.
+    #[must_use]
+    pub const fn charged_bytes(self) -> usize {
+        self.retained_bytes
+            .saturating_add(self.reserved_terminal_bytes)
+    }
+
+    /// Deployment-wide storage pressure; individual owner pressure is separate.
+    #[must_use]
+    pub const fn is_saturated(self) -> bool {
+        self.retained_tasks >= self.task_limit || self.charged_bytes() >= self.byte_limit
+    }
+
+    /// Whether charged bytes exceed the representable gauge range.
+    #[must_use]
+    pub const fn overflowed(self) -> bool {
+        self.retained_bytes
+            .checked_add(self.reserved_terminal_bytes)
+            .is_none()
+    }
+}
+
+/// Shared Task execution reservations, including claims and post-result cleanup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorTaskExecution {
+    /// Deployment-wide bound on outstanding execution reservations.
+    pub limit: usize,
+    /// Claims and live application futures that still own a slot.
+    pub reserved: usize,
+    /// Execution ceiling for each immutable principal partition.
+    pub owner_limit: usize,
+    /// Partitions with outstanding execution reservations.
+    pub owner_partitions: usize,
+    /// Partitions at their execution ceiling.
+    pub saturated_owner_partitions: usize,
+}
+
+impl OperatorTaskExecution {
+    /// Whether all deployment-wide execution slots are charged.
+    #[must_use]
+    pub const fn is_saturated(self) -> bool {
+        self.reserved >= self.limit
+    }
+}
+
+/// Capacity of the separate bounded terminal-reclamation audit journal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorTaskRetention {
+    /// Maximum retained reclamation receipts.
+    pub record_limit: usize,
+    /// Receipts physically retained until journal maintenance releases them.
+    pub retained_records: usize,
+    /// Separate encoded-byte ceiling for the audit/idempotency journal.
+    pub byte_limit: usize,
+    /// Bytes charged to retained receipts.
+    pub retained_bytes: usize,
+}
+
+impl OperatorTaskRetention {
+    /// Whether the journal has exhausted either declared capacity bound.
+    #[must_use]
+    pub const fn is_saturated(self) -> bool {
+        self.retained_records >= self.record_limit || self.retained_bytes >= self.byte_limit
+    }
+}
+
+/// One coherent, fixed-size observation of a Task store and its execution pool.
+///
+/// This contributor describes storage and execution reservations, not whether a
+/// Task service is running or a persistent backend has been qualified. Expired
+/// records remain visible until normal store maintenance actually releases them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorTaskStore {
+    /// Official Task-state counts from the same store boundary.
+    pub states: OperatorTaskStates,
+    /// Retained payload and terminal-reservation charges.
+    pub storage: OperatorTaskStorage,
+    /// Shared execution reservations, including asynchronous cleanup.
+    pub execution: OperatorTaskExecution,
+    /// Separate administrative receipt retention.
+    pub retention: OperatorTaskRetention,
+}
+
 /// Request slots charged by the client executor's own admission primitive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperatorRequestCapacity {
@@ -299,6 +435,8 @@ pub enum OperatorSnapshotError {
     GenerationExhausted,
     /// A panic poisoned the contributor cell; no coherent snapshot is available.
     Poisoned,
+    /// The contributor was dropped or belongs to another process generation.
+    Unavailable,
 }
 
 impl std::fmt::Display for OperatorSnapshotError {
@@ -307,6 +445,7 @@ impl std::fmt::Display for OperatorSnapshotError {
             Self::Busy => "operator snapshot contributor is busy",
             Self::GenerationExhausted => "operator snapshot configuration generation exhausted",
             Self::Poisoned => "operator snapshot contributor state is poisoned",
+            Self::Unavailable => "operator snapshot contributor is unavailable",
         })
     }
 }
@@ -327,7 +466,9 @@ pub trait OperatorSnapshotSource<Contributor = OperatorHttpConnections> {
 /// Schema 3 distinguishes HTTP connection admission, client request/correlation
 /// admission, and retained stdio output. The default contributor preserves the
 /// HTTP listener API; [`OperatorExecutorSnapshot`] and [`OperatorStdioSnapshot`]
-/// name the client and stdio observations explicitly.
+/// name the client and stdio observations explicitly. [`OperatorTaskSnapshot`]
+/// uses schema version 4 for the separate Task-store contributor; existing
+/// listener, executor, and stdio contributors retain schema version 3.
 /// No contributor asserts process-wide progress, credential availability,
 /// durable task readiness, or per-request byte budgets.
 /// In particular, `Ready` may coincide with saturation: only an acquired live
@@ -350,6 +491,9 @@ pub type OperatorExecutorSnapshot = OperatorSnapshot<OperatorExecutorCapacity>;
 
 /// Explicit stdio writer snapshot type for storage and exporter APIs.
 pub type OperatorStdioSnapshot = OperatorSnapshot<OperatorStdioOutput>;
+
+/// Explicit Task-store snapshot type, distinct from listener readiness.
+pub type OperatorTaskSnapshot = OperatorSnapshot<OperatorTaskStore>;
 
 impl<Contributor> OperatorSnapshot<Contributor> {
     /// Captures through a shipped contributor without acquiring an admission slot.
@@ -637,6 +781,51 @@ impl OperatorSnapshot<OperatorStdioOutput> {
     }
 }
 
+impl OperatorSnapshot<OperatorTaskStore> {
+    /// Tasks add a distinct contributor; existing connection/executor/output
+    /// snapshots retain their established schema version and field semantics.
+    pub const TASK_SCHEMA_VERSION: u32 = 4;
+
+    /// Constructs a Task-store observation from one coherent admission boundary.
+    ///
+    /// A live store remains structurally ready while saturated. No Task service,
+    /// listener, credential, or durable-recovery readiness is inferred here.
+    #[must_use]
+    pub fn task_store(
+        captured_at: Instant,
+        configuration_generation: u64,
+        contributor: OperatorTaskStore,
+    ) -> Self {
+        Self {
+            schema_version: Self::TASK_SCHEMA_VERSION,
+            captured_at,
+            configuration_generation,
+            profile: OperatorProfile::Modern,
+            lifecycle: OperatorLifecycle::Running,
+            readiness: OperatorReadiness::Ready,
+            reasons: [
+                (contributor.storage.is_saturated()
+                    || contributor.storage.saturated_owner_partitions > 0)
+                    .then_some(OperatorReason::TaskStorageCapacitySaturated),
+                (contributor.execution.is_saturated()
+                    || contributor.execution.saturated_owner_partitions > 0)
+                    .then_some(OperatorReason::TaskExecutionCapacitySaturated),
+                contributor
+                    .retention
+                    .is_saturated()
+                    .then_some(OperatorReason::TaskRetentionCapacitySaturated),
+            ],
+            contributor,
+        }
+    }
+
+    /// Fixed Task pressure slots: retained storage, executions, and audit retention.
+    #[must_use]
+    pub const fn reasons(&self) -> &[Option<OperatorReason>; 3] {
+        &self.reasons
+    }
+}
+
 /// Thread-safe server statistics collector.
 #[derive(Debug, Clone)]
 pub struct ServerStats {
@@ -848,6 +1037,81 @@ mod tests {
 
     const fn http_reasons(snapshot: &OperatorSnapshot) -> &[Option<OperatorReason>; 2] {
         snapshot.reasons()
+    }
+
+    #[test]
+    fn task_operator_schema_and_pressure_are_separate_from_listener_readiness() {
+        let contributor = OperatorTaskStore {
+            states: OperatorTaskStates {
+                completed: 1,
+                ..OperatorTaskStates::default()
+            },
+            storage: OperatorTaskStorage {
+                task_limit: 2,
+                retained_tasks: 1,
+                byte_limit: 10,
+                retained_bytes: 4,
+                reserved_terminal_bytes: 1,
+                owner_task_limit: 1,
+                owner_byte_limit: 5,
+                owner_partitions: 1,
+                saturated_owner_partitions: 1,
+            },
+            execution: OperatorTaskExecution {
+                limit: 2,
+                reserved: 1,
+                owner_limit: 1,
+                owner_partitions: 1,
+                saturated_owner_partitions: 1,
+            },
+            retention: OperatorTaskRetention {
+                record_limit: 1,
+                retained_records: 1,
+                byte_limit: 10,
+                retained_bytes: 5,
+            },
+        };
+        let now = Instant::now();
+        let snapshot = OperatorSnapshot::task_store(now, 9, contributor);
+        assert_eq!(snapshot.schema_version(), 4);
+        assert_eq!(OperatorSnapshot::SCHEMA_VERSION, 3);
+        assert_eq!(snapshot.configuration_generation(), 9);
+        assert_eq!(snapshot.captured_at(), now);
+        assert_eq!(snapshot.profile(), OperatorProfile::Modern);
+        assert_eq!(snapshot.readiness(), OperatorReadiness::Ready);
+        assert_eq!(snapshot.lifecycle(), OperatorLifecycle::Running);
+        assert_eq!(*snapshot.contributor(), contributor);
+        assert_eq!(
+            snapshot.reasons(),
+            &[
+                Some(OperatorReason::TaskStorageCapacitySaturated),
+                Some(OperatorReason::TaskExecutionCapacitySaturated),
+                Some(OperatorReason::TaskRetentionCapacitySaturated),
+            ]
+        );
+        assert!(!contributor.storage.is_saturated());
+        assert!(!contributor.execution.is_saturated());
+        assert!(contributor.retention.is_saturated());
+    }
+
+    #[test]
+    fn task_operator_byte_accounting_never_hides_overflow() {
+        let storage = OperatorTaskStorage {
+            task_limit: 2,
+            byte_limit: usize::MAX,
+            retained_bytes: usize::MAX - 1,
+            reserved_terminal_bytes: 1,
+            ..OperatorTaskStorage::default()
+        };
+        assert_eq!(storage.charged_bytes(), usize::MAX);
+        assert!(storage.is_saturated());
+        assert!(!storage.overflowed());
+        let overflowed = OperatorTaskStorage {
+            reserved_terminal_bytes: 2,
+            ..storage
+        };
+        assert_eq!(overflowed.charged_bytes(), usize::MAX);
+        assert!(overflowed.overflowed());
     }
 
     #[test]

@@ -1342,7 +1342,28 @@ fn https_readiness(bytes: &[u8], status: u16) -> Value {
     assert_eq!(body["schema"], "fastmcp.http.readiness/v1");
     assert_eq!(body["snapshotSchema"], OperatorSnapshot::SCHEMA_VERSION);
     assert_eq!(body["schemaVersion"], OperatorSnapshot::SCHEMA_VERSION);
-    assert_eq!(body.as_object().unwrap().len(), 12);
+    assert_eq!(
+        body.as_object().unwrap().len(),
+        12 + usize::from(cfg!(feature = "tasks"))
+    );
+    if cfg!(feature = "tasks") {
+        let tasks = &body["tasks"];
+        assert_eq!(tasks["schema"], "fastmcp.tasks.store/v1");
+        assert_eq!(
+            tasks["schemaVersion"],
+            fastmcp_core::OperatorTaskSnapshot::TASK_SCHEMA_VERSION
+        );
+        assert_eq!(tasks["scope"], "task_store");
+        assert_eq!(tasks["status"], "observed");
+        assert_eq!(tasks["storage"]["retainedTasks"], 0);
+        assert_eq!(tasks["execution"]["reserved"], 0);
+        assert_eq!(
+            tasks["pressure"],
+            json!({"storage": false, "execution": false, "retention": false})
+        );
+    } else {
+        assert!(body.get("tasks").is_none());
+    }
     assert!(body["reasons"].is_array());
     let wire = std::str::from_utf8(bytes).unwrap();
     for private in [

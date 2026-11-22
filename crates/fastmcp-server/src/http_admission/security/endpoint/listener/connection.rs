@@ -127,7 +127,10 @@ pub(super) async fn serve(
             };
             *admission = Some(HttpNativeConnectionAdmission::Health(control));
             let response = if readiness {
-                crate::http_readiness_response(endpoint.http_operator.as_ref())
+                crate::http_readiness_response(
+                    endpoint.http_operator.as_ref(),
+                    crate::http_task_store_observation(&endpoint.server),
+                )
             } else {
                 HttpResponse::ok().with_json(&serde_json::json!({ "status": "ok" }))
             };

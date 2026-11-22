@@ -409,8 +409,9 @@ pub mod core {
         OperatorExecutorState, OperatorHttpConnections, OperatorLifecycle, OperatorOutputCapacity,
         OperatorOutputCounters, OperatorProfile, OperatorReadiness, OperatorReason,
         OperatorRequestCapacity, OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource,
-        OperatorStdioOutput, OperatorStdioSnapshot, Outcome, OutcomeExt,
-        PROTOCOL_LIMITS_INITIAL_GENERATION, ParseDurationError, PercentEncodingPolicy,
+        OperatorStdioOutput, OperatorStdioSnapshot, OperatorTaskExecution, OperatorTaskRetention,
+        OperatorTaskSnapshot, OperatorTaskStates, OperatorTaskStorage, OperatorTaskStore, Outcome,
+        OutcomeExt, PROTOCOL_LIMITS_INITIAL_GENERATION, ParseDurationError, PercentEncodingPolicy,
         PreAuthSourceBucketKey, ProgressReporter, PromptCaller, PromptGetResult, PromptMessageItem,
         PromptMessageRole, ProtocolLimit, ProtocolLimits, ProtocolLimitsBuilder,
         ProtocolLimitsError, QueryPolicy, QuotaPartitionKey, RandomDrawError, RegionId,
@@ -514,9 +515,9 @@ pub mod server {
         FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
         FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
         InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
-        TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
-        TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
-        TaskRetentionTarget,
+        TaskOperatorHandle, TaskRetentionAdministrator, TaskRetentionAuditPage,
+        TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
+        TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
     };
     /// WebSocket server listener and lifecycle APIs.
     #[cfg(feature = "websocket-experimental")]
@@ -587,6 +588,8 @@ pub use fastmcp_core::{
 pub use fastmcp_core::{
     OperatorCorrelationCapacity, OperatorExecutorCapacity, OperatorExecutorSnapshot,
     OperatorExecutorState, OperatorHttpConnections, OperatorRequestCapacity,
+    OperatorTaskExecution, OperatorTaskRetention, OperatorTaskSnapshot, OperatorTaskStates,
+    OperatorTaskStorage, OperatorTaskStore,
 };
 // The established root `NotificationSender` is the server router callback;
 // expose the McpContext progress capability without changing that legacy name.
@@ -1019,7 +1022,7 @@ pub use fastmcp_server::{
     FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
     FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskAccessAction,
-    TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskRetentionAdministrator,
+    TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskOperatorHandle, TaskRetentionAdministrator,
     TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
     TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
 };
@@ -3543,9 +3546,9 @@ pub mod modern {
         FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
         FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
         InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
-        TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
-        TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
-        TaskRetentionTarget,
+        TaskOperatorHandle, TaskRetentionAdministrator, TaskRetentionAuditPage,
+        TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
+        TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
     };
 
     #[cfg(all(feature = "apps", feature = "tasks"))]
