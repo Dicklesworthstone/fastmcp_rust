@@ -5824,7 +5824,7 @@ impl FinalSubscriptionTransportAdmission {
             return true;
         }
         let allowed = !self.refused.load(Ordering::Acquire)
-            && self.resources.context.ensure_live().is_ok()
+            && Server::request_context_error(&self.resources.context).is_none()
             && if let Some(owned) = self.request_notification_matches(notification) {
                 // Progress and logs belong to the request carrying this body,
                 // not to its selected subscription event filter. An explicit
@@ -6030,7 +6030,7 @@ impl FinalSubscriptionQueuedEvent {
     fn is_authorized(&self) -> bool {
         self.admission
             .as_ref()
-            .is_none_or(|admission| admission.context.ensure_live().is_ok())
+            .is_none_or(|admission| Server::request_context_error(&admission.context).is_none())
             && self
                 .resource
                 .as_ref()
@@ -6591,7 +6591,7 @@ impl FinalSubscriptionRegistry {
         }
 
         if let Some(admission) = &resource_admission {
-            admission.context.ensure_live()?;
+            Server::enforce_request_context(&admission.context)?;
             if request_cancellation.is_cancel_requested() {
                 return Err(McpError::request_cancelled());
             }
@@ -6976,7 +6976,7 @@ impl FinalSubscriptionRegistry {
             if entry
                 .resource_admission
                 .as_ref()
-                .is_some_and(|admission| admission.context.ensure_live().is_err())
+                .is_some_and(|admission| Server::request_context_error(&admission.context).is_some())
             {
                 self.retire_guarded_subscription(&entry);
                 continue;
@@ -7134,7 +7134,7 @@ impl FinalSubscriptionRegistry {
             if entry
                 .resource_admission
                 .as_ref()
-                .is_some_and(|admission| admission.context.ensure_live().is_err())
+                .is_some_and(|admission| Server::request_context_error(&admission.context).is_some())
             {
                 self.retire_guarded_subscription(&entry);
                 continue;
@@ -17570,7 +17570,7 @@ impl Server {
         notifications
             .validate_resource_subscriptions()
             .map_err(|error| McpError::invalid_params(error.to_string()))?;
-        request_ctx.ensure_live()?;
+        Self::enforce_request_context(request_ctx)?;
         let Some(uris) = notifications.resource_subscriptions.as_ref() else {
             return Ok(Vec::new());
         };
@@ -17584,7 +17584,7 @@ impl Server {
                 bindings.push(Arc::new(binding));
             }
         }
-        request_ctx.ensure_live()?;
+        Self::enforce_request_context(request_ctx)?;
         notifications.resource_subscriptions = Some(accepted);
         Ok(bindings)
     }
@@ -59209,6 +59209,214 @@ mod lib_unit_tests {
                         .delivery
                         .allows_subscription_message(&JsonRpcMessage::Request(notification),)
                 );
+            }
+        }
+    }
+
+    mod subscription_authorization_tests {
+        use super::*;
+        use fastmcp_core::AuthContext;
+
+        fn filter() -> SubscriptionFilter {
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            }
+        }
+
+        fn context(cx: &Cx, id: u64, revocation: &McpRequestCancellation) -> McpContext {
+            McpContext::new(cx.clone(), id).with_auth(
+                AuthContext::with_subject("subscription-owner")
+                    .with_verification_cancellation(revocation.clone()),
+            )
+        }
+
+        #[test]
+        fn subscription_transport_request_notifications_recheck_auth_authority() {
+            for progress in [false, true] {
+                for expired in [false, true] {
+                    let cx = Cx::for_testing();
+                    let fixture = request_notification_admission_fixture(
+                        &cx,
+                        Some("marker".into()),
+                        Some(McpLogLevel::Info),
+                    );
+                    let revocation = McpRequestCancellation::new();
+                    let mut auth = AuthContext::with_subject("subscription-owner")
+                        .with_verification_cancellation(revocation.clone());
+                    if expired {
+                        auth = auth.with_verification_valid_until(Instant::now());
+                    }
+                    assert!(fixture.context.set_auth(auth));
+                    let notification = if progress {
+                        request_progress_notification(serde_json::json!("marker"))
+                    } else {
+                        request_log_notification("info")
+                    };
+                    let message = JsonRpcMessage::Request(notification);
+                    if !expired {
+                        assert!(fixture.delivery.allows_subscription_message(&message));
+                        assert!(revocation.cancel());
+                    }
+                    assert!(!fixture.delivery.allows_subscription_message(&message));
+                    assert!(fixture.admission.refused.load(Ordering::Acquire));
+                    assert!(fixture.context.ensure_live().is_ok());
+                    assert!(cx.checkpoint().is_ok());
+                }
+            }
+        }
+
+        #[test]
+        fn subscription_stale_auth_refuses_admission_before_acknowledgement() {
+            for expired in [false, true] {
+                let server = Server::new("subscription-auth", "1").build();
+                let cx = Cx::for_testing();
+                let revocation = McpRequestCancellation::new();
+                let mut auth = AuthContext::with_subject("subscription-owner")
+                    .with_verification_cancellation(revocation.clone());
+                if expired {
+                    auth = auth.with_verification_valid_until(Instant::now());
+                } else {
+                    assert!(revocation.cancel());
+                }
+                let ctx = McpContext::new(cx.clone(), 101).with_auth(auth);
+                let seen = Arc::new(AtomicUsize::new(0));
+                let callback_seen = Arc::clone(&seen);
+                let error = server
+                    .open_subscription_listen_in_context(
+                        &ctx,
+                        RequestId::Number(101),
+                        filter(),
+                        Arc::new(move |_| {
+                            callback_seen.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    )
+                    .err()
+                    .expect("stale authentication must refuse before acknowledgement");
+                assert_eq!(error.code, McpErrorCode::ResourceForbidden);
+                assert_eq!(error.message, "Authentication failed");
+                assert!(error.data.is_none());
+                assert_eq!(seen.load(Ordering::SeqCst), 0);
+                assert!(server.final_subscriptions.inner.lock().unwrap().entries.is_empty());
+                assert_eq!(server.final_subscriptions.admission.lock().unwrap().total, 0);
+                assert!(ctx.ensure_live().is_ok());
+                assert!(cx.checkpoint().is_ok());
+            }
+        }
+
+        #[test]
+        fn subscription_revocation_stops_catalog_delivery_without_cancelling_siblings() {
+            let server = Server::new("subscription-auth", "1").build();
+            let cx = Cx::for_testing();
+            let revoked = McpRequestCancellation::new();
+            let healthy = McpRequestCancellation::new();
+            let contexts = [context(&cx, 101, &revoked), context(&cx, 102, &healthy)];
+            let seen = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+            let mut handles = Vec::new();
+            for (index, ctx) in contexts.iter().enumerate() {
+                let callback_seen = Arc::clone(&seen[index]);
+                handles.push(
+                    server
+                        .open_subscription_listen_in_context(
+                            ctx,
+                            RequestId::Number(if index == 0 { 101 } else { 102 }),
+                            filter(),
+                            Arc::new(move |_| {
+                                callback_seen.fetch_add(1, Ordering::SeqCst);
+                            }),
+                        )
+                        .unwrap(),
+                );
+            }
+            assert_eq!(
+                server
+                    .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(seen[0].load(Ordering::SeqCst), 2);
+            assert_eq!(seen[1].load(Ordering::SeqCst), 2);
+
+            assert!(revoked.cancel());
+            assert_eq!(
+                server
+                    .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(seen[0].load(Ordering::SeqCst), 2);
+            assert_eq!(seen[1].load(Ordering::SeqCst), 3);
+            assert_eq!(server.final_subscriptions.inner.lock().unwrap().entries.len(), 1);
+            assert!(contexts.iter().all(|ctx| ctx.ensure_live().is_ok()));
+            assert!(cx.checkpoint().is_ok());
+            assert!(!healthy.is_cancel_requested());
+            drop(handles);
+            let admission = server.final_subscriptions.admission.lock().unwrap();
+            assert_eq!(admission.total, 0);
+            assert!(admission.principals.is_empty());
+        }
+
+        #[test]
+        fn subscription_queued_catalog_event_rechecks_auth_after_acknowledgement() {
+            for revoke_after_enqueue in [false, true] {
+                let server = Arc::new(Server::new("subscription-auth", "1").build());
+                let cx = Cx::for_testing();
+                let revocation = McpRequestCancellation::new();
+                let ctx = context(&cx, 101, &revocation);
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let callback_seen = Arc::clone(&seen);
+                let callback_server = Arc::downgrade(&server);
+                let callback_revocation = revocation.clone();
+                let opened = server.open_subscription_listen_in_context(
+                    &ctx,
+                    RequestId::Number(101),
+                    filter(),
+                    Arc::new(move |notification| {
+                        let acknowledged =
+                            notification.method == "notifications/subscriptions/acknowledged";
+                        callback_seen.lock().unwrap().push(notification.method);
+                        if acknowledged {
+                            assert_eq!(
+                                callback_server
+                                    .upgrade()
+                                    .unwrap()
+                                    .publish_subscription_notification(
+                                        ServerNotification::ToolsListChanged(None),
+                                    )
+                                    .unwrap(),
+                                1
+                            );
+                            if revoke_after_enqueue {
+                                assert!(callback_revocation.cancel());
+                            }
+                        }
+                    }),
+                );
+                if revoke_after_enqueue {
+                    assert_eq!(
+                        opened.err().expect("queued event lost its authority").code,
+                        McpErrorCode::RequestCancelled
+                    );
+                    assert_eq!(
+                        *seen.lock().unwrap(),
+                        vec!["notifications/subscriptions/acknowledged".to_owned()]
+                    );
+                } else {
+                    assert_eq!(
+                        *seen.lock().unwrap(),
+                        vec![
+                            "notifications/subscriptions/acknowledged".to_owned(),
+                            "notifications/tools/list_changed".to_owned(),
+                        ]
+                    );
+                    drop(opened.unwrap());
+                }
+                assert!(server.final_subscriptions.inner.lock().unwrap().entries.is_empty());
+                let admission = server.final_subscriptions.admission.lock().unwrap();
+                assert_eq!(admission.total, 0);
+                assert!(admission.principals.is_empty());
+                assert!(ctx.ensure_live().is_ok());
+                assert!(cx.checkpoint().is_ok());
             }
         }
     }

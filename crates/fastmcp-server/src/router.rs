@@ -1889,7 +1889,11 @@ fn compose_handler_budget(
 }
 
 fn budget_error(ctx: &McpContext) -> Option<McpError> {
-    ctx.ensure_live().is_err().then(|| cancellation_error(ctx))
+    // Direct router calls and nested component dispatch do not necessarily
+    // pass through Server dispatch again. Reuse its request authority guard
+    // before handler effects and after completion so retained authentication
+    // cannot outlive its verification deadline or revocation policy.
+    crate::Server::request_context_error(ctx)
 }
 
 /// The error for a request that is no longer live. A handler whose own
@@ -4119,6 +4123,7 @@ impl Router {
         uri: &AbsoluteUri,
     ) -> McpResult<Option<ResourceSubscriptionBinding>> {
         ctx.ensure_live()?;
+        crate::Server::enforce_authentication_freshness(ctx.auth().as_ref())?;
         if !ctx.is_resource_enabled(uri.as_str()) {
             return Ok(None);
         }
@@ -4128,13 +4133,19 @@ impl Router {
             return Ok(None);
         };
         let matcher =
-            crate::catch_extension_unwind(|| resolved.handler.subscription_matcher(ctx, uri))
-                .map_err(|_| crate::extension_panic_error("resource_subscription_registration"))?
-                .map_err(|error| sanitize_handler_error(ctx.cx(), "resource", error))?;
+            crate::catch_extension_unwind(|| resolved.handler.subscription_matcher(ctx, uri));
+        ctx.ensure_live()?;
+        crate::Server::enforce_authentication_freshness(ctx.auth().as_ref())?;
+        let matcher = matcher
+            .map_err(|_| crate::extension_panic_error("resource_subscription_registration"))?
+            .map_err(|error| sanitize_handler_error(ctx.cx(), "resource", error))?;
         let matcher_revision = matcher
             .as_ref()
             .map(|matcher| {
-                crate::catch_extension_unwind(|| matcher.revision())
+                let revision = crate::catch_extension_unwind(|| matcher.revision());
+                ctx.ensure_live()?;
+                crate::Server::enforce_authentication_freshness(ctx.auth().as_ref())?;
+                revision
                     .map_err(|_| crate::extension_panic_error("resource_subscription_revision"))
             })
             .transpose()?;
@@ -6304,8 +6315,12 @@ impl Router {
         };
         let resources = crate::catch_extension_unwind(|| {
             self.resources_filtered(session_state, tag_filters)
-        })
-        .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "resource_definition"))?;
+        });
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        let resources = resources
+            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "resource_definition"))?;
         let Some(page_size) = self.list_page_size else {
             return Ok(ListResourcesResult {
                 resources,
@@ -6656,10 +6671,13 @@ impl Router {
             None
         };
         let prompts =
-            crate::catch_extension_unwind(|| self.prompts_filtered(session_state, tag_filters))
-                .map_err(|_payload| {
-                    sanitized_handler_panic(request_ctx.cx(), "prompt_definition")
-                })?;
+            crate::catch_extension_unwind(|| self.prompts_filtered(session_state, tag_filters));
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
+        }
+        let prompts = prompts.map_err(|_payload| {
+            sanitized_handler_panic(request_ctx.cx(), "prompt_definition")
+        })?;
         let Some(page_size) = self.list_page_size else {
             return Ok(ListPromptsResult {
                 prompts,
@@ -8483,9 +8501,17 @@ impl ResourceSubscriptionBinding {
             && self.registration_key == resolved.registration_key
     }
 
+    fn check_authority(&self) -> McpResult<()> {
+        self.context.ensure_live()?;
+        crate::Server::enforce_authentication_freshness(self.context.auth().as_ref())
+    }
+
     fn check_revision(&self) -> McpResult<()> {
+        self.check_authority()?;
         if let Some(matcher) = &self.matcher {
-            let revision = crate::catch_extension_unwind(|| matcher.revision())
+            let revision = crate::catch_extension_unwind(|| matcher.revision());
+            self.check_authority()?;
+            let revision = revision
                 .map_err(|_| crate::extension_panic_error("resource_subscription_revision"))?;
             if Some(revision) != self.matcher_revision {
                 return Err(McpError::new(
@@ -8498,7 +8524,7 @@ impl ResourceSubscriptionBinding {
     }
 
     fn check_visibility(&self, emitted: &AbsoluteUri) -> McpResult<()> {
-        self.context.ensure_live()?;
+        self.check_authority()?;
         if !self.context.is_resource_enabled(self.parent.as_str())
             || !self.context.is_resource_enabled(emitted.as_str())
         {
@@ -8513,7 +8539,7 @@ impl ResourceSubscriptionBinding {
     /// Checks matching and current authority without invoking a reader or
     /// holding a registry lock. Call both before enqueue and before delivery.
     pub(crate) fn validate_event(&self, emitted: &AbsoluteUri) -> McpResult<bool> {
-        self.context.ensure_live()?;
+        self.check_authority()?;
         if !self.context.is_resource_enabled(self.parent.as_str()) {
             return Err(McpError::new(
                 McpErrorCode::ResourceForbidden,
@@ -8553,10 +8579,11 @@ impl ResourceSubscriptionBinding {
             if !exact {
                 let matched = crate::catch_extension_unwind(|| {
                     matcher.matches(&self.context, &self.parent, emitted)
-                })
-                .map_err(|_| crate::extension_panic_error("resource_subscription_matching"))?
-                .map_err(|error| sanitize_handler_error(self.context.cx(), "resource", error))?;
-                self.context.ensure_live()?;
+                });
+                self.check_authority()?;
+                let matched = matched
+                    .map_err(|_| crate::extension_panic_error("resource_subscription_matching"))?
+                    .map_err(|error| sanitize_handler_error(self.context.cx(), "resource", error))?;
                 self.check_revision()?;
                 if !self.context.is_resource_enabled(self.parent.as_str()) {
                     return Err(McpError::new(
@@ -8571,10 +8598,11 @@ impl ResourceSubscriptionBinding {
             self.check_visibility(emitted)?;
             let authorized = crate::catch_extension_unwind(|| {
                 matcher.authorize(&self.context, &self.parent, emitted)
-            })
-            .map_err(|_| crate::extension_panic_error("resource_subscription_authorization"))?
-            .map_err(|error| sanitize_handler_error(self.context.cx(), "resource", error))?;
+            });
             self.check_visibility(emitted)?;
+            let authorized = authorized
+                .map_err(|_| crate::extension_panic_error("resource_subscription_authorization"))?
+                .map_err(|error| sanitize_handler_error(self.context.cx(), "resource", error))?;
             self.check_revision()?;
             if !authorized {
                 return Err(McpError::new(
@@ -13186,12 +13214,14 @@ mod router_tests {
 
     mod resource_subscription_tests {
         use super::*;
+        use fastmcp_core::{AuthContext, McpRequestCancellation};
 
         const PARENT: &str = "sub://project/root";
         const CHILD: &str = "sub://project/root/child";
 
         struct Policy {
             revision: AtomicU64,
+            revision_reads: AtomicUsize,
             allowed: AtomicBool,
             registrations: AtomicUsize,
             authorizations: AtomicUsize,
@@ -13200,12 +13230,15 @@ mod router_tests {
             error_stage: AtomicUsize,
             revise_during_match: AtomicBool,
             revise_during_authorize: AtomicBool,
+            revocation: McpRequestCancellation,
+            revoke_stage: AtomicUsize,
         }
 
         impl Policy {
             fn new() -> Arc<Self> {
                 Arc::new(Self {
                     revision: AtomicU64::new(7),
+                    revision_reads: AtomicUsize::new(0),
                     allowed: AtomicBool::new(true),
                     registrations: AtomicUsize::new(0),
                     authorizations: AtomicUsize::new(0),
@@ -13214,7 +13247,24 @@ mod router_tests {
                     error_stage: AtomicUsize::new(0),
                     revise_during_match: AtomicBool::new(false),
                     revise_during_authorize: AtomicBool::new(false),
+                    revocation: McpRequestCancellation::new(),
+                    revoke_stage: AtomicUsize::new(0),
                 })
+            }
+
+            fn revoke_at(&self, stage: usize) {
+                if self.revoke_stage.load(Ordering::SeqCst) == stage {
+                    self.revocation.cancel();
+                }
+            }
+
+            fn effect_counts(&self) -> [usize; 4] {
+                [
+                    self.registrations.load(Ordering::SeqCst),
+                    self.authorizations.load(Ordering::SeqCst),
+                    self.matches.load(Ordering::SeqCst),
+                    self.revision_reads.load(Ordering::SeqCst),
+                ]
             }
 
             fn private_error() -> McpError {
@@ -13233,6 +13283,8 @@ mod router_tests {
                     2,
                     "private policy detail"
                 );
+                self.revision_reads.fetch_add(1, Ordering::SeqCst);
+                self.revoke_at(2);
                 self.revision.load(Ordering::SeqCst)
             }
 
@@ -13254,6 +13306,7 @@ mod router_tests {
                     return Err(Self::private_error());
                 }
                 self.authorizations.fetch_add(1, Ordering::SeqCst);
+                self.revoke_at(3);
                 if self.revise_during_authorize.load(Ordering::SeqCst) {
                     self.revision.fetch_add(1, Ordering::SeqCst);
                 }
@@ -13277,6 +13330,7 @@ mod router_tests {
                     return Err(Self::private_error());
                 }
                 self.matches.fetch_add(1, Ordering::SeqCst);
+                self.revoke_at(4);
                 if self.revise_during_match.load(Ordering::SeqCst) {
                     self.revision.fetch_add(1, Ordering::SeqCst);
                 }
@@ -13321,6 +13375,7 @@ mod router_tests {
                     return Err(Policy::private_error());
                 }
                 self.0.registrations.fetch_add(1, Ordering::SeqCst);
+                self.0.revoke_at(1);
                 Ok(Some(self.0.clone()))
             }
 
@@ -13354,6 +13409,133 @@ mod router_tests {
                 .unwrap()
                 .unwrap();
             (router, ctx, policy, binding)
+        }
+
+        fn authenticated_context(policy: &Policy) -> McpContext {
+            context().with_auth(
+                AuthContext::with_subject("alice")
+                    .with_verification_cancellation(policy.revocation.clone()),
+            )
+        }
+
+        fn authenticated_fixture() -> (
+            Arc<Router>,
+            McpContext,
+            Arc<Policy>,
+            ResourceSubscriptionBinding,
+        ) {
+            let policy = Policy::new();
+            let mut router = Router::new();
+            router
+                .add_resource_with_behavior(
+                    Provider(Arc::clone(&policy), true),
+                    crate::DuplicateBehavior::Error,
+                )
+                .unwrap();
+            let router = Arc::new(router);
+            let ctx = authenticated_context(&policy);
+            let binding = router
+                .bind_resource_subscription(&ctx, &AbsoluteUri::parse(PARENT).unwrap())
+                .unwrap()
+                .unwrap();
+            (router, ctx, policy, binding)
+        }
+
+        fn assert_auth_refusal(error: McpError) {
+            assert_eq!(error.code, McpErrorCode::ResourceForbidden);
+            assert_eq!(error.message, "Authentication failed");
+            assert!(error.data.is_none());
+        }
+
+        #[test]
+        fn resource_subscription_stale_auth_prevents_registration_and_delivery_effects() {
+            for expired in [false, true] {
+                let (router, ctx, policy, binding) = authenticated_fixture();
+                let child = AbsoluteUri::parse(CHILD).unwrap();
+                assert!(binding.validate_event(&child).unwrap());
+                let effects = policy.effect_counts();
+                let stale_ctx = if expired {
+                    context().with_auth(
+                        ctx.auth()
+                            .unwrap()
+                            .with_verification_valid_until(Instant::now()),
+                    )
+                } else {
+                    assert!(policy.revocation.cancel());
+                    ctx.clone()
+                };
+
+                assert_auth_refusal(
+                    router
+                        .bind_resource_subscription(&stale_ctx, binding.parent_uri())
+                        .err()
+                        .expect("stale authority must not invoke registration"),
+                );
+                // A past deadline on the retained facts exercises delivery
+                // expiry without depending on scheduler or wall-clock timing.
+                let stale_binding = ResourceSubscriptionBinding {
+                    context: stale_ctx.clone(),
+                    ..binding
+                };
+                assert_auth_refusal(stale_binding.validate_event(&child).unwrap_err());
+                assert_eq!(policy.effect_counts(), effects);
+                assert!(stale_ctx.ensure_live().is_ok());
+            }
+        }
+
+        #[test]
+        fn resource_subscription_retained_exact_binding_rechecks_auth_revocation() {
+            let policy = Policy::new();
+            let mut router = Router::new();
+            router.add_resource(NamedResource::new(PARENT));
+            let router = Arc::new(router);
+            let ctx = authenticated_context(&policy);
+            let parent = AbsoluteUri::parse(PARENT).unwrap();
+            let binding = router
+                .bind_resource_subscription(&ctx, &parent)
+                .unwrap()
+                .unwrap();
+            assert!(binding.matcher.is_none());
+            assert!(binding.validate_event(&parent).unwrap());
+            assert!(policy.revocation.cancel());
+            assert_auth_refusal(binding.validate_event(&parent).unwrap_err());
+            assert!(ctx.ensure_live().is_ok());
+        }
+
+        #[test]
+        fn resource_subscription_callback_revocation_stops_further_effects_and_delivery() {
+            for stage in 1..=4 {
+                let (router, ctx, policy, binding) = authenticated_fixture();
+                let child = AbsoluteUri::parse(CHILD).unwrap();
+                assert!(binding.validate_event(&child).unwrap());
+                let mut effects = policy.effect_counts();
+                policy.revoke_stage.store(stage, Ordering::SeqCst);
+
+                let error = if stage == 1 {
+                    effects[0] += 1;
+                    router
+                        .bind_resource_subscription(&ctx, binding.parent_uri())
+                        .err()
+                        .expect("registration revocation must prevent binding")
+                } else {
+                    effects[3] += 1;
+                    if stage == 3 {
+                        effects[1] += 1;
+                        effects[3] += 1;
+                    }
+                    if stage == 3 || stage == 4 {
+                        effects[2] += 1;
+                    }
+                    binding
+                        .validate_event(&child)
+                        .expect_err("provider revocation must prevent delivery")
+                };
+                assert_auth_refusal(error);
+                assert_eq!(policy.effect_counts(), effects, "callback stage {stage}");
+                assert_auth_refusal(binding.validate_event(&child).unwrap_err());
+                assert_eq!(policy.effect_counts(), effects);
+                assert!(ctx.ensure_live().is_ok());
+            }
         }
 
         #[test]
@@ -18901,6 +19083,403 @@ mod router_tests {
         let result = block_on(r.handle_prompts_get(&request_ctx, params, state, None, None))
             .expect("a zero balance is not a retroactive failure");
         assert_eq!(result.messages.len(), 0);
+    }
+
+    mod authorization_freshness_tests {
+        use super::*;
+        use fastmcp_core::{AuthContext, McpRequestCancellation};
+
+        const NAME: &str = "auth-guarded";
+        const URI: &str = "guard://content";
+
+        #[derive(Clone)]
+        struct GuardedHandler {
+            calls: Arc<AtomicUsize>,
+            revoke_during_call: Arc<AtomicBool>,
+            definition_calls: Arc<AtomicUsize>,
+            revoke_during_definition: Arc<AtomicBool>,
+            revocation: McpRequestCancellation,
+        }
+
+        impl GuardedHandler {
+            fn defined(&self) {
+                self.definition_calls.fetch_add(1, Ordering::SeqCst);
+                if self.revoke_during_definition.load(Ordering::SeqCst) {
+                    self.revocation.cancel();
+                }
+            }
+
+            fn entered(&self, ctx: &McpContext) {
+                assert_eq!(ctx.auth().unwrap().subject.as_deref(), Some("alice"));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.revoke_during_call.load(Ordering::SeqCst) {
+                    assert!(self.revocation.cancel());
+                }
+            }
+        }
+
+        impl ToolHandler for GuardedHandler {
+            fn definition(&self) -> Tool {
+                self.defined();
+                NamedTool::new(NAME).definition()
+            }
+
+            fn call(&self, ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+                self.entered(ctx);
+                NamedTool::new(NAME).call(ctx, args)
+            }
+        }
+
+        impl ResourceHandler for GuardedHandler {
+            fn definition(&self) -> Resource {
+                self.defined();
+                NamedResource::new(URI).definition()
+            }
+
+            fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                self.entered(ctx);
+                NamedResource::new(URI).read(ctx)
+            }
+        }
+
+        impl PromptHandler for GuardedHandler {
+            fn definition(&self) -> Prompt {
+                self.defined();
+                NamedPrompt::new(NAME).definition()
+            }
+
+            fn get(
+                &self,
+                ctx: &McpContext,
+                args: HashMap<String, String>,
+            ) -> McpResult<Vec<PromptMessage>> {
+                self.entered(ctx);
+                NamedPrompt::new(NAME).get(ctx, args)
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Component {
+            Tool,
+            Resource,
+            Prompt,
+        }
+
+        const COMPONENTS: [Component; 3] =
+            [Component::Tool, Component::Resource, Component::Prompt];
+
+        struct Fixture {
+            router: Arc<Router>,
+            ctx: McpContext,
+            state: SessionState,
+            handler: GuardedHandler,
+        }
+
+        impl Fixture {
+            fn new(final_surface: bool) -> Self {
+                let handler = GuardedHandler {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    revoke_during_call: Arc::new(AtomicBool::new(false)),
+                    definition_calls: Arc::new(AtomicUsize::new(0)),
+                    revoke_during_definition: Arc::new(AtomicBool::new(false)),
+                    revocation: McpRequestCancellation::new(),
+                };
+                let mut router = Router::new();
+                router.add_tool(handler.clone()).expect("tool is admitted");
+                router.add_resource(handler.clone());
+                router.add_prompt(handler.clone());
+                let state = SessionState::new();
+                let auth = AuthContext::with_subject("alice")
+                    .with_session_owner(sha256_bounded(b"router-auth-owner", 128).unwrap())
+                    .with_verification_cancellation(handler.revocation.clone());
+                let ctx = McpContext::with_state(Cx::for_testing(), 1, state.clone())
+                    .with_auth(auth)
+                    .with_final_request_surface(final_surface);
+                Self {
+                    router: Arc::new(router),
+                    ctx,
+                    state,
+                    handler,
+                }
+            }
+
+            fn invoke_direct(&self, component: Component) -> McpResult<()> {
+                if self.ctx.is_final_request_surface() {
+                    return match component {
+                        Component::Tool => {
+                            block_on(self.router.handle_tools_call_final_in_request(
+                                &self.ctx,
+                                self.ctx.cx(),
+                                serde_json::from_value(serde_json::json!({
+                                    "_meta": {}, "name": NAME, "arguments": {}
+                                }))
+                                .unwrap(),
+                                self.state.clone(),
+                                None,
+                                None,
+                                None,
+                                None,
+                            ))
+                            .map(|_| ())
+                        }
+                        Component::Resource => {
+                            block_on(self.router.handle_resources_read_final_in_request(
+                                &self.ctx,
+                                self.ctx.cx(),
+                                serde_json::from_value(serde_json::json!({
+                                    "_meta": {}, "uri": URI
+                                }))
+                                .unwrap(),
+                                self.state.clone(),
+                                None,
+                                None,
+                                None,
+                                None,
+                            ))
+                            .map(|_| ())
+                        }
+                        Component::Prompt => {
+                            block_on(self.router.handle_prompts_get_final_in_request(
+                                &self.ctx,
+                                self.ctx.cx(),
+                                serde_json::from_value(serde_json::json!({
+                                    "_meta": {}, "name": NAME
+                                }))
+                                .unwrap(),
+                                self.state.clone(),
+                                None,
+                                None,
+                                None,
+                                None,
+                            ))
+                            .map(|_| ())
+                        }
+                    };
+                }
+
+                match component {
+                    Component::Tool => block_on(self.router.handle_tools_call(
+                        &self.ctx,
+                        CallToolParams {
+                            name: NAME.to_owned(),
+                            arguments: Some(serde_json::json!({})),
+                            meta: None,
+                        },
+                        self.state.clone(),
+                        None,
+                        None,
+                    ))
+                    .map(|_| ()),
+                    Component::Resource => block_on(self.router.handle_resources_read(
+                        &self.ctx,
+                        &ReadResourceParams {
+                            uri: URI.to_owned(),
+                            meta: None,
+                        },
+                        self.state.clone(),
+                        None,
+                        None,
+                    ))
+                    .map(|_| ()),
+                    Component::Prompt => block_on(self.router.handle_prompts_get(
+                        &self.ctx,
+                        GetPromptParams {
+                            name: NAME.to_owned(),
+                            arguments: None,
+                            meta: None,
+                        },
+                        self.state.clone(),
+                        None,
+                        None,
+                    ))
+                    .map(|_| ()),
+                }
+            }
+
+            fn invoke_nested(&self, component: Component) -> McpResult<()> {
+                // Invoke the router adapter itself: a McpContext convenience
+                // method's own guard must not mask a bypass in this layer.
+                match component {
+                    Component::Tool => block_on(
+                        RouterToolCaller::new(Arc::clone(&self.router), self.state.clone())
+                            .call_tool(&self.ctx, NAME, serde_json::json!({}), 1),
+                    )
+                    .map(|_| ()),
+                    Component::Resource => block_on(
+                        RouterResourceReader::new(Arc::clone(&self.router), self.state.clone())
+                            .read_resource(&self.ctx, URI, 1),
+                    )
+                    .map(|_| ()),
+                    Component::Prompt => block_on(
+                        RouterPromptCaller::new(Arc::clone(&self.router), self.state.clone())
+                            .get_prompt(&self.ctx, NAME, HashMap::new(), 1),
+                    )
+                    .map(|_| ()),
+                }
+            }
+
+            fn assert_auth_refusal(&self, result: McpResult<()>) {
+                let error = result.expect_err("stale authentication must be refused");
+                assert_eq!(error.code, McpErrorCode::ResourceForbidden);
+                assert_eq!(error.message, "Authentication failed");
+                assert!(
+                    self.ctx.ensure_live().is_ok(),
+                    "auth revocation is not request cancellation"
+                );
+            }
+        }
+
+        #[test]
+        fn direct_and_nested_dispatch_refuse_revoked_auth_before_handler_effects() {
+            for final_surface in [false, true] {
+                for invoke in [Fixture::invoke_direct, Fixture::invoke_nested] {
+                    let fixture = Fixture::new(final_surface);
+                    for component in COMPONENTS {
+                        invoke(&fixture, component).expect("live authority admits the handler");
+                    }
+                    assert_eq!(fixture.handler.calls.load(Ordering::SeqCst), 3);
+                    assert!(fixture.handler.revocation.cancel());
+                    for component in COMPONENTS {
+                        fixture.assert_auth_refusal(invoke(&fixture, component));
+                    }
+                    assert_eq!(fixture.handler.calls.load(Ordering::SeqCst), 3);
+                }
+            }
+        }
+
+        #[test]
+        fn direct_and_nested_dispatch_discard_results_revoked_during_handler() {
+            for final_surface in [false, true] {
+                for invoke in [Fixture::invoke_direct, Fixture::invoke_nested] {
+                    for component in COMPONENTS {
+                        let fixture = Fixture::new(final_surface);
+                        invoke(&fixture, component).expect("live authority admits the result");
+                        fixture
+                            .handler
+                            .revoke_during_call
+                            .store(true, Ordering::SeqCst);
+                        fixture.assert_auth_refusal(invoke(&fixture, component));
+                        assert_eq!(fixture.handler.calls.load(Ordering::SeqCst), 2);
+                        fixture.assert_auth_refusal(invoke(&fixture, component));
+                        assert_eq!(fixture.handler.calls.load(Ordering::SeqCst), 2);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn direct_and_nested_dispatch_refuse_expired_auth_before_handler_effects() {
+            for final_surface in [false, true] {
+                for invoke in [Fixture::invoke_direct, Fixture::invoke_nested] {
+                    let mut fixture = Fixture::new(final_surface);
+                    for component in COMPONENTS {
+                        invoke(&fixture, component).expect("live authority admits the handler");
+                    }
+                    let expired = fixture
+                        .ctx
+                        .auth()
+                        .unwrap()
+                        .with_verification_valid_until(Instant::now());
+                    // Authentication is write-once. Create the paired request
+                    // with the same ambient context and state, changing only
+                    // the retained verification deadline.
+                    fixture.ctx = McpContext::with_state(
+                        fixture.ctx.cx().clone(),
+                        fixture.ctx.request_id(),
+                        fixture.state.clone(),
+                    )
+                    .with_auth(expired)
+                    .with_final_request_surface(final_surface);
+                    for component in COMPONENTS {
+                        fixture.assert_auth_refusal(invoke(&fixture, component));
+                    }
+                    assert_eq!(fixture.handler.calls.load(Ordering::SeqCst), 3);
+                    assert!(!fixture.handler.revocation.is_terminal());
+                }
+            }
+        }
+
+        #[test]
+        fn direct_legacy_catalog_listing_discards_definitions_after_auth_revocation() {
+            for page_size in [None, Some(1)] {
+                for component in [Component::Resource, Component::Prompt] {
+                    let mut fixture = Fixture::new(false);
+                    Arc::get_mut(&mut fixture.router).unwrap().list_page_size = page_size;
+                    let list = || match component {
+                        Component::Resource => fixture
+                            .router
+                            .handle_resources_list(
+                                &fixture.ctx,
+                                ListResourcesParams::default(),
+                                Some(&fixture.state),
+                            )
+                            .map(|result| result.resources.len()),
+                        Component::Prompt => fixture
+                            .router
+                            .handle_prompts_list(
+                                &fixture.ctx,
+                                ListPromptsParams::default(),
+                                Some(&fixture.state),
+                            )
+                            .map(|result| result.prompts.len()),
+                        Component::Tool => unreachable!(),
+                    };
+                    let definitions = fixture.handler.definition_calls.load(Ordering::SeqCst);
+                    assert_eq!(list().expect("live authority admits catalog definitions"), 1);
+                    assert_eq!(
+                        fixture.handler.definition_calls.load(Ordering::SeqCst),
+                        definitions + 1
+                    );
+
+                    fixture
+                        .handler
+                        .revoke_during_definition
+                        .store(true, Ordering::SeqCst);
+                    fixture.assert_auth_refusal(list().map(|_| ()));
+                    assert_eq!(
+                        fixture.handler.definition_calls.load(Ordering::SeqCst),
+                        definitions + 2
+                    );
+                    fixture.assert_auth_refusal(list().map(|_| ()));
+                    assert_eq!(
+                        fixture.handler.definition_calls.load(Ordering::SeqCst),
+                        definitions + 2
+                    );
+                    assert_eq!(fixture.handler.calls.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
+
+        #[test]
+        fn direct_catalog_listing_refuses_revoked_auth() {
+            for final_surface in [false, true] {
+                let fixture = Fixture::new(final_surface);
+                let list = || {
+                    if final_surface {
+                        fixture
+                            .router
+                            .handle_final_tools_list(
+                                &fixture.ctx,
+                                serde_json::from_value(serde_json::json!({"_meta": {}})).unwrap(),
+                            )
+                            .map(|result| result.tools.len())
+                    } else {
+                        fixture
+                            .router
+                            .handle_tools_list(
+                                &fixture.ctx,
+                                ListToolsParams::default(),
+                                Some(&fixture.state),
+                            )
+                            .map(|result| result.tools.len())
+                    }
+                };
+                assert_eq!(list().expect("live authority can list the tool"), 1);
+                assert!(fixture.handler.revocation.cancel());
+                fixture.assert_auth_refusal(list().map(|_| ()));
+                assert_eq!(fixture.handler.calls.load(Ordering::SeqCst), 0);
+            }
+        }
     }
 
     #[test]
