@@ -693,6 +693,29 @@ impl OidcCodeGrant {
         self.expires_at
     }
 
+    /// Reject input authority drift before a provider is allowed to access a
+    /// confidential client credential. Serialization repeats this check after
+    /// acquisition because the original code lifetime may have expired.
+    pub(super) fn admit_token_request(
+        &self,
+        profile: &EnterpriseProfile,
+        policy: EnterpriseResponsePolicy,
+        keys: &OidcVerificationKeys,
+        now: SystemTime,
+    ) -> Result<(), EnterpriseExchangeError> {
+        if self.configuration.profile != *profile
+            || self.configuration.response_policy != policy
+            || keys.issuer() != profile.idp_issuer()
+            || keys.generation() != profile.oidc_key_generation()
+        {
+            return Err(EnterpriseExchangeError::ResponseRejected(
+                EnterpriseResponseError::PolicyBindingMismatch,
+            ));
+        }
+        live(self.created_at, self.expires_at, now)
+            .map_err(EnterpriseExchangeError::CodeFlowRejected)
+    }
+
     /// The driver can serialize the protected code only for the original
     /// profile and response policy. This consumes the local grant on every
     /// outcome without exposing its code, verifier or nonce to the caller.
@@ -710,17 +733,7 @@ impl OidcCodeGrant {
         ),
         EnterpriseExchangeError,
     > {
-        if self.configuration.profile != *profile
-            || self.configuration.response_policy != policy
-            || keys.issuer() != profile.idp_issuer()
-            || keys.generation() != profile.oidc_key_generation()
-        {
-            return Err(EnterpriseExchangeError::ResponseRejected(
-                EnterpriseResponseError::PolicyBindingMismatch,
-            ));
-        }
-        live(self.created_at, self.expires_at, now)
-            .map_err(EnterpriseExchangeError::CodeFlowRejected)?;
+        self.admit_token_request(profile, policy, keys, now)?;
         let mut fields = self.token_fields().to_vec();
         let request = build_confidential_token_request(
             profile.idp_authentication(),

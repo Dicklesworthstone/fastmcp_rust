@@ -2,6 +2,8 @@
 //! Only public key material and compact signatures are retained here.
 
 use super::*;
+use crate::http_auth::enterprise::credentials::EnterpriseCredentialBinding;
+use crate::http_auth::enterprise::credentials::tests::CredentialStoreFixture;
 use crate::http_auth::enterprise::identity::{
     EnterpriseClientIdModel, EnterpriseGlobalClientRegistration, EnterpriseIdentityConfiguration,
     EnterpriseIdentitySnapshotConfiguration, EnterpriseIdentityTrustDomains,
@@ -35,7 +37,7 @@ fn headers() -> Vec<(String, String)> {
         ("Pragma".to_owned(), "no-cache".to_owned()),
     ]
 }
-fn profile(requested: &[&str]) -> EnterpriseProfile {
+pub(in crate::http_auth::enterprise) fn profile(requested: &[&str]) -> EnterpriseProfile {
     profile_with_authentication(
         requested,
         EnterpriseClientAuthentication::ClientSecretBasic,
@@ -210,7 +212,9 @@ fn subject_mapping() -> PreexistingEnterpriseSubjectMapping {
     }
 }
 
-fn subject_mappings(profile: &EnterpriseProfile) -> EnterpriseSubjectMappingTable {
+pub(in crate::http_auth::enterprise) fn subject_mappings(
+    profile: &EnterpriseProfile,
+) -> EnterpriseSubjectMappingTable {
     EnterpriseSubjectMappingTable::from_trusted_configuration(
         profile,
         subject_configuration(profile),
@@ -981,6 +985,513 @@ fn run_exchange_async<T>(f: impl Future<Output = T>) -> T {
     rt.block_on(f)
 }
 
+async fn protected_exchange_provider(
+    cx: &Cx,
+    fixture: &CredentialStoreFixture,
+    selected: &EnterpriseProfile,
+    snapshot: &EnterpriseIdentitySnapshotKey,
+    role: EnterpriseCredentialRole,
+    secret: &str,
+) -> (
+    EnterpriseClientCredentialProvider,
+    fastmcp_core::persistent::PersistentBlobRevision,
+) {
+    let binding =
+        EnterpriseCredentialBinding::new(selected.clone(), snapshot.clone(), role).unwrap();
+    let record = binding
+        .encode_record(EnterpriseClientSecret::try_new(secret).unwrap(), 1)
+        .unwrap();
+    let store = fixture.store();
+    let revision = store
+        .create(cx, record, cx.now().saturating_add_nanos(5_000_000_000))
+        .await
+        .unwrap();
+    let provider = EnterpriseClientCredentialProvider::new(
+        binding,
+        store,
+        revision,
+        1,
+        Instant::now() + Duration::from_secs(60),
+    )
+    .unwrap();
+    (provider, revision)
+}
+
+#[test]
+fn enterprise_protected_credentials_drive_all_three_posts_with_both_authentication_methods() {
+    let (oidc_keys, jag_keys) = keys();
+    for method in [
+        EnterpriseClientAuthentication::ClientSecretBasic,
+        EnterpriseClientAuthentication::ClientSecretPost,
+    ] {
+        run_exchange_async(async {
+            let cx = Cx::current().unwrap();
+            let selected = profile_with_authentication(&["read"], method, method);
+            let mut row = subject_mapping();
+            row.client_subject = "client-subject".into();
+            let mappings = EnterpriseSubjectMappingTable::from_trusted_configuration(
+                &selected,
+                subject_configuration(&selected),
+                vec![row],
+                now(),
+            )
+            .unwrap();
+            let fixture = CredentialStoreFixture::new(&cx).await;
+            let (idp, _) = protected_exchange_provider(
+                &cx,
+                &fixture,
+                &selected,
+                mappings.snapshot(),
+                EnterpriseCredentialRole::Idp,
+                "protected-idp +/=",
+            )
+            .await;
+            let (resource_as, _) = protected_exchange_provider(
+                &cx,
+                &fixture,
+                &selected,
+                mappings.snapshot(),
+                EnterpriseCredentialRole::ResourceAuthorizationServer,
+                "protected-resource +/=",
+            )
+            .await;
+            let fetcher = test_fetcher();
+            let poster = ScriptedExchangePoster::new(vec![
+                Ok(ok_exchange_response(
+                    "idp.example",
+                    fetcher.root_identity(),
+                    oidc_token_body(),
+                )),
+                Ok(ok_exchange_response(
+                    "idp.example",
+                    fetcher.root_identity(),
+                    serde_json::to_vec(&jag_body()).unwrap(),
+                )),
+                Ok(ok_exchange_response(
+                    "as.example",
+                    fetcher.root_identity(),
+                    serde_json::to_vec(&access_body()).unwrap(),
+                )),
+            ]);
+            let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+            let (outcome, _) = driver
+                .exchange_oidc_code_for_identity_with_provider(
+                    &cx,
+                    grant_for_exchange(selected.clone(), EnterpriseResponsePolicy::default(), 0x22),
+                    &idp,
+                    mappings.snapshot(),
+                    &oidc_keys,
+                    now(),
+                )
+                .await
+                .unwrap();
+            let identity = success(outcome);
+            let oidc_digest = identity.identity().compact_digest();
+            let replay = ExchangeReplayFixture::new(&cx);
+            let reserved = replay
+                .reserve(&cx, &selected, identity, now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            let (outcome, _) = driver
+                .exchange_identity_for_id_jag_with_provider(
+                    &cx,
+                    reserved,
+                    &idp,
+                    mappings.snapshot(),
+                    &jag_keys,
+                    TenantExpectation::SingleTenant,
+                    ResourceTenantExpectation::SingleTenant,
+                    now() + Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            let (outcome, _) = driver
+                .exchange_id_jag_for_access_token_with_provider(
+                    &cx,
+                    success(outcome),
+                    &mappings,
+                    mappings.snapshot(),
+                    &resource_as,
+                    now() + Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            let token = success(outcome);
+            assert_eq!(token.subject_binding().oidc_digest(), oidc_digest);
+            assert_eq!(token.subject_binding().snapshot(), mappings.snapshot());
+            let bearer = token
+                .into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(
+                bearer
+                    .authorization_for_target(
+                        &CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap(),
+                    )
+                    .as_deref(),
+                Some("Bearer final-opaque-token")
+            );
+            assert_eq!(fixture.read_count(), 3);
+            assert_eq!(replay.reserved_aliases(), 2);
+            let posted = poster.take_recorded();
+            assert_eq!(posted.len(), 3);
+            assert_eq!(
+                (&*posted[0].host, &*posted[1].host, &*posted[2].host),
+                ("idp.example", "idp.example", "as.example")
+            );
+            assert!(posted[0].body.starts_with("grant_type=authorization_code&"));
+            assert!(posted[1].body.contains(
+                "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid_token"
+            ));
+            assert!(posted[2].body.starts_with(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion="
+            ));
+            for (index, post) in posted.iter().enumerate() {
+                assert_eq!(
+                    post.has_authorization,
+                    method == EnterpriseClientAuthentication::ClientSecretBasic
+                );
+                if method == EnterpriseClientAuthentication::ClientSecretPost {
+                    assert!(post.body.ends_with(if index == 2 {
+                        "&client_id=native-resource&client_secret=protected-resource+%2B%2F%3D"
+                    } else {
+                        "&client_id=native-idp&client_secret=protected-idp+%2B%2F%3D"
+                    }));
+                } else {
+                    assert!(!post.body.contains("client_secret="));
+                }
+            }
+            assert!(!driver.inner.busy.load(Ordering::Acquire));
+        });
+    }
+}
+
+#[test]
+fn enterprise_protected_credentials_refuse_role_profile_snapshot_and_input_drift_before_read() {
+    let (oidc_keys, _) = keys();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let selected = profile(&["read"]);
+        let mappings = subject_mappings(&selected);
+        let fixture = CredentialStoreFixture::new(&cx).await;
+        for defect in 0..4 {
+            let binding_profile = if defect == 1 {
+                profile_with_authentication(
+                    &["read"],
+                    EnterpriseClientAuthentication::ClientSecretPost,
+                    EnterpriseClientAuthentication::ClientSecretPost,
+                )
+            } else {
+                selected.clone()
+            };
+            let mut configuration = subject_configuration(&binding_profile);
+            if defect == 2 {
+                configuration.snapshot.generation += 1;
+            }
+            let binding_mappings = EnterpriseSubjectMappingTable::from_trusted_configuration(
+                &binding_profile,
+                configuration,
+                vec![subject_mapping()],
+                now(),
+            )
+            .unwrap();
+            let binding_snapshot = if defect == 2 {
+                binding_mappings.snapshot()
+            } else {
+                mappings.snapshot()
+            };
+            let role = if defect == 0 {
+                EnterpriseCredentialRole::ResourceAuthorizationServer
+            } else {
+                EnterpriseCredentialRole::Idp
+            };
+            let (provider, _) = protected_exchange_provider(
+                &cx,
+                &fixture,
+                &binding_profile,
+                binding_snapshot,
+                role,
+                "never-disclosed",
+            )
+            .await;
+            let grant_profile = if defect == 3 {
+                profile(&["read", "write"])
+            } else {
+                selected.clone()
+            };
+            let poster = ScriptedExchangePoster::new(vec![]);
+            let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+            let result = driver
+                .exchange_oidc_code_for_identity_with_provider(
+                    &cx,
+                    grant_for_exchange(grant_profile, EnterpriseResponsePolicy::default(), 0x22),
+                    &provider,
+                    mappings.snapshot(),
+                    &oidc_keys,
+                    now(),
+                )
+                .await;
+            assert_eq!(
+                result.err(),
+                Some(if defect == 3 {
+                    EnterpriseExchangeError::ResponseRejected(
+                        EnterpriseResponseError::PolicyBindingMismatch,
+                    )
+                } else {
+                    EnterpriseExchangeError::CredentialRejected(
+                        EnterpriseCredentialError::BindingMismatch,
+                    )
+                })
+            );
+            assert_eq!(fixture.read_count(), 0);
+            assert!(poster.take_recorded().is_empty());
+            assert!(!driver.inner.busy.load(Ordering::Acquire));
+        }
+    });
+}
+
+#[test]
+fn enterprise_protected_credentials_keep_replay_and_mapping_gates_before_provider_access() {
+    let (_, jag_keys) = keys();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let selected = profile(&["read"]);
+        let mappings = subject_mappings(&selected);
+        let fixture = CredentialStoreFixture::new(&cx).await;
+        let (resource_as, _) = protected_exchange_provider(
+            &cx,
+            &fixture,
+            &selected,
+            mappings.snapshot(),
+            EnterpriseCredentialRole::ResourceAuthorizationServer,
+            "resource-stage-only",
+        )
+        .await;
+        let replay = ExchangeReplayFixture::new(&cx);
+        let reserved = replay
+            .reserve(&cx, &selected, identity_for_exchange(&selected), now())
+            .await
+            .unwrap();
+        let poster = ScriptedExchangePoster::new(vec![]);
+        let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+        assert_eq!(
+            driver
+                .exchange_identity_for_id_jag_with_provider(
+                    &cx,
+                    reserved,
+                    &resource_as,
+                    mappings.snapshot(),
+                    &jag_keys,
+                    TenantExpectation::SingleTenant,
+                    ResourceTenantExpectation::SingleTenant,
+                    now(),
+                )
+                .await
+                .err(),
+            Some(EnterpriseExchangeError::CredentialRejected(
+                EnterpriseCredentialError::BindingMismatch,
+            ))
+        );
+        assert_eq!(replay.reserved_aliases(), 2);
+        let (exchanged, replay) = exchanged_for_test(&cx, &selected).await;
+        let absent = EnterpriseSubjectMappingTable::from_trusted_configuration(
+            &selected,
+            subject_configuration(&selected),
+            vec![],
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            driver
+                .exchange_id_jag_for_access_token_with_provider(
+                    &cx,
+                    exchanged,
+                    &absent,
+                    absent.snapshot(),
+                    &resource_as,
+                    now() + Duration::from_secs(1),
+                )
+                .await
+                .err(),
+            Some(EnterpriseExchangeError::SubjectMappingRejected(
+                EnterpriseIdentityError::MappingUnavailable,
+            ))
+        );
+        assert_eq!(fixture.read_count(), 0);
+        assert_eq!(replay.reserved_aliases(), 2);
+        assert!(poster.take_recorded().is_empty());
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
+    });
+}
+
+#[test]
+fn enterprise_protected_credential_acquisition_keeps_deadline_cancellation_and_effect_ceiling() {
+    #[derive(Clone, Copy)]
+    enum Stop {
+        Cancel,
+        Deadline,
+        Revoke,
+        Restricted,
+        Rotate,
+    }
+    let (oidc_keys, _) = keys();
+    for stop in [
+        Stop::Cancel,
+        Stop::Deadline,
+        Stop::Revoke,
+        Stop::Restricted,
+        Stop::Rotate,
+    ] {
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .with_timer_driver(timer)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            let selected = profile(&["read"]);
+            let mappings = subject_mappings(&selected);
+            let fixture = CredentialStoreFixture::new(&cx).await;
+            let (provider, revision) = protected_exchange_provider(
+                &cx,
+                &fixture,
+                &selected,
+                mappings.snapshot(),
+                EnterpriseCredentialRole::Idp,
+                "pending-acquisition-secret",
+            )
+            .await;
+            let gate = fixture.pause_next_read();
+            let poster = ScriptedExchangePoster::new(vec![]);
+            let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+            {
+                let mut pending =
+                    std::pin::pin!(driver.exchange_oidc_code_for_identity_with_provider(
+                        &cx,
+                        grant_for_exchange(
+                            selected.clone(),
+                            EnterpriseResponsePolicy::default(),
+                            0x22
+                        ),
+                        &provider,
+                        mappings.snapshot(),
+                        &oidc_keys,
+                        now(),
+                    ));
+                poll_fn(|task| {
+                    assert!(pending.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(fixture.read_count(), 1);
+                assert!(poster.take_recorded().is_empty());
+                let expected = match stop {
+                    Stop::Cancel => {
+                        cx.set_cancel_requested(true);
+                        EnterpriseExchangeError::Cancelled
+                    }
+                    Stop::Deadline => {
+                        clock.advance(6_000_000_000);
+                        EnterpriseExchangeError::TimedOut
+                    }
+                    Stop::Revoke => {
+                        provider.revoke();
+                        EnterpriseExchangeError::CredentialRejected(
+                            EnterpriseCredentialError::Revoked,
+                        )
+                    }
+                    Stop::Restricted => EnterpriseExchangeError::RuntimeUnavailable,
+                    Stop::Rotate => {
+                        let binding = EnterpriseCredentialBinding::new(
+                            selected.clone(),
+                            mappings.snapshot().clone(),
+                            EnterpriseCredentialRole::Idp,
+                        )
+                        .unwrap();
+                        let record = binding
+                            .encode_record(
+                                EnterpriseClientSecret::try_new("replacement-during-read").unwrap(),
+                                2,
+                            )
+                            .unwrap();
+                        let next = fixture
+                            .store()
+                            .replace(
+                                &cx,
+                                &revision,
+                                record,
+                                cx.now().saturating_add_nanos(5_000_000_000),
+                            )
+                            .await
+                            .unwrap();
+                        provider
+                            .rotate(&revision, next, 2, Instant::now() + Duration::from_secs(60))
+                            .unwrap();
+                        EnterpriseExchangeError::CredentialRejected(
+                            EnterpriseCredentialError::Revoked,
+                        )
+                    }
+                };
+                if matches!(stop, Stop::Restricted) {
+                    poll_fn(|task| {
+                        let _restriction = Cx::push_restriction(
+                            asupersync::cx::cap::CapSet::<true, true, true, false, true>::MASK,
+                        );
+                        match pending.as_mut().poll(task) {
+                            Poll::Ready(result) => assert_eq!(result.err(), Some(expected)),
+                            Poll::Pending => {
+                                panic!("attenuated caller remained parked on credential storage")
+                            }
+                        }
+                        Poll::Ready(())
+                    })
+                    .await;
+                } else {
+                    assert_eq!(pending.await.err(), Some(expected));
+                }
+            }
+            gate.release();
+            assert_eq!(fixture.read_count(), 1);
+            assert!(poster.take_recorded().is_empty());
+            assert!(!driver.inner.busy.load(Ordering::Acquire));
+            if !matches!(stop, Stop::Revoke) {
+                // The failed operation did not cancel a fresh caller or consume
+                // another code. A later admitted operation reads its own record.
+                let sibling = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let fetcher = test_fetcher();
+                let poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+                    "idp.example",
+                    fetcher.root_identity(),
+                    oidc_token_body(),
+                ))]);
+                let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+                let result = driver
+                    .exchange_oidc_code_for_identity_with_provider(
+                        &sibling,
+                        grant_for_exchange(
+                            selected.clone(),
+                            EnterpriseResponsePolicy::default(),
+                            0x22,
+                        ),
+                        &provider,
+                        mappings.snapshot(),
+                        &oidc_keys,
+                        now(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    result.0,
+                    EnterpriseResponseOutcome::Success { .. }
+                ));
+                assert_eq!(fixture.read_count(), 2);
+                assert_eq!(poster.take_recorded().len(), 1);
+            }
+        });
+    }
+}
+
 #[test]
 fn enterprise_oidc_code_redemption_reaches_bearer_through_both_confidential_methods() {
     let (oidc_keys, jag_keys) = keys();
@@ -1427,6 +1938,232 @@ impl ExchangePoster for ParkedCodePoster {
 }
 
 #[test]
+fn enterprise_protected_credential_rotation_revokes_pending_post_and_next_post_uses_new_secret() {
+    let (oidc_keys, _) = keys();
+    for rotate in [false, true] {
+        run_exchange_async(async {
+            let cx = Cx::current().unwrap();
+            let selected = profile_with_authentication(
+                &["read"],
+                EnterpriseClientAuthentication::ClientSecretPost,
+                EnterpriseClientAuthentication::ClientSecretPost,
+            );
+            let mappings = subject_mappings(&selected);
+            let fixture = CredentialStoreFixture::new(&cx).await;
+            let (provider, revision) = protected_exchange_provider(
+                &cx,
+                &fixture,
+                &selected,
+                mappings.snapshot(),
+                EnterpriseCredentialRole::Idp,
+                "old-protected-secret",
+            )
+            .await;
+            let parked = Arc::new(ParkedCodePoster {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                held_lifetime: std::sync::Mutex::new(None),
+            });
+            let mut driver = EnterpriseExchangeDriver::new(
+                selected.clone(),
+                test_fetcher(),
+                EnterpriseResponsePolicy::default(),
+            )
+            .unwrap();
+            Arc::get_mut(&mut driver.inner).unwrap().test_post = Some(parked.clone());
+            {
+                let mut pending =
+                    std::pin::pin!(driver.exchange_oidc_code_for_identity_with_provider(
+                        &cx,
+                        grant_for_exchange(
+                            selected.clone(),
+                            EnterpriseResponsePolicy::default(),
+                            0x22
+                        ),
+                        &provider,
+                        mappings.snapshot(),
+                        &oidc_keys,
+                        now(),
+                    ));
+                poll_fn(|task| {
+                    assert!(pending.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(fixture.read_count(), 1);
+                assert_eq!(parked.calls.load(Ordering::SeqCst), 1);
+                if rotate {
+                    let binding = EnterpriseCredentialBinding::new(
+                        selected.clone(),
+                        mappings.snapshot().clone(),
+                        EnterpriseCredentialRole::Idp,
+                    )
+                    .unwrap();
+                    let record = binding
+                        .encode_record(
+                            EnterpriseClientSecret::try_new("new-protected-secret").unwrap(),
+                            2,
+                        )
+                        .unwrap();
+                    let next = fixture
+                        .store()
+                        .replace(
+                            &cx,
+                            &revision,
+                            record,
+                            cx.now().saturating_add_nanos(5_000_000_000),
+                        )
+                        .await
+                        .unwrap();
+                    provider
+                        .rotate(&revision, next, 2, Instant::now() + Duration::from_secs(60))
+                        .unwrap();
+                } else {
+                    provider.revoke();
+                }
+                assert_eq!(
+                    pending.await.err(),
+                    Some(EnterpriseExchangeError::CredentialRejected(
+                        EnterpriseCredentialError::Revoked,
+                    ))
+                );
+            }
+            assert_eq!(parked.calls.load(Ordering::SeqCst), 1);
+            // The transport seam deliberately retains the dispatch permit.
+            // Revocation releases this caller but cannot invent quiescence.
+            assert!(driver.inner.busy.load(Ordering::Acquire));
+            drop(parked.held_lifetime.lock().unwrap().take());
+            assert!(!driver.inner.busy.load(Ordering::Acquire));
+            let poster = ScriptedExchangePoster::new(if rotate {
+                vec![Ok(ok_exchange_response(
+                    "idp.example",
+                    driver.inner.fetcher.root_identity(),
+                    oidc_token_body(),
+                ))]
+            } else {
+                vec![]
+            });
+            Arc::get_mut(&mut driver.inner).unwrap().test_post = Some(poster.clone());
+            let next = driver
+                .exchange_oidc_code_for_identity_with_provider(
+                    &cx,
+                    grant_for_exchange(selected.clone(), EnterpriseResponsePolicy::default(), 0x22),
+                    &provider,
+                    mappings.snapshot(),
+                    &oidc_keys,
+                    now(),
+                )
+                .await;
+            if rotate {
+                assert!(matches!(
+                    next.unwrap().0,
+                    EnterpriseResponseOutcome::Success { .. }
+                ));
+                assert_eq!(fixture.read_count(), 2);
+                let posted = poster.take_recorded();
+                assert_eq!(posted.len(), 1);
+                assert!(
+                    posted[0]
+                        .body
+                        .ends_with("client_secret=new-protected-secret")
+                );
+                assert!(!posted[0].body.contains("old-protected-secret"));
+            } else {
+                assert_eq!(
+                    next.err(),
+                    Some(EnterpriseExchangeError::CredentialRejected(
+                        EnterpriseCredentialError::Revoked,
+                    ))
+                );
+                assert_eq!(fixture.read_count(), 1);
+                assert!(poster.take_recorded().is_empty());
+            }
+        });
+    }
+}
+
+#[test]
+fn enterprise_protected_credential_revocation_discards_a_ready_valid_signed_response() {
+    struct RevokingPoster {
+        inner: Arc<ScriptedExchangePoster>,
+        provider: Arc<EnterpriseClientCredentialProvider>,
+    }
+    impl ExchangePoster for RevokingPoster {
+        fn post<'a>(
+            &'a self,
+            cx: &'a Cx,
+            url: &'a GuardedHttpsUrl,
+            request: &'a GuardedHttpRequest,
+            lifetime: Arc<dyn Send + Sync>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let response = self.inner.post(cx, url, request, lifetime);
+            Box::pin(async move {
+                let result = response.await;
+                self.provider.revoke();
+                result
+            })
+        }
+    }
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let selected = profile(&["read"]);
+        let mappings = subject_mappings(&selected);
+        let fixture = CredentialStoreFixture::new(&cx).await;
+        let (provider, _) = protected_exchange_provider(
+            &cx,
+            &fixture,
+            &selected,
+            mappings.snapshot(),
+            EnterpriseCredentialRole::Idp,
+            "revoked-at-response",
+        )
+        .await;
+        let provider = Arc::new(provider);
+        let fetcher = test_fetcher();
+        let poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+            "idp.example",
+            fetcher.root_identity(),
+            oidc_token_body(),
+        ))]);
+        let mut driver = EnterpriseExchangeDriver::new(
+            selected.clone(),
+            fetcher,
+            EnterpriseResponsePolicy::default(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut driver.inner).unwrap().test_post = Some(Arc::new(RevokingPoster {
+            inner: Arc::clone(&poster),
+            provider: Arc::clone(&provider),
+        }));
+        let (oidc_keys, _) = keys();
+        assert_eq!(
+            driver
+                .exchange_oidc_code_for_identity_with_provider(
+                    &cx,
+                    grant_for_exchange(selected, EnterpriseResponsePolicy::default(), 0x22),
+                    &provider,
+                    mappings.snapshot(),
+                    &oidc_keys,
+                    now(),
+                )
+                .await
+                .err(),
+            Some(EnterpriseExchangeError::CredentialRejected(
+                EnterpriseCredentialError::Revoked,
+            ))
+        );
+        assert_eq!(fixture.read_count(), 1);
+        assert_eq!(poster.take_recorded().len(), 1);
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
+    });
+}
+
+#[test]
 fn enterprise_oidc_code_redemption_cancellation_and_deadline_retain_dispatch_custody() {
     let selected = profile(&["read"]);
     let (oidc_keys, _) = keys();
@@ -1721,12 +2458,15 @@ fn enterprise_exchange_driver_confidential_response_preserves_verification_and_r
             )
             .unwrap();
             let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&driver.inner.busy)).unwrap());
+            let secret = EnterpriseClientSecret::try_new("request-secret").unwrap();
+            let credential = ExchangeCredential::Local(&secret);
             let result = driver
                 .dispatch_post(
                     &cx,
                     &driver.inner.idp_token_url,
                     &request,
                     deadline,
+                    &credential,
                     Arc::clone(&permit),
                     || Ok(()),
                 )

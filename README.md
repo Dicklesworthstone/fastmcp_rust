@@ -1808,6 +1808,11 @@ response admission and local identity resolution separate:
   persistent MAC derivation, a registered restore-authority write intent, an
   atomic assertion-use store, and independent commit acknowledgment. It returns
   an exclusive reserved assertion only after the complete transaction succeeds.
+- `credentials::EnterpriseClientCredentialProvider` reads a confidential-client
+  secret from an exact, independently selected `PersistentBlobStore` revision.
+  Its protected record binds the complete profile, current identity snapshot,
+  credential role and generation. Rotation and revocation invalidate pending
+  reads and exchanges as well as credentials already acquired by the driver.
 
 The native OIDC sequence is
 `OidcCodeFlowConfiguration::prepare` →
@@ -1842,6 +1847,33 @@ snapshot and signed-token binding digests. Its usable lifetime cannot exceed
 either signed assertion or the mapping review. Code redemption does not bypass
 the durable replay boundary, and successful mapping does not create or link an
 account.
+
+For protected credential custody, provision separate IdP and resource-AS records
+using `EnterpriseCredentialBinding::new` and `encode_record`, then commit them
+with the registered protected store's `create` or `replace` operation. Retain
+each exact returned revision in trusted configuration and pass it, its
+credential generation and a monotonic validity deadline to
+`EnterpriseClientCredentialProvider::new`. The IdP role serves code redemption
+and ID-JAG exchange; the resource-AS role serves final JWT-bearer redemption.
+The backend cannot select a newer record or substitute another role or profile.
+
+Use the driver's `exchange_oidc_code_for_identity_with_provider`,
+`exchange_identity_for_id_jag_with_provider`, and
+`exchange_id_jag_for_access_token_with_provider` methods to consume those
+providers. Each requires the independently current identity snapshot. Input,
+key and subject-mapping admission precedes credential access, and acquisition,
+serialization, POST and response admission retain the original deadline and
+caller capability ceiling. A provider error ends the operation; these entry
+points do not accept a fallback plaintext secret.
+
+After committing a replacement record, `provider.rotate` selects its exact
+revision and a strictly higher credential generation. It immediately invalidates
+the prior generation, including exchanges waiting for a response.
+`provider.revoke` permanently revokes that provider. Neither operation cancels
+sibling caller contexts, and a refused exchange does not retry its grant.
+The protected store's external envelope, blob and restore-authority providers
+remain deployment trust boundaries. This component does not establish durable
+browser-flow custody or activate the complete enterprise authorization profile.
 
 To use that result with the native MCP HTTP client, create an
 `http::EnterpriseHttpPolicy` from the same admitted `EnterpriseProfile`, the

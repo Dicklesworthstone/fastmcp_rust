@@ -1153,7 +1153,9 @@ fn profile_generations(profile: &EnterpriseProfile) -> [u64; 9] {
     ]
 }
 
-fn profile_digest(profile: &EnterpriseProfile) -> Result<Sha256Digest, EnterpriseIdentityError> {
+pub(super) fn profile_digest(
+    profile: &EnterpriseProfile,
+) -> Result<Sha256Digest, EnterpriseIdentityError> {
     let mut encoded = IdentityEncoding::new(b"fastmcp-enterprise-identity-profile-v2");
     for value in profile_names(profile) {
         encoded.text(value)?;

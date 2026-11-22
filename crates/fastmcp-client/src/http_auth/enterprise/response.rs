@@ -7,7 +7,9 @@
 //! exchange, keeps the three grant forms distinct, and consumes inputs on every
 //! outcome. Resource-AS redemption requires an exact preexisting subject mapping
 //! between the original verified OIDC identity and its returned signed ID-JAG.
-//! It does not activate EMA or issue browser-flow, credential-custody or external
+//! Provider-backed entry points acquire role-bound credentials from an exact
+//! protected blob revision and retain revocable custody through the exchange.
+//! This does not activate EMA or issue browser-flow or external
 //! identity/deployment attestations. Those trust boundaries remain additional
 //! requirements for the complete enterprise profile. Embeddings run
 //! synchronous signature admission on their caller-owned bounded CPU lane.
@@ -38,6 +40,10 @@ use fastmcp_transport::{
     GuardedHttpPeerProvenance, GuardedHttpRequest, GuardedHttpsUrl,
 };
 
+use super::credentials::{
+    EnterpriseClientCredentialProvider, EnterpriseCredentialError, EnterpriseCredentialLease,
+    EnterpriseCredentialRole,
+};
 use super::identity::{
     EnterpriseIdentityError, EnterpriseIdentitySnapshotKey, EnterpriseSubjectMappingTable,
     LocalEnterpriseSubjectId,
@@ -668,7 +674,7 @@ impl EnterpriseClientSecret {
         Ok(Self { value })
     }
 
-    fn as_str(&self) -> &str {
+    pub(super) fn as_str(&self) -> &str {
         self.value.as_str()
     }
 }
@@ -699,6 +705,7 @@ pub enum EnterpriseExchangeError {
     CodeFlowRejected(OidcCodeFlowError),
     ResponseRejected(EnterpriseResponseError),
     SubjectMappingRejected(EnterpriseIdentityError),
+    CredentialRejected(EnterpriseCredentialError),
     CredentialBindingFailed,
 }
 
@@ -738,6 +745,7 @@ impl fmt::Display for EnterpriseExchangeError {
             Self::CodeFlowRejected(error) => error.fmt(formatter),
             Self::ResponseRejected(error) => error.fmt(formatter),
             Self::SubjectMappingRejected(error) => error.fmt(formatter),
+            Self::CredentialRejected(error) => error.fmt(formatter),
             Self::CredentialBindingFailed => {
                 formatter.write_str("enterprise access token could not be bound to HTTPS resource")
             }
@@ -1105,13 +1113,69 @@ impl EnterpriseExchangeDriver {
         ),
         EnterpriseExchangeError,
     > {
+        self.exchange_oidc_code_using(
+            cx,
+            grant,
+            ExchangeCredentials::Local(idp_client_secret),
+            oidc_keys,
+            received_at,
+        )
+        .await
+    }
+
+    /// Redeems a local OIDC code with an exact protected IdP credential record.
+    /// The independently selected current mapping snapshot and full profile
+    /// must match the provider before its authenticated store read. Acquisition
+    /// and POST share one original deadline; rotation/revocation invalidates
+    /// either pending stage. This does not attest browser or deployment custody.
+    pub async fn exchange_oidc_code_for_identity_with_provider(
+        &self,
+        cx: &Cx,
+        grant: OidcCodeGrant,
+        provider: &EnterpriseClientCredentialProvider,
+        expected_snapshot: &EnterpriseIdentitySnapshotKey,
+        oidc_keys: &OidcVerificationKeys,
+        received_at: SystemTime,
+    ) -> Result<
+        (
+            EnterpriseResponseOutcome<EnterpriseIdentityAssertion>,
+            EnterpriseExchangeObservation,
+        ),
+        EnterpriseExchangeError,
+    > {
+        self.exchange_oidc_code_using(
+            cx,
+            grant,
+            ExchangeCredentials::Protected {
+                provider,
+                expected_snapshot,
+            },
+            oidc_keys,
+            received_at,
+        )
+        .await
+    }
+
+    async fn exchange_oidc_code_using(
+        &self,
+        cx: &Cx,
+        grant: OidcCodeGrant,
+        credentials: ExchangeCredentials<'_>,
+        oidc_keys: &OidcVerificationKeys,
+        received_at: SystemTime,
+    ) -> Result<
+        (
+            EnterpriseResponseOutcome<EnterpriseIdentityAssertion>,
+            EnterpriseExchangeObservation,
+        ),
+        EnterpriseExchangeError,
+    > {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let clock = ExchangeClock::new(received_at, admitted.now());
         let expires_at = grant.expires_at();
-        let (request, response_admission) = grant.into_token_request(
+        grant.admit_token_request(
             &self.inner.profile,
             self.inner.response_policy,
-            idp_client_secret.as_str(),
             oidc_keys,
             clock.wall_now()?,
         )?;
@@ -1123,12 +1187,29 @@ impl EnterpriseExchangeDriver {
             self.inner.fetcher.policy().deadline(),
         )?;
         let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
+        let (credential, deadline) = credentials
+            .acquire(
+                &admitted,
+                &self.inner.profile,
+                EnterpriseCredentialRole::Idp,
+                deadline,
+                || Ok(()),
+            )
+            .await?;
+        let (request, response_admission) = grant.into_token_request(
+            &self.inner.profile,
+            self.inner.response_policy,
+            credential.as_str()?,
+            oidc_keys,
+            clock.wall_now()?,
+        )?;
         let response = self
             .dispatch_post(
                 &admitted,
                 &self.inner.idp_token_url,
                 &request,
                 deadline,
+                &credential,
                 Arc::clone(&permit),
                 // No identity assertion exists until this response is verified.
                 // Replay reservation is mandatory in the subsequent stage.
@@ -1152,6 +1233,7 @@ impl EnterpriseExchangeDriver {
                 )
                 .map_err(EnterpriseExchangeError::CodeFlowRejected)
         })?;
+        credential.check()?;
         if let EnterpriseResponseOutcome::Success {
             value: assertion, ..
         } = &outcome
@@ -1176,6 +1258,71 @@ impl EnterpriseExchangeDriver {
         cx: &Cx,
         reserved: ReservedIdentityAssertion,
         idp_client_secret: &EnterpriseClientSecret,
+        id_jag_keys: &IdJagVerificationKeys,
+        idp_tenant: TenantExpectation<'_>,
+        resource_tenant: ResourceTenantExpectation<'_>,
+        received_at: SystemTime,
+    ) -> Result<
+        (
+            EnterpriseResponseOutcome<EnterpriseExchangedIdJag>,
+            EnterpriseExchangeObservation,
+        ),
+        EnterpriseExchangeError,
+    > {
+        self.exchange_identity_using(
+            cx,
+            reserved,
+            ExchangeCredentials::Local(idp_client_secret),
+            id_jag_keys,
+            idp_tenant,
+            resource_tenant,
+            received_at,
+        )
+        .await
+    }
+
+    /// Exchanges a durably reserved identity using only the selected protected
+    /// IdP credential provider. Input/key/tenant admission precedes secret
+    /// acquisition; the replay guard stays live through acquisition and POST.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn exchange_identity_for_id_jag_with_provider(
+        &self,
+        cx: &Cx,
+        reserved: ReservedIdentityAssertion,
+        provider: &EnterpriseClientCredentialProvider,
+        expected_snapshot: &EnterpriseIdentitySnapshotKey,
+        id_jag_keys: &IdJagVerificationKeys,
+        idp_tenant: TenantExpectation<'_>,
+        resource_tenant: ResourceTenantExpectation<'_>,
+        received_at: SystemTime,
+    ) -> Result<
+        (
+            EnterpriseResponseOutcome<EnterpriseExchangedIdJag>,
+            EnterpriseExchangeObservation,
+        ),
+        EnterpriseExchangeError,
+    > {
+        self.exchange_identity_using(
+            cx,
+            reserved,
+            ExchangeCredentials::Protected {
+                provider,
+                expected_snapshot,
+            },
+            id_jag_keys,
+            idp_tenant,
+            resource_tenant,
+            received_at,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn exchange_identity_using(
+        &self,
+        cx: &Cx,
+        reserved: ReservedIdentityAssertion,
+        credentials: ExchangeCredentials<'_>,
         id_jag_keys: &IdJagVerificationKeys,
         idp_tenant: TenantExpectation<'_>,
         resource_tenant: ResourceTenantExpectation<'_>,
@@ -1216,6 +1363,15 @@ impl EnterpriseExchangeDriver {
             self.inner.fetcher.policy().deadline(),
         )?;
         let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
+        let (credential, deadline) = credentials
+            .acquire(
+                &admitted,
+                profile,
+                EnterpriseCredentialRole::Idp,
+                deadline,
+                || reservation.check().map_err(map_reservation_error),
+            )
+            .await?;
         let scope_wire = profile.requested_scopes().as_wire_value();
         let mut fields: Vec<(&str, &str)> = vec![
             ("grant_type", TOKEN_EXCHANGE_GRANT),
@@ -1231,7 +1387,7 @@ impl EnterpriseExchangeDriver {
         let request = build_confidential_token_request(
             profile.idp_authentication(),
             profile.idp_client_id(),
-            idp_client_secret.as_str(),
+            credential.as_str()?,
             &mut fields,
         )?;
         let response = self
@@ -1240,6 +1396,7 @@ impl EnterpriseExchangeDriver {
                 &self.inner.idp_token_url,
                 &request,
                 deadline,
+                &credential,
                 Arc::clone(&permit),
                 || reservation.check().map_err(map_reservation_error),
             )
@@ -1264,6 +1421,7 @@ impl EnterpriseExchangeDriver {
                 )
                 .map_err(EnterpriseExchangeError::ResponseRejected)
         })?;
+        credential.check()?;
         reservation.check().map_err(map_reservation_error)?;
         let outcome = match outcome {
             EnterpriseResponseOutcome::Success { value, cache } => {
@@ -1321,6 +1479,64 @@ impl EnterpriseExchangeDriver {
         ),
         EnterpriseExchangeError,
     > {
+        self.exchange_id_jag_using(
+            cx,
+            exchanged,
+            mappings,
+            expected_snapshot,
+            ExchangeCredentials::Local(resource_as_client_secret),
+            received_at,
+        )
+        .await
+    }
+
+    /// Redeems the exact exchanged assertion using only a protected Resource-AS
+    /// credential. The required subject mapping is resolved before any provider
+    /// access and the provider must bind that same independently current snapshot.
+    pub async fn exchange_id_jag_for_access_token_with_provider(
+        &self,
+        cx: &Cx,
+        exchanged: EnterpriseExchangedIdJag,
+        mappings: &EnterpriseSubjectMappingTable,
+        expected_snapshot: &EnterpriseIdentitySnapshotKey,
+        provider: &EnterpriseClientCredentialProvider,
+        received_at: SystemTime,
+    ) -> Result<
+        (
+            EnterpriseResponseOutcome<EnterpriseBoundAccessToken>,
+            EnterpriseExchangeObservation,
+        ),
+        EnterpriseExchangeError,
+    > {
+        self.exchange_id_jag_using(
+            cx,
+            exchanged,
+            mappings,
+            expected_snapshot,
+            ExchangeCredentials::Protected {
+                provider,
+                expected_snapshot,
+            },
+            received_at,
+        )
+        .await
+    }
+
+    async fn exchange_id_jag_using(
+        &self,
+        cx: &Cx,
+        exchanged: EnterpriseExchangedIdJag,
+        mappings: &EnterpriseSubjectMappingTable,
+        expected_snapshot: &EnterpriseIdentitySnapshotKey,
+        credentials: ExchangeCredentials<'_>,
+        received_at: SystemTime,
+    ) -> Result<
+        (
+            EnterpriseResponseOutcome<EnterpriseBoundAccessToken>,
+            EnterpriseExchangeObservation,
+        ),
+        EnterpriseExchangeError,
+    > {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let clock = ExchangeClock::new(received_at, admitted.now());
         let profile = &self.inner.profile;
@@ -1370,6 +1586,18 @@ impl EnterpriseExchangeDriver {
             self.inner.fetcher.policy().deadline(),
         )?;
         let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&self.inner.busy))?);
+        let (credential, deadline) = credentials
+            .acquire(
+                &admitted,
+                profile,
+                EnterpriseCredentialRole::ResourceAuthorizationServer,
+                deadline,
+                || {
+                    reservation.check().map_err(map_reservation_error)?;
+                    subject_binding.check(clock.wall_now()?)
+                },
+            )
+            .await?;
         let mut fields: Vec<(&str, &str)> = vec![
             ("grant_type", JWT_BEARER_GRANT),
             ("assertion", id_jag.compact_assertion.as_str()),
@@ -1377,7 +1605,7 @@ impl EnterpriseExchangeDriver {
         let request = build_confidential_token_request(
             profile.resource_as_authentication(),
             profile.resource_as_client_id(),
-            resource_as_client_secret.as_str(),
+            credential.as_str()?,
             &mut fields,
         )?;
         let response = self
@@ -1386,6 +1614,7 @@ impl EnterpriseExchangeDriver {
                 &self.inner.resource_as_token_url,
                 &request,
                 deadline,
+                &credential,
                 Arc::clone(&permit),
                 || {
                     reservation.check().map_err(map_reservation_error)?;
@@ -1410,6 +1639,7 @@ impl EnterpriseExchangeDriver {
                 )
                 .map_err(EnterpriseExchangeError::ResponseRejected)
         })?;
+        credential.check()?;
         reservation.check().map_err(map_reservation_error)?;
         subject_binding.check(clock.wall_now()?)?;
         let mapped = match outcome {
@@ -1441,42 +1671,32 @@ impl EnterpriseExchangeDriver {
         Ok((mapped, observation))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_post(
         &self,
         cx: &Cx,
         url: &GuardedHttpsUrl,
         request: &GuardedHttpRequest,
         deadline: ExchangeDeadline,
+        credential: &ExchangeCredential<'_>,
         permit: Arc<ExchangePermit>,
         check_reservation: impl Fn() -> Result<(), EnterpriseExchangeError>,
     ) -> Result<GuardedHttpConfidentialResponse, EnterpriseExchangeError> {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
-        let response = CallerContextFuture::new(&admitted, async {
-            let mut timer = std::pin::pin!(Sleep::new(deadline.runtime));
-            let (_sender, mut receiver) = oneshot::channel::<()>();
-            let mut cancelled = std::pin::pin!(receiver.recv(&admitted));
-            let mut call = std::pin::pin!(async {
-                self.send_post(&admitted, url, request, permit.clone())
-                    .await
-            });
-            poll_fn(|task| {
-                check_reservation()?;
-                deadline.check(&admitted)?;
-                if cancelled.as_mut().poll(task).is_ready() {
-                    return Poll::Ready(Err(EnterpriseExchangeError::Cancelled));
-                }
-                if timer.as_mut().poll(task).is_ready() {
-                    deadline.check(&admitted)?;
-                    return Poll::Ready(Err(EnterpriseExchangeError::TimedOut));
-                }
-                let res = call.as_mut().poll(task);
-                check_reservation()?;
-                deadline.check(&admitted)?;
-                res
-            })
-            .await
-        })
-        .await?;
+        let response = deadline
+            .run_with_credential(
+                &admitted,
+                async {
+                    self.send_post(&admitted, url, request, permit.clone())
+                        .await
+                },
+                credential.revoked(),
+                || {
+                    check_reservation()?;
+                    credential.check()
+                },
+            )
+            .await?;
 
         if response.redirect().is_some() {
             return Err(EnterpriseExchangeError::RedirectRefused);
@@ -1514,6 +1734,94 @@ impl EnterpriseExchangeDriver {
         )
         .await
         .map_err(map_exchange_fetch_error)
+    }
+}
+
+/// Raw local primitives and protected custody have distinct public entry
+/// points. The selected source is closed before any asynchronous work, so a
+/// provider refusal can never fall back to a caller-supplied secret.
+enum ExchangeCredentials<'a> {
+    Local(&'a EnterpriseClientSecret),
+    Protected {
+        provider: &'a EnterpriseClientCredentialProvider,
+        expected_snapshot: &'a EnterpriseIdentitySnapshotKey,
+    },
+}
+
+impl<'a> ExchangeCredentials<'a> {
+    async fn acquire(
+        self,
+        admitted: &Cx,
+        profile: &EnterpriseProfile,
+        role: EnterpriseCredentialRole,
+        deadline: ExchangeDeadline,
+        check_input: impl Fn() -> Result<(), EnterpriseExchangeError>,
+    ) -> Result<(ExchangeCredential<'a>, ExchangeDeadline), EnterpriseExchangeError> {
+        deadline.check(admitted)?;
+        check_input()?;
+        match self {
+            Self::Local(secret) => Ok((ExchangeCredential::Local(secret), deadline)),
+            Self::Protected {
+                provider,
+                expected_snapshot,
+            } => {
+                let selected = provider
+                    .select(profile, expected_snapshot, role)
+                    .map_err(EnterpriseExchangeError::CredentialRejected)?;
+                let deadline = deadline.cap_until(admitted, selected.valid_until())?;
+                let lease = deadline
+                    .run_with_credential(
+                        admitted,
+                        async {
+                            selected
+                                .read(admitted, deadline.runtime)
+                                .await
+                                .map_err(EnterpriseExchangeError::CredentialRejected)
+                        },
+                        selected.revoked(),
+                        || {
+                            check_input()?;
+                            selected
+                                .check()
+                                .map_err(EnterpriseExchangeError::CredentialRejected)
+                        },
+                    )
+                    .await?;
+                Ok((ExchangeCredential::Protected(lease), deadline))
+            }
+        }
+    }
+}
+
+enum ExchangeCredential<'a> {
+    Local(&'a EnterpriseClientSecret),
+    Protected(EnterpriseCredentialLease),
+}
+
+impl ExchangeCredential<'_> {
+    fn as_str(&self) -> Result<&str, EnterpriseExchangeError> {
+        match self {
+            Self::Local(secret) => Ok(secret.as_str()),
+            Self::Protected(lease) => lease
+                .as_str()
+                .map_err(EnterpriseExchangeError::CredentialRejected),
+        }
+    }
+
+    fn check(&self) -> Result<(), EnterpriseExchangeError> {
+        match self {
+            Self::Local(_) => Ok(()),
+            Self::Protected(lease) => lease
+                .check()
+                .map_err(EnterpriseExchangeError::CredentialRejected),
+        }
+    }
+
+    async fn revoked(&self) {
+        match self {
+            Self::Local(_) => std::future::pending().await,
+            Self::Protected(lease) => lease.revoked().await,
+        }
     }
 }
 
@@ -1617,6 +1925,67 @@ impl ExchangeDeadline {
             }
             Ok(())
         })
+    }
+
+    fn cap_until(
+        self,
+        admitted: &Cx,
+        valid_until: Instant,
+    ) -> Result<Self, EnterpriseExchangeError> {
+        let remaining = valid_until
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(EnterpriseExchangeError::CredentialRejected(
+                EnterpriseCredentialError::Expired,
+            ))?;
+        let nanos = u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX);
+        let capped = Self {
+            monotonic: self.monotonic.min(valid_until),
+            runtime: self.runtime.min(admitted.now().saturating_add_nanos(nanos)),
+        };
+        capped.check(admitted)?;
+        Ok(capped)
+    }
+
+    /// One caller-owned polling boundary covers protected acquisition and the
+    /// native POST. Rotation has its own wakeup; neither it nor cancellation
+    /// waits for the underlying provider or socket to become ready.
+    async fn run_with_credential<T>(
+        self,
+        admitted: &Cx,
+        operation: impl Future<Output = Result<T, EnterpriseExchangeError>>,
+        revoked: impl Future<Output = ()>,
+        check_authority: impl Fn() -> Result<(), EnterpriseExchangeError>,
+    ) -> Result<T, EnterpriseExchangeError> {
+        CallerContextFuture::new(admitted, async {
+            let mut timer = std::pin::pin!(Sleep::new(self.runtime));
+            let (_sender, mut receiver) = oneshot::channel::<()>();
+            let mut cancelled = std::pin::pin!(receiver.recv(admitted));
+            let mut revoked = std::pin::pin!(revoked);
+            let mut operation = std::pin::pin!(operation);
+            poll_fn(|task| {
+                check_authority()?;
+                self.check(admitted)?;
+                if cancelled.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(EnterpriseExchangeError::Cancelled));
+                }
+                if revoked.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(EnterpriseExchangeError::CredentialRejected(
+                        EnterpriseCredentialError::Revoked,
+                    )));
+                }
+                if timer.as_mut().poll(task).is_ready() {
+                    self.check(admitted)?;
+                    return Poll::Ready(Err(EnterpriseExchangeError::TimedOut));
+                }
+                let result = operation.as_mut().poll(task);
+                check_authority()?;
+                self.check(admitted)?;
+                result
+            })
+            .await
+        })
+        .await
     }
 
     /// A validated token is still private until the caller and original

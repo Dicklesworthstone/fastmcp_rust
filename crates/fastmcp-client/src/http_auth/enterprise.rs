@@ -14,12 +14,15 @@
 //! The guarded two-stage token driver consumes a completed assertion reservation
 //! and returns an exclusively owned, resource-bound bearer credential. This
 //! low-level dispatch component does not activate the MCP extension or launch a
-//! browser. Durable browser-flow custody, confidential credential providers and
-//! independently attested deployment/identity authority remain separate work.
+//! browser. Protected-blob credential providers bind each native POST to an
+//! independently selected role, complete profile and reviewed identity snapshot.
+//! Durable browser-flow custody and independently attested deployment/identity
+//! authority remain separate work.
 //! A local byte digest or subject lookup is not a launch or authorization receipt.
 //! The opt-in HTTP policy owner binds an already exchanged grant to fresh
 //! admitted metadata and checks its declaration on each outgoing MCP request.
 
+pub mod credentials;
 /// Post-exchange, request-local enterprise binding for the native HTTP client.
 pub mod http;
 pub mod identity;
