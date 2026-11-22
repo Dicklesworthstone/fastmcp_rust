@@ -4668,8 +4668,13 @@ fn validate_server_http_route_configuration(
         server.http_config.readiness_path.as_str(),
     ]
     .into_iter()
-    .chain(server.http_config.metrics.as_ref().map(HttpMetricsConfig::path))
-    {
+    .chain(
+        server
+            .http_config
+            .metrics
+            .as_ref()
+            .map(HttpMetricsConfig::path),
+    ) {
         if !path.starts_with('/')
             || path.starts_with("//")
             || path.len() > 1024
@@ -9224,9 +9229,12 @@ fn http_diagnostic_response(
             HttpDiagnosticRoute::Metrics => http_metrics::metrics_response(
                 operator,
                 server.http_config.metrics.as_ref().is_some_and(|metrics| {
-                    metrics.authorizes(request.headers.iter().map(|(name, value)| {
-                        (name.as_str(), value.as_str())
-                    }))
+                    metrics.authorizes(
+                        request
+                            .headers
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_str())),
+                    )
                 }),
             ),
         }

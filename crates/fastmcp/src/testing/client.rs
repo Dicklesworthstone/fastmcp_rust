@@ -1847,9 +1847,7 @@ mod tests {
         assert!(debug_before.contains("protocol_mode: Modern2026"));
         assert!(debug_before.contains("negotiated_mode: None"));
 
-        let init = client
-            .initialize()
-            .expect("modern discovery must succeed");
+        let init = client.initialize().expect("modern discovery must succeed");
         assert_eq!(init.protocol_version, FINAL_PROTOCOL_VERSION);
         let debug_after = format!("{client:?}");
         assert!(debug_after.contains("negotiated_mode: Some(Modern2026)"));

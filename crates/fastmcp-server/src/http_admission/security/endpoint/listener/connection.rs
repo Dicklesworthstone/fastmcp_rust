@@ -117,7 +117,11 @@ pub(super) async fn serve(
             return;
         }
         Ingress::Request { request, cors } => (request, cors),
-        Ingress::Diagnostic { route, authorized, cors } => {
+        Ingress::Diagnostic {
+            route,
+            authorized,
+            cors,
+        } => {
             let Some(current) = admission.take() else {
                 return;
             };
@@ -131,15 +135,14 @@ pub(super) async fn serve(
                 crate::HttpDiagnosticRoute::Health => {
                     HttpResponse::ok().with_json(&serde_json::json!({ "status": "ok" }))
                 }
-                crate::HttpDiagnosticRoute::Readiness => {
-                    crate::http_readiness_response(
-                        endpoint.http_operator.as_ref(),
-                        crate::http_task_store_observation(&endpoint.server),
-                    )
-                }
-                crate::HttpDiagnosticRoute::Metrics => {
-                    crate::http_metrics::metrics_response(endpoint.http_operator.as_ref(), authorized)
-                }
+                crate::HttpDiagnosticRoute::Readiness => crate::http_readiness_response(
+                    endpoint.http_operator.as_ref(),
+                    crate::http_task_store_observation(&endpoint.server),
+                ),
+                crate::HttpDiagnosticRoute::Metrics => crate::http_metrics::metrics_response(
+                    endpoint.http_operator.as_ref(),
+                    authorized,
+                ),
             };
             buffered(
                 cx,

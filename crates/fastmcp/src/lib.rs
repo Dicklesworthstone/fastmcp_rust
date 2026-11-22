@@ -590,9 +590,9 @@ pub use fastmcp_core::{
 };
 pub use fastmcp_core::{
     OperatorCorrelationCapacity, OperatorExecutorCapacity, OperatorExecutorSnapshot,
-    OperatorExecutorState, OperatorHttpConnections, OperatorRequestCapacity,
-    OperatorTaskExecution, OperatorTaskRetention, OperatorTaskSnapshot, OperatorTaskStates,
-    OperatorTaskStorage, OperatorTaskStore,
+    OperatorExecutorState, OperatorHttpConnections, OperatorRequestCapacity, OperatorTaskExecution,
+    OperatorTaskRetention, OperatorTaskSnapshot, OperatorTaskStates, OperatorTaskStorage,
+    OperatorTaskStore,
 };
 // The established root `NotificationSender` is the server router callback;
 // expose the McpContext progress capability without changing that legacy name.
@@ -3551,8 +3551,8 @@ pub mod modern {
         FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
         InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
         TaskOperatorHandle, TaskRetentionAdministrator, TaskRetentionAuditPage,
-        TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
-        TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+        TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
+        TaskRetentionReclamation, TaskRetentionTarget,
     };
 
     #[cfg(all(feature = "apps", feature = "tasks"))]

@@ -23,7 +23,8 @@ const MAX_REQUEST_LINE_BYTES: usize = 8192;
 const MAX_EXPECTATION_MEMBERS: usize = 16;
 const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
-pub(super) enum Ingress {    Request {
+pub(super) enum Ingress {
+    Request {
         request: Request,
         cors: CorsResponseHeaders,
     },
@@ -37,7 +38,8 @@ pub(super) enum Ingress {    Request {
     Continue,
 }
 
-enum AdmittedHead {    Post {
+enum AdmittedHead {
+    Post {
         cors: CorsResponseHeaders,
         send_continue: bool,
     },
@@ -136,7 +138,11 @@ impl SecuredCodec {
                     Some(HttpDiagnosticRoute::Health)
                 } else if path == readiness {
                     Some(HttpDiagnosticRoute::Readiness)
-                } else if self.metrics.as_ref().is_some_and(|metrics| path == metrics.path()) {
+                } else if self
+                    .metrics
+                    .as_ref()
+                    .is_some_and(|metrics| path == metrics.path())
+                {
                     Some(HttpDiagnosticRoute::Metrics)
                 } else {
                     None
@@ -286,11 +292,17 @@ impl SecuredCodec {
                 if let Some(route) = diagnostic {
                     let authorized = route != HttpDiagnosticRoute::Metrics
                         || self.metrics.as_ref().is_some_and(|metrics| {
-                            metrics.authorizes(headers.iter().map(|(name, value)| {
-                                (name.as_str(), value.as_str())
-                            }))
+                            metrics.authorizes(
+                                headers
+                                    .iter()
+                                    .map(|(name, value)| (name.as_str(), value.as_str())),
+                            )
                         });
-                    return Ok(AdmittedHead::Diagnostic { route, authorized, cors });
+                    return Ok(AdmittedHead::Diagnostic {
+                        route,
+                        authorized,
+                        cors,
+                    });
                 }
                 // RFC 9110 10.1.1: never wait for content before acknowledging
                 // an admitted HTTP/1.1 expectation. HTTP/1.0 ignores it, and no
@@ -373,10 +385,18 @@ impl Decoder for SecuredCodec {
                     self.finished = true;
                     return Ok(Some(Ingress::Immediate(response)));
                 }
-                Ok(AdmittedHead::Diagnostic { route, authorized, cors }) => {
+                Ok(AdmittedHead::Diagnostic {
+                    route,
+                    authorized,
+                    cors,
+                }) => {
                     source.clear();
                     self.finished = true;
-                    return Ok(Some(Ingress::Diagnostic { route, authorized, cors }));
+                    return Ok(Some(Ingress::Diagnostic {
+                        route,
+                        authorized,
+                        cors,
+                    }));
                 }
                 Ok(AdmittedHead::Post {
                     cors,

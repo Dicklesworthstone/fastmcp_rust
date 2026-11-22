@@ -1450,8 +1450,7 @@ impl Drop for ObservedExchangeGrant {
 #[test]
 fn enterprise_exchange_response_admission_keeps_live_verified_grants() {
     let virtual_clock = Arc::new(asupersync::time::VirtualClock::new());
-    let timer =
-        asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&virtual_clock));
+    let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&virtual_clock));
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .with_timer_driver(timer)
         .build()
@@ -1493,9 +1492,8 @@ fn enterprise_exchange_response_admission_discards_verified_grants_after_cancell
     for stage in 0..3 {
         for terminal in 0..4 {
             let virtual_clock = Arc::new(asupersync::time::VirtualClock::new());
-            let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(
-                &virtual_clock,
-            ));
+            let timer =
+                asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&virtual_clock));
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .with_timer_driver(timer)
                 .build()

@@ -2779,8 +2779,8 @@ impl InMemoryFinalTaskPayloadAccounting {
                 owner.bytes -= released;
                 let is_saturated = owner.tasks >= self.max_tasks_per_owner
                     || owner.bytes >= self.max_bytes_per_owner;
-                self.saturated_owners = self.saturated_owners - usize::from(was_saturated)
-                    + usize::from(is_saturated);
+                self.saturated_owners =
+                    self.saturated_owners - usize::from(was_saturated) + usize::from(is_saturated);
             }
         }
     }
@@ -2796,8 +2796,8 @@ impl InMemoryFinalTaskPayloadAccounting {
                 owner.bytes -= charge.total + charge.cancellation_reserve;
                 let is_saturated = owner.tasks >= self.max_tasks_per_owner
                     || owner.bytes >= self.max_bytes_per_owner;
-                self.saturated_owners = self.saturated_owners - usize::from(was_saturated)
-                    + usize::from(is_saturated);
+                self.saturated_owners =
+                    self.saturated_owners - usize::from(was_saturated) + usize::from(is_saturated);
                 if owner.tasks == 0 {
                     self.owners.remove(&charge.owner);
                 }

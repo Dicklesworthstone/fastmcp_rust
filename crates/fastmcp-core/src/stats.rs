@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 mod prometheus;
 
 pub use prometheus::{
-    MAX_OPERATOR_PROMETHEUS_BYTES, OPERATOR_PROMETHEUS_CONTENT_TYPE, OPERATOR_PROMETHEUS_SCHEMA_VERSION,
-    OperatorMetricsError,
+    MAX_OPERATOR_PROMETHEUS_BYTES, OPERATOR_PROMETHEUS_CONTENT_TYPE,
+    OPERATOR_PROMETHEUS_SCHEMA_VERSION, OperatorMetricsError,
 };
 
 /// Frozen protocol policy for one observed endpoint generation.
