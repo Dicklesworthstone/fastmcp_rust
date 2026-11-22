@@ -47270,9 +47270,10 @@ exec sleep 2
     /// Reads the peer side of an exchange the client abandoned and requires
     /// that no further request byte arrives. Before response headers the client
     /// resets the socket, because a clean FIN would read as a legal request
-    /// write-half close and leave the handler running (6ecb1d6d). After them it
-    /// may close cleanly, or the kernel may reset a socket closed with unread
-    /// response bytes.
+    /// write-half close and leave the handler running (6ecb1d6d). Incomplete
+    /// SSE responses also reset until their protocol terminal is admitted.
+    /// Other responses may close cleanly, or the kernel may reset a socket
+    /// closed with unread response bytes.
     #[cfg(unix)]
     fn assert_abandoned_http_exchange_closed(
         stream: &mut TcpStream,
@@ -48629,8 +48630,11 @@ exec sleep 2
             let request = read_http_cache_test_request(&mut sibling);
             assert_eq!(request["id"], 3);
             write_http_cache_test_response(&mut sibling, "application/json", br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"com.example/raw-result","value":33}}"#);
-            let mut byte = [0_u8; 1];
-            assert!(matches!(pending.read(&mut byte), Ok(0)));
+            assert_abandoned_http_exchange_closed(
+                &mut pending,
+                true,
+                "cancellation must close its owned response body",
+            );
             assert!(
                 matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
                 "resuming a dropped event wait must not send another POST"
@@ -48769,10 +48773,10 @@ exec sleep 2
             assert_eq!(request["id"], 2);
             pending.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
             pending.flush().unwrap();
-            let mut byte = [0_u8; 1];
-            assert!(
-                matches!(pending.read(&mut byte), Ok(0)),
-                "timeout must release its owned response body"
+            assert_abandoned_http_exchange_closed(
+                &mut pending,
+                true,
+                "timeout must release its owned response body",
             );
             let mut sibling = accept_owned_extension_peer(&listener);
             let request = read_http_cache_test_request(&mut sibling);
