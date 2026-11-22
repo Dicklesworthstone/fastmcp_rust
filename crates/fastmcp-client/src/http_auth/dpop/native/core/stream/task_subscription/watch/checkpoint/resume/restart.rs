@@ -31,7 +31,7 @@ use fastmcp_protocol::FinalRequestMeta;
 use super::super::super::{DpopTaskWatchError, DpopTaskWatchPolicy, WatchState};
 use super::{
     DpopTaskResumeError, DpopTaskResumeSnapshot, TaskResumeBinding, TaskResumeChange,
-    TaskResumeError, TaskResumeRecord,
+    TaskResumeError, TaskResumeRecord, resume_read_deadline,
 };
 use crate::http_auth::caller::with_caller;
 use crate::http_auth::dpop::native::core::stream::DpopStreamLimits;
@@ -508,20 +508,31 @@ impl DpopTaskRestart<'_> {
                 let budget = self.budget.clone();
                 self.lifetime
                     .during(cx, cancellation, &owner, credential, supplied, async {
-                        let observed = client
-                            .reconcile_task_resume_with_state(
-                                caller,
-                                cancellation,
-                                credential,
-                                metadata,
-                                current,
-                                pending,
-                                bounds,
-                                state,
-                                Some(budget),
-                                &mut |_| true,
-                            )
-                            .await;
+                        let observed = match resume_read_deadline(
+                            caller,
+                            current,
+                            pending,
+                            client.resource().as_str(),
+                        ) {
+                            Ok(retention) => {
+                                client
+                                    .reconcile_task_resume_with_state(
+                                        caller,
+                                        cancellation,
+                                        credential,
+                                        metadata,
+                                        current,
+                                        pending,
+                                        bounds,
+                                        retention,
+                                        state,
+                                        Some(budget),
+                                        &mut |_| true,
+                                    )
+                                    .await
+                            }
+                            Err(error) => Err(error.into()),
+                        };
                         let observed = match observed {
                             Ok(snapshot) => DpopTaskRestartOutcome::Reconciled(snapshot),
                             Err(DpopTaskResumeError::Resume(TaskResumeError::Unavailable)) => {
