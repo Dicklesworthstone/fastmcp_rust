@@ -34,8 +34,9 @@ use super::{
     forward_notification, upstream_error,
 };
 
-/// Local capability declarations for the explicitly supplied input handler.
-/// All flags default to false. These are not copied from downstream metadata.
+/// Local input permissions for a host handler or the downstream MRTR adapter.
+/// All flags default to false. Host handlers advertise these declarations;
+/// downstream forwarding intersects them with the admitted client's support.
 /// Sampling tools/context also enable basic sampling; neither enables the other.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagedOAuthInputCapabilities {
@@ -48,7 +49,7 @@ pub struct ManagedOAuthInputCapabilities {
 }
 
 impl ManagedOAuthInputCapabilities {
-    fn metadata(self) -> Value {
+    pub(super) fn metadata(self) -> Value {
         let mut capabilities = Map::new();
         if self.roots {
             capabilities.insert("roots".to_owned(), json!({}));
@@ -208,19 +209,31 @@ impl ManagedOAuthProvider {
     /// request-ID allocator also covers every continuation, so concurrent handlers
     /// cannot reuse another handler's IDs. Calling `with_limits` afterwards retains
     /// this resolver while changing the new provider's call/catalog bounds.
+    ///
+    /// This mode cannot be combined with `with_downstream_inputs`. If downstream
+    /// resolution was already selected, the returned provider fails
+    /// `validate_input_mode` and refuses acquisition and execution before effects.
     pub fn with_input_handler(
         mut self,
         policy: ManagedOAuthInputPolicy,
         handler: Arc<dyn ManagedOAuthInputHandler>,
     ) -> Self {
-        self.forwarder = Arc::new(Forwarder {
-            backend: Arc::new(InteractiveBackend {
+        let backend: Arc<dyn CoreBackend> = if matches!(
+            self.forwarder.backend.input_mode(),
+            super::downstream::InputMode::Downstream | super::downstream::InputMode::Conflicting
+        ) {
+            super::downstream::conflicting_backend()
+        } else {
+            Arc::new(InteractiveBackend {
                 session: self.session.clone(),
                 policy,
                 handler,
                 next_id: Arc::clone(&self.forwarder.next_id),
                 header_review: None,
-            }),
+            })
+        };
+        self.forwarder = Arc::new(Forwarder {
+            backend,
             next_id: Arc::clone(&self.forwarder.next_id),
             limits: self.forwarder.limits,
         });
@@ -237,6 +250,10 @@ struct InteractiveBackend {
 }
 
 impl CoreBackend for InteractiveBackend {
+    fn input_mode(&self) -> super::downstream::InputMode {
+        super::downstream::InputMode::Host
+    }
+
     fn with_reviewed_headers(
         &self,
         reviewed: Arc<ReviewedToolHeaders>,

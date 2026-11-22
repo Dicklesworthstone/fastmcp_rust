@@ -19,10 +19,12 @@
 //! expiry and cancellation checks remain in the managed client.
 //!
 //! The default provider advertises no reverse-input or extension capabilities.
-//! Host-resolved interactions advertise only locally configured input support;
-//! they do not relay upstream requestState to downstream clients. This provider
-//! does not claim legacy execution, transparent downstream MRTR, or Tasks relay.
-//! Unexpected input-required or extension results are never flattened.
+//! Host-resolved interactions advertise only locally configured input support.
+//! The separate opt-in downstream mode advertises only the locally permitted
+//! subset of the admitted client's inputs. The server seals upstream requestState
+//! inside its own bounded, principal-bound continuation; it is never a public
+//! downstream retry token. Legacy execution and Tasks relay remain outside this
+//! provider. Unexpected input-required or extension results are never flattened.
 //!
 //! ```ignore
 //! use fastmcp_server::providers::managed_oauth::ManagedOAuthProvider;
@@ -40,6 +42,8 @@
 //! }
 //! ```
 
+/// Explicit downstream MRTR through the server's private continuation registry.
+pub mod downstream;
 /// Authenticated, reversibly routed resource templates.
 pub mod dynamic;
 /// Explicit schema-derived parameter-header disclosure for upstream tools.
@@ -70,6 +74,7 @@ use fastmcp_protocol::{
 };
 use serde_json::{Value, json};
 
+use crate::bidirectional::MrtrCompletedInputs;
 use crate::handler::{
     BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
     FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolExecutionMode, ToolHandler,
@@ -207,6 +212,7 @@ impl ManagedOAuthProvider {
 
     async fn catalog(&self, cx: &Cx, method: &str) -> McpResult<Vec<CoreResult>> {
         check_cx(cx)?;
+        self.validate_input_mode()?;
         let request = core_request(method, json!({}), None)?;
         let collector = ManagedCatalogClient::new(self.session.clone(), self.catalog_limits);
         let collected = collector
@@ -266,9 +272,41 @@ impl ManagedOAuthPrompt {
             _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
         }
     }
+
+    async fn invoke_outcome(
+        &self,
+        ctx: &McpContext,
+        cx: &Cx,
+        arguments: HashMap<String, String>,
+        resume_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+        match self
+            .forwarder
+            .execute_resuming(
+                ctx,
+                cx,
+                "prompts/get",
+                json!({"name": self.upstream_name, "arguments": arguments}),
+                resume_inputs,
+            )
+            .await?
+        {
+            FinalCoreResult::PromptsGet { result, .. } => Ok(FinalMethodOutcome::Complete(result)),
+            FinalCoreResult::PromptsGetInputRequired { result, .. }
+                if self.forwarder.forwards_downstream_inputs() =>
+            {
+                Ok(FinalMethodOutcome::InputRequired(result))
+            }
+            _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
+        }
+    }
 }
 
 impl PromptHandler for ManagedOAuthPrompt {
+    fn declares_final_mrtr(&self) -> bool {
+        self.forwarder.forwards_downstream_inputs()
+    }
+
     // Legacy shape is registration-only. Modern catalogs use final_definition.
     fn definition(&self) -> Prompt {
         Prompt {
@@ -333,13 +371,7 @@ impl PromptHandler for ManagedOAuthPrompt {
         ctx: &'a McpContext,
         arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
-        Box::pin(async move {
-            outcome(
-                self.invoke(ctx, ctx.cx(), arguments)
-                    .await
-                    .map(FinalMethodOutcome::Complete),
-            )
-        })
+        self.get_final_outcome_async_resuming_in_request(ctx, ctx.cx(), arguments, None)
     }
     fn get_final_outcome_async_in_request<'a>(
         &'a self,
@@ -347,13 +379,18 @@ impl PromptHandler for ManagedOAuthPrompt {
         cx: &'a Cx,
         arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
-        Box::pin(async move {
-            outcome(
-                self.invoke(ctx, cx, arguments)
-                    .await
-                    .map(FinalMethodOutcome::Complete),
-            )
-        })
+        self.get_final_outcome_async_resuming_in_request(ctx, cx, arguments, None)
+    }
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: HashMap<String, String>,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        Box::pin(
+            async move { outcome(self.invoke_outcome(ctx, cx, arguments, resume_inputs).await) },
+        )
     }
 }
 
@@ -417,9 +454,39 @@ impl ManagedOAuthResource {
             _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
         }
     }
+
+    async fn invoke_outcome(
+        &self,
+        ctx: &McpContext,
+        cx: &Cx,
+        uri: &str,
+        resume_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        if uri != self.definition.uri.as_str() {
+            return Err(McpError::invalid_params(
+                "Managed OAuth resource URI does not match its route",
+            ));
+        }
+        resource_outcome(
+            self.forwarder
+                .execute_resuming(
+                    ctx,
+                    cx,
+                    "resources/read",
+                    json!({"uri": uri}),
+                    resume_inputs,
+                )
+                .await?,
+            self.forwarder.forwards_downstream_inputs(),
+        )
+    }
 }
 
 impl ResourceHandler for ManagedOAuthResource {
+    fn declares_final_mrtr(&self) -> bool {
+        self.forwarder.forwards_downstream_inputs()
+    }
+
     fn definition(&self) -> Resource {
         Resource {
             uri: self.definition.uri.as_str().to_owned(),
@@ -485,9 +552,8 @@ impl ResourceHandler for ManagedOAuthResource {
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
         Box::pin(async move {
             outcome(
-                self.invoke(ctx, ctx.cx(), self.definition.uri.as_str())
-                    .await
-                    .map(FinalMethodOutcome::Complete),
+                self.invoke_outcome(ctx, ctx.cx(), self.definition.uri.as_str(), None)
+                    .await,
             )
         })
     }
@@ -495,15 +561,9 @@ impl ResourceHandler for ManagedOAuthResource {
         &'a self,
         ctx: &'a McpContext,
         uri: &'a str,
-        _params: &'a UriParams,
+        params: &'a UriParams,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
-        Box::pin(async move {
-            outcome(
-                self.invoke(ctx, ctx.cx(), uri)
-                    .await
-                    .map(FinalMethodOutcome::Complete),
-            )
-        })
+        self.read_final_outcome_async_with_uri_resuming_in_request(ctx, ctx.cx(), uri, params, None)
     }
     fn read_final_async_with_uri_in_request<'a>(
         &'a self,
@@ -519,15 +579,32 @@ impl ResourceHandler for ManagedOAuthResource {
         ctx: &'a McpContext,
         cx: &'a Cx,
         uri: &'a str,
-        _params: &'a UriParams,
+        params: &'a UriParams,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
-        Box::pin(async move {
-            outcome(
-                self.invoke(ctx, cx, uri)
-                    .await
-                    .map(FinalMethodOutcome::Complete),
-            )
-        })
+        self.read_final_outcome_async_with_uri_resuming_in_request(ctx, cx, uri, params, None)
+    }
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        uri: &'a str,
+        _params: &'a UriParams,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move { outcome(self.invoke_outcome(ctx, cx, uri, resume_inputs).await) })
+    }
+}
+
+fn resource_outcome(
+    result: FinalCoreResult,
+    downstream_inputs: bool,
+) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+    match result {
+        FinalCoreResult::ResourcesRead { result, .. } => Ok(FinalMethodOutcome::Complete(result)),
+        FinalCoreResult::ResourcesReadInputRequired { result, .. } if downstream_inputs => {
+            Ok(FinalMethodOutcome::InputRequired(result))
+        }
+        _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
     }
 }
 
@@ -583,9 +660,41 @@ impl ManagedOAuthTool {
             .await?;
         tool_result(result)
     }
+
+    async fn invoke_outcome(
+        &self,
+        ctx: &McpContext,
+        cx: &Cx,
+        arguments: Value,
+        resume_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalToolOutcome> {
+        match self
+            .forwarder
+            .execute_resuming(
+                ctx,
+                cx,
+                "tools/call",
+                json!({"name": self.upstream_name, "arguments": arguments}),
+                resume_inputs,
+            )
+            .await?
+        {
+            FinalCoreResult::ToolsCall { result, .. } => Ok(FinalToolOutcome::Complete(result)),
+            FinalCoreResult::ToolsCallInputRequired { result, .. }
+                if self.forwarder.forwards_downstream_inputs() =>
+            {
+                Ok(FinalToolOutcome::InputRequired(result))
+            }
+            _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
+        }
+    }
 }
 
 impl ToolHandler for ManagedOAuthTool {
+    fn declares_final_mrtr(&self) -> bool {
+        self.forwarder.forwards_downstream_inputs()
+    }
+
     // Required legacy registration shape only; no lossy legacy execution is offered.
     fn definition(&self) -> Tool {
         Tool {
@@ -648,13 +757,7 @@ impl ToolHandler for ManagedOAuthTool {
         ctx: &'a McpContext,
         arguments: Value,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
-        Box::pin(async move {
-            outcome(
-                self.invoke(ctx, ctx.cx(), arguments)
-                    .await
-                    .map(FinalToolOutcome::Complete),
-            )
-        })
+        self.call_final_outcome_async_resuming_in_request(ctx, ctx.cx(), arguments, None)
     }
     fn call_final_outcome_async_in_request<'a>(
         &'a self,
@@ -662,13 +765,18 @@ impl ToolHandler for ManagedOAuthTool {
         cx: &'a Cx,
         arguments: Value,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
-        Box::pin(async move {
-            outcome(
-                self.invoke(ctx, cx, arguments)
-                    .await
-                    .map(FinalToolOutcome::Complete),
-            )
-        })
+        self.call_final_outcome_async_resuming_in_request(ctx, cx, arguments, None)
+    }
+    fn call_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: Value,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(
+            async move { outcome(self.invoke_outcome(ctx, cx, arguments, resume_inputs).await) },
+        )
     }
 }
 
@@ -746,6 +854,41 @@ fn allocate_request_id(next_id: &AtomicU64) -> McpResult<RequestId> {
 }
 
 impl Forwarder {
+    fn validate_input_mode(&self) -> McpResult<()> {
+        if self.backend.input_mode() == downstream::InputMode::Conflicting {
+            return Err(downstream::mode_conflict());
+        }
+        Ok(())
+    }
+
+    fn forwards_downstream_inputs(&self) -> bool {
+        self.backend.input_mode() == downstream::InputMode::Downstream
+    }
+
+    async fn execute_resuming(
+        &self,
+        ctx: &McpContext,
+        cx: &Cx,
+        method: &str,
+        parameters: Value,
+        resume_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalCoreResult> {
+        ctx.checkpoint()?;
+        check_cx(cx)?;
+        self.validate_input_mode()?;
+        let parameters = if let Some(resume) = resume_inputs {
+            if !self.forwards_downstream_inputs() {
+                return Err(McpError::invalid_params(
+                    "Managed OAuth downstream input resolution is not enabled",
+                ));
+            }
+            downstream::overlay_resume(parameters, resume)?
+        } else {
+            parameters
+        };
+        self.execute(ctx, cx, method, parameters).await
+    }
+
     fn allocate_id(&self) -> McpResult<RequestId> {
         allocate_request_id(&self.next_id)
     }
@@ -759,6 +902,7 @@ impl Forwarder {
     ) -> McpResult<FinalCoreResult> {
         ctx.checkpoint()?;
         check_cx(cx)?;
+        self.validate_input_mode()?;
         let progress = ctx
             .progress_marker()
             .map(serde_json::to_value)
@@ -780,6 +924,10 @@ impl Forwarder {
 // Production construction installs NativeBackend or the opt-in interaction
 // adapter. Test injection is private and cannot grant a schema bypass.
 trait CoreBackend: Send + Sync {
+    fn input_mode(&self) -> downstream::InputMode {
+        downstream::InputMode::Complete
+    }
+
     fn execute<'a>(
         &'a self,
         ctx: &'a McpContext,

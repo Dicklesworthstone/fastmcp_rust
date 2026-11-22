@@ -138,6 +138,7 @@ impl ManagedOAuthProvider {
         limits: ManagedSubscriptionLimits,
     ) -> McpResult<ManagedOAuthResourceUpdates> {
         check_cx(cx)?;
+        self.validate_input_mode()?;
         let requested = resource_filter(&self.forwarder.next_id, resources)?;
         let request = core_request(
             "subscriptions/listen",

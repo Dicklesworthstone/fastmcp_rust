@@ -5,6 +5,8 @@
 //! bounds every child process and caller-owned runtime.
 
 use super::*;
+
+mod downstream;
 use fastmcp_client::http_auth::rpc::catalog::ManagedCatalogLimits;
 use fastmcp_core::McpErrorCode;
 use fastmcp_server::providers::managed_oauth::ManagedOAuthProvider;
@@ -15,6 +17,7 @@ use fastmcp_server::providers::managed_oauth::interaction::{
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Case {
+    Downstream(downstream::Case),
     Complete,
     Decline,
     Unadvertised,
@@ -112,6 +115,9 @@ impl ManagedOAuthInputHandler for Host {
 }
 
 pub(super) async fn scenario(cx: Cx, case: Case) {
+    if let Case::Downstream(case) = case {
+        return downstream::scenario(cx, case).await;
+    }
     let peer = Peer::new(&cx, true).await;
     let ((), session) = pair(
         peer.login(),

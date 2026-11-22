@@ -22,7 +22,11 @@ use fastmcp_protocol::{
 };
 use serde_json::json;
 
-use super::{Forwarder, MODERN_ASYNC_ONLY, ManagedOAuthProvider, UNEXPECTED_RESULT, outcome};
+use super::{
+    Forwarder, MODERN_ASYNC_ONLY, ManagedOAuthProvider, UNEXPECTED_RESULT, outcome,
+    resource_outcome,
+};
+use crate::bidirectional::MrtrCompletedInputs;
 use crate::handler::{
     BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalResourceUriUse,
     ResourceHandler, ResourceUriUsePolicy, UriParams,
@@ -35,7 +39,8 @@ impl ManagedOAuthProvider {
     /// used by the server. A duplicate or non-reversible template rejects the
     /// collection without returning partial handlers. Namespaces do not alter
     /// template URIs. Register the returned handlers with `builder.resource`.
-    /// This installs neither subscription relay nor MRTR continuation state.
+    /// Subscription relay remains explicit. If downstream inputs were enabled
+    /// on this provider, the returned handlers use the server's MRTR registry.
     pub async fn resource_templates(
         &self,
         cx: &Cx,
@@ -108,6 +113,30 @@ impl ManagedOAuthResourceTemplate {
         }
     }
 
+    async fn invoke_outcome(
+        &self,
+        ctx: &McpContext,
+        cx: &Cx,
+        uri: &str,
+        resume_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        ctx.checkpoint()?;
+        super::check_cx(cx)?;
+        self.admit_uri(uri)?;
+        resource_outcome(
+            self.forwarder
+                .execute_resuming(
+                    ctx,
+                    cx,
+                    "resources/read",
+                    json!({"uri": uri}),
+                    resume_inputs,
+                )
+                .await?,
+            self.forwarder.forwards_downstream_inputs(),
+        )
+    }
+
     fn admit_uri(&self, uri: &str) -> McpResult<AbsoluteUri> {
         // A variable in the scheme position can expand to HTTPS even though
         // the catalog template does not literally begin with it. Apply the
@@ -134,7 +163,7 @@ fn route_error() -> McpError {
     McpError::invalid_params("Resource URI does not match the managed OAuth template")
 }
 
-fn build_templates(
+pub(super) fn build_templates(
     forwarder: Arc<Forwarder>,
     entries: Vec<FinalResourceTemplate>,
 ) -> McpResult<Vec<ManagedOAuthResourceTemplate>> {
@@ -168,6 +197,10 @@ fn build_templates(
 }
 
 impl ResourceHandler for ManagedOAuthResourceTemplate {
+    fn declares_final_mrtr(&self) -> bool {
+        self.forwarder.forwards_downstream_inputs()
+    }
+
     // Registration fallback only; no lossy legacy execution is installed.
     fn definition(&self) -> Resource {
         Resource {
@@ -234,15 +267,9 @@ impl ResourceHandler for ManagedOAuthResourceTemplate {
         &'a self,
         ctx: &'a McpContext,
         uri: &'a str,
-        _params: &'a UriParams,
+        params: &'a UriParams,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
-        Box::pin(async move {
-            outcome(
-                self.invoke(ctx, ctx.cx(), uri)
-                    .await
-                    .map(FinalMethodOutcome::Complete),
-            )
-        })
+        self.read_final_outcome_async_with_uri_resuming_in_request(ctx, ctx.cx(), uri, params, None)
     }
     fn read_final_async_with_uri_in_request<'a>(
         &'a self,
@@ -258,15 +285,19 @@ impl ResourceHandler for ManagedOAuthResourceTemplate {
         ctx: &'a McpContext,
         cx: &'a Cx,
         uri: &'a str,
-        _params: &'a UriParams,
+        params: &'a UriParams,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
-        Box::pin(async move {
-            outcome(
-                self.invoke(ctx, cx, uri)
-                    .await
-                    .map(FinalMethodOutcome::Complete),
-            )
-        })
+        self.read_final_outcome_async_with_uri_resuming_in_request(ctx, cx, uri, params, None)
+    }
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        uri: &'a str,
+        _params: &'a UriParams,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move { outcome(self.invoke_outcome(ctx, cx, uri, resume_inputs).await) })
     }
 }
 
