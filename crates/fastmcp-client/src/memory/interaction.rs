@@ -7,19 +7,26 @@
 //! execution and explicit Tasks calls remain single-request operations.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use asupersync::Cx;
 use fastmcp_core::{McpRequestCancellation, McpResult};
-use fastmcp_protocol::{CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY};
+use fastmcp_protocol::{CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, InputRequiredResult};
 use serde_json::Value;
 
 use super::{MemoryClient, MemoryClientBuilder, checkpoint};
 use crate::execution::{MrtrDriver, MrtrDriverLimits};
 use crate::{
-    MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES, ReverseRequestHandlers,
-    check_mrtr_operation, mrtr_input_required_for_method, mrtr_operation_deadline,
-    mrtr_retry_parameters, wait_for_mrtr_operation,
+    MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses,
+    ReverseRequestHandlers, admit_complete_mrtr_input_batch, check_mrtr_operation,
+    mrtr_input_required_for_method, mrtr_operation_deadline, mrtr_retry_parameters,
+    wait_for_mrtr_operation,
 };
+
+enum MemoryMrtrResponder<F> {
+    Installed(ReverseRequestHandlers),
+    Caller(F),
+}
 
 impl MemoryClientBuilder {
     /// Installs modern sampling, roots, and elicitation handlers before discovery.
@@ -41,6 +48,105 @@ impl MemoryClientBuilder {
 }
 
 impl MemoryClient {
+    /// Calls a tool with a responder selected for this operation alone.
+    ///
+    /// Unlike [`Self::call_tool`], this uses only `respond`, never the connection's
+    /// installed reverse handlers. Advertise the capabilities the responder can
+    /// fulfill with [`MemoryClientBuilder::capabilities`] before connecting;
+    /// supplying a callback does not add capabilities to an existing connection.
+    /// Every embedded input request and the cumulative response budget are
+    /// admitted before the callback runs. It must return one response for every
+    /// requested key and may return an empty map for a state-only continuation.
+    ///
+    /// The synchronous callback must return promptly. Cancellation and the
+    /// earlier of `deadline` and the client's absolute timeout are checked
+    /// before and after it runs, so a late response cannot authorize another
+    /// request. Each continuation receives a fresh ID and retains the original
+    /// method, arguments, and capabilities. Failed requests are never retried;
+    /// Tasks are not negotiated. The complete typed result retains metadata and
+    /// open fields. Use [`Self::execute_core`] to drive a single request manually.
+    pub async fn call_tool_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: Value,
+        respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        self.follow_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            MemoryMrtrResponder::Caller(respond),
+        )
+        .await
+    }
+
+    /// Reads a resource with a responder selected for this operation alone.
+    ///
+    /// This has the same capability, cancellation, deadline, and complete-map
+    /// response contract as [`Self::call_tool_with_mrtr_retry`]. The original URI
+    /// remains bound across every round. Complete first-round results honor the
+    /// connection's cache policy; input-required results and all continuations
+    /// remain uncached. Installed reverse handlers are not invoked.
+    pub async fn read_resource_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        uri: &str,
+        respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        self.follow_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            "resources/read",
+            serde_json::json!({"uri": uri}),
+            MemoryMrtrResponder::Caller(respond),
+        )
+        .await
+    }
+
+    /// Gets a prompt with a responder selected for this operation alone.
+    ///
+    /// This has the same capability, cancellation, deadline, and complete-map
+    /// response contract as [`Self::call_tool_with_mrtr_retry`]. The original name
+    /// and arguments remain unchanged; only the latest response map and opaque
+    /// request state are added to each fresh request. Installed reverse handlers
+    /// are not invoked, and a rejected response never sends a continuation.
+    pub async fn get_prompt_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: HashMap<String, String>,
+        respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        self.follow_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            "prompts/get",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            MemoryMrtrResponder::Caller(respond),
+        )
+        .await
+    }
+
     /// Reads a resource, fulfilling input-required results through installed handlers.
     ///
     /// The original caller context, cancellation token, absolute deadline, and
@@ -101,6 +207,34 @@ impl MemoryClient {
                 .map(|(result, _)| result);
         }
         let deadline = mrtr_operation_deadline(cx, self.timeout_policy)?;
+        self.follow_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            method,
+            original_parameters,
+            MemoryMrtrResponder::<fn(&InputRequiredResult) -> McpResult<MrtrInputResponses>>::Installed(
+                handlers,
+            ),
+        )
+        .await
+    }
+
+    async fn follow_mrtr<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        method: &str,
+        original_parameters: Value,
+        mut responder: MemoryMrtrResponder<F>,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        self.ensure_open()?;
+        checkpoint(cx, cancellation)?;
+        let deadline = deadline.min(mrtr_operation_deadline(cx, self.timeout_policy)?);
         let mut driver = MrtrDriver::new(
             cx,
             deadline,
@@ -130,16 +264,34 @@ impl MemoryClient {
                     return Ok(result);
                 };
                 driver.begin_continuation()?;
-                driver.admit_input_responses(
-                    input_required
-                        .input_requests()
-                        .map_or(0, |requests| requests.members().len()),
-                )?;
-                let responses = handlers
-                    .respond_to_input_required_async(cx, &capabilities, input_required, || {
-                        check_mrtr_operation(cx, Some(cancellation), deadline)
-                    })
-                    .await?;
+                let responses = match &mut responder {
+                    MemoryMrtrResponder::Installed(handlers) => {
+                        driver.admit_input_responses(
+                            input_required
+                                .input_requests()
+                                .map_or(0, |requests| requests.members().len()),
+                        )?;
+                        handlers
+                            .respond_to_input_required_async(
+                                cx,
+                                &capabilities,
+                                input_required,
+                                || check_mrtr_operation(cx, Some(cancellation), deadline),
+                            )
+                            .await?
+                    }
+                    MemoryMrtrResponder::Caller(respond) => {
+                        admit_complete_mrtr_input_batch(
+                            &mut driver,
+                            &capabilities,
+                            input_required,
+                        )?;
+                        check_mrtr_operation(cx, Some(cancellation), deadline)?;
+                        let responses = respond(input_required)?;
+                        check_mrtr_operation(cx, Some(cancellation), deadline)?;
+                        responses
+                    }
+                };
                 parameters =
                     mrtr_retry_parameters(original_parameters.clone(), input_required, responses)?;
             }
@@ -158,7 +310,7 @@ mod tests {
     use std::time::Duration;
 
     use asupersync::runtime::RuntimeBuilder;
-    use fastmcp_core::McpErrorCode;
+    use fastmcp_core::{McpError, McpErrorCode};
     use fastmcp_protocol::{
         ClientCapabilities, ClientInfo, FinalCoreResult, JsonRpcMessage, JsonRpcRequest,
         JsonRpcResponse, RequestId,
@@ -346,6 +498,56 @@ mod tests {
             }
         }
 
+        async fn call_with_responder<F>(
+            self,
+            cx: &Cx,
+            client: &mut MemoryClient,
+            cancellation: &McpRequestCancellation,
+            deadline: Instant,
+            respond: F,
+        ) -> McpResult<CoreResult>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        {
+            match self {
+                Self::Tool => {
+                    client
+                        .call_tool_with_mrtr_retry(
+                            cx,
+                            cancellation,
+                            deadline,
+                            "interactive",
+                            json!({"value":"résumé 東京"}),
+                            respond,
+                        )
+                        .await
+                }
+                Self::Resource => {
+                    client
+                        .read_resource_with_mrtr_retry(
+                            cx,
+                            cancellation,
+                            deadline,
+                            "file:///interaction-resource",
+                            respond,
+                        )
+                        .await
+                }
+                Self::Prompt => {
+                    client
+                        .get_prompt_with_mrtr_retry(
+                            cx,
+                            cancellation,
+                            deadline,
+                            "interactive",
+                            HashMap::from([("value".to_owned(), "résumé 東京".to_owned())]),
+                            respond,
+                        )
+                        .await
+                }
+            }
+        }
+
         fn assert_completed(self, result: CoreResult) {
             // `encode_complete_result`, not `serde_json::to_string`.
             // `CompleteResult<T>` derives only Debug + Clone -- deliberately,
@@ -387,6 +589,366 @@ mod tests {
             assert_eq!(result["com.example/receipt"]["value"], "résumé 東京");
             assert!(source.contains("7.30e-2"));
         }
+    }
+
+    fn answer_roots(input: &InputRequiredResult) -> McpResult<MrtrInputResponses> {
+        Ok(input
+            .input_requests()
+            .into_iter()
+            .flat_map(|requests| requests.members())
+            .map(|member| (member.name.clone(), json!({"roots":[]})))
+            .collect())
+    }
+
+    fn explicit_builder() -> MemoryClientBuilder {
+        builder().capabilities(serde_json::from_value(json!({"roots":{}})).unwrap())
+    }
+
+    #[test]
+    fn memory_explicit_mrtr_all_verbs_preserve_request_and_exact_result_across_rounds() {
+        fn assert_send<T: Send>(_: T) {}
+
+        run(|cx| async move {
+            for verb in [Verb::Tool, Verb::Resource, Verb::Prompt] {
+                for installed in [false, true] {
+                    let installed_calls = Arc::new(AtomicUsize::new(0));
+                    let builder = if installed {
+                        explicit_builder().reverse_request_handlers(roots_handler(&installed_calls))
+                    } else {
+                        explicit_builder()
+                    };
+                    let (mut client, mut peer) = connected(&cx, builder, json!({})).await;
+                    // These unpolled futures prove the installed-handler and
+                    // explicit-responder APIs remain Send without dispatching
+                    // another operation or duplicating their runtime tests.
+                    let cancellation = McpRequestCancellation::new();
+                    assert_send(client.call_tool(&cx, &cancellation, "interactive", json!({})));
+                    assert_send(client.call_tool_with_mrtr_retry(
+                        &cx,
+                        &cancellation,
+                        Instant::now() + Duration::from_secs(5),
+                        "interactive",
+                        json!({}),
+                        answer_roots,
+                    ));
+                    let mut serving = cx
+                        .spawn(move |peer_cx| async move {
+                            let original = receive(&peer_cx, &mut peer, verb.method(), 2)
+                                .await
+                                .params
+                                .unwrap();
+                            for (key, value) in verb.original().as_object().unwrap() {
+                                assert_eq!(&original[key], value);
+                            }
+                            let challenges = [
+                                json!({"resultType":"input_required", "requestState":"first",
+                                    "inputRequests":{"first":{"method":"roots/list"}}}),
+                                json!({"resultType":"input_required",
+                                    "inputRequests":{"second":{"method":"roots/list"}}}),
+                                json!({"resultType":"input_required", "requestState":"third"}),
+                            ];
+                            for (round, challenge) in challenges.into_iter().enumerate() {
+                                let id = i64::try_from(round).unwrap() + 2;
+                                peer.send_async(&peer_cx, &response(id, challenge.clone()))
+                                    .await
+                                    .unwrap();
+                                let mut retry = receive(&peer_cx, &mut peer, verb.method(), id + 1)
+                                    .await
+                                    .params
+                                    .unwrap();
+                                assert_eq!(
+                                    retry.get("requestState"),
+                                    challenge.get("requestState")
+                                );
+                                let expected_responses = match round {
+                                    0 => Some(json!({"first":{"roots":[]}})),
+                                    1 => Some(json!({"second":{"roots":[]}})),
+                                    _ => None,
+                                };
+                                assert_eq!(
+                                    retry.get("inputResponses"),
+                                    expected_responses.as_ref()
+                                );
+                                retry.as_object_mut().unwrap().remove("requestState");
+                                retry.as_object_mut().unwrap().remove("inputResponses");
+                                assert_eq!(retry, original);
+                            }
+                            let mut complete = verb.completed();
+                            if matches!(verb, Verb::Resource) {
+                                complete["ttlMs"] = json!(60_000);
+                            }
+                            peer.send_async(&peer_cx, &response(5, complete))
+                                .await
+                                .unwrap();
+                            peer
+                        })
+                        .unwrap();
+                    let mut states = Vec::new();
+                    let result = verb
+                        .call_with_responder(
+                            &cx,
+                            &mut client,
+                            &McpRequestCancellation::new(),
+                            Instant::now() + Duration::from_secs(5),
+                            |input| {
+                                states.push(input.request_state().map(str::to_owned));
+                                answer_roots(input)
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    verb.assert_completed(result);
+                    assert_eq!(
+                        states,
+                        [Some("first".to_owned()), None, Some("third".to_owned())]
+                    );
+                    assert_eq!(installed_calls.load(Ordering::Acquire), 0);
+                    assert_eq!(client.next_id, 6);
+                    assert_eq!(client.final_result_cache_stats().fills, 0);
+                    let _peer = serving.join(&cx).await.unwrap();
+                    client.close(&cx).unwrap();
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn memory_explicit_mrtr_admits_the_whole_capability_batch_before_callback() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx, explicit_builder(), json!({})).await;
+            let mut serving = cx
+                .spawn(move |peer_cx| async move {
+                    receive(&peer_cx, &mut peer, "tools/call", 2).await;
+                    let mut challenge = input("not-replayed");
+                    challenge["inputRequests"]["undeclared"] = json!({
+                        "method":"elicitation/create",
+                        "params":{"mode":"form", "message":"Approve",
+                            "requestedSchema":{"type":"object", "properties":{}}},
+                    });
+                    peer.send_async(&peer_cx, &response(2, challenge))
+                        .await
+                        .unwrap();
+                    receive(&peer_cx, &mut peer, "tools/list", 3).await;
+                    peer.send_async(&peer_cx, &response(3, tools()))
+                        .await
+                        .unwrap();
+                    peer
+                })
+                .unwrap();
+            let mut calls = 0;
+            let error = Verb::Tool
+                .call_with_responder(
+                    &cx,
+                    &mut client,
+                    &McpRequestCancellation::new(),
+                    Instant::now() + Duration::from_secs(5),
+                    |input| {
+                        calls += 1;
+                        answer_roots(input)
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert!(error.message.contains("unadvertised client capability"));
+            assert_eq!(calls, 0);
+            assert_eq!(client.next_id, 3);
+            client
+                .list_tools(&cx, &McpRequestCancellation::new(), None)
+                .await
+                .unwrap();
+            let _peer = serving.join(&cx).await.unwrap();
+            client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn memory_explicit_mrtr_rejected_or_cancelled_responder_never_sends_a_continuation() {
+        #[derive(Clone, Copy)]
+        enum Stop {
+            Error,
+            Cancel,
+            MissingKey,
+            WrongKey,
+            Late,
+        }
+        run(|cx| async move {
+            for stop in [
+                Stop::Error,
+                Stop::Cancel,
+                Stop::MissingKey,
+                Stop::WrongKey,
+                Stop::Late,
+            ] {
+                let (mut client, mut peer) = connected(&cx, explicit_builder(), json!({})).await;
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        receive(&peer_cx, &mut peer, "tools/call", 2).await;
+                        peer.send_async(&peer_cx, &response(2, input("not-replayed")))
+                            .await
+                            .unwrap();
+                        receive(&peer_cx, &mut peer, "tools/list", 3).await;
+                        peer.send_async(&peer_cx, &response(3, tools()))
+                            .await
+                            .unwrap();
+                        peer
+                    })
+                    .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let deadline = Instant::now()
+                    + if matches!(stop, Stop::Late) {
+                        Duration::from_millis(250)
+                    } else {
+                        Duration::from_secs(5)
+                    };
+                let mut calls = 0;
+                let error = Verb::Tool
+                    .call_with_responder(&cx, &mut client, &cancellation, deadline, |input| {
+                        calls += 1;
+                        match stop {
+                            Stop::Error => Err(McpError::invalid_request("host declined input")),
+                            Stop::Cancel => {
+                                cancellation.cancel();
+                                answer_roots(input)
+                            }
+                            Stop::MissingKey => Ok(MrtrInputResponses::new()),
+                            Stop::WrongKey => Ok(MrtrInputResponses::from([(
+                                "unrequested".to_owned(),
+                                json!({"roots":[]}),
+                            )])),
+                            Stop::Late => {
+                                // Synchronous callbacks cannot be preempted;
+                                // their late answers must still be discarded.
+                                std::thread::sleep(
+                                    deadline.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(1),
+                                );
+                                answer_roots(input)
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_err();
+                match stop {
+                    Stop::Error => assert_eq!(error.message, "host declined input"),
+                    Stop::Cancel => assert_eq!(error.code, McpErrorCode::RequestCancelled),
+                    Stop::MissingKey | Stop::WrongKey => {
+                        assert_eq!(error.code, McpErrorCode::InvalidParams)
+                    }
+                    Stop::Late => assert!(error.message.contains("deadline")),
+                }
+                assert_eq!(calls, 1);
+                assert_eq!(client.next_id, 3);
+                assert!(cx.checkpoint().is_ok());
+                client
+                    .list_tools(&cx, &McpRequestCancellation::new(), None)
+                    .await
+                    .unwrap();
+                let _peer = serving.join(&cx).await.unwrap();
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn memory_explicit_mrtr_cancelled_or_expired_operation_has_no_effects() {
+        run(|cx| async move {
+            for cancelled in [false, true] {
+                let (mut client, mut peer) = connected(&cx, explicit_builder(), json!({})).await;
+                let cancellation = McpRequestCancellation::new();
+                let deadline = if cancelled {
+                    cancellation.cancel();
+                    Instant::now() + Duration::from_secs(5)
+                } else {
+                    Instant::now()
+                };
+                let mut calls = 0;
+                let error = Verb::Tool
+                    .call_with_responder(&cx, &mut client, &cancellation, deadline, |input| {
+                        calls += 1;
+                        answer_roots(input)
+                    })
+                    .await
+                    .unwrap_err();
+                if cancelled {
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                } else {
+                    assert!(error.message.contains("deadline"));
+                }
+                assert_eq!(calls, 0);
+                assert_eq!(client.next_id, 2);
+                peer.send_async(&cx, &response(2, tools())).await.unwrap();
+                client
+                    .list_tools(&cx, &McpRequestCancellation::new(), None)
+                    .await
+                    .unwrap();
+                receive(&cx, &mut peer, "tools/list", 2).await;
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn memory_explicit_mrtr_round_and_total_input_limits_precede_callback_effects() {
+        run(|cx| async move {
+            for total_limit in [false, true] {
+                let (mut client, mut peer) = connected(&cx, explicit_builder(), json!({})).await;
+                let (challenges, keys, expected_calls) = if total_limit {
+                    (2, MAX_MRTR_TOTAL_INPUT_RESPONSES / 2 + 1, 1)
+                } else {
+                    (
+                        MAX_MRTR_CONTINUATION_ROUNDS + 1,
+                        1,
+                        MAX_MRTR_CONTINUATION_ROUNDS,
+                    )
+                };
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        for round in 0..challenges {
+                            let id = i64::try_from(round).unwrap() + 2;
+                            receive(&peer_cx, &mut peer, "tools/call", id).await;
+                            let inputs = (0..keys)
+                                .map(|key| (format!("roots-{key}"), json!({"method":"roots/list"})))
+                                .collect::<serde_json::Map<_, _>>();
+                            peer.send_async(&peer_cx, &response(id, json!({
+                                "resultType":"input_required", "requestState":format!("round-{round}"),
+                                "inputRequests":inputs,
+                            }))).await.unwrap();
+                        }
+                        let id = i64::try_from(challenges).unwrap() + 2;
+                        receive(&peer_cx, &mut peer, "tools/list", id).await;
+                        peer.send_async(&peer_cx, &response(id, tools())).await.unwrap();
+                        peer
+                    })
+                    .unwrap();
+                let mut calls = 0;
+                let cancellation = McpRequestCancellation::new();
+                let error = Verb::Tool
+                    .call_with_responder(
+                        &cx,
+                        &mut client,
+                        &cancellation,
+                        Instant::now() + Duration::from_secs(5),
+                        |input| {
+                            calls += 1;
+                            answer_roots(input)
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert!(error.message.contains(if total_limit {
+                    "total input-response limit"
+                } else {
+                    "continuation-round limit"
+                }));
+                assert_eq!(calls, expected_calls);
+                assert_eq!(client.next_id, i64::try_from(challenges).unwrap() + 2);
+                client.list_tools(&cx, &cancellation, None).await.unwrap();
+                let _peer = serving.join(&cx).await.unwrap();
+                client.close(&cx).unwrap();
+            }
+        });
     }
 
     #[test]
