@@ -17,9 +17,9 @@ use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::InputRequiredResult;
 
 use super::{
-    BoxFuture, ClientCredentialsCoreError, ClientCredentialsProvider, Forwarder, MACHINE_FAILURE,
-    MachineBackend, MachineResponse, check_cx, forward_notification, machine_error, next_pair,
-    upstream_error,
+    BoxFuture, ClientCredentialsCoreError, ClientCredentialsProvider, CoreBackend, Forwarder,
+    InputMode, MACHINE_FAILURE, MachineBackend, MachineResponse, check_cx, downstream,
+    forward_notification, machine_error, next_pair, upstream_error,
 };
 use crate::providers::managed_oauth::interaction::{
     HostDisposition, ManagedOAuthInputHandler, ManagedOAuthInputPolicy,
@@ -56,14 +56,22 @@ impl ClientCredentialsProvider {
     /// and must be safe to drop. Cancellation cannot undo a host side effect that
     /// already happened. This is local host resolution, not transparent downstream
     /// MRTR or Tasks relay. Catalogs and completion stay on the core-only path.
+    /// If downstream resolution was previously selected, the returned provider
+    /// fails `validate_input_mode` and refuses subsequent acquisition and calls
+    /// before credential, network or callback work. Existing clones are unchanged.
     pub fn with_input_handler(
         mut self,
         policy: ManagedOAuthInputPolicy,
         handler: Arc<dyn ManagedOAuthInputHandler>,
     ) -> Self {
         let next_id = Arc::clone(&self.forwarder.next_id);
-        self.forwarder = Arc::new(Forwarder {
-            backend: Arc::new(MachineBackend {
+        let backend: Arc<dyn CoreBackend> = if matches!(
+            self.forwarder.backend.input_mode(),
+            InputMode::Downstream | InputMode::Conflicting
+        ) {
+            downstream::conflicting_backend()
+        } else {
+            Arc::new(MachineBackend {
                 source: Arc::clone(&self.source),
                 next_id: Arc::clone(&next_id),
                 inputs: Some(Arc::new(MachineInputs {
@@ -71,7 +79,10 @@ impl ClientCredentialsProvider {
                     handler,
                     next_id: Arc::clone(&next_id),
                 })),
-            }),
+            })
+        };
+        self.forwarder = Arc::new(Forwarder {
+            backend,
             next_id,
             limits: self.forwarder.limits,
         });

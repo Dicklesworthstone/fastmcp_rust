@@ -77,18 +77,7 @@ impl ManagedOAuthProvider {
         mut self,
         allowed: ManagedOAuthInputCapabilities,
     ) -> McpResult<Self> {
-        self.validate_input_mode()?;
-        if self.forwarder.backend.input_mode() != InputMode::Complete {
-            return Err(mode_conflict());
-        }
-        self.forwarder = Arc::new(Forwarder {
-            backend: Arc::new(DownstreamBackend {
-                inner: Arc::clone(&self.forwarder.backend),
-                allowed,
-            }),
-            next_id: Arc::clone(&self.forwarder.next_id),
-            limits: self.forwarder.limits,
-        });
+        self.forwarder = enable_downstream_inputs(&self.forwarder, allowed)?;
         Ok(self)
     }
 
@@ -98,6 +87,26 @@ impl ManagedOAuthProvider {
     pub fn validate_input_mode(&self) -> McpResult<()> {
         self.forwarder.validate_input_mode()
     }
+}
+
+/// Both managed login and machine grants use the same sealed continuation
+/// boundary. Only the independently authenticated inner backend differs.
+pub(super) fn enable_downstream_inputs(
+    forwarder: &Arc<Forwarder>,
+    allowed: ManagedOAuthInputCapabilities,
+) -> McpResult<Arc<Forwarder>> {
+    forwarder.validate_input_mode()?;
+    if forwarder.backend.input_mode() != InputMode::Complete {
+        return Err(mode_conflict());
+    }
+    Ok(Arc::new(Forwarder {
+        backend: Arc::new(DownstreamBackend {
+            inner: Arc::clone(&forwarder.backend),
+            allowed,
+        }),
+        next_id: Arc::clone(&forwarder.next_id),
+        limits: forwarder.limits,
+    }))
 }
 
 pub(super) fn mode_conflict() -> McpError {

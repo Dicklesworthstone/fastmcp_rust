@@ -3,6 +3,8 @@
 //! completion routing, ID allocation and response ownership are production code.
 //! These tests do not establish native OAuth interoperability or TLS behavior.
 
+mod downstream;
+
 use super::*;
 use crate::handler::{CompletionHandler, PromptHandler, ResourceHandler, ToolHandler, UriParams};
 use crate::providers::managed_oauth::interaction::{

@@ -7,7 +7,7 @@
 use super::*;
 
 #[path = "managed_provider/downstream.rs"]
-mod downstream;
+pub(crate) mod downstream;
 use fastmcp_client::http_auth::rpc::catalog::ManagedCatalogLimits;
 use fastmcp_core::McpErrorCode;
 use fastmcp_server::providers::managed_oauth::ManagedOAuthProvider;

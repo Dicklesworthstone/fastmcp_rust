@@ -7,9 +7,9 @@ use super::*;
 use fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionLimits;
 use fastmcp_server::providers::managed_oauth::ManagedOAuthTool;
 
-const ALICE: &str = "GATEWAY-ALICE-CREDENTIAL";
-const BOB: &str = "GATEWAY-BOB-CREDENTIAL";
-const RESTRICTED: &str = "GATEWAY-ALICE-RESTRICTED";
+pub(crate) const ALICE: &str = "GATEWAY-ALICE-CREDENTIAL";
+pub(crate) const BOB: &str = "GATEWAY-BOB-CREDENTIAL";
+pub(crate) const RESTRICTED: &str = "GATEWAY-ALICE-RESTRICTED";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Case {
@@ -22,13 +22,13 @@ pub(crate) enum Case {
     ConflictingModes,
 }
 
-struct Gateway {
+pub(crate) struct Gateway {
     endpoint: ServerHttpEndpoint,
     policy: HttpSecurityPolicy,
 }
 
 impl Gateway {
-    fn new(tool: ManagedOAuthTool) -> Self {
+    pub(crate) fn new(tool: ManagedOAuthTool) -> Self {
         let identity = |name: &str, scope: &str| {
             let mut auth = AuthContext::with_subject(name.to_owned())
                 .with_session_owner(fastmcp_core::sha256_bounded(name.as_bytes(), 64).unwrap());
@@ -68,7 +68,7 @@ impl Gateway {
         }
     }
 
-    async fn send(
+    pub(crate) async fn send(
         &self,
         cx: &Cx,
         id: i64,
@@ -120,14 +120,14 @@ impl Gateway {
     }
 }
 
-fn parameters(quantity: u64) -> Value {
+pub(crate) fn parameters(quantity: u64) -> Value {
     json!({
         "name":"remote/checkout",
         "arguments":{"quantity":quantity,"_meta":{"application-data":"kept"}}
     })
 }
 
-fn retry_parameters(quantity: u64, state: &Value) -> Value {
+pub(crate) fn retry_parameters(quantity: u64, state: &Value) -> Value {
     let mut params = parameters(quantity);
     params["requestState"] = state.clone();
     params["inputResponses"] = json!({
@@ -137,7 +137,7 @@ fn retry_parameters(quantity: u64, state: &Value) -> Value {
     params
 }
 
-fn assert_challenge(upstream: &Value, downstream: &Value) {
+pub(crate) fn assert_challenge(upstream: &Value, downstream: &Value) {
     assert!(upstream.get("error").is_none(), "{upstream}");
     assert!(downstream.get("error").is_none(), "{downstream}");
     assert_eq!(upstream["result"]["resultType"], "input_required");
@@ -163,7 +163,7 @@ fn assert_challenge(upstream: &Value, downstream: &Value) {
     }
 }
 
-fn assert_refused(reply: &Value, upstream_state: &Value, peer: &Peer) {
+pub(crate) fn assert_refused(reply: &Value, upstream_state: &Value, peer: &Peer) {
     assert!(reply.get("error").is_some(), "{reply}");
     let diagnostic = reply.to_string();
     assert!(!diagnostic.contains(&peer.token));

@@ -7,6 +7,8 @@
 #![cfg(all(feature = "proxy", feature = "native-tls-roots"))]
 #![recursion_limit = "256"]
 
+#[path = "http_continuation_recovery/machine_provider.rs"]
+mod machine_provider;
 #[path = "http_continuation_recovery/managed_provider.rs"]
 mod managed_provider;
 #[path = "http_continuation_recovery/provider_headers.rs"]
@@ -368,7 +370,14 @@ impl Peer {
             );
         }
         assert!(!headers.contains_key("transfer-encoding"));
-        let size: usize = headers["content-length"].parse().unwrap();
+        let size: usize = match headers.get("content-length") {
+            Some(length) => length.parse().unwrap(),
+            None if start.starts_with("GET ") => 0,
+            None => panic!("fixture POST requires explicit content length"),
+        };
+        if start.starts_with("GET ") {
+            assert_eq!(size, 0, "metadata GET must not carry a body");
+        }
         assert!(end + size <= 65536);
         while bytes.len() < end + size {
             let count = socket.read(&mut chunk).await.unwrap();
@@ -618,6 +627,7 @@ enum Case {
     Abandon,
     Endpoint,
     Provider(managed_provider::Case),
+    MachineProvider(machine_provider::Case),
     ProviderUpdates(provider_updates::Case),
     SchemaBound(schema_bound::Case),
     SchemaDriver(schema_driver::Case),
@@ -698,6 +708,10 @@ fn run(case: Case) {
         });
 }
 async fn scenario(cx: Cx, case: Case) {
+    if let Case::MachineProvider(selected) = case {
+        Box::pin(machine_provider::scenario(cx, selected)).await;
+        return;
+    }
     if let Case::ProviderUpdates(selected) = case {
         Box::pin(provider_updates::scenario(cx, selected)).await;
         return;

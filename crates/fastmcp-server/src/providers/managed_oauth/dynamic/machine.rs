@@ -35,6 +35,8 @@ use fastmcp_protocol::{
 };
 use serde_json::json;
 
+use super::super::downstream::{self, InputMode};
+use super::super::interaction::ManagedOAuthInputCapabilities;
 use super::super::subscriptions::{
     ManagedOAuthResourceSelector, ManagedOAuthResourceUpdates, ResourceUpdateStream,
     resource_filter,
@@ -74,7 +76,9 @@ const CATALOG_FAILURE: &str = "Machine-authenticated upstream catalog acquisitio
 ///
 /// By default only complete modern core results are forwarded. Explicitly
 /// installing `with_input_handler` enables bounded host-resolved input-required
-/// rounds, not transparent downstream continuation state. Resource updates use
+/// rounds. The separate `with_downstream_inputs` mode lets the admitted client
+/// answer within an explicit local allowlist, using the server's private,
+/// principal-bound continuation registry. Resource updates use
 /// the explicit, caller-owned `open_resource_updates` relay; it installs no
 /// per-downstream proxy subscription or automatic reconnect. Legacy execution
 /// and Tasks relay remain separate. No failed POST is retried and no runtime
@@ -127,7 +131,7 @@ impl ClientCredentialsProvider {
     /// Policies are already validated by the native client. Existing clones and
     /// registered handlers retain their policy. All clones still share one ID
     /// allocator for BOTH discovery and operation IDs, including catalog pages.
-    /// An explicitly installed input handler is retained with the new limits.
+    /// The selected host or downstream input mode is retained with the new limits.
     pub fn with_limits(
         mut self,
         calls: ManagedCoreLimits,
@@ -140,6 +144,37 @@ impl ClientCredentialsProvider {
         });
         self.catalog_limits = catalogs;
         self
+    }
+
+    /// Lets subsequently collected tools, resources, templates and prompts ask
+    /// the admitted downstream client for roots, sampling or elicitation.
+    ///
+    /// The allowlist is intersected with that client's current capabilities.
+    /// The server keeps upstream request state private and binds one-use retries
+    /// to the original operation, principal and grants. Every resumed POST uses
+    /// the machine client's ordinary credential acquisition and same-token
+    /// discovery; downstream credentials and identity never become upstream
+    /// authority. Closing the machine client still retires the shared owner.
+    ///
+    /// Native limits apply per POST; the server's continuation retention, round,
+    /// input and byte limits bound pauses between downstream requests.
+    /// Host and downstream resolution cannot be combined. Selecting this after
+    /// `with_input_handler` returns an error; selecting a host afterwards creates
+    /// an invalid configuration detectable by [Self::validate_input_mode] and
+    /// refused before catalogs, subscriptions or execution perform effects.
+    /// Existing clones and already collected handlers retain their own mode.
+    pub fn with_downstream_inputs(
+        mut self,
+        allowed: ManagedOAuthInputCapabilities,
+    ) -> McpResult<Self> {
+        self.forwarder = downstream::enable_downstream_inputs(&self.forwarder, allowed)?;
+        Ok(self)
+    }
+
+    /// Checks input-mode compatibility without credential or network work.
+    /// Acquisition and handler execution perform the same check themselves.
+    pub fn validate_input_mode(&self) -> McpResult<()> {
+        self.forwarder.validate_input_mode()
     }
 
     /// Prefix local tool/prompt names only. Resource identities and upstream
@@ -253,6 +288,7 @@ impl ClientCredentialsProvider {
         limits: ClientCredentialsCoreSubscriptionLimits,
     ) -> McpResult<ManagedOAuthResourceUpdates> {
         check_subscription_caller(cx, cancellation)?;
+        self.validate_input_mode()?;
         let filter = resource_filter(&self.forwarder.next_id, resources)?;
         let upstream = self
             .source
@@ -266,6 +302,7 @@ impl ClientCredentialsProvider {
 
     async fn catalog(&self, cx: &Cx, method: &'static str) -> McpResult<Vec<CoreResult>> {
         check_cx(cx)?;
+        self.validate_input_mode()?;
         let result = self
             .source
             .collect(cx, method, &self.forwarder.next_id, self.catalog_limits)
@@ -543,6 +580,14 @@ struct MachineBackend {
 }
 
 impl CoreBackend for MachineBackend {
+    fn input_mode(&self) -> InputMode {
+        if self.inputs.is_some() {
+            InputMode::Host
+        } else {
+            InputMode::Complete
+        }
+    }
+
     fn execute<'a>(
         &'a self,
         ctx: &'a McpContext,
