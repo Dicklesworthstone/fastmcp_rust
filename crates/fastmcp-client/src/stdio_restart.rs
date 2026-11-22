@@ -1024,6 +1024,39 @@ impl SupervisedStdioClient {
                                 .await);
                         }
                         Err(error) => {
+                            // Discovery alone does not publish a replacement.
+                            // A natural exit while restoring its listener may
+                            // spend another attempt in this same incident, but
+                            // only the transport's pre-cleanup OS observation
+                            // can authorize it. Protocol errors and a live
+                            // child closing stdout remain terminal.
+                            let natural_exit = matches!(
+                                self.client.stdio_restart_observation,
+                                Some(StdioRestartObservation::ProvisionalExited { .. })
+                            );
+                            if natural_exit {
+                                if let Err(cleanup) = self.client.close_with_cx(&caller).await {
+                                    let error = StdioRestartError::Cleanup(cleanup);
+                                    self.circuit = Some(error.clone());
+                                    return Err(error);
+                                }
+                                if is_cleanup_unverified(&error) || !self.cleanly_settled() {
+                                    return Err(self
+                                        .fail_and_close(&caller, StdioRestartError::Cleanup(error))
+                                        .await);
+                                }
+                                // Keep the original configured subscription ID
+                                // until publication. Retaining the provisional
+                                // listener here would erase the opt-in because
+                                // it necessarily has a different request ID.
+                                self.schedule_backoff();
+                                if cancellation.is_cancel_requested()
+                                    || caller.checkpoint().is_err()
+                                {
+                                    return Err(StdioRestartError::Cancelled);
+                                }
+                                continue;
+                            }
                             return Err(self
                                 .fail_and_close(&caller, StdioRestartError::Subscription(error))
                                 .await);
@@ -1305,11 +1338,36 @@ while IFS= read -r request; do
             accepted='{"toolsListChanged":true}'
             if [ "$first_process" = no ]; then
                 case "$SUPERVISION_MODE" in
-                    restore-rejected)
+                    restore-rejected-exit|restore-broadens-exit|restore-malformed-exit|restore-live-eof)
+                        printf '%s\n' restore-wait >> "$SUPERVISION_LOG"
+                        while [ ! -f "$SUPERVISION_GATE" ]; do sleep 0.01; done
+                        ;;
+                esac
+                case "$SUPERVISION_MODE" in
+                    restore-rejected|restore-rejected-exit)
                         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"unsupported"}}\n' "$request_id"
+                        if [ "$SUPERVISION_MODE" = restore-rejected-exit ]; then exit 24; fi
                         continue
                         ;;
-                    restore-broadens) accepted='{"toolsListChanged":true,"promptsListChanged":true}' ;;
+                    restore-broadens|restore-broadens-exit) accepted='{"toolsListChanged":true,"promptsListChanged":true}' ;;
+                    restore-malformed-exit)
+                        printf '%s\n' 'not-json'
+                        exit 24
+                        ;;
+                    restore-live-eof)
+                        printf '%s\n' stdout-closed >> "$SUPERVISION_LOG"
+                        exec 1>&-
+                        while IFS= read -r ignored; do :; done
+                        exit 0
+                        ;;
+                    restore-crash)
+                        if [ ! -f "$SUPERVISION_FIRST.restore-crashed" ]; then
+                            : > "$SUPERVISION_FIRST.restore-crashed"
+                            printf '%s\n' restore-wait >> "$SUPERVISION_LOG"
+                            while [ ! -f "$SUPERVISION_GATE" ]; do sleep 0.01; done
+                            exit 24
+                        fi
+                        ;;
                     restore-silent) continue ;;
                     restore-gated)
                         printf '%s\n' restore-wait >> "$SUPERVISION_LOG"
@@ -1318,6 +1376,7 @@ while IFS= read -r request; do
                 esac
             fi
             printf '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":%s},"notifications":%s}}\n' "$request_id" "$accepted"
+            if [ "$first_process" = no ] && [ "$SUPERVISION_MODE" = restore-broadens-exit ]; then exit 24; fi
             if [ "$SUPERVISION_MODE" = subscription-terminal ]; then
                 printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":%s}}}\n' "$request_id" "$request_id"
             else
@@ -1886,6 +1945,151 @@ done
                     ));
                     assert_eq!(owner.generation(), 1);
                     assert!(owner.client.child_cleanup_complete());
+                    assert!(matches!(
+                        owner.recover(&cx, &McpRequestCancellation::new()).await,
+                        Err(StdioRestartError::Subscription(_))
+                    ));
+                    assert_eq!(owner.restart_attempts(), 1);
+                    assert_eq!(fixture.count("listen"), 2);
+                    assert_eq!(fixture.count("effect"), 1);
+                    owner.close_with_cx(&cx).await.unwrap();
+                }
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_restoration_crash_uses_original_attempt_budget() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for attempts in [1, 2] {
+                    let fixture = Fixture::new();
+                    let mut owner = fixture
+                        .connect(&cx, "restore-crash", quick_policy(attempts))
+                        .await;
+                    let old_id = open_catalog(&mut owner, &cx).await;
+                    let _ = crash(&mut owner, &cx).await;
+                    let cancellation = McpRequestCancellation::new();
+                    drop_recovery_after_listen(&mut owner, &cx, &cancellation, &fixture).await;
+                    let original_deadline = owner.recovery.as_ref().unwrap().deadline;
+                    assert!(matches!(
+                        owner.recovery.as_ref().unwrap().phase,
+                        RecoveryPhase::Restoring
+                    ));
+                    assert_eq!(owner.generation(), 1);
+                    assert_eq!(owner.restart_attempts(), 1);
+                    assert_eq!(owner.catalog_subscription.as_ref().unwrap().request_id, old_id);
+                    std::fs::write(&fixture.gate, b"exit").unwrap();
+                    wait_for_exit(&mut owner, &cx).await;
+
+                    let result = owner.recover(&cx, &cancellation).await;
+                    if attempts == 1 {
+                        assert!(matches!(result, Err(StdioRestartError::AttemptsExhausted)));
+                        assert_eq!(owner.generation(), 1);
+                        assert_eq!(owner.recovery.as_ref().unwrap().deadline, original_deadline);
+                        assert!(owner.cleanly_settled());
+                        assert!(matches!(
+                            owner.recover(&cx, &McpRequestCancellation::new()).await,
+                            Err(StdioRestartError::AttemptsExhausted)
+                        ));
+                        assert_eq!(fixture.count("start"), 2);
+                    } else {
+                        let recovery = result.unwrap();
+                        assert_eq!((recovery.previous_generation, recovery.generation), (1, 2));
+                        assert_eq!(recovery.attempts, 2);
+                        // The failed replacement's exit is not substituted for
+                        // the original interrupted generation's crash evidence.
+                        assert_eq!(recovery.process_exit.code, Some(23));
+                        let restored = recovery.catalog_subscription.unwrap();
+                        assert_eq!(restored.previous_subscription_id, old_id);
+                        let discoveries = fixture.ids("discovery");
+                        let listeners = fixture.ids("listen");
+                        assert_eq!(discoveries.len(), 3);
+                        assert_eq!(listeners.len(), 3);
+                        assert!(discoveries.windows(2).all(|pair| pair[0] < pair[1]));
+                        assert!(listeners.windows(2).all(|pair| pair[0] < pair[1]));
+                        assert!(discoveries[2] > listeners[1]);
+                        assert_eq!(restored.subscription_id, RequestId::Number(listeners[2]));
+                        assert!(matches!(
+                            owner
+                                .next_subscription_event_with_cx(&cx, &cancellation)
+                                .await
+                                .unwrap(),
+                            StdioSubscriptionEvent::Acknowledged(filter) if filter == catalog_filter()
+                        ));
+                        assert!(matches!(
+                            owner
+                                .next_subscription_event_with_cx(&cx, &cancellation)
+                                .await
+                                .unwrap(),
+                            StdioSubscriptionEvent::Notification(
+                                crate::ServerNotification::ToolsListChanged(_)
+                            )
+                        ));
+                        owner
+                            .client_mut()
+                            .unwrap()
+                            .request_core_with_cx(&cx, &cancellation, "tools/list", json!({}))
+                            .await
+                            .unwrap();
+                        assert_eq!(fixture.count("list"), 1);
+                    }
+                    assert_eq!(owner.restart_attempts(), u64::from(attempts));
+                    assert_eq!(fixture.count("effect"), 1);
+                    owner.close_with_cx(&cx).await.unwrap();
+                }
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_protocol_exit_or_live_eof_never_authorizes_retry() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                for mode in [
+                    "restore-rejected-exit",
+                    "restore-broadens-exit",
+                    "restore-malformed-exit",
+                    "restore-live-eof",
+                ] {
+                    let fixture = Fixture::new();
+                    let mut owner = fixture.connect(&cx, mode, quick_policy(3)).await;
+                    open_catalog(&mut owner, &cx).await;
+                    let _ = crash(&mut owner, &cx).await;
+                    let cancellation = McpRequestCancellation::new();
+                    drop_recovery_after_listen(&mut owner, &cx, &cancellation, &fixture).await;
+                    std::fs::write(&fixture.gate, b"respond").unwrap();
+                    if mode == "restore-live-eof" {
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        while fixture.count("stdout-closed") == 0 {
+                            assert!(Instant::now() < deadline, "fixture did not close stdout");
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(2)).await;
+                        }
+                        assert!(
+                            owner
+                                .client
+                                .child
+                                .as_mut()
+                                .unwrap()
+                                .try_wait()
+                                .unwrap()
+                                .is_none()
+                        );
+                    } else {
+                        // Even a proven exit cannot turn an earlier malformed
+                        // or rejected acknowledgement into restart authority.
+                        wait_for_exit(&mut owner, &cx).await;
+                    }
+                    assert!(matches!(
+                        owner.recover(&cx, &cancellation).await,
+                        Err(StdioRestartError::Subscription(_))
+                    ));
+                    assert_eq!(owner.generation(), 1);
+                    assert!(owner.cleanly_settled());
                     assert!(matches!(
                         owner.recover(&cx, &McpRequestCancellation::new()).await,
                         Err(StdioRestartError::Subscription(_))
