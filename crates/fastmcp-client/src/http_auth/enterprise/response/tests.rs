@@ -1589,6 +1589,89 @@ fn enterprise_exchange_response_deadline_does_not_restart_after_preparation() {
 }
 
 #[test]
+fn enterprise_exchange_driver_confidential_response_preserves_verification_and_redacts_diagnostics()
+{
+    let selected = profile(&["read"]);
+    let (_, keys) = keys();
+    let body = serde_json::to_vec(&jag_body()).unwrap();
+    let fixture = fixtures();
+    let compact = fixture["id_jag"].as_str().unwrap();
+    for redirected in [false, true] {
+        let root = test_fetcher().root_identity().to_owned();
+        let mut response = ok_exchange_response("idp.example", &root, body.clone());
+        if redirected {
+            response.status = 307;
+            response.redirect = Some(fastmcp_transport::GuardedHttpRedirect {
+                status: 307,
+                location: Some("https://elsewhere.example/?code=redirect-secret".to_owned()),
+            });
+        }
+        let poster = ScriptedExchangePoster::new(vec![Ok(response)]);
+        let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+        let request = GuardedHttpRequest::new(
+            "application/x-www-form-urlencoded",
+            b"grant_type=opaque&client_secret=request-secret".to_vec(),
+        )
+        .unwrap();
+        run_exchange_async(async {
+            let cx = Cx::current().unwrap();
+            let clock = ExchangeClock::new(now(), cx.now());
+            let deadline = ExchangeDeadline::new(
+                &cx,
+                &clock,
+                clock.monotonic + Duration::from_secs(60),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let permit = Arc::new(ExchangePermit::acquire(Arc::clone(&driver.inner.busy)).unwrap());
+            let result = driver
+                .dispatch_post(
+                    &cx,
+                    &driver.inner.idp_token_url,
+                    &request,
+                    deadline,
+                    Arc::clone(&permit),
+                    || Ok(()),
+                )
+                .await;
+            if redirected {
+                assert_eq!(
+                    result.unwrap_err(),
+                    EnterpriseExchangeError::RedirectRefused
+                );
+            } else {
+                // The real dispatcher transfers its response owner directly to
+                // the verifier. The transport unit tests separately exercise
+                // this owner over authenticated native TLS.
+                let response: GuardedHttpConfidentialResponse = result.unwrap();
+                assert_eq!(response.body(), body);
+                assert!(!format!("{response:?}").contains(compact));
+                let admitted = selected
+                    .admit_id_jag_response(
+                        EnterpriseTokenResponse {
+                            status: response.status(),
+                            headers: response.headers(),
+                            body: response.body(),
+                        },
+                        &keys,
+                        TenantExpectation::SingleTenant,
+                        ResourceTenantExpectation::SingleTenant,
+                        EnterpriseResponsePolicy::default(),
+                        now(),
+                    )
+                    .unwrap();
+                assert_eq!(success(admitted).granted_scopes(), ["read"]);
+                assert!(driver.inner.busy.load(Ordering::Acquire));
+                drop(response);
+            }
+            drop(permit);
+            assert!(!driver.inner.busy.load(Ordering::Acquire));
+        });
+        assert_eq!(poster.take_recorded().len(), 1);
+    }
+}
+
+#[test]
 fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives() {
     let selected = profile(&["read"]);
     let (oidc_keys, jag_keys) = keys();

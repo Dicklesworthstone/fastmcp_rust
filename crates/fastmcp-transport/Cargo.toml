@@ -31,6 +31,7 @@ fastmcp-protocol.workspace = true
 asupersync = { workspace = true, features = ["tls", "tls-webpki-roots"] }
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 # FND-01 TRANSPORT-NO-GETRANDOM: WebSocket masking uses fastmcp-core crypto.
 
 [target.'cfg(unix)'.dependencies]

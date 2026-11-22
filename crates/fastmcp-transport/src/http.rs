@@ -91,6 +91,7 @@ use fastmcp_protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseAdmission, RequestId,
     decode_strict_jsonrpc_response,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "legacy-2024-11-05")]
 use crate::sse::SseEvent;
@@ -1466,7 +1467,7 @@ pub struct GuardedHttpPeerProvenance {
 }
 
 /// Observed redirect response. Redirects are reported, never followed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GuardedHttpRedirect {
     /// 3xx status observed on the single request.
     pub status: u16,
@@ -1474,8 +1475,29 @@ pub struct GuardedHttpRedirect {
     pub location: Option<String>,
 }
 
+impl std::fmt::Debug for GuardedHttpRedirect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardedHttpRedirect")
+            .field("status", &self.status)
+            .field("location", &self.location.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl Zeroize for GuardedHttpRedirect {
+    fn zeroize(&mut self) {
+        self.status.zeroize();
+        self.location.zeroize();
+    }
+}
+
 /// A fully bounded one-shot response from [`GuardedHttpFetcher`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its fields remain ordinary caller-owned values. Use
+/// [`GuardedHttpFetcher::post_confidential`] for secret-bearing responses that
+/// must remain in zeroizing ownership through validation and cancellation.
+#[derive(Clone, PartialEq, Eq)]
 pub struct GuardedHttpFetchResponse {
     /// HTTP status returned by the single request.
     pub status: u16,
@@ -1487,6 +1509,116 @@ pub struct GuardedHttpFetchResponse {
     pub redirect: Option<GuardedHttpRedirect>,
     /// Selected route and TLS facts.
     pub provenance: GuardedHttpPeerProvenance,
+}
+
+impl std::fmt::Debug for GuardedHttpFetchResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardedHttpFetchResponse")
+            .field("status", &self.status)
+            .field("header_count", &self.headers.len())
+            .field("body_len", &self.body.len())
+            .field("redirect", &self.redirect)
+            .field("provenance", &self.provenance)
+            .finish()
+    }
+}
+
+/// A response whose body, fields and redirect location are wiped on drop.
+///
+/// This owner is deliberately not `Clone`. Its accessors borrow the protected
+/// values; callers that explicitly copy those values own the copies' custody.
+/// Debug exposes lengths and route provenance, never response contents.
+///
+/// Protection covers allocations owned by this type, including completed
+/// results discarded by a cancelled guarded worker. It does not cover earlier
+/// copies made by the caller or transient buffers inside asupersync's native
+/// HTTP codec, TLS implementation, kernel, or remote peer. Those upstream
+/// buffers are not accessible to this owner and require separate guarantees.
+pub struct GuardedHttpConfidentialResponse {
+    status: u16,
+    headers: Zeroizing<Vec<(String, String)>>,
+    body: Zeroizing<Vec<u8>>,
+    redirect: Option<Zeroizing<GuardedHttpRedirect>>,
+    provenance: GuardedHttpPeerProvenance,
+    // Struct fields drop in declaration order: retain phase capacity until
+    // every protected response allocation above has been wiped, even when a
+    // runtime-held completed result is discarded after its parent disappears.
+    _lifetime: Option<Arc<dyn Send + Sync>>,
+}
+
+impl GuardedHttpConfidentialResponse {
+    /// Take custody of already-owned response allocations without copying.
+    /// This does not undo copies made before ownership was transferred here.
+    #[must_use]
+    pub fn from_response(response: GuardedHttpFetchResponse) -> Self {
+        Self {
+            status: response.status,
+            headers: Zeroizing::new(response.headers),
+            body: Zeroizing::new(response.body),
+            redirect: response.redirect.map(Zeroizing::new),
+            provenance: response.provenance,
+            _lifetime: None,
+        }
+    }
+
+    /// The received HTTP status.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Borrow the received fields in wire order.
+    #[must_use]
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// Borrow the identity-coded response body.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Borrow the redirect observation, if one was received.
+    #[must_use]
+    pub fn redirect(&self) -> Option<&GuardedHttpRedirect> {
+        self.redirect.as_deref()
+    }
+
+    /// Borrow the selected route and TLS facts.
+    #[must_use]
+    pub fn provenance(&self) -> &GuardedHttpPeerProvenance {
+        &self.provenance
+    }
+
+    // Ordinary fetch/post explicitly transfers responsibility back to its
+    // historical public field-based response, after the last caller check.
+    fn into_response(mut self) -> GuardedHttpFetchResponse {
+        GuardedHttpFetchResponse {
+            status: self.status,
+            headers: std::mem::take(&mut *self.headers),
+            body: std::mem::take(&mut *self.body),
+            redirect: self.redirect.as_mut().map(|redirect| GuardedHttpRedirect {
+                status: redirect.status,
+                location: redirect.location.take(),
+            }),
+            provenance: self.provenance,
+        }
+    }
+}
+
+impl std::fmt::Debug for GuardedHttpConfidentialResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardedHttpConfidentialResponse")
+            .field("status", &self.status)
+            .field("header_count", &self.headers.len())
+            .field("body_len", &self.body.len())
+            .field("redirect", &self.redirect())
+            .field("provenance", &self.provenance)
+            .finish()
+    }
 }
 
 /// Failure from guarded URL admission, resolution, TLS, or one-shot HTTP.
@@ -1792,18 +1924,23 @@ impl GuardedHttpFetcher {
                 selected_address,
             };
             let body_limit = self.policy.response_body_bytes;
-            let wire = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
+            let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
                 let _lifetime = lifetime;
-                exchange.exchange(phase_cx, request).await
+                let wire = exchange.exchange(phase_cx, request).await?;
+                let mut response = guarded_admit_owned_response(
+                    wire.status,
+                    wire.headers,
+                    wire.body,
+                    body_limit,
+                    wire.provenance,
+                    false,
+                )?;
+                response._lifetime = _lifetime;
+                Ok(response)
             })
             .await?;
-            return guarded_admit_native_response(
-                wire.status,
-                wire.headers,
-                wire.body,
-                body_limit,
-                wire.provenance,
-            );
+            guarded_fetch_checkpoint(cx)?;
+            return Ok(response.into_response());
         }
 
         let connector = self.connector.clone();
@@ -1840,17 +1977,18 @@ impl GuardedHttpFetcher {
                 )
                 .await
                 .map_err(|error| GuardedHttpFetchError::Http(error.to_string()))?;
-            guarded_admit_native_response(
-                response.status,
-                response.headers,
-                response.body,
+            let mut response = guarded_admit_completed_native_response(
+                response,
                 policy.response_body_bytes,
                 provenance,
-            )
+                false,
+            )?;
+            response._lifetime = _lifetime;
+            Ok(response)
         })
         .await?;
         guarded_fetch_checkpoint(cx)?;
-        Ok(response)
+        Ok(response.into_response())
     }
 
     /// The fixed policy used by this fetcher.
@@ -1908,11 +2046,16 @@ const MAX_GUARDED_ROOT_SET_IDENTITY_PREIMAGE_BYTES: usize = GUARDED_ROOT_SET_IDE
 /// SP, and HTAB (so CR, LF, NUL, other controls, DEL, and non-ASCII are
 /// refused), and must not begin or end with SP or HTAB. The body is at most
 /// [`MAX_GUARDED_REQUEST_BODY_BYTES`].
+///
+/// Owned fields and any explicit clones are zeroized on drop, including
+/// rejected inputs and replaced authorization values. This protection starts
+/// when construction takes ownership and does not extend to earlier caller
+/// copies or the native HTTP/TLS stack's internal transient buffers.
 #[derive(Clone, PartialEq, Eq)]
 pub struct GuardedHttpRequest {
-    content_type: String,
-    body: Vec<u8>,
-    authorization: Option<String>,
+    content_type: Zeroizing<String>,
+    body: Zeroizing<Vec<u8>>,
+    authorization: Option<Zeroizing<String>>,
 }
 
 impl GuardedHttpRequest {
@@ -1921,8 +2064,8 @@ impl GuardedHttpRequest {
         content_type: impl Into<String>,
         body: impl Into<Vec<u8>>,
     ) -> Result<Self, GuardedHttpFetchError> {
-        let content_type = content_type.into();
-        let body = body.into();
+        let content_type = Zeroizing::new(content_type.into());
+        let body = Zeroizing::new(body.into());
         if body.len() > MAX_GUARDED_REQUEST_BODY_BYTES {
             return Err(GuardedHttpFetchError::InvalidRequest("request body bound"));
         }
@@ -1938,13 +2081,13 @@ impl GuardedHttpRequest {
 
     /// Attach a validated authorization field value.
     ///
-    /// On refusal the value is dropped and never echoed; the typed error
-    /// carries only static text.
+    /// On refusal the value and request are wiped and never echoed; the typed
+    /// error carries only static text. Replacing an earlier value wipes it.
     pub fn with_authorization(
         mut self,
         value: impl Into<String>,
     ) -> Result<Self, GuardedHttpFetchError> {
-        let value = value.into();
+        let value = Zeroizing::new(value.into());
         if !is_guarded_request_field_value(&value) {
             return Err(GuardedHttpFetchError::InvalidRequest("authorization value"));
         }
@@ -1978,7 +2121,7 @@ impl std::fmt::Debug for GuardedHttpRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GuardedHttpRequest")
-            .field("content_type", &self.content_type)
+            .field("content_type", &self.content_type.as_str())
             .field("body_len", &self.body.len())
             .field(
                 "authorization",
@@ -2014,13 +2157,18 @@ pub fn guarded_encode_post_request(
     request: &GuardedHttpRequest,
 ) -> Result<Vec<u8>, GuardedHttpFetchError> {
     let mut encoded = asupersync::bytes::BytesMut::new();
-    asupersync::codec::Encoder::encode(
+    let result = asupersync::codec::Encoder::encode(
         &mut asupersync::http::h1::Http1ClientCodec::new(),
         guarded_compose_post_request(url, request),
         &mut encoded,
-    )
-    .map_err(|error| GuardedHttpFetchError::Http(error.to_string()))?;
-    Ok(encoded.as_ref().to_vec())
+    );
+    if let Err(error) = result {
+        encoded.as_mut().zeroize();
+        return Err(GuardedHttpFetchError::Http(error.to_string()));
+    }
+    // Transfer the serializer's allocation instead of retaining a second
+    // plaintext copy. This explicit wire export is owned by the caller.
+    Ok(encoded.into_vec())
 }
 
 /// The one composer for guarded POST requests, shared by
@@ -2031,15 +2179,15 @@ fn guarded_compose_post_request(
 ) -> NativeHttpRequest {
     let mut builder = NativeHttpRequest::post(url.target.clone())
         .header("Host", url.authority())
-        .header("Content-Type", request.content_type.clone())
+        .header("Content-Type", request.content_type.as_str())
         .header("Content-Length", request.body.len().to_string());
     if let Some(authorization) = request.authorization.as_ref() {
-        builder = builder.header("Authorization", authorization.clone());
+        builder = builder.header("Authorization", authorization.as_str());
     }
     builder
         .header("Accept-Encoding", "identity")
         .header("Connection", "close")
-        .body(request.body.clone())
+        .body(request.body.to_vec())
         .build()
 }
 
@@ -2224,8 +2372,9 @@ impl GuardedHttpFetcher {
         url: &GuardedHttpsUrl,
         request: &GuardedHttpRequest,
     ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
-        self.post_with_retained_lifetime(cx, url, request, None)
+        self.post_with_retained_lifetime(cx, url, request, None, false)
             .await
+            .map(GuardedHttpConfidentialResponse::into_response)
     }
 
     /// POST while retaining a caller's admission/resource guard in every owned
@@ -2244,8 +2393,45 @@ impl GuardedHttpFetcher {
         request: &GuardedHttpRequest,
         lifetime: Arc<dyn Send + Sync>,
     ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
-        self.post_with_retained_lifetime(cx, url, request, Some(lifetime))
+        self.post_with_retained_lifetime(cx, url, request, Some(lifetime), false)
             .await
+            .map(GuardedHttpConfidentialResponse::into_response)
+    }
+
+    /// POST while keeping returned body, fields and redirect data in a
+    /// non-Clone zeroizing owner. Response contents are never formatted into
+    /// diagnostics, including malformed content-coding errors.
+    ///
+    /// Network, TLS, address, body and deadline policy are identical to
+    /// [`Self::post`]. Ownership begins in the worker before response
+    /// validation, so cancellation, timeout and rejection dispose protected
+    /// completed results. Asupersync's internal HTTP/TLS transient buffers are
+    /// outside this guarantee; see [`GuardedHttpConfidentialResponse`].
+    pub async fn post_confidential(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+        request: &GuardedHttpRequest,
+    ) -> Result<GuardedHttpConfidentialResponse, GuardedHttpFetchError> {
+        self.post_with_retained_lifetime(cx, url, request, None, true)
+            .await
+            .map_err(redact_guarded_confidential_error)
+    }
+
+    /// Confidential POST retaining capacity in every phase and in the returned
+    /// response. The last response-owned guard drops after its secret fields
+    /// are wiped. Retain a caller Arc for any later processing that outlives
+    /// the returned response and must remain charged.
+    pub async fn post_confidential_with_lifetime(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+        request: &GuardedHttpRequest,
+        lifetime: Arc<dyn Send + Sync>,
+    ) -> Result<GuardedHttpConfidentialResponse, GuardedHttpFetchError> {
+        self.post_with_retained_lifetime(cx, url, request, Some(lifetime), true)
+            .await
+            .map_err(redact_guarded_confidential_error)
     }
 
     async fn post_with_retained_lifetime(
@@ -2254,7 +2440,8 @@ impl GuardedHttpFetcher {
         url: &GuardedHttpsUrl,
         request: &GuardedHttpRequest,
         lifetime: Option<Arc<dyn Send + Sync>>,
-    ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
+        confidential: bool,
+    ) -> Result<GuardedHttpConfidentialResponse, GuardedHttpFetchError> {
         guarded_fetch_checkpoint(cx)?;
         let fetch_deadline = time::wall_now() + self.policy.deadline;
         let answers = self
@@ -2272,12 +2459,14 @@ impl GuardedHttpFetcher {
 
         let connector = self.connector.clone();
         let host = url.host.clone();
-        let native_request = guarded_compose_post_request(url, request);
+        let url = url.clone();
+        let request = request.clone();
         let policy = self.policy.clone();
         let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
             // Declared before I/O resources so ordinary scope destruction
             // disposes the request/stream before releasing this capacity.
             let _lifetime = lifetime;
+            let request = request;
             guarded_fetch_checkpoint(&phase_cx)?;
             let tcp = NativeTcpStream::connect(selected_address)
                 .await
@@ -2291,6 +2480,11 @@ impl GuardedHttpFetcher {
                 .map_err(|error| GuardedHttpFetchError::Tls(error.to_string()))?;
             let provenance = guarded_peer_provenance(&tls, host, selected_address, &policy)?;
             guarded_fetch_checkpoint(&phase_cx)?;
+            // The phase owns a zeroizing clone while connection/TLS admission
+            // can suspend or fail. Make native copies only at their handoff to
+            // Http1Client; its private codec/TLS buffers cannot be wiped here.
+            let native_request = guarded_compose_post_request(&url, &request);
+            drop(request);
             let (response, _stream, _body_withheld) =
                 NativeHttp1Client::request_with_io_and_max_body_size(
                     tls,
@@ -2298,14 +2492,21 @@ impl GuardedHttpFetcher {
                     policy.response_body_bytes,
                 )
                 .await
-                .map_err(|error| GuardedHttpFetchError::Http(error.to_string()))?;
-            guarded_admit_native_response(
-                response.status,
-                response.headers,
-                response.body,
+                .map_err(|error| {
+                    GuardedHttpFetchError::Http(if confidential {
+                        "<redacted>".to_owned()
+                    } else {
+                        error.to_string()
+                    })
+                })?;
+            let mut response = guarded_admit_completed_native_response(
+                response,
                 policy.response_body_bytes,
                 provenance,
-            )
+                confidential,
+            )?;
+            response._lifetime = _lifetime;
+            Ok(response)
         })
         .await?;
         guarded_fetch_checkpoint(cx)?;
@@ -2431,45 +2632,108 @@ pub fn guarded_admit_native_response(
     body_limit: usize,
     provenance: GuardedHttpPeerProvenance,
 ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
-    let header_bytes = headers.iter().try_fold(0_usize, |total, (name, value)| {
-        total
-            .checked_add(name.len())
-            .and_then(|total| total.checked_add(value.len()))
-            .and_then(|total| total.checked_add(4))
-            .ok_or(GuardedHttpFetchError::ResponseHeadersTooLarge)
-    })?;
+    guarded_admit_owned_response(status, headers, body, body_limit, provenance, false)
+        .map(GuardedHttpConfidentialResponse::into_response)
+}
+
+fn guarded_admit_completed_native_response(
+    mut response: asupersync::http::h1::Response,
+    body_limit: usize,
+    provenance: GuardedHttpPeerProvenance,
+    confidential: bool,
+) -> Result<GuardedHttpConfidentialResponse, GuardedHttpFetchError> {
+    // These native fields are not exposed by guarded fetch. Once handed back
+    // to us they are still peer-controlled allocations and may carry secrets.
+    response.reason.zeroize();
+    response.trailers.zeroize();
+    guarded_admit_owned_response(
+        response.status,
+        response.headers,
+        response.body,
+        body_limit,
+        provenance,
+        confidential,
+    )
+}
+
+fn guarded_admit_owned_response(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    body_limit: usize,
+    provenance: GuardedHttpPeerProvenance,
+    confidential: bool,
+) -> Result<GuardedHttpConfidentialResponse, GuardedHttpFetchError> {
+    // Own every sensitive allocation before any fallible validation. This
+    // also protects a completed result that a cancelled phase never delivers.
+    let mut response = GuardedHttpConfidentialResponse::from_response(GuardedHttpFetchResponse {
+        status,
+        headers,
+        body,
+        redirect: None,
+        provenance,
+    });
+    let header_bytes = response
+        .headers
+        .iter()
+        .try_fold(0_usize, |total, (name, value)| {
+            total
+                .checked_add(name.len())
+                .and_then(|total| total.checked_add(value.len()))
+                .and_then(|total| total.checked_add(4))
+                .ok_or(GuardedHttpFetchError::ResponseHeadersTooLarge)
+        })?;
     if header_bytes > MAX_GUARDED_RESPONSE_HEADER_BYTES {
         return Err(GuardedHttpFetchError::ResponseHeadersTooLarge);
     }
-    if body.len() > body_limit {
+    if response.body.len() > body_limit {
         return Err(GuardedHttpFetchError::Http(
             "response body exceeded guarded bound".to_owned(),
         ));
     }
-    for (_, encoding) in headers
+    for (_, encoding) in response
+        .headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
     {
         if !is_identity_content_coding(encoding) {
             return Err(GuardedHttpFetchError::UnexpectedContentEncoding(
-                encoding.clone(),
+                if confidential {
+                    "<redacted>".to_owned()
+                } else {
+                    encoding.clone()
+                },
             ));
         }
     }
-    let redirect = (300..400).contains(&status).then(|| GuardedHttpRedirect {
-        status,
-        location: headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
-            .map(|(_, value)| value.clone()),
+    response.redirect = (300..400).contains(&status).then(|| {
+        Zeroizing::new(GuardedHttpRedirect {
+            status,
+            location: response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+                .map(|(_, value)| value.clone()),
+        })
     });
-    Ok(GuardedHttpFetchResponse {
-        status,
-        headers,
-        body,
-        redirect,
-        provenance,
-    })
+    Ok(response)
+}
+
+fn redact_guarded_confidential_error(mut error: GuardedHttpFetchError) -> GuardedHttpFetchError {
+    match &mut error {
+        GuardedHttpFetchError::Resolution(message)
+        | GuardedHttpFetchError::Connect(message)
+        | GuardedHttpFetchError::Tls(message)
+        | GuardedHttpFetchError::Http(message)
+        | GuardedHttpFetchError::UnexpectedContentEncoding(message) => {
+            // Preserve the typed failure while disposing any peer-derived or
+            // runtime-owned diagnostic before it can escape the secret path.
+            message.zeroize();
+            message.push_str("<redacted>");
+        }
+        _ => {}
+    }
+    error
 }
 
 fn guarded_peer_provenance(
@@ -8296,6 +8560,7 @@ X/aCEJ5+hA==
     /// root identity its fetcher reported before posting.
     struct GuardedLoopbackPostRun {
         results: Vec<Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>,
+        confidential_results: Vec<Result<GuardedHttpConfidentialResponse, GuardedHttpFetchError>>,
         urls: Vec<GuardedHttpsUrl>,
         root_identities: Vec<String>,
         observation: GuardedLoopbackPostObservation,
@@ -8312,6 +8577,15 @@ X/aCEJ5+hA==
         attempts: Vec<GuardedLoopbackPostAttempt>,
         responses: Vec<Vec<u8>>,
         lifetime: Option<Arc<dyn Send + Sync>>,
+    ) -> GuardedLoopbackPostRun {
+        guarded_loopback_posts_with_custody(attempts, responses, lifetime, false)
+    }
+
+    fn guarded_loopback_posts_with_custody(
+        attempts: Vec<GuardedLoopbackPostAttempt>,
+        responses: Vec<Vec<u8>>,
+        lifetime: Option<Arc<dyn Send + Sync>>,
+        confidential: bool,
     ) -> GuardedLoopbackPostRun {
         fastmcp_core::block_on(async {
             let cx = Cx::current().expect("runtime installs loopback context");
@@ -8337,6 +8611,7 @@ X/aCEJ5+hA==
                 })
                 .expect("spawn loopback POST server");
             let mut results = Vec::with_capacity(attempts.len());
+            let mut confidential_results = Vec::with_capacity(attempts.len());
             let mut urls = Vec::with_capacity(attempts.len());
             let mut root_identities = Vec::with_capacity(attempts.len());
             for attempt in attempts {
@@ -8357,14 +8632,35 @@ X/aCEJ5+hA==
                 ))
                 .expect("loopback POST URL");
                 root_identities.push(fetcher.root_identity().to_owned());
-                results.push(match &lifetime {
-                    Some(lifetime) => {
-                        fetcher
-                            .post_with_lifetime(&cx, &url, &attempt.request, Arc::clone(lifetime))
-                            .await
-                    }
-                    None => fetcher.post(&cx, &url, &attempt.request).await,
-                });
+                if confidential {
+                    confidential_results.push(match &lifetime {
+                        Some(lifetime) => {
+                            fetcher
+                                .post_confidential_with_lifetime(
+                                    &cx,
+                                    &url,
+                                    &attempt.request,
+                                    Arc::clone(lifetime),
+                                )
+                                .await
+                        }
+                        None => fetcher.post_confidential(&cx, &url, &attempt.request).await,
+                    });
+                } else {
+                    results.push(match &lifetime {
+                        Some(lifetime) => {
+                            fetcher
+                                .post_with_lifetime(
+                                    &cx,
+                                    &url,
+                                    &attempt.request,
+                                    Arc::clone(lifetime),
+                                )
+                                .await
+                        }
+                        None => fetcher.post(&cx, &url, &attempt.request).await,
+                    });
+                }
                 urls.push(url);
             }
             let join_deadline =
@@ -8394,6 +8690,7 @@ X/aCEJ5+hA==
                 std::mem::take(&mut *observation.lock().expect("loopback POST observation lock"));
             GuardedLoopbackPostRun {
                 results,
+                confidential_results,
                 urls,
                 root_identities,
                 observation,
@@ -8403,6 +8700,331 @@ X/aCEJ5+hA==
 
     fn guarded_loopback_member_roots() -> GuardedRootSet {
         GuardedRootSet::new([guarded_loopback_root()]).expect("member root set")
+    }
+
+    #[test]
+    fn guarded_confidential_request_owns_clones_and_replaced_authorization() {
+        fn zeroizing_owner<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        let body = b"client_secret=body-secret&code=one-use".to_vec();
+        let original_allocation = body.as_ptr();
+        let request = GuardedHttpRequest::new("application/x-www-form-urlencoded", body)
+            .unwrap()
+            .with_authorization("Basic initial-secret")
+            .unwrap();
+        assert_eq!(request.body().as_ptr(), original_allocation);
+        zeroizing_owner(&request.content_type);
+        zeroizing_owner(&request.body);
+        zeroizing_owner(request.authorization.as_ref().unwrap());
+        let copied = request.clone();
+        assert_eq!(copied.body(), request.body());
+        assert_ne!(copied.body().as_ptr(), request.body().as_ptr());
+        zeroizing_owner(&copied.body);
+        zeroizing_owner(copied.authorization.as_ref().unwrap());
+
+        let replaced = request
+            .with_authorization("Basic replacement-secret")
+            .unwrap();
+        let url = GuardedHttpsUrl::parse("https://public.example/token").unwrap();
+        let encoded = guarded_encode_post_request(&url, &replaced).unwrap();
+        let encoded = std::str::from_utf8(&encoded).unwrap();
+        assert!(encoded.contains("Authorization: Basic replacement-secret\r\n"));
+        assert!(!encoded.contains("initial-secret"));
+        assert!(encoded.ends_with("client_secret=body-secret&code=one-use"));
+        for value in [&copied, &replaced] {
+            let debug = format!("{value:?}");
+            for secret in [
+                "body-secret",
+                "one-use",
+                "initial-secret",
+                "replacement-secret",
+            ] {
+                assert!(!debug.contains(secret), "request Debug exposed {secret}");
+            }
+        }
+        let rejected = replaced.with_authorization("Bearer rejected-secret\r\nInjected: value");
+        assert_eq!(
+            rejected.unwrap_err(),
+            GuardedHttpFetchError::InvalidRequest("authorization value"),
+        );
+        assert_eq!(copied.body(), b"client_secret=body-secret&code=one-use");
+    }
+
+    #[test]
+    fn guarded_confidential_response_transfers_allocations_and_redacts_all_contents() {
+        fn zeroizing_owner<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        let body = b"response-body-secret".to_vec();
+        let headers = vec![(
+            "X-header-name-secret".to_owned(),
+            "header-value-secret".to_owned(),
+        )];
+        let body_allocation = body.as_ptr();
+        let header_allocation = headers.as_ptr();
+        let raw = GuardedHttpFetchResponse {
+            status: 307,
+            headers,
+            body,
+            redirect: Some(GuardedHttpRedirect {
+                status: 307,
+                location: Some("https://elsewhere.example/?code=redirect-secret".to_owned()),
+            }),
+            provenance: guarded_test_provenance(),
+        };
+        let ordinary_debug = format!("{raw:?}");
+        let response = GuardedHttpConfidentialResponse::from_response(raw);
+        assert_eq!(response.body().as_ptr(), body_allocation);
+        assert_eq!(response.headers().as_ptr(), header_allocation);
+        assert_eq!(response.status(), 307);
+        assert_eq!(response.body(), b"response-body-secret");
+        assert_eq!(response.headers()[0].1, "header-value-secret");
+        assert_eq!(
+            response.redirect().unwrap().location.as_deref(),
+            Some("https://elsewhere.example/?code=redirect-secret")
+        );
+        assert_eq!(response.provenance(), &guarded_test_provenance());
+        zeroizing_owner(&response.body);
+        zeroizing_owner(&response.headers);
+        zeroizing_owner(response.redirect.as_ref().unwrap());
+        for debug in [
+            ordinary_debug,
+            format!("{response:?}"),
+            format!("{:?}", response.redirect()),
+        ] {
+            for secret in [
+                "response-body-secret",
+                "X-header-name-secret",
+                "header-value-secret",
+                "redirect-secret",
+            ] {
+                assert!(!debug.contains(secret), "response Debug exposed {secret}");
+            }
+        }
+        // The historical ordinary API can still transfer each public field.
+        let ordinary = response.into_response();
+        assert_eq!(ordinary.body.as_ptr(), body_allocation);
+        assert_eq!(ordinary.headers.as_ptr(), header_allocation);
+        let GuardedHttpFetchResponse {
+            body,
+            headers,
+            redirect,
+            provenance,
+            ..
+        } = ordinary;
+        assert_eq!(body, b"response-body-secret");
+        assert_eq!(headers[0].1, "header-value-secret");
+        assert!(
+            redirect
+                .unwrap()
+                .location
+                .unwrap()
+                .ends_with("redirect-secret")
+        );
+        assert_eq!(provenance, guarded_test_provenance());
+    }
+
+    #[test]
+    fn guarded_confidential_response_admission_preserves_bounds_and_redacts_errors() {
+        let body = b"response-secret".to_vec();
+        let good = guarded_admit_owned_response(
+            200,
+            vec![("Content-Encoding".to_owned(), "identity".to_owned())],
+            body.clone(),
+            body.len(),
+            guarded_test_provenance(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(good.body(), body);
+        let oversized = guarded_admit_owned_response(
+            200,
+            Vec::new(),
+            body.clone(),
+            body.len() - 1,
+            guarded_test_provenance(),
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(oversized, GuardedHttpFetchError::Http(_)));
+        assert!(!format!("{oversized:?}").contains("response-secret"));
+        let oversized_headers = guarded_admit_owned_response(
+            200,
+            vec![(
+                "X-secret".to_owned(),
+                "h".repeat(MAX_GUARDED_RESPONSE_HEADER_BYTES),
+            )],
+            body.clone(),
+            body.len(),
+            guarded_test_provenance(),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            oversized_headers,
+            GuardedHttpFetchError::ResponseHeadersTooLarge
+        );
+        for confidential in [false, true] {
+            let malformed = guarded_admit_owned_response(
+                200,
+                vec![(
+                    "Content-Encoding".to_owned(),
+                    "peer-derived-secret".to_owned(),
+                )],
+                body.clone(),
+                body.len(),
+                guarded_test_provenance(),
+                confidential,
+            )
+            .unwrap_err();
+            assert_eq!(
+                malformed,
+                GuardedHttpFetchError::UnexpectedContentEncoding(
+                    if confidential {
+                        "<redacted>"
+                    } else {
+                        "peer-derived-secret"
+                    }
+                    .to_owned(),
+                ),
+            );
+        }
+        for error in [
+            GuardedHttpFetchError::Resolution("resolver-secret".to_owned()),
+            GuardedHttpFetchError::Connect("connect-secret".to_owned()),
+            GuardedHttpFetchError::Tls("tls-secret".to_owned()),
+            GuardedHttpFetchError::Http("http-secret".to_owned()),
+            GuardedHttpFetchError::UnexpectedContentEncoding("coding-secret".to_owned()),
+        ] {
+            let kind = std::mem::discriminant(&error);
+            let redacted = redact_guarded_confidential_error(error);
+            assert_eq!(std::mem::discriminant(&redacted), kind);
+            assert!(!format!("{redacted:?}: {redacted}").contains("-secret"));
+        }
+        for error in [
+            GuardedHttpFetchError::Cancelled,
+            GuardedHttpFetchError::DeadlineExceeded,
+        ] {
+            assert_eq!(redact_guarded_confidential_error(error.clone()), error);
+        }
+    }
+
+    #[test]
+    fn guarded_confidential_post_delivers_real_tls_response_and_exact_request() {
+        for retain in [false, true] {
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let lifetime: Option<Arc<dyn Send + Sync>> = retain.then(|| {
+                Arc::new(GuardedLifetimeProbe {
+                    dropped: Arc::clone(&dropped),
+                }) as Arc<dyn Send + Sync>
+            });
+            let request = GuardedHttpRequest::new(
+                "application/x-www-form-urlencoded",
+                b"client_secret=request-secret".to_vec(),
+            )
+            .unwrap()
+            .with_authorization("Basic authorization-secret")
+            .unwrap();
+            let body = "{\"access_token\":\"response-secret\"}";
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-token: header-secret\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            ).into_bytes();
+            let run = guarded_loopback_posts_with_custody(
+                vec![GuardedLoopbackPostAttempt {
+                    roots: guarded_loopback_member_roots(),
+                    request: request.clone(),
+                    host: "foobar.com",
+                }],
+                vec![wire],
+                lifetime,
+                true,
+            );
+            assert_eq!(dropped.load(Ordering::Acquire), 0);
+            assert!(run.results.is_empty());
+            let response = run.confidential_results[0].as_ref().unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.body(), body.as_bytes());
+            assert!(
+                response
+                    .headers()
+                    .iter()
+                    .any(|(name, value)| name == "X-token" && value == "header-secret")
+            );
+            assert_eq!(
+                response.provenance().root_policy_revision,
+                run.root_identities[0]
+            );
+            assert!(response.redirect().is_none());
+            let debug = format!("{response:?}");
+            assert!(!debug.contains("response-secret"));
+            assert!(!debug.contains("header-secret"));
+            assert_eq!(run.observation.accepted_connections, 1);
+            assert_eq!(
+                run.observation.requests,
+                vec![guarded_encode_post_request(&run.urls[0], &request).unwrap()]
+            );
+            drop(run);
+            assert_eq!(dropped.load(Ordering::Acquire), usize::from(retain));
+        }
+    }
+
+    #[test]
+    fn guarded_confidential_post_refuses_untrusted_tls_without_sending_credentials() {
+        let request = GuardedHttpRequest::new(
+            "application/x-www-form-urlencoded",
+            b"client_secret=request-secret".to_vec(),
+        )
+        .unwrap()
+        .with_authorization("Basic authorization-secret")
+        .unwrap();
+        let run = guarded_loopback_posts_with_custody(
+            vec![GuardedLoopbackPostAttempt {
+                roots: GuardedRootSet::new(vec![guarded_outside_root()]).unwrap(),
+                request,
+                host: "foobar.com",
+            }],
+            vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec()],
+            None,
+            true,
+        );
+        assert_eq!(
+            run.confidential_results[0].as_ref().unwrap_err(),
+            &GuardedHttpFetchError::Tls("<redacted>".to_owned()),
+        );
+        assert_eq!(run.observation.accepted_connections, 1);
+        assert!(run.observation.requests.is_empty());
+    }
+
+    #[test]
+    fn guarded_confidential_post_rejects_secret_coding_and_never_follows_redirects() {
+        let request = GuardedHttpRequest::new("application/json", b"{}".to_vec()).unwrap();
+        let run = guarded_loopback_posts_with_custody(
+            vec![
+                GuardedLoopbackPostAttempt { roots: guarded_loopback_member_roots(), request: request.clone(), host: "foobar.com" },
+                GuardedLoopbackPostAttempt { roots: guarded_loopback_member_roots(), request, host: "foobar.com" },
+            ],
+            vec![
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: coding-secret\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbody-secret".to_vec(),
+                b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://foobar.com/elsewhere?code=redirect-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            ],
+            None, true,
+        );
+        assert_eq!(
+            run.confidential_results[0].as_ref().unwrap_err(),
+            &GuardedHttpFetchError::UnexpectedContentEncoding("<redacted>".to_owned())
+        );
+        let redirect = run.confidential_results[1].as_ref().unwrap();
+        assert_eq!(redirect.status(), 307);
+        assert_eq!(
+            redirect.redirect().unwrap().location.as_deref(),
+            Some("https://foobar.com/elsewhere?code=redirect-secret")
+        );
+        let diagnostics = format!("{:?}", run.confidential_results);
+        for secret in ["coding-secret", "body-secret", "redirect-secret"] {
+            assert!(!diagnostics.contains(secret));
+        }
+        assert_eq!(run.observation.accepted_connections, 2);
+        assert_eq!(run.observation.requests.len(), 2);
     }
 
     /// X7(i), lower proof class (cfg(test) loopback, PL-3): the bytes the
@@ -8678,6 +9300,15 @@ X/aCEJ5+hA==
 
     #[test]
     fn guarded_post_lifetime_outlives_cancelled_resolver_after_parent_drop() {
+        assert_guarded_post_lifetime_after_parent_drop(false);
+    }
+
+    #[test]
+    fn guarded_confidential_post_lifetime_outlives_cancelled_resolver_after_parent_drop() {
+        assert_guarded_post_lifetime_after_parent_drop(true);
+    }
+
+    fn assert_guarded_post_lifetime_after_parent_drop(confidential: bool) {
         let started = Arc::new(AtomicUsize::new(0));
         let resolver_dropped = Arc::new(AtomicUsize::new(0));
         let alive_at_drop = Arc::new(AtomicUsize::new(0));
@@ -8708,7 +9339,19 @@ X/aCEJ5+hA==
         .unwrap();
         fastmcp_core::block_on(async {
             let cx = Cx::current().unwrap();
-            let mut post = Box::pin(fetcher.post_with_lifetime(&cx, &url, &request, lifetime));
+            let mut post = Box::pin(async {
+                if confidential {
+                    fetcher
+                        .post_confidential_with_lifetime(&cx, &url, &request, lifetime)
+                        .await
+                        .map(|_| ())
+                } else {
+                    fetcher
+                        .post_with_lifetime(&cx, &url, &request, lifetime)
+                        .await
+                        .map(|_| ())
+                }
+            });
             time::timeout_at(
                 time::wall_now() + Duration::from_secs(1),
                 std::future::poll_fn(|task| {

@@ -1104,6 +1104,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

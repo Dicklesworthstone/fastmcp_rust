@@ -29,9 +29,11 @@ use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::runtime::CallerContextFuture;
 use fastmcp_core::{AccessToken, CanonicalHttpUrl};
+#[cfg(test)]
+use fastmcp_transport::GuardedHttpFetchResponse;
 use fastmcp_transport::{
-    GuardedHttpFetchError, GuardedHttpFetchResponse, GuardedHttpFetcher, GuardedHttpPeerProvenance,
-    GuardedHttpRequest, GuardedHttpsUrl,
+    GuardedHttpConfidentialResponse, GuardedHttpFetchError, GuardedHttpFetcher,
+    GuardedHttpPeerProvenance, GuardedHttpRequest, GuardedHttpsUrl,
 };
 
 use super::oidc::{OidcCodeFlowError, OidcCodeGrant};
@@ -937,6 +939,11 @@ struct ExchangeDriverInner {
 /// verification, and scope/resource/expiry clamping without exposing compact
 /// assertions externally.
 ///
+/// Request fields and completed HTTP response allocations stay in zeroizing
+/// transport owners through rejection, cancellation and response verification.
+/// The native HTTP codec and TLS stack's private transient buffers remain
+/// outside that limited ownership guarantee.
+///
 /// This is a low-level transport component, not complete EMA activation. Raw
 /// secrets supplied here do not attest a confidential credential provider, and
 /// the required reservation's local flow identifiers do not attest browser
@@ -1048,15 +1055,15 @@ impl EnterpriseExchangeDriver {
             .await?;
         let observation = EnterpriseExchangeObservation {
             endpoint: self.inner.profile.idp_token_endpoint().to_owned(),
-            provenance: response.provenance,
+            provenance: response.provenance().clone(),
         };
         let outcome = deadline.admit_response(&admitted, || {
             response_admission
                 .admit_token_response(
                     EnterpriseTokenResponse {
-                        status: response.status,
-                        headers: &response.headers,
-                        body: &response.body,
+                        status: response.status(),
+                        headers: response.headers(),
+                        body: response.body(),
                     },
                     oidc_keys,
                     clock.wall_now()?,
@@ -1157,15 +1164,15 @@ impl EnterpriseExchangeDriver {
             .await?;
         let observation = EnterpriseExchangeObservation {
             endpoint: profile.idp_token_endpoint().to_owned(),
-            provenance: response.provenance,
+            provenance: response.provenance().clone(),
         };
         let outcome = deadline.admit_response(&admitted, || {
             profile
                 .admit_id_jag_response(
                     EnterpriseTokenResponse {
-                        status: response.status,
-                        headers: &response.headers,
-                        body: &response.body,
+                        status: response.status(),
+                        headers: response.headers(),
+                        body: response.body(),
                     },
                     id_jag_keys,
                     idp_tenant,
@@ -1267,16 +1274,16 @@ impl EnterpriseExchangeDriver {
             .await?;
         let observation = EnterpriseExchangeObservation {
             endpoint: profile.resource_as_token_endpoint().to_owned(),
-            provenance: response.provenance,
+            provenance: response.provenance().clone(),
         };
         let received_at = clock.wall_now()?;
         let outcome = deadline.admit_response(&admitted, || {
             id_jag
                 .admit_access_token_response(
                     EnterpriseTokenResponse {
-                        status: response.status,
-                        headers: &response.headers,
-                        body: &response.body,
+                        status: response.status(),
+                        headers: response.headers(),
+                        body: response.body(),
                     },
                     received_at,
                 )
@@ -1318,7 +1325,7 @@ impl EnterpriseExchangeDriver {
         deadline: ExchangeDeadline,
         permit: Arc<ExchangePermit>,
         check_reservation: impl Fn() -> Result<(), EnterpriseExchangeError>,
-    ) -> Result<GuardedHttpFetchResponse, EnterpriseExchangeError> {
+    ) -> Result<GuardedHttpConfidentialResponse, EnterpriseExchangeError> {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let response = CallerContextFuture::new(&admitted, async {
             let mut timer = std::pin::pin!(Sleep::new(deadline.runtime));
@@ -1347,17 +1354,17 @@ impl EnterpriseExchangeDriver {
         })
         .await?;
 
-        if response.redirect.is_some() {
+        if response.redirect().is_some() {
             return Err(EnterpriseExchangeError::RedirectRefused);
         }
-        if response.body.len() > self.inner.fetcher.policy().response_body_bytes()
-            || response.body.len() > MAX_ENTERPRISE_EXCHANGE_RESPONSE_BYTES
+        if response.body().len() > self.inner.fetcher.policy().response_body_bytes()
+            || response.body().len() > MAX_ENTERPRISE_EXCHANGE_RESPONSE_BYTES
         {
             return Err(EnterpriseExchangeError::ResponseRejected(
                 EnterpriseResponseError::InvalidResponse,
             ));
         }
-        verify_exchange_provenance(&response.provenance, url, &self.inner.fetcher)?;
+        verify_exchange_provenance(response.provenance(), url, &self.inner.fetcher)?;
         Ok(response)
     }
 
@@ -1367,18 +1374,19 @@ impl EnterpriseExchangeDriver {
         url: &GuardedHttpsUrl,
         request: &GuardedHttpRequest,
         lifetime: Arc<dyn Send + Sync>,
-    ) -> Result<GuardedHttpFetchResponse, EnterpriseExchangeError> {
+    ) -> Result<GuardedHttpConfidentialResponse, EnterpriseExchangeError> {
         #[cfg(test)]
         if let Some(poster) = &self.inner.test_post {
             return poster
                 .post(cx, url, request, lifetime)
                 .await
+                .map(GuardedHttpConfidentialResponse::from_response)
                 .map_err(map_exchange_fetch_error);
         }
         Box::pin(
             self.inner
                 .fetcher
-                .post_with_lifetime(cx, url, request, lifetime),
+                .post_confidential_with_lifetime(cx, url, request, lifetime),
         )
         .await
         .map_err(map_exchange_fetch_error)
