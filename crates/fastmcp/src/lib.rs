@@ -1877,6 +1877,38 @@ pub mod auto {
                 .await
         }
 
+        /// Sends an admitted extension request with its request-owned server events.
+        ///
+        /// Only notifications admitted by the frozen descriptor and exact request
+        /// ID reach the callback, before the final result. Delivery is bounded and
+        /// does not extend the idle deadline. Cancellation or callback rejection
+        /// retires this request while preserving unrelated work on the connection.
+        pub async fn request_final_extension_with_notifications(
+            &mut self,
+            cx: &Cx,
+            cancellation: &fastmcp_core::McpRequestCancellation,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+            on_notification: &mut (
+                dyn FnMut(fastmcp_protocol::JsonRpcRequest) -> McpResult<()> + Send
+            ),
+        ) -> McpResult<JsonValue>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .request_final_extension_with_notifications(
+                    cx,
+                    cancellation,
+                    extension_id,
+                    method,
+                    parameters,
+                    on_notification,
+                )
+                .await
+        }
+
         /// Publishes one configured extension notification with fresh settings proof.
         /// Auto sessions selected to exact 2024 reject before writing a frame.
         /// This does not allocate a request ID or wait for a response.
@@ -5142,6 +5174,38 @@ pub mod modern {
                     extension_id,
                     method,
                     parameters,
+                )
+                .await
+        }
+
+        /// Sends an admitted extension request with its request-owned server events.
+        ///
+        /// Only notifications admitted by the frozen descriptor and exact request
+        /// ID reach the callback, before the final result. Delivery is bounded and
+        /// does not extend the idle deadline. Cancellation or callback rejection
+        /// retires this request while preserving unrelated work on the connection.
+        pub async fn request_final_extension_with_notifications(
+            &mut self,
+            cx: &Cx,
+            cancellation: &fastmcp_core::McpRequestCancellation,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+            on_notification: &mut (
+                dyn FnMut(fastmcp_protocol::JsonRpcRequest) -> McpResult<()> + Send
+            ),
+        ) -> McpResult<JsonValue>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .request_final_extension_with_notifications(
+                    cx,
+                    cancellation,
+                    extension_id,
+                    method,
+                    parameters,
+                    on_notification,
                 )
                 .await
         }
@@ -14757,6 +14821,146 @@ mod tests {
     }
 
     #[cfg(feature = "websocket-experimental")]
+    fn facade_websocket_extension_events_configuration() -> (
+        super::ExtensionId,
+        super::ExtensionDescriptorRegistry,
+        super::ClientExtensionDiscovery,
+    ) {
+        let (id, original, discovery) = facade_websocket_extension_configuration();
+        let mut descriptor = original.descriptor(&id).unwrap().clone();
+        descriptor.notification = Some(super::ExtensionNotificationDescriptor {
+            name: "example/events".to_owned(),
+            direction: super::ExtensionDirection::ServerToClient,
+            activation_proof: None,
+        });
+        descriptor.stdio_correlation = Some(super::StdioCorrelationDescriptor {
+            metadata_key: "com.example/request".to_owned(),
+            methods: vec!["example/events".to_owned()],
+            direction: super::ExtensionDirection::ServerToClient,
+            codec: super::StdioCorrelationCodec::RequestId,
+        });
+        let mut registry = super::ExtensionDescriptorRegistry::new();
+        registry.register(descriptor).unwrap();
+        (id, registry, discovery)
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn write_facade_extension_event_responses(
+        peer: &mut asupersync::net::tcp::VirtualTcpStream,
+    ) {
+        for source in [
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"com.example/facade":{"mode":"facade"}}},"ttlMs":0,"cacheScope":"private"}}"#,
+            r#"{"jsonrpc":"2.0","method":"example/events","params":{"value":"first","_meta":{"com.example/request":2}}}"#,
+            r#"{"jsonrpc":"2.0","method":"example/events","params":{"value":"second","_meta":{"com.example/request":2e0}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"echoed":{"input":"ok"}}}"#,
+        ] {
+            write_facade_server_text_frame(peer, source).await;
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn facade_modern_websocket_extension_delivers_owned_notifications() {
+        run_test(|| async {
+            let cx = super::Cx::current().unwrap();
+            let (client_io, mut peer_io) = facade_async_websocket_pair();
+            write_facade_extension_event_responses(&mut peer_io).await;
+            let (id, registry, discovery) = facade_websocket_extension_events_configuration();
+            let mut client = super::modern::ClientBuilder::new()
+                .extension_registry(registry, discovery, || {
+                    accept_facade_websocket_extension_settings
+                })
+                .unwrap()
+                .connect_websocket_with_cx(
+                    &cx,
+                    super::AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+            let cancellation = super::McpRequestCancellation::new();
+            let mut observed = Vec::new();
+            let result = client
+                .request_final_extension_with_notifications(
+                    &cx,
+                    &cancellation,
+                    &id,
+                    "example/facadeEcho",
+                    serde_json::json!({"input": "ok"}),
+                    &mut |notification| {
+                        assert!(notification.id.is_none());
+                        assert_eq!(notification.method, "example/events");
+                        observed.push(notification.params.unwrap()["value"].clone());
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                observed,
+                [serde_json::json!("first"), serde_json::json!("second")]
+            );
+            assert_eq!(result["echoed"]["input"], "ok");
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn facade_auto_modern_websocket_extension_delivers_owned_notifications() {
+        run_test(|| async {
+            let cx = super::Cx::current().unwrap();
+            let (client_io, mut peer_io) = facade_async_websocket_pair();
+            write_facade_extension_event_responses(&mut peer_io).await;
+            let (id, registry, discovery) = facade_websocket_extension_events_configuration();
+            let mut transport = Some(super::AsyncWsClientTransport::from_upgraded(client_io));
+            let mut client = super::auto::client_builder()
+                .extension_registry(registry, discovery, || {
+                    accept_facade_websocket_extension_settings
+                })
+                .unwrap()
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    let selected = transport.take();
+                    async move {
+                        selected.ok_or_else(|| {
+                            super::McpError::internal_error("unexpected fallback transport")
+                        })
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(client.selected_protocol_era(), super::ProtocolEra::Modern2026);
+            let cancellation = super::McpRequestCancellation::new();
+            let mut observed = Vec::new();
+            let result = client
+                .request_final_extension_with_notifications(
+                    &cx,
+                    &cancellation,
+                    &id,
+                    "example/facadeEcho",
+                    serde_json::json!({"input": "ok"}),
+                    &mut |notification| {
+                        assert!(notification.id.is_none());
+                        assert_eq!(notification.method, "example/events");
+                        observed.push(notification.params.unwrap()["value"].clone());
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                observed,
+                [serde_json::json!("first"), serde_json::json!("second")]
+            );
+            assert_eq!(result["echoed"]["input"], "ok");
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn facade_modern_websocket_final_extension_uses_bilateral_registry() {
         run_test(|| async {
@@ -14887,6 +15091,25 @@ mod tests {
                 .await
                 .expect_err("exact legacy Auto selection rejects a final extension before contact");
             assert_eq!(error.code, super::McpErrorCode::InvalidParams);
+            let cancellation = super::McpRequestCancellation::new();
+            let mut events = 0;
+            let error = client
+                .request_final_extension_with_notifications(
+                    &cx,
+                    &cancellation,
+                    &extension_id,
+                    "example/facadeEcho",
+                    serde_json::json!({"input": "also-forbidden"}),
+                    &mut |_| {
+                        events += 1;
+                        Ok(())
+                    },
+                )
+                .await
+                .expect_err("the notification-aware API retains the exact-2024 boundary");
+            assert_eq!(error.code, super::McpErrorCode::InvalidParams);
+            assert_eq!(events, 0);
+            assert!(!cancellation.is_cancel_requested());
             client
                 .close(&cx)
                 .await

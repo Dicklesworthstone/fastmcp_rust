@@ -4360,6 +4360,8 @@ pub const MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS: usize = 64;
 /// produces its suppressed terminal response.
 #[cfg(feature = "websocket-experimental")]
 const MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS: usize = 64;
+#[cfg(feature = "websocket-experimental")]
+const MAX_WEBSOCKET_EXTENSION_NOTIFICATIONS: usize = 64;
 
 // A cancelled caller must not be held hostage by a peer that stops consuming
 // frames. This is deliberately a short, connection-owned commit boundary: the
@@ -5543,6 +5545,20 @@ pub struct WebSocketResponse {
     pub raw_result: Option<String>,
 }
 
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketExtensionNotificationObserver<'a> {
+    admission: &'a session::ClientExtensionResultAdmission,
+    on_notification: &'a mut (dyn FnMut(JsonRpcRequest) -> McpResult<()> + Send),
+}
+
+#[cfg(feature = "websocket-experimental")]
+#[derive(Default)]
+struct WebSocketRequestCallbacks<'a> {
+    on_progress: Option<&'a mut (dyn FnMut(FinalProgressNotificationParams) + Send)>,
+    on_log: Option<&'a mut (dyn FnMut(FinalLogMessageParams) + Send)>,
+    on_extension: Option<WebSocketExtensionNotificationObserver<'a>>,
+}
+
 /// The one request whose send or receive turn currently borrows the client.
 /// Its shared election outlives that borrow, so dropping a public future does
 /// not forget a committed request or silently reuse a partially written frame.
@@ -5550,6 +5566,7 @@ pub struct WebSocketResponse {
 struct WebSocketTransientRequest {
     request_id: RequestId,
     subscription: bool,
+    extension_admission: Option<session::ClientExtensionResultAdmission>,
     state: Arc<WebSocketTransientRequestState>,
 }
 
@@ -6273,6 +6290,7 @@ impl WebSocketSubscriptionLifetime {
 struct RetiredWebSocketRequest {
     key: CorrelationKey,
     subscription: bool,
+    extension_admission: Option<session::ClientExtensionResultAdmission>,
 }
 
 /// One caller-clock lifetime for discovery, a possible fresh legacy leg, and
@@ -7118,8 +7136,11 @@ where
             JsonRpcRequest::new(method, params, id),
             Some(cancellation),
             None,
-            Some(on_progress),
-            on_log,
+            WebSocketRequestCallbacks {
+                on_progress: Some(on_progress),
+                on_log,
+                on_extension: None,
+            },
         )
         .await
     }
@@ -7152,8 +7173,7 @@ where
             request,
             cancellation,
             operation_deadline,
-            None,
-            None,
+            WebSocketRequestCallbacks::default(),
         )
         .await
     }
@@ -7164,8 +7184,7 @@ where
         mut request: JsonRpcRequest,
         cancellation: Option<&McpRequestCancellation>,
         operation_deadline: Option<Instant>,
-        mut on_progress: Option<&mut (dyn FnMut(FinalProgressNotificationParams) + Send)>,
-        mut on_log: Option<&mut (dyn FnMut(FinalLogMessageParams) + Send)>,
+        mut callbacks: WebSocketRequestCallbacks<'_>,
     ) -> McpResult<WebSocketResponse>
     where
         IO: Send + 'static,
@@ -7213,8 +7232,20 @@ where
         let id = request.id.clone().ok_or_else(|| {
             McpError::internal_error("WebSocket admitted request requires a JSON-RPC ID")
         })?;
+        let extension_key = callbacks
+            .on_extension
+            .as_ref()
+            .map(|_| id.correlation_key())
+            .transpose()
+            .map_err(|_| McpError::invalid_params("WebSocket extension request ID is invalid"))?;
         let owner =
             self.begin_websocket_request(id.clone(), request.method == "subscriptions/listen")?;
+        if let Some(observer) = callbacks.on_extension.as_ref() {
+            self.transient_request
+                .as_mut()
+                .expect("the admitted request owns its transient state")
+                .extension_admission = Some(observer.admission.clone());
+        }
         let mut send_deadline = WebSocketConnectDeadline::new(cx, timeout_policy)?;
         if let Some(deadline) = operation_deadline {
             send_deadline.absolute = send_deadline
@@ -7275,6 +7306,7 @@ where
         let mut last_progress = None;
         let mut last_final_progress = None;
         let mut last_forwarded_progress = None;
+        let mut extension_notifications = 0usize;
         loop {
             self.expire_live_websocket_subscriptions().await?;
             if cx.checkpoint().is_err()
@@ -7393,7 +7425,69 @@ where
             self.expire_live_websocket_subscriptions_at(received_at)
                 .await?;
             let JsonRpcMessage::Response(response) = frame.message() else {
-                if on_log.is_some()
+                if let Some(observer) = callbacks.on_extension.as_mut()
+                    && let Some(key) = extension_key.as_ref()
+                    && let JsonRpcMessage::Request(notification) = frame.message()
+                    && observer
+                        .admission
+                        .matches_notification_candidate(notification, key)
+                {
+                    // The metadata scalar selects only a candidate. The same
+                    // frozen registry, raw JSON and exact-ID admission used by
+                    // multiplexed stdio must authorize it before any callback.
+                    let admitted = (|| -> McpResult<()> {
+                        let raw = raw_notification_params_from_frame(frame.source())?;
+                        observer
+                            .admission
+                            .admit_stream_notification(notification, raw.as_deref(), key)
+                            .filter(|admission| admission.correlation_key() == key)
+                            .ok_or_else(|| {
+                                McpError::invalid_request(
+                                    "WebSocket extension notification is not admitted",
+                                )
+                            })?;
+                        Ok(())
+                    })();
+                    if let Err(error) = admitted {
+                        return Err(self.terminal_callback_error(cx, error).await);
+                    }
+                    if cx.checkpoint().is_err()
+                        || cx
+                            .budget()
+                            .deadline
+                            .is_some_and(|deadline| cx.now() >= deadline)
+                        || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                    {
+                        return Err(self
+                            .retire_committed_request_after_cancellation(id, false)
+                            .await);
+                    }
+                    let delivered =
+                        if extension_notifications == MAX_WEBSOCKET_EXTENSION_NOTIFICATIONS {
+                            Err(McpError::invalid_request(
+                                "WebSocket extension notification budget exceeded",
+                            ))
+                        } else {
+                            extension_notifications += 1;
+                            (observer.on_notification)(notification.clone())
+                        };
+                    if let Err(error) = delivered {
+                        // A downstream sink can reject an otherwise admitted
+                        // event. Settle the exact native owner before returning
+                        // its error, retaining late-frame custody for reuse.
+                        let cleanup = self
+                            .retire_committed_request_after_cancellation(id, false)
+                            .await;
+                        return Err(if cleanup.code == McpErrorCode::RequestCancelled {
+                            error
+                        } else {
+                            cleanup
+                        });
+                    }
+                    // Extension events never reset the request's idle budget.
+                    continue;
+                }
+                if callbacks.on_log.is_some()
                     && self.selected_protocol_era() == ProtocolEra::Modern2026
                     && let JsonRpcMessage::Request(notification) = frame.message()
                     && notification.method == NOTIFICATIONS_MESSAGE
@@ -7431,7 +7525,8 @@ where
                         && !cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
                         && cx.checkpoint().is_ok()
                     {
-                        on_log
+                        callbacks
+                            .on_log
                             .as_deref_mut()
                             .expect("live log callback was selected")(
                             message
@@ -7488,7 +7583,7 @@ where
                         idle_deadline = received_at + timeout_policy.idle_timeout();
                     }
                 }
-                if let Some(callback) = on_progress.as_deref_mut()
+                if let Some(callback) = callbacks.on_progress.as_deref_mut()
                     && self.final_progress_notifications.len() > retained_progress
                     && let Some(expected_key) = expected_progress_key.as_ref()
                     && let JsonRpcMessage::Request(notification) = frame.message()
@@ -7752,6 +7847,7 @@ where
         self.retired_requests.push_back(RetiredWebSocketRequest {
             key,
             subscription: true,
+            extension_admission: None,
         });
         self.finish_websocket_request(request_id);
         Ok(())
@@ -7790,6 +7886,36 @@ where
         };
         self.retired_requests.remove(retired_position);
         true
+    }
+
+    /// Valid late extension events keep their retired request owner until its
+    /// final response arrives. They never enter a later request's callback.
+    fn discard_retired_websocket_extension_notification(
+        &self,
+        frame: &ReceivedTransportFrame,
+    ) -> McpResult<bool> {
+        let JsonRpcMessage::Request(notification) = frame.message() else {
+            return Ok(false);
+        };
+        for retired in &self.retired_requests {
+            let Some(admission) = retired.extension_admission.as_ref() else {
+                continue;
+            };
+            if !admission.matches_notification_candidate(notification, &retired.key) {
+                continue;
+            }
+            let raw = raw_notification_params_from_frame(frame.source())?;
+            admission
+                .admit_stream_notification(notification, raw.as_deref(), &retired.key)
+                .filter(|admitted| admitted.correlation_key() == &retired.key)
+                .ok_or_else(|| {
+                    McpError::invalid_request(
+                        "WebSocket retired extension notification is not admitted",
+                    )
+                })?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Events already sent before cancellation can arrive before the peer's
@@ -8110,6 +8236,9 @@ where
             ));
         };
         if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+            if self.discard_retired_websocket_extension_notification(frame)? {
+                return Ok(());
+            }
             if self.discard_retired_websocket_subscription_notification(request)? {
                 return Ok(());
             }
@@ -8208,6 +8337,11 @@ where
                 || self.transient_request.as_ref().is_some_and(|owner| {
                     owner.request_id.correlates_with(&request_id) && owner.subscription
                 }),
+            extension_admission: self
+                .transient_request
+                .as_ref()
+                .filter(|owner| owner.request_id.correlates_with(&request_id))
+                .and_then(|owner| owner.extension_admission.clone()),
         });
         self.finish_websocket_request(&request_id);
         let connection_cx = self.connection_cx.clone();
@@ -9947,6 +10081,7 @@ where
             extension_id,
             method,
             parameters,
+            None,
         )
         .await
     }
@@ -9975,6 +10110,41 @@ where
             extension_id,
             method,
             parameters,
+            None,
+        )
+        .await
+    }
+
+    /// Sends an extension request with its admitted server notifications.
+    ///
+    /// Only server notifications declared by the frozen descriptor, with
+    /// bounded raw parameters and exact request-ID correlation, reach
+    /// `on_notification` in receive order before the result. An extension may
+    /// emit no notifications. At most 64 are delivered; they do not reset
+    /// the request's idle timeout or enter a connection notification queue.
+    ///
+    /// Cancellation and callback failures settle native request retirement
+    /// before returning. Valid late events remain owned by that retired
+    /// request until its final response, and cannot reach another callback.
+    pub async fn request_final_extension_with_notifications(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+        on_notification: &mut (dyn FnMut(JsonRpcRequest) -> McpResult<()> + Send),
+    ) -> McpResult<serde_json::Value>
+    where
+        IO: Send + 'static,
+    {
+        self.request_final_extension_with_optional_cancellation(
+            cx,
+            Some(cancellation),
+            extension_id,
+            method,
+            parameters,
+            Some(on_notification),
         )
         .await
     }
@@ -9986,6 +10156,7 @@ where
         extension_id: &fastmcp_protocol::ExtensionId,
         method: &str,
         parameters: serde_json::Value,
+        on_notification: Option<&mut (dyn FnMut(JsonRpcRequest) -> McpResult<()> + Send)>,
     ) -> McpResult<serde_json::Value>
     where
         IO: Send + 'static,
@@ -10000,11 +10171,22 @@ where
         }
         let parameters = self.with_modern_request_metadata(parameters)?;
         let request_id = self.allocate_request_id().await?;
+        let callbacks = WebSocketRequestCallbacks {
+            on_extension: on_notification.map(|on_notification| {
+                WebSocketExtensionNotificationObserver {
+                    admission: &admission,
+                    on_notification,
+                }
+            }),
+            ..WebSocketRequestCallbacks::default()
+        };
         let received = self
-            .request_admitted_with_raw_result(
+            .request_admitted_with_raw_result_with_deadline_and_callbacks(
                 cx,
                 JsonRpcRequest::new(method, Some(parameters), request_id),
                 cancellation,
+                None,
+                callbacks,
             )
             .await?;
         if let Some(error) = received.response.error {
@@ -12344,6 +12526,7 @@ where
         self.transient_request = Some(WebSocketTransientRequest {
             request_id,
             subscription,
+            extension_admission: None,
             state: Arc::clone(&state),
         });
         Ok(WebSocketRequestDropGuard { state })
@@ -12381,15 +12564,16 @@ where
         match phase {
             None => Ok(()),
             Some(WebSocketTransientRequestState::ABANDONED_RESPONSE) => {
-                let owner = self
+                // Retirement must transfer the complete frozen owner into its
+                // tombstone before releasing the transient slot. In particular,
+                // dropped extension callbacks still own late server events.
+                let (request_id, subscription) = self
                     .transient_request
-                    .take()
+                    .as_ref()
+                    .map(|owner| (owner.request_id.clone(), owner.subscription))
                     .expect("abandoned request owner");
                 let outcome = self
-                    .retire_committed_request_after_cancellation(
-                        owner.request_id,
-                        owner.subscription,
-                    )
+                    .retire_committed_request_after_cancellation(request_id, subscription)
                     .await;
                 if outcome.code == McpErrorCode::RequestCancelled && !self.closed {
                     Ok(())
@@ -39221,6 +39405,7 @@ exec sleep 2
                                 .correlation_key()
                                 .unwrap(),
                             subscription: false,
+                            extension_admission: None,
                         });
                     }
                 }
@@ -43661,6 +43846,624 @@ exec sleep 2
                 .await
                 .expect("close reusable extension client");
             assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    fn websocket_extension_notification_builder() -> (fastmcp_protocol::ExtensionId, ClientBuilder) {
+        use fastmcp_protocol::extensions::{
+            ExtensionDescriptorRegistry, ExtensionFallbackPolicy, ExtensionNotificationDescriptor,
+            StdioCorrelationCodec, StdioCorrelationDescriptor,
+        };
+
+        let (id, original, discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let mut descriptor = original.descriptor(&id).unwrap().clone();
+        descriptor.notification = Some(ExtensionNotificationDescriptor {
+            name: "example/events".to_owned(),
+            direction: ExtensionDirection::ServerToClient,
+            activation_proof: None,
+        });
+        descriptor.stdio_correlation = Some(StdioCorrelationDescriptor {
+            metadata_key: "com.example/request".to_owned(),
+            methods: vec!["example/events".to_owned()],
+            direction: ExtensionDirection::ServerToClient,
+            codec: StdioCorrelationCodec::RequestId,
+        });
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry.register(descriptor).unwrap();
+        let builder = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+            .extension_registry(registry, discovery, || accept_raw_extension_settings)
+            .unwrap();
+        (id, builder)
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    async fn websocket_extension_notification_discovery(
+        cx: &Cx,
+        server: &mut AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream>,
+    ) {
+        let JsonRpcMessage::Request(discovery) = server.recv(cx).await.unwrap() else {
+            panic!("extension discovery request expected");
+        };
+        assert_eq!(discovery.method, SERVER_DISCOVER_METHOD);
+        assert_eq!(discovery.id, Some(RequestId::Number(1)));
+        let source = modern_raw_extension_discovery_response(
+            "extension-notification-websocket-peer",
+            Some(serde_json::json!({"mode": "raw"})),
+        );
+        let result: serde_json::Value = serde_json::from_str(&source).unwrap();
+        server
+            .send(
+                cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    discovery.id.unwrap(),
+                    result["result"].clone(),
+                )),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    fn websocket_extension_event(owner: serde_json::Value, value: &str) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "example/events",
+            Some(serde_json::json!({
+                "value": value,
+                "_meta": {"com.example/request": owner},
+            })),
+        ))
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
+    fn clt_ext_websocket_request_notifications_are_correlated_and_delivered_before_result() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+                let (client_io, server_io) = async_websocket_pair();
+                let mut peer = cx
+                    .spawn(move |peer_cx| async move {
+                        let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                        websocket_extension_notification_discovery(&peer_cx, &mut server).await;
+                        let JsonRpcMessage::Request(request) = server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("extension request expected");
+                        };
+                        assert_eq!(request.id, Some(RequestId::Number(2)));
+                        assert_eq!(request.method, "example/echo");
+                        for (owner, value) in [
+                            (serde_json::json!(2), "first"),
+                            (serde_json::from_str("2e0").unwrap(), "second"),
+                        ] {
+                            server
+                                .send(&peer_cx, &websocket_extension_event(owner, value))
+                                .await
+                                .unwrap();
+                        }
+                        server
+                            .send(
+                                &peer_cx,
+                                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    request.id.unwrap(),
+                                    serde_json::json!({"echoed": "complete"}),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            server.recv(&peer_cx).await,
+                            Err(TransportError::Closed)
+                        ));
+                    })
+                    .unwrap();
+                let (id, builder) = websocket_extension_notification_builder();
+                let mut client = builder
+                    .connect_websocket_with_cx(
+                        &cx,
+                        AsyncWsClientTransport::from_upgraded(client_io),
+                    )
+                    .await
+                    .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let mut observed = Vec::new();
+                let result = client
+                    .request_final_extension_with_notifications(
+                        &cx,
+                        &cancellation,
+                        &id,
+                        "example/echo",
+                        serde_json::json!({"input": "ok"}),
+                        &mut |notification| {
+                            assert_eq!(notification.id, None);
+                            assert_eq!(notification.method, "example/events");
+                            observed.push(notification.params.unwrap()["value"].clone());
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(observed, [serde_json::json!("first"), serde_json::json!("second")]);
+                assert_eq!(result["echoed"], "complete");
+                assert!(!cancellation.is_cancel_requested());
+                assert!(client.final_server_notifications.is_empty());
+                assert!(client.final_progress_notifications.is_empty());
+                assert!(client.transient_request.is_none());
+                assert!(client.retired_requests.is_empty());
+                client.close(&cx).await.unwrap();
+                peer.join(&cx).await.unwrap();
+            })
+            .await
+            .expect("owned extension notifications precede a bounded final response");
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
+    fn clt_ext_websocket_request_notifications_reject_wrong_owner_without_callback() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+                for (owner, method) in [
+                    (serde_json::json!("2"), "example/events"),
+                    (serde_json::json!(3), "example/events"),
+                    (serde_json::json!(2), "example/other_events"),
+                ] {
+                    let (client_io, server_io) = async_websocket_pair();
+                    let mut peer = cx
+                        .spawn(move |peer_cx| async move {
+                            let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                            websocket_extension_notification_discovery(&peer_cx, &mut server)
+                                .await;
+                            let JsonRpcMessage::Request(request) =
+                                server.recv(&peer_cx).await.unwrap()
+                            else {
+                                panic!("extension request expected");
+                            };
+                            assert_eq!(request.id, Some(RequestId::Number(2)));
+                            let JsonRpcMessage::Request(mut event) =
+                                websocket_extension_event(owner, "must-not-publish")
+                            else {
+                                unreachable!();
+                            };
+                            event.method = method.to_owned();
+                            server
+                                .send(&peer_cx, &JsonRpcMessage::Request(event))
+                                .await
+                                .unwrap();
+                            assert!(matches!(
+                                server.recv(&peer_cx).await,
+                                Err(TransportError::Closed)
+                            ));
+                        })
+                        .unwrap();
+                    let (id, builder) = websocket_extension_notification_builder();
+                    let mut client = builder
+                        .connect_websocket_with_cx(
+                            &cx,
+                            AsyncWsClientTransport::from_upgraded(client_io),
+                        )
+                        .await
+                        .unwrap();
+                    let cancellation = McpRequestCancellation::new();
+                    let mut callbacks = 0;
+                    let error = client
+                        .request_final_extension_with_notifications(
+                            &cx,
+                            &cancellation,
+                            &id,
+                            "example/echo",
+                            serde_json::json!({"input": "ok"}),
+                            &mut |_| {
+                                callbacks += 1;
+                                Ok(())
+                            },
+                        )
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    assert_eq!(callbacks, 0);
+                    assert!(client.closed);
+                    assert!(client.close_settled);
+                    assert!(client.transient_request.is_none());
+                    assert!(!cancellation.is_cancel_requested());
+                    assert!(cx.checkpoint().is_ok());
+                    peer.join(&cx).await.unwrap();
+                }
+            })
+            .await
+            .expect("wrong-owner extension notifications close without publishing");
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[derive(Clone, Copy)]
+    enum WebSocketExtensionNotificationInterruption {
+        Cancellation,
+        CallbackError,
+        DroppedFuture,
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    async fn exercise_websocket_extension_notification_retirement(
+        interruption: WebSocketExtensionNotificationInterruption,
+    ) {
+        let callback_error = matches!(
+            interruption,
+            WebSocketExtensionNotificationInterruption::CallbackError
+        );
+        let dropped = matches!(
+            interruption,
+            WebSocketExtensionNotificationInterruption::DroppedFuture
+        );
+        let cx = Cx::current().unwrap();
+        asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    websocket_extension_notification_discovery(&peer_cx, &mut server).await;
+                    let JsonRpcMessage::Request(request) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("extension request expected");
+                    };
+                    assert_eq!(request.id, Some(RequestId::Number(2)));
+                    server
+                        .send(
+                            &peer_cx,
+                            &websocket_extension_event(serde_json::json!(2), "first"),
+                        )
+                        .await
+                        .unwrap();
+                    let JsonRpcMessage::Request(cancelled) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("native cancellation expected before reuse");
+                    };
+                    assert_eq!(cancelled.id, None);
+                    assert_eq!(cancelled.method, "notifications/cancelled");
+                    assert_eq!(cancelled.params.unwrap()["requestId"], 2);
+                    server
+                        .send(
+                            &peer_cx,
+                            &websocket_extension_event(serde_json::json!(2), "late"),
+                        )
+                        .await
+                        .unwrap();
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                RequestId::Number(2),
+                                serde_json::json!({"echoed": "late"}),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    let JsonRpcMessage::Request(reused) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("independent extension request expected");
+                    };
+                    assert_eq!(reused.id, Some(RequestId::Number(3)));
+                    assert_eq!(reused.method, "example/echo");
+                    server
+                        .send(
+                            &peer_cx,
+                            &websocket_extension_event(serde_json::json!(3), "fresh"),
+                        )
+                        .await
+                        .unwrap();
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                reused.id.unwrap(),
+                                serde_json::json!({"echoed": "live"}),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .unwrap();
+            let (id, builder) = websocket_extension_notification_builder();
+            let mut client = builder
+                .connect_websocket_with_cx(
+                    &cx,
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+            let pre_cancelled = McpRequestCancellation::new();
+            pre_cancelled.cancel();
+            let mut observed = Vec::new();
+            let error = client
+                .request_final_extension_with_notifications(
+                    &cx,
+                    &pre_cancelled,
+                    &id,
+                    "example/echo",
+                    serde_json::json!({"input": "never-published"}),
+                    &mut |notification| {
+                        observed.push(notification.params.unwrap()["value"].clone());
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(client.next_id, 2);
+            assert!(observed.is_empty());
+            let cancellation = McpRequestCancellation::new();
+            let received_event = Arc::new(AtomicBool::new(false));
+            let error = {
+                let mut observe = |notification: JsonRpcRequest| {
+                    observed.push(notification.params.unwrap()["value"].clone());
+                    received_event.store(true, Ordering::Release);
+                    match interruption {
+                        WebSocketExtensionNotificationInterruption::Cancellation => {
+                            cancellation.cancel();
+                            Ok(())
+                        }
+                        WebSocketExtensionNotificationInterruption::CallbackError => {
+                            Err(McpError::invalid_params("observer rejected its event"))
+                        }
+                        WebSocketExtensionNotificationInterruption::DroppedFuture => Ok(()),
+                    }
+                };
+                let mut request = Box::pin(client.request_final_extension_with_notifications(
+                    &cx,
+                    &cancellation,
+                    &id,
+                    "example/echo",
+                    serde_json::json!({"input": "retire-after-event"}),
+                    &mut observe,
+                ));
+                if dropped {
+                    std::future::poll_fn(|task| {
+                        assert!(request.as_mut().poll(task).is_pending());
+                        if received_event.load(Ordering::Acquire) {
+                            std::task::Poll::Ready(())
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                    drop(request);
+                    None
+                } else {
+                    Some(request.await.unwrap_err())
+                }
+            };
+            if let Some(error) = error {
+                if callback_error {
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                    assert_eq!(error.message, "observer rejected its event");
+                } else {
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                }
+            }
+            assert_eq!(cancellation.is_cancel_requested(), !callback_error && !dropped);
+            assert_eq!(observed, [serde_json::json!("first")]);
+            if dropped {
+                let owner = client.transient_request.as_ref().unwrap();
+                assert_eq!(
+                    owner.state.phase.load(Ordering::Acquire),
+                    WebSocketTransientRequestState::ABANDONED_RESPONSE
+                );
+                assert!(owner.extension_admission.is_some());
+                assert!(client.retired_requests.is_empty());
+            } else {
+                assert!(client.transient_request.is_none());
+                assert_eq!(client.retired_requests.len(), 1);
+            }
+            assert!(cx.checkpoint().is_ok());
+            let live = McpRequestCancellation::new();
+            let result = client
+                .request_final_extension_with_notifications(
+                    &cx,
+                    &live,
+                    &id,
+                    "example/echo",
+                    serde_json::json!({"input": "live"}),
+                    &mut |notification| {
+                        observed.push(notification.params.unwrap()["value"].clone());
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(observed, [serde_json::json!("first"), serde_json::json!("fresh")]);
+            assert_eq!(result["echoed"], "live");
+            assert!(client.retired_requests.is_empty());
+            assert!(client.transient_request.is_none());
+            assert!(!live.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+            client.close(&cx).await.unwrap();
+            peer.join(&cx).await.unwrap();
+        })
+        .await
+        .expect("native cancellation settles before bounded same-connection reuse");
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
+    fn clt_ext_websocket_request_notification_cancellation_discards_late_owned_frames() {
+        run_test(|| {
+            exercise_websocket_extension_notification_retirement(
+                WebSocketExtensionNotificationInterruption::Cancellation,
+            )
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
+    fn clt_ext_websocket_request_notification_callback_error_retires_before_reuse() {
+        run_test(|| {
+            exercise_websocket_extension_notification_retirement(
+                WebSocketExtensionNotificationInterruption::CallbackError,
+            )
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
+    fn clt_ext_websocket_request_notification_drop_preserves_late_owned_frames() {
+        run_test(|| {
+            exercise_websocket_extension_notification_retirement(
+                WebSocketExtensionNotificationInterruption::DroppedFuture,
+            )
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
+    fn clt_ext_websocket_request_notification_budget_retires_before_the_65th_callback() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+                for count in [64, 65] {
+                    let (client_io, server_io) = async_websocket_pair();
+                    let mut peer = cx
+                        .spawn(move |peer_cx| async move {
+                            let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                            websocket_extension_notification_discovery(&peer_cx, &mut server)
+                                .await;
+                            let JsonRpcMessage::Request(request) =
+                                server.recv(&peer_cx).await.unwrap()
+                            else {
+                                panic!("extension request expected");
+                            };
+                            assert_eq!(request.id, Some(RequestId::Number(2)));
+                            for ordinal in 0..count {
+                                server
+                                    .send(
+                                        &peer_cx,
+                                        &websocket_extension_event(
+                                            serde_json::json!(2),
+                                            &ordinal.to_string(),
+                                        ),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                            if count == 65 {
+                                let JsonRpcMessage::Request(cancelled) =
+                                    server.recv(&peer_cx).await.unwrap()
+                                else {
+                                    panic!("budget exhaustion must retire the native owner");
+                                };
+                                assert_eq!(cancelled.id, None);
+                                assert_eq!(cancelled.method, "notifications/cancelled");
+                                assert_eq!(cancelled.params.unwrap()["requestId"], 2);
+                                server
+                                    .send(
+                                        &peer_cx,
+                                        &websocket_extension_event(serde_json::json!(2), "late"),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                            server
+                                .send(
+                                    &peer_cx,
+                                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                        RequestId::Number(2),
+                                        serde_json::json!({"echoed": "complete"}),
+                                    )),
+                                )
+                                .await
+                                .unwrap();
+                            let JsonRpcMessage::Request(reused) =
+                                server.recv(&peer_cx).await.unwrap()
+                            else {
+                                panic!("independent request expected after event budget");
+                            };
+                            assert_eq!(reused.id, Some(RequestId::Number(3)));
+                            assert_eq!(reused.method, "example/echo");
+                            server
+                                .send(
+                                    &peer_cx,
+                                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                        reused.id.unwrap(),
+                                        serde_json::json!({"echoed": "live"}),
+                                    )),
+                                )
+                                .await
+                                .unwrap();
+                            assert!(matches!(
+                                server.recv(&peer_cx).await,
+                                Err(TransportError::Closed)
+                            ));
+                        })
+                        .unwrap();
+                    let (id, builder) = websocket_extension_notification_builder();
+                    let mut client = builder
+                        .connect_websocket_with_cx(
+                            &cx,
+                            AsyncWsClientTransport::from_upgraded(client_io),
+                        )
+                        .await
+                        .unwrap();
+                    let cancellation = McpRequestCancellation::new();
+                    let mut callbacks = 0usize;
+                    let result = client
+                        .request_final_extension_with_notifications(
+                            &cx,
+                            &cancellation,
+                            &id,
+                            "example/echo",
+                            serde_json::json!({"input": "bounded-events"}),
+                            &mut |notification| {
+                                assert_eq!(
+                                    notification.params.unwrap()["value"],
+                                    callbacks.to_string()
+                                );
+                                callbacks += 1;
+                                Ok(())
+                            },
+                        )
+                        .await;
+                    assert_eq!(callbacks, 64);
+                    if count == 65 {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                        assert_eq!(
+                            error.message,
+                            "WebSocket extension notification budget exceeded"
+                        );
+                        assert_eq!(client.retired_requests.len(), 1);
+                    } else {
+                        assert_eq!(result.unwrap()["echoed"], "complete");
+                        assert!(client.retired_requests.is_empty());
+                    }
+                    assert!(client.transient_request.is_none());
+                    assert!(!cancellation.is_cancel_requested());
+                    let reused = client
+                        .request_final_extension(
+                            &cx,
+                            &id,
+                            "example/echo",
+                            serde_json::json!({"input": "live"}),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(reused["echoed"], "live");
+                    assert!(client.retired_requests.is_empty());
+                    assert_eq!(callbacks, 64);
+                    assert!(cx.checkpoint().is_ok());
+                    client.close(&cx).await.unwrap();
+                    peer.join(&cx).await.unwrap();
+                }
+            })
+            .await
+            .expect("64 accepted events and the rejected 65th retain bounded native ownership");
         });
     }
 
