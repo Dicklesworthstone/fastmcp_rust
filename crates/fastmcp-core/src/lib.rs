@@ -101,10 +101,12 @@ pub use trace::{
 };
 
 pub use stats::{
+    MAX_OPERATOR_PROMETHEUS_BYTES, OPERATOR_PROMETHEUS_CONTENT_TYPE, OPERATOR_PROMETHEUS_SCHEMA_VERSION,
     OperatorConnectionCapacity, OperatorConnectionCounters, OperatorCorrelationCapacity,
     OperatorExecutorCapacity, OperatorExecutorSnapshot, OperatorExecutorState,
-    OperatorHttpConnections, OperatorLifecycle, OperatorOutputCapacity, OperatorOutputCounters,
-    OperatorProfile, OperatorReadiness, OperatorReason, OperatorRequestCapacity, OperatorSnapshot,
+    OperatorHttpConnections, OperatorLifecycle, OperatorMetricsError, OperatorOutputCapacity,
+    OperatorOutputCounters, OperatorProfile, OperatorReadiness, OperatorReason, OperatorRequestCapacity,
+    OperatorSnapshot,
     OperatorSnapshotError, OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot,
     OperatorTaskExecution, OperatorTaskRetention, OperatorTaskSnapshot, OperatorTaskStates,
     OperatorTaskStorage, OperatorTaskStore,
