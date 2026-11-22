@@ -1207,6 +1207,70 @@ fn error_response(id: Option<RequestId>, code: i32, message: &'static str) -> Js
     ))
 }
 
+#[derive(Default)]
+struct ModernDispatchProgress {
+    admitted: bool,
+    started: bool,
+    completed: bool,
+}
+
+/// A real native subscription may already own a partially written control.
+/// Let its retained dispatch reach the cleanup epilogue before dropping it,
+/// while preserving the transport's elected cancellation or timeout response.
+/// The receipt is set only after native relay admission; this must never poll
+/// an unstarted dispatch or extend arbitrary application/backend work.
+async fn finish_native_proxy_subscription_dispatch<F>(
+    cleanup_cx: &Cx,
+    request_cx: &Cx,
+    delivery: Option<&FinalSubscriptionTerminalDelivery>,
+    progress: &ModernDispatchProgress,
+    mut dispatch: Pin<&mut F>,
+    selected: Option<JsonRpcResponse>,
+) -> Option<JsonRpcResponse>
+where
+    F: Future<Output = Option<JsonRpcResponse>> + ?Sized,
+{
+    if !progress.admitted
+        || !progress.started
+        || progress.completed
+        || !delivery.is_some_and(FinalSubscriptionTerminalDelivery::has_native_proxy_cleanup)
+    {
+        return selected;
+    }
+    if !cleanup_cx.capabilities().time
+        || Cx::current().is_some_and(|host| !host.capabilities().time)
+        || cleanup_cx.timer_driver().is_none()
+    {
+        // Without an admitted timer, retain the native client's conservative
+        // dropped-write fencing instead of inventing an unbounded wait.
+        return selected;
+    }
+    let deadline = cleanup_cx.now().saturating_add_nanos(
+        u64::try_from(HTTP_TERMINAL_DRAIN_TIMEOUT.as_nanos()).unwrap_or(u64::MAX),
+    );
+    let mut timeout = pin!(Sleep::new(deadline));
+    poll_fn(|task| {
+        if !cleanup_cx.capabilities().time
+            || Cx::current().is_some_and(|host| !host.capabilities().time)
+            || cleanup_cx.timer_driver().is_none()
+        {
+            return Poll::Ready(());
+        }
+        let _cleanup = Cx::set_current(Some(cleanup_cx.clone()));
+        if cleanup_cx.now() >= deadline
+            || cleanup_cx.masked(|| timeout.as_mut().poll(task)).is_ready()
+        {
+            return Poll::Ready(());
+        }
+        // Mask only the cleanup timer. Request authority stays cancelled and
+        // its original deadline still prevents new application effects.
+        let _request = Cx::set_current(Some(request_cx.clone()));
+        dispatch.as_mut().poll(task).map(|_| ())
+    })
+    .await;
+    selected
+}
+
 fn prepare_request(
     lifetime: &ConnectionLifetime,
     cx: &Cx,
@@ -1409,14 +1473,17 @@ fn prepare_request(
                 owner.subscription_terminal.clone(),
                 notifications,
             ));
-            let admitted = owner
-                .reservation
-                .queue
-                .begin_modern_dispatch(owner.reservation.request_id.as_ref())
-                == ModernDispatchStart::Ready;
-            poll_fn(|task| {
+            let mut progress = ModernDispatchProgress {
+                admitted: owner
+                    .reservation
+                    .queue
+                    .begin_modern_dispatch(owner.reservation.request_id.as_ref())
+                    == ModernDispatchStart::Ready,
+                ..ModernDispatchProgress::default()
+            };
+            let selected = poll_fn(|task| {
                 let _caller = Cx::set_current(Some(request_cx.clone()));
-                if !admitted || owner.cancelled() || caller.checkpoint().is_err() {
+                if !progress.admitted || owner.cancelled() || caller.checkpoint().is_err() {
                     dispatch_cancellation.cancel();
                     interrupted = true;
                     return Poll::Ready(None);
@@ -1443,9 +1510,25 @@ fn prepare_request(
                         )
                     }));
                 }
-                dispatch.as_mut().poll(task)
+                progress.started = true;
+                let response = dispatch.as_mut().poll(task);
+                progress.completed = response.is_ready();
+                response
             })
-            .await
+            .await;
+            if interrupted {
+                finish_native_proxy_subscription_dispatch(
+                    &caller,
+                    &request_cx,
+                    owner.subscription_terminal.as_deref(),
+                    &progress,
+                    dispatch.as_mut(),
+                    selected,
+                )
+                .await
+            } else {
+                selected
+            }
         };
         if interrupted || owner.cancelled() || caller.checkpoint().is_err() {
             region
@@ -3422,6 +3505,223 @@ mod tests {
     use fastmcp_protocol::{Content, Tool};
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Waker};
+
+    #[cfg(all(feature = "proxy", feature = "websocket"))]
+    mod native_proxy_cleanup_tests {
+        use super::*;
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+
+        fn run<F, Fut>(scenario: F)
+        where
+            F: FnOnce(Cx, Arc<VirtualClock>) -> Fut,
+            Fut: Future<Output = ()>,
+        {
+            let clock = Arc::new(VirtualClock::new());
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(TimerDriverHandle::with_virtual_clock(Arc::clone(&clock)))
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                assert!(cx.blocking_pool_handle().is_none());
+                scenario(cx, clock).await;
+            });
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        fn admitted() -> ModernDispatchProgress {
+            ModernDispatchProgress {
+                admitted: true,
+                started: true,
+                completed: false,
+            }
+        }
+
+        fn native_delivery() -> FinalSubscriptionTerminalDelivery {
+            let delivery = FinalSubscriptionTerminalDelivery::default();
+            delivery.native_proxy_cleanup.store(true, Ordering::Release);
+            delivery
+        }
+
+        #[test]
+        fn native_subscription_cleanup_never_starts_unadmitted_or_ordinary_work() {
+            run(|cx, _| async move {
+                for (has_delivery, native, admitted, started, completed) in [
+                    (false, false, true, true, false),
+                    (true, false, true, true, false),
+                    (true, true, false, true, false),
+                    (true, true, true, false, false),
+                    (true, true, true, true, true),
+                ] {
+                    let delivery = FinalSubscriptionTerminalDelivery::default();
+                    delivery
+                        .native_proxy_cleanup
+                        .store(native, Ordering::Release);
+                    let progress = ModernDispatchProgress {
+                        admitted,
+                        started,
+                        completed,
+                    };
+                    let polls = AtomicUsize::new(0);
+                    let mut dispatch = pin!(poll_fn(|_| {
+                        polls.fetch_add(1, Ordering::AcqRel);
+                        Poll::Ready(Some(JsonRpcResponse::success(
+                            RequestId::Number(901),
+                            serde_json::json!({"unexpected": true}),
+                        )))
+                    }));
+                    let selected = finish_native_proxy_subscription_dispatch(
+                        &cx,
+                        &cx,
+                        has_delivery.then_some(&delivery),
+                        &progress,
+                        dispatch.as_mut(),
+                        None,
+                    )
+                    .await;
+                    assert!(selected.is_none());
+                    assert_eq!(polls.load(Ordering::Acquire), 0);
+                }
+            });
+        }
+
+        #[test]
+        fn native_subscription_cleanup_keeps_cancellation_and_discards_late_response() {
+            run(|cx, _| async move {
+                for selected in [
+                    None,
+                    Some(JsonRpcResponse::error(
+                        Some(RequestId::Number(7)),
+                        JsonRpcError {
+                            code: McpErrorCode::RequestCancelled.into(),
+                            message: "Request timeout exceeded".to_owned(),
+                            data: None,
+                        },
+                    )),
+                ] {
+                    let expected = serde_json::to_value(&selected).unwrap();
+                    let delivery = native_delivery();
+                    let progress = admitted();
+                    let request_cx = Cx::for_request();
+                    let cancellation = McpRequestCancellation::new();
+                    let released = AtomicBool::new(false);
+                    let polls = AtomicUsize::new(0);
+                    let mut dispatch = pin!(poll_fn(|_| {
+                        let previous = polls.fetch_add(1, Ordering::AcqRel);
+                        if previous == 0 {
+                            return Poll::Pending;
+                        }
+                        assert!(cancellation.is_cancel_requested());
+                        assert!(Cx::current().unwrap().is_cancel_requested());
+                        if released.load(Ordering::Acquire) {
+                            Poll::Ready(Some(JsonRpcResponse::success(
+                                RequestId::Number(7),
+                                serde_json::json!({"late": true}),
+                            )))
+                        } else {
+                            Poll::Pending
+                        }
+                    }));
+                    assert!(
+                        poll_fn(|task| Poll::Ready(dispatch.as_mut().poll(task)))
+                            .await
+                            .is_pending()
+                    );
+                    cancellation.cancel();
+                    request_cx.set_cancel_requested(true);
+                    let mut cleanup = Box::pin(finish_native_proxy_subscription_dispatch(
+                        &cx,
+                        &request_cx,
+                        Some(&delivery),
+                        &progress,
+                        dispatch.as_mut(),
+                        selected,
+                    ));
+                    assert!(
+                        poll_fn(|task| Poll::Ready(cleanup.as_mut().poll(task)))
+                            .await
+                            .is_pending()
+                    );
+                    assert_eq!(polls.load(Ordering::Acquire), 2);
+                    released.store(true, Ordering::Release);
+                    assert_eq!(serde_json::to_value(cleanup.await).unwrap(), expected);
+                    assert_eq!(polls.load(Ordering::Acquire), 3);
+                    cx.checkpoint().unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn native_subscription_cleanup_has_a_fixed_virtual_clock_bound() {
+            run(|cx, clock| async move {
+                let delivery = native_delivery();
+                let progress = admitted();
+                let polls = AtomicUsize::new(0);
+                let mut dispatch = pin!(poll_fn(|_| {
+                    polls.fetch_add(1, Ordering::AcqRel);
+                    Poll::<Option<JsonRpcResponse>>::Pending
+                }));
+                let mut cleanup = Box::pin(finish_native_proxy_subscription_dispatch(
+                    &cx,
+                    &cx,
+                    Some(&delivery),
+                    &progress,
+                    dispatch.as_mut(),
+                    None,
+                ));
+                assert!(
+                    poll_fn(|task| Poll::Ready(cleanup.as_mut().poll(task)))
+                        .await
+                        .is_pending()
+                );
+                assert_eq!(polls.load(Ordering::Acquire), 1);
+                clock.advance(u64::try_from(HTTP_TERMINAL_DRAIN_TIMEOUT.as_nanos()).unwrap());
+                assert!(matches!(
+                    poll_fn(|task| Poll::Ready(cleanup.as_mut().poll(task))).await,
+                    Poll::Ready(None)
+                ));
+                assert_eq!(polls.load(Ordering::Acquire), 1);
+            });
+        }
+
+        #[test]
+        fn native_subscription_cleanup_rechecks_the_resuming_host_time_ceiling() {
+            run(|cx, _| async move {
+                let delivery = native_delivery();
+                let progress = admitted();
+                let polls = AtomicUsize::new(0);
+                let mut dispatch = pin!(poll_fn(|_| {
+                    polls.fetch_add(1, Ordering::AcqRel);
+                    Poll::<Option<JsonRpcResponse>>::Pending
+                }));
+                let mut cleanup = Box::pin(finish_native_proxy_subscription_dispatch(
+                    &cx,
+                    &cx,
+                    Some(&delivery),
+                    &progress,
+                    dispatch.as_mut(),
+                    None,
+                ));
+                assert!(
+                    poll_fn(|task| Poll::Ready(cleanup.as_mut().poll(task)))
+                        .await
+                        .is_pending()
+                );
+                assert_eq!(polls.load(Ordering::Acquire), 1);
+                {
+                    let _restriction =
+                        Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                    assert!(matches!(
+                        poll_fn(|task| Poll::Ready(cleanup.as_mut().poll(task))).await,
+                        Poll::Ready(None)
+                    ));
+                }
+                assert_eq!(polls.load(Ordering::Acquire), 1);
+            });
+        }
+    }
 
     #[cfg(all(feature = "websocket", feature = "legacy-2024-11-05"))]
     mod legacy_websocket_custody {

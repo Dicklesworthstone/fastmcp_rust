@@ -800,6 +800,58 @@ pub trait ProxyCatalogListener: Send {
         cx: &'a Cx,
         request_cancellation: &'a fastmcp_core::McpRequestCancellation,
     ) -> Pin<Box<dyn Future<Output = McpResult<ProxyCatalogListenerEvent>> + Send + 'a>>;
+
+    /// Identifies native turns whose selected control write must finish before
+    /// ordinary cancellation releases their transport owner. The receipt can
+    /// only be constructed by the native adapter, never by a custom backend.
+    #[doc(hidden)]
+    #[cfg(feature = "websocket")]
+    fn native_cleanup(&self) -> Option<ProxyNativeCatalogCleanup> {
+        None
+    }
+
+    /// Finishes native work retained between event deliveries. Callers must
+    /// first obtain this listener's sealed native cleanup receipt.
+    #[doc(hidden)]
+    #[cfg(feature = "websocket")]
+    fn finish_native_cleanup(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
+
+/// Sealed permission to finish the native adapter's bounded control cleanup.
+///
+/// This is deliberately unavailable to arbitrary backend futures. Wrappers
+/// may only propagate a receipt belonging to an actual native listener.
+#[doc(hidden)]
+#[cfg(feature = "websocket")]
+#[derive(Clone, Copy)]
+pub struct ProxyNativeCatalogCleanup {
+    _private: (),
+}
+
+fn catalog_listener_has_native_cleanup(listener: &dyn ProxyCatalogListener) -> bool {
+    #[cfg(feature = "websocket")]
+    {
+        listener.native_cleanup().is_some()
+    }
+    #[cfg(not(feature = "websocket"))]
+    {
+        let _ = listener;
+        false
+    }
+}
+
+/// Completes selected native cleanup before a normal server stream exit.
+/// Dropping an arbitrary backend remains immediate; only a sealed adapter or
+/// its retaining wrappers can opt into this bounded completion path.
+pub(crate) async fn finish_proxy_catalog_listener(listener: &mut dyn ProxyCatalogListener) {
+    #[cfg(feature = "websocket")]
+    if listener.native_cleanup().is_some() {
+        listener.finish_native_cleanup().await;
+    }
+    #[cfg(not(feature = "websocket"))]
+    let _ = listener;
 }
 
 /// One event emitted by a [`ProxyCatalogListener`].
@@ -5056,6 +5108,16 @@ struct AdmittedProxyCatalogListener {
 }
 
 impl ProxyCatalogListener for AdmittedProxyCatalogListener {
+    #[cfg(feature = "websocket")]
+    fn native_cleanup(&self) -> Option<ProxyNativeCatalogCleanup> {
+        self.inner.native_cleanup()
+    }
+
+    #[cfg(feature = "websocket")]
+    fn finish_native_cleanup(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(finish_proxy_catalog_listener(self.inner.as_mut()))
+    }
+
     fn next_async<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -5102,23 +5164,175 @@ impl ProxyCatalogListener for AdmittedProxyCatalogListener {
     }
 }
 
-type ProxyCatalogListenTurn = Pin<
+struct ProxyCatalogListenerOwner {
+    listener: Box<dyn ProxyCatalogListener>,
+    cancellation: fastmcp_core::McpRequestCancellation,
+}
+
+impl ProxyCatalogListenerOwner {
+    fn new(listener: Box<dyn ProxyCatalogListener>) -> Self {
+        Self {
+            listener,
+            cancellation: fastmcp_core::McpRequestCancellation::new(),
+        }
+    }
+}
+
+impl Drop for ProxyCatalogListenerOwner {
+    fn drop(&mut self) {
+        // This token belongs to the listener across all of its read turns.
+        // Even a custom backend retaining a clone observes owner termination
+        // before its destructor runs, including between event deliveries.
+        self.cancellation.cancel();
+    }
+}
+
+type ProxyCatalogListenFuture = Pin<
     Box<
         dyn Future<
                 Output = (
-                    Box<dyn ProxyCatalogListener>,
+                    ProxyCatalogListenerOwner,
                     McpResult<ProxyCatalogListenerEvent>,
                 ),
             > + Send,
     >,
 >;
 
+struct ProxyCatalogListenTurn {
+    future: ProxyCatalogListenFuture,
+    cancellation: fastmcp_core::McpRequestCancellation,
+    #[cfg(feature = "websocket")]
+    native_cleanup: Option<ProxyNativeCatalogCleanup>,
+}
+
+impl ProxyCatalogListenTurn {
+    fn new(mut owner: ProxyCatalogListenerOwner, cx: &Cx) -> Self {
+        let cancellation = owner.cancellation.clone();
+        let owned_cancellation = cancellation.clone();
+        let owned_cx = cx.clone();
+        #[cfg(feature = "websocket")]
+        let native_cleanup = owner.listener.native_cleanup();
+        Self {
+            future: Box::pin(async move {
+                let event = owner
+                    .listener
+                    .next_async(&owned_cx, &owned_cancellation)
+                    .await;
+                (owner, event)
+            }),
+            cancellation,
+            #[cfg(feature = "websocket")]
+            native_cleanup,
+        }
+    }
+
+    fn has_native_cleanup(&self) -> bool {
+        #[cfg(feature = "websocket")]
+        {
+            self.native_cleanup.is_some()
+        }
+        #[cfg(not(feature = "websocket"))]
+        {
+            false
+        }
+    }
+
+    fn poll(
+        &mut self,
+        task_cx: &mut std::task::Context<'_>,
+    ) -> Poll<(
+        ProxyCatalogListenerOwner,
+        McpResult<ProxyCatalogListenerEvent>,
+    )> {
+        self.future.as_mut().poll(task_cx)
+    }
+}
+
+type ProxyCatalogCleanupFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Cleanup stays in the listener owner, not in an individual wait future.
+/// A task revalidation guard may drop a wait while its server epilogue still
+/// owns this listener; that epilogue must be able to resume the exact write.
+#[derive(Default)]
+struct ProxyCatalogCleanup {
+    futures: Vec<Option<ProxyCatalogCleanupFuture>>,
+    #[cfg(feature = "websocket")]
+    native_cleanup: Option<ProxyNativeCatalogCleanup>,
+}
+
+impl ProxyCatalogCleanup {
+    /// Signal all owners before polling any cleanup. Native turns retain
+    /// their bounded control write; arbitrary backends are dropped promptly.
+    fn begin(
+        &mut self,
+        turns: &mut Vec<Option<ProxyCatalogListenTurn>>,
+        listeners: &mut Vec<Option<ProxyCatalogListenerOwner>>,
+    ) {
+        for turn in std::mem::take(turns).into_iter().flatten() {
+            turn.cancellation.cancel();
+            if turn.has_native_cleanup() {
+                #[cfg(feature = "websocket")]
+                {
+                    self.native_cleanup = self.native_cleanup.or(turn.native_cleanup);
+                }
+                self.futures.push(Some(Box::pin(async move {
+                    let (mut owner, _) = turn.future.await;
+                    // A nested multiplexer may have returned one event while
+                    // retaining another route's partially written control.
+                    finish_proxy_catalog_listener(owner.listener.as_mut()).await;
+                })));
+            }
+        }
+        for mut owner in std::mem::take(listeners).into_iter().flatten() {
+            owner.cancellation.cancel();
+            if catalog_listener_has_native_cleanup(owner.listener.as_ref()) {
+                #[cfg(feature = "websocket")]
+                {
+                    self.native_cleanup = self.native_cleanup.or(owner.listener.native_cleanup());
+                }
+                self.futures.push(Some(Box::pin(async move {
+                    finish_proxy_catalog_listener(owner.listener.as_mut()).await;
+                })));
+            }
+        }
+    }
+
+    /// Discard drain results so the original cancellation or terminal outcome
+    /// remains authoritative. A failed native write still fences its client.
+    async fn finish(&mut self) {
+        std::future::poll_fn(|task_cx| {
+            let mut pending = false;
+            for slot in &mut self.futures {
+                if let Some(future) = slot {
+                    if future.as_mut().poll(task_cx).is_ready() {
+                        *slot = None;
+                    } else {
+                        pending = true;
+                    }
+                }
+            }
+            if pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
+        self.futures.clear();
+        #[cfg(feature = "websocket")]
+        {
+            self.native_cleanup = None;
+        }
+    }
+}
+
 /// At most one owned read per admitted route: a ready sibling never drops an
 /// unfinished HTTP/stdio read. The existing transport and delivery queues
 /// retain their byte/count bounds; this broker adds no unbounded event queue.
 struct MultiplexedProxyCatalogListener {
-    listeners: Vec<Option<Box<dyn ProxyCatalogListener>>>,
+    listeners: Vec<Option<ProxyCatalogListenerOwner>>,
     turns: Vec<Option<ProxyCatalogListenTurn>>,
+    cleanup: ProxyCatalogCleanup,
     acknowledgement: Option<SubscriptionFilter>,
     next_route: usize,
     terminated: bool,
@@ -5128,18 +5342,22 @@ impl MultiplexedProxyCatalogListener {
     fn new(listeners: Vec<Box<dyn ProxyCatalogListener>>, filter: SubscriptionFilter) -> Self {
         Self {
             turns: (0..listeners.len()).map(|_| None).collect(),
-            listeners: listeners.into_iter().map(Some).collect(),
+            listeners: listeners
+                .into_iter()
+                .map(|listener| Some(ProxyCatalogListenerOwner::new(listener)))
+                .collect(),
+            cleanup: ProxyCatalogCleanup::default(),
             acknowledgement: Some(filter),
             next_route: 0,
             terminated: false,
         }
     }
 
-    fn terminate(&mut self) {
+    async fn terminate(&mut self) {
         self.terminated = true;
         self.acknowledgement = None;
-        self.turns.clear();
-        self.listeners.clear();
+        self.cleanup.begin(&mut self.turns, &mut self.listeners);
+        self.cleanup.finish().await;
     }
 
     async fn next_event(
@@ -5153,7 +5371,7 @@ impl MultiplexedProxyCatalogListener {
             ));
         }
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.terminate();
+            self.terminate().await;
             return Err(McpError::request_cancelled());
         }
         if let Some(filter) = self.acknowledgement.take() {
@@ -5167,20 +5385,15 @@ impl MultiplexedProxyCatalogListener {
                 for offset in 0..route_count {
                     let index = (self.next_route + offset) % route_count;
                     if self.turns[index].is_none() {
-                        let mut listener = self.listeners[index]
+                        let listener = self.listeners[index]
                             .take()
                             .expect("catalog route is owned by its listener or read turn");
-                        let owned_cx = cx.clone();
-                        let owned_cancellation = cancellation.clone();
-                        self.turns[index] = Some(Box::pin(async move {
-                            let event = listener.next_async(&owned_cx, &owned_cancellation).await;
-                            (listener, event)
-                        }));
+                        self.turns[index] = Some(ProxyCatalogListenTurn::new(listener, cx));
                     }
                     let turn = self.turns[index]
                         .as_mut()
                         .expect("catalog read was installed");
-                    if let Poll::Ready((listener, event)) = turn.as_mut().poll(task_cx) {
+                    if let Poll::Ready((listener, event)) = turn.poll(task_cx) {
                         self.turns[index] = None;
                         self.listeners[index] = Some(listener);
                         self.next_route = (index + 1) % route_count;
@@ -5196,17 +5409,17 @@ impl MultiplexedProxyCatalogListener {
                 Ok(ProxyCatalogListenerEvent::Notification(notification))
             }
             Ok(ProxyCatalogListenerEvent::Terminal) => {
-                self.terminate();
+                self.terminate().await;
                 Ok(ProxyCatalogListenerEvent::Terminal)
             }
             Ok(ProxyCatalogListenerEvent::Acknowledged(_)) => {
-                self.terminate();
+                self.terminate().await;
                 Err(McpError::invalid_request(
                     "Proxy upstream catalog listener acknowledged more than once",
                 ))
             }
             Err(error) => {
-                self.terminate();
+                self.terminate().await;
                 Err(error)
             }
         }
@@ -5214,6 +5427,29 @@ impl MultiplexedProxyCatalogListener {
 }
 
 impl ProxyCatalogListener for MultiplexedProxyCatalogListener {
+    #[cfg(feature = "websocket")]
+    fn native_cleanup(&self) -> Option<ProxyNativeCatalogCleanup> {
+        self.cleanup
+            .native_cleanup
+            .or_else(|| {
+                self.listeners
+                    .iter()
+                    .flatten()
+                    .find_map(|owner| owner.listener.native_cleanup())
+            })
+            .or_else(|| {
+                self.turns
+                    .iter()
+                    .flatten()
+                    .find_map(|turn| turn.native_cleanup)
+            })
+    }
+
+    #[cfg(feature = "websocket")]
+    fn finish_native_cleanup(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.terminate())
+    }
+
     fn next_async<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -5238,10 +5474,11 @@ pub(crate) enum ProxyMixedSubscriptionEvent {
 /// discard the other's partially consumed HTTP or stdio frame.
 #[cfg(feature = "tasks")]
 pub(crate) struct ProxyMixedSubscriptionListener {
-    catalog: Option<Box<dyn ProxyCatalogListener>>,
+    catalog: Option<ProxyCatalogListenerOwner>,
     tasks: Option<Box<dyn ProxyFinalTaskListener>>,
     catalog_turn: Option<ProxyCatalogListenTurn>,
     task_turn: Option<ProxyFinalTaskListenTurn>,
+    cleanup: ProxyCatalogCleanup,
     tasks_first: bool,
     terminated: bool,
 }
@@ -5254,21 +5491,24 @@ impl ProxyMixedSubscriptionListener {
         tasks: Box<dyn ProxyFinalTaskListener>,
     ) -> Self {
         Self {
-            catalog: Some(catalog),
+            catalog: Some(ProxyCatalogListenerOwner::new(catalog)),
             tasks: Some(tasks),
             catalog_turn: None,
             task_turn: None,
+            cleanup: ProxyCatalogCleanup::default(),
             tasks_first: false,
             terminated: false,
         }
     }
 
-    fn terminate(&mut self) {
+    pub(crate) async fn finish_native_cleanup(&mut self) {
         self.terminated = true;
-        self.catalog_turn = None;
         self.task_turn = None;
-        self.catalog = None;
         self.tasks = None;
+        let mut turns = vec![self.catalog_turn.take()];
+        let mut listeners = vec![self.catalog.take()];
+        self.cleanup.begin(&mut turns, &mut listeners);
+        self.cleanup.finish().await;
     }
 
     pub(crate) async fn next_event(
@@ -5282,20 +5522,15 @@ impl ProxyMixedSubscriptionListener {
             ));
         }
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.terminate();
+            self.finish_native_cleanup().await;
             return Err(McpError::request_cancelled());
         }
         if self.catalog_turn.is_none() {
-            let mut listener = self
+            let listener = self
                 .catalog
                 .take()
                 .expect("catalog listener or read owns the leg");
-            let owned_cx = cx.clone();
-            let owned_cancellation = cancellation.clone();
-            self.catalog_turn = Some(Box::pin(async move {
-                let event = listener.next_async(&owned_cx, &owned_cancellation).await;
-                (listener, event)
-            }));
+            self.catalog_turn = Some(ProxyCatalogListenTurn::new(listener, cx));
         }
         if self.task_turn.is_none() {
             let mut listener = self
@@ -5334,7 +5569,7 @@ impl ProxyMixedSubscriptionListener {
                         }
                     } else {
                         let turn = self.catalog_turn.as_mut().expect("catalog read is retained");
-                        if let Poll::Ready((listener, event)) = turn.as_mut().poll(task_cx) {
+                        if let Poll::Ready((listener, event)) = turn.poll(task_cx) {
                             self.catalog_turn = None;
                             self.catalog = Some(listener);
                             self.tasks_first = true;
@@ -5362,7 +5597,7 @@ impl ProxyMixedSubscriptionListener {
         ) {
             // Either leg ending creates a gap in the advertised combined
             // selection. Release both owners; never reconnect or replay it.
-            self.terminate();
+            self.finish_native_cleanup().await;
         }
         event
     }

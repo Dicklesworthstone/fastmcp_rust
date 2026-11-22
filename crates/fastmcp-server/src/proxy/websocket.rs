@@ -5,6 +5,9 @@
 //! mutex has been released. No reader task, private runtime, or synchronous
 //! transport adapter is introduced here.
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -25,10 +28,11 @@ use fastmcp_protocol::{
 
 use super::{
     ProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalogListener,
-    ProxyCatalogListenerEvent, ProxyPollTimer, await_proxy_operation_or_cancellation,
-    await_proxy_request_or_cancellation, catalog_capability, discovery_supports_final_capability,
-    discovery_supports_final_completion, inbound_client_capabilities,
-    inbound_identity_implementation, inbound_logging_level, relay_upstream_log_message,
+    ProxyCatalogListenerEvent, ProxyNativeCatalogCleanup, ProxyPollTimer,
+    await_proxy_operation_or_cancellation, await_proxy_request_or_cancellation, catalog_capability,
+    discovery_supports_final_capability, discovery_supports_final_completion,
+    inbound_client_capabilities, inbound_identity_implementation, inbound_logging_level,
+    relay_upstream_log_message,
 };
 use crate::handler::BoxFuture;
 
@@ -236,6 +240,10 @@ impl<IO> ProxyCatalogListener for WebSocketCatalogListener<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    fn native_cleanup(&self) -> Option<ProxyNativeCatalogCleanup> {
+        Some(ProxyNativeCatalogCleanup { _private: () })
+    }
+
     fn next_async<'a>(
         &'a mut self,
         cx: &'a Cx,

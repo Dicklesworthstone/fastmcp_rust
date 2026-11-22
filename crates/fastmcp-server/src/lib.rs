@@ -4943,6 +4943,9 @@ struct FinalSubscriptionTerminalDelivery {
     // Only the request-owned SSE writer, after its Stream election, uses
     // this flag to retain an admitted listen across listener cancellation.
     subscription_request: AtomicBool,
+    // Only an admitted native proxy listener can authorize its transport
+    // driver to finish selected cleanup after normal request cancellation.
+    native_proxy_cleanup: AtomicBool,
     native_shutdown_deadline: Mutex<Option<Instant>>,
     // Retained independently of registry membership so an already-buffered
     // event cannot outlive the provider authority that admitted it.
@@ -4950,6 +4953,10 @@ struct FinalSubscriptionTerminalDelivery {
 }
 
 impl FinalSubscriptionTerminalDelivery {
+    pub(crate) fn has_native_proxy_cleanup(&self) -> bool {
+        self.native_proxy_cleanup.load(Ordering::Acquire)
+    }
+
     /// Rechecks data at the real transport boundary, after its outbox wait.
     /// Never call this while holding an outbox, registry, or election lock:
     /// provider callbacks may reenter the server.
@@ -20042,6 +20049,18 @@ impl Server {
             catalog_relay_listener = Some(listener);
         }
 
+        #[cfg(all(feature = "proxy", feature = "websocket"))]
+        if let Some(delivery) = terminal_delivery.as_ref()
+            && catalog_relay_listener
+                .as_ref()
+                .is_some_and(|listener| listener.native_cleanup().is_some())
+        {
+            // The receipt is constructed only by the native adapter and
+            // propagated by its retaining wrappers. An arbitrary backend
+            // cannot turn cancellation into permission for extra polling.
+            delivery.native_proxy_cleanup.store(true, Ordering::Release);
+        }
+
         #[cfg(all(feature = "proxy", feature = "tasks"))]
         let mut mixed_relay_listener = match (catalog_relay_listener.take(), relay_listener.take())
         {
@@ -20115,298 +20134,319 @@ impl Server {
             }),
         )?;
 
-        #[cfg(feature = "tasks")]
-        let mut task_access_check_at = request_ctx.cx().now();
-
-        while !self.final_subscriptions.is_terminating() {
+        // Every routine exit must release native proxy I/O only after its
+        // already selected, bounded control write finishes. A multiplexed
+        // listener can retain that write while a sibling event is published,
+        // so cleanup cannot live solely inside its next-event wait.
+        let outcome = async {
             #[cfg(feature = "tasks")]
-            if request_ctx.cx().now() >= task_access_check_at {
-                task_access_check_at = request_ctx.cx().now().saturating_add_nanos(1_000_000_000);
-                if let Some((runtime, admitted)) = task_access_revalidation.as_ref()
-                    && !admitted
-                        .values()
-                        .all(|metadata| runtime.task_access_is_current(request_ctx, metadata))
-                {
-                    request_cancellation.cancel();
-                }
-            }
-            if request_cancellation.is_cancel_requested() {
-                if lease.server_termination_completed(request_ctx.cx()).await {
-                    return Ok(());
-                }
-                if let Some(delivery) = &terminal_delivery {
-                    delivery.mark_failed();
-                }
-                return Err(McpError::request_cancelled());
-            }
-            if request_ctx.ensure_live().is_err() {
-                // Listener cancellation can become visible before its owning
-                // serve loop collects terminal receipts. Keep this exact
-                // lease registered until that election; otherwise Drop could
-                // remove the only authority for its required control. An
-                // embedding without a lifecycle owner still has a bound.
-                let deadline = Instant::now() + HTTP_TERMINAL_DRAIN_TIMEOUT;
-                while !self.final_subscriptions.is_terminating()
-                    && !request_cancellation.is_cancel_requested()
-                {
-                    if Instant::now() >= deadline
-                        || request_ctx
-                            .budget()
-                            .deadline
-                            .is_some_and(|deadline| request_ctx.cx().now() >= deadline)
+            let mut task_access_check_at = request_ctx.cx().now();
+
+            while !self.final_subscriptions.is_terminating() {
+                #[cfg(feature = "tasks")]
+                if request_ctx.cx().now() >= task_access_check_at {
+                    task_access_check_at =
+                        request_ctx.cx().now().saturating_add_nanos(1_000_000_000);
+                    if let Some((runtime, admitted)) = task_access_revalidation.as_ref()
+                        && !admitted
+                            .values()
+                            .all(|metadata| runtime.task_access_is_current(request_ctx, metadata))
                     {
+                        request_cancellation.cancel();
+                    }
+                }
+                if request_cancellation.is_cancel_requested() {
+                    if lease.server_termination_completed(request_ctx.cx()).await {
+                        return Ok(());
+                    }
+                    if let Some(delivery) = &terminal_delivery {
+                        delivery.mark_failed();
+                    }
+                    return Err(McpError::request_cancelled());
+                }
+                if request_ctx.ensure_live().is_err() {
+                    // Listener cancellation can become visible before its owning
+                    // serve loop collects terminal receipts. Keep this exact
+                    // lease registered until that election; otherwise Drop could
+                    // remove the only authority for its required control. An
+                    // embedding without a lifecycle owner still has a bound.
+                    let deadline = Instant::now() + HTTP_TERMINAL_DRAIN_TIMEOUT;
+                    while !self.final_subscriptions.is_terminating()
+                        && !request_cancellation.is_cancel_requested()
+                    {
+                        if Instant::now() >= deadline
+                            || request_ctx
+                                .budget()
+                                .deadline
+                                .is_some_and(|deadline| request_ctx.cx().now() >= deadline)
+                        {
+                            if let Some(delivery) = &terminal_delivery {
+                                delivery.mark_failed();
+                            }
+                            request_cancellation.cancel();
+                            return Err(McpError::request_cancelled());
+                        }
+                        asupersync::runtime::yield_now().await;
+                    }
+                    break;
+                }
+                #[cfg(all(feature = "proxy", feature = "tasks"))]
+                if let Some(listener) = mixed_relay_listener.as_mut() {
+                    let operation = listener.next_event(request_ctx.cx(), &request_cancellation);
+                    let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref()
+                    {
+                        runtime
+                            .guard_task_subscription_operation(
+                                request_ctx.cx(),
+                                request_ctx,
+                                admitted,
+                                &request_cancellation,
+                                operation,
+                            )
+                            .await
+                    } else {
+                        operation.await
+                    };
+                    match event {
+                        Ok(proxy::ProxyMixedSubscriptionEvent::Catalog(notification)) => {
+                            if lease.publish(notification).is_err() {
+                                return lease
+                                    .terminate(request_ctx.cx(), &request_cancellation)
+                                    .await;
+                            }
+                            continue;
+                        }
+                        Ok(proxy::ProxyMixedSubscriptionEvent::Task(notification)) => {
+                            if lease.publish_task(notification).is_err() {
+                                return lease
+                                    .terminate(request_ctx.cx(), &request_cancellation)
+                                    .await;
+                            }
+                            continue;
+                        }
+                        Ok(proxy::ProxyMixedSubscriptionEvent::Terminal) => {
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
+                        }
+                        Err(_) if request_ctx.ensure_live().is_err() => continue,
+                        Err(_) => {
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
+                        }
+                    }
+                }
+                #[cfg(all(feature = "proxy", feature = "tasks"))]
+                if let Some(listener) = relay_listener.as_mut() {
+                    let operation = listener.next_async(request_ctx.cx(), &request_cancellation);
+                    let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref()
+                    {
+                        runtime
+                            .guard_task_subscription_operation(
+                                request_ctx.cx(),
+                                request_ctx,
+                                admitted,
+                                &request_cancellation,
+                                operation,
+                            )
+                            .await
+                    } else {
+                        operation.await
+                    };
+                    match event {
+                        Ok(ProxyFinalTaskListenerEvent::Notification(notification)) => {
+                            if lease.publish_task(notification).is_err() {
+                                return lease
+                                    .terminate(request_ctx.cx(), &request_cancellation)
+                                    .await;
+                            }
+                            continue;
+                        }
+                        Ok(ProxyFinalTaskListenerEvent::Terminal) => {
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
+                        }
+                        Ok(ProxyFinalTaskListenerEvent::Acknowledged(_)) => {
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
+                        }
+                        Err(_) if request_ctx.ensure_live().is_err() => continue,
+                        Err(_) => {
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
+                        }
+                    }
+                }
+                #[cfg(feature = "proxy")]
+                if let Some(listener) = catalog_relay_listener.as_mut() {
+                    let operation = listener.next_async(request_ctx.cx(), &request_cancellation);
+                    #[cfg(feature = "tasks")]
+                    let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref()
+                    {
+                        runtime
+                            .guard_task_subscription_operation(
+                                request_ctx.cx(),
+                                request_ctx,
+                                admitted,
+                                &request_cancellation,
+                                operation,
+                            )
+                            .await
+                    } else {
+                        operation.await
+                    };
+                    #[cfg(not(feature = "tasks"))]
+                    let event = operation.await;
+                    match event {
+                        Ok(ProxyCatalogListenerEvent::Notification(notification)) => {
+                            // This upstream request belongs to one downstream
+                            // lease. Publishing globally duplicates overlapping
+                            // listeners and crosses their authorization boundary.
+                            if lease.publish(notification).is_err() {
+                                return lease
+                                    .terminate(request_ctx.cx(), &request_cancellation)
+                                    .await;
+                            }
+                            continue;
+                        }
+                        Ok(ProxyCatalogListenerEvent::Terminal) => {
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
+                        }
+                        Ok(ProxyCatalogListenerEvent::Acknowledged(_)) => {
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
+                        }
+                        Err(_) if request_ctx.ensure_live().is_err() => continue,
+                        Err(_) => {
+                            return lease
+                                .terminate(request_ctx.cx(), &request_cancellation)
+                                .await;
+                        }
+                    }
+                }
+                if request_cancellation.is_cancel_requested() {
+                    // A server-side election cancels this request as its wake;
+                    // the already committed control owns its only wire terminal.
+                    if lease.server_termination_completed(request_ctx.cx()).await {
+                        return Ok(());
+                    }
+                    if let Some(delivery) = &terminal_delivery {
+                        delivery.mark_failed();
+                    }
+                    return Err(McpError::request_cancelled());
+                }
+                if request_ctx.ensure_live().is_err() {
+                    continue;
+                }
+                // The registry is intentionally transport-neutral. Polling uses
+                // the caller-owned clock and never creates a detached wake task;
+                // a request cancellation wakes its transport-owned dispatch task.
+                // Race the poll against `cancelled()` so two live HTTP listens
+                // wake as soon as `terminate_with_receipt` elects cancellation,
+                // instead of remaining parked on a cancelled-Cx timer.
+                if request_ctx.ensure_live().is_err() {
+                    asupersync::runtime::yield_now().await;
+                } else {
+                    let next_poll = request_ctx.cx().now().saturating_add_nanos(1_000_000);
+                    let wake_at = request_ctx
+                        .budget()
+                        .deadline
+                        .map_or(next_poll, |deadline| deadline.min(next_poll));
+                    let mut sleep = std::pin::pin!(asupersync::time::sleep_until(wake_at));
+                    let cancellation = request_cancellation.clone();
+                    let mut cancelled = std::pin::pin!(async move {
+                        cancellation.cancelled().await;
+                    });
+                    let time_authorized = std::future::poll_fn(|task_cx| {
+                        if self.final_subscriptions.is_terminating()
+                            || request_cancellation.is_cancel_requested()
+                        {
+                            return std::task::Poll::Ready(true);
+                        }
+                        if cancelled.as_mut().poll(task_cx).is_ready() {
+                            return std::task::Poll::Ready(true);
+                        }
+                        // Observe request liveness on every poll, including a
+                        // shared ceiling tightened after this timer was armed.
+                        if request_ctx.ensure_live().is_err() {
+                            return std::task::Poll::Ready(true);
+                        }
+                        // Sleep discovers its timer through the ambient Cx. The
+                        // deadline above belongs to this request, which may be
+                        // polled by an embedding with no ambient context or a
+                        // different clock. Check the host's time ceiling before
+                        // replacing it: set_current preserves the held Cx's mask,
+                        // not restrictions on the ambient context it replaces.
+                        // Sleep's driverless fallback must not supply denied time
+                        // authority. Recheck on every poll because the host may
+                        // resume a suspended listen in a narrower scope.
+                        if !request_ctx.cx().capabilities().time
+                            || Cx::current().is_some_and(|host| !host.capabilities().time)
+                        {
+                            return std::task::Poll::Ready(false);
+                        }
+                        // No application callback runs under this binding; the
+                        // prior ambient context is restored before yielding.
+                        let _current = Cx::set_current(Some(request_ctx.cx().clone()));
+                        // A still-future tightened ceiling must also move the
+                        // wake earlier. Never extend the already registered wait.
+                        if let Some(deadline) = request_ctx.budget().deadline
+                            && deadline < sleep.deadline()
+                        {
+                            sleep.as_mut().get_mut().reset(deadline);
+                        }
+                        if sleep.as_mut().poll(task_cx).is_ready() {
+                            return std::task::Poll::Ready(true);
+                        }
+                        std::task::Poll::Pending
+                    })
+                    .await;
+                    if !time_authorized {
                         if let Some(delivery) = &terminal_delivery {
                             delivery.mark_failed();
                         }
                         request_cancellation.cancel();
                         return Err(McpError::request_cancelled());
                     }
-                    asupersync::runtime::yield_now().await;
-                }
-                break;
-            }
-            #[cfg(all(feature = "proxy", feature = "tasks"))]
-            if let Some(listener) = mixed_relay_listener.as_mut() {
-                let operation = listener.next_event(request_ctx.cx(), &request_cancellation);
-                let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
-                    runtime
-                        .guard_task_subscription_operation(
-                            request_ctx.cx(),
-                            request_ctx,
-                            admitted,
-                            &request_cancellation,
-                            operation,
-                        )
-                        .await
-                } else {
-                    operation.await
-                };
-                match event {
-                    Ok(proxy::ProxyMixedSubscriptionEvent::Catalog(notification)) => {
-                        if lease.publish(notification).is_err() {
-                            return lease
-                                .terminate(request_ctx.cx(), &request_cancellation)
-                                .await;
-                        }
-                        continue;
-                    }
-                    Ok(proxy::ProxyMixedSubscriptionEvent::Task(notification)) => {
-                        if lease.publish_task(notification).is_err() {
-                            return lease
-                                .terminate(request_ctx.cx(), &request_cancellation)
-                                .await;
-                        }
-                        continue;
-                    }
-                    Ok(proxy::ProxyMixedSubscriptionEvent::Terminal) => {
-                        return lease
-                            .terminate(request_ctx.cx(), &request_cancellation)
-                            .await;
-                    }
-                    Err(_) if request_ctx.ensure_live().is_err() => continue,
-                    Err(_) => {
-                        return lease
-                            .terminate(request_ctx.cx(), &request_cancellation)
-                            .await;
-                    }
                 }
             }
-            #[cfg(all(feature = "proxy", feature = "tasks"))]
-            if let Some(listener) = relay_listener.as_mut() {
-                let operation = listener.next_async(request_ctx.cx(), &request_cancellation);
-                let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
-                    runtime
-                        .guard_task_subscription_operation(
-                            request_ctx.cx(),
-                            request_ctx,
-                            admitted,
-                            &request_cancellation,
-                            operation,
-                        )
-                        .await
-                } else {
-                    operation.await
-                };
-                match event {
-                    Ok(ProxyFinalTaskListenerEvent::Notification(notification)) => {
-                        if lease.publish_task(notification).is_err() {
-                            return lease
-                                .terminate(request_ctx.cx(), &request_cancellation)
-                                .await;
-                        }
-                        continue;
-                    }
-                    Ok(ProxyFinalTaskListenerEvent::Terminal) => {
-                        return lease
-                            .terminate(request_ctx.cx(), &request_cancellation)
-                            .await;
-                    }
-                    Ok(ProxyFinalTaskListenerEvent::Acknowledged(_)) => {
-                        return lease
-                            .terminate(request_ctx.cx(), &request_cancellation)
-                            .await;
-                    }
-                    Err(_) if request_ctx.ensure_live().is_err() => continue,
-                    Err(_) => {
-                        return lease
-                            .terminate(request_ctx.cx(), &request_cancellation)
-                            .await;
-                    }
-                }
-            }
-            #[cfg(feature = "proxy")]
-            if let Some(listener) = catalog_relay_listener.as_mut() {
-                let operation = listener.next_async(request_ctx.cx(), &request_cancellation);
-                #[cfg(feature = "tasks")]
-                let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
-                    runtime
-                        .guard_task_subscription_operation(
-                            request_ctx.cx(),
-                            request_ctx,
-                            admitted,
-                            &request_cancellation,
-                            operation,
-                        )
-                        .await
-                } else {
-                    operation.await
-                };
-                #[cfg(not(feature = "tasks"))]
-                let event = operation.await;
-                match event {
-                    Ok(ProxyCatalogListenerEvent::Notification(notification)) => {
-                        // This upstream request belongs to one downstream
-                        // lease. Publishing globally duplicates overlapping
-                        // listeners and crosses their authorization boundary.
-                        if lease.publish(notification).is_err() {
-                            return lease
-                                .terminate(request_ctx.cx(), &request_cancellation)
-                                .await;
-                        }
-                        continue;
-                    }
-                    Ok(ProxyCatalogListenerEvent::Terminal) => {
-                        return lease
-                            .terminate(request_ctx.cx(), &request_cancellation)
-                            .await;
-                    }
-                    Ok(ProxyCatalogListenerEvent::Acknowledged(_)) => {
-                        return lease
-                            .terminate(request_ctx.cx(), &request_cancellation)
-                            .await;
-                    }
-                    Err(_) if request_ctx.ensure_live().is_err() => continue,
-                    Err(_) => {
-                        return lease
-                            .terminate(request_ctx.cx(), &request_cancellation)
-                            .await;
-                    }
-                }
-            }
-            if request_cancellation.is_cancel_requested() {
-                // A server-side election cancels this request as its wake;
-                // the already committed control owns its only wire terminal.
-                if lease.server_termination_completed(request_ctx.cx()).await {
-                    return Ok(());
-                }
-                if let Some(delivery) = &terminal_delivery {
-                    delivery.mark_failed();
-                }
-                return Err(McpError::request_cancelled());
-            }
-            if request_ctx.ensure_live().is_err() {
-                continue;
-            }
-            // The registry is intentionally transport-neutral. Polling uses
-            // the caller-owned clock and never creates a detached wake task;
-            // a request cancellation wakes its transport-owned dispatch task.
-            // Race the poll against `cancelled()` so two live HTTP listens
-            // wake as soon as `terminate_with_receipt` elects cancellation,
-            // instead of remaining parked on a cancelled-Cx timer.
-            if request_ctx.ensure_live().is_err() {
+
+            // `terminate_with_receipt` publishes its global terminating bit before
+            // it acquires each lease election. Do not let that brief ordering
+            // window turn a server-owned graceful close into peer cancellation:
+            // wait until this exact lease records which terminal owner won.
+            while self.final_subscriptions.is_terminating()
+                && !lease.has_graceful_completion()
+                && !lease.is_peer_terminated()
+                && !request_cancellation.is_cancel_requested()
+            {
                 asupersync::runtime::yield_now().await;
-            } else {
-                let next_poll = request_ctx.cx().now().saturating_add_nanos(1_000_000);
-                let wake_at = request_ctx
-                    .budget()
-                    .deadline
-                    .map_or(next_poll, |deadline| deadline.min(next_poll));
-                let mut sleep = std::pin::pin!(asupersync::time::sleep_until(wake_at));
-                let cancellation = request_cancellation.clone();
-                let mut cancelled = std::pin::pin!(async move {
-                    cancellation.cancelled().await;
-                });
-                let time_authorized = std::future::poll_fn(|task_cx| {
-                    if self.final_subscriptions.is_terminating()
-                        || request_cancellation.is_cancel_requested()
-                    {
-                        return std::task::Poll::Ready(true);
-                    }
-                    if cancelled.as_mut().poll(task_cx).is_ready() {
-                        return std::task::Poll::Ready(true);
-                    }
-                    // Observe request liveness on every poll, including a
-                    // shared ceiling tightened after this timer was armed.
-                    if request_ctx.ensure_live().is_err() {
-                        return std::task::Poll::Ready(true);
-                    }
-                    // Sleep discovers its timer through the ambient Cx. The
-                    // deadline above belongs to this request, which may be
-                    // polled by an embedding with no ambient context or a
-                    // different clock. Check the host's time ceiling before
-                    // replacing it: set_current preserves the held Cx's mask,
-                    // not restrictions on the ambient context it replaces.
-                    // Sleep's driverless fallback must not supply denied time
-                    // authority. Recheck on every poll because the host may
-                    // resume a suspended listen in a narrower scope.
-                    if !request_ctx.cx().capabilities().time
-                        || Cx::current().is_some_and(|host| !host.capabilities().time)
-                    {
-                        return std::task::Poll::Ready(false);
-                    }
-                    // No application callback runs under this binding; the
-                    // prior ambient context is restored before yielding.
-                    let _current = Cx::set_current(Some(request_ctx.cx().clone()));
-                    // A still-future tightened ceiling must also move the
-                    // wake earlier. Never extend the already registered wait.
-                    if let Some(deadline) = request_ctx.budget().deadline
-                        && deadline < sleep.deadline()
-                    {
-                        sleep.as_mut().get_mut().reset(deadline);
-                    }
-                    if sleep.as_mut().poll(task_cx).is_ready() {
-                        return std::task::Poll::Ready(true);
-                    }
-                    std::task::Poll::Pending
-                })
-                .await;
-                if !time_authorized {
-                    if let Some(delivery) = &terminal_delivery {
-                        delivery.mark_failed();
-                    }
-                    request_cancellation.cancel();
-                    return Err(McpError::request_cancelled());
-                }
             }
-        }
 
-        // `terminate_with_receipt` publishes its global terminating bit before
-        // it acquires each lease election. Do not let that brief ordering
-        // window turn a server-owned graceful close into peer cancellation:
-        // wait until this exact lease records which terminal owner won.
-        while self.final_subscriptions.is_terminating()
-            && !lease.has_graceful_completion()
-            && !lease.is_peer_terminated()
-            && !request_cancellation.is_cancel_requested()
-        {
-            asupersync::runtime::yield_now().await;
-        }
+            if lease.server_termination_completed(request_ctx.cx()).await {
+                return Ok(());
+            }
 
-        if lease.server_termination_completed(request_ctx.cx()).await {
-            return Ok(());
+            Err(McpError::request_cancelled())
         }
+        .await;
 
-        Err(McpError::request_cancelled())
+        #[cfg(feature = "proxy")]
+        if let Some(listener) = catalog_relay_listener.as_mut() {
+            proxy::finish_proxy_catalog_listener(listener.as_mut()).await;
+        }
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        if let Some(listener) = mixed_relay_listener.as_mut() {
+            listener.finish_native_cleanup().await;
+        }
+        outcome
     }
 
     #[cfg(test)]
