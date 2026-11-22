@@ -257,6 +257,7 @@ where
             Ok(Box::new(WebSocketTaskListener {
                 client: backend_client,
                 _owner: owner,
+                context: ctx.clone(),
             }) as Box<dyn ProxyFinalTaskListener>)
         })
     }
@@ -268,6 +269,7 @@ where
 {
     client: Arc<Mutex<WebSocketClient<IO>>>,
     _owner: WebSocketTaskSubscriptionOwner,
+    context: McpContext,
 }
 
 impl<IO> ProxyFinalTaskListener for WebSocketTaskListener<IO>
@@ -292,36 +294,44 @@ where
         cancellation: &'a McpRequestCancellation,
     ) -> BoxFuture<'a, McpResult<ProxyFinalTaskListenerEvent>> {
         Box::pin(async move {
-            loop {
-                let mut client = await_proxy_operation_or_cancellation(
-                    cx,
-                    cancellation,
-                    Box::pin(async {
-                        OwnedMutexGuard::lock(Arc::clone(&self.client), cx)
-                            .await
-                            .map_err(websocket_lock_error)
-                    }),
-                )
-                .await?;
-                let event = client
-                    .poll_final_task_subscription_event(cx, cancellation)
+            let context = self.context.clone().with_request_cx(cx.clone());
+            let wire_cancellation = McpRequestCancellation::new();
+            // The MCP operation deadline can be earlier than its caller Cx or
+            // the native subscription timeout. Keep driving the selected read
+            // after that deadline so its bounded cancellation write completes.
+            drive_native_listener(&context, &wire_cancellation, cancellation, async {
+                loop {
+                    let mut client = await_proxy_operation_or_cancellation(
+                        cx,
+                        &wire_cancellation,
+                        Box::pin(async {
+                            OwnedMutexGuard::lock(Arc::clone(&self.client), cx)
+                                .await
+                                .map_err(websocket_lock_error)
+                        }),
+                    )
                     .await?;
-                drop(client);
-                if let Some(event) = event {
-                    return Ok(match event {
-                        StdioTaskSubscriptionEvent::Acknowledged(filter) => {
-                            ProxyFinalTaskListenerEvent::Acknowledged(filter)
-                        }
-                        StdioTaskSubscriptionEvent::Notification(notification) => {
-                            ProxyFinalTaskListenerEvent::Notification(notification)
-                        }
-                        StdioTaskSubscriptionEvent::Terminal => {
-                            ProxyFinalTaskListenerEvent::Terminal
-                        }
-                    });
+                    let event = client
+                        .poll_final_task_subscription_event(cx, &wire_cancellation)
+                        .await?;
+                    drop(client);
+                    if let Some(event) = event {
+                        return Ok(match event {
+                            StdioTaskSubscriptionEvent::Acknowledged(filter) => {
+                                ProxyFinalTaskListenerEvent::Acknowledged(filter)
+                            }
+                            StdioTaskSubscriptionEvent::Notification(notification) => {
+                                ProxyFinalTaskListenerEvent::Notification(notification)
+                            }
+                            StdioTaskSubscriptionEvent::Terminal => {
+                                ProxyFinalTaskListenerEvent::Terminal
+                            }
+                        });
+                    }
+                    asupersync::runtime::yield_now().await;
                 }
-                asupersync::runtime::yield_now().await;
-            }
+            })
+            .await
         })
     }
 }

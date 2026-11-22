@@ -5,10 +5,10 @@
 //! mutex has been released. No reader task, private runtime, or synchronous
 //! transport adapter is introduced here.
 
-#[cfg(test)]
-mod tests;
 #[cfg(feature = "tasks")]
 mod tasks;
+#[cfg(test)]
+mod tests;
 #[cfg(feature = "tasks")]
 pub use tasks::{PreparedProxyWebSocketTaskListener, PreparedProxyWebSocketTaskRequest};
 
@@ -322,7 +322,8 @@ where
         Box::pin(async move {
             ctx.checkpoint()?;
             let (request, parameters) =
-                self.backend.prepare_parameters(ctx, request, self.allow_tasks)?;
+                self.backend
+                    .prepare_parameters(ctx, request, self.allow_tasks)?;
 
             // A waiter owns no wire state yet, so cancellation may drop this
             // acquisition immediately. Once acquired, the native client owns
@@ -363,6 +364,7 @@ where
                                 })
                         })
                 },
+                None,
             )
             .await;
             // Live callbacks consume matching progress and requested logs as
@@ -647,7 +649,26 @@ async fn drive_native_request<T>(
     wire_cancellation: &McpRequestCancellation,
     operation: impl Future<Output = McpResult<T>>,
 ) -> McpResult<T> {
-    drive_native_request_with_priority(ctx, wire_cancellation, operation, |_| false).await
+    drive_native_request_with_priority(ctx, wire_cancellation, operation, |_| false, None).await
+}
+
+/// Observes a detached listener owner without replacing the opening request's
+/// cancellation domain, which remains part of its managed context authority.
+#[cfg(feature = "tasks")]
+async fn drive_native_listener<T>(
+    ctx: &McpContext,
+    wire_cancellation: &McpRequestCancellation,
+    listener_cancellation: &McpRequestCancellation,
+    operation: impl Future<Output = McpResult<T>>,
+) -> McpResult<T> {
+    drive_native_request_with_priority(
+        ctx,
+        wire_cancellation,
+        operation,
+        |_| false,
+        Some(listener_cancellation),
+    )
+    .await
 }
 
 async fn drive_native_request_with_priority<T>(
@@ -655,15 +676,22 @@ async fn drive_native_request_with_priority<T>(
     wire_cancellation: &McpRequestCancellation,
     operation: impl Future<Output = McpResult<T>>,
     keep_committed_result: impl Fn(&McpResult<T>) -> bool,
+    additional_cancellation: Option<&McpRequestCancellation>,
 ) -> McpResult<T> {
     let mut operation = std::pin::pin!(operation);
     let request_cancellation = ctx.request_cancellation();
     let mut cancelled = std::pin::pin!(request_cancellation.cancelled());
+    let mut additional_cancelled =
+        additional_cancellation.map(|signal| Box::pin(signal.cancelled()));
     let mut timer = ProxyPollTimer::new(ctx.cx());
     let mut cancellation_error = None;
     std::future::poll_fn(|task_cx| {
         if cancellation_error.is_none()
-            && (ctx.ensure_live().is_err() || cancelled.as_mut().poll(task_cx).is_ready())
+            && (ctx.ensure_live().is_err()
+                || cancelled.as_mut().poll(task_cx).is_ready()
+                || additional_cancelled
+                    .as_mut()
+                    .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready()))
         {
             cancellation_error = Some(McpError::request_cancelled());
             wire_cancellation.cancel();
@@ -677,7 +705,11 @@ async fn drive_native_request_with_priority<T>(
                 return Poll::Ready(result);
             }
             if cancellation_error.is_none()
-                && (ctx.ensure_live().is_err() || cancelled.as_mut().poll(task_cx).is_ready())
+                && (ctx.ensure_live().is_err()
+                    || cancelled.as_mut().poll(task_cx).is_ready()
+                    || additional_cancelled
+                        .as_mut()
+                        .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready()))
             {
                 cancellation_error = Some(McpError::request_cancelled());
             }
@@ -696,7 +728,12 @@ async fn drive_native_request_with_priority<T>(
             // retains exclusive transport ownership until it returns.
             return Poll::Pending;
         }
-        if ctx.ensure_live().is_err() || cancelled.as_mut().poll(task_cx).is_ready() {
+        if ctx.ensure_live().is_err()
+            || cancelled.as_mut().poll(task_cx).is_ready()
+            || additional_cancelled
+                .as_mut()
+                .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready())
+        {
             cancellation_error = Some(McpError::request_cancelled());
             wire_cancellation.cancel();
             task_cx.waker().wake_by_ref();

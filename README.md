@@ -1211,9 +1211,21 @@ while a request is running, without accumulating them in the retained queue. Req
 share one cancellation-aware connection owner. Cancelling a queued request has
 no upstream effect, and an active request retains ownership until its native
 cancellation cleanup finishes. Keep the caller runtime alive for the connection.
-This adapter currently provides core requests; catalog/resource subscription
-relays and Tasks are not advertised. `ProxyClient::from_websocket` exposes the
-same adapter for callers using the lower-level native client.
+Catalog and resource subscriptions share bounded ingress turns with ordinary
+requests. With `tasks`, complete upstream Tasks discovery and an explicit
+`ProxyTaskRetentionPolicy` also enable Task creation, get/update/cancel controls,
+and status subscriptions. Task handles remain bound to their original route,
+caller and authorized tool, including when an input-required call later creates
+a Task. `ProxyClient::from_websocket` exposes the same adapter for callers using
+the lower-level native client.
+
+Task subscription acknowledgement and event waits honor the opening operation's
+deadline and cancellation together with the listener owner's cancellation.
+Cancellation finishes the native control write before releasing the connection
+for reuse. A control rejected before dispatch leaves sibling requests usable;
+an interrupted partial request send retires the uncertain connection instead of
+appending another request to it. Request-specific Task identity and capabilities
+never replace the shared session's metadata.
 
 Exact-2024 proxy invocations preserve complete upstream `tools/call`,
 `resources/read`, and `prompts/get` results, including content annotations,

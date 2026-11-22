@@ -11526,16 +11526,7 @@ where
     where
         IO: Send + 'static,
     {
-        if !metadata
-            .client_capabilities
-            .extensions
-            .as_ref()
-            .is_some_and(|extensions| extensions.contains_key(fastmcp_protocol::TASKS_EXTENSION))
-        {
-            return Err(McpError::invalid_params(
-                "An owned Tasks subscription requires explicit Tasks client capability",
-            ));
-        }
+        Self::explicit_final_task_request_meta(metadata.clone())?;
         let owner = WebSocketTaskSubscriptionOwner {
             abandonment: McpRequestCancellation::new(),
         };
@@ -12300,11 +12291,16 @@ where
     #[cfg(feature = "tasks")]
     fn explicit_final_task_request_meta(metadata: FinalRequestMeta) -> McpResult<TaskRequestMeta> {
         if metadata.protocol_version != MODERN_PROTOCOL_VERSION
-            || !metadata.client_capabilities.extensions.as_ref()
-                .is_some_and(|extensions| extensions.contains_key(fastmcp_protocol::TASKS_EXTENSION))
+            || !metadata
+                .client_capabilities
+                .extensions
+                .as_ref()
+                .and_then(|extensions| extensions.get(fastmcp_protocol::TASKS_EXTENSION))
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
         {
             return Err(McpError::invalid_params(
-                "Explicit Tasks metadata requires the final protocol and Tasks client capability",
+                "Explicit Tasks metadata requires the final protocol and empty Tasks settings",
             ));
         }
         serde_json::from_value(serde_json::to_value(metadata).map_err(McpError::from)?)
@@ -12619,20 +12615,32 @@ where
         R: serde::de::DeserializeOwned,
         IO: Send + 'static,
     {
-        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            || cx.checkpoint().is_err()
+            || cx
+                .budget()
+                .deadline
+                .is_some_and(|deadline| cx.now() >= deadline)
+        {
             return Err(McpError::request_cancelled());
-        }
-        if cx.checkpoint().is_err() {
-            return Err(self.terminal_cancellation(cx).await);
         }
         let params = serde_json::to_value(parameters).map_err(|_| {
             McpError::invalid_params("Modern Tasks request parameters could not serialize")
         })?;
+        // A cancelled control has no connection authority before dispatch.
+        // Settle any earlier abandoned owner, then recheck this caller before
+        // allocating an ID or publishing a new request on the shared socket.
+        self.settle_abandoned_websocket_request().await?;
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            || cx.checkpoint().is_err()
+            || cx
+                .budget()
+                .deadline
+                .is_some_and(|deadline| cx.now() >= deadline)
+        {
+            return Err(McpError::request_cancelled());
+        }
         if let Some(task) = input_task {
-            // Allocation drains abandoned operations. Complete that potentially
-            // yielding work before the final retention check, so an expired
-            // snapshot spends neither a new ID nor a new update frame.
-            self.settle_abandoned_websocket_request().await?;
             task_wait::admit_input_retention(task)?;
         }
         let request_id = self.allocate_request_id().await?;
@@ -41241,6 +41249,282 @@ exec sleep 2
                 }
                 client.close(&cx).await.unwrap();
             }
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    #[test]
+    fn websocket_task_controls_preflight_keeps_the_shared_connection_usable() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            let (mut client, mut peer_io) = websocket_subscription_test_client(
+                &healthy,
+                SubscriptionTimeoutPolicy::default(),
+                true,
+                false,
+            )
+            .await;
+            let task: FinalTask = serde_json::from_value(serde_json::json!({
+                "taskId": "shared-task", "status": "input_required",
+                "createdAt": "2026-07-28T00:00:00Z", "lastUpdatedAt": "2026-07-28T00:00:00Z",
+                "ttlMs": null, "inputRequests": {"roots": {"method": "roots/list"}},
+            }))
+            .unwrap();
+            for interruption in ["context", "token", "deadline"] {
+                for method in [TASK_GET, TASK_UPDATE, TASK_CANCEL] {
+                    let caller = runtime.request_cx_with_budget(if interruption == "deadline" {
+                        asupersync::Budget::INFINITE.with_deadline(healthy.now())
+                    } else {
+                        asupersync::Budget::INFINITE
+                    });
+                    let cancellation = McpRequestCancellation::new();
+                    if interruption == "context" {
+                        caller.set_cancel_requested(true);
+                    }
+                    if interruption == "token" {
+                        cancellation.cancel();
+                    }
+                    let metadata = websocket_explicit_tasks_test_metadata();
+                    let result = match method {
+                        TASK_GET => client
+                            .get_task_final_with_metadata(
+                                &caller,
+                                task.base().task_id.clone(),
+                                metadata,
+                                &cancellation,
+                                &mut |_| {},
+                            )
+                            .await
+                            .map(|_| ()),
+                        TASK_UPDATE => client
+                            .update_task_final_with_metadata(
+                                &caller,
+                                &task,
+                                serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                                    .unwrap(),
+                                metadata,
+                                &cancellation,
+                                &mut |_| {},
+                            )
+                            .await
+                            .map(|_| ()),
+                        TASK_CANCEL => client
+                            .cancel_task_final_with_metadata(
+                                &caller,
+                                task.base().task_id.clone(),
+                                metadata,
+                                &cancellation,
+                                &mut |_| {},
+                            )
+                            .await
+                            .map(|_| ()),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        result.unwrap_err().code,
+                        McpErrorCode::RequestCancelled,
+                        "{method}: {interruption}"
+                    );
+                    assert!(!client.is_closed(), "{method}: {interruption}");
+                    assert_eq!(client.next_id, 2);
+                    assert!(client.transient_request.is_none());
+                    assert!(client.retired_requests.is_empty());
+                    assert!(healthy.checkpoint().is_ok());
+                }
+            }
+            let mut result = serde_json::to_value(&task).unwrap();
+            result["resultType"] = serde_json::json!("complete");
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(RequestId::Number(2), result))
+                    .unwrap(),
+            )
+            .await;
+            let fetched = client
+                .get_task_final(&healthy, task.base().task_id.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&fetched.task).unwrap(),
+                serde_json::to_value(&task).unwrap(),
+            );
+            let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+            for (id, method) in [(1, SERVER_DISCOVER_METHOD), (2, TASK_GET)] {
+                let JsonRpcMessage::Request(request) = peer.recv(&healthy).await.unwrap() else {
+                    panic!("expected native request");
+                };
+                assert_eq!(request.id, Some(RequestId::Number(id)));
+                assert_eq!(request.method, method);
+            }
+            client.close(&healthy).await.unwrap();
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    fn websocket_explicit_tasks_test_metadata() -> FinalRequestMeta {
+        FinalRequestMeta::new(ClientCapabilities {
+            roots: Some(Default::default()),
+            extensions: Some(std::collections::BTreeMap::from([(
+                fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                serde_json::json!({}),
+            )])),
+            ..ClientCapabilities::default()
+        })
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    #[test]
+    fn websocket_task_metadata_rejects_invalid_declarations_before_transport_effects() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (mut client, mut peer_io) = websocket_subscription_test_client(
+                &cx,
+                SubscriptionTimeoutPolicy::default(),
+                true,
+                false,
+            )
+            .await;
+            let task: FinalTask = serde_json::from_value(serde_json::json!({
+                "taskId": "declared-task", "status": "input_required",
+                "createdAt": "2026-07-28T00:00:00Z", "lastUpdatedAt": "2026-07-28T00:00:00Z",
+                "ttlMs": null, "inputRequests": {"roots": {"method": "roots/list"}},
+            }))
+            .unwrap();
+            let filter: SubscriptionFilter = serde_json::from_value(serde_json::json!({
+                "taskIds": ["declared-task"],
+            }))
+            .unwrap();
+            for defect in ["version", "missing", "settings", "null", "boolean", "array"] {
+                let mut metadata = websocket_explicit_tasks_test_metadata();
+                match defect {
+                    "version" => metadata.protocol_version = "2024-11-05".to_owned(),
+                    "missing" => metadata.client_capabilities.extensions = None,
+                    _ => {
+                        metadata
+                            .client_capabilities
+                            .extensions
+                            .as_mut()
+                            .unwrap()
+                            .insert(
+                                fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                                match defect {
+                                    "settings" => serde_json::json!({"unsupported": true}),
+                                    "null" => serde_json::Value::Null,
+                                    "boolean" => serde_json::json!(true),
+                                    _ => serde_json::json!([]),
+                                },
+                            );
+                    }
+                }
+                let cancellation = McpRequestCancellation::new();
+                assert_eq!(
+                    client
+                        .get_task_final_with_metadata(
+                            &cx,
+                            task.base().task_id.clone(),
+                            metadata.clone(),
+                            &cancellation,
+                            &mut |_| {},
+                        )
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams,
+                    "{defect}"
+                );
+                assert_eq!(
+                    client
+                        .update_task_final_with_metadata(
+                            &cx,
+                            &task,
+                            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                                .unwrap(),
+                            metadata.clone(),
+                            &cancellation,
+                            &mut |_| {},
+                        )
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams,
+                    "{defect}"
+                );
+                assert_eq!(
+                    client
+                        .cancel_task_final_with_metadata(
+                            &cx,
+                            task.base().task_id.clone(),
+                            metadata.clone(),
+                            &cancellation,
+                            &mut |_| {},
+                        )
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams,
+                    "{defect}"
+                );
+                assert_eq!(
+                    client
+                        .open_owned_final_task_subscription_listener(&cx, filter.clone(), metadata,)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams,
+                    "{defect}"
+                );
+                assert_eq!(client.next_id, 2, "{defect}");
+                assert!(client.live_task_subscription.is_none());
+                assert!(client.transient_request.is_none());
+                assert!(client.retired_requests.is_empty());
+                assert!(!client.is_closed());
+            }
+            let mut result = serde_json::to_value(&task).unwrap();
+            result["resultType"] = serde_json::json!("complete");
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(RequestId::Number(2), result))
+                    .unwrap(),
+            )
+            .await;
+            let mut metadata = websocket_explicit_tasks_test_metadata();
+            metadata.client_info = Some(
+                fastmcp_protocol::common_types::Implementation::try_new("task-caller", "1")
+                    .unwrap(),
+            );
+            metadata
+                .additional_metadata
+                .insert("example/request".to_owned(), serde_json::json!("local"));
+            client
+                .get_task_final_with_metadata(
+                    &cx,
+                    task.base().task_id.clone(),
+                    metadata,
+                    &McpRequestCancellation::new(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+            peer.recv(&cx).await.unwrap();
+            let JsonRpcMessage::Request(request) = peer.recv(&cx).await.unwrap() else {
+                panic!("expected tasks/get after the rejected declarations");
+            };
+            assert_eq!(request.id, Some(RequestId::Number(2)));
+            let parameters = request.params.unwrap();
+            assert_eq!(
+                parameters["_meta"][FINAL_CLIENT_INFO_META_KEY]["name"],
+                "task-caller"
+            );
+            assert_eq!(parameters["_meta"]["example/request"], "local");
+            assert_ne!(
+                client.session.modern_client_implementation().name,
+                "task-caller"
+            );
+            client.close(&cx).await.unwrap();
         });
     }
 

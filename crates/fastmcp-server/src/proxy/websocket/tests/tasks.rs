@@ -159,6 +159,337 @@ async fn receive(
 }
 
 #[test]
+fn websocket_tasks_proxy_operation_deadline_cancels_ack_and_stream_waits() {
+    run(|cx| async move {
+        for acknowledged in [false, true] {
+            let (client, mut peer) = connect(&cx, true).await;
+            let (proxy, backend) = retained_proxy(client);
+            let ctx = context(&cx, "owner")
+                .with_operation_deadline(Some(cx.now().saturating_add_nanos(100_000_000)));
+            let filter = task_filter(FinalTaskId::parse("upstream-only").unwrap());
+            if acknowledged {
+                frame(&mut peer, &acknowledgement(2, &filter)).await;
+            }
+            let mut listener = proxy
+                .open_final_task_listener_async(&ctx, filter)
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            if acknowledged {
+                assert!(matches!(
+                    listener.next_async(&cx, &cancellation).await.unwrap(),
+                    ProxyFinalTaskListenerEvent::Acknowledged(_)
+                ));
+            }
+            assert_eq!(
+                listener
+                    .next_async(&cx, &cancellation)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled,
+                "the MCP deadline interrupts a silent native listener"
+            );
+            assert!(cx.now() >= ctx.budget().deadline.unwrap());
+            assert!(cx.checkpoint().is_ok());
+            assert!(!cancellation.is_cancel_requested());
+            assert!(!ctx.request_cancellation().is_cancel_requested());
+            drop(listener);
+            frame(&mut peer, r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#).await;
+            proxy.catalog_typed_with_cx(&cx).await.unwrap();
+            backend.close(&cx).await.unwrap();
+            let mut peer = AsyncWsServerTransport::from_upgraded(peer);
+            receive(&cx, &mut peer, "server/discover", Some(1)).await;
+            receive(&cx, &mut peer, "subscriptions/listen", Some(2)).await;
+            let cancelled = receive(&cx, &mut peer, "notifications/cancelled", None).await;
+            assert_eq!(cancelled.params.unwrap()["requestId"], 2);
+            receive(&cx, &mut peer, "tools/list", Some(3)).await;
+        }
+    });
+}
+
+#[test]
+fn websocket_tasks_proxy_retains_both_request_and_listener_cancellation() {
+    run(|cx| async move {
+        for managed in [false, true] {
+            for cancel_opening_request in [false, true] {
+                let (client, mut peer) = connect(&cx, true).await;
+                let (proxy, backend) = retained_proxy(client);
+                let opening_cancellation = McpRequestCancellation::new();
+                let ctx =
+                    context(&cx, "owner").with_request_cancellation(opening_cancellation.clone());
+                let (ctx, lease) = if managed {
+                    let (scoped, lease) = ctx.begin_request_scope().unwrap();
+                    (scoped, Some(lease))
+                } else {
+                    (ctx, None)
+                };
+                let filter = task_filter(FinalTaskId::parse("upstream-only").unwrap());
+                frame(&mut peer, &acknowledgement(2, &filter)).await;
+                let mut listener = proxy
+                    .open_final_task_listener_async(&ctx, filter)
+                    .await
+                    .unwrap();
+                let listener_cancellation = McpRequestCancellation::new();
+                assert!(matches!(
+                    listener
+                        .next_async(&cx, &listener_cancellation)
+                        .await
+                        .unwrap(),
+                    ProxyFinalTaskListenerEvent::Acknowledged(_)
+                ));
+                {
+                    let mut waiting = Box::pin(listener.next_async(&cx, &listener_cancellation));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending()
+                    );
+                    let selected = if cancel_opening_request {
+                        &opening_cancellation
+                    } else {
+                        &listener_cancellation
+                    };
+                    assert!(selected.cancel());
+                    assert_eq!(
+                        waiting.await.unwrap_err().code,
+                        McpErrorCode::RequestCancelled
+                    );
+                }
+                assert_eq!(
+                    opening_cancellation.is_cancel_requested(),
+                    cancel_opening_request
+                );
+                assert_eq!(
+                    listener_cancellation.is_cancel_requested(),
+                    !cancel_opening_request
+                );
+                assert_eq!(ctx.ensure_live().is_err(), cancel_opening_request);
+                assert!(cx.checkpoint().is_ok());
+                drop(listener);
+                frame(&mut peer, r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#).await;
+                proxy.catalog_typed_with_cx(&cx).await.unwrap();
+                backend.close(&cx).await.unwrap();
+                drop(lease);
+                let mut peer = AsyncWsServerTransport::from_upgraded(peer);
+                receive(&cx, &mut peer, "server/discover", Some(1)).await;
+                receive(&cx, &mut peer, "subscriptions/listen", Some(2)).await;
+                let cancelled = receive(&cx, &mut peer, "notifications/cancelled", None).await;
+                assert_eq!(cancelled.params.unwrap()["requestId"], 2);
+                receive(&cx, &mut peer, "tools/list", Some(3)).await;
+            }
+        }
+    });
+}
+
+#[test]
+fn websocket_tasks_proxy_resumes_bound_inputs_into_a_task() {
+    use crate::bidirectional::{
+        MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest, MrtrInputRequests, MrtrRetry,
+    };
+
+    run(|cx| async move {
+        let (client, mut peer) = connect(&cx, true).await;
+        let (proxy, backend) = retained_proxy(client);
+        let relay = proxy.final_tasks_relay().unwrap().unwrap();
+        relay
+            .install_access_authorizers(vec![Arc::new(Access)])
+            .unwrap();
+        let ctx = context(&cx, "owner").with_client_implementation(
+            fastmcp_core::ClientImplementationInfo::new("downstream-caller", "2"),
+        );
+        let handler = ProxyToolHandler::from_final_with_task_relay(
+            serde_json::from_value(json!({"name":"work","inputSchema":{"type":"object"}})).unwrap(),
+            proxy.clone(),
+            Arc::clone(&relay),
+        )
+        .unwrap();
+        frame(&mut peer, r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","requestState":"upstream-private-continuation","inputRequests":{"roots":{"method":"roots/list"}}}}"#).await;
+        let Outcome::Ok(FinalToolOutcome::InputRequired(required)) = handler
+            .call_final_outcome_async(&ctx, json!({"value":73}))
+            .await
+        else {
+            panic!("first native round retains the upstream MRTR branch")
+        };
+        assert_eq!(
+            required.request_state(),
+            Some("upstream-private-continuation")
+        );
+        let registry = MrtrExchangeRegistry::new();
+        let binding = MrtrExchangeBinding::new(
+            "tools/call",
+            "work".to_owned(),
+            [7; 32],
+            [9; 32],
+            None,
+            [11; 32],
+        );
+        let issued = registry
+            .issue_bound(
+                ctx.request_cancellation().clone(),
+                binding.clone(),
+                MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())]).unwrap(),
+                required.request_state().map(str::to_owned),
+            )
+            .unwrap();
+        let wire = serde_json::to_value(issued).unwrap();
+        let state = wire["requestState"].as_str().unwrap();
+        assert_ne!(state, "upstream-private-continuation");
+        assert!(
+            registry
+                .accept_wire_bound(
+                    state,
+                    &binding,
+                    &std::collections::BTreeMap::from([(
+                        "roots".to_owned(),
+                        json!({"action":"decline"})
+                    )]),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            registry.active_len(),
+            1,
+            "wrong-kind input cannot consume the exchange"
+        );
+        let roots = json!({"roots":[{"uri":"file:///allowed","name":"allowed"}]});
+        let MrtrRetry::Complete(resume) = registry
+            .accept_wire_bound(
+                state,
+                &binding,
+                &std::collections::BTreeMap::from([("roots".to_owned(), roots.clone())]),
+            )
+            .unwrap()
+        else {
+            panic!("typed retry completes the bound exchange")
+        };
+        assert_eq!(registry.active_len(), 0);
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        frame(
+            &mut peer,
+            &task_response(3, "task", &task(&timestamp, "working")),
+        )
+        .await;
+        let Outcome::Ok(FinalToolOutcome::CreateTask {
+            work_descriptor, ..
+        }) = handler
+            .call_final_outcome_async_resuming_in_request(
+                &ctx,
+                &cx,
+                json!({"value":73}),
+                Some(&resume),
+            )
+            .await
+        else {
+            panic!("resumed native call retains its Task branch")
+        };
+        let registration = Arc::new(());
+        let admitted = relay
+            .admit_carried_task_for_operation(
+                &ctx,
+                &work_descriptor,
+                crate::FinalTaskOperation::for_tool("work", &registration).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(admitted.task.base().task_id.as_str(), "upstream-only");
+        assert_eq!(
+            proxy.final_task_registry_snapshot_for_test().unwrap()["pendingCreations"],
+            0
+        );
+        backend.close(&cx).await.unwrap();
+        let mut peer = AsyncWsServerTransport::from_upgraded(peer);
+        receive(&cx, &mut peer, "server/discover", Some(1)).await;
+        let initial = receive(&cx, &mut peer, "tools/call", Some(2)).await;
+        assert!(initial.params.unwrap().get("requestState").is_none());
+        let resumed = receive(&cx, &mut peer, "tools/call", Some(3)).await;
+        let params = resumed.params.unwrap();
+        assert_eq!(params["requestState"], "upstream-private-continuation");
+        assert_eq!(params["inputResponses"], json!({"roots":roots}));
+        assert_eq!(params["arguments"], json!({"value":73}));
+        assert_eq!(
+            params["_meta"][fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY]["name"],
+            "downstream-caller"
+        );
+        assert_eq!(
+            params["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+            json!({"io.modelcontextprotocol/tasks":{}})
+        );
+    });
+}
+
+#[test]
+fn websocket_tasks_proxy_partial_open_cannot_append_another_request() {
+    run(|cx| async move {
+        for cancelled in [false, true] {
+            let (io, mut peer) = VirtualTcpStream::pair(
+                "127.0.0.1:45311".parse().unwrap(),
+                "127.0.0.1:45312".parse().unwrap(),
+            );
+            frame(&mut peer, &discovery(true)).await;
+            let gate = Arc::new(ControlGate::default());
+            let client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                ClientInfo {
+                    name: "gateway".to_owned(),
+                    version: "1".to_owned(),
+                },
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(GatedIo {
+                    inner: io,
+                    gate: Arc::clone(&gate),
+                }),
+            )
+            .await
+            .unwrap();
+            let proxy = ProxyClient::from_websocket(client, 1).unwrap();
+            let ctx = context(&cx, "owner");
+            let filter = task_filter(FinalTaskId::parse("upstream-only").unwrap());
+            gate.armed.store(true, Ordering::Release);
+            {
+                let mut opening = Box::pin(proxy.open_final_task_listener_async(&ctx, filter));
+                std::future::poll_fn(|task_cx| {
+                    assert!(opening.as_mut().poll(task_cx).is_pending());
+                    if gate.parked.load(Ordering::Acquire) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                assert_eq!(gate.accepted.load(Ordering::Acquire), 1);
+                if cancelled {
+                    ctx.request_cancellation().cancel();
+                    assert_eq!(
+                        opening.await.err().unwrap().code,
+                        McpErrorCode::RequestCancelled
+                    );
+                }
+            }
+            gate.release();
+            assert!(
+                proxy
+                    .get_final_task(
+                        &context(&cx, "owner"),
+                        FinalTaskId::parse("upstream-only").unwrap(),
+                    )
+                    .await
+                    .is_err(),
+                "next operation retires the uncertain request writer"
+            );
+            assert!(proxy.catalog_typed_with_cx(&cx).await.is_err());
+            let mut peer = AsyncWsServerTransport::from_upgraded(peer);
+            receive(&cx, &mut peer, "server/discover", Some(1)).await;
+            assert!(
+                peer.recv(&cx).await.is_err(),
+                "no frame follows the partial abandoned send"
+            );
+        }
+    });
+}
+
+#[test]
 fn websocket_tasks_proxy_lifecycle_maps_handles_and_preserves_exact_completed_result() {
     run(|cx| async move {
         let (client, mut peer) = connect(&cx, true).await;
