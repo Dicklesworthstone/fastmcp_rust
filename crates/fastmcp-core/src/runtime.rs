@@ -683,6 +683,68 @@ pub fn with_caller_context<T>(cx: &asupersync::Cx, operation: impl FnOnce() -> T
     operation()
 }
 
+/// A driver may retain a cancelled timer's registration until its next sweep.
+/// Give it a revocable forwarding target instead of the caller's own waker so
+/// abandoning a request releases that caller without waiting for the driver.
+#[derive(Default)]
+struct CallerWakeRegistration {
+    target: std::sync::Mutex<Option<std::sync::Arc<CallerWakeTarget>>>,
+}
+
+impl CallerWakeRegistration {
+    fn replace(&self, target: Option<std::sync::Arc<CallerWakeTarget>>) {
+        let previous = std::mem::replace(
+            &mut *self
+                .target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            target,
+        );
+        // A foreign waker destructor may re-enter the registration.
+        drop(previous);
+    }
+
+    fn forward(&self) {
+        // Clone only our Arc while locked. Foreign clone/wake/drop callbacks
+        // must never run under the registration mutex. A wake already in
+        // flight at revocation may finish, but its target retains its ceiling.
+        let target = self
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(target) = target {
+            with_caller_context(&target.caller, || {
+                if let Some(waker) = target.waker.as_ref() {
+                    waker.wake_by_ref();
+                }
+            });
+        }
+    }
+}
+
+impl std::task::Wake for CallerWakeRegistration {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.forward();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.forward();
+    }
+}
+
+struct CallerWakeTarget {
+    caller: asupersync::Cx,
+    waker: Option<std::task::Waker>,
+}
+
+impl Drop for CallerWakeTarget {
+    fn drop(&mut self) {
+        let waker = self.waker.take();
+        with_caller_context(&self.caller, || drop(waker));
+    }
+}
+
 /// A future whose polling and destruction retain its admitted caller context.
 ///
 /// The initial host ceiling is captured at construction. Each poll retains any
@@ -691,11 +753,14 @@ pub fn with_caller_context<T>(cx: &asupersync::Cx, operation: impl FnOnce() -> T
 /// the current host's permissions, while identity,
 /// cancellation, budget and drivers still belong to the original caller.
 /// No thread-local guard survives a poll, and abandoning the future runs its
-/// cleanup with the same authority as its work. No runtime or task is created.
+/// cleanup with the same authority as its work. Wakers retained by a driver
+/// are revoked at completion or abandonment, so delayed registration cleanup
+/// cannot retain the caller. No runtime or task is created.
 #[must_use = "futures do nothing unless polled or awaited"]
 pub struct CallerContextFuture<F: Future> {
     caller: asupersync::Cx,
     future: Option<std::pin::Pin<Box<F>>>,
+    wake: std::sync::Arc<CallerWakeRegistration>,
 }
 
 impl<F: Future> CallerContextFuture<F> {
@@ -710,6 +775,7 @@ impl<F: Future> CallerContextFuture<F> {
         Self {
             caller,
             future: Some(Box::pin(future)),
+            wake: std::sync::Arc::default(),
         }
     }
 }
@@ -736,15 +802,22 @@ impl<F: Future> Future for CallerContextFuture<F> {
             // Latch before entering the user future, including when that poll
             // panics or yields. Later abandonment cannot widen its cleanup.
             this.caller = asupersync::Cx::current().expect("explicit caller context is installed");
+            this.wake.replace(Some(std::sync::Arc::new(CallerWakeTarget {
+                caller: this.caller.clone(),
+                waker: Some(task_cx.waker().clone()),
+            })));
+            let waker = std::task::Waker::from(std::sync::Arc::clone(&this.wake));
+            let mut task_cx = std::task::Context::from_waker(&waker);
             let result = this
                 .future
                 .as_mut()
                 .expect("caller-context future polled after completion")
                 .as_mut()
-                .poll(task_cx);
+                .poll(&mut task_cx);
             if result.is_ready() {
                 // Release the actual user future before restoring the host,
                 // even when it completed in a more restricted resumed poll.
+                this.wake.replace(None);
                 drop(this.future.take());
             }
             result
@@ -755,7 +828,10 @@ impl<F: Future> Future for CallerContextFuture<F> {
 impl<F: Future> Drop for CallerContextFuture<F> {
     fn drop(&mut self) {
         let future = self.future.take();
-        with_caller_context(&self.caller, || drop(future));
+        with_caller_context(&self.caller, || {
+            self.wake.replace(None);
+            drop(future);
+        });
     }
 }
 
@@ -1172,6 +1248,248 @@ mod tests {
                 "the caller itself is not mutated"
             );
         }
+    }
+
+    #[test]
+    fn caller_context_future_revokes_retained_wakers_on_completion_and_abandonment() {
+        use asupersync::Cx;
+        use std::cell::{Cell, RefCell};
+        use std::future::{Future, poll_fn};
+        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for complete in [false, true] {
+            let caller = Cx::for_testing();
+            let _host = Cx::set_current(Some(Cx::for_testing()));
+            let retained = Rc::new(RefCell::new(Vec::new()));
+            let registrations = Rc::clone(&retained);
+            let ready = Rc::new(Cell::new(false));
+            let completion = Rc::clone(&ready);
+            let mut future = Box::pin(super::CallerContextFuture::new(
+                &caller,
+                poll_fn(move |task| {
+                    // Model a timer driver that lazily retains cancelled
+                    // registrations after the future itself is destroyed.
+                    registrations.borrow_mut().push(task.waker().clone());
+                    if completion.get() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            ));
+            let counter = Arc::new(CountWake(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&counter));
+            let mut task = Context::from_waker(&waker);
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            retained.borrow()[0].wake_by_ref();
+            assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+            if complete {
+                ready.set(true);
+                assert!(future.as_mut().poll(&mut task).is_ready());
+                assert_eq!(
+                    Arc::strong_count(&counter),
+                    2,
+                    "completion retires the caller before the future is dropped"
+                );
+            }
+            drop(future);
+            drop(waker);
+            assert_eq!(
+                Arc::strong_count(&counter),
+                1,
+                "stale driver entries must not own the caller"
+            );
+            for stale in retained.borrow().iter() {
+                stale.wake_by_ref();
+            }
+            assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn caller_context_future_replaces_and_retires_wakers_under_the_retained_ceiling() {
+        use asupersync::Cx;
+        use std::cell::RefCell;
+        use std::future::{Future, poll_fn};
+        use std::rc::Rc;
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct ObserveWake {
+            wakes: Arc<Mutex<Vec<[bool; 5]>>>,
+            drops: Arc<Mutex<Vec<[bool; 5]>>>,
+        }
+
+        impl Wake for ObserveWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.wakes
+                    .lock()
+                    .unwrap()
+                    .push(effects(&Cx::current().unwrap()));
+            }
+        }
+
+        impl Drop for ObserveWake {
+            fn drop(&mut self) {
+                self.drops
+                    .lock()
+                    .unwrap()
+                    .push(effects(&Cx::current().unwrap()));
+            }
+        }
+
+        let caller = Cx::for_testing();
+        let _host = Cx::set_current(Some(Cx::for_testing()));
+        let retained = Rc::new(RefCell::new(Vec::new()));
+        let registrations = Rc::clone(&retained);
+        let mut future = Box::pin(super::CallerContextFuture::new(
+            &caller,
+            poll_fn(move |task| {
+                registrations.borrow_mut().push(task.waker().clone());
+                Poll::<()>::Pending
+            }),
+        ));
+        let first_wakes = Arc::new(Mutex::new(Vec::new()));
+        let second_wakes = Arc::new(Mutex::new(Vec::new()));
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let first = Waker::from(Arc::new(ObserveWake {
+            wakes: Arc::clone(&first_wakes),
+            drops: Arc::clone(&drops),
+        }));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&first))
+                .is_pending()
+        );
+        drop(first);
+        assert!(drops.lock().unwrap().is_empty());
+        let restriction = Cx::push_restriction(super::CapMask::none());
+        let second = Waker::from(Arc::new(ObserveWake {
+            wakes: Arc::clone(&second_wakes),
+            drops: Arc::clone(&drops),
+        }));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&second))
+                .is_pending()
+        );
+        drop(restriction);
+        assert_eq!(*drops.lock().unwrap(), vec![[false; 5]]);
+        // Even a registration retained from the earlier, broader poll wakes
+        // only the new caller, under the most recently admitted ceiling.
+        retained.borrow()[0].wake_by_ref();
+        assert!(first_wakes.lock().unwrap().is_empty());
+        assert_eq!(*second_wakes.lock().unwrap(), vec![[false; 5]]);
+        drop(second);
+        drop(future);
+        assert_eq!(*drops.lock().unwrap(), vec![[false; 5], [false; 5]]);
+        for stale in retained.borrow().iter() {
+            stale.wake_by_ref();
+        }
+        assert_eq!(*second_wakes.lock().unwrap(), vec![[false; 5]]);
+        assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+    }
+
+    #[test]
+    fn caller_context_future_in_flight_wake_cleanup_keeps_the_caller_ceiling() {
+        use asupersync::Cx;
+        use std::cell::RefCell;
+        use std::future::{Future, poll_fn};
+        use std::rc::Rc;
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::task::{Context, Poll, Wake, Waker};
+        use std::time::Duration;
+
+        struct BlockingWake {
+            started: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            drops: Arc<Mutex<Vec<[bool; 5]>>>,
+        }
+
+        impl Wake for BlockingWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                assert_eq!(effects(&Cx::current().unwrap()), [false; 5]);
+                self.started.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        }
+
+        impl Drop for BlockingWake {
+            fn drop(&mut self) {
+                self.drops
+                    .lock()
+                    .unwrap()
+                    .push(effects(&Cx::current().unwrap()));
+            }
+        }
+
+        let caller = Cx::for_testing();
+        let _host = Cx::set_current(Some(Cx::for_testing()));
+        let retained = Rc::new(RefCell::new(None));
+        let registration = Rc::clone(&retained);
+        let restriction = Cx::push_restriction(super::CapMask::none());
+        let mut future = Box::pin(super::CallerContextFuture::new(
+            &caller,
+            poll_fn(move |task| {
+                *registration.borrow_mut() = Some(task.waker().clone());
+                Poll::<()>::Pending
+            }),
+        ));
+        drop(restriction);
+        let (started, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let waker = Waker::from(Arc::new(BlockingWake {
+            started,
+            release: Mutex::new(released),
+            drops: Arc::clone(&drops),
+        }));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+        let proxy = retained.borrow_mut().take().unwrap();
+        let worker = std::thread::spawn(move || proxy.wake());
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Revocation must not wait on a foreign wake callback or hold the
+        // registration mutex while that callback is running.
+        drop(future);
+        assert!(drops.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(*drops.lock().unwrap(), vec![[false; 5]]);
+        assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
     }
 
     #[test]
