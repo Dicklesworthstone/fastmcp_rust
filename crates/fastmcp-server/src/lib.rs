@@ -24933,7 +24933,7 @@ impl Server {
             }
             return Some(McpError::request_cancelled());
         }
-        None
+        Self::enforce_authentication_freshness(ctx.auth().as_ref()).err()
     }
 
     fn enforce_request_context(ctx: &McpContext) -> McpResult<()> {
@@ -26101,10 +26101,7 @@ impl Server {
     }
 
     fn enforce_authentication_freshness(auth: Option<&AuthContext>) -> McpResult<()> {
-        if auth
-            .and_then(AuthContext::verification_valid_until)
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        if auth.is_some_and(|facts| !facts.verification_is_current()) {
             return Err(McpError::new(
                 McpErrorCode::ResourceForbidden,
                 "Authentication failed",

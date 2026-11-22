@@ -1612,6 +1612,66 @@ mod tests {
     }
 
     #[test]
+    fn revoked_verification_policy_denies_task_reads_mutations_and_retained_events() {
+        let (store, runtime, id, registration) = fixture();
+        let cancellation = fastmcp_core::McpRequestCancellation::new();
+        let facts = context(&["invoke", "manage", "sensitive"])
+            .auth()
+            .unwrap()
+            .with_verification_cancellation(cancellation.clone());
+        let caller = McpContext::new(Cx::for_testing(), 2).with_auth(facts);
+        let admitted = runtime
+            .admit_task_for_request(&caller, &id, TaskAccessAction::Listen)
+            .unwrap();
+        let event = store.inner.latest_notification(&id).unwrap();
+        assert!(
+            runtime
+                .notification_matches_task_access(&caller, &admitted, &event)
+                .unwrap()
+        );
+        let reads = store.payload_reads.load(Ordering::SeqCst);
+        let metadata_reads = store.metadata_reads.load(Ordering::SeqCst);
+        assert!(cancellation.cancel());
+        for action in [
+            TaskAccessAction::Get,
+            TaskAccessAction::Update,
+            TaskAccessAction::Cancel,
+            TaskAccessAction::Listen,
+        ] {
+            assert_eq!(
+                runtime
+                    .task_for_request(&caller, &id, action)
+                    .unwrap_err()
+                    .message,
+                "Task not found"
+            );
+        }
+        let operation = FinalTaskOperation::for_tool("sensitive-tool", &registration).unwrap();
+        assert_eq!(
+            runtime
+                .create_task_for_operation(&caller, operation, work(), None)
+                .unwrap_err()
+                .message,
+            "Task not found"
+        );
+        assert!(!runtime.task_access_is_current(&caller, &admitted));
+        assert!(
+            runtime
+                .notification_matches_task_access(&caller, &admitted, &event)
+                .is_err()
+        );
+        assert_eq!(store.payload_reads.load(Ordering::SeqCst), reads);
+        assert_eq!(store.metadata_reads.load(Ordering::SeqCst), metadata_reads);
+        let renewed = context(&["invoke", "manage", "sensitive"]);
+        assert!(
+            runtime
+                .task_for_request(&renewed, &id, TaskAccessAction::Get)
+                .is_ok(),
+            "new verification for the same owner can still use the Task"
+        );
+    }
+
+    #[test]
     fn expired_verification_receipts_deny_all_access_before_metadata_or_payload() {
         let (store, runtime, id, registration) = fixture();
         let caller = context(&["invoke", "manage", "sensitive"]);

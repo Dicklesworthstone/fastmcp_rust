@@ -11,8 +11,10 @@
 //! Fresh keys remain usable during a failed refresh, but never past their hard
 //! monotonic expiry. A slow or abandoned refresh cannot hold admission hostage,
 //! revive revoked trust, or overwrite a newer administrative installation.
-//! Revocation and refresh affect new authentication only, not work admitted
-//! earlier. This is not OIDC discovery, introspection, or individual-token revocation.
+//! Revocation and successful key replacement also retire previously returned
+//! authentication facts at their next guarded use or delivery. They do not
+//! preempt application code already running. This is not OIDC discovery,
+//! introspection, or individual-token revocation.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -20,7 +22,9 @@ use std::sync::{Arc, RwLock};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use fastmcp_core::{AccessToken, AuthContext, McpContext, McpError, McpErrorCode, McpResult};
+use fastmcp_core::{
+    AccessToken, AuthContext, McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult,
+};
 
 use super::jwt_resource::{JwtResourceAuthError, JwtResourcePolicy, JwtResourceVerifier};
 use crate::auth::{AuthRequest, TokenVerifier};
@@ -133,6 +137,13 @@ impl std::error::Error for JwksRefreshError {}
 struct KeyGeneration {
     verifier: JwtResourceVerifier,
     expires_at: Instant,
+    cancellation: McpRequestCancellation,
+}
+
+impl Drop for KeyGeneration {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 struct RefreshTicket {
@@ -234,11 +245,15 @@ impl ManagedJwtResourceVerifier {
         let retired = state.active.replace(Arc::new(KeyGeneration {
             verifier,
             expires_at,
+            cancellation: McpRequestCancellation::new(),
         }));
         state.revoked = false;
         state.flight = None;
         state.next_attempt_at = next_attempt_at;
         drop(state);
+        if let Some(retired) = &retired {
+            retired.cancellation.cancel();
+        }
         drop(retired);
         Ok(())
     }
@@ -257,6 +272,9 @@ impl ManagedJwtResourceVerifier {
         state.flight = None;
         let retired = state.active.take();
         drop(state);
+        if let Some(retired) = &retired {
+            retired.cancellation.cancel();
+        }
         drop(retired);
         Ok(changed)
     }
@@ -313,7 +331,13 @@ impl ManagedJwtResourceVerifier {
             return Err(JwtResourceAuthError::KeysChanged);
         }
         auth_checkpoint(ctx)?;
-        Ok(authenticated.with_verification_valid_until(active.expires_at))
+        let authenticated = authenticated
+            .with_verification_valid_until(active.expires_at)
+            .with_verification_cancellation(active.cancellation.clone());
+        if !authenticated.verification_is_current() {
+            return Err(JwtResourceAuthError::KeysUnavailable);
+        }
+        Ok(authenticated)
     }
 
     /// Performs at most one due refresh. `fetch` is not called when cancelled,
@@ -414,10 +438,14 @@ impl ManagedJwtResourceVerifier {
         let retired = state.active.replace(Arc::new(KeyGeneration {
             verifier,
             expires_at: lease.ticket.expires_at,
+            cancellation: McpRequestCancellation::new(),
         }));
         state.next_attempt_at = lease.ticket.next_refresh_at;
         state.flight = None;
         drop(state);
+        if let Some(retired) = &retired {
+            retired.cancellation.cancel();
+        }
         drop(retired);
         Ok(())
     }
@@ -603,6 +631,57 @@ mod tests {
         assert_eq!(
             authenticated.verification_valid_until(),
             Some(generation.expires_at)
+        );
+    }
+
+    #[test]
+    fn managed_jwt_revoke_and_replacement_retire_previously_issued_facts() {
+        let (verifier, elapsed) = fixture();
+        verifier.install_jwks(&jwks()).unwrap();
+        let generation = verifier.fresh_generation().unwrap();
+        let facts = verifier
+            .finish_authentication(&ctx(), &generation, AuthContext::with_subject("subject"))
+            .unwrap();
+        assert!(facts.verification_is_current());
+        assert!(verifier.install_jwks(b"{}").is_err());
+        assert!(
+            facts.verification_is_current(),
+            "invalid replacement preserves the live generation"
+        );
+        verifier.install_jwks(&jwks()).unwrap();
+        assert!(
+            facts.verification_is_revoked(),
+            "even identical keys are a new administrative generation"
+        );
+        assert!(!facts.clone().verification_is_current());
+        let fresh = verifier.fresh_generation().unwrap();
+        let refreshed = verifier
+            .finish_authentication(&ctx(), &fresh, AuthContext::with_subject("subject"))
+            .unwrap();
+        assert!(refreshed.verification_is_current());
+        elapsed.store(10, Ordering::SeqCst);
+        assert_eq!(
+            ready(verifier.refresh_with(&ctx(), || async { Ok(jwks()) })),
+            Ok(JwksRefreshOutcome::Updated)
+        );
+        assert!(
+            refreshed.verification_is_revoked(),
+            "successful refresh retires the replaced verdicts"
+        );
+        let active = verifier.fresh_generation().unwrap();
+        let current = verifier
+            .finish_authentication(&ctx(), &active, AuthContext::with_subject("subject"))
+            .unwrap();
+        assert!(current.verification_is_current());
+        assert!(verifier.revoke_all().unwrap());
+        assert!(
+            current.verification_is_revoked(),
+            "retaining the old key Arc cannot preserve authorization"
+        );
+        verifier.install_jwks(&jwks()).unwrap();
+        assert!(
+            !current.verification_is_current(),
+            "re-enabling trust never revives old facts"
         );
     }
 

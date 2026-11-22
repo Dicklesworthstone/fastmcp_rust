@@ -756,12 +756,9 @@ impl TokenAuthProvider {
         access: &AccessToken,
         auth: AuthContext,
     ) -> McpResult<AuthContext> {
-        if auth
-            .verification_valid_until()
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        if !auth.verification_is_current() {
             return Err(auth_error(
-                "Token verifier returned expired authentication facts",
+                "Token verifier returned unavailable authentication facts",
             ));
         }
         if principal_fingerprint(Some(&auth)).is_err() {

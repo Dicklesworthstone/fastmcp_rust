@@ -7,7 +7,13 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::McpRequestCancellation;
 use crate::crypto::Sha256Digest;
+use crate::runtime::{ProcessBoundToken, ProcessGenerationGuard};
+
+// Independent policy owners may all constrain one verdict. Keep the retained
+// cancellation domains fixed-size; exceeding the bound retires the verdict.
+const MAX_VERIFICATION_CANCELLATIONS: usize = 8;
 
 /// Maximum admitted UTF-8 bytes in one access-token value.
 pub const MAX_ACCESS_TOKEN_BYTES: usize = 4 * 1024;
@@ -536,6 +542,79 @@ mod tests {
     }
 
     #[test]
+    fn auth_verification_cancellation_is_shared_bounded_and_conjunctive() {
+        let first = crate::McpRequestCancellation::new();
+        let second = crate::McpRequestCancellation::new();
+        let facts = AuthContext::with_subject("verified")
+            .with_verification_cancellation(first.clone())
+            .with_verification_cancellation(second);
+        let sibling = facts.clone();
+        drop(facts.clone());
+        assert!(facts.verification_is_current());
+        assert!(sibling.verification_is_current());
+        assert!(first.cancel());
+        assert!(facts.verification_is_revoked());
+        assert!(!sibling.verification_is_current());
+        assert!(
+            !sibling
+                .with_verification_cancellation(crate::McpRequestCancellation::new())
+                .verification_is_current(),
+            "another policy cannot replace the revoked first constraint"
+        );
+
+        let mut bounded = AuthContext::with_subject("verified");
+        for _ in 0..super::MAX_VERIFICATION_CANCELLATIONS {
+            bounded = bounded.with_verification_cancellation(crate::McpRequestCancellation::new());
+        }
+        assert!(bounded.verification_is_current());
+        let exhausted =
+            bounded.with_verification_cancellation(crate::McpRequestCancellation::new());
+        assert!(exhausted.verification_is_revoked());
+        assert!(!exhausted.clone().verification_is_current());
+    }
+
+    #[test]
+    fn auth_verification_policy_cannot_bypass_expiry_or_be_serialized() {
+        let cancellation = crate::McpRequestCancellation::new();
+        let facts = AuthContext::with_subject("verified")
+            .with_verification_cancellation(cancellation.clone());
+        assert_eq!(
+            serde_json::to_value(&facts).unwrap(),
+            serde_json::json!({"subject":"verified"})
+        );
+        let expired = facts
+            .clone()
+            .with_verification_valid_until(std::time::Instant::now());
+        assert!(!expired.verification_is_current());
+        assert!(
+            !expired.verification_is_revoked(),
+            "expiry and policy retirement are distinct"
+        );
+        assert!(facts.verification_is_current());
+        assert!(cancellation.begin_finalization());
+        assert!(
+            facts.verification_is_revoked(),
+            "finalization must not freeze a live grant forever"
+        );
+
+        let injected: AuthContext = serde_json::from_value(serde_json::json!({
+            "subject":"verified", "verification_cancellations":[{}], "verification_retired":true
+        }))
+        .unwrap();
+        assert!(
+            injected
+                .verification_cancellations
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(!injected.verification_retired);
+        assert_eq!(
+            serde_json::to_value(&injected).unwrap(),
+            serde_json::json!({"subject":"verified"})
+        );
+    }
+
+    #[test]
     fn auth_context_full_serialization_roundtrip() {
         let owner = Sha256Digest::from_bytes([0xA5; 32]);
         let ctx = AuthContext {
@@ -544,6 +623,7 @@ mod tests {
             claims: Some(serde_json::json!({"aud": "api"})),
             session_owner: None,
             verification_valid_until: None,
+            ..AuthContext::default()
         }
         .with_session_owner(owner);
         let json = serde_json::to_value(&ctx).expect("serialize");
@@ -586,6 +666,7 @@ mod tests {
             claims: None,
             session_owner: None,
             verification_valid_until: None,
+            ..AuthContext::default()
         };
 
         let debug = format!("{ctx:?}");
@@ -655,6 +736,14 @@ pub struct AuthContext {
     /// freshness custody, not a serializable grant or an identity component.
     #[serde(skip)]
     verification_valid_until: Option<std::time::Instant>,
+    /// Live local policy constraints. These are never serialized or included
+    /// in the authenticated identity/cache partition.
+    #[serde(skip)]
+    verification_cancellations: [Option<McpRequestCancellation>; MAX_VERIFICATION_CANCELLATIONS],
+    #[serde(skip)]
+    verification_retired: bool,
+    #[serde(skip)]
+    verification_process: Option<ProcessBoundToken>,
 }
 
 impl fmt::Debug for AuthContext {
@@ -667,6 +756,10 @@ impl fmt::Debug for AuthContext {
             .field(
                 "has_verification_deadline",
                 &self.verification_valid_until.is_some(),
+            )
+            .field(
+                "verification_policy_count",
+                &self.verification_cancellations.iter().flatten().count(),
             )
             .finish()
     }
@@ -726,5 +819,66 @@ impl AuthContext {
     #[must_use]
     pub fn verification_valid_until(&self) -> Option<std::time::Instant> {
         self.verification_valid_until
+    }
+
+    /// Binds this verified decision to a live, independently owned policy.
+    ///
+    /// Cancelling or finalizing the supplied domain invalidates every clone of
+    /// these facts. Dropping an ordinary facts clone does not revoke siblings.
+    /// The provider must cancel its domain when its policy is revoked, replaced,
+    /// or destroyed. This does not cancel the application's ambient context or
+    /// preempt already-running application code; consumers check before their
+    /// next guarded operation or delivery.
+    ///
+    /// Repeated calls add constraints and can never replace an earlier one.
+    /// At most eight independent domains are retained; attempting to attach a
+    /// ninth permanently retires the verdict without allocating another slot.
+    /// The domain is bound to this process generation; unavailable process
+    /// protection also retires it. Serialization omits this custody and cannot
+    /// restore it. Live-memory clone safety still requires external protection.
+    #[must_use]
+    pub fn with_verification_cancellation(mut self, cancellation: McpRequestCancellation) -> Self {
+        if self.verification_process.is_none() {
+            match ProcessGenerationGuard::install() {
+                Ok(guard) => self.verification_process = Some(guard.token()),
+                Err(_) => self.verification_retired = true,
+            }
+        }
+        if let Some(slot) = self
+            .verification_cancellations
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        {
+            *slot = Some(cancellation);
+        } else {
+            self.verification_retired = true;
+        }
+        self
+    }
+
+    /// Whether a live policy has irreversibly retired this provider verdict.
+    /// A time-only expiry is separate so a transport can still perform its
+    /// explicitly configured periodic revalidation, but revocation is final.
+    #[must_use]
+    pub fn verification_is_revoked(&self) -> bool {
+        self.verification_retired
+            || self
+                .verification_process
+                .is_some_and(|process| process.verify().is_err())
+            || self
+                .verification_cancellations
+                .iter()
+                .flatten()
+                .any(McpRequestCancellation::is_terminal)
+    }
+
+    /// Checks both the original freshness ceiling and every live policy owner.
+    /// This is a bounded, local observation and performs no provider callbacks.
+    #[must_use]
+    pub fn verification_is_current(&self) -> bool {
+        !self.verification_is_revoked()
+            && self
+                .verification_valid_until
+                .is_none_or(|deadline| std::time::Instant::now() < deadline)
     }
 }

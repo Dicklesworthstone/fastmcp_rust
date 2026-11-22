@@ -361,8 +361,17 @@ scenarios, including every input-required one, so a measurement taken without
 - **Authentication admission is incomplete:** native HTTP accepts credentials
   only from `Authorization`; recognized body/meta and query credential fields
   are rejected before the provider or application runs. Other adapters retain
-  a stripped legacy JSON-RPC credential fallback. Complete authorization,
-  lease/revocation, and OAuth challenge qualification remain open.
+  a stripped legacy JSON-RPC credential fallback. Providers can attach bounded,
+  clone-shared live policy constraints with
+  `AuthContext::with_verification_cancellation`. Revoking a constraint denies
+  queued authentication receipts, the next guarded request or Task operation,
+  and retained SSE delivery, including revocation during an asynchronous
+  revalidation. `ManagedJwtResourceVerifier` retires previously returned facts
+  on successful key replacement or explicit trust revocation. Facts keep their
+  original expiry and identity; policy constraints do not become cache keys,
+  serialize as authority, or cancel sibling requests. Already-running
+  application code is not preempted. Complete authorization and OAuth challenge
+  qualification remain open.
 - **Legacy Tasks RPC stays dead:** `tasks/list` and `tasks/submit` return
   JSON-RPC `MethodNotFound`. Official MCP 2026-07-28 methods `tasks/get`,
   `tasks/update`, and `tasks/cancel` are served by default (process-local

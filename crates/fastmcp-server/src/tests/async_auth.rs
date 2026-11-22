@@ -43,6 +43,7 @@ struct Provider {
     polls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
     valid_until: Option<Instant>,
+    verification_cancellation: Option<fastmcp_core::McpRequestCancellation>,
 }
 
 impl Provider {
@@ -53,6 +54,7 @@ impl Provider {
             polls: Arc::new(AtomicUsize::new(0)),
             drops: Arc::new(AtomicUsize::new(0)),
             valid_until: None,
+            verification_cancellation: None,
         }
     }
 }
@@ -125,6 +127,9 @@ impl Future for ProviderFuture<'_> {
         facts.scopes = vec!["read".to_owned()];
         if let Some(deadline) = this.provider.valid_until {
             facts = facts.with_verification_valid_until(deadline);
+        }
+        if let Some(cancellation) = &this.provider.verification_cancellation {
+            facts = facts.with_verification_cancellation(cancellation.clone());
         }
         if matches!(this.provider.behavior, Behavior::ExpiredReady) {
             facts = facts.with_verification_valid_until(Instant::now());
@@ -525,6 +530,55 @@ fn native_async_auth_receipt_expiry_prevents_commit_without_mutating_context() {
         assert_eq!(serde_json::to_vec(&refused).unwrap(), before);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn native_auth_policy_revocation_invalidates_queued_receipts_and_committed_facts() {
+    run(|cx| async move {
+        let cancellation = fastmcp_core::McpRequestCancellation::new();
+        let mut provider = Provider::new(Behavior::YieldSuccess);
+        provider.verification_cancellation = Some(cancellation.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = server(provider.clone(), &calls);
+        let request = rpc();
+        let receipt = server
+            .preauthenticate_http_request_async(&cx, &request, &authorization())
+            .await
+            .unwrap();
+        let inbound = InboundRequestContext::new(cx.clone(), 7, InboundRequestTransport::Http);
+        let (fresh, _fresh_lease) = McpContext::new(cx.clone(), 7)
+            .begin_request_scope()
+            .unwrap();
+        receipt
+            .commit(&fresh, &inbound, &mut request.clone())
+            .unwrap();
+        assert!(Server::enforce_request_context(&fresh).is_ok());
+        assert!(cancellation.cancel());
+        assert_eq!(
+            Server::enforce_request_context(&fresh).unwrap_err().code,
+            McpErrorCode::ResourceForbidden
+        );
+        let (queued, _queued_lease) = McpContext::new(cx.clone(), 7)
+            .begin_request_scope()
+            .unwrap();
+        let mut refused = request.clone();
+        let before = serde_json::to_vec(&refused).unwrap();
+        assert_eq!(
+            receipt
+                .commit(&queued, &inbound, &mut refused)
+                .unwrap_err()
+                .code,
+            McpErrorCode::ResourceForbidden
+        );
+        assert!(queued.auth().is_none());
+        assert_eq!(serde_json::to_vec(&refused).unwrap(), before);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            cx.checkpoint().is_ok(),
+            "policy revocation leaves the caller and sibling requests live"
+        );
     });
 }
 
@@ -959,6 +1013,169 @@ mod introspection {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert!(cx.checkpoint().is_ok());
             assert_sanitized(&recovered);
+        });
+    }
+}
+
+mod live_policy_delivery {
+    use super::*;
+    use crate::{Middleware, MiddlewareDecision};
+    use fastmcp_core::McpRequestCancellation;
+
+    const GUARDED_OUTPUT: &str = "live-policy-guarded-output-canary";
+
+    struct PolicyTool {
+        calls: Arc<AtomicUsize>,
+        revoke: Option<McpRequestCancellation>,
+    }
+
+    impl ToolHandler for PolicyTool {
+        fn definition(&self) -> Tool {
+            AuthenticatedTool(Arc::clone(&self.calls)).definition()
+        }
+
+        fn call(&self, context: &McpContext, _: Value) -> McpResult<Vec<Content>> {
+            context.checkpoint()?;
+            let facts = context.auth().expect("HTTP admission committed its facts");
+            assert_eq!(facts.subject.as_deref(), Some("async-owner"));
+            assert!(facts.verification_is_current());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(cancellation) = &self.revoke {
+                assert!(cancellation.cancel());
+            }
+            // The extension deliberately returns success after the policy
+            // change. Dispatch owns the final authorization boundary.
+            Ok(vec![Content::text(GUARDED_OUTPUT)])
+        }
+    }
+
+    struct ResponseObserver(Arc<AtomicUsize>);
+
+    impl Middleware for ResponseObserver {
+        fn on_response(
+            &self,
+            _: &McpContext,
+            _: &JsonRpcRequest,
+            response: Value,
+        ) -> McpResult<Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(response)
+        }
+    }
+
+    struct PolicyCache {
+        calls: Arc<AtomicUsize>,
+        revoke: Option<McpRequestCancellation>,
+    }
+
+    impl Middleware for PolicyCache {
+        fn on_request(
+            &self,
+            context: &McpContext,
+            _: &JsonRpcRequest,
+        ) -> McpResult<MiddlewareDecision> {
+            assert!(context.auth().unwrap().verification_is_current());
+            assert!(context.mark_response_cache_hit(1));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(cancellation) = &self.revoke {
+                assert!(cancellation.cancel());
+            }
+            Ok(MiddlewareDecision::Respond(json!({
+                "resultType": "complete",
+                "content": [{"type": "text", "text": GUARDED_OUTPUT}],
+            })))
+        }
+    }
+
+    fn assert_delivery(response: &HttpResponse, revoked: bool) {
+        let rpc: JsonRpcResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(rpc.id, Some(RequestId::Number(7)));
+        if revoked {
+            assert_eq!(
+                rpc.error.map(|error| error.code),
+                Some(i32::from(McpErrorCode::ResourceForbidden).into())
+            );
+            assert!(rpc.result.is_none());
+            assert!(!String::from_utf8_lossy(&response.body).contains(GUARDED_OUTPUT));
+        } else {
+            assert_eq!(response.status, HttpStatus::OK);
+            assert!(rpc.error.is_none());
+            let result = rpc.result.unwrap();
+            assert_eq!(result["resultType"], "complete");
+            assert_eq!(result["content"][0]["text"], GUARDED_OUTPUT);
+        }
+        assert_sanitized(response);
+    }
+
+    #[test]
+    fn native_http_handler_policy_revocation_fences_success_before_response_middleware() {
+        run(|cx| async move {
+            for revoked in [false, true] {
+                let cancellation = McpRequestCancellation::new();
+                let mut provider = Provider::new(Behavior::YieldSuccess);
+                provider.verification_cancellation = Some(cancellation.clone());
+                let handler_calls = Arc::new(AtomicUsize::new(0));
+                let response_calls = Arc::new(AtomicUsize::new(0));
+                let endpoint = endpoint(
+                    Server::new("native-handler-policy-revocation", "1")
+                        .protocol_policy(ProtocolPolicy::ModernOnly)
+                        .unwrap()
+                        .request_timeout(0)
+                        .auth_provider(provider.clone())
+                        .tool(PolicyTool {
+                            calls: Arc::clone(&handler_calls),
+                            revoke: revoked.then_some(cancellation),
+                        })
+                        .middleware(ResponseObserver(Arc::clone(&response_calls)))
+                        .build(),
+                );
+
+                let response = call(&cx, &endpoint, request()).await;
+                assert_delivery(&response, revoked);
+                assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(response_calls.load(Ordering::SeqCst), usize::from(!revoked));
+                assert!(cx.checkpoint().is_ok());
+            }
+        });
+    }
+
+    #[test]
+    fn native_http_cache_hit_cannot_deliver_after_its_policy_lease_is_revoked() {
+        run(|cx| async move {
+            for revoked in [false, true] {
+                let cancellation = McpRequestCancellation::new();
+                let mut provider = Provider::new(Behavior::YieldSuccess);
+                provider.verification_cancellation = Some(cancellation.clone());
+                let handler_calls = Arc::new(AtomicUsize::new(0));
+                let cache_calls = Arc::new(AtomicUsize::new(0));
+                let response_calls = Arc::new(AtomicUsize::new(0));
+                let endpoint = endpoint(
+                    Server::new("native-cache-policy-revocation", "1")
+                        .protocol_policy(ProtocolPolicy::ModernOnly)
+                        .unwrap()
+                        .request_timeout(0)
+                        .auth_provider(provider.clone())
+                        .tool(PolicyTool {
+                            calls: Arc::clone(&handler_calls),
+                            revoke: None,
+                        })
+                        .middleware(ResponseObserver(Arc::clone(&response_calls)))
+                        .middleware(PolicyCache {
+                            calls: Arc::clone(&cache_calls),
+                            revoke: revoked.then_some(cancellation),
+                        })
+                        .build(),
+                );
+
+                let response = call(&cx, &endpoint, request()).await;
+                assert_delivery(&response, revoked);
+                assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(cache_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(response_calls.load(Ordering::SeqCst), usize::from(!revoked));
+                assert!(cx.checkpoint().is_ok());
+            }
         });
     }
 }

@@ -187,6 +187,14 @@ impl SseAuthorizationLease {
             self.close();
             return Err(error);
         }
+        if self
+            .facts
+            .as_ref()
+            .is_some_and(AuthContext::verification_is_revoked)
+        {
+            self.close();
+            return Err(SseAuthorizationError::Rejected);
+        }
         Ok(cx.now() < self.next_check && Instant::now() < self.wall_expiry)
     }
 
@@ -348,6 +356,15 @@ impl SseAuthorizationLease {
             check.started.elapsed(),
             self.config.check_timeout,
         )?;
+        // Revocation may win while the provider is awaiting I/O. A fresh
+        // same-identity verdict cannot revive this stream's retired owner.
+        if self
+            .facts
+            .as_ref()
+            .is_some_and(AuthContext::verification_is_revoked)
+        {
+            return Err(SseAuthorizationError::Rejected);
+        }
         let (principal, facts) = facts?;
         if principal != self.principal || !same_facts(self.facts.as_ref(), facts.as_ref()) {
             return Err(SseAuthorizationError::FactsChanged);
@@ -417,6 +434,9 @@ fn verification_expiry(
     interval: Duration,
     facts: Option<&AuthContext>,
 ) -> Result<Instant, SseAuthorizationError> {
+    if facts.is_some_and(|facts| !facts.verification_is_current()) {
+        return Err(SseAuthorizationError::Rejected);
+    }
     let interval_end = started
         .checked_add(interval)
         .ok_or(SseAuthorizationError::InvalidPolicy)?;
@@ -873,6 +893,103 @@ mod tests {
                 ),
                 Err(SseAuthorizationError::Rejected)
             ));
+        });
+    }
+
+    #[test]
+    fn revoked_policy_closes_cached_sse_before_provider_or_queued_output() {
+        with_virtual_clock(|runtime| {
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let (provider, mut lease) = async_fixture(&cx);
+            let cancellation = fastmcp_core::McpRequestCancellation::new();
+            let facts = provider
+                .inner
+                .facts
+                .lock()
+                .unwrap()
+                .clone()
+                .with_verification_cancellation(cancellation.clone());
+            *provider.inner.facts.lock().unwrap() = facts;
+            due(&mut lease, &cx);
+            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut check = Box::pin(lease.check_async(&cx));
+            assert_eq!(check.as_mut().poll(&mut task), Poll::Ready(Ok(())));
+            drop(check);
+            assert_eq!(lease.check_cached(&cx), Ok(true));
+            let before = provider.created.load(Ordering::SeqCst);
+            assert!(cancellation.cancel());
+            let polls = std::cell::Cell::new(0);
+            let mut authorization = Some(lease);
+            let mut guarded = Box::pin(super::super::guard_response(
+                &cx,
+                &mut authorization,
+                poll_fn(|_| {
+                    polls.set(polls.get() + 1);
+                    Poll::Ready(17)
+                }),
+            ));
+            assert_eq!(
+                guarded.as_mut().poll(&mut task),
+                Poll::Ready(Err(super::super::SecuredHttpEndpointError::Revalidation(
+                    SseAuthorizationError::Rejected
+                )))
+            );
+            drop(guarded);
+            assert_eq!(polls.get(), 0);
+            assert_eq!(provider.created.load(Ordering::SeqCst), before);
+            assert_eq!(
+                authorization.as_mut().unwrap().check_cached(&cx),
+                Err(SseAuthorizationError::Closed)
+            );
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn policy_revoked_during_sse_revalidation_cannot_be_replaced_by_same_identity() {
+        with_virtual_clock(|runtime| {
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let (provider, mut lease) = async_fixture(&cx);
+            let original = provider.inner.facts.lock().unwrap().clone();
+            let cancellation = fastmcp_core::McpRequestCancellation::new();
+            *provider.inner.facts.lock().unwrap() = original
+                .clone()
+                .with_verification_cancellation(cancellation.clone());
+            due(&mut lease, &cx);
+            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut opening = Box::pin(lease.check_async(&cx));
+            assert_eq!(opening.as_mut().poll(&mut task), Poll::Ready(Ok(())));
+            drop(opening);
+            due(&mut lease, &cx);
+            provider.pending.store(true, Ordering::SeqCst);
+            let polls = std::cell::Cell::new(0);
+            let mut authorization = Some(lease);
+            let mut guarded = Box::pin(super::super::guard_response(
+                &cx,
+                &mut authorization,
+                poll_fn(|_| {
+                    polls.set(polls.get() + 1);
+                    Poll::Ready(17)
+                }),
+            ));
+            assert!(guarded.as_mut().poll(&mut task).is_pending());
+            assert!(cancellation.cancel());
+            *provider.inner.facts.lock().unwrap() = original
+                .with_verification_cancellation(fastmcp_core::McpRequestCancellation::new());
+            provider.pending.store(false, Ordering::SeqCst);
+            assert_eq!(
+                guarded.as_mut().poll(&mut task),
+                Poll::Ready(Err(super::super::SecuredHttpEndpointError::Revalidation(
+                    SseAuthorizationError::Rejected
+                )))
+            );
+            drop(guarded);
+            assert_eq!(polls.get(), 0);
+            assert_eq!(
+                authorization.as_mut().unwrap().check_cached(&cx),
+                Err(SseAuthorizationError::Closed)
+            );
+            assert!(authorization.as_ref().unwrap().facts.is_none());
         });
     }
 

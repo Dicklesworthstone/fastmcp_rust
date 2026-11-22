@@ -532,10 +532,7 @@ impl IntrospectionVerifier {
         {
             return Err(IntrospectionError::PolicyChanged);
         }
-        if facts
-            .verification_valid_until()
-            .is_none_or(|expiry| Instant::now() >= expiry)
-        {
+        if facts.verification_valid_until().is_none() || !facts.verification_is_current() {
             return Err(IntrospectionError::InvalidClaims);
         }
         Ok(facts)
