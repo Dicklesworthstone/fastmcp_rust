@@ -682,6 +682,13 @@ enum Commands {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         max_pages: u32,
 
+        /// Total HTTP connection and catalog acquisition budget in seconds (1-900).
+        /// Includes TCP/TLS setup and every page; no partial report is published
+        /// on expiry. Applies only to explicit HTTP endpoints.
+        #[arg(long, default_value_t = 120, conflicts_with = "server",
+            value_parser = clap::value_parser!(u64).range(1..=900))]
+        timeout: u64,
+
         /// Protocol-policy selection for the client connection.
         #[arg(long, value_enum, default_value_t = CliProtocolPolicy::default())]
         protocol_policy: CliProtocolPolicy,
@@ -1483,6 +1490,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             format,
             output,
             max_pages,
+            timeout,
             protocol_policy,
         } => match server.as_deref() {
             Some(server) => {
@@ -1519,6 +1527,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                     protocol_policy,
                     bearer_token_file.as_deref(),
                     max_pages,
+                    timeout,
                 ))
                 .await
             }
@@ -9093,6 +9102,7 @@ fn parse_http_inspect_endpoint(
 
 /// Inspects an explicit, policy-bound HTTP endpoint bundle through the
 /// shipped dual-era client.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_inspect_http(
     cx: &Cx,
     protocol_plan: ClientProtocolPlan,
@@ -9101,34 +9111,60 @@ async fn cmd_inspect_http(
     protocol_policy: CliProtocolPolicy,
     bearer_token_file: Option<&Path>,
     max_pages: u32,
+    timeout_secs: u64,
 ) -> McpResult<()> {
     validate_cli_protocol_policy(protocol_policy)?;
-    let mut client = Box::pin(
-        http_client_builder(protocol_plan, bearer_token_file)?.connect_http_client_with_cx(cx),
-    )
-    .await
-    .map_err(|error| {
-        fastmcp_core::McpError::internal_error(format!(
-            "inspect could not connect to the configured HTTP endpoint bundle: {error}"
-        ))
-    })?;
-
-    let negotiated_version = client.connection().protocol_version().ok_or_else(|| {
-        fastmcp_core::McpError::internal_error(
-            "HTTP inspect completed without a negotiated protocol version",
+    let inspection = async {
+        let mut client = Box::pin(
+            http_client_builder(protocol_plan, bearer_token_file)?.connect_http_client_with_cx(cx),
         )
-    })?;
-    let protocol_status = InspectProtocolStatus::new(protocol_policy, negotiated_version)?;
-    let server_info =
-        InspectIdentity::from_discovery(client.server_info(), client.server_discovery().as_ref());
-    let capabilities = http_inspect_capabilities(&client)?;
-    let (acquisition_truncated, tools, resources, resource_templates, prompts) = inspect_catalogs(
-        cx,
-        &mut InspectClient::Http(&mut client),
-        &capabilities,
-        max_pages,
-    )
-    .await?;
+        .await
+        .map_err(|error| {
+            fastmcp_core::McpError::internal_error(format!(
+                "inspect could not connect to the configured HTTP endpoint bundle: {error}"
+            ))
+        })?;
+
+        let negotiated_version = client.connection().protocol_version().ok_or_else(|| {
+            fastmcp_core::McpError::internal_error(
+                "HTTP inspect completed without a negotiated protocol version",
+            )
+        })?;
+        let protocol_status = InspectProtocolStatus::new(protocol_policy, negotiated_version)?;
+        let server_info = InspectIdentity::from_discovery(
+            client.server_info(),
+            client.server_discovery().as_ref(),
+        );
+        let capabilities = http_inspect_capabilities(&client)?;
+        let (acquisition_truncated, tools, resources, resource_templates, prompts) =
+            inspect_catalogs(
+                cx,
+                &mut InspectClient::Http(&mut client),
+                &capabilities,
+                max_pages,
+            )
+            .await?;
+        Ok((
+            server_info,
+            capabilities,
+            tools,
+            resources,
+            resource_templates,
+            prompts,
+            acquisition_truncated,
+            protocol_status,
+        ))
+    };
+    let (
+        server_info,
+        capabilities,
+        tools,
+        resources,
+        resource_templates,
+        prompts,
+        acquisition_truncated,
+        protocol_status,
+    ) = Box::pin(bounded_http_inspect(cx, timeout_secs, inspection)).await?;
 
     write_inspect_report(
         server_info.as_ref(),
@@ -9141,6 +9177,89 @@ async fn cmd_inspect_http(
         protocol_status,
         format,
         output,
+    )
+}
+
+/// One timeout owns connection setup and the entire catalog acquisition. Native
+/// response timers start after commitment and cannot bound TCP/TLS setup. Keep
+/// this owner outside the page loop so a successful page never refreshes it.
+async fn bounded_http_inspect<T>(
+    cx: &Cx,
+    timeout_secs: u64,
+    operation: impl std::future::Future<Output = McpResult<T>>,
+) -> McpResult<T> {
+    use std::future::Future as _;
+    use std::task::Poll;
+
+    fastmcp_core::runtime::CallerContextFuture::new(cx, async {
+        if !(1..=900).contains(&timeout_secs) {
+            return Err(fastmcp_core::McpError::invalid_params(
+                "HTTP inspect timeout must be between 1 and 900 seconds",
+            ));
+        }
+        let caller = inspect_http_caller()?;
+        let deadline = caller
+            .now()
+            .as_nanos()
+            .checked_add(timeout_secs * 1_000_000_000)
+            .map(asupersync::types::Time::from_nanos)
+            .ok_or_else(inspect_http_timeout_error)?;
+        let deadline = caller
+            .budget()
+            .deadline
+            .map_or(deadline, |caller_deadline| caller_deadline.min(deadline));
+        let mut bounded = Box::pin(asupersync::time::timeout_at(deadline, Box::pin(operation)));
+        // Register cancellation independently of transport readiness, including
+        // setup futures that have not yet registered a socket or response wait.
+        let (_cancellation_guard, mut cancellation_signal) =
+            asupersync::channel::oneshot::channel::<()>();
+        let mut cancelled = std::pin::pin!(cancellation_signal.recv(&caller));
+        std::future::poll_fn(|task_cx| {
+            let check = || {
+                let caller = inspect_http_caller()?;
+                if caller.now() >= deadline {
+                    return Err(inspect_http_timeout_error());
+                }
+                Ok(())
+            };
+            if let Err(error) = check() {
+                return Poll::Ready(Err(error));
+            }
+            if cancelled.as_mut().poll(task_cx).is_ready() {
+                return Poll::Ready(Err(fastmcp_core::McpError::request_cancelled()));
+            }
+            match bounded.as_mut().poll(task_cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => Poll::Ready(
+                    check().and_then(|()| result.map_err(|_| inspect_http_timeout_error())?),
+                ),
+            }
+        })
+        .await
+    })
+    .await
+}
+
+/// CallerContextFuture installs the explicit caller on every poll and drop,
+/// retaining restrictions from narrower hosts instead of borrowing authority.
+fn inspect_http_caller() -> McpResult<Cx> {
+    let caller = Cx::current().ok_or_else(|| {
+        fastmcp_core::McpError::internal_error("HTTP inspect requires its caller context")
+    })?;
+    caller
+        .checkpoint()
+        .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+    if !caller.capabilities().time || caller.timer_driver().is_none() {
+        return Err(fastmcp_core::McpError::internal_error(
+            "HTTP inspect requires the caller's TIME capability and timer driver",
+        ));
+    }
+    Ok(caller)
+}
+
+fn inspect_http_timeout_error() -> fastmcp_core::McpError {
+    fastmcp_core::McpError::internal_error(
+        "HTTP inspect reached --timeout before catalog acquisition completed; no report was published",
     )
 }
 
@@ -15620,6 +15739,148 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn inspect_http_budget_preserves_caller_ceiling_on_poll_and_drop() {
+        use asupersync::cx::{CapSet, CapSetRuntimeMask};
+        use std::cell::Cell;
+        use std::future::{Future, poll_fn};
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        struct ObserveDrop(Rc<Cell<Option<bool>>>);
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.0
+                    .set(Cx::current().map(|caller| caller.capabilities().time));
+            }
+        }
+
+        for denied_after_pending in [None, Some(false), Some(true)] {
+            let runtime = build_cli_runtime().expect("CLI runtime");
+            runtime.block_on(async {
+                let caller = Cx::current().expect("caller");
+                let expected_task = caller.task_id();
+                let polls = Rc::new(Cell::new(0));
+                let observed_polls = Rc::clone(&polls);
+                let dropped = Rc::new(Cell::new(None));
+                let probe = ObserveDrop(Rc::clone(&dropped));
+                let operation = poll_fn(move |_| {
+                    let _retain_probe = &probe;
+                    assert_eq!(Cx::current().unwrap().task_id(), expected_task);
+                    observed_polls.set(observed_polls.get() + 1);
+                    if denied_after_pending == Some(true) {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(17))
+                    }
+                });
+                let mut bounded = Box::pin(bounded_http_inspect(&caller, 120, operation));
+                let mut task = Context::from_waker(Waker::noop());
+                if denied_after_pending == Some(true) {
+                    assert!(bounded.as_mut().poll(&mut task).is_pending());
+                    assert_eq!(polls.get(), 1);
+                }
+                let restriction = denied_after_pending
+                    .map(|_| Cx::push_restriction(<CapSet<true, false, true, true, true>>::MASK));
+                let result = bounded.as_mut().poll(&mut task);
+                match denied_after_pending {
+                    None => {
+                        assert!(matches!(result, Poll::Ready(Ok(17))));
+                        assert_eq!(polls.get(), 1);
+                    }
+                    Some(after_pending) => {
+                        let Poll::Ready(Err(error)) = result else {
+                            panic!("TIME denial must precede another operation poll");
+                        };
+                        assert!(error.message.contains("TIME capability"));
+                        assert_eq!(polls.get(), usize::from(after_pending));
+                    }
+                }
+                drop(bounded);
+                // The captured operation owns the probe, so destruction must
+                // occur within the same retained caller ceiling as polling.
+                assert_eq!(dropped.get(), Some(denied_after_pending.is_none()));
+                drop(restriction);
+                assert!(Cx::current().unwrap().capabilities().time);
+            });
+        }
+    }
+
+    #[test]
+    fn inspect_http_budget_cancellation_wakes_silent_work_and_precedes_ready_work() {
+        use std::future::{Future, poll_fn};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for pre_cancelled in [false, true] {
+            let runtime = build_cli_runtime().expect("CLI runtime");
+            runtime.block_on(async {
+                let caller = Cx::current().expect("caller");
+                caller.set_cancel_requested(pre_cancelled);
+                let polls = std::cell::Cell::new(0);
+                let operation = poll_fn(|_| {
+                    polls.set(polls.get() + 1);
+                    if pre_cancelled {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Pending
+                    }
+                });
+                let mut bounded = Box::pin(bounded_http_inspect(&caller, 120, operation));
+                let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake_count));
+                let mut task = Context::from_waker(&waker);
+                if !pre_cancelled {
+                    assert!(bounded.as_mut().poll(&mut task).is_pending());
+                    let before_cancel = wake_count.0.load(Ordering::SeqCst);
+                    caller.set_cancel_requested(true);
+                    assert!(wake_count.0.load(Ordering::SeqCst) > before_cancel);
+                }
+                let Poll::Ready(Err(error)) = bounded.as_mut().poll(&mut task) else {
+                    panic!("cancellation must retire the operation immediately");
+                };
+                assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
+                assert_eq!(polls.get(), usize::from(!pre_cancelled));
+            });
+        }
+    }
+
+    #[test]
+    fn inspect_http_budget_arms_the_earlier_original_caller_deadline() {
+        let runtime = build_cli_runtime().expect("CLI runtime");
+        runtime.block_on(async {
+            let host = Cx::current().expect("host");
+            let deadline = asupersync::types::Time::from_nanos(host.now().as_nanos() + 50_000_000);
+            let caller =
+                runtime.request_cx_with_budget(asupersync::Budget::new().with_deadline(deadline));
+            let result = asupersync::time::timeout(
+                host.now(),
+                std::time::Duration::from_millis(500),
+                Box::pin(bounded_http_inspect(
+                    &caller,
+                    120,
+                    std::future::pending::<McpResult<()>>(),
+                )),
+            )
+            .await
+            .expect("the original caller deadline must wake a silent operation");
+            let error = result.expect_err("caller deadline must retire inspection");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
+            assert!(!error.message.contains("--timeout"));
+        });
+    }
+
+    #[test]
     fn operation_timeout_policy_accepts_the_published_range_without_extending_progress() {
         for seconds in [1, 300, 301, 900] {
             let duration = std::time::Duration::from_secs(seconds);
@@ -17110,6 +17371,45 @@ IFS= read -r end
                         .is_err()
                 );
             }
+        }
+
+        #[test]
+        fn inspect_http_timeout_cli_bounds_and_stdio_default() {
+            let cli = Cli::try_parse_from(["fastmcp", "inspect", "./server"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Inspect { timeout: 120, .. }
+            ));
+            for (value, expected) in [("1", 1), ("900", 900)] {
+                let cli = Cli::try_parse_from([
+                    "fastmcp",
+                    "inspect",
+                    "--http-url",
+                    "http://127.0.0.1/mcp",
+                    "--timeout",
+                    value,
+                ])
+                .unwrap();
+                assert!(
+                    matches!(cli.command, Commands::Inspect { timeout, .. } if timeout == expected)
+                );
+            }
+            for value in ["0", "901", "-1"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "fastmcp",
+                        "inspect",
+                        "--http-url",
+                        "http://127.0.0.1/mcp",
+                        "--timeout",
+                        value,
+                    ])
+                    .is_err()
+                );
+            }
+            assert!(
+                Cli::try_parse_from(["fastmcp", "inspect", "--timeout", "1", "./server",]).is_err()
+            );
         }
 
         #[test]

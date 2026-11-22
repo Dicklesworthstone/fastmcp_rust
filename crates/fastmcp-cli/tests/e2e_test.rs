@@ -3693,6 +3693,395 @@ fn e2e_cli_test_http_timeout_reports_source_and_retires_the_exchange() {
 }
 
 #[test]
+fn e2e_cli_inspect_http_timeout_bounds_discovery_and_later_pages() {
+    for withheld_response in [None, Some(0), Some(2)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let retired_response = Arc::new(AtomicUsize::new(0));
+        let fixture = spawn_http_inspect_deadline_fixture(
+            listener,
+            [Duration::ZERO; 3],
+            withheld_response,
+            Arc::clone(&retired_response),
+        );
+        let output = run_cli(&[
+            "inspect",
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "modern-only",
+            "--timeout",
+            "1",
+            "--max-pages",
+            "2",
+            "--format",
+            "json",
+        ]);
+        wait_for_loopback_fixture(fixture, "HTTP inspect deadline");
+        if let Some(response) = withheld_response {
+            assert_http_inspect_timeout(&output);
+            assert_eq!(retired_response.load(Ordering::SeqCst), response + 1);
+        } else {
+            assert_http_inspect_complete_catalog(&output);
+            assert_eq!(retired_response.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[test]
+fn e2e_cli_inspect_http_timeout_does_not_refresh_after_successful_pages() {
+    // Every response takes less than a one-second per-request timeout. The
+    // same complete exchange needs more than one second in total, so only
+    // the two-second command budget admits it.
+    for timeout in ["2", "1"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let retired_response = Arc::new(AtomicUsize::new(0));
+        let fixture = spawn_http_inspect_deadline_fixture(
+            listener,
+            [
+                Duration::from_millis(200),
+                Duration::from_millis(300),
+                Duration::from_millis(800),
+            ],
+            None,
+            Arc::clone(&retired_response),
+        );
+        let output = run_cli(&[
+            "inspect",
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "modern-only",
+            "--timeout",
+            timeout,
+            "--max-pages",
+            "2",
+            "--format",
+            "json",
+        ]);
+        wait_for_loopback_fixture(fixture, "HTTP inspect cumulative deadline");
+        if timeout == "2" {
+            assert_http_inspect_complete_catalog(&output);
+            assert_eq!(retired_response.load(Ordering::SeqCst), 0);
+        } else {
+            assert_http_inspect_timeout(&output);
+            assert_eq!(
+                retired_response.load(Ordering::SeqCst),
+                3,
+                "the final page must be abandoned under the original budget"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_inspect_http_timeout_preserves_output_and_never_downgrades_auto() {
+    let modern_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let modern = format!("http://{}/mcp", modern_listener.local_addr().unwrap());
+    let legacy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let legacy_address = legacy_listener.local_addr().unwrap();
+    let sse = format!("http://{legacy_address}/legacy-sse");
+    let message = format!("http://{legacy_address}/legacy-message");
+    let legacy_contacts = Arc::new(AtomicUsize::new(0));
+    let observer = spawn_forbidden_http_contact_observer(
+        legacy_listener,
+        Arc::clone(&legacy_contacts),
+        "HTTP inspect timeout legacy fallback",
+    );
+    let retired_response = Arc::new(AtomicUsize::new(0));
+    let fixture = spawn_http_inspect_deadline_fixture(
+        modern_listener,
+        [Duration::ZERO; 3],
+        Some(2),
+        Arc::clone(&retired_response),
+    );
+    let output_path = std::env::temp_dir().join(format!(
+        "fastmcp-inspect-timeout-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let sentinel = b"previous complete inspection\n";
+    let mut file = std::fs::File::create_new(&output_path).expect("create unique inspect output");
+    file.write_all(sentinel).unwrap();
+    drop(file);
+
+    let output = run_cli(&[
+        "inspect",
+        "--http-url",
+        &modern,
+        "--legacy-sse-url",
+        &sse,
+        "--legacy-message-url",
+        &message,
+        "--protocol-policy",
+        "auto",
+        "--timeout",
+        "1",
+        "--max-pages",
+        "2",
+        "--format",
+        "json",
+        "--output",
+        output_path.to_str().unwrap(),
+    ]);
+    let retained_output = std::fs::read(&output_path);
+    std::fs::remove_file(&output_path).expect("remove the test's temporary output");
+    wait_for_loopback_fixture(fixture, "Auto inspect final-page timeout");
+    stop_forbidden_http_contact_observer(observer, "HTTP inspect timeout legacy fallback");
+    assert_http_inspect_timeout(&output);
+    assert_eq!(retired_response.load(Ordering::SeqCst), 3);
+    assert_eq!(retained_output.unwrap(), sentinel);
+    assert_eq!(legacy_contacts.load(Ordering::SeqCst), 0);
+}
+
+fn expect_inspect_fixture_closed(stream: &mut TcpStream, deadline: Instant, context: &str) {
+    loop {
+        match stream.set_read_timeout(Some(fixture_wait(deadline, context))) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+            Err(error) => panic!("{context}: set inspect retirement timeout: {error}"),
+        }
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => return,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            result => panic!("{context}: expected exchange retirement, got {result:?}"),
+        }
+    }
+}
+
+fn spawn_http_inspect_deadline_fixture(
+    listener: TcpListener,
+    response_delays: [Duration; 3],
+    withheld_response: Option<usize>,
+    retired_response: Arc<AtomicUsize>,
+) -> LoopbackFixture {
+    spawn_loopback_fixture_with_deadline(
+        "HTTP inspect deadline",
+        Duration::from_secs(8),
+        move |deadline| {
+            for (index, delay) in response_delays.into_iter().enumerate() {
+                let mut stream =
+                    accept_h1_fixture_connection(&listener, deadline, "HTTP inspect request");
+                let (head, request) = read_h1_json_request(&mut stream, deadline);
+                assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
+                assert_eq!(request["id"], index + 1);
+                assert_eq!(
+                    request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                    "2026-07-28"
+                );
+                assert_eq!(
+                    request["method"],
+                    if index == 0 {
+                        "server/discover"
+                    } else {
+                        "tools/list"
+                    }
+                );
+                if index == 2 {
+                    assert_eq!(request["params"]["cursor"], "second-page");
+                } else {
+                    assert!(request["params"].get("cursor").is_none());
+                }
+                if withheld_response == Some(index) {
+                    expect_inspect_fixture_closed(&mut stream, deadline, "expired HTTP inspect");
+                    retired_response.store(index + 1, Ordering::SeqCst);
+                    return;
+                }
+
+                // Observe retirement while waiting to send the scheduled
+                // response. A per-page budget reset would keep the socket
+                // alive and receive every response, making the negative
+                // cumulative-budget control incorrectly succeed.
+                let response_at = Instant::now() + delay;
+                while Instant::now() < response_at {
+                    let wait = fixture_wait(deadline, "delay HTTP inspect response")
+                        .min(response_at.saturating_duration_since(Instant::now()));
+                    if wait.is_zero() {
+                        break;
+                    }
+                    match stream.set_read_timeout(Some(wait)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+                        Err(error) => panic!("set HTTP inspect delay timeout: {error}"),
+                    }
+                    let mut byte = [0_u8; 1];
+                    match stream.read(&mut byte) {
+                        Ok(0) => {
+                            retired_response.store(index + 1, Ordering::SeqCst);
+                            return;
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ) =>
+                        {
+                            retired_response.store(index + 1, Ordering::SeqCst);
+                            return;
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) => {}
+                        result => {
+                            panic!("pending HTTP inspect must remain open or retire: {result:?}")
+                        }
+                    }
+                }
+                let result = match index {
+                    0 => serde_json::json!({
+                        "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}}, "ttlMs": 0, "cacheScope": "private",
+                    }),
+                    1 => serde_json::json!({
+                        "resultType": "complete", "tools": [{
+                            "name": "first-tool", "inputSchema": {"type": "object"},
+                        }], "nextCursor": "second-page", "ttlMs": 0, "cacheScope": "private",
+                    }),
+                    _ => serde_json::json!({
+                        "resultType": "complete", "tools": [{
+                            "name": "second-tool", "inputSchema": {"type": "object"},
+                        }], "ttlMs": 0, "cacheScope": "private",
+                    }),
+                };
+                write_h1_json_response(
+                    &mut stream,
+                    deadline,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": result,
+                    })
+                    .to_string(),
+                );
+            }
+        },
+    )
+}
+
+fn assert_http_inspect_complete_catalog(output: &Output) {
+    assert!(output.status.success(), "{}", stderr_str(output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "fastmcp.cli.inspect/v2");
+    assert_eq!(report["protocol"]["version"], "2026-07-28");
+    assert_eq!(report["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(report["tools"][0]["name"], "first-tool");
+    assert_eq!(report["tools"][1]["name"], "second-tool");
+    assert_eq!(report["truncated"], false);
+}
+
+fn assert_http_inspect_timeout(output: &Output) {
+    assert!(!output.status.success());
+    let failure: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("timeout emits one complete error document without a partial catalog");
+    assert_eq!(failure["schema"], "fastmcp.cli.error/v2");
+    assert_eq!(failure["command"], "inspect");
+    assert_eq!(failure["success"], false);
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--timeout")
+    );
+    assert!(failure.get("tools").is_none());
+    assert!(!stdout_str(output).contains("first-tool"));
+}
+
+#[test]
+fn e2e_cli_inspect_http_timeout_retires_stalled_tls_setup() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("https://{}/mcp", listener.local_addr().unwrap());
+    let fixture = spawn_loopback_fixture_with_deadline(
+        "stalled inspect TLS handshake",
+        Duration::from_secs(8),
+        move |deadline| {
+            let mut stream =
+                accept_h1_fixture_connection(&listener, deadline, "inspect TLS handshake");
+            let mut record = [0_u8; 5];
+            let mut filled = 0;
+            while filled < record.len() {
+                let read = read_h1_fixture_chunk(
+                    &mut stream,
+                    &mut record[filled..],
+                    deadline,
+                    "read inspect TLS ClientHello",
+                );
+                assert!(read > 0, "TLS setup must start before timing out");
+                filled += read;
+            }
+            assert_eq!(record[0], 22, "client must send a TLS handshake record");
+            assert_eq!(record[1], 3);
+            // Do not send a ServerHello: native response timers have not
+            // started yet. Only the command deadline can retire this setup.
+            let mut received = record.len();
+            loop {
+                match stream
+                    .set_read_timeout(Some(fixture_wait(deadline, "await TLS setup retirement")))
+                {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+                    Err(error) => panic!("set inspect TLS retirement timeout: {error}"),
+                }
+                let mut bytes = [0_u8; 1024];
+                match stream.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        received += read;
+                        assert!(received <= 128 * 1024, "bounded ClientHello capture");
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(error) => panic!("inspect TLS setup retirement: {error}"),
+                }
+            }
+        },
+    );
+    let output = run_cli(&[
+        "inspect",
+        "--http-url",
+        &url,
+        "--protocol-policy",
+        "modern-only",
+        "--timeout",
+        "1",
+        "--format",
+        "json",
+    ]);
+    wait_for_loopback_fixture(fixture, "stalled inspect TLS handshake");
+    assert_http_inspect_timeout(&output);
+}
+
+#[test]
 fn e2e_cli_inspect_http_bundle_modern_only_uses_live_modern_h1_and_negotiated_status_renderer() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP inspect fixture");
     let address = listener
@@ -3763,17 +4152,27 @@ fn e2e_cli_inspect_http_bundle_modern_only_uses_live_modern_h1_and_negotiated_st
 
     let rendered: serde_json::Value =
         serde_json::from_str(&stdout_str(&output)).expect("inspect output is diagnostic JSON");
+    assert_eq!(rendered["schema"], "fastmcp.cli.inspect/v2");
     assert_eq!(rendered["server"]["name"], "modern-h1-inspect");
     assert_eq!(rendered["protocol"]["policy"], "modern-only");
     assert_eq!(rendered["protocol"]["version"], "2026-07-28");
     assert_eq!(rendered["protocol"]["era"], "modern-2026");
     assert_eq!(rendered["tools"][0]["name"], "h1-tool");
+    assert_eq!(rendered["tools"][0]["title"], "Final H1 Tool");
     assert_eq!(
-        rendered["tools"][0]["icon"]["src"],
-        "https://example.test/h1-tool.png"
+        rendered["tools"][0]["icons"],
+        serde_json::json!([{
+            "src": "https://example.test/h1-tool.png",
+            "mimeType": "image/png",
+            "sizes": ["16x16"],
+            "theme": "dark",
+        }])
     );
-    assert_eq!(rendered["tools"][0]["icon"]["mimeType"], "image/png");
-    assert_eq!(rendered["tools"][0]["icon"]["sizes"], "16x16");
+    assert_eq!(
+        rendered["tools"][0]["_meta"]["com.example/inspect"]["retained"],
+        true
+    );
+    assert!(rendered["tools"][0].get("icon").is_none());
 }
 
 #[cfg(not(feature = "legacy-2024-11-05"))]
