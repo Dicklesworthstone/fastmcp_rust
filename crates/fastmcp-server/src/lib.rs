@@ -210,8 +210,9 @@ pub use tasks::{
     FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
     FinalTaskInitialWorkClaim, FinalTaskNotificationEmitter, FinalTaskOperation,
     FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
-    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
-    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskStoreFuture,
+    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    InMemoryFinalTaskStore,
     MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
     TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskOperatorHandle,
     TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
@@ -1259,33 +1260,52 @@ impl ServerExtensionRuntime {
 
         let get_runtime = task_runtime.clone();
         self.handlers
-            .register(
+            .register_async(
                 tasks_id.clone(),
                 fastmcp_protocol::tasks_extension::TASK_GET,
                 move |context: &McpContext, parameters: serde_json::Value| {
-                    tasks::dispatch_final_tasks_get(&get_runtime, context, parameters)
+                    let runtime = get_runtime.clone();
+                    Box::pin(async move {
+                        tasks::dispatch_final_tasks_get(&runtime, context, parameters).await
+                    })
                 },
             )
             .map_err(ServerExtensionConfigurationError::Handler)?;
 
         let update_runtime = task_runtime.clone();
         self.handlers
-            .register(
+            .register_local_task_control(
                 tasks_id.clone(),
                 fastmcp_protocol::tasks_extension::TASK_UPDATE,
-                move |context: &McpContext, parameters: serde_json::Value| {
-                    tasks::dispatch_final_tasks_update(&update_runtime, context, parameters)
+                move |context: &McpContext,
+                      parameters: serde_json::Value,
+                      receipt: extensions::TaskControlReceipt| {
+                    let runtime = update_runtime.clone();
+                    Box::pin(async move {
+                        tasks::dispatch_final_tasks_update(
+                            &runtime, context, parameters, receipt,
+                        )
+                        .await
+                    })
                 },
             )
             .map_err(ServerExtensionConfigurationError::Handler)?;
 
         let cancel_runtime = task_runtime.clone();
         self.handlers
-            .register(
+            .register_local_task_control(
                 tasks_id.clone(),
                 fastmcp_protocol::tasks_extension::TASK_CANCEL,
-                move |context: &McpContext, parameters: serde_json::Value| {
-                    tasks::dispatch_final_tasks_cancel(&cancel_runtime, context, parameters)
+                move |context: &McpContext,
+                      parameters: serde_json::Value,
+                      receipt: extensions::TaskControlReceipt| {
+                    let runtime = cancel_runtime.clone();
+                    Box::pin(async move {
+                        tasks::dispatch_final_tasks_cancel(
+                            &runtime, context, parameters, receipt,
+                        )
+                        .await
+                    })
                 },
             )
             .map_err(ServerExtensionConfigurationError::Handler)?;
@@ -18548,13 +18568,21 @@ impl Server {
                 "Extension request is not admitted",
             ));
         }
-        self.invoke_negotiated_extension_async(request_ctx, &current, extension_id, request, None)
-            .await
-            .and_then(|response| {
-                response.result.ok_or_else(|| {
-                    McpError::internal_error("extension handler omitted its response result")
-                })
+        let receipt = extensions::TaskControlReceipt::default();
+        self.invoke_negotiated_extension_async(
+            request_ctx,
+            &current,
+            extension_id,
+            request,
+            None,
+            &receipt,
+        )
+        .await
+        .and_then(|response| {
+            response.result.ok_or_else(|| {
+                McpError::internal_error("extension handler omitted its response result")
             })
+        })
     }
 
     fn validate_extension_request_binding(
@@ -18595,6 +18623,7 @@ impl Server {
         extension_id: &ExtensionId,
         request: &JsonRpcRequest,
         handler_admission: Option<FinalHandlerAdmission>,
+        receipt: &extensions::TaskControlReceipt,
     ) -> McpResult<JsonRpcResponse> {
         let mut request = request.clone();
         remove_modern_protocol_metadata(&mut request);
@@ -18611,6 +18640,7 @@ impl Server {
                 extension_id,
                 &request,
                 handler_admission,
+                receipt,
             )
             .await
             .map_err(|error| match error {
@@ -18635,12 +18665,14 @@ impl Server {
     ) -> McpResult<serde_json::Value> {
         require_exact_modern_extension_metadata(request)?;
         let admission = self.admit_extension_request(request_ctx, request)?;
+        let receipt = extensions::TaskControlReceipt::default();
         self.dispatch_admitted_extension_fallback_async(
             request_ctx,
             request,
             admission.as_ref(),
             retained_response,
             None,
+            &receipt,
         )
         .await
     }
@@ -18652,6 +18684,7 @@ impl Server {
         admission: Option<&ServerExtensionRequestAdmission>,
         retained_response: &mut Option<JsonRpcResponse>,
         handler_admission: Option<FinalHandlerAdmission>,
+        receipt: &extensions::TaskControlReceipt,
     ) -> McpResult<serde_json::Value> {
         require_exact_modern_extension_metadata(request)?;
         request_ctx.ensure_live()?;
@@ -18663,6 +18696,7 @@ impl Server {
                 &admission.extension_id,
                 request,
                 handler_admission,
+                receipt,
             )
             .await?;
         let value = response.result.clone().ok_or_else(|| {
@@ -19048,6 +19082,7 @@ impl Server {
 
         let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
         let mut retained_extension_response = None;
+        let task_control_receipt = extensions::TaskControlReceipt::default();
         let mut extension_admission = None;
         let result: McpResult<serde_json::Value> = async {
             extension_admission = self.admit_extension_request(&request_ctx, &admission_request)?;
@@ -19110,6 +19145,7 @@ impl Server {
                             extension_admission.as_ref(),
                             &mut retained_extension_response,
                             None,
+                            &task_control_receipt,
                         )
                         .await
                     }
@@ -19176,7 +19212,8 @@ impl Server {
                 Err(self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error))
             }
         };
-        let result = Self::request_context_error(&request_ctx).map_or(result, Err);
+        let result = task_control_receipt
+            .resolve_liveness(result, Self::request_context_error(&request_ctx));
 
         let succeeded = result.is_ok();
         if let Some(stats) = &self.stats {
@@ -19219,7 +19256,9 @@ impl Server {
                 }
             }
             Err(error) => {
-                let masked = mask_peer_error(error, self.mask_error_details);
+                let masked = task_control_receipt
+                    .fixed_uncertainty_error()
+                    .unwrap_or_else(|| mask_peer_error(error, self.mask_error_details));
                 JsonRpcResponse::error(
                     Some(response_id),
                     JsonRpcError {
@@ -19244,6 +19283,7 @@ impl Server {
         terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
         handler_admission: Option<FinalHandlerAdmission>,
+        task_control_receipt: extensions::TaskControlReceipt,
     ) -> Option<JsonRpcResponse> {
         // The value the raw sidecar was admitted with, before authentication
         // may strip credentials from this request.
@@ -19506,6 +19546,8 @@ impl Server {
         // Bound the dispatch state and its Send proof before the progress
         // timer and transport futures wrap it. The same owner still polls
         // and drops the request; no extra task or cancellation scope is added.
+        // The outer response writer retains this invocation's private Task
+        // receipt through its own final cancellation fence.
         let mut retained_extension_response = None;
         let dispatch: std::pin::Pin<
             Box<dyn Future<Output = McpResult<Option<serde_json::Value>>> + Send + '_>,
@@ -19560,6 +19602,7 @@ impl Server {
                             extension_admission.as_ref(),
                             &mut retained_extension_response,
                             handler_admission,
+                            &task_control_receipt,
                         )
                         .await
                     }
@@ -19680,14 +19723,15 @@ impl Server {
         let upstream_task_state_unknown = result
             .as_ref()
             .is_err_and(is_upstream_proxy_task_state_unknown_error);
-        let result = if graceful_subscription_completion
+        let interruption = if graceful_subscription_completion
             || graceful_subscription_canonical_substitution
             || upstream_task_state_unknown
         {
-            result
+            None
         } else {
-            Self::request_context_error(&request_ctx).map_or(result, Err)
+            Self::request_context_error(&request_ctx)
         };
+        let result = task_control_receipt.resolve_liveness(result, interruption);
         // Elect terminal ownership before final progress, logging, or a
         // response writer can run. A cancellation result, or cancellation
         // already elected by response-body drop, suppresses every trailing
@@ -19739,7 +19783,9 @@ impl Server {
                 }
             }
             Err(error) => {
-                let masked = mask_peer_error(error, self.mask_error_details);
+                let masked = task_control_receipt
+                    .fixed_uncertainty_error()
+                    .unwrap_or_else(|| mask_peer_error(error, self.mask_error_details));
                 JsonRpcResponse::error(
                     Some(response_id),
                     JsonRpcError {
@@ -20690,6 +20736,38 @@ impl Server {
         notification_sender: NotificationSender,
         handler_admission: Option<FinalHandlerAdmission>,
     ) -> Option<JsonRpcResponse> {
+        self.dispatch_with_protocol_policy_owned_and_task_receipt(
+            policy,
+            inbound,
+            request,
+            raw_params,
+            auth_receipt,
+            websocket_connection_generation,
+            modern_http_owner,
+            request_cancellation,
+            terminal_delivery,
+            notification_sender,
+            handler_admission,
+            extensions::TaskControlReceipt::default(),
+        )
+        .await
+    }
+
+    async fn dispatch_with_protocol_policy_owned_and_task_receipt(
+        self: Arc<Self>,
+        policy: ProtocolPolicy,
+        inbound: &InboundRequestContext,
+        request: JsonRpcRequest,
+        raw_params: Option<Arc<str>>,
+        auth_receipt: Option<AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
+        modern_http_owner: Option<u64>,
+        request_cancellation: McpRequestCancellation,
+        terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
+        notification_sender: NotificationSender,
+        handler_admission: Option<FinalHandlerAdmission>,
+        task_control_receipt: extensions::TaskControlReceipt,
+    ) -> Option<JsonRpcResponse> {
         if matches!(policy, ProtocolPolicy::ModernOnly)
             && request.method == "initialize"
             && request.validate().is_ok()
@@ -20711,6 +20789,7 @@ impl Server {
             terminal_delivery,
             notification_sender,
             handler_admission,
+            task_control_receipt,
         )
         .await
     }
@@ -22398,6 +22477,7 @@ impl Server {
             let dispatch = move |request_cx: Cx| async move {
                 let mut reservation = reservation;
                 let cancellation = reservation.cancellation();
+                let task_control_receipt = extensions::TaskControlReceipt::default();
                 let subscription_request = request.method == SUBSCRIPTIONS_LISTEN;
                 let subscription_terminal = subscription_request
                     .then(|| Arc::new(FinalSubscriptionTerminalDelivery::default()));
@@ -22456,7 +22536,7 @@ impl Server {
                     }),
                     ModernDispatchStart::Ready => {
                         Arc::clone(&request_server)
-                            .dispatch_with_protocol_policy_owned(
+                            .dispatch_with_protocol_policy_owned_and_task_receipt(
                                 request_server.protocol_policy,
                                 &inbound,
                                 request,
@@ -22467,6 +22547,8 @@ impl Server {
                                 cancellation.clone(),
                                 subscription_terminal,
                                 committed_notifications,
+                                None,
+                                task_control_receipt.clone(),
                             )
                             .await
                     }
@@ -22493,13 +22575,22 @@ impl Server {
                     let suppress_peer_cancelled =
                         !finalized && cancellation.is_peer_cancel_requested();
                     if !finalized && !suppress_peer_cancelled {
+                        let error = task_control_receipt
+                            .resolve_liveness::<()>(
+                                Err(McpError::new(
+                                    McpErrorCode::RequestCancelled,
+                                    "Request cancelled before response finalization",
+                                )),
+                                None,
+                            )
+                            .err()
+                            .unwrap_or_else(McpError::request_cancelled);
                         response = JsonRpcResponse::error(
                             response.id,
                             JsonRpcError {
-                                code: McpErrorCode::RequestCancelled.into(),
-                                message: "Request cancelled before response finalization"
-                                    .to_owned(),
-                                data: None,
+                                code: error.code.into(),
+                                message: error.message,
+                                data: error.data,
                             },
                         );
                     }
@@ -23679,10 +23770,12 @@ impl Server {
                                                     }
                                                 },
                                             );
+                                            let task_control_receipt =
+                                                extensions::TaskControlReceipt::default();
                                             let response = poll_on_cx(
                                                 &request_cx,
                                                 Arc::clone(&request_server)
-                                                    .dispatch_with_protocol_policy_owned(
+                                                    .dispatch_with_protocol_policy_owned_and_task_receipt(
                                                         request_server.protocol_policy,
                                                         &inbound,
                                                         request.clone(),
@@ -23693,6 +23786,8 @@ impl Server {
                                                         request_cancellation.clone(),
                                                         subscription_terminal,
                                                         notification_sender,
+                                                        None,
+                                                        task_control_receipt.clone(),
                                                     ),
                                             );
                                             response.map_or(Ok(()), |mut response| {
@@ -23724,14 +23819,22 @@ impl Server {
                                                     && request_cancellation
                                                         .is_peer_cancel_requested();
                                                 if !finalized && !suppress_peer_cancelled {
+                                                    let error = task_control_receipt
+                                                        .resolve_liveness::<()>(
+                                                            Err(McpError::new(
+                                                                McpErrorCode::RequestCancelled,
+                                                                "Request cancelled before response finalization",
+                                                            )),
+                                                            None,
+                                                        )
+                                                        .err()
+                                                        .unwrap_or_else(McpError::request_cancelled);
                                                     response = JsonRpcResponse::error(
                                                         response.id.clone(),
                                                         JsonRpcError {
-                                                            code: McpErrorCode::RequestCancelled
-                                                                .into(),
-                                                            message: "Request cancelled before response finalization"
-                                                                .to_string(),
-                                                            data: None,
+                                                            code: error.code.into(),
+                                                            message: error.message,
+                                                            data: error.data,
                                                         },
                                                     );
                                                 }
@@ -28038,6 +28141,11 @@ impl TestHttpEndpoint for ServerBuilder {
 
 #[cfg(test)]
 mod lib_unit_tests {
+    #[cfg(feature = "tasks")]
+    mod async_task_control_http_tests {
+        include!("tasks/control/http_tests.rs");
+    }
+
     use super::*;
     use asupersync::io::AsyncReadExt;
     use asupersync::runtime::RuntimeBuilder;
@@ -64879,6 +64987,7 @@ mod lib_unit_tests {
                             callback_seen.lock().unwrap().push(notification);
                         }),
                         None,
+                        extensions::TaskControlReceipt::default(),
                     )
                     .await
                     .expect("an id-bearing tool call returns its terminal response");

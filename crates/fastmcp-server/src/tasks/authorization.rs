@@ -682,7 +682,7 @@ pub(super) fn task_access_denied() -> McpError {
     McpError::invalid_params("Task not found")
 }
 
-fn ensure_current_task_authentication(ctx: &McpContext) -> McpResult<()> {
+pub(super) fn ensure_current_task_authentication(ctx: &McpContext) -> McpResult<()> {
     ctx.ensure_live()?;
     crate::Server::enforce_authentication_freshness(ctx.auth().as_ref())
         .map_err(|_| task_access_denied())

@@ -38,6 +38,88 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+/// Invocation-local evidence that a trusted local Task mutation crossed its
+/// storage admission boundary. Application handlers never receive this value;
+/// a method name, extension descriptor or error payload cannot manufacture it.
+#[derive(Clone, Default)]
+pub(crate) struct TaskControlReceipt {
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl TaskControlReceipt {
+    #[cfg(feature = "tasks")]
+    pub(crate) fn admit_write(&self) {
+        self.state.store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "tasks")]
+    pub(crate) fn no_commit(&self) {
+        self.state.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "tasks")]
+    pub(crate) fn committed(&self) {
+        self.state.store(2, std::sync::atomic::Ordering::Release);
+    }
+
+    fn has_admitted_write(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    /// Keep ordinary request fences intact while refusing to describe an
+    /// admitted mutation as clean cancellation after its outcome became
+    /// uncertain. This does not authorize further callbacks or storage work.
+    pub(crate) fn resolve_liveness<T>(
+        &self,
+        result: McpResult<T>,
+        interruption: Option<McpError>,
+    ) -> McpResult<T> {
+        if self.has_admitted_write() && (interruption.is_some() || result.is_err()) {
+            self.state.store(3, std::sync::atomic::Ordering::Release);
+            return Err(Self::uncertainty_error());
+        }
+        if let Some(error) = self.fixed_uncertainty_error() {
+            return Err(error);
+        }
+        interruption.map_or(result, Err)
+    }
+
+    /// Reconstruct only the fixed reviewed uncertainty body after ordinary
+    /// error masking. Provider and middleware text is never unmasked.
+    pub(crate) fn fixed_uncertainty_error(&self) -> Option<McpError> {
+        (self.state.load(std::sync::atomic::Ordering::Acquire) == 3)
+            .then(Self::uncertainty_error)
+    }
+
+    fn uncertainty_error() -> McpError {
+        McpError {
+            code: fastmcp_core::McpErrorCode::InternalError,
+            message: "Task mutation may have committed; its outcome could not be verified. Reconcile Task state before retrying."
+                .to_owned(),
+            data: Some(serde_json::json!({"reason": "TaskStateUnknown"})),
+        }
+    }
+
+    fn resolve_handler_result<T>(
+        &self,
+        context: &McpContext,
+        result: McpResult<T>,
+    ) -> McpResult<T> {
+        // An ordinary handler error has always passed through before the
+        // registry's post-response liveness fence.
+        if result.is_err() && !self.has_admitted_write() {
+            return result;
+        }
+        self.resolve_liveness(
+            result,
+            context
+                .ensure_live()
+                .err()
+                .map(|_| McpError::request_cancelled()),
+        )
+    }
+}
+
 /// A typed implementation for one client-to-server extension request.
 ///
 /// The supplied [`McpContext`] is the caller's request context. Implementations
@@ -206,6 +288,30 @@ trait ErasedExtensionHandler: Send + Sync {
         })
     }
 
+    /// Supplies a private local-write receipt without widening any ordinary
+    /// extension handler's callback surface.
+    fn invoke_admitted_with_receipt_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+        _receipt: TaskControlReceipt,
+    ) -> BoxFuture<'a, McpResult<Value>> {
+        self.invoke_admitted_async(context, negotiated, parameters)
+    }
+
+    fn invoke_response_with_receipt_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+        id: RequestId,
+        handler_admission: Option<crate::FinalHandlerAdmission>,
+        _receipt: TaskControlReceipt,
+    ) -> BoxFuture<'a, McpResult<JsonRpcResponse>> {
+        self.invoke_response_async(context, negotiated, parameters, id, handler_admission)
+    }
+
     /// Consumes authorization custody for this exact notification invocation.
     fn invoke_authorized_notification_async<'a>(
         &'a self,
@@ -273,6 +379,70 @@ where
             let request = serde_json::from_value(parameters)
                 .map_err(|error| McpError::invalid_params(error.to_string()))?;
             let response = (self.handler)(context, request).await?;
+            encode_extension_response(id, &response)
+        })
+    }
+}
+
+
+/// Only the server's local Task update/cancel installation can register this
+/// adapter. The receipt is separate from wire values and user error data.
+#[cfg(feature = "tasks")]
+struct LocalTaskControlHandler<Request, Response, Handler> {
+    handler: Handler,
+    marker: PhantomData<fn(Request) -> Response>,
+}
+
+#[cfg(feature = "tasks")]
+impl<Request, Response, Handler> ErasedExtensionHandler
+    for LocalTaskControlHandler<Request, Response, Handler>
+where
+    Request: DeserializeOwned + Send,
+    Response: Serialize,
+    Handler: for<'a> Fn(
+            &'a McpContext,
+            Request,
+            TaskControlReceipt,
+        ) -> BoxFuture<'a, McpResult<Response>>
+        + Send
+        + Sync,
+{
+    fn invoke(&self, _context: &McpContext, _parameters: Value) -> McpResult<Value> {
+        Err(McpError::invalid_request(
+            "this extension handler requires asynchronous request dispatch",
+        ))
+    }
+
+    fn invoke_admitted_with_receipt_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        _negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+        receipt: TaskControlReceipt,
+    ) -> BoxFuture<'a, McpResult<Value>> {
+        Box::pin(async move {
+            let request = serde_json::from_value(parameters)
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+            let response = (self.handler)(context, request, receipt).await?;
+            serde_json::to_value(response).map_err(|_| {
+                McpError::internal_error("typed extension handler response serialization failed")
+            })
+        })
+    }
+
+    fn invoke_response_with_receipt_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        _negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+        id: RequestId,
+        _handler_admission: Option<crate::FinalHandlerAdmission>,
+        receipt: TaskControlReceipt,
+    ) -> BoxFuture<'a, McpResult<JsonRpcResponse>> {
+        Box::pin(async move {
+            let request = serde_json::from_value(parameters)
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+            let response = (self.handler)(context, request, receipt).await?;
             encode_extension_response(id, &response)
         })
     }
@@ -886,6 +1056,37 @@ impl ExtensionHandlerRegistry {
         )
     }
 
+    /// Registers the library-owned local Task mutation path. The invocation
+    /// receipt never enters the public handler or context APIs.
+    #[cfg(feature = "tasks")]
+    pub(crate) fn register_local_task_control<Request, Response, Handler>(
+        &mut self,
+        extension_id: ExtensionId,
+        method: impl Into<String>,
+        handler: Handler,
+    ) -> Result<(), ExtensionHandlerRegistrationError>
+    where
+        Request: DeserializeOwned + Send + 'static,
+        Response: Serialize + 'static,
+        Handler: for<'a> Fn(
+                &'a McpContext,
+                Request,
+                TaskControlReceipt,
+            ) -> BoxFuture<'a, McpResult<Response>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_handler(
+            extension_id,
+            method.into(),
+            Box::new(LocalTaskControlHandler::<Request, Response, Handler> {
+                handler,
+                marker: PhantomData,
+            }),
+        )
+    }
+
     /// Registers a typed, request-scoped extension notification handler.
     ///
     /// The explicit authorizer runs after transport authentication and before
@@ -1236,20 +1437,21 @@ impl ExtensionHandlerRegistry {
         context
             .ensure_live()
             .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
-        let response = handler
-            .invoke_admitted_async(
+        let receipt = TaskControlReceipt::default();
+        let result = handler
+            .invoke_admitted_with_receipt_async(
                 context,
                 admitted,
                 request
                     .params
                     .clone()
                     .unwrap_or_else(|| serde_json::json!({})),
+                receipt.clone(),
             )
-            .await
+            .await;
+        let response = receipt
+            .resolve_handler_result(context, result)
             .map_err(ExtensionHandlerInvocationError::Handler)?;
-        context
-            .ensure_live()
-            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
         self.validate_response_result(
             negotiated,
             protocol_era,
@@ -1264,6 +1466,7 @@ impl ExtensionHandlerRegistry {
 
     /// Uses the same current-request admission as the value API, retaining
     /// typed source-bearing output until the transport serializes its reply.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn invoke_response_async(
         &self,
         context: &McpContext,
@@ -1272,6 +1475,7 @@ impl ExtensionHandlerRegistry {
         extension_id: &ExtensionId,
         request: &JsonRpcRequest,
         handler_admission: Option<crate::FinalHandlerAdmission>,
+        receipt: &TaskControlReceipt,
     ) -> Result<JsonRpcResponse, ExtensionHandlerInvocationError> {
         let handler = self.admitted_handler(negotiated, protocol_era, extension_id, request)?;
         let admitted = negotiated.active(extension_id).ok_or_else(|| {
@@ -1288,8 +1492,8 @@ impl ExtensionHandlerRegistry {
         context
             .ensure_live()
             .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
-        let response = handler
-            .invoke_response_async(
+        let result = handler
+            .invoke_response_with_receipt_async(
                 context,
                 admitted,
                 request
@@ -1298,12 +1502,12 @@ impl ExtensionHandlerRegistry {
                     .unwrap_or_else(|| serde_json::json!({})),
                 id,
                 handler_admission,
+                receipt.clone(),
             )
-            .await
+            .await;
+        let response = receipt
+            .resolve_handler_result(context, result)
             .map_err(ExtensionHandlerInvocationError::Handler)?;
-        context
-            .ensure_live()
-            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
         let value = response.result.as_ref().ok_or_else(|| {
             ExtensionHandlerInvocationError::Handler(McpError::internal_error(
                 "extension handler omitted its response result",

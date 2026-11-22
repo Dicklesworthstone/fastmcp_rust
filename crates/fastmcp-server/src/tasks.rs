@@ -44,6 +44,7 @@
 //! tests and is not part of the shipped API.
 
 mod authorization;
+mod control;
 pub use authorization::{
     FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
     TaskExecutionAuthorizer,
@@ -1562,6 +1563,15 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 // Final MCP Tasks durable state machine (2026-07-28)
 // ============================================================================
 
+/// Caller-owned storage future used by the asynchronous Task control methods.
+///
+/// A backend must retain its operation's resources until completion or correct
+/// cancellation. Dropping a future must not leave detached writes or borrowed
+/// buffers in use. A possibly committed write must retain its original recovery
+/// identity; cancellation is not evidence that the mutation did not commit.
+pub type FinalTaskStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = McpResult<T>> + Send + 'a>>;
+
 /// Application-owned durable storage for final Tasks.
 ///
 /// `create_task` and `replace_task` must atomically retain the task and its
@@ -1581,6 +1591,110 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 /// dispatch-lease state. This history survives recovery and terminal
 /// transitions and is removed only when the task is reclaimed.
 pub trait FinalTaskStore: Send + Sync {
+    /// Reads redacted access metadata under the requesting caller's context.
+    /// The framework authorizes this metadata before requesting any payload.
+    ///
+    /// Override the asynchronous control methods for storage that must await
+    /// I/O. Defaults poll the existing bounded, synchronous implementation.
+    /// The request context preserves cancellation, its lease and effective
+    /// budget; use `ctx.cx()` only for caller-owned I/O, and observe
+    /// `ctx.request_cancelled()` when a pending operation must settle after
+    /// request-local cancellation. A write that may have committed must report
+    /// that uncertainty instead of treating cancellation as proof of rollback.
+    /// The worker and subscription callback interfaces remain synchronous;
+    /// these hooks alone do not establish a persistent Task backend.
+    fn get_task_access_metadata_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAccessMetadata>> {
+        Box::pin(async move {
+            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.get_task_access_metadata(task_id)
+        })
+    }
+
+    /// Loads a Task only after the caller has authorized its redacted metadata.
+    /// Preserve all snapshot identity, generation and operation bindings.
+    fn get_task_snapshot_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.get_task_snapshot(task_id)
+        })
+    }
+
+    /// Performs the existing atomic execution-expiry transition asynchronously.
+    /// A successful returned snapshot is the committed result, even if caller
+    /// cancellation arrives while the backend completes its commit receipt.
+    fn expire_task_execution_if_current_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        expected: &'a FinalTaskSnapshot,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.expire_task_execution_if_current(expected)
+        })
+    }
+
+    /// Atomically commits the exact Task transition, notification and accepted
+    /// inputs under the requesting caller. All synchronous CAS and receipt
+    /// requirements also apply to this asynchronous override.
+    fn replace_task_and_append_input_if_current_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        expected: &'a FinalTaskSnapshot,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+        input_responses: FinalTaskInputResponses,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.replace_task_and_append_input_if_current(
+                expected,
+                task,
+                notification,
+                input_responses,
+            )
+        })
+    }
+
+    /// Atomically commits cooperative cancellation and clears unconsumed input.
+    /// An override must return the same exact committed snapshot required by
+    /// the synchronous operation; it must not reconstruct a newer live value.
+    fn request_cancellation_and_clear_input_if_current_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        expected: &'a FinalTaskSnapshot,
+        cancelled_task: FinalTask,
+        cancelled_notification: FinalTaskStatusNotification,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.request_cancellation_and_clear_input_if_current(
+                expected,
+                cancelled_task,
+                cancelled_notification,
+            )
+        })
+    }
+
+    /// Reads retained cancellation intent without blocking the request's poll.
+    fn is_cancellation_requested_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        Box::pin(async move {
+            ctx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.is_cancellation_requested(task_id)
+        })
+    }
+
     /// Publishes an optional sealed, non-blocking operator observation handle.
     ///
     /// The runtime obtains this handle once during construction. Scraping it
@@ -8463,49 +8577,10 @@ impl FinalTaskRuntime {
         current: &FinalTaskSnapshot,
         input_responses: &FinalTaskInputResponses,
     ) -> McpResult<UpdateTaskResult> {
-        let FinalTask::InputRequired {
-            base,
-            input_requests,
-        } = current.task()
+        let Some((task, outstanding_responses)) =
+            prepare_task_input_update(current, input_responses)?
         else {
             return Ok(UpdateTaskResult::default());
-        };
-        let mut input_requests = input_requests.clone();
-        let ledger = FinalTaskInputLedger::from_requests(&input_requests)
-            .map_err(|error| McpError::invalid_params(error.to_string()))?;
-        // The protocol permits replayed/already-satisfied and unknown keys.
-        // Retain only the keys still outstanding before type validation so an
-        // ignored key can neither fail a valid update nor create a durable
-        // notification, generation, or worker handoff mutation.
-        let outstanding_responses = input_responses
-            .iter()
-            .filter(|(key, _)| input_requests.contains_key(*key))
-            .map(|(key, response)| (key.clone(), response.clone()))
-            .collect::<FinalTaskInputResponses>();
-        if outstanding_responses.is_empty() {
-            return Ok(UpdateTaskResult::default());
-        }
-        ledger
-            .validate_responses(&outstanding_responses)
-            .map_err(|error| McpError::invalid_params(error.to_string()))?;
-        for key in outstanding_responses.keys() {
-            input_requests.remove(key);
-        }
-        let task = if input_requests.is_empty() {
-            FinalTask::Working(transition_final_task_base(
-                base.clone(),
-                FinalTaskStatus::Working,
-                None,
-            )?)
-        } else {
-            FinalTask::InputRequired {
-                base: transition_final_task_base(
-                    base.clone(),
-                    FinalTaskStatus::InputRequired,
-                    None,
-                )?,
-                input_requests,
-            }
         };
         self.persist_transition_appending_input(current, task, outstanding_responses)?;
         Ok(UpdateTaskResult::default())
@@ -11484,8 +11559,59 @@ impl Drop for AuthorizedTaskServiceRunner {
     }
 }
 
+/// Prepares the same pure input transition for synchronous application calls
+/// and asynchronous wire requests. No store access or mutation occurs here.
+fn prepare_task_input_update(
+    current: &FinalTaskSnapshot,
+    input_responses: &FinalTaskInputResponses,
+) -> McpResult<Option<(FinalTask, FinalTaskInputResponses)>> {
+    let FinalTask::InputRequired {
+        base,
+        input_requests,
+    } = current.task()
+    else {
+        return Ok(None);
+    };
+    let mut input_requests = input_requests.clone();
+    let ledger = FinalTaskInputLedger::from_requests(&input_requests)
+        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+    // Unknown and already-satisfied keys are ignored before type validation.
+    // They cannot cause a new generation, notification or worker handoff.
+    let outstanding_responses = input_responses
+        .iter()
+        .filter(|(key, _)| input_requests.contains_key(*key))
+        .map(|(key, response)| (key.clone(), response.clone()))
+        .collect::<FinalTaskInputResponses>();
+    if outstanding_responses.is_empty() {
+        return Ok(None);
+    }
+    ledger
+        .validate_responses(&outstanding_responses)
+        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+    for key in outstanding_responses.keys() {
+        input_requests.remove(key);
+    }
+    let task = if input_requests.is_empty() {
+        FinalTask::Working(transition_final_task_base(
+            base.clone(),
+            FinalTaskStatus::Working,
+            None,
+        )?)
+    } else {
+        FinalTask::InputRequired {
+            base: transition_final_task_base(
+                base.clone(),
+                FinalTaskStatus::InputRequired,
+                None,
+            )?,
+            input_requests,
+        }
+    };
+    Ok(Some((task, outstanding_responses)))
+}
+
 /// Decodes and serves a negotiated `tasks/get` request through the final runtime.
-pub(crate) fn dispatch_final_tasks_get(
+pub(crate) async fn dispatch_final_tasks_get(
     runtime: &FinalTaskRuntime,
     ctx: &McpContext,
     parameters: serde_json::Value,
@@ -11494,7 +11620,8 @@ pub(crate) fn dispatch_final_tasks_get(
         .map_err(|_| McpError::invalid_params("Invalid final tasks/get parameters"))?;
     validate_final_task_request_meta(&parameters.request, "tasks/get")?;
     let task = runtime
-        .task_for_request(ctx, &parameters.task_id, TaskAccessAction::Get)?
+        .task_for_request_with_cx(ctx, &parameters.task_id, TaskAccessAction::Get)
+        .await?
         .into_task();
     Ok(fastmcp_protocol::CompleteTaskResult {
         task,
@@ -11504,30 +11631,41 @@ pub(crate) fn dispatch_final_tasks_get(
 }
 
 /// Decodes and serves a negotiated `tasks/update` request through the final runtime.
-pub(crate) fn dispatch_final_tasks_update(
+pub(crate) async fn dispatch_final_tasks_update(
     runtime: &FinalTaskRuntime,
     ctx: &McpContext,
     parameters: serde_json::Value,
+    receipt: crate::extensions::TaskControlReceipt,
 ) -> McpResult<serde_json::Value> {
     let parameters = serde_json::from_value::<UpdateTaskParams>(parameters)
         .map_err(|_| McpError::invalid_params("Invalid final tasks/update parameters"))?;
     validate_final_task_request_meta(&parameters.request, "tasks/update")?;
-    let current = runtime.task_for_request(ctx, &parameters.task_id, TaskAccessAction::Update)?;
-    serde_json::to_value(runtime.update_task_snapshot(&current, &parameters.input_responses)?)
+    let result = runtime
+        .update_task_for_request_with_receipt(
+            ctx,
+            &parameters.task_id,
+            &parameters.input_responses,
+            receipt,
+        )
+        .await?;
+    serde_json::to_value(result)
         .map_err(|_| McpError::internal_error("final tasks/update response serialization failed"))
 }
 
 /// Decodes and serves a negotiated `tasks/cancel` request through the final runtime.
-pub(crate) fn dispatch_final_tasks_cancel(
+pub(crate) async fn dispatch_final_tasks_cancel(
     runtime: &FinalTaskRuntime,
     ctx: &McpContext,
     parameters: serde_json::Value,
+    receipt: crate::extensions::TaskControlReceipt,
 ) -> McpResult<serde_json::Value> {
     let parameters = serde_json::from_value::<FinalCancelTaskParams>(parameters)
         .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel parameters"))?;
     validate_final_task_request_meta(&parameters.request, "tasks/cancel")?;
-    let current = runtime.task_for_request(ctx, &parameters.task_id, TaskAccessAction::Cancel)?;
-    serde_json::to_value(runtime.cancel_task_snapshot(&current)?)
+    let result = runtime
+        .cancel_task_for_request_with_receipt(ctx, &parameters.task_id, receipt)
+        .await?;
+    serde_json::to_value(result)
         .map_err(|_| McpError::internal_error("final tasks/cancel response serialization failed"))
 }
 
@@ -11699,6 +11837,17 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
     use std::time::Duration;
+
+    fn ready_task_control<T>(future: impl Future<Output = McpResult<T>>) -> McpResult<T> {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match Future::poll(future.as_mut(), &mut context) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                panic!("in-memory task control must be ready on its first poll")
+            }
+        }
+    }
 
     mod task_operator_tests {
         use super::*;
@@ -18567,7 +18716,13 @@ mod tests {
                         *probe.after_commit.lock().unwrap() = Some(hook);
                         let mut parameters = final_task_method_parameters(&task_id);
                         parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
-                        dispatch_final_tasks_update(&runtime, &ctx, parameters).map(|_| ())
+                        ready_task_control(dispatch_final_tasks_update(
+                            &runtime,
+                            &ctx,
+                            parameters,
+                            crate::extensions::TaskControlReceipt::default(),
+                        ))
+                        .map(|_| ())
                     }
                     AtomicTaskCommitPhase::RequireInput => {
                         assert!(
@@ -18981,11 +19136,12 @@ mod tests {
                 notifications_for_runtime.fetch_add(1, AtomicOrdering::SeqCst);
             }),
         );
-        let result = dispatch_final_tasks_cancel(
+        let result = ready_task_control(dispatch_final_tasks_cancel(
             &runtime,
             &McpContext::new(Cx::for_testing(), 1),
             final_task_method_parameters(&task_id),
-        );
+            crate::extensions::TaskControlReceipt::default(),
+        ));
         if let Some(mutation) = mutation {
             let error = result.expect_err("a substituted cancellation successor must fail closed");
             assert_eq!(
@@ -26869,11 +27025,12 @@ mod tests {
         let mut parameters = final_task_method_parameters(&task_id);
         parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
 
-        let response = dispatch_final_tasks_update(
+        let response = ready_task_control(dispatch_final_tasks_update(
             &runtime,
             &McpContext::new(Cx::for_testing(), 1),
             parameters,
-        )
+            crate::extensions::TaskControlReceipt::default(),
+        ))
         .expect("an unexpired precommit snapshot admits tasks/update");
         assert_eq!(response["resultType"], "complete");
 
@@ -26905,11 +27062,12 @@ mod tests {
         let mut parameters = final_task_method_parameters(&task_id);
         parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
 
-        let error = dispatch_final_tasks_update(
+        let error = ready_task_control(dispatch_final_tasks_update(
             &runtime,
             &McpContext::new(Cx::for_testing(), 1),
             parameters,
-        )
+            crate::extensions::TaskControlReceipt::default(),
+        ))
         .expect_err("an expired precommit snapshot cannot mutate through tasks/update");
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
         assert_eq!(error.data, None);
@@ -27288,11 +27446,12 @@ mod tests {
 
         let mut parameters = final_task_method_parameters(&task_id);
         parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
-        let response = dispatch_final_tasks_update(
+        let response = ready_task_control(dispatch_final_tasks_update(
             &runtime,
             &McpContext::new(Cx::for_testing(), 1),
             parameters,
-        )
+            crate::extensions::TaskControlReceipt::default(),
+        ))
         .expect("a delivered post-commit notification preserves the update RPC success");
 
         assert_eq!(response["resultType"], "complete");
@@ -27347,11 +27506,12 @@ mod tests {
         let mut parameters = final_task_method_parameters(&task_id);
         parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dispatch_final_tasks_update(
+            ready_task_control(dispatch_final_tasks_update(
                 &runtime,
                 &McpContext::new(Cx::for_testing(), 1),
                 parameters.clone(),
-            )
+                crate::extensions::TaskControlReceipt::default(),
+            ))
         }));
         let response = result
             .expect("a panicking emitter is contained after the durable update")
@@ -27383,11 +27543,12 @@ mod tests {
             .expect("read durable generation after committed update")
             .expect("committed update retains its task")
             .generation();
-        let replay = dispatch_final_tasks_update(
+        let replay = ready_task_control(dispatch_final_tasks_update(
             &runtime,
             &McpContext::new(Cx::for_testing(), 1),
             parameters,
-        )
+            crate::extensions::TaskControlReceipt::default(),
+        ))
         .expect("the retry after delivery degradation is acknowledged as a replay");
         assert_eq!(replay["resultType"], "complete");
         assert_eq!(
@@ -27411,11 +27572,11 @@ mod tests {
             .task_id
             .clone();
 
-        let response = dispatch_final_tasks_get(
+        let response = ready_task_control(dispatch_final_tasks_get(
             &runtime,
             &McpContext::new(Cx::for_testing(), 1),
             final_task_method_parameters(&task_id),
-        )
+        ))
         .expect("official final tasks/get parameters are admitted");
         let response = serde_json::to_value(response).expect("typed final task response encodes");
         // The frozen final wire is the FLAT complete envelope (resultType +
@@ -27424,7 +27585,7 @@ mod tests {
         assert_eq!(response["resultType"], serde_json::json!("complete"));
         assert_eq!(response["taskId"], serde_json::json!(task_id));
         assert!(
-            dispatch_final_tasks_get(
+            ready_task_control(dispatch_final_tasks_get(
                 &runtime,
                 &McpContext::new(Cx::for_testing(), 1),
                 serde_json::json!({
@@ -27434,7 +27595,7 @@ mod tests {
                         "io.modelcontextprotocol/clientCapabilities": {}
                     }
                 }),
-            )
+            ))
             .is_err(),
             "changing only taskId to the legacy id field fails final strict decoding"
         );
@@ -27456,20 +27617,22 @@ mod tests {
             }
         });
         assert!(
-            dispatch_final_tasks_cancel(
+            ready_task_control(dispatch_final_tasks_cancel(
                 &runtime,
                 &McpContext::new(Cx::for_testing(), 1),
-                missing_capabilities
-            )
+                missing_capabilities,
+                crate::extensions::TaskControlReceipt::default(),
+            ))
             .is_err(),
             "changing only the required modern metadata fails final tasks/cancel admission"
         );
 
-        let response = dispatch_final_tasks_cancel(
+        let response = ready_task_control(dispatch_final_tasks_cancel(
             &runtime,
             &McpContext::new(Cx::for_testing(), 1),
             final_task_method_parameters(&task_id),
-        )
+            crate::extensions::TaskControlReceipt::default(),
+        ))
         .expect("official final tasks/cancel parameters are admitted");
         assert_eq!(response["resultType"], "complete");
         assert!(matches!(
@@ -27505,11 +27668,12 @@ mod tests {
         });
 
         assert!(
-            dispatch_final_tasks_update(
+            ready_task_control(dispatch_final_tasks_update(
                 &runtime,
                 &McpContext::new(Cx::for_testing(), 1),
-                missing_metadata
-            )
+                missing_metadata,
+                crate::extensions::TaskControlReceipt::default(),
+            ))
             .is_err(),
             "changing only the final request metadata rejects tasks/update before mutation"
         );
@@ -27523,9 +27687,13 @@ mod tests {
 
         let mut admitted = final_task_method_parameters(&task_id);
         admitted["inputResponses"] = input_responses;
-        let response =
-            dispatch_final_tasks_update(&runtime, &McpContext::new(Cx::for_testing(), 1), admitted)
-                .expect("exact final metadata admits tasks/update");
+        let response = ready_task_control(dispatch_final_tasks_update(
+            &runtime,
+            &McpContext::new(Cx::for_testing(), 1),
+            admitted,
+            crate::extensions::TaskControlReceipt::default(),
+        ))
+        .expect("exact final metadata admits tasks/update");
         assert_eq!(response["resultType"], "complete");
         assert!(matches!(
             runtime
