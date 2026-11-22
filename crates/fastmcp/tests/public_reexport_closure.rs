@@ -789,6 +789,41 @@ fn facade_names_and_builds_the_proxy_legacy_notifications_a_backend_returns() {
     assert!(notifications.progress.is_empty());
 }
 
+/// Public metrics configuration, rendering and errors use only facade imports.
+#[test]
+fn facade_operator_prometheus_exports_are_usable_without_internal_crates() {
+    use fastmcp_rust::{
+        HttpMetricsConfig, HttpServerConfig, MAX_OPERATOR_PROMETHEUS_BYTES,
+        OPERATOR_PROMETHEUS_CONTENT_TYPE, OPERATOR_PROMETHEUS_SCHEMA_VERSION,
+        OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle,
+        OperatorMetricsError, OperatorProfile, OperatorSnapshot,
+    };
+
+    let config = HttpServerConfig::new().metrics(HttpMetricsConfig::public("/metrics"));
+    let _: &fastmcp_rust::server::HttpMetricsConfig = config.metrics.as_ref().unwrap();
+    let snapshot = OperatorSnapshot::http_connections(
+        std::time::Instant::now(),
+        7,
+        OperatorProfile::Modern,
+        OperatorLifecycle::Running,
+        OperatorConnectionCapacity {
+            limit: 2,
+            active: 1,
+            reserved: 0,
+        },
+        OperatorConnectionCounters::default(),
+    );
+    let text = snapshot.prometheus_text().unwrap();
+    assert!(text.len() <= MAX_OPERATOR_PROMETHEUS_BYTES);
+    assert_eq!(OPERATOR_PROMETHEUS_SCHEMA_VERSION, 1);
+    assert!(OPERATOR_PROMETHEUS_CONTENT_TYPE.starts_with("text/plain;"));
+    assert!(text.contains("fastmcp_operator_http_connections_active{profile=\"modern\"} 1\n"));
+    let error: fastmcp_rust::core::OperatorMetricsError = snapshot
+        .prometheus_text_with_limit(text.len() - 1)
+        .unwrap_err();
+    assert_eq!(error, OperatorMetricsError::ByteLimitExceeded);
+}
+
 /// Live consumer-position proof that `fastmcp_rust::modern::Server` exposes
 /// origin-guarded secured HTTP (and native HTTPS signatures) with live `/ready`
 /// and graceful `operator_handle().begin_drain()` through the facade alone.

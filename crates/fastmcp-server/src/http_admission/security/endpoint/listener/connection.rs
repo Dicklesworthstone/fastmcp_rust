@@ -61,6 +61,7 @@ pub(super) async fn serve(
             .with_diagnostics(
                 &endpoint.server.http_config.health_path,
                 &endpoint.server.http_config.readiness_path,
+                endpoint.server.http_config.metrics.as_ref(),
                 admission
                     .as_ref()
                     .is_some_and(HttpNativeConnectionAdmission::health_only),
@@ -116,7 +117,7 @@ pub(super) async fn serve(
             return;
         }
         Ingress::Request { request, cors } => (request, cors),
-        Ingress::Diagnostic { readiness, cors } => {
+        Ingress::Diagnostic { route, authorized, cors } => {
             let Some(current) = admission.take() else {
                 return;
             };
@@ -126,13 +127,19 @@ pub(super) async fn serve(
                 return;
             };
             *admission = Some(HttpNativeConnectionAdmission::Health(control));
-            let response = if readiness {
-                crate::http_readiness_response(
-                    endpoint.http_operator.as_ref(),
-                    crate::http_task_store_observation(&endpoint.server),
-                )
-            } else {
-                HttpResponse::ok().with_json(&serde_json::json!({ "status": "ok" }))
+            let response = match route {
+                crate::HttpDiagnosticRoute::Health => {
+                    HttpResponse::ok().with_json(&serde_json::json!({ "status": "ok" }))
+                }
+                crate::HttpDiagnosticRoute::Readiness => {
+                    crate::http_readiness_response(
+                        endpoint.http_operator.as_ref(),
+                        crate::http_task_store_observation(&endpoint.server),
+                    )
+                }
+                crate::HttpDiagnosticRoute::Metrics => {
+                    crate::http_metrics::metrics_response(endpoint.http_operator.as_ref(), authorized)
+                }
             };
             buffered(
                 cx,

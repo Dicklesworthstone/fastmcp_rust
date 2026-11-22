@@ -82,6 +82,7 @@ pub mod caching;
 pub mod extensions;
 mod handler;
 pub mod http_admission;
+mod http_metrics;
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod legacy_2024;
 mod middleware;
@@ -117,12 +118,13 @@ pub use extensions::{
 #[cfg(feature = "console")]
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_core::stats::{
-    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle,
-    OperatorOutputCapacity, OperatorOutputCounters, OperatorProfile, OperatorReadiness,
-    OperatorReason, OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource,
-    OperatorStdioOutput, OperatorStdioSnapshot, OperatorTaskExecution, OperatorTaskRetention,
-    OperatorTaskSnapshot, OperatorTaskStates, OperatorTaskStorage, OperatorTaskStore, ServerStats,
-    StatsSnapshot,
+    MAX_OPERATOR_PROMETHEUS_BYTES, OPERATOR_PROMETHEUS_CONTENT_TYPE,
+    OPERATOR_PROMETHEUS_SCHEMA_VERSION, OperatorConnectionCapacity, OperatorConnectionCounters,
+    OperatorLifecycle, OperatorMetricsError, OperatorOutputCapacity, OperatorOutputCounters,
+    OperatorProfile, OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorSnapshotError,
+    OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot, OperatorTaskExecution,
+    OperatorTaskRetention, OperatorTaskSnapshot, OperatorTaskStates, OperatorTaskStorage,
+    OperatorTaskStore, ServerStats, StatsSnapshot,
 };
 use fastmcp_protocol::{
     MAX_CLIENT_REGISTRATION_BYTES, SecurityDocumentKind, admit_security_document,
@@ -143,6 +145,8 @@ pub use handler::{
     create_context_with_progress, create_context_with_progress_and_senders,
     promote_legacy_prompt_messages, promote_legacy_resource_contents, promote_legacy_tool_content,
 };
+use http_metrics::HttpDiagnosticRoute;
+pub use http_metrics::HttpMetricsConfig;
 pub use middleware::continuation_replay::{
     ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
 };
@@ -4310,6 +4314,13 @@ pub struct HttpServerConfig {
     /// reject overlap with protected-resource metadata. Embedding adapters
     /// without a bound listener cannot claim connection readiness.
     pub readiness_path: String,
+    /// Optional Prometheus diagnostics with independent scrape access control.
+    ///
+    /// Disabled by default. The route uses the same bounded diagnostic lane as
+    /// health/readiness, never MCP authentication or protocol dispatch. A
+    /// successfully captured saturated/draining snapshot still returns 200;
+    /// the exported gauges describe its state. Snapshot failure returns 503.
+    pub metrics: Option<HttpMetricsConfig>,
     /// Maximum number of concurrent connections (default: 64).
     pub max_connections: usize,
     /// Time allowed to receive one complete request on an accepted
@@ -4419,6 +4430,7 @@ impl Default for HttpServerConfig {
         Self {
             health_path: "/health".to_string(),
             readiness_path: "/ready".to_string(),
+            metrics: None,
             max_connections: 64,
             request_read_timeout: DEFAULT_HTTP_REQUEST_READ_TIMEOUT,
             response_write_timeout: DEFAULT_HTTP_RESPONSE_WRITE_TIMEOUT,
@@ -4464,6 +4476,33 @@ impl HttpServerConfig {
     pub fn readiness_path(mut self, path: impl Into<String>) -> Self {
         self.readiness_path = path.into();
         self
+    }
+
+    /// Installs a bounded Prometheus route with explicit independent access.
+    ///
+    /// The path must be distinct from health, readiness, MCP, legacy, OAuth,
+    /// and protected-resource metadata routes. Metrics contain only the live
+    /// listener's closed operational vocabulary, never peer identities.
+    #[must_use]
+    pub fn metrics(mut self, config: HttpMetricsConfig) -> Self {
+        self.metrics = Some(config);
+        self
+    }
+
+    fn diagnostic_route(&self, path: &str) -> Option<HttpDiagnosticRoute> {
+        if path == self.health_path {
+            Some(HttpDiagnosticRoute::Health)
+        } else if path == self.readiness_path {
+            Some(HttpDiagnosticRoute::Readiness)
+        } else if self
+            .metrics
+            .as_ref()
+            .is_some_and(|metrics| path == metrics.path())
+        {
+            Some(HttpDiagnosticRoute::Metrics)
+        } else {
+            None
+        }
     }
 
     /// Sets the maximum number of concurrent connections.
@@ -4627,7 +4666,10 @@ fn validate_server_http_route_configuration(
     for path in [
         server.http_config.health_path.as_str(),
         server.http_config.readiness_path.as_str(),
-    ] {
+    ]
+    .into_iter()
+    .chain(server.http_config.metrics.as_ref().map(HttpMetricsConfig::path))
+    {
         if !path.starts_with('/')
             || path.starts_with("//")
             || path.len() > 1024
@@ -9161,11 +9203,7 @@ fn http_diagnostic_response(
     operator: Option<&HttpOperatorHandle>,
     request: &HttpRequest,
 ) -> Option<HttpResponse> {
-    if request.path != server.http_config.health_path
-        && request.path != server.http_config.readiness_path
-    {
-        return None;
-    }
+    let route = server.http_config.diagnostic_route(&request.path)?;
     let response = if request
         .header("origin")
         .is_some_and(|origin| !server.http_config.handler_config.admits_origin(origin))
@@ -9175,10 +9213,23 @@ fn http_diagnostic_response(
         HttpResponse::new(HttpStatus::METHOD_NOT_ALLOWED).with_header("allow", "GET")
     } else if !request.body.is_empty() || !request.query.is_empty() {
         HttpResponse::bad_request()
-    } else if request.path == server.http_config.health_path {
-        HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"}))
     } else {
-        http_readiness_response(operator, http_task_store_observation(server))
+        match route {
+            HttpDiagnosticRoute::Health => {
+                HttpResponse::ok().with_json(&serde_json::json!({"status": "ok"}))
+            }
+            HttpDiagnosticRoute::Readiness => {
+                http_readiness_response(operator, http_task_store_observation(server))
+            }
+            HttpDiagnosticRoute::Metrics => http_metrics::metrics_response(
+                operator,
+                server.http_config.metrics.as_ref().is_some_and(|metrics| {
+                    metrics.authorizes(request.headers.iter().map(|(name, value)| {
+                        (name.as_str(), value.as_str())
+                    }))
+                }),
+            ),
+        }
     };
     Some(response.with_header("cache-control", "no-store"))
 }
@@ -16364,8 +16415,7 @@ async fn serve_native_http_diagnostic(
         .uri
         .split_once('?')
         .map_or(request.uri.as_str(), |(path, _)| path);
-    let diagnostic = path == endpoint.server.http_config.health_path
-        || path == endpoint.server.http_config.readiness_path;
+    let diagnostic = endpoint.server.http_config.diagnostic_route(path).is_some();
     if !diagnostic && !admission.health_only() {
         return Some(admission);
     }
@@ -58345,6 +58395,284 @@ mod lib_unit_tests {
                 .join()
                 .map_err(|_| "readiness probe controller panicked")??;
             require_quiescent_http_shutdown(shutdown, "readiness probe").await
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_http_metrics_require_dedicated_auth_and_redact_request_data() {
+        #[derive(Debug)]
+        struct MetricsAuthMustNotRun(Arc<AtomicUsize>);
+
+        impl AuthProvider for MetricsAuthMustNotRun {
+            fn authenticate(
+                &self,
+                _ctx: &McpContext,
+                _request: AuthRequest<'_>,
+            ) -> McpResult<AuthContext> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(McpError::invalid_request("MCP auth must not serve metrics"))
+            }
+        }
+
+        run_live_http_test(|cx| async move {
+            let auth_calls = Arc::new(AtomicUsize::new(0));
+            let metrics = HttpMetricsConfig::bearer("/metrics", "scrape-secret-canary")
+                .map_err(|error| error.to_string())?;
+            let bound = Server::new("private-metrics-server-canary", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .map_err(|error| error.to_string())?
+                .auth_provider(MetricsAuthMustNotRun(Arc::clone(&auth_calls)))
+                .http_config(HttpServerConfig::new().max_connections(1).metrics(metrics))
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let operator = bound.operator_handle();
+            let limiter = Arc::clone(&bound.connection_limiter);
+            let control_active = Arc::clone(&bound.endpoint.health_control_active);
+            let caller_cx = cx.clone();
+            let controller = thread::spawn(move || -> Result<(), String> {
+                let _cancel = NativeHttpWriteProbeCancellation(caller_cx);
+                native_http_write_probe_wait("metrics listener running", || {
+                    operator
+                        .operator_snapshot()
+                        .is_ok_and(|snapshot| snapshot.lifecycle() == OperatorLifecycle::Running)
+                })?;
+                for (authorization, status) in [
+                    ("", "401"),
+                    ("Authorization: Bearer wrong-secret-canary\r\n", "401"),
+                    ("Authorization: Bearer mcp-credential-canary\r\n", "401"),
+                    (
+                        "Authorization: Bearer scrape-secret-canary\r\nauthorization: Bearer scrape-secret-canary\r\n",
+                        "400",
+                    ),
+                    ("Authorization: Bearer scrape-secret-canary\r\n", "200"),
+                ] {
+                    let request = format!(
+                        "GET /metrics HTTP/1.1\r\nHost: {address}\r\n{authorization}X-Private: header-value-canary\r\nCookie: session=cookie-value-canary\r\nConnection: close\r\n\r\n"
+                    );
+                    let raw = native_http_write_probe_exchange(address, request.as_bytes())?;
+                    let text = std::str::from_utf8(&raw).map_err(|error| error.to_string())?;
+                    assert!(
+                        text.starts_with(&format!("HTTP/1.1 {status} ")),
+                        "unexpected metrics authorization response: {text}"
+                    );
+                    for forbidden in [
+                        "scrape-secret-canary",
+                        "wrong-secret-canary",
+                        "mcp-credential-canary",
+                        "header-value-canary",
+                        "cookie-value-canary",
+                        "private-metrics-server-canary",
+                        "127.0.0.1",
+                    ] {
+                        assert!(
+                            !text.contains(forbidden),
+                            "metrics response disclosed request or server data: {forbidden}"
+                        );
+                    }
+                    let body = live_http_response_body(&raw)?;
+                    if status == "200" {
+                        let headers = text.to_ascii_lowercase();
+                        assert!(headers.contains("cache-control: no-store\r\n"));
+                        assert!(headers.contains(&format!(
+                            "content-type: {}\r\n",
+                            fastmcp_core::OPERATOR_PROMETHEUS_CONTENT_TYPE
+                        )));
+                        assert!(body.len() <= fastmcp_core::MAX_OPERATOR_PROMETHEUS_BYTES);
+                        let body = std::str::from_utf8(body).map_err(|error| error.to_string())?;
+                        for sample in [
+                            "fastmcp_operator_http_connections_active{profile=\"modern\"} 0",
+                            "fastmcp_operator_http_connections_reserved{profile=\"modern\"} 0",
+                            "fastmcp_operator_http_connections_saturated{profile=\"modern\"} 0",
+                            "fastmcp_operator_http_readiness_ready{profile=\"modern\"} 1",
+                        ] {
+                            assert!(body.lines().any(|line| line == sample), "missing {sample}");
+                        }
+                    } else {
+                        assert!(
+                            !body
+                                .windows(b"fastmcp_operator_".len())
+                                .any(|window| window == b"fastmcp_operator_"),
+                            "unauthorized or ambiguous credentials received metrics"
+                        );
+                    }
+                    native_http_write_probe_wait("metrics diagnostic released", || {
+                        limiter.active.load(Ordering::Acquire) == 0
+                            && !control_active.load(Ordering::Acquire)
+                    })?;
+                }
+                assert_eq!(auth_calls.load(Ordering::SeqCst), 0);
+                let snapshot = operator
+                    .operator_snapshot()
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(snapshot.connections().active, 0);
+                assert_eq!(snapshot.connections().reserved, 0);
+                assert_eq!(
+                    snapshot.counters().accepted + snapshot.counters().probes_acquired,
+                    snapshot.counters().released,
+                    "authorized and rejected scrapes must release every protocol permit"
+                );
+                Ok(())
+            });
+            let shutdown = bound.serve(&cx).await.map_err(|error| error.to_string())?;
+            controller
+                .join()
+                .map_err(|_| "metrics authorization controller panicked")??;
+            require_quiescent_http_shutdown(shutdown, "metrics authorization").await
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_http_metrics_survive_saturation_and_drain_with_one_control_lane() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("metrics-capacity-live", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .map_err(|error| error.to_string())?
+                .http_config(
+                    HttpServerConfig::new()
+                        .max_connections(1)
+                        .metrics(HttpMetricsConfig::public("/metrics")),
+                )
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let operator = bound.operator_handle();
+            let limiter = Arc::clone(&bound.connection_limiter);
+            let control_active = Arc::clone(&bound.endpoint.health_control_active);
+            let caller_cx = cx.clone();
+            let controller = thread::spawn(move || -> Result<(), String> {
+                let _cancel = NativeHttpWriteProbeCancellation(caller_cx.clone());
+                native_http_write_probe_wait("metrics capacity listener running", || {
+                    operator
+                        .operator_snapshot()
+                        .is_ok_and(|snapshot| snapshot.lifecycle() == OperatorLifecycle::Running)
+                })?;
+                let request = format!(
+                    "GET /metrics HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+                );
+                let scrape = || -> Result<String, String> {
+                    let raw = native_http_write_probe_exchange(address, request.as_bytes())?;
+                    let text = std::str::from_utf8(&raw).map_err(|error| error.to_string())?;
+                    if !text.starts_with("HTTP/1.1 200 ") {
+                        return Err(format!("operational scrape failed: {text}"));
+                    }
+                    let body = std::str::from_utf8(live_http_response_body(&raw)?)
+                        .map_err(|error| error.to_string())?
+                        .to_owned();
+                    native_http_write_probe_wait("metrics control lane release", || {
+                        !control_active.load(Ordering::Acquire)
+                    })?;
+                    Ok(body)
+                };
+                let has_sample = |body: &str, name: &str, value: usize| {
+                    let expected =
+                        format!("fastmcp_operator_http_{name}{{profile=\"modern\"}} {value}");
+                    assert!(
+                        body.lines().any(|line| line == expected),
+                        "scrape missing {expected}"
+                    );
+                };
+
+                let baseline = scrape()?;
+                has_sample(&baseline, "connections_active", 0);
+                has_sample(&baseline, "connections_reserved", 0);
+                has_sample(&baseline, "connections_saturated", 0);
+
+                let reservation = operator
+                    .admission_probe()
+                    .acquire(&caller_cx, Instant::now() + Duration::from_secs(20))
+                    .map_err(|error| error.to_string())?;
+                let saturated = scrape()?;
+                has_sample(&saturated, "connections_active", 0);
+                has_sample(&saturated, "connections_reserved", 1);
+                has_sample(&saturated, "connections_saturated", 1);
+                has_sample(&saturated, "readiness_ready", 1);
+
+                // A slow diagnostic client occupies only the one overflow lane.
+                // Even another valid scrape is closed while that lane is held.
+                let mut stalled = native_http_write_probe_connect(address)?;
+                std::io::Write::write_all(&mut stalled, b"GET /metrics HTTP/1.1\r\n")
+                    .map_err(|error| error.to_string())?;
+                native_http_write_probe_wait("single metrics control lane occupied", || {
+                    control_active.load(Ordering::Acquire)
+                })?;
+                let mut excess = native_http_write_probe_connect(address)?;
+                match std::io::Write::write_all(&mut excess, request.as_bytes()) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                let mut excess_response = Vec::new();
+                match std::io::Read::read_to_end(&mut excess, &mut excess_response) {
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                assert!(
+                    excess_response.is_empty(),
+                    "a second diagnostic connection bypassed the bounded control lane"
+                );
+                drop(excess);
+                drop(stalled);
+                native_http_write_probe_wait("stalled metrics control lane released", || {
+                    !control_active.load(Ordering::Acquire)
+                })?;
+                let recovered = scrape()?;
+                has_sample(&recovered, "connections_reserved", 1);
+                has_sample(&recovered, "connections_saturated", 1);
+                drop(reservation);
+                let recovered = scrape()?;
+                has_sample(&recovered, "connections_reserved", 0);
+                has_sample(&recovered, "connections_saturated", 0);
+
+                operator.begin_drain().map_err(|error| error.to_string())?;
+                let draining = scrape()?;
+                has_sample(&draining, "lifecycle_stopping", 1);
+                has_sample(&draining, "readiness_stopping", 1);
+                has_sample(&draining, "connections_active", 0);
+                has_sample(&draining, "connections_reserved", 0);
+                let ready_request =
+                    format!("GET /ready HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+                let ready = native_http_write_probe_exchange(address, ready_request.as_bytes())?;
+                assert!(ready.starts_with(b"HTTP/1.1 503 "));
+                native_http_write_probe_health(address)?;
+                native_http_write_probe_wait("final metrics permit release", || {
+                    limiter.active.load(Ordering::Acquire) == 0
+                        && !control_active.load(Ordering::Acquire)
+                })?;
+                let snapshot = operator
+                    .operator_snapshot()
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(snapshot.lifecycle(), OperatorLifecycle::Stopping);
+                assert_eq!(snapshot.connections().active, 0);
+                assert_eq!(snapshot.connections().reserved, 0);
+                assert_eq!(
+                    snapshot.counters().accepted + snapshot.counters().probes_acquired,
+                    snapshot.counters().released,
+                    "scrapes, overflow rejection, and drain must conserve every slot"
+                );
+                Ok(())
+            });
+            let shutdown = bound.serve(&cx).await.map_err(|error| error.to_string())?;
+            controller
+                .join()
+                .map_err(|_| "metrics capacity controller panicked")??;
+            require_quiescent_http_shutdown(shutdown, "metrics capacity").await
         });
     }
 

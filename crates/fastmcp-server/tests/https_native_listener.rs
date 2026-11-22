@@ -57,8 +57,8 @@ use fastmcp_server::oauth::{
     OAuthServerConfig,
 };
 use fastmcp_server::{
-    AuthProvider, AuthRequest, HttpOperatorHandle, HttpServerConfig, HttpServerShutdown, Server,
-    StaticTokenVerifier, TokenAuthProvider, ToolHandler,
+    AuthProvider, AuthRequest, HttpMetricsConfig, HttpOperatorHandle, HttpServerConfig,
+    HttpServerShutdown, Server, StaticTokenVerifier, TokenAuthProvider, ToolHandler,
 };
 use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpResponse, HttpStatus};
 use serde_json::{Value, json};
@@ -1727,5 +1727,355 @@ fn https_native_readiness_control_handshakes_are_bounded_and_recover_capacity() 
                 .in_use(),
             0
         );
+    });
+}
+
+const METRICS_TOKEN: &str = "test-only-native-tls-scrape-credential";
+
+fn metrics_server(probe: &Probe, capacity: usize, config: HttpMetricsConfig) -> Server {
+    Server::new("private-tls-metrics-server", "private-tls-metrics-version")
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .unwrap()
+        .http_config(
+            HttpServerConfig::new()
+                .health_path("/livez")
+                .readiness_path("/readyz")
+                .max_connections(capacity)
+                .metrics(config),
+        )
+        .auth_provider(probe.clone())
+        .tool(probe.clone())
+        .build()
+}
+
+fn metrics_request(token: &str) -> HttpRequest {
+    diagnostic("/metrics").with_header("authorization", format!("Bearer {token}"))
+}
+
+fn https_metrics(bytes: &[u8]) -> std::collections::BTreeMap<String, u64> {
+    let response = decode_wire(bytes);
+    assert_eq!(response.status.0, 200);
+    assert_eq!(response.headers["cache-control"], "no-store");
+    assert_eq!(response.headers["access-control-allow-origin"], ORIGIN);
+    assert_eq!(
+        response.headers["content-type"],
+        fastmcp_core::OPERATOR_PROMETHEUS_CONTENT_TYPE,
+    );
+    assert!(!response.headers.contains_key("www-authenticate"));
+    assert!(response.body.len() <= fastmcp_core::MAX_OPERATOR_PROMETHEUS_BYTES);
+    let text = std::str::from_utf8(&response.body).unwrap();
+    assert!(text.ends_with('\n'));
+    let mut values = std::collections::BTreeMap::new();
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let (name, value) = line.split_once(' ').expect("a metric has a numeric value");
+        let name = name
+            .strip_prefix("fastmcp_operator_http_")
+            .unwrap()
+            .strip_suffix("{profile=\"modern\"}")
+            .expect("only the closed profile label may appear");
+        assert!(
+            values
+                .insert(name.to_owned(), value.parse().unwrap())
+                .is_none()
+        );
+    }
+    assert_eq!(values.len(), 30);
+    let wire = std::str::from_utf8(bytes).unwrap();
+    for private in [
+        METRICS_TOKEN,
+        TOKEN,
+        SUBJECT,
+        TOOL,
+        "private-tls-metrics-server",
+        "private-tls-metrics-version",
+        "private-tls-health-cookie",
+        "private-tls-health-request-id",
+    ] {
+        assert!(
+            !wire.contains(private),
+            "metrics exposed private request or server context"
+        );
+    }
+    values
+}
+
+#[test]
+fn https_native_metrics_require_separate_credentials_and_preserve_raw_security() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let running = Running::configured(
+            &cx,
+            metrics_server(
+                &probe,
+                1,
+                HttpMetricsConfig::bearer("/metrics", METRICS_TOKEN).unwrap(),
+            ),
+            policy(),
+            Duration::from_secs(30),
+        )
+        .await;
+        wait_operator(&running.operator, |snapshot| {
+            snapshot.lifecycle() == OperatorLifecycle::Running
+        })
+        .await;
+        let values = https_metrics(
+            &exchange(&cx, running.address, metrics_request(METRICS_TOKEN))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(values["readiness_ready"], 1);
+        assert_eq!(values["connections_active"], 0);
+        assert_eq!(values["connections_reserved"], 0);
+        assert_eq!(probe.counts(), (0, 0));
+
+        let mut missing_token = metrics_request(METRICS_TOKEN);
+        missing_token.headers.remove("authorization");
+        for request in [
+            missing_token,
+            metrics_request(TOKEN),
+            metrics_request("private-invalid-metrics-token"),
+            metrics_request(METRICS_TOKEN)
+                .with_header("authorization", format!("Basic {METRICS_TOKEN}")),
+        ] {
+            let response = decode_wire(&exchange(&cx, running.address, request).await.unwrap());
+            assert_eq!(response.status.0, 401);
+            assert_eq!(
+                response.headers["www-authenticate"],
+                "Bearer realm=\"fastmcp-metrics\""
+            );
+            assert_eq!(response.headers["cache-control"], "no-store");
+            assert_eq!(response.headers["access-control-allow-origin"], ORIGIN);
+            assert!(
+                response.body.is_empty(),
+                "failed scrape authentication reveals no snapshot"
+            );
+            assert_eq!(probe.counts(), (0, 0), "MCP auth cannot authorize a scrape");
+        }
+
+        for (request, status) in [
+            (
+                metrics_request(METRICS_TOKEN).with_header("host", "private-evil-host.example"),
+                403,
+            ),
+            (
+                metrics_request(METRICS_TOKEN)
+                    .with_header("origin", "https://private-evil-origin.example"),
+                403,
+            ),
+            (
+                diagnostic("/metrics?private-query-canary")
+                    .with_header("authorization", format!("Bearer {METRICS_TOKEN}")),
+                400,
+            ),
+            (
+                metrics_request(METRICS_TOKEN).with_body(b"private-body-canary".to_vec()),
+                400,
+            ),
+            (
+                HttpRequest::new(HttpMethod::Post, "/metrics")
+                    .with_header("host", "localhost")
+                    .with_header("authorization", format!("Bearer {METRICS_TOKEN}")),
+                405,
+            ),
+        ] {
+            let bytes = exchange(&cx, running.address, request).await.unwrap();
+            let response = decode_wire(&bytes);
+            assert_eq!(response.status.0, status);
+            assert_eq!(response.headers["cache-control"], "no-store");
+            assert!(response.body.is_empty());
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains("private-"));
+            assert!(!text.contains(METRICS_TOKEN));
+            assert_eq!(probe.counts(), (0, 0));
+        }
+
+        for suffix in [
+            format!("Authorization: Bearer {METRICS_TOKEN}\r\n\r\n"),
+            "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n".to_owned(),
+            "\r\nGET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n".to_owned(),
+        ] {
+            let raw = format!(
+                "GET /metrics HTTP/1.1\r\nHost: localhost\r\nOrigin: {ORIGIN}\r\nauthorization: Bearer {METRICS_TOKEN}\r\nContent-Length: 0\r\nConnection: close\r\n{suffix}"
+            );
+            let response = decode_wire(
+                &exchange_bytes(&cx, running.address, raw.into_bytes())
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(response.status.0, 400);
+            assert!(response.body.is_empty());
+            assert_eq!(probe.counts(), (0, 0));
+        }
+
+        // Credential separation is bidirectional: installing a scrape token
+        // must not silently grant that token MCP authentication authority.
+        let refused =
+            request(false).with_header("authorization", format!("Bearer {METRICS_TOKEN}"));
+        let response = decode_wire(&exchange(&cx, running.address, refused).await.unwrap());
+        assert_eq!(response.status.0, 401);
+        assert_eq!(probe.counts(), (1, 0));
+        success(
+            &decode_wire(
+                &exchange(&cx, running.address, request(false))
+                    .await
+                    .unwrap(),
+            ),
+            false,
+        );
+        assert_eq!(probe.counts(), (2, 1));
+        running.stop(&cx).await;
+    });
+}
+
+#[test]
+fn https_native_metrics_observe_reserved_capacity_and_drain_without_consuming_it() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let running = Running::configured(
+            &cx,
+            metrics_server(
+                &probe,
+                1,
+                HttpMetricsConfig::bearer("/metrics", METRICS_TOKEN).unwrap(),
+            ),
+            policy(),
+            Duration::from_secs(30),
+        )
+        .await;
+        wait_operator(&running.operator, |snapshot| {
+            snapshot.lifecycle() == OperatorLifecycle::Running
+        })
+        .await;
+        let permit = running
+            .operator
+            .admission_probe()
+            .acquire(&cx, std::time::Instant::now() + Duration::from_secs(25))
+            .unwrap();
+        let before = OperatorSnapshot::capture(&running.operator).unwrap();
+        assert_eq!(before.connections().reserved, 1);
+        assert_eq!(before.connections().active, 0);
+        let generation = before.configuration_generation();
+        for _ in 0..2 {
+            let values = https_metrics(
+                &exchange(&cx, running.address, metrics_request(METRICS_TOKEN))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(values["configuration_generation"], generation);
+            assert_eq!(values["connections_reserved"], 1);
+            assert_eq!(values["connections_active"], 0);
+            assert_eq!(values["connections_saturated"], 1);
+            assert_eq!(
+                values["readiness_ready"], 1,
+                "saturation is distinct from structural readiness"
+            );
+            let after = OperatorSnapshot::capture(&running.operator).unwrap();
+            assert_eq!(after.connections(), before.connections());
+            assert_eq!(after.counters().accepted, before.counters().accepted);
+            assert_eq!(after.counters().released, before.counters().released);
+            assert_eq!(
+                after.counters().probes_acquired,
+                before.counters().probes_acquired
+            );
+        }
+        let denied = decode_wire(
+            &exchange(&cx, running.address, metrics_request(TOKEN))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(denied.status.0, 401);
+        assert!(denied.body.is_empty());
+        assert_eq!(
+            OperatorSnapshot::capture(&running.operator)
+                .unwrap()
+                .connections(),
+            before.connections()
+        );
+        assert_eq!(probe.counts(), (0, 0));
+
+        drop(permit);
+        let recovered = https_metrics(
+            &exchange(&cx, running.address, metrics_request(METRICS_TOKEN))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(recovered["connections_reserved"], 0);
+        assert_eq!(recovered["connections_saturated"], 0);
+        assert_eq!(recovered["configuration_generation"], generation);
+        running.operator.begin_drain().unwrap();
+        let draining = https_metrics(
+            &exchange(&cx, running.address, metrics_request(METRICS_TOKEN))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(draining["lifecycle_stopping"], 1);
+        assert_eq!(draining["readiness_stopping"], 1);
+        assert_eq!(draining["readiness_ready"], 0);
+        let refused = decode_wire(
+            &exchange(&cx, running.address, request(false))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            refused.status.0, 503,
+            "the diagnostics lane cannot admit MCP after drain"
+        );
+        assert_eq!(probe.counts(), (0, 0));
+        let operator = running.operator.clone();
+        running.stop(&cx).await;
+        let stopped = OperatorSnapshot::capture(&operator).unwrap();
+        assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+        assert_eq!(stopped.connections().in_use(), 0);
+        assert_eq!(
+            stopped.counters().accepted + stopped.counters().probes_acquired,
+            stopped.counters().released
+        );
+    });
+}
+
+#[test]
+fn https_native_metrics_are_opt_in_and_route_collisions_fail_before_binding() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let metadata_path = policy().resource_metadata_path().unwrap().to_owned();
+        for path in ["/mcp", "/livez", "/readyz", metadata_path.as_str()] {
+            let server = metrics_server(&probe, 1, HttpMetricsConfig::public(path));
+            let error = match Box::pin(server.bind_secured_https(
+                &cx,
+                "not-a-socket-address",
+                policy(),
+                acceptor(),
+            ))
+            .await
+            {
+                Ok(_) => panic!("overlapping diagnostics must fail before socket binding"),
+                Err(error) => error,
+            };
+            assert!(
+                error.message.contains("route"),
+                "route admission must fail before address resolution: {error}"
+            );
+        }
+        assert_eq!(probe.counts(), (0, 0));
+
+        let running = Running::configured(
+            &cx,
+            readiness_server(&probe, 1),
+            policy(),
+            Duration::from_secs(30),
+        )
+        .await;
+        let response = decode_wire(
+            &exchange(&cx, running.address, metrics_request(METRICS_TOKEN))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            response.status.0, 404,
+            "ordinary listeners do not expose metrics implicitly"
+        );
+        assert!(response.body.is_empty());
+        assert_eq!(probe.counts(), (0, 0));
+        running.stop(&cx).await;
     });
 }

@@ -160,9 +160,10 @@ impl Server {
                 "secured HTTP policy does not match the MCP route",
             ));
         }
-        if policy.resource_metadata_path().is_some_and(|path| {
-            path == self.http_config.health_path || path == self.http_config.readiness_path
-        }) {
+        if policy
+            .resource_metadata_path()
+            .is_some_and(|path| self.http_config.diagnostic_route(path).is_some())
+        {
             return Err(McpError::invalid_request(
                 "secured HTTP diagnostic and resource metadata routes overlap",
             ));

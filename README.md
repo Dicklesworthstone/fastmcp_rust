@@ -848,6 +848,47 @@ listeners. Embedding adapters without a bound listener cannot report live
 connection readiness. These observations do not establish upstream
 availability, durable Tasks, or OAuth security qualification.
 
+### Bounded Prometheus diagnostics (current source tree)
+
+Metrics are disabled by default. Install a separate diagnostic route with an
+explicit access policy on either native HTTP listener:
+
+```rust
+use fastmcp_rust::{HttpMetricsConfig, HttpServerConfig, McpResult};
+
+fn http_config(scrape_token: &str) -> McpResult<HttpServerConfig> {
+    Ok(HttpServerConfig::new().metrics(
+        HttpMetricsConfig::bearer("/metrics", scrape_token)?,
+    ))
+}
+```
+
+The scrape credential is independent of MCP authentication. Only a
+purpose-specific keyed verifier is retained; authorization happens before
+snapshot capture. Use HTTPS or a trusted TLS terminator when transmitting the
+credential. `HttpMetricsConfig::public("/metrics")` explicitly permits public
+scrapes when that is the deployment's intended policy. Route collisions fail
+before binding, including OAuth and protected-resource metadata routes.
+
+The GET response uses Prometheus text 0.0.4, `Cache-Control: no-store`, and a
+16 KiB output ceiling. A successful capture returns 200 even during saturation
+or drain, so those conditions remain observable as gauges; an unavailable
+snapshot returns 503. Metrics share the single bounded diagnostic lane with
+health/readiness and release protocol admission before capture. Secured HTTP
+and HTTPS preserve their Host, Origin, framing, and diagnostic I/O limits.
+
+The same `prometheus_text()` and `prometheus_text_with_limit(bytes)` methods
+are available on HTTP, client-executor, and stdio-output snapshots for
+application-owned exporters. Each contributor has 30 fixed series, prefixed
+`fastmcp_operator_http_`, `fastmcp_operator_executor_`, or
+`fastmcp_operator_stdio_`. The only label is the closed protocol `profile`;
+configuration generations, schema versions, lifecycle, readiness, capacity,
+and overflow are values. No endpoint, tool, principal, request, token, or error
+text becomes a metric label. Encoding performs no I/O, takes no admission
+permit, and never writes to protocol stdout. The built-in route exports the
+HTTP connection contributor; it does not infer Task, authentication, or
+upstream health from that snapshot.
+
 ### Modern subscription admission (current source tree)
 
 Modern subscription listeners share a server-wide capacity of 64 streams and

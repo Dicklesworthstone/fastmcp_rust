@@ -15,36 +15,36 @@ use super::super::super::{
 };
 use crate::{
     BytesMut, Decoder, Encoder, Framed, HTTP_ACCEPT_CANCEL_POLL, HTTP_HEALTH_MAX_HEADER_BYTES,
-    Http1DecodeError, Http1Response, HttpListenerShutdown, NativeHttp1Codec, OAuthHttpRoutes,
-    OAuthNativeH1RouteLimits,
+    Http1DecodeError, Http1Response, HttpDiagnosticRoute, HttpListenerShutdown, HttpMetricsConfig,
+    NativeHttp1Codec, OAuthHttpRoutes, OAuthNativeH1RouteLimits,
 };
 
 const MAX_REQUEST_LINE_BYTES: usize = 8192;
 const MAX_EXPECTATION_MEMBERS: usize = 16;
 const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
-pub(super) enum Ingress {
-    Request {
+pub(super) enum Ingress {    Request {
         request: Request,
         cors: CorsResponseHeaders,
     },
     Immediate(HttpResponse),
     Diagnostic {
-        readiness: bool,
+        route: HttpDiagnosticRoute,
+        authorized: bool,
         cors: CorsResponseHeaders,
     },
     // Head admission only, never a dispatch or authentication permit.
     Continue,
 }
 
-enum AdmittedHead {
-    Post {
+enum AdmittedHead {    Post {
         cors: CorsResponseHeaders,
         send_continue: bool,
     },
     Immediate(HttpResponse),
     Diagnostic {
-        readiness: bool,
+        route: HttpDiagnosticRoute,
+        authorized: bool,
         cors: CorsResponseHeaders,
     },
 }
@@ -55,6 +55,7 @@ pub(super) struct SecuredCodec {
     body_limit: usize,
     oauth_limits: Option<OAuthNativeH1RouteLimits>,
     diagnostic_paths: Option<(String, String)>,
+    metrics: Option<HttpMetricsConfig>,
     health_only: bool,
     cors: Option<CorsResponseHeaders>,
     finished: bool,
@@ -69,6 +70,7 @@ impl SecuredCodec {
             body_limit,
             oauth_limits: None,
             diagnostic_paths: None,
+            metrics: None,
             health_only: false,
             cors: None,
             finished: false,
@@ -85,9 +87,11 @@ impl SecuredCodec {
         mut self,
         health_path: &str,
         readiness_path: &str,
+        metrics: Option<&HttpMetricsConfig>,
         health_only: bool,
     ) -> Self {
         self.diagnostic_paths = Some((health_path.to_owned(), readiness_path.to_owned()));
+        self.metrics = metrics.cloned();
         self.health_only = health_only;
         self
     }
@@ -129,9 +133,11 @@ impl SecuredCodec {
             .as_ref()
             .and_then(|(health, readiness)| {
                 if path == health {
-                    Some(false)
+                    Some(HttpDiagnosticRoute::Health)
                 } else if path == readiness {
-                    Some(true)
+                    Some(HttpDiagnosticRoute::Readiness)
+                } else if self.metrics.as_ref().is_some_and(|metrics| path == metrics.path()) {
+                    Some(HttpDiagnosticRoute::Metrics)
                 } else {
                     None
                 }
@@ -277,8 +283,14 @@ impl SecuredCodec {
                 Ok(AdmittedHead::Immediate(response))
             }
             HttpSecurityHead::Post(cors) => {
-                if let Some(readiness) = diagnostic {
-                    return Ok(AdmittedHead::Diagnostic { readiness, cors });
+                if let Some(route) = diagnostic {
+                    let authorized = route != HttpDiagnosticRoute::Metrics
+                        || self.metrics.as_ref().is_some_and(|metrics| {
+                            metrics.authorizes(headers.iter().map(|(name, value)| {
+                                (name.as_str(), value.as_str())
+                            }))
+                        });
+                    return Ok(AdmittedHead::Diagnostic { route, authorized, cors });
                 }
                 // RFC 9110 10.1.1: never wait for content before acknowledging
                 // an admitted HTTP/1.1 expectation. HTTP/1.0 ignores it, and no
@@ -361,10 +373,10 @@ impl Decoder for SecuredCodec {
                     self.finished = true;
                     return Ok(Some(Ingress::Immediate(response)));
                 }
-                Ok(AdmittedHead::Diagnostic { readiness, cors }) => {
+                Ok(AdmittedHead::Diagnostic { route, authorized, cors }) => {
                     source.clear();
                     self.finished = true;
-                    return Ok(Some(Ingress::Diagnostic { readiness, cors }));
+                    return Ok(Some(Ingress::Diagnostic { route, authorized, cors }));
                 }
                 Ok(AdmittedHead::Post {
                     cors,
