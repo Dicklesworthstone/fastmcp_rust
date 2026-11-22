@@ -1677,6 +1677,11 @@ impl std::fmt::Debug for ProgressReporter {
 /// `McpContext` and applying consuming builders; constructing a new context
 /// around a cloned [`Cx`] would reset FastMCP's request-local accounting.
 ///
+/// Client requests and cross-component calls check the current authentication
+/// verdict before invoking their provider and before returning its result.
+/// Expiry or policy revocation denies those capabilities without cancelling
+/// the caller's runtime or granting a cancellation mask new authority.
+///
 /// # Example
 ///
 /// ```ignore
@@ -2919,6 +2924,27 @@ impl McpContext {
         Ok(())
     }
 
+    /// Admission and delivery fence for request-owned capabilities. Keep this
+    /// separate from cooperative cancellation: a mask may defer cancellation,
+    /// but it cannot extend an expired or revoked authentication verdict.
+    fn ensure_capability_live(&self) -> crate::McpResult<()> {
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        if self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|auth| !auth.verification_is_current())
+        {
+            return Err(crate::McpError::new(
+                crate::McpErrorCode::ResourceForbidden,
+                "Authentication failed",
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether this request's own deadline, not an explicit cancellation,
     /// has ended it.
     ///
@@ -4074,7 +4100,7 @@ impl McpContext {
     /// Returns whether client roots are available in this context.
     #[must_use]
     pub fn can_list_roots(&self) -> bool {
-        self.ensure_live().is_ok() && self.roots_provider.is_some()
+        self.ensure_capability_live().is_ok() && self.roots_provider.is_some()
     }
 
     /// Lists the filesystem roots exposed by the connected client.
@@ -4084,8 +4110,7 @@ impl McpContext {
     /// Returns an error when the client did not advertise roots, the transport
     /// cannot complete the reverse request, or this request is cancelled.
     pub async fn list_roots(&self) -> crate::McpResult<Vec<ClientRoot>> {
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
+        self.ensure_capability_live()?;
         let provider = self.roots_provider.as_ref().ok_or_else(|| {
             crate::McpError::new(
                 crate::McpErrorCode::InvalidRequest,
@@ -4097,10 +4122,9 @@ impl McpContext {
             return Err(peer_request_bridge_would_deadlock("Listing roots"));
         }
 
-        let roots = provider.list_roots().await?;
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
-        Ok(roots)
+        let roots = provider.list_roots().await;
+        self.ensure_capability_live()?;
+        roots
     }
 
     // ========================================================================
@@ -4113,7 +4137,7 @@ impl McpContext {
     /// capability and a sampling sender has been configured.
     #[must_use]
     pub fn can_sample(&self) -> bool {
-        self.ensure_live().is_ok() && self.sampling_sender.is_some()
+        self.ensure_capability_live().is_ok() && self.sampling_sender.is_some()
     }
 
     /// Requests an LLM completion from the client.
@@ -4184,8 +4208,7 @@ impl McpContext {
         &self,
         request: SamplingRequest,
     ) -> crate::McpResult<SamplingResponse> {
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
+        self.ensure_capability_live()?;
         let sender = self.sampling_sender.as_ref().ok_or_else(|| {
             crate::McpError::new(
                 crate::McpErrorCode::InvalidRequest,
@@ -4207,10 +4230,9 @@ impl McpContext {
             return Err(peer_request_bridge_would_deadlock("Sampling"));
         }
 
-        let response = sender.create_message(request).await?;
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
-        Ok(response)
+        let response = sender.create_message(request).await;
+        self.ensure_capability_live()?;
+        response
     }
 
     // ========================================================================
@@ -4223,7 +4245,7 @@ impl McpContext {
     /// capability and an elicitation sender has been configured.
     #[must_use]
     pub fn can_elicit(&self) -> bool {
-        self.ensure_live().is_ok() && self.elicitation_sender.is_some()
+        self.ensure_capability_live().is_ok() && self.elicitation_sender.is_some()
     }
 
     /// Requests user input via a form.
@@ -4330,8 +4352,7 @@ impl McpContext {
         &self,
         request: ElicitationRequest,
     ) -> crate::McpResult<ElicitationResponse> {
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
+        self.ensure_capability_live()?;
         let sender = self.elicitation_sender.as_ref().ok_or_else(|| {
             crate::McpError::new(
                 crate::McpErrorCode::InvalidRequest,
@@ -4343,10 +4364,9 @@ impl McpContext {
             return Err(peer_request_bridge_would_deadlock("Elicitation"));
         }
 
-        let response = sender.elicit(request).await?;
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
-        Ok(response)
+        let response = sender.elicit(request).await;
+        self.ensure_capability_live()?;
+        response
     }
 
     // ========================================================================
@@ -4359,7 +4379,7 @@ impl McpContext {
     /// been attached to this context.
     #[must_use]
     pub fn can_read_resources(&self) -> bool {
-        self.ensure_live().is_ok() && self.resource_reader.is_some()
+        self.ensure_capability_live().is_ok() && self.resource_reader.is_some()
     }
 
     /// Returns the current resource read depth.
@@ -4399,8 +4419,7 @@ impl McpContext {
     /// }
     /// ```
     pub async fn read_resource(&self, uri: &str) -> crate::McpResult<ResourceReadResult> {
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
+        self.ensure_capability_live()?;
         // Check if we have a resource reader
         let reader = self.resource_reader.as_ref().ok_or_else(|| {
             crate::McpError::new(
@@ -4426,10 +4445,9 @@ impl McpContext {
         // Read the resource with incremented depth
         let result = reader
             .read_resource(self, uri, nested_dispatch_depth + 1)
-            .await?;
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
-        Ok(result)
+            .await;
+        self.ensure_capability_live()?;
+        result
     }
 
     /// Reads a resource and extracts the text content.
@@ -4505,7 +4523,7 @@ impl McpContext {
     /// been attached to this context.
     #[must_use]
     pub fn can_call_tools(&self) -> bool {
-        self.ensure_live().is_ok() && self.tool_caller.is_some()
+        self.ensure_capability_live().is_ok() && self.tool_caller.is_some()
     }
 
     /// Returns the current tool call depth.
@@ -4548,8 +4566,7 @@ impl McpContext {
         name: &str,
         args: serde_json::Value,
     ) -> crate::McpResult<ToolCallResult> {
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
+        self.ensure_capability_live()?;
         // Check if we have a tool caller
         let caller = self.tool_caller.as_ref().ok_or_else(|| {
             crate::McpError::new(
@@ -4574,10 +4591,9 @@ impl McpContext {
         // Call the tool with incremented depth
         let result = caller
             .call_tool(self, name, args, nested_dispatch_depth + 1)
-            .await?;
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
-        Ok(result)
+            .await;
+        self.ensure_capability_live()?;
+        result
     }
 
     /// Calls a tool and extracts the text content.
@@ -4686,7 +4702,7 @@ impl McpContext {
     /// Returns whether prompt getting is available in this context.
     #[must_use]
     pub fn can_get_prompts(&self) -> bool {
-        self.ensure_live().is_ok() && self.prompt_caller.is_some()
+        self.ensure_capability_live().is_ok() && self.prompt_caller.is_some()
     }
 
     /// Returns the current prompt get depth.
@@ -4710,8 +4726,7 @@ impl McpContext {
         name: &str,
         arguments: std::collections::HashMap<String, String>,
     ) -> crate::McpResult<PromptGetResult> {
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
+        self.ensure_capability_live()?;
         let caller = self.prompt_caller.as_ref().ok_or_else(|| {
             crate::McpError::new(
                 crate::McpErrorCode::InternalError,
@@ -4732,10 +4747,9 @@ impl McpContext {
 
         let result = caller
             .get_prompt(self, name, arguments, nested_dispatch_depth + 1)
-            .await?;
-        self.ensure_live()
-            .map_err(|_| crate::McpError::request_cancelled())?;
-        Ok(result)
+            .await;
+        self.ensure_capability_live()?;
+        result
     }
 
     /// Gets a prompt and extracts the first text message.
@@ -7169,6 +7183,271 @@ mod tests {
             error.message,
             "Roots not available: client does not support roots capability"
         );
+    }
+
+    struct CapabilityAuthorityProbe {
+        calls: std::sync::atomic::AtomicUsize,
+        revocation: McpRequestCancellation,
+        revoke_on_call: bool,
+        fail_on_call: bool,
+    }
+
+    impl CapabilityAuthorityProbe {
+        fn finish<T>(&self, result: T) -> crate::McpResult<T> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.revoke_on_call {
+                self.revocation.cancel();
+            }
+            if self.fail_on_call {
+                Err(crate::McpError::invalid_params("private-provider-error"))
+            } else {
+                Ok(result)
+            }
+        }
+
+        fn context(self: &Arc<Self>, auth: Option<AuthContext>) -> McpContext {
+            let context = McpContext::new(Cx::for_testing(), 1)
+                .with_roots_provider(self.clone())
+                .with_sampling(self.clone())
+                .with_elicitation(self.clone())
+                .with_resource_reader(self.clone())
+                .with_tool_caller(self.clone())
+                .with_prompt_caller(self.clone());
+            match auth {
+                Some(auth) => context.with_auth(auth),
+                None => context,
+            }
+        }
+    }
+
+    impl RootsProvider for CapabilityAuthorityProbe {
+        fn list_roots(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = crate::McpResult<Vec<ClientRoot>>> + Send + '_>> {
+            Box::pin(async {
+                self.finish(vec![ClientRoot::with_name(
+                    "file:///private",
+                    "private-result",
+                )])
+            })
+        }
+    }
+
+    impl SamplingSender for CapabilityAuthorityProbe {
+        fn create_message(
+            &self,
+            _request: SamplingRequest,
+        ) -> Pin<Box<dyn Future<Output = crate::McpResult<SamplingResponse>> + Send + '_>> {
+            Box::pin(async { self.finish(SamplingResponse::new("private-result", "model")) })
+        }
+    }
+
+    impl ElicitationSender for CapabilityAuthorityProbe {
+        fn elicit(
+            &self,
+            _request: ElicitationRequest,
+        ) -> Pin<Box<dyn Future<Output = crate::McpResult<ElicitationResponse>> + Send + '_>>
+        {
+            Box::pin(async {
+                self.finish(ElicitationResponse::accept(
+                    std::collections::HashMap::from([(
+                        "answer".to_owned(),
+                        serde_json::json!("private-result"),
+                    )]),
+                ))
+            })
+        }
+    }
+
+    impl ResourceReader for CapabilityAuthorityProbe {
+        fn read_resource<'a>(
+            &'a self,
+            _context: &'a McpContext,
+            uri: &'a str,
+            _depth: u32,
+        ) -> Pin<Box<dyn Future<Output = crate::McpResult<ResourceReadResult>> + Send + 'a>>
+        {
+            Box::pin(async move { self.finish(ResourceReadResult::text(uri, "private-result")) })
+        }
+    }
+
+    impl ToolCaller for CapabilityAuthorityProbe {
+        fn call_tool<'a>(
+            &'a self,
+            _context: &'a McpContext,
+            _name: &'a str,
+            _args: serde_json::Value,
+            _depth: u32,
+        ) -> Pin<Box<dyn Future<Output = crate::McpResult<ToolCallResult>> + Send + 'a>> {
+            Box::pin(async { self.finish(ToolCallResult::text("private-result")) })
+        }
+    }
+
+    impl PromptCaller for CapabilityAuthorityProbe {
+        fn get_prompt<'a>(
+            &'a self,
+            _context: &'a McpContext,
+            _name: &'a str,
+            _arguments: std::collections::HashMap<String, String>,
+            _depth: u32,
+        ) -> Pin<Box<dyn Future<Output = crate::McpResult<PromptGetResult>> + Send + 'a>> {
+            Box::pin(async {
+                self.finish(PromptGetResult::new(vec![PromptMessageItem::user_text(
+                    "private-result",
+                )]))
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum GuardedCapability {
+        Roots,
+        Sampling,
+        Elicitation,
+        Resource,
+        Tool,
+        Prompt,
+    }
+
+    const GUARDED_CAPABILITIES: [GuardedCapability; 6] = [
+        GuardedCapability::Roots,
+        GuardedCapability::Sampling,
+        GuardedCapability::Elicitation,
+        GuardedCapability::Resource,
+        GuardedCapability::Tool,
+        GuardedCapability::Prompt,
+    ];
+
+    impl GuardedCapability {
+        fn available(self, context: &McpContext) -> bool {
+            match self {
+                Self::Roots => context.can_list_roots(),
+                Self::Sampling => context.can_sample(),
+                Self::Elicitation => context.can_elicit(),
+                Self::Resource => context.can_read_resources(),
+                Self::Tool => context.can_call_tools(),
+                Self::Prompt => context.can_get_prompts(),
+            }
+        }
+
+        async fn invoke(self, context: &McpContext) -> crate::McpResult<String> {
+            match self {
+                Self::Roots => Ok(context.list_roots().await?[0].name.clone().unwrap()),
+                Self::Sampling => context.sample("request", 10).await?.into_text(),
+                Self::Elicitation => Ok(context
+                    .elicit_form("request", serde_json::json!({"type":"object"}))
+                    .await?
+                    .get_string("answer")
+                    .unwrap()
+                    .to_owned()),
+                Self::Resource => context.read_resource_text("test://private").await,
+                Self::Tool => {
+                    context
+                        .call_tool_text("private", serde_json::json!({}))
+                        .await
+                }
+                Self::Prompt => context.get_prompt_text("private", Default::default()).await,
+            }
+        }
+    }
+
+    fn capability_authority_probe(
+        revoke_on_call: bool,
+        fail_on_call: bool,
+    ) -> Arc<CapabilityAuthorityProbe> {
+        Arc::new(CapabilityAuthorityProbe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            revocation: McpRequestCancellation::new(),
+            revoke_on_call,
+            fail_on_call,
+        })
+    }
+
+    #[test]
+    fn capability_calls_preserve_current_and_anonymous_authority() {
+        for capability in GUARDED_CAPABILITIES {
+            for authenticated in [false, true] {
+                let probe = capability_authority_probe(false, false);
+                let auth = authenticated.then(|| {
+                    AuthContext::with_subject("approved")
+                        .with_verification_cancellation(probe.revocation.clone())
+                });
+                let context = probe.context(auth);
+                assert!(capability.available(&context), "{capability:?}");
+                let result = crate::block_on(capability.invoke(&context)).unwrap();
+                assert_eq!(result, "private-result", "{capability:?}");
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+                assert!(context.ensure_live().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn capability_calls_refuse_stale_authority_before_provider_effects() {
+        for capability in GUARDED_CAPABILITIES {
+            for expired in [false, true] {
+                let probe = capability_authority_probe(false, false);
+                let mut auth = AuthContext::with_subject("approved")
+                    .with_verification_cancellation(probe.revocation.clone());
+                if expired {
+                    auth = auth.with_verification_valid_until(std::time::Instant::now());
+                }
+                let context = probe.context(Some(auth));
+                let retained = context.clone();
+                if !expired {
+                    probe.revocation.cancel();
+                }
+                assert!(!capability.available(&retained), "{capability:?}");
+                let error = crate::block_on(capability.invoke(&retained)).unwrap_err();
+                assert_eq!(error.code, crate::McpErrorCode::ResourceForbidden);
+                assert_eq!(error.message, "Authentication failed");
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 0, "{capability:?}");
+                assert!(context.ensure_live().is_ok());
+                assert!(!context.cx().is_cancel_requested());
+            }
+        }
+    }
+
+    #[test]
+    fn capability_calls_withhold_success_and_error_after_revocation() {
+        for capability in GUARDED_CAPABILITIES {
+            for fail_on_call in [false, true] {
+                let probe = capability_authority_probe(true, fail_on_call);
+                let context = probe.context(Some(
+                    AuthContext::with_subject("approved")
+                        .with_verification_cancellation(probe.revocation.clone()),
+                ));
+                assert!(capability.available(&context));
+                let error = crate::block_on(capability.invoke(&context)).unwrap_err();
+                assert_eq!(error.code, crate::McpErrorCode::ResourceForbidden);
+                assert_eq!(error.message, "Authentication failed");
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1, "{capability:?}");
+                assert!(!capability.available(&context));
+                assert!(context.ensure_live().is_ok());
+                assert!(!context.cx().is_cancel_requested());
+            }
+        }
+    }
+
+    #[test]
+    fn capability_revocation_is_not_deferred_by_a_cancellation_mask() {
+        for capability in GUARDED_CAPABILITIES {
+            let probe = capability_authority_probe(false, false);
+            let context = probe.context(Some(
+                AuthContext::with_subject("approved")
+                    .with_verification_cancellation(probe.revocation.clone()),
+            ));
+            probe.revocation.cancel();
+            let error = context
+                .masked(|| {
+                    assert!(context.ensure_live().is_ok());
+                    crate::block_on(capability.invoke(&context))
+                })
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, crate::McpErrorCode::ResourceForbidden);
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0, "{capability:?}");
+        }
     }
 
     #[test]
