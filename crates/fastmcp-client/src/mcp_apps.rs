@@ -951,6 +951,9 @@ impl McpAppsInMemoryViewTransport {
 /// Raw JSON-RPC carrier for the closed Apps wire protocol. The carrier owns
 /// browser/native delivery only; every frame is admitted by
 /// [`McpAppsBridgeAdmission`] before the Host acts on it.
+/// Delivery failure does not prove that the peer failed to observe the frame.
+/// The Host fences terminal replies and notifications after a failed or
+/// abandoned send to prevent reuse of ambiguous state.
 #[allow(async_fn_in_trait)]
 pub trait McpAppsWireBridgeTransport: Send {
     async fn send_to_view(&mut self, cx: &Cx, frame: String) -> Result<(), McpAppsHostError>;
@@ -1804,15 +1807,15 @@ struct WirePreparedCatalogPage {
     omitted_sizes: u64,
 }
 
-/// A carrier may commit bytes before its send future is cancelled. Such a
-/// send must fence the View rather than leave a remotely visible handle with
-/// no corresponding committed local owner.
-struct WireCatalogSendGuard<'a> {
+/// A carrier may commit bytes before its send future fails or is cancelled.
+/// Fence the View on uncertain delivery so a remotely visible response,
+/// notification or handle cannot leave a reusable, inconsistent local owner.
+struct WireDeliveryGuard<'a> {
     disconnected: &'a mut bool,
     committed: bool,
 }
 
-impl Drop for WireCatalogSendGuard<'_> {
+impl Drop for WireDeliveryGuard<'_> {
     fn drop(&mut self) {
         if !self.committed {
             *self.disconnected = true;
@@ -3650,21 +3653,22 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             };
             McpAppsJsonRpcEnvelope::validate_response_for(method, &result)
                 .map_err(McpAppsHostError::Bridge)?;
-            if catalog.is_some() || method == McpAppsRoutedMethod::SamplingCreateMessage {
-                // A typed sampling result can satisfy each content-block bound
-                // while exceeding the complete frame budget. Reject it through
-                // the sanitized terminal-error path before touching the carrier.
-                McpAppsJsonRpcEnvelope::Response {
-                    id: id.clone(),
-                    result: result.clone(),
-                }
-                .encode(McpAppsBridgeDirection::HostToView)
-                .map_err(McpAppsHostError::Bridge)?;
+            // Individual content fields may all be valid while their complete
+            // frame exceeds the carrier bound. This also applies to ordinary
+            // tool/resource results and completed Tasks, whose effects have
+            // already committed. Preflight once, before choosing the terminal
+            // branch, so a refused result still gets one sanitized error and
+            // releases its View correlation without replaying the operation.
+            let frame = McpAppsJsonRpcEnvelope::Response {
+                id: id.clone(),
+                result: result.clone(),
             }
-            Ok(result)
+            .encode(McpAppsBridgeDirection::HostToView)
+            .map_err(McpAppsHostError::Bridge)?;
+            Ok((result, frame))
         });
         match result {
-            Ok(result) => {
+            Ok((result, frame)) => {
                 let initialization = if method == McpAppsRoutedMethod::Initialize {
                     let response: McpAppsPinnedInitializeResult = decode_params(Some(&result))?;
                     let request: McpAppsPinnedInitializeParams = decode_params(params)?;
@@ -3676,22 +3680,15 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 } else {
                     None
                 };
-                let response = McpAppsJsonRpcEnvelope::Response {
-                    id: id.clone(),
-                    result: result.clone(),
-                };
                 if let (Some(request), Some(prepared)) = (catalog, prepared_catalog) {
                     // Preflight every fallible encode, quota and correlation
                     // step before entering the carrier. A dropped/failed send
                     // fences the Host; success has one synchronous commit.
-                    let frame = response
-                        .encode(McpAppsBridgeDirection::HostToView)
-                        .map_err(McpAppsHostError::Bridge)?;
                     let mut admission = self.admission.clone();
                     admission
                         .complete_response(McpAppsBridgeDirection::ViewToHost, &id, &result)
                         .map_err(McpAppsHostError::Bridge)?;
-                    let mut guard = WireCatalogSendGuard {
+                    let mut guard = WireDeliveryGuard {
                         disconnected: &mut self.disconnected,
                         committed: false,
                     };
@@ -3713,7 +3710,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     guard.committed = true;
                     return Ok(());
                 }
-                self.send_envelope(cx, response).await?;
+                self.send_frame(cx, frame).await?;
                 if method == McpAppsRoutedMethod::Initialize {
                     self.admission
                         .initialization_response_committed()
@@ -4368,10 +4365,23 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         let frame = envelope
             .encode(McpAppsBridgeDirection::HostToView)
             .map_err(McpAppsHostError::Bridge)?;
-        await_wire_operation(cx, &WireHostDeadline::new(cx), async {
+        self.send_frame(cx, frame).await
+    }
+
+    async fn send_frame(&mut self, cx: &Cx, frame: String) -> Result<(), McpAppsHostError> {
+        // Encoding failures above never enter the carrier and leave the View
+        // usable. Once delivery begins, an error or dropped future cannot
+        // prove whether the peer observed this terminal/control frame.
+        let mut guard = WireDeliveryGuard {
+            disconnected: &mut self.disconnected,
+            committed: false,
+        };
+        let sent = await_wire_operation(cx, &WireHostDeadline::new(cx), async {
             self.transport.send_to_view(cx, frame).await
         })
-        .await
+        .await;
+        guard.committed = sent.is_ok();
+        sent
     }
 }
 
@@ -6605,6 +6615,46 @@ exec sleep 10
         json!({"resultType": "complete", "content": [{"type": "text", "text": "completed core operation"}]})
     }
 
+    // Keep every content block individually admissible. One extra block is
+    // enough to cross only the complete bridge frame's byte bound.
+    fn large_apps_complete_result(method: McpAppsRoutedMethod, oversized: bool) -> Value {
+        let marker = "private-completed-operation:";
+        let text = format!(
+            "{marker}{}",
+            "x".repeat(fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES - marker.len())
+        );
+        let blocks = fastmcp_protocol::MAX_MCP_APPS_BRIDGE_MESSAGE_BYTES
+            / fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES
+            - usize::from(!oversized);
+        match method {
+            McpAppsRoutedMethod::ToolsCall => {
+                json!({"content": vec![json!({"type": "text", "text": text}); blocks]})
+            }
+            McpAppsRoutedMethod::ResourcesRead => {
+                json!({"contents": vec![json!({"uri": "test://private", "text": text}); blocks]})
+            }
+            _ => panic!("large completion fixture requires a tool or resource"),
+        }
+    }
+
+    fn assert_large_apps_frame_admission(
+        method: McpAppsRoutedMethod,
+        result: &Value,
+        oversized: bool,
+    ) {
+        McpAppsJsonRpcEnvelope::validate_response_for(method, result).unwrap();
+        let encoded = McpAppsJsonRpcEnvelope::Response {
+            id: McpAppsJsonRpcRequestId::string("completed-operation".into()).unwrap(),
+            result: result.clone(),
+        }
+        .encode(McpAppsBridgeDirection::HostToView);
+        if oversized {
+            assert!(matches!(encoded, Err(McpAppsBridgeError::MessageTooLarge)));
+        } else {
+            assert!(encoded.is_ok());
+        }
+    }
+
     fn apps_server_tool_page(names: &[&str]) -> Value {
         json!({
             "resultType": "complete",
@@ -7344,6 +7394,80 @@ exec sleep 10
 
     #[cfg(feature = "tasks")]
     #[test]
+    fn public_http_apps_task_completion_obeys_the_complete_frame_budget() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for oversized in [false, true] {
+                let result = large_apps_complete_result(McpAppsRoutedMethod::ToolsCall, oversized);
+                assert_large_apps_frame_admission(
+                    McpAppsRoutedMethod::ToolsCall, &result, oversized,
+                );
+                let mut completed = server_task_snapshot("completed", false);
+                completed["result"] = result.clone();
+                let (address, peer) = server_input_http_peer_with_extensions(
+                    vec![
+                        server_task_snapshot("working", true),
+                        server_task_snapshot("input_required", false),
+                        json!({"resultType": "complete"}),
+                        completed,
+                    ],
+                    true,
+                    false,
+                );
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client(&cx, address).await;
+                let mut effects = ServerTaskEffects::new();
+                // Permit the complete snapshot so this exercises publication
+                // after actual Task completion, not the observation quota.
+                effects.policy = Some(McpAppsServerTaskPolicy::new(
+                    std::time::Duration::from_millis(10), 16, 4 * 1024 * 1024,
+                ).unwrap());
+                let calls = Arc::clone(&effects.input.calls);
+                let snapshots = Arc::clone(&effects.snapshots);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap()
+                    .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let response = stateful_wire_request(
+                    &mut host, &mut view, &cx, "completed-operation", "tools/call",
+                    json!({"name": "server_task"}),
+                )
+                .await;
+                if oversized {
+                    assert_eq!(response, json!({
+                        "jsonrpc": "2.0", "id": "completed-operation",
+                        "error": {"code": -32000, "message": "MCP Apps request rejected"}
+                    }));
+                } else {
+                    assert_eq!(response["result"], result);
+                }
+                assert!(!response.to_string().contains("private-server-task"));
+                assert_eq!(calls.lock().unwrap().len(), 1);
+                assert_eq!(snapshots.lock().unwrap().last().unwrap()["status"], "completed");
+                assert_eq!(
+                    stateful_wire_request(
+                        &mut host, &mut view, &cx, "completed-operation", "ping", json!({}),
+                    ).await["result"],
+                    json!({})
+                );
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                let requests = peer.join().unwrap();
+                assert_eq!(
+                    requests.iter().map(|request| request["method"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    vec!["server/discover", "tools/call", "tasks/get", "tasks/update", "tasks/get"]
+                );
+                assert_eq!(requests[3]["params"]["inputResponses"], server_input_response());
+            }
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
     fn public_http_apps_server_task_requires_creation_and_snapshot_consent() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -7912,6 +8036,79 @@ exec sleep 10
                 assert_eq!(requests.len(), 3);
                 assert_eq!(requests[2]["method"], "tools/call");
                 assert_eq!(requests[2]["params"]["name"], "healthy");
+            }
+        });
+    }
+
+    #[test]
+    fn public_http_apps_core_completion_obeys_the_complete_frame_budget() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (method, wire_method, params) in [
+                (
+                    McpAppsRoutedMethod::ToolsCall,
+                    "tools/call",
+                    json!({"name": "server_echo"}),
+                ),
+                (
+                    McpAppsRoutedMethod::ResourcesRead,
+                    "resources/read",
+                    json!({"uri": "test://private"}),
+                ),
+            ] {
+                let oversized = large_apps_complete_result(method, true);
+                let bounded = large_apps_complete_result(method, false);
+                assert_large_apps_frame_admission(method, &oversized, true);
+                assert_large_apps_frame_admission(method, &bounded, false);
+                let mut oversized_core = oversized;
+                oversized_core["resultType"] = json!("complete");
+                let mut bounded_core = bounded.clone();
+                bounded_core["resultType"] = json!("complete");
+                let (address, peer) = server_input_http_peer(vec![
+                    server_input_required("private-round"),
+                    oversized_core,
+                    bounded_core,
+                ]);
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client(&cx, address).await;
+                let effects =
+                    ServerInputEffects::new(server_input_response(), ServerInputDecision::Respond);
+                let calls = Arc::clone(&effects.calls);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap()
+                    .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+
+                let refused = stateful_wire_request(
+                    &mut host, &mut view, &cx, "completed-operation", wire_method, params.clone(),
+                )
+                .await;
+                assert_eq!(refused, json!({
+                    "jsonrpc": "2.0", "id": "completed-operation",
+                    "error": {"code": -32000, "message": "MCP Apps request rejected"}
+                }));
+                assert!(!refused.to_string().contains("private-completed-operation"));
+                assert_eq!(calls.lock().unwrap().len(), 1);
+
+                // A new explicit request reuses the retired View correlation.
+                // The completed effect must not be retried by the Host.
+                let accepted = stateful_wire_request(
+                    &mut host, &mut view, &cx, "completed-operation", wire_method, params,
+                )
+                .await;
+                assert_eq!(accepted["result"], bounded);
+                assert_eq!(calls.lock().unwrap().len(), 1);
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.len(), 4);
+                assert_eq!(requests[0]["method"], "server/discover");
+                assert!(requests[1..].iter().all(|request| request["method"] == wire_method));
+                assert_eq!(requests[2]["params"]["requestState"], "private-round");
+                assert!(requests[3]["params"].get("requestState").is_none());
             }
         });
     }
@@ -13299,6 +13496,208 @@ exec sleep 10
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum WireSendDisposition {
+        Complete,
+        FailAfterDelivery,
+        PendingAfterDelivery,
+    }
+
+    struct DeliveredWireTransport {
+        inner: McpAppsInMemoryWireHostTransport,
+        disposition: WireSendDisposition,
+        delivered: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl McpAppsWireBridgeTransport for DeliveredWireTransport {
+        async fn send_to_view(&mut self, cx: &Cx, frame: String) -> Result<(), McpAppsHostError> {
+            self.inner.send_to_view(cx, frame).await?;
+            self.delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.disposition {
+                WireSendDisposition::Complete => Ok(()),
+                WireSendDisposition::FailAfterDelivery => Err(McpAppsHostError::Transport(
+                    "carrier failed after delivery".into(),
+                )),
+                WireSendDisposition::PendingAfterDelivery => std::future::pending().await,
+            }
+        }
+
+        async fn receive_from_view(&mut self, cx: &Cx) -> Result<String, McpAppsHostError> {
+            self.inner.receive_from_view(cx).await
+        }
+    }
+
+    #[test]
+    fn closed_wire_uncertain_terminal_delivery_fences_committed_effects() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for disposition in [
+                WireSendDisposition::Complete,
+                WireSendDisposition::FailAfterDelivery,
+                WireSendDisposition::PendingAfterDelivery,
+            ] {
+                for accepted in [false, true] {
+                    let cx = Cx::current().unwrap();
+                    let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                    let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let mut policy = state_recording_policy();
+                    policy.context = if accepted {
+                        ContextDecision::Accept
+                    } else {
+                        ContextDecision::Refuse
+                    };
+                    let entries = Arc::clone(&policy.entries);
+                    let changes = Arc::clone(&policy.changes);
+                    let mut host = McpAppsWireHost::new_negotiated(
+                        DeliveredWireTransport {
+                            inner: transport,
+                            disposition: WireSendDisposition::Complete,
+                            delivered: Arc::clone(&delivered),
+                        },
+                        stateful_wire_configuration(),
+                        policy,
+                        activation_proof(),
+                    );
+                    activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                    host.transport.disposition = disposition;
+                    let request = json!({
+                        "jsonrpc": "2.0", "id": "effect", "method": "ui/update-model-context",
+                        "params": {"content": [{"type": "text", "text": "committed context"}]}
+                    }).to_string();
+                    view.send_to_host(&cx, request.clone()).await.unwrap();
+                    if disposition == WireSendDisposition::PendingAfterDelivery {
+                        let mut sending = Box::pin(host.process_next(&cx));
+                        poll_fn(|task| {
+                            assert!(sending.as_mut().poll(task).is_pending());
+                            Poll::Ready(())
+                        }).await;
+                        // Prove the abandoned future had already published its
+                        // terminal frame, not merely started receiving input.
+                        assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 2);
+                        drop(sending);
+                    } else {
+                        assert_eq!(
+                            host.process_next(&cx).await.is_ok(),
+                            disposition == WireSendDisposition::Complete
+                        );
+                    }
+                    let response: Value =
+                        serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                    assert_eq!(response["id"], "effect");
+                    assert_eq!(response.get("result").is_some(), accepted);
+                    assert_eq!(response.get("error").is_some(), !accepted);
+                    assert_eq!(entries.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    assert_eq!(changes.lock().unwrap().len(), usize::from(accepted));
+                    if disposition == WireSendDisposition::Complete {
+                        assert_eq!(
+                            stateful_wire_request(
+                                &mut host, &mut view, &cx, "effect", "ping", json!({}),
+                            ).await["result"],
+                            json!({})
+                        );
+                        assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                    } else {
+                        assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
+                        view.send_to_host(&cx, request).await.unwrap();
+                        assert!(host.process_next(&cx).await.is_err());
+                        assert!(
+                            host.send_notification(&cx, McpAppsHostNotification::ToolsListChanged)
+                                .await.is_err()
+                        );
+                    }
+                    assert_eq!(entries.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    assert_eq!(changes.lock().unwrap().len(), usize::from(accepted));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_uncertain_notification_delivery_fences_host_context() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for disposition in [
+                WireSendDisposition::Complete,
+                WireSendDisposition::FailAfterDelivery,
+                WireSendDisposition::PendingAfterDelivery,
+            ] {
+                let cx = Cx::current().unwrap();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut host = McpAppsWireHost::new_negotiated(
+                    DeliveredWireTransport {
+                        inner: transport,
+                        disposition: WireSendDisposition::Complete,
+                        delivered: Arc::clone(&delivered),
+                    },
+                    stateful_wire_configuration(),
+                    WirePolicy,
+                    activation_proof(),
+                );
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                // A local encoding refusal has not touched the carrier and
+                // must leave the View usable.
+                assert!(host.send_notification(
+                    &cx,
+                    McpAppsHostNotification::ToolCancelled {
+                        reason: Some("x".repeat(
+                            fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES + 1,
+                        )),
+                    },
+                ).await.is_err());
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+                let notification = McpAppsHostNotification::HostContextChanged(McpAppsHostContext {
+                    display_mode: Some(McpAppsDisplayMode::Fullscreen),
+                    available_display_modes: vec![
+                        McpAppsDisplayMode::Fullscreen, McpAppsDisplayMode::Pip,
+                    ],
+                    locale: None,
+                });
+                host.transport.disposition = disposition;
+                if disposition == WireSendDisposition::PendingAfterDelivery {
+                    let mut sending = Box::pin(host.send_notification(&cx, notification.clone()));
+                    poll_fn(|task| {
+                        assert!(sending.as_mut().poll(task).is_pending());
+                        Poll::Ready(())
+                    }).await;
+                    assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 2);
+                    drop(sending);
+                } else {
+                    assert_eq!(
+                        host.send_notification(&cx, notification.clone()).await.is_ok(),
+                        disposition == WireSendDisposition::Complete
+                    );
+                }
+                let response: Value =
+                    serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                assert!(response.get("id").is_none());
+                assert_eq!(response["params"]["displayMode"], "fullscreen");
+                if disposition == WireSendDisposition::Complete {
+                    assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Fullscreen));
+                    assert_eq!(host.state.host_context.locale.as_deref(), Some("en-US"));
+                    assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                } else {
+                    assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
+                    assert_eq!(host.display_mode(), None);
+                    assert_eq!(
+                        host.state.host_context.display_mode,
+                        Some(McpAppsDisplayMode::Inline)
+                    );
+                    host.transport.disposition = WireSendDisposition::Complete;
+                    assert!(host.send_notification(&cx, notification).await.is_err());
+                    assert!(host.process_next(&cx).await.is_err());
+                    assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 2);
+                }
+            }
+        });
+    }
+
     #[test]
     fn closed_wire_host_context_notification_commits_partial_state_only_after_send() {
         block_on(async {
@@ -13322,15 +13721,6 @@ exec sleep 10
                 ],
                 locale: None,
             });
-            host.transport.fail = true;
-            assert!(
-                host.send_notification(&cx, notification.clone())
-                    .await
-                    .is_err()
-            );
-            assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Inline));
-            assert!(host.state.permits_mode(McpAppsDisplayMode::Inline));
-            host.transport.fail = false;
             host.send_notification(&cx, notification).await.unwrap();
             let _ = view.receive_from_host(&cx).await.unwrap();
             assert_eq!(host.display_mode(), Some(McpAppsDisplayMode::Fullscreen));
