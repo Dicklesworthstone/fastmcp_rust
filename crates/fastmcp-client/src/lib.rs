@@ -18421,6 +18421,16 @@ impl HttpClient {
         &self,
         parameters: &serde_json::Value,
     ) -> Result<serde_json::Value, HttpClientError> {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+        match &self.connection {
+            ClientHttpConnection::Modern(client) => client
+                .admit_enterprise_parameters(parameters)
+                .map_err(|error| {
+                    HttpClientError::Connection(ClientHttpConnectionError::Modern(error))
+                })?,
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => {}
+        }
         if self.selected_protocol_era() != ProtocolEra::Modern2026 {
             let mut parameters = parameters.clone();
             trace::apply_parameters(&mut parameters, None);

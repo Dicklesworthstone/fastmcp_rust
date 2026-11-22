@@ -661,11 +661,31 @@ pub async fn probe_secured_http_and_https_facade_closure(cx: &Cx) -> McpResult<(
     Ok(())
 }
 
+/// A retained Tasks observation handle is usable through the public facade
+/// without exposing the store, protocol records, or application callbacks.
+#[cfg(feature = "readme-default")]
+pub fn probe_task_operator_facade_closure(
+    runtime: &fastmcp_rust::FinalTaskRuntime,
+) -> Result<Option<fastmcp_rust::OperatorTaskSnapshot>, fastmcp_rust::OperatorSnapshotError> {
+    use fastmcp_rust::{OperatorSnapshotSource, TaskOperatorHandle};
+
+    let _: Option<fastmcp_rust::OperatorTaskStates> = None;
+    let _: Option<fastmcp_rust::OperatorTaskStorage> = None;
+    let _: Option<fastmcp_rust::OperatorTaskExecution> = None;
+    let _: Option<fastmcp_rust::OperatorTaskRetention> = None;
+    let _: Option<fastmcp_rust::OperatorTaskStore> = None;
+    let handle: Option<TaskOperatorHandle> = runtime.task_operator_handle();
+    handle.map(|handle| handle.operator_snapshot()).transpose()
+}
+
 /// External consumer closure for the opt-in `enterprise-auth` profile:
 /// verifies `EnterpriseExchangeDriver` and its companion secret/token/observation
 /// types are nameable through `fastmcp_rust` alone.
 #[cfg(feature = "enterprise-auth")]
 pub fn probe_enterprise_auth_facade_closure() {
+    use fastmcp_rust::http_auth::enterprise::http::{
+        ENTERPRISE_AUTHORIZATION_EXTENSION_ID, EnterpriseHttpPolicy, EnterpriseHttpPolicyError,
+    };
     use fastmcp_rust::http_auth::enterprise::response::{
         EnterpriseBoundAccessToken, EnterpriseClientSecret, EnterpriseExchangeDriver,
         EnterpriseExchangeError, EnterpriseExchangeObservation,
@@ -676,6 +696,25 @@ pub fn probe_enterprise_auth_facade_closure() {
     let _: Option<EnterpriseExchangeDriver> = None;
     let _: Option<EnterpriseBoundAccessToken> = None;
     let _: Option<EnterpriseExchangeObservation> = None;
+    let _: Option<EnterpriseHttpPolicy> = None;
+    let _: Option<EnterpriseHttpPolicyError> = None;
+    let _: &str = ENTERPRISE_AUTHORIZATION_EXTENSION_ID;
+}
+
+/// The exchange result reaches the real era-pinned HTTP builder without
+/// extracting a raw token or inventing a protocol extension descriptor.
+#[cfg(feature = "enterprise-auth")]
+pub fn probe_enterprise_http_credential_consumer(
+    token: fastmcp_rust::http_auth::enterprise::response::EnterpriseBoundAccessToken,
+    policy: &fastmcp_rust::http_auth::enterprise::http::EnterpriseHttpPolicy,
+    now: std::time::Instant,
+    wall_now: std::time::SystemTime,
+) -> Result<
+    fastmcp_rust::modern::ClientBuilder,
+    fastmcp_rust::http_auth::enterprise::http::EnterpriseHttpPolicyError,
+> {
+    let credential = token.into_http_credential(policy, now, wall_now)?;
+    Ok(fastmcp_rust::modern::ClientBuilder::new().http_bearer_credential(credential))
 }
 
 /// NEGATIVE 1 — the EXTERN PRELUDE half. Differs from the positive above in

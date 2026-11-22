@@ -1812,6 +1812,33 @@ A successful identity still needs `IdentityAssertionReplay::reserve` before
 `exchange_id_jag_for_access_token` returns a credential bound to the configured
 MCP resource. Code redemption does not bypass that durable replay boundary.
 
+To use that result with the native MCP HTTP client, create an
+`http::EnterpriseHttpPolicy` from the same admitted `EnterpriseProfile` and
+the independently established monotonic freshness deadlines for the IdP and
+resource-AS metadata. Then consume the exchanged token with
+`EnterpriseBoundAccessToken::into_http_credential(&policy, now, wall_now)` and
+pass the result to `modern::ClientBuilder::http_bearer_credential`.
+
+The builder carries the exact
+`io.modelcontextprotocol/enterprise-managed-authorization: {}` client
+declaration on discovery and subsequent modern MCP requests. Existing Tasks,
+Apps, and application extension settings are preserved. A conflicting nonempty
+enterprise declaration is rejected. This authorization overlay does not invent
+a `server/discover` capability or extension descriptor.
+
+Keep the policy owner alive for the client's lifetime. Revoking, replacing, or
+dropping it invalidates every credential lease, including a request prepared
+before revocation. Policy replacement must advance its policy generation and
+cannot roll back metadata, registration, or key generations. The complete
+exchange profile and original metadata document identities must match, and the
+earlier metadata deadline can only shorten the token's original lifetime.
+Raw HTTP requests must carry the exact current declaration in their encoded
+metadata before the credential can be attached; the target-only credential
+accessor withholds policy-bound enterprise tokens. Raw notifications and replies
+use `ModernHttpRequest::control` to omit request-only routing headers. This is the
+post-exchange MCP HTTP path; browser custody, deployment-provider qualification, SAML, and
+built-in enterprise token issuance retain their separate implementation gates.
+
 The lower-level `OidcCodeGrant::write_token_form` and
 `OidcCodeResponseAdmission::admit_token_response` remain available to embeddings
 with their own dispatcher. That codec writes to a caller-selected confidential
@@ -2774,6 +2801,41 @@ HTTP listeners retain their existing `OperatorSnapshot` connection-admission
 surface. These client observations cover the executor-backed stdio and memory
 paths; they do not imply readiness of other client transports, durable task
 workers, credentials, or the entire application.
+
+### Tasks store observations
+
+With `tasks` enabled, `FinalTaskRuntime::task_operator_handle()` returns an
+optional `TaskOperatorHandle` for the installed store. The built-in
+`InMemoryFinalTaskStore` supplies this handle; custom stores may omit it.
+Capture it through the same exporter-neutral API:
+
+```rust
+use fastmcp_rust::{OperatorTaskSnapshot, OperatorSnapshotError, TaskOperatorHandle};
+
+fn observe_tasks(
+    handle: &TaskOperatorHandle,
+) -> Result<OperatorTaskSnapshot, OperatorSnapshotError> {
+    OperatorTaskSnapshot::capture(handle)
+}
+```
+
+The observation includes retained task states, storage counts and encoded-byte
+charges, reserved retirement capacity, active execution capacity, and retention
+journal usage. These gauges come from the store's actual admission accounting.
+Terminal results continue to consume storage until normal expiry or authorized
+reclamation; an execution permit remains charged while its service future is
+still cleaning up. The snapshot exposes aggregate pressure without task IDs,
+principal identities, input values, results, or error messages.
+
+Capture uses immediate lock attempts and returns `Busy` when a store mutation
+owns the necessary state. It does not scan task payloads, run expiry maintenance,
+invoke application clocks or providers, or reserve capacity. A retained handle
+does not keep a discarded store alive. The HTTP readiness response includes
+the optional Tasks observation when available, while connection readiness
+continues to describe HTTP admission: a full Tasks store does not prevent
+ordinary tool, resource, or catalog requests from using available connections.
+This is process-local operational visibility, not persistent Tasks or an
+application-wide readiness guarantee.
 
 ---
 

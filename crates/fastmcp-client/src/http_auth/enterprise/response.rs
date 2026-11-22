@@ -11,7 +11,7 @@
 //! synchronous signature admission on their caller-owned bounded CPU lane.
 
 #[cfg(test)]
-mod tests;
+pub(in crate::http_auth) mod tests;
 mod wire;
 
 use std::fmt;
@@ -793,6 +793,7 @@ impl EnterpriseExchangedIdJag {
 /// resource-bound bearer conversion.
 pub struct EnterpriseBoundAccessToken {
     response: EnterpriseAccessTokenResponse,
+    profile: EnterpriseProfile,
     reservation: IdentityAssertionExchangeGuard,
     received_at: SystemTime,
     expires_at_monotonic: Instant,
@@ -805,6 +806,52 @@ impl EnterpriseBoundAccessToken {
         &self.response
     }
 
+    /// Consumes an exchanged grant into a policy-owned native HTTP credential.
+    /// The public HTTP builder stamps the exact enterprise declaration on
+    /// discovery and every subsequent request. Raw request construction must
+    /// supply that declaration itself or no credential can be attached.
+    ///
+    /// The complete exchange profile must equal the owner's current admitted
+    /// overlay. Token and independently supplied metadata deadlines can only
+    /// shorten the resulting lifetime. Policy rotation, revoke and owner drop
+    /// invalidate every clone. The sealed exchange process/restore guard is
+    /// retained and checked before subsequent use. This binding does not attest the
+    /// separate browser, identity, or durable replay deployment boundaries.
+    pub fn into_http_credential(
+        self,
+        policy: &super::http::EnterpriseHttpPolicy,
+        now_monotonic: Instant,
+        received_at_wall: SystemTime,
+    ) -> Result<BoundBearerCredential, super::http::EnterpriseHttpPolicyError> {
+        use super::http::EnterpriseHttpPolicyError;
+
+        policy.admit(&self.profile)?;
+        let (credential, reservation) = self
+            .into_bearer_and_guard(now_monotonic, received_at_wall)
+            .map_err(|_| EnterpriseHttpPolicyError::CredentialUnavailable)?;
+        let mut credential = credential
+            .for_owner(policy.cancellation())
+            .ok_or(EnterpriseHttpPolicyError::CredentialUnavailable)?;
+        credential.expires_at = Some(
+            credential
+                .expires_at
+                .ok_or(EnterpriseHttpPolicyError::CredentialUnavailable)?
+                .min(policy.metadata_valid_until()),
+        );
+        credential.enterprise_request_binding = true;
+        credential.enterprise_exchange_guard = Some(Arc::new(
+            super::http::EnterpriseHttpGrantGuard::new(reservation),
+        ));
+        if credential.is_revoked()
+            || credential
+                .expires_at
+                .is_none_or(|deadline| Instant::now() >= deadline)
+        {
+            return Err(EnterpriseHttpPolicyError::CredentialUnavailable);
+        }
+        Ok(credential)
+    }
+
     /// Consumes this grant and binds it strictly to its exact HTTPS MCP resource
     /// with a monotonic deadline no later than the original response's deadline.
     /// A stale wall-clock sample cannot extend the grant or reset its lifetime.
@@ -813,6 +860,16 @@ impl EnterpriseBoundAccessToken {
         now_monotonic: Instant,
         received_at_wall: SystemTime,
     ) -> Result<BoundBearerCredential, EnterpriseExchangeError> {
+        self.into_bearer_and_guard(now_monotonic, received_at_wall)
+            .map(|(credential, _)| credential)
+    }
+
+    fn into_bearer_and_guard(
+        self,
+        now_monotonic: Instant,
+        received_at_wall: SystemTime,
+    ) -> Result<(BoundBearerCredential, IdentityAssertionExchangeGuard), EnterpriseExchangeError>
+    {
         self.reservation.check().map_err(map_reservation_error)?;
         if received_at_wall < self.received_at || Instant::now() >= self.expires_at_monotonic {
             return Err(EnterpriseExchangeError::CredentialBindingFailed);
@@ -831,12 +888,13 @@ impl EnterpriseBoundAccessToken {
             .min(self.expires_at_monotonic);
         let resource = CanonicalHttpUrl::parse(self.response.resource())
             .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)?;
-        BoundBearerCredential::bind_with_expiry(
+        let credential = BoundBearerCredential::bind_with_expiry(
             resource,
             self.response.access_token.as_str(),
             deadline,
         )
-        .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)
+        .map_err(|_| EnterpriseExchangeError::CredentialBindingFailed)?;
+        Ok((credential, self.reservation))
     }
 }
 
@@ -1234,6 +1292,7 @@ impl EnterpriseExchangeDriver {
                 EnterpriseResponseOutcome::Success {
                     value: EnterpriseBoundAccessToken {
                         response: value,
+                        profile: profile.clone(),
                         reservation,
                         received_at: clock.wall,
                         expires_at_monotonic,

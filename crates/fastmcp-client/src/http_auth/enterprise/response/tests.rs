@@ -40,7 +40,23 @@ fn profile_with_authentication(
     idp_authentication: EnterpriseClientAuthentication,
     resource_as_authentication: EnterpriseClientAuthentication,
 ) -> EnterpriseProfile {
-    let url = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
+    profile_for_http_resource(
+        requested,
+        idp_authentication,
+        resource_as_authentication,
+        "https://mcp.example/mcp",
+        30,
+    )
+}
+
+fn profile_for_http_resource(
+    requested: &[&str],
+    idp_authentication: EnterpriseClientAuthentication,
+    resource_as_authentication: EnterpriseClientAuthentication,
+    resource: &str,
+    policy_generation: u64,
+) -> EnterpriseProfile {
+    let url = CanonicalHttpUrl::parse(resource).unwrap();
     let cfg = EnterpriseProfileConfiguration {
         idp: EnterpriseRegistrationConfiguration {
             issuer: "https://idp.example".into(),
@@ -80,7 +96,7 @@ fn profile_with_authentication(
         )
         .unwrap(),
         deployment_scope_allowance: vec!["read".into(), "write".into()],
-        policy_generation: 30,
+        policy_generation,
         idp_metadata_generation: 31,
         resource_as_metadata_generation: 32,
         aggregate_registration_generation: 33,
@@ -2236,6 +2252,454 @@ fn enterprise_exchange_restore_quarantine_fences_each_disclosure_and_credential_
         ));
         assert_eq!(poster.take_recorded().len(), 1);
         assert_eq!(replay.reserved_aliases(), 2);
+    });
+}
+
+/// Post-exchange fixture for the real local-TLS HTTP-client test. This does not
+/// pretend that the separate scripted IdP fixtures ran against the local peer.
+pub(in crate::http_auth) fn http_policy_credential_for_test(
+    resource: &CanonicalHttpUrl,
+) -> (
+    super::super::http::EnterpriseHttpPolicy,
+    BoundBearerCredential,
+) {
+    use super::super::http::EnterpriseHttpPolicy;
+    let selected = profile_for_http_resource(
+        &["read"],
+        EnterpriseClientAuthentication::ClientSecretBasic,
+        EnterpriseClientAuthentication::ClientSecretPost,
+        resource.as_str(),
+        30,
+    );
+    let expiry = Instant::now() + Duration::from_secs(90);
+    let owner = EnterpriseHttpPolicy::new(selected, expiry, expiry).unwrap();
+    let mut credential =
+        BoundBearerCredential::bind_with_expiry(resource.clone(), "enterprise-http-secret", expiry)
+            .unwrap()
+            .for_owner(owner.cancellation())
+            .unwrap();
+    credential.enterprise_request_binding = true;
+    (owner, credential)
+}
+
+fn enterprise_http_request_body(settings: Value) -> Vec<u8> {
+    use super::super::http::ENTERPRISE_AUTHORIZATION_EXTENSION_ID;
+    serde_json::to_vec(&json!({
+        "jsonrpc":"2.0", "id":1, "method":"tools/list",
+        "params":{"_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{
+                "extensions":{ENTERPRISE_AUTHORIZATION_EXTENSION_ID:settings}
+            }
+        }}
+    }))
+    .unwrap()
+}
+
+fn enterprise_raw_request(
+    resource: &str,
+    body: Vec<u8>,
+    credential: &BoundBearerCredential,
+) -> crate::http_executor::ModernHttpRequest {
+    crate::http_executor::ModernHttpRequest::new(
+        resource,
+        body,
+        fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+        "tools/list",
+        None,
+    )
+    .unwrap()
+    .with_authorization(credential)
+}
+
+fn has_enterprise_header(request: &crate::http_executor::ModernHttpRequest) -> bool {
+    request
+        .headers()
+        .iter()
+        .any(|(name, value)| name == "Authorization" && value == "Bearer enterprise-http-secret")
+}
+
+#[test]
+fn enterprise_http_headers_require_the_current_exact_raw_declaration() {
+    let resource = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
+    let (_owner, credential) = http_policy_credential_for_test(&resource);
+    let positive = enterprise_raw_request(
+        resource.as_str(),
+        enterprise_http_request_body(json!({})),
+        &credential,
+    );
+    assert!(has_enterprise_header(&positive));
+    assert!(credential.authorization_for_target(&resource).is_none());
+    for settings in [
+        Value::Null,
+        json!(true),
+        json!([]),
+        json!("{}"),
+        json!({"enabled":true}),
+    ] {
+        assert!(!has_enterprise_header(&enterprise_raw_request(
+            resource.as_str(),
+            enterprise_http_request_body(settings),
+            &credential,
+        )));
+    }
+    for raw in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"example.com/enterprise-managed-authorization":{}}}}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2024-11-05","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/enterprise-managed-authorization":{}}}}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/enterprise-managed-authorization":{},"io.modelcontextprotocol/enterprise-managed-authorization":{}}}}}}"#,
+    ] {
+        assert!(!has_enterprise_header(&enterprise_raw_request(
+            resource.as_str(),
+            raw.as_bytes().to_vec(),
+            &credential,
+        )));
+    }
+    for target in [
+        "https://mcp.example/other",
+        "https://other.example/mcp",
+        "http://mcp.example/mcp",
+    ] {
+        assert!(!has_enterprise_header(&enterprise_raw_request(
+            target,
+            enterprise_http_request_body(json!({})),
+            &credential,
+        )));
+    }
+    let wrong_header_era = crate::http_executor::ModernHttpRequest::new(
+        resource.as_str(),
+        enterprise_http_request_body(json!({})),
+        "2024-11-05",
+        "tools/list",
+        None,
+    )
+    .unwrap()
+    .with_authorization(&credential);
+    assert!(!has_enterprise_header(&wrong_header_era));
+    let wrong_method = crate::http_executor::ModernHttpRequest::new(
+        resource.as_str(),
+        enterprise_http_request_body(json!({})),
+        fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+        "tools/call",
+        None,
+    )
+    .unwrap()
+    .with_authorization(&credential);
+    assert!(!has_enterprise_header(&wrong_method));
+    let mut call: Value = serde_json::from_slice(&enterprise_http_request_body(json!({}))).unwrap();
+    call["method"] = json!("tools/call");
+    call["params"]["name"] = json!("lookup");
+    let call = serde_json::to_vec(&call).unwrap();
+    for name in [None, Some("other")] {
+        let wrong_name = crate::http_executor::ModernHttpRequest::new(
+            resource.as_str(),
+            call.clone(),
+            fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+            "tools/call",
+            name.map(str::to_owned),
+        )
+        .unwrap()
+        .with_authorization(&credential);
+        assert!(!has_enterprise_header(&wrong_name));
+    }
+    let matching_name = crate::http_executor::ModernHttpRequest::new(
+        resource.as_str(),
+        call,
+        fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+        "tools/call",
+        Some("lookup".to_owned()),
+    )
+    .unwrap()
+    .with_authorization(&credential);
+    assert!(has_enterprise_header(&matching_name));
+    // Responses and notifications carry neither request-local metadata nor
+    // request routing headers. The raw request constructor cannot disguise a
+    // control envelope using unrelated Mcp-Method/Mcp-Name headers.
+    for control in [
+        br#"{"jsonrpc":"2.0","id":2,"result":{}}"#.as_slice(),
+        br#"{"jsonrpc":"2.0","method":"notifications/example"}"#.as_slice(),
+    ] {
+        assert!(!has_enterprise_header(&enterprise_raw_request(
+            resource.as_str(),
+            control.to_vec(),
+            &credential,
+        )));
+        let control =
+            crate::http_executor::ModernHttpRequest::control(resource.as_str(), control.to_vec())
+                .unwrap()
+                .with_authorization(&credential);
+        assert!(has_enterprise_header(&control));
+        assert!(!control.headers().iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("mcp-method")
+                || name.eq_ignore_ascii_case("mcp-name")
+                || name.eq_ignore_ascii_case("mcp-protocol-version")
+        }));
+    }
+    assert!(
+        crate::http_executor::ModernHttpRequest::control(
+            resource.as_str(),
+            enterprise_http_request_body(json!({})),
+        )
+        .is_err()
+    );
+    let notification = crate::http_executor::ModernHttpRequest::notification(
+        resource.as_str(),
+        "notifications/example",
+        json!({}),
+    )
+    .unwrap()
+    .with_authorization(&credential);
+    assert!(has_enterprise_header(&notification));
+    assert!(
+        has_enterprise_header(&positive),
+        "every refused twin leaves the owner unchanged"
+    );
+}
+
+#[test]
+fn enterprise_http_policy_rotation_and_drop_revoke_prepared_requests_and_clones() {
+    use super::super::http::{EnterpriseHttpPolicy, EnterpriseHttpPolicyError};
+    let resource = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
+    let (mut owner, credential) = http_policy_credential_for_test(&resource);
+    let debug = format!("{owner:?}");
+    for identity in ["mcp.example", "idp.example", "as.example", "client-at-idp"] {
+        assert!(!debug.contains(identity));
+    }
+    let request = enterprise_raw_request(
+        resource.as_str(),
+        enterprise_http_request_body(json!({})),
+        &credential,
+    );
+    drop(credential.clone());
+    drop(request.clone());
+    assert!(has_enterprise_header(&request));
+    let fresh = Instant::now() + Duration::from_secs(90);
+    for (idp_deadline, as_deadline) in [(Instant::now(), fresh), (fresh, Instant::now())] {
+        assert_eq!(
+            EnterpriseHttpPolicy::new(owner.profile().clone(), idp_deadline, as_deadline).err(),
+            Some(EnterpriseHttpPolicyError::StaleMetadata)
+        );
+    }
+    assert_eq!(
+        owner.replace(owner.profile().clone(), fresh, fresh),
+        Err(EnterpriseHttpPolicyError::GenerationRollback)
+    );
+    assert!(has_enterprise_header(&request));
+    let replacement = profile_for_http_resource(
+        &["read"],
+        EnterpriseClientAuthentication::ClientSecretBasic,
+        EnterpriseClientAuthentication::ClientSecretPost,
+        resource.as_str(),
+        31,
+    );
+    assert_eq!(
+        owner.replace(replacement.clone(), Instant::now(), fresh),
+        Err(EnterpriseHttpPolicyError::StaleMetadata)
+    );
+    assert!(has_enterprise_header(&request));
+    owner.replace(replacement, fresh, fresh).unwrap();
+    assert!(credential.is_revoked());
+    assert!(!has_enterprise_header(&request));
+
+    let (owner, credential) = http_policy_credential_for_test(&resource);
+    let request = enterprise_raw_request(
+        resource.as_str(),
+        enterprise_http_request_body(json!({})),
+        &credential,
+    );
+    owner.revoke();
+    assert!(!has_enterprise_header(&request));
+    let (owner, credential) = http_policy_credential_for_test(&resource);
+    let request = enterprise_raw_request(
+        resource.as_str(),
+        enterprise_http_request_body(json!({})),
+        &credential,
+    );
+    drop(owner);
+    assert!(credential.is_revoked());
+    assert!(!has_enterprise_header(&request));
+
+    let exhausted_profile = profile_for_http_resource(
+        &["read"],
+        EnterpriseClientAuthentication::ClientSecretBasic,
+        EnterpriseClientAuthentication::ClientSecretPost,
+        resource.as_str(),
+        u64::MAX,
+    );
+    let mut exhausted = EnterpriseHttpPolicy::new(exhausted_profile, fresh, fresh).unwrap();
+    assert_eq!(
+        exhausted.replace(profile(&["read"]), fresh, fresh),
+        Err(EnterpriseHttpPolicyError::GenerationRollback)
+    );
+}
+
+async fn final_token_for_http_binding(
+    cx: &Cx,
+    selected: &EnterpriseProfile,
+) -> EnterpriseBoundAccessToken {
+    final_token_and_replay_for_http_binding(cx, selected)
+        .await
+        .0
+}
+
+async fn final_token_and_replay_for_http_binding(
+    cx: &Cx,
+    selected: &EnterpriseProfile,
+) -> (EnterpriseBoundAccessToken, ExchangeReplayFixture) {
+    let (exchanged, replay) = exchanged_for_test(cx, selected).await;
+    let fetcher = test_fetcher();
+    let poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+        "as.example",
+        fetcher.root_identity(),
+        serde_json::to_vec(&access_body()).unwrap(),
+    ))]);
+    let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+    let secret = EnterpriseClientSecret::try_new("fixture-resource-secret").unwrap();
+    let (outcome, _) = driver
+        .exchange_id_jag_for_access_token(cx, exchanged, &secret, now())
+        .await
+        .unwrap();
+    assert_eq!(poster.take_recorded().len(), 1);
+    (success(outcome), replay)
+}
+
+#[test]
+fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines() {
+    use super::super::http::{EnterpriseHttpPolicy, EnterpriseHttpPolicyError};
+    let selected = profile(&["read"]);
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let idp_expiry = Instant::now() + Duration::from_secs(20);
+        let as_expiry = idp_expiry + Duration::from_secs(10);
+        let owner = EnterpriseHttpPolicy::new(selected.clone(), idp_expiry, as_expiry).unwrap();
+        let token = final_token_for_http_binding(&cx, &selected).await;
+        let credential = token
+            .into_http_credential(&owner, Instant::now() + Duration::from_hours(1), now())
+            .unwrap();
+        assert_eq!(credential.expires_at(), Some(idp_expiry));
+        let request = enterprise_raw_request(
+            "https://mcp.example/mcp",
+            enterprise_http_request_body(json!({})),
+            &credential,
+        );
+        assert!(
+            request.headers().iter().any(
+                |(name, value)| name == "Authorization" && value == "Bearer final-opaque-token"
+            )
+        );
+
+        for wrong_profile in [
+            profile(&["read", "write"]),
+            profile_for_http_resource(
+                &["read"],
+                EnterpriseClientAuthentication::ClientSecretBasic,
+                EnterpriseClientAuthentication::ClientSecretPost,
+                "https://other.example/mcp",
+                30,
+            ),
+            profile_for_http_resource(
+                &["read"],
+                EnterpriseClientAuthentication::ClientSecretBasic,
+                EnterpriseClientAuthentication::ClientSecretPost,
+                "https://mcp.example/mcp",
+                31,
+            ),
+        ] {
+            let other_owner =
+                EnterpriseHttpPolicy::new(wrong_profile, idp_expiry, as_expiry).unwrap();
+            let token = final_token_for_http_binding(&cx, &selected).await;
+            assert_eq!(
+                token
+                    .into_http_credential(&other_owner, Instant::now(), now())
+                    .err(),
+                Some(EnterpriseHttpPolicyError::ProfileMismatch)
+            );
+        }
+        let token = final_token_for_http_binding(&cx, &selected).await;
+        assert_eq!(
+            token
+                .into_http_credential(&owner, Instant::now(), now() - Duration::from_secs(1))
+                .err(),
+            Some(EnterpriseHttpPolicyError::CredentialUnavailable)
+        );
+        let mut expired = final_token_for_http_binding(&cx, &selected).await;
+        expired.expires_at_monotonic = Instant::now();
+        assert_eq!(
+            expired
+                .into_http_credential(&owner, Instant::now() - Duration::from_secs(60), now())
+                .err(),
+            Some(EnterpriseHttpPolicyError::CredentialUnavailable)
+        );
+        let (token, replay) = final_token_and_replay_for_http_binding(&cx, &selected).await;
+        replay.quarantine(&cx).await;
+        assert_eq!(
+            token
+                .into_http_credential(&owner, Instant::now(), now())
+                .err(),
+            Some(EnterpriseHttpPolicyError::CredentialUnavailable)
+        );
+        assert_eq!(
+            replay.reserved_aliases(),
+            2,
+            "HTTP binding never reopens consumed identity aliases"
+        );
+        let (token, replay) = final_token_and_replay_for_http_binding(&cx, &selected).await;
+        let guarded = token
+            .into_http_credential(&owner, Instant::now(), now())
+            .unwrap();
+        let guarded_request = enterprise_raw_request(
+            "https://mcp.example/mcp",
+            enterprise_http_request_body(json!({})),
+            &guarded,
+        );
+        assert!(
+            guarded_request
+                .headers()
+                .iter()
+                .any(|(name, _)| name == "Authorization")
+        );
+        replay.quarantine(&cx).await;
+        assert!(guarded.is_revoked());
+        assert!(
+            !guarded_request
+                .headers()
+                .iter()
+                .any(|(name, _)| name == "Authorization")
+        );
+        assert_eq!(replay.reserved_aliases(), 2);
+        owner.revoke();
+        assert!(
+            !request
+                .headers()
+                .iter()
+                .any(|(name, _)| name == "Authorization")
+        );
+        let token = final_token_for_http_binding(&cx, &selected).await;
+        assert_eq!(
+            token
+                .into_http_credential(&owner, Instant::now(), now())
+                .err(),
+            Some(EnterpriseHttpPolicyError::Revoked)
+        );
+    });
+}
+
+#[test]
+fn enterprise_http_raw_missing_declaration_refuses_before_opening_a_connection() {
+    use crate::http_executor::{ModernHttpExecutor, ModernHttpExecutorError};
+    let resource = CanonicalHttpUrl::parse("https://127.0.0.1:9/mcp").unwrap();
+    let (_owner, credential) = http_policy_credential_for_test(&resource);
+    let request = enterprise_raw_request(
+        resource.as_str(),
+        enterprise_http_request_body(json!({"not":"empty"})),
+        &credential,
+    );
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        assert!(matches!(
+            ModernHttpExecutor::new().execute(&cx, &request).await,
+            Err(ModernHttpExecutorError::CredentialUnavailable)
+        ));
     });
 }
 

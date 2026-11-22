@@ -17,7 +17,11 @@
 //! browser. Durable browser-flow custody, confidential credential providers and
 //! independently attested deployment/identity authority remain separate work.
 //! A local byte digest or subject lookup is not a launch or authorization receipt.
+//! The opt-in HTTP policy owner binds an already exchanged grant to fresh
+//! admitted metadata and checks its declaration on each outgoing MCP request.
 
+/// Post-exchange, request-local enterprise binding for the native HTTP client.
+pub mod http;
 pub mod identity;
 pub mod keys;
 pub mod oidc;

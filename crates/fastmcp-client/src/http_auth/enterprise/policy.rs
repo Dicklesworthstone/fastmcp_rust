@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId};
+use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, sha256_bounded};
 use fastmcp_protocol::security_admission::{
     SecurityDocumentKind, admit_security_document, admit_security_document_object,
 };
@@ -196,6 +196,7 @@ pub struct EnterpriseProfileConfiguration {
 pub struct EnterpriseProfile {
     configuration: EnterpriseProfileConfiguration,
     oidc_openid_allowed: bool,
+    document_digests: [[u8; 32]; 5],
 }
 
 impl EnterpriseProfile {
@@ -207,7 +208,9 @@ impl EnterpriseProfile {
     /// record must independently declare `authorization_grant_profiles_supported`
     /// and client `grant_types`. AS `grant_types_supported` never substitutes
     /// for either client declaration. Unknown metadata fields are bounded and
-    /// ignored; they never supply missing authority. Raw credentials and DCR
+    /// ignored for authorization; they never supply missing authority. Exact
+    /// admitted document bytes remain part of this profile's immutable identity.
+    /// Raw credentials and DCR
     /// management fields are refused by presence before any JSON map is built.
     ///
     /// This only validates local inputs. Callers must obtain the documents and
@@ -329,6 +332,22 @@ impl EnterpriseProfile {
         Ok(Self {
             configuration,
             oidc_openid_allowed,
+            document_digests: [
+                document_digest(SecurityDocumentKind::OidcProviderMetadata, idp_metadata)?,
+                document_digest(
+                    SecurityDocumentKind::AuthorizationServerMetadata,
+                    resource_as_metadata,
+                )?,
+                document_digest(
+                    SecurityDocumentKind::ClientRegistration,
+                    aggregate_client_metadata,
+                )?,
+                document_digest(SecurityDocumentKind::ClientRegistration, idp_registration)?,
+                document_digest(
+                    SecurityDocumentKind::ClientRegistration,
+                    resource_registration,
+                )?,
+            ],
         })
     }
 
@@ -464,6 +483,15 @@ impl EnterpriseProfile {
     pub fn aggregate_registration_generation(&self) -> u64 {
         self.configuration.aggregate_registration_generation
     }
+}
+
+fn document_digest(
+    kind: SecurityDocumentKind,
+    bytes: &[u8],
+) -> Result<[u8; 32], EnterprisePolicyError> {
+    sha256_bounded(bytes, kind.byte_limit())
+        .map(fastmcp_core::Sha256Digest::into_bytes)
+        .map_err(|_| EnterprisePolicyError::InvalidDocument)
 }
 
 /// A bounded literal OAuth scope request. No hierarchy or defaults are inferred.
@@ -951,6 +979,25 @@ mod tests {
             &bytes[3],
             &bytes[4],
         )
+    }
+
+    #[test]
+    fn enterprise_profile_identity_includes_each_exact_admitted_document() {
+        let original_documents = documents();
+        let original = admit(configuration(), &original_documents).unwrap();
+        assert_eq!(
+            original,
+            admit(configuration(), &original_documents).unwrap()
+        );
+        for index in 0..original_documents.len() {
+            let mut changed_documents = original_documents.clone();
+            changed_documents[index]["admitted-document-revision"] = json!("new");
+            let changed = admit(configuration(), &changed_documents).unwrap();
+            assert_ne!(
+                original, changed,
+                "document {index} changed without a generation update"
+            );
+        }
     }
 
     #[test]

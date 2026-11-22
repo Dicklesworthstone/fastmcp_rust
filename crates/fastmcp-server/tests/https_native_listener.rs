@@ -501,6 +501,68 @@ fn https_native_authenticated_json_and_sse_preserve_principal_progress_and_paylo
 }
 
 #[test]
+fn https_native_enterprise_declaration_preserves_core_dispatch_without_rpc_descriptor() {
+    const ENTERPRISE: &str = "io.modelcontextprotocol/enterprise-managed-authorization";
+
+    run(|cx| async move {
+        let probe = Probe::new();
+        let running = Running::start(&cx, &probe, Duration::from_secs(10)).await;
+        let declared = |method: &str| {
+            let mut request = request(false).with_header("mcp-method", method).with_body(
+                serde_json::to_vec(&json!({
+                    "jsonrpc":"2.0", "id":17, "method":method,
+                    "params":{"_meta":{
+                        "io.modelcontextprotocol/protocolVersion":FINAL_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities":{
+                            "extensions":{ENTERPRISE:{}}
+                        }
+                    }}
+                }))
+                .unwrap(),
+            );
+            request.headers.remove("mcp-name");
+            request
+        };
+        let discovery = exchange(&cx, running.address, declared("server/discover")).await;
+        let listed = exchange(&cx, running.address, declared("tools/list")).await;
+        // An identical declaration cannot replace bearer authentication.
+        let mut unauthenticated = declared("tools/list");
+        unauthenticated.headers.remove("authorization");
+        let refused = exchange(&cx, running.address, unauthenticated).await;
+        let recovered = exchange(&cx, running.address, declared("tools/list")).await;
+        running.stop(&cx).await;
+
+        let discovery = decode_wire(&discovery.unwrap());
+        assert_eq!(discovery.status.0, 200);
+        let discovery: Value = serde_json::from_slice(&discovery.body).unwrap();
+        assert_eq!(discovery["result"]["resultType"], "complete");
+        assert!(discovery.get("error").is_none());
+        assert!(
+            discovery["result"]["capabilities"]
+                .get("extensions")
+                .and_then(|extensions| extensions.get(ENTERPRISE))
+                .is_none(),
+            "an authorization declaration does not install an RPC descriptor"
+        );
+        for bytes in [listed.unwrap(), recovered.unwrap()] {
+            let response = decode_wire(&bytes);
+            assert_eq!(response.status.0, 200);
+            let response: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(response["result"]["resultType"], "complete");
+            assert!(
+                response["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == TOOL)
+            );
+        }
+        assert_eq!(decode_wire(&refused.unwrap()).status.0, 401);
+        assert_eq!(probe.effects.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
 fn https_native_credential_and_origin_refusals_leave_handler_state_unchanged() {
     run(|cx| async move {
         let probe = Probe::new();

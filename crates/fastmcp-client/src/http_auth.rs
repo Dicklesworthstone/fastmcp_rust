@@ -118,6 +118,10 @@ pub struct BoundBearerCredential {
     expires_at: Option<Instant>,
     revoked: McpRequestCancellation,
     owner_cancellation: Option<McpRequestCancellation>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+    enterprise_request_binding: bool,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+    enterprise_exchange_guard: Option<std::sync::Arc<enterprise::http::EnterpriseHttpGrantGuard>>,
 }
 
 impl fmt::Debug for BoundBearerCredential {
@@ -167,6 +171,10 @@ impl BoundBearerCredential {
             expires_at: None,
             revoked: McpRequestCancellation::new(),
             owner_cancellation: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+            enterprise_request_binding: false,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+            enterprise_exchange_guard: None,
         })
     }
 
@@ -232,6 +240,14 @@ impl BoundBearerCredential {
     /// its owner has cancelled. Expiry remains a separate condition.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+        if self
+            .enterprise_exchange_guard
+            .as_ref()
+            .is_some_and(|guard| !guard.is_valid())
+        {
+            return true;
+        }
         self.revoked.is_cancel_requested()
             || self
                 .owner_cancellation
@@ -248,8 +264,58 @@ impl BoundBearerCredential {
     /// never observe the token. Consumers requiring authenticated dispatch
     /// must reject a withheld credential rather than silently sending a
     /// request without authorization.
+    /// Enterprise-policy credentials additionally require the encoded current
+    /// MCP request, so this target-only accessor always withholds them. Use
+    /// [`crate::ClientBuilder::http_bearer_credential`] or
+    /// [`crate::http_executor::ModernHttpRequest::with_authorization`] instead.
     #[must_use]
     pub fn authorization_for_target(&self, target: &CanonicalHttpUrl) -> Option<String> {
+        if self.requires_enterprise_declaration() {
+            return None;
+        }
+        self.authorization_at(target, Instant::now())
+    }
+
+    pub(crate) fn requires_enterprise_declaration(&self) -> bool {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+        {
+            self.enterprise_request_binding
+        }
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "enterprise-auth")))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn authorization_for_http_request(
+        &self,
+        target: &CanonicalHttpUrl,
+        body: &[u8],
+        protocol_version: &str,
+        method: &str,
+        name: Option<&str>,
+        request_routing_headers: bool,
+    ) -> Option<String> {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+        if self.enterprise_request_binding
+            && (protocol_version != fastmcp_protocol::FINAL_PROTOCOL_VERSION
+                || !enterprise::http::admits_http_document(
+                    body,
+                    method,
+                    name,
+                    request_routing_headers,
+                ))
+        {
+            return None;
+        }
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "enterprise-auth")))]
+        let _ = (
+            body,
+            protocol_version,
+            method,
+            name,
+            request_routing_headers,
+        );
         self.authorization_at(target, Instant::now())
     }
 

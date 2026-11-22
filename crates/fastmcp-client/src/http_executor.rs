@@ -451,9 +451,24 @@ pub struct ModernHttpRequest {
     name: Option<String>,
     name_header: Option<String>,
     authorization: Option<String>,
+    attached_credential: Option<AttachedBearerCredential>,
     parameter_headers: Option<Vec<(String, String)>>,
     request_routing_headers: bool,
 }
+
+/// Retains an enterprise policy lease instead of freezing its bearer header
+/// when a caller prepares a raw request. Cloned requests share that lease;
+/// equality denotes the same credential owner, not equal secret bytes.
+#[derive(Clone)]
+struct AttachedBearerCredential(Arc<crate::http_auth::BoundBearerCredential>);
+
+impl PartialEq for AttachedBearerCredential {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for AttachedBearerCredential {}
 
 impl fmt::Debug for ModernHttpRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -470,7 +485,8 @@ impl fmt::Debug for ModernHttpRequest {
             )
             .field(
                 "authorization",
-                &self.authorization.as_ref().map(|_| "<redacted>"),
+                &(self.authorization.is_some() || self.attached_credential.is_some())
+                    .then_some("<redacted>"),
             )
             .finish()
     }
@@ -523,9 +539,34 @@ impl ModernHttpRequest {
             name,
             name_header,
             authorization: None,
+            attached_credential: None,
             parameter_headers: None,
             request_routing_headers: true,
         })
+    }
+
+    /// Constructs a header-free JSON-RPC notification or response POST.
+    ///
+    /// Admits one bounded, duplicate-free control envelope. Ordinary requests
+    /// must use [`Self::new`]; no request routing headers or request metadata
+    /// are synthesized for controls. This also permits a policy-bound enterprise
+    /// credential to authenticate a reply without inventing a client request.
+    pub fn control(
+        target: impl Into<String>,
+        body: Vec<u8>,
+    ) -> Result<Self, ModernHttpExecutorError> {
+        let message = decode_strict_jsonrpc_message(&body, crate::MAX_HTTP_EXECUTION_REQUEST_BYTES)
+            .map_err(|_| ModernHttpExecutorError::InvalidRequestMetadata)?;
+        let method = match message {
+            JsonRpcMessage::Request(request) if request.id.is_none() => request.method,
+            JsonRpcMessage::Response(_) => "response".to_owned(),
+            JsonRpcMessage::Request(_) => {
+                return Err(ModernHttpExecutorError::InvalidRequestMetadata);
+            }
+        };
+        let mut request = Self::new(target, body, MODERN_PROTOCOL_VERSION, method, None)?;
+        request.request_routing_headers = false;
+        Ok(request)
     }
 
     /// Constructs a notification only after its frozen activation was admitted.
@@ -540,22 +581,28 @@ impl ModernHttpRequest {
             .map_err(|_| ModernHttpClientError::ExtensionNotificationNotAdmitted)?;
         let body = serde_json::to_vec(&notification)
             .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
-        let mut request = Self::new(target, body, MODERN_PROTOCOL_VERSION, method, None)
-            .map_err(ModernHttpClientError::Executor)?;
-        request.request_routing_headers = false;
-        Ok(request)
+        Self::control(target, body).map_err(ModernHttpClientError::Executor)
     }
 
     /// Attaches the bound bearer credential's `Authorization` header when —
     /// and only when — this request's target is canonically identical to the credential's
     /// bound HTTPS resource. Any other target leaves the request
     /// credential-free rather than downgrading or redirecting the token.
+    /// Enterprise-policy credentials retain a live lease here: each header
+    /// construction checks the current policy and exact encoded declaration.
+    /// Native dispatch refuses a withheld enterprise credential before contact.
     #[must_use]
     pub fn with_authorization(
         mut self,
         credential: &crate::http_auth::BoundBearerCredential,
     ) -> Self {
-        self.authorization = self.bound_authorization(credential);
+        if credential.requires_enterprise_declaration() {
+            self.authorization = None;
+            self.attached_credential = Some(AttachedBearerCredential(Arc::new(credential.clone())));
+        } else {
+            self.authorization = self.bound_authorization(credential);
+            self.attached_credential = None;
+        }
         self
     }
 
@@ -564,7 +611,14 @@ impl ModernHttpRequest {
         credential: &crate::http_auth::BoundBearerCredential,
     ) -> Option<String> {
         let target = fastmcp_core::CanonicalHttpUrl::parse(&self.target).ok()?;
-        credential.authorization_for_target(&target)
+        credential.authorization_for_http_request(
+            &target,
+            &self.body,
+            &self.protocol_version,
+            &self.method,
+            self.name.as_deref(),
+            self.request_routing_headers,
+        )
     }
 
     /// Returns the configured absolute target supplied by the caller.
@@ -619,7 +673,10 @@ impl ModernHttpRequest {
         }
         let authorization = match credential {
             Some(credential) => self.bound_authorization(credential),
-            None => self.authorization.clone(),
+            None => match &self.attached_credential {
+                Some(credential) => self.bound_authorization(&credential.0),
+                None => self.authorization.clone(),
+            },
         };
         if let Some(authorization) = authorization {
             headers.push(("Authorization".to_owned(), authorization));
@@ -5025,13 +5082,22 @@ impl ModernHttpExecutor {
         if metadata.kind != ModernHttpResponseKind::Sse {
             response_head_admitted.store(true, Ordering::Release);
         }
-        let diagnostic_credential = self.bearer_credential.clone().or_else(|| {
-            let token = request.authorization.as_deref()?.strip_prefix("Bearer ")?;
-            let target = fastmcp_core::CanonicalHttpUrl::parse(request.target()).ok()?;
-            crate::http_auth::BoundBearerCredential::bind(target, token)
-                .ok()
-                .map(Arc::new)
-        });
+        let diagnostic_credential = self
+            .bearer_credential
+            .clone()
+            .or_else(|| {
+                request
+                    .attached_credential
+                    .as_ref()
+                    .map(|credential| Arc::clone(&credential.0))
+            })
+            .or_else(|| {
+                let token = request.authorization.as_deref()?.strip_prefix("Bearer ")?;
+                let target = fastmcp_core::CanonicalHttpUrl::parse(request.target()).ok()?;
+                crate::http_auth::BoundBearerCredential::bind(target, token)
+                    .ok()
+                    .map(Arc::new)
+            });
         Ok(ModernHttpResponseStream {
             metadata,
             response: Box::new(ModernHttpNativeResponse {
@@ -5057,6 +5123,12 @@ async fn execute_native_modern_request(
     request_bytes_sent: Arc<AtomicBool>,
     response_head_admitted: Arc<AtomicBool>,
 ) -> Result<ClientStreamingResponse<ModernHttpIo>, ModernHttpExecutorError> {
+    let credential = credential.or_else(|| {
+        request
+            .attached_credential
+            .as_ref()
+            .map(|credential| credential.0.as_ref())
+    });
     let map_error = |error| map_modern_exchange_error(error, &request_bytes_sent);
     let unavailable = |credential: &crate::http_auth::BoundBearerCredential| {
         credential.is_revoked()
@@ -5071,10 +5143,24 @@ async fn execute_native_modern_request(
     if credential.is_some_and(unavailable) {
         return Err(ModernHttpExecutorError::CredentialUnavailable);
     }
+    // An enterprise credential cannot be used without this encoded request's
+    // exact declaration and current policy. Refuse before DNS/TCP/TLS rather
+    // than silently treating a withheld credential as an anonymous request.
+    if credential.is_some_and(|credential| {
+        credential.requires_enterprise_declaration()
+            && request.bound_authorization(credential).is_none()
+    }) {
+        return Err(ModernHttpExecutorError::CredentialUnavailable);
+    }
     // Admission compares canonical resources. Use that same spelling on the
     // wire: native ParsedUrl deliberately preserves raw paths, including dot
     // segments that must not select a different route under private trust.
-    let target = resource_tls.map_or(request.target(), |trust| trust.resource.as_str());
+    let target = credential
+        .filter(|credential| credential.requires_enterprise_declaration())
+        .map_or_else(
+            || resource_tls.map_or(request.target(), |trust| trust.resource.as_str()),
+            |credential| credential.resource().as_str(),
+        );
     let parsed = ParsedUrl::parse(target).map_err(map_error)?;
     cx.checkpoint()
         .map_err(|_| ModernHttpExecutorError::Cancelled)?;
@@ -5131,6 +5217,12 @@ async fn execute_native_modern_request(
     // different resource retains that API's optional-auth behavior. The public
     // configured client separately binds its exact resource before connecting.
     if credential.is_some_and(unavailable) {
+        return Err(ModernHttpExecutorError::CredentialUnavailable);
+    }
+    if credential
+        .is_some_and(crate::http_auth::BoundBearerCredential::requires_enterprise_declaration)
+        && !headers.iter().any(|(name, _)| name == "Authorization")
+    {
         return Err(ModernHttpExecutorError::CredentialUnavailable);
     }
     let native_request = Request::builder(Method::Post, parsed.path.clone())
@@ -8404,6 +8496,37 @@ async fn read_typed_http_jsonrpc_response(
 }
 
 impl ModernHttpClient {
+    /// Checks current authority before high-level metadata synthesis or a
+    /// typed-result cache lookup can hide a caller's invalid declaration.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+    pub(crate) fn admit_enterprise_parameters(
+        &self,
+        parameters: &serde_json::Value,
+    ) -> Result<(), ModernHttpClientError> {
+        if let Some(credential) = self
+            .executor
+            .bearer_credential
+            .as_deref()
+            .filter(|credential| credential.requires_enterprise_declaration())
+        {
+            if credential.is_revoked()
+                || credential
+                    .expires_at()
+                    .is_none_or(|deadline| Instant::now() >= deadline)
+            {
+                return Err(ModernHttpClientError::Executor(
+                    ModernHttpExecutorError::CredentialUnavailable,
+                ));
+            }
+            if !crate::http_auth::enterprise::http::admits_caller_parameters(parameters) {
+                return Err(ModernHttpClientError::Executor(
+                    ModernHttpExecutorError::InvalidRequestMetadata,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Connects using one immutable HTTP protocol plan and a disposable modern
     /// `server/discover` probe.
     ///
@@ -8513,12 +8636,17 @@ impl ModernHttpClient {
         let generic_apps_configured = client_extension_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.configures_mcp_apps());
-        let client_extensions = merge_client_extensions(
+        let mut client_extensions = merge_client_extensions(
             (!generic_apps_configured)
                 .then_some(mcp_apps_settings.as_ref())
                 .flatten(),
             configured_extensions.as_ref(),
         );
+        add_enterprise_authorization_extension(
+            &mut client_extensions,
+            &client_capabilities,
+            bearer_credential.as_ref(),
+        )?;
         // Discovery is the first client-authored request. It must carry the
         // same configured identity as every request made by the ready client,
         // before the peer can make any identity-dependent discovery decision.
@@ -8810,7 +8938,27 @@ impl ModernHttpClient {
     fn configured_client_extensions(
         &self,
         additional_client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
-    ) -> Option<BTreeMap<String, serde_json::Value>> {
+    ) -> Result<Option<BTreeMap<String, serde_json::Value>>, ModernHttpClientError> {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+        if self
+            .executor
+            .bearer_credential
+            .as_deref()
+            .is_some_and(crate::http_auth::BoundBearerCredential::requires_enterprise_declaration)
+            && additional_client_extensions
+                .and_then(|extensions| {
+                    extensions.get(
+                        crate::http_auth::enterprise::http::ENTERPRISE_AUTHORIZATION_EXTENSION_ID,
+                    )
+                })
+                .is_some_and(|settings| {
+                    !settings.as_object().is_some_and(serde_json::Map::is_empty)
+                })
+        {
+            return Err(ModernHttpClientError::Executor(
+                ModernHttpExecutorError::InvalidRequestMetadata,
+            ));
+        }
         let mut extensions = self
             .client_extension_runtime
             .as_ref()
@@ -8822,7 +8970,13 @@ impl ModernHttpClient {
                     .or_insert_with(|| settings.clone());
             }
         }
-        (!extensions.is_empty()).then_some(extensions)
+        let mut extensions = (!extensions.is_empty()).then_some(extensions);
+        add_enterprise_authorization_extension(
+            &mut extensions,
+            &self.client_capabilities,
+            self.executor.bearer_credential.as_deref(),
+        )?;
+        Ok(extensions)
     }
 
     fn build_post_discovery_request(
@@ -8840,7 +8994,7 @@ impl ModernHttpClient {
             .as_ref()
             .is_some_and(|runtime| runtime.configures_mcp_apps());
         let client_extension_settings =
-            self.configured_client_extensions(additional_client_extensions);
+            self.configured_client_extensions(additional_client_extensions)?;
         let mut client_extensions = merge_client_extensions(
             (mcp_apps_active && !generic_apps_configured)
                 .then_some(self.mcp_apps_settings.as_ref())
@@ -9471,7 +9625,7 @@ impl ModernHttpClient {
             .client_extension_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.configures_mcp_apps());
-        let client_extension_settings = self.configured_client_extensions(None);
+        let client_extension_settings = self.configured_client_extensions(None)?;
         let client_extensions = merge_client_extensions(
             (self.discovery_state.mcp_apps_activation_receipt.is_some()
                 && !generic_apps_configured)
@@ -10415,7 +10569,7 @@ impl ModernHttpClient {
             .client_extension_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.configures_mcp_apps());
-        let configured_extensions = self.configured_client_extensions(Some(client_extensions));
+        let configured_extensions = self.configured_client_extensions(Some(client_extensions))?;
         let client_extensions = merge_client_extensions(
             (discovery.mcp_apps_activation_receipt.is_some() && !generic_apps_configured)
                 .then_some(self.mcp_apps_settings.as_ref())
@@ -13504,6 +13658,71 @@ fn merge_client_extensions(
     (!merged.is_empty()).then_some(merged)
 }
 
+/// Authorization overlays are current client declarations. They are never
+/// registered as bilateral RPC descriptors or inferred from server discovery.
+#[cfg_attr(
+    not(all(not(target_arch = "wasm32"), feature = "enterprise-auth")),
+    allow(clippy::unnecessary_wraps)
+)]
+fn add_enterprise_authorization_extension(
+    extensions: &mut Option<BTreeMap<String, serde_json::Value>>,
+    client_capabilities: &ClientCapabilities,
+    credential: Option<&crate::http_auth::BoundBearerCredential>,
+) -> Result<(), ModernHttpClientError> {
+    #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+    if let Some(credential) =
+        credential.filter(|credential| credential.requires_enterprise_declaration())
+    {
+        use crate::http_auth::enterprise::http::ENTERPRISE_AUTHORIZATION_EXTENSION_ID;
+
+        if credential.is_revoked()
+            || credential
+                .expires_at()
+                .is_none_or(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(ModernHttpClientError::Executor(
+                ModernHttpExecutorError::CredentialUnavailable,
+            ));
+        }
+        let extensions = extensions.get_or_insert_with(BTreeMap::new);
+        // Adding this authorization overlay must preserve explicit builder
+        // declarations. Conflicting configuration is refused, never repaired
+        // by replacing one set of settings with another.
+        if let Some(configured) = client_capabilities.extensions.as_ref() {
+            for (id, settings) in configured {
+                if extensions
+                    .get(id)
+                    .is_some_and(|current| current != settings)
+                {
+                    return Err(ModernHttpClientError::Executor(
+                        ModernHttpExecutorError::InvalidRequestMetadata,
+                    ));
+                }
+                extensions
+                    .entry(id.clone())
+                    .or_insert_with(|| settings.clone());
+            }
+        }
+        match extensions.get(ENTERPRISE_AUTHORIZATION_EXTENSION_ID) {
+            Some(value) if !value.as_object().is_some_and(serde_json::Map::is_empty) => {
+                return Err(ModernHttpClientError::Executor(
+                    ModernHttpExecutorError::InvalidRequestMetadata,
+                ));
+            }
+            Some(_) => {}
+            None => {
+                extensions.insert(
+                    ENTERPRISE_AUTHORIZATION_EXTENSION_ID.to_owned(),
+                    serde_json::json!({}),
+                );
+            }
+        }
+    }
+    #[cfg(not(all(not(target_arch = "wasm32"), feature = "enterprise-auth")))]
+    let _ = (extensions, client_capabilities, credential);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_modern_request_with_extensions(
     target: &str,
@@ -13610,6 +13829,18 @@ fn build_modern_request_after_method_validation(
     client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
     outbound_trace: Option<&fastmcp_core::OutboundTraceDecision>,
 ) -> Result<ModernHttpRequest, ModernHttpClientError> {
+    // A configured declaration may fill an absent value, but must not repair
+    // an explicitly malformed caller value into apparent activation.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+    if client_extensions.is_some_and(|extensions| {
+        extensions
+            .contains_key(crate::http_auth::enterprise::http::ENTERPRISE_AUTHORIZATION_EXTENSION_ID)
+    }) && !crate::http_auth::enterprise::http::admits_caller_parameters(&parameters)
+    {
+        return Err(ModernHttpClientError::Executor(
+            ModernHttpExecutorError::InvalidRequestMetadata,
+        ));
+    }
     let mut parameters = parameters
         .as_object()
         .cloned()
@@ -13674,7 +13905,7 @@ fn build_modern_request_after_method_validation(
         .map_err(ModernHttpClientError::Executor)
 }
 
-fn request_name_header_value(
+pub(crate) fn request_name_header_value(
     method: &str,
     parameters: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Option<String>, ModernHttpClientError> {

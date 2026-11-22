@@ -392,6 +392,138 @@ async fn warmup(cx: &Cx, peer: &Peer, client: &mut ManagedHttpClient) {
     assert_catalog(listed.unwrap(), "lookup");
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+#[test]
+fn enterprise_http_public_builder_stamps_every_request_and_observes_owner_revocation() {
+    use crate::HttpClientError;
+    use crate::http_auth::enterprise::http::ENTERPRISE_AUTHORIZATION_EXTENSION_ID;
+    use crate::http_auth::enterprise::response::tests::http_policy_credential_for_test;
+    use crate::http_executor::{
+        ClientHttpConnectionError, ModernHttpClientError, ModernHttpExecutorError,
+    };
+
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let (owner, credential) = http_policy_credential_for_test(&peer.resource());
+        drop(credential.clone());
+        for settings in [Value::Null, json!(true), json!({"enabled":true})] {
+            let refused = peer
+                .client_builder()
+                .capabilities(fastmcp_protocol::ClientCapabilities {
+                    extensions: Some(BTreeMap::from([(
+                        ENTERPRISE_AUTHORIZATION_EXTENSION_ID.to_owned(),
+                        settings,
+                    )])),
+                    ..fastmcp_protocol::ClientCapabilities::default()
+                })
+                .http_bearer_credential(credential.clone())
+                .connect_http_client_with_cx(&cx)
+                .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(HttpClientError::Connection(
+                        ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(
+                            ModernHttpExecutorError::InvalidRequestMetadata
+                        ))
+                    ))
+                ),
+                "malformed builder settings cannot be repaired into activation"
+            );
+        }
+        peer.no_more(&cx).await;
+        let assert_declaration = |body: &Value,
+                                  headers: &BTreeMap<String, String>,
+                                  method: &str| {
+            assert_eq!(
+                body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    [ENTERPRISE_AUTHORIZATION_EXTENSION_ID],
+                json!({})
+            );
+            assert_eq!(
+                body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    ["com.example/preserved"],
+                json!({"mode":"read"})
+            );
+            assert_eq!(headers["mcp-method"], method);
+            assert_eq!(headers["mcp-protocol-version"], FINAL_PROTOCOL_VERSION);
+        };
+        let (client, ()) = Box::pin(pair(
+            peer.client_builder()
+                .capabilities(fastmcp_protocol::ClientCapabilities {
+                    extensions: Some(BTreeMap::from([(
+                        "com.example/preserved".to_owned(),
+                        json!({"mode":"read"}),
+                    )])),
+                    ..fastmcp_protocol::ClientCapabilities::default()
+                })
+                .http_bearer_credential(credential)
+                .connect_http_client_with_cx(&cx),
+            async {
+                let (mut stream, request, headers) = peer
+                    .mcp_request("server/discover", "enterprise-http-secret")
+                    .await;
+                assert_declaration(&request, &headers, "server/discover");
+                // EMA is an authorization overlay: this server does not
+                // advertise an EMA RPC descriptor or any extension at all.
+                reply(
+                    &mut stream,
+                    200,
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":discovery()}),
+                )
+                .await;
+            },
+        ))
+        .await;
+        let mut client = client.unwrap();
+        for capabilities in [
+            json!(null),
+            json!({"extensions":null}),
+            json!({"extensions":{ENTERPRISE_AUTHORIZATION_EXTENSION_ID:null}}),
+            json!({"extensions":{ENTERPRISE_AUTHORIZATION_EXTENSION_ID:{"enabled":true}}}),
+        ] {
+            let refused = client
+                .request_final_core(
+                    &cx,
+                    "tools/list",
+                    json!({"_meta":{"io.modelcontextprotocol/clientCapabilities":capabilities}}),
+                )
+                .await;
+            assert!(
+                refused.is_err(),
+                "malformed caller settings cannot be repaired into activation"
+            );
+        }
+        peer.no_more(&cx).await;
+        let (listed, ()) = Box::pin(pair(client.list_tools(&cx, None), async {
+            let (mut stream, request, headers) = peer
+                .mcp_request("tools/list", "enterprise-http-secret")
+                .await;
+            assert_declaration(&request, &headers, "tools/list");
+            reply(
+                &mut stream,
+                200,
+                json!({"jsonrpc":"2.0","id":request["id"],"result":catalog("enterprise-lookup")}),
+            )
+            .await;
+        }))
+        .await;
+        assert_catalog(listed.unwrap(), "enterprise-lookup");
+        owner.revoke();
+        assert!(
+            client.list_tools(&cx, None).await.is_err(),
+            "a cached catalog cannot preserve a revoked enterprise policy"
+        );
+        let refused = client.list_resources(&cx, None).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("credential"),
+            "policy revocation must produce an authorization failure: {refused}"
+        );
+        peer.no_more(&cx).await;
+    });
+}
+
 fn managed_extension_builder(peer: &Peer) -> (ExtensionId, ClientBuilder, Arc<AtomicUsize>) {
     let id = ExtensionId::parse("com.example/raw").unwrap();
     let descriptor = ExtensionDescriptor {
