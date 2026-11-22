@@ -945,11 +945,11 @@ struct CancellationObservation {
 /// sees and what the server sees.
 ///
 /// The server half matters as much as the client half: `server_saw_stream_close`
-/// is EOF observed on the response connection. Without it this would prove only
-/// that the caller stopped reading, which is not the same claim as the response
-/// stream being closed - a leaked connection would look identical from inside
-/// the client. The wait for EOF is bounded and the case REQUIRES the close, so a
-/// leak fails here rather than being tolerated.
+/// is EOF or a reset observed on the response connection. Without it this would
+/// prove only that the caller stopped reading, which is not the same claim as
+/// the response stream being closed - a leaked connection would look identical
+/// from inside the client. The wait for closure is bounded and the case REQUIRES
+/// the close, so a leak fails here rather than being tolerated.
 fn observe_caller_cancellation() -> CancellationObservation {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind the cancellation fixture");
     let address = listener
@@ -978,12 +978,18 @@ fn observe_caller_cancellation() -> CancellationObservation {
         begin_sse_response(&mut call);
         write_sse_event(&mut call, &progress_event(&server_marker, 1));
 
-        // Block reading the response connection. A cancelling caller closes it,
-        // which surfaces here as EOF.
+        // Block reading the response connection. Cancelling an unfinished SSE
+        // exchange deliberately resets it: a clean FIN alone could also be a
+        // valid request write-half close. Both EOF and reset prove release;
+        // a timeout, WouldBlock, or another read error does not.
         call.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("bound the cancellation fixture read");
         let mut sink = [0_u8; 1024];
-        let saw_close = matches!(call.read(&mut sink), Ok(0));
+        let saw_close = match call.read(&mut sink) {
+            Ok(0) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::ConnectionReset,
+            Ok(_) => false,
+        };
         drop(call);
 
         release_rx
@@ -3953,7 +3959,7 @@ fn case_endpoint_instance_key_partition(builder: &mut CaseBuilder, wire: &WireOb
 /// B's subject has two halves and this proves both. The caller half is that a
 /// cancelled caller gets a typed refusal rather than a hang or a silent clean
 /// end. The server half is that the response stream is actually CLOSED - EOF
-/// observed on the response connection - which is the claim a purely
+/// or reset observed on the response connection - which is the claim a purely
 /// client-side assertion cannot make, because a leaked connection looks
 /// identical from inside the client.
 fn case_caller_cancellation_close(builder: &mut CaseBuilder, wire: &WireObservations) {
@@ -3978,7 +3984,7 @@ fn case_caller_cancellation_close(builder: &mut CaseBuilder, wire: &WireObservat
 
     assert!(
         cancel.server_saw_stream_close,
-        "the server must observe EOF on the response connection; without it the caller \
+        "the server must observe EOF or reset on the response connection; without it the caller \
          merely stopped reading and the response stream was not proven closed"
     );
     builder.positive("cancel-response-stream-closed", "true");
