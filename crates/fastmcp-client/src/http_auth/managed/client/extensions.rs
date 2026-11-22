@@ -9,7 +9,7 @@ use std::io::{self, Write};
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
-use fastmcp_protocol::extensions::validate_extension_notification_metadata;
+use fastmcp_protocol::extensions::{NegotiatedExtension, validate_extension_notification_metadata};
 use fastmcp_protocol::{ExtensionId, RequestId, ServerNotification};
 use serde::Serialize;
 use serde_json::Value;
@@ -336,6 +336,41 @@ impl ExtensionNotification<'_> {
 }
 
 impl ManagedHttpClient {
+    /// Acquires a current grant and returns one configured extension's admitted
+    /// discovery snapshot without executing an application method.
+    ///
+    /// The descriptor and effective settings are data for constructing a typed
+    /// consumer, not permission to reuse the original credential or connection.
+    /// Later calls still acquire a live grant and negotiate again whenever its
+    /// generation changes. No raw client or response owner escapes the managed
+    /// lifetime, and inactive or unconfigured extensions are refused.
+    pub async fn negotiate_extension(
+        &mut self,
+        cx: &Cx,
+        extension_id: &ExtensionId,
+    ) -> Result<NegotiatedExtension, ManagedHttpClientError> {
+        self.negotiate_extension_with_cancellation(cx, &McpRequestCancellation::new(), extension_id)
+            .await
+    }
+
+    /// Discovers the configured extension with request-local cancellation.
+    /// Acquisition, discovery and publication share the original credential
+    /// lifetime and this client's complete operation deadline.
+    pub async fn negotiate_extension_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &ExtensionId,
+    ) -> Result<NegotiatedExtension, ManagedHttpClientError> {
+        match self
+            .perform_any(cx, cancellation, Call::ExtensionAdmission(extension_id))
+            .await?
+        {
+            CallResult::ExtensionAdmission(admitted) => Ok(*admitted),
+            _ => Err(ManagedHttpClientError::InvalidPolicy),
+        }
+    }
+
     /// Executes one registered extension call under the original managed grant.
     ///
     /// Authenticated discovery negotiates the configured descriptor/settings;

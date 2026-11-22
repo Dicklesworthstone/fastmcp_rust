@@ -18,6 +18,7 @@ use std::time::Duration;
 use asupersync::Cx;
 use fastmcp_core::{CanonicalHttpUrl, McpErrorCode, McpRequestCancellation};
 use fastmcp_protocol::CoreResult;
+use fastmcp_protocol::extensions::NegotiatedExtension;
 use fastmcp_protocol::http_headers::ParameterHeaderBinding;
 use serde_json::Value;
 
@@ -151,6 +152,7 @@ enum CallResult {
     Catalog(Result<catalog::Collected, ManagedHttpClientError>),
     CoreListen(core_listen::ListenResult),
     Extension(Box<ManagedExtensionResult>),
+    ExtensionAdmission(Box<NegotiatedExtension>),
     ExtensionNotification,
     #[cfg(feature = "tasks")]
     Task(Box<tasks::TaskResult>),
@@ -164,6 +166,7 @@ impl CallResult {
             Self::Catalog(_)
             | Self::CoreListen(_)
             | Self::Extension(_)
+            | Self::ExtensionAdmission(_)
             | Self::ExtensionNotification => Err(ManagedHttpClientError::InvalidPolicy),
             #[cfg(feature = "tasks")]
             Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
@@ -185,6 +188,7 @@ impl CallResult {
             Self::Catalog(Err(_))
             | Self::CoreListen(_)
             | Self::Extension(_)
+            | Self::ExtensionAdmission(_)
             | Self::ExtensionNotification => Err(ManagedHttpClientError::InvalidPolicy),
             #[cfg(feature = "tasks")]
             Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
@@ -669,6 +673,7 @@ enum Call<'a> {
     Catalog(CatalogKind, CatalogLimits),
     CoreListen(core_listen::ListenRequest<'a>),
     Extension(extensions::ExtensionRequest<'a>),
+    ExtensionAdmission(&'a fastmcp_protocol::ExtensionId),
     ExtensionNotification(extensions::ExtensionNotification<'a>),
     Tool {
         name: &'a str,
@@ -728,6 +733,18 @@ impl<'a> Call<'a> {
                 return Box::pin(request.dispatch(cx, client, boundary))
                     .await
                     .map(|result| CallResult::Extension(Box::new(result)));
+            }
+            Self::ExtensionAdmission(extension_id) => {
+                boundary.check(cx).map_err(HttpClientError::CoreResult)?;
+                let admitted = client
+                    .negotiated_extensions()
+                    .and_then(|extensions| extensions.active(extension_id).cloned())
+                    .ok_or_else(|| {
+                        HttpClientError::CoreResult(fastmcp_core::McpError::invalid_request(
+                            "Managed discovery did not activate the requested extension",
+                        ))
+                    })?;
+                return Ok(CallResult::ExtensionAdmission(Box::new(admitted)));
             }
             Self::ExtensionNotification(notification) => {
                 notification.dispatch(cx, client, boundary).await?;

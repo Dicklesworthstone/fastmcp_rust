@@ -9,6 +9,9 @@
 
 #[path = "http_continuation_recovery/machine_provider.rs"]
 mod machine_provider;
+#[cfg(feature = "extension-authoring")]
+#[path = "http_continuation_recovery/managed_extensions.rs"]
+mod managed_extensions;
 #[path = "http_continuation_recovery/managed_provider.rs"]
 mod managed_provider;
 #[path = "http_continuation_recovery/provider_headers.rs"]
@@ -248,6 +251,14 @@ enum Delivery {
 }
 impl Peer {
     async fn new(cx: &Cx, journal_enabled: bool) -> Self {
+        Self::new_with_builder(cx, journal_enabled, |builder| builder).await
+    }
+
+    async fn new_with_builder(
+        cx: &Cx,
+        journal_enabled: bool,
+        configure: impl FnOnce(fastmcp_server::ServerBuilder) -> fastmcp_server::ServerBuilder,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("https://{}", listener.local_addr().unwrap());
         let resource = format!("{origin}/mcp");
@@ -273,11 +284,11 @@ impl Peer {
             )
             .unwrap(),
         );
-        let mut builder = Server::new("native-recovery", "1")
+        let mut builder = configure(Server::new("native-recovery", "1")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .unwrap()
             .auth_provider(provider)
-            .tool(probe.clone());
+            .tool(probe.clone()));
         if journal_enabled {
             builder = builder.middleware(journal.clone());
         }
@@ -628,6 +639,8 @@ enum Case {
     Endpoint,
     Provider(managed_provider::Case),
     MachineProvider(machine_provider::Case),
+    #[cfg(feature = "extension-authoring")]
+    ManagedExtensions(managed_extensions::Case),
     ProviderUpdates(provider_updates::Case),
     SchemaBound(schema_bound::Case),
     SchemaDriver(schema_driver::Case),
@@ -708,6 +721,11 @@ fn run(case: Case) {
         });
 }
 async fn scenario(cx: Cx, case: Case) {
+    #[cfg(feature = "extension-authoring")]
+    if let Case::ManagedExtensions(selected) = case {
+        Box::pin(managed_extensions::scenario(cx, selected)).await;
+        return;
+    }
     if let Case::MachineProvider(selected) = case {
         Box::pin(machine_provider::scenario(cx, selected)).await;
         return;

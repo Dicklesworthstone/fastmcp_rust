@@ -2,12 +2,15 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
+use fastmcp_client::http_auth::managed::ManagedOAuthSession;
+use fastmcp_client::http_auth::managed::client::{ManagedExtensionLimits, ManagedHttpClient};
 use fastmcp_client::{
     ClientBuilder, ClientHttpConnection, HttpClient, ModernHttpExtensionEvent,
     ModernHttpExtensionExecution,
 };
-use fastmcp_core::{Cx, DEFAULT_JSON_RPC_MAX_BODY_BYTES};
+use fastmcp_core::{Cx, DEFAULT_JSON_RPC_MAX_BODY_BYTES, McpRequestCancellation};
 use fastmcp_protocol::extensions::{
     ClientExtensionDiscovery, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
 };
@@ -29,12 +32,14 @@ use super::{
 // Bound the total work even when a peer keeps sending valid nonterminal events.
 const MAX_INTERMEDIATE_EVENTS: usize = 64;
 const MAX_PENDING_NOTIFICATIONS: usize = 64;
+const MAX_PENDING_MANAGED_OPERATIONS: usize = 64;
 
 /// A negotiated HTTP upstream for one complete authored extension contract.
 ///
-/// Construct this handle with [`ExtensionRegistration::connect_http_upstream`].
-/// Clones share bounded request and notification accounting and a fresh request
-/// ID allocator. Notifications never allocate a request ID or response waiter.
+/// Construct this handle with [`ExtensionRegistration::connect_http_upstream`]
+/// or [`ExtensionRegistration::connect_managed_http_upstream`]. Clones share
+/// bounded request and notification accounting. Every request owns its HTTP
+/// response and correlation domain; notifications never allocate a response waiter.
 /// They expose no client, credentials, registry, resolver, or execution control.
 /// Each forwarded request owns its response stream and cancellation lifetime.
 ///
@@ -45,11 +50,61 @@ const MAX_PENDING_NOTIFICATIONS: usize = 64;
 /// log notifications are consumed without being forwarded to the caller.
 #[derive(Clone)]
 pub struct ExtensionHttpUpstream {
-    client: Arc<Mutex<HttpClient>>,
+    client: HttpProxyClient,
     descriptor: Arc<ExtensionDescriptor>,
     protocol: ProtocolDescriptor,
     negotiated: NegotiatedExtension,
     pending_notifications: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+enum HttpProxyClient {
+    Native(Arc<Mutex<HttpClient>>),
+    Managed(Arc<ManagedHttpUpstream>),
+}
+
+struct ManagedHttpUpstream {
+    session: ManagedOAuthSession,
+    builder: ClientBuilder,
+    operation_timeout: Duration,
+    pending: Arc<AtomicUsize>,
+}
+
+impl ManagedHttpUpstream {
+    fn client(&self) -> McpResult<ManagedHttpClient> {
+        ManagedHttpClient::new(
+            self.session.clone(),
+            self.builder.clone(),
+            self.operation_timeout,
+        )
+        .map_err(|_| McpError::invalid_request("Managed HTTP extension upstream is unavailable"))
+    }
+}
+
+struct PreparedHttpUpstream {
+    builder: ClientBuilder,
+    descriptor: Arc<ExtensionDescriptor>,
+    protocol: ProtocolDescriptor,
+    effective: Arc<OnceLock<ExtensionSettings>>,
+}
+
+impl PreparedHttpUpstream {
+    fn seal(
+        self,
+        client: HttpProxyClient,
+        negotiated: NegotiatedExtension,
+    ) -> McpResult<ExtensionHttpUpstream> {
+        self.effective
+            .set(negotiated.effective_settings().settings().clone())
+            .map_err(|_| McpError::internal_error("HTTP upstream settings are already sealed"))?;
+        Ok(ExtensionHttpUpstream {
+            client,
+            descriptor: self.descriptor,
+            protocol: self.protocol,
+            negotiated,
+            pending_notifications: Arc::new(AtomicUsize::new(0)),
+        })
+    }
 }
 
 impl std::fmt::Debug for ExtensionHttpUpstream {
@@ -134,6 +189,87 @@ impl ExtensionRegistration {
     where
         ClientSettings: Serialize + Sync + ?Sized,
     {
+        let prepared = self.prepare_http_upstream(builder, client_settings)?;
+        let connected = Box::pin(prepared.builder.clone().connect_http_client_with_cx(cx)).await;
+        ensure_connection_live(cx)?;
+        let client = connected
+            .map_err(|_| McpError::invalid_request("HTTP extension upstream connection failed"))?;
+        let negotiated = client
+            .negotiated_extensions()
+            .and_then(|extensions| extensions.active(&prepared.descriptor.id).cloned())
+            .ok_or_else(|| {
+                McpError::invalid_request("HTTP upstream did not activate the typed extension")
+            })?;
+        prepared.seal(
+            HttpProxyClient::Native(Arc::new(Mutex::new(client))),
+            negotiated,
+        )
+    }
+
+    /// Connects a typed extension gateway through an application-owned OAuth
+    /// login, including managed renewal and original-credential lifetime guards.
+    ///
+    /// The builder must select the session's exact modern HTTPS resource. Its
+    /// identity, TLS roots and transport policy remain local to the upstream
+    /// leg. The session replaces any builder bearer; downstream credentials,
+    /// identity and metadata never become upstream authority.
+    ///
+    /// Initial authenticated discovery seals the effective settings. Each
+    /// forwarded operation owns an independent managed client and fresh
+    /// discovery, so even renewed grants must admit those same settings before
+    /// an application POST. A changed or inactive extension fails closed.
+    /// At most 64 managed operations may be in flight across all handle clones;
+    /// no mutex is held over acquisition, discovery, callbacks or response I/O.
+    /// The finite timeout covers that entire operation. Cancellation, dropping
+    /// one request, or a rejected notification does not close the shared login.
+    ///
+    /// Use this handle with the ordinary `typed_http_proxy_*` routes. Their
+    /// exact contract, schema, downstream authorization and notification checks
+    /// apply unchanged. No failed operation is retried automatically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client plan, endpoint, operation timeout or typed
+    /// settings are invalid, the login cannot acquire a live grant, or the
+    /// authenticated upstream does not activate this extension.
+    pub async fn connect_managed_http_upstream<ClientSettings>(
+        self,
+        cx: &Cx,
+        session: ManagedOAuthSession,
+        builder: ClientBuilder,
+        client_settings: &ClientSettings,
+        operation_timeout: Duration,
+    ) -> McpResult<ExtensionHttpUpstream>
+    where
+        ClientSettings: Serialize + Sync + ?Sized,
+    {
+        let prepared = self.prepare_http_upstream(builder, client_settings)?;
+        let upstream = Arc::new(ManagedHttpUpstream {
+            session,
+            builder: prepared.builder.clone(),
+            operation_timeout,
+            pending: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut client = upstream.client()?;
+        let negotiated = Box::pin(client.negotiate_extension(cx, &prepared.descriptor.id))
+            .await
+            .map_err(|_| {
+                McpError::invalid_request(
+                    "Managed HTTP upstream did not activate the typed extension",
+                )
+            })?;
+        ensure_connection_live(cx)?;
+        prepared.seal(HttpProxyClient::Managed(upstream), negotiated)
+    }
+
+    fn prepare_http_upstream<ClientSettings>(
+        self,
+        builder: ClientBuilder,
+        client_settings: &ClientSettings,
+    ) -> McpResult<PreparedHttpUpstream>
+    where
+        ClientSettings: Serialize + Sync + ?Sized,
+    {
         if builder.selected_protocol_plan().policy() != ProtocolPolicy::ModernOnly
             || builder
                 .selected_protocol_plan()
@@ -170,34 +306,25 @@ impl ExtensionRegistration {
             })?;
         // No application callback from the declaration survives into forwarding.
         drop(self.handlers);
-        let connected = Box::pin(builder.connect_http_client_with_cx(cx)).await;
-        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-        if cx
-            .budget()
-            .deadline
-            .is_some_and(|deadline| cx.now() >= deadline)
-        {
-            return Err(McpError::request_cancelled());
-        }
-        let client = connected
-            .map_err(|_| McpError::invalid_request("HTTP extension upstream connection failed"))?;
-        let negotiated = client
-            .negotiated_extensions()
-            .and_then(|extensions| extensions.active(&self.descriptor.id).cloned())
-            .ok_or_else(|| {
-                McpError::invalid_request("HTTP upstream did not activate the typed extension")
-            })?;
-        effective
-            .set(negotiated.effective_settings().settings().clone())
-            .map_err(|_| McpError::internal_error("HTTP upstream settings are already sealed"))?;
-        Ok(ExtensionHttpUpstream {
-            client: Arc::new(Mutex::new(client)),
+        Ok(PreparedHttpUpstream {
+            builder,
             descriptor: self.descriptor,
             protocol,
-            negotiated,
-            pending_notifications: Arc::new(AtomicUsize::new(0)),
+            effective,
         })
     }
+}
+
+fn ensure_connection_live(cx: &Cx) -> McpResult<()> {
+    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+    if cx
+        .budget()
+        .deadline
+        .is_some_and(|deadline| cx.now() >= deadline)
+    {
+        return Err(McpError::request_cancelled());
+    }
+    Ok(())
 }
 
 impl<ClientSettings, ServerSettings, Settings>
@@ -464,11 +591,11 @@ struct TypedHttpProxyHandler<Request, Response, Settings> {
     marker: PhantomData<fn(Request, Settings) -> Response>,
 }
 
-struct HttpProxyNotificationPermit {
+struct HttpProxyPermit {
     pending: Arc<AtomicUsize>,
 }
 
-impl HttpProxyNotificationPermit {
+impl HttpProxyPermit {
     fn reserve(pending: &Arc<AtomicUsize>) -> McpResult<Self> {
         pending
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -481,9 +608,22 @@ impl HttpProxyNotificationPermit {
             pending: Arc::clone(pending),
         })
     }
+
+    fn reserve_managed(pending: &Arc<AtomicUsize>) -> McpResult<Self> {
+        pending
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_PENDING_MANAGED_OPERATIONS).then_some(count + 1)
+            })
+            .map_err(|_| {
+                McpError::invalid_request("Managed HTTP extension upstream capacity exceeded")
+            })?;
+        Ok(Self {
+            pending: Arc::clone(pending),
+        })
+    }
 }
 
-impl Drop for HttpProxyNotificationPermit {
+impl Drop for HttpProxyPermit {
     fn drop(&mut self) {
         self.pending.fetch_sub(1, Ordering::AcqRel);
     }
@@ -540,7 +680,7 @@ where
 
     async fn forward(&self, context: &McpContext, parameters: Value) -> McpResult<Value> {
         ensure_live(context)?;
-        let _permit = HttpProxyNotificationPermit::reserve(&self.upstream.pending_notifications)?;
+        let _permit = HttpProxyPermit::reserve(&self.upstream.pending_notifications)?;
         let method = self
             .binding
             .descriptor
@@ -551,18 +691,42 @@ where
             })?;
         // Clone the immutable modern transport, not a request or its authority.
         // A short lock is never retained over network or cancellation awaits.
-        let client = {
-            let client =
-                self.upstream.client.lock().map_err(|_| {
+        let client = match &self.upstream.client {
+            HttpProxyClient::Managed(upstream) => {
+                let _operation = HttpProxyPermit::reserve_managed(&upstream.pending)?;
+                let mut client = upstream.client()?;
+                return poll_live(context, async {
+                    let acknowledged = client
+                        .notify_final_extension_with_cancellation(
+                            context.cx(),
+                            &context.request_cancellation(),
+                            &self.binding.descriptor.id,
+                            &method.name,
+                            parameters,
+                        )
+                        .await;
+                    ensure_live(context)?;
+                    acknowledged.map_err(|_| {
+                        McpError::invalid_request(
+                            "Managed HTTP extension upstream notification was not acknowledged",
+                        )
+                    })?;
+                    Ok(Value::Null)
+                })
+                .await;
+            }
+            HttpProxyClient::Native(client) => {
+                let client = client.lock().map_err(|_| {
                     McpError::internal_error("HTTP extension upstream is unavailable")
                 })?;
-            #[allow(unreachable_patterns)]
-            match client.connection() {
-                ClientHttpConnection::Modern(client) => client.clone(),
-                _ => {
-                    return Err(McpError::invalid_request(
-                        "HTTP extension proxy requires a modern upstream",
-                    ));
+                #[allow(unreachable_patterns)]
+                match client.connection() {
+                    ClientHttpConnection::Modern(client) => client.clone(),
+                    _ => {
+                        return Err(McpError::invalid_request(
+                            "HTTP extension proxy requires a modern upstream",
+                        ));
+                    }
                 }
             }
         };
@@ -738,13 +902,18 @@ where
     async fn forward(&self, context: &McpContext, parameters: Value) -> McpResult<Value> {
         ensure_live(context)?;
         let method = &self.binding.descriptor.methods[self.binding.method_index];
+        let client = match &self.upstream.client {
+            HttpProxyClient::Managed(upstream) => {
+                return self.forward_managed(context, parameters, upstream).await;
+            }
+            HttpProxyClient::Native(client) => client,
+        };
         // The lock covers only synchronous admission and allocation. Every
         // execution is owned, so no client lock is held across network awaits.
         let execution = {
-            let client =
-                self.upstream.client.lock().map_err(|_| {
-                    McpError::internal_error("HTTP extension upstream is unavailable")
-                })?;
+            let client = client
+                .lock()
+                .map_err(|_| McpError::internal_error("HTTP extension upstream is unavailable"))?;
             client.execute_final_extension(
                 context.cx(),
                 &self.binding.descriptor.id,
@@ -760,6 +929,91 @@ where
         poll_live(context, self.receive(context, execution)).await
     }
 
+    async fn forward_managed(
+        &self,
+        context: &McpContext,
+        parameters: Value,
+        upstream: &ManagedHttpUpstream,
+    ) -> McpResult<Value> {
+        let _permit = HttpProxyPermit::reserve_managed(&upstream.pending)?;
+        let mut client = upstream.client()?;
+        let method = &self.binding.descriptor.methods[self.binding.method_index];
+        poll_live(context, async {
+            let cancellation = McpRequestCancellation::new();
+            let mut relay_error = None;
+            let result = {
+                let mut observer = |event: &ModernHttpExtensionEvent| {
+                    if relay_error.is_some() {
+                        return;
+                    }
+                    if let ModernHttpExtensionEvent::ExtensionNotification {
+                        notification,
+                        raw_params,
+                    } = event
+                    {
+                        let relayed = self
+                            .notification
+                            .as_ref()
+                            .ok_or_else(|| {
+                                McpError::invalid_request(
+                                    "HTTP request-only proxy does not relay extension notifications",
+                                )
+                            })
+                            .and_then(|relay| {
+                                relay.relay(context, notification.clone(), raw_params.as_deref())
+                            });
+                        if let Err(error) = relayed {
+                            relay_error = Some(error);
+                            cancellation.cancel();
+                        }
+                    }
+                };
+                client
+                    .request_final_extension_with_events_and_cancellation(
+                        context.cx(),
+                        &cancellation,
+                        &self.binding.descriptor.id,
+                        &method.name,
+                        parameters,
+                        ManagedExtensionLimits::default(),
+                        &mut observer,
+                    )
+                    .await
+            };
+            if let Some(error) = relay_error {
+                return Err(error);
+            }
+            ensure_live(context)?;
+            let result = result.map_err(|_| {
+                McpError::invalid_request("Managed HTTP extension upstream request failed")
+            })?;
+            self.admit_result(context, result.into_result())
+        })
+        .await
+    }
+
+    fn admit_result(&self, context: &McpContext, mut result: Value) -> McpResult<Value> {
+        ensure_live(context)?;
+        let object = result.as_object_mut().ok_or_else(|| {
+            McpError::invalid_request("HTTP extension upstream result must be an object")
+        })?;
+        // Only typed application data crosses either kind of upstream leg.
+        object.remove("_meta");
+        self.binding.result_schema.validate(&result).map_err(|_| {
+            McpError::invalid_request("HTTP extension upstream result does not satisfy its schema")
+        })?;
+        let response: Response = serde_json::from_value(result).map_err(|_| {
+            McpError::invalid_request("HTTP extension upstream typed result was rejected")
+        })?;
+        let result = self.binding.encode(context, &response)?;
+        if result.get("_meta").is_some() {
+            return Err(McpError::internal_error(
+                "typed proxy result serialization cannot supply framework metadata",
+            ));
+        }
+        Ok(result)
+    }
+
     async fn receive(
         &self,
         context: &McpContext,
@@ -773,32 +1027,8 @@ where
                 McpError::invalid_request("HTTP extension upstream response failed")
             })?;
             match event {
-                Some(ModernHttpExtensionEvent::Terminal(mut result)) => {
-                    let object = result.as_object_mut().ok_or_else(|| {
-                        McpError::invalid_request(
-                            "HTTP extension upstream result must be an object",
-                        )
-                    })?;
-                    // Upstream protocol metadata is not gateway identity or
-                    // downstream authority. Only typed application data crosses.
-                    object.remove("_meta");
-                    self.binding.result_schema.validate(&result).map_err(|_| {
-                        McpError::invalid_request(
-                            "HTTP extension upstream result does not satisfy its schema",
-                        )
-                    })?;
-                    let response: Response = serde_json::from_value(result).map_err(|_| {
-                        McpError::invalid_request(
-                            "HTTP extension upstream typed result was rejected",
-                        )
-                    })?;
-                    let result = self.binding.encode(context, &response)?;
-                    if result.get("_meta").is_some() {
-                        return Err(McpError::internal_error(
-                            "typed proxy result serialization cannot supply framework metadata",
-                        ));
-                    }
-                    return Ok(result);
+                Some(ModernHttpExtensionEvent::Terminal(result)) => {
+                    return self.admit_result(context, result);
                 }
                 Some(
                     ModernHttpExtensionEvent::Progress(_)
@@ -928,17 +1158,35 @@ mod tests {
         let shared = Arc::clone(&pending);
         let mut permits = Vec::new();
         for _ in 0..MAX_PENDING_NOTIFICATIONS {
-            permits.push(HttpProxyNotificationPermit::reserve(&pending).unwrap());
+            permits.push(HttpProxyPermit::reserve(&pending).unwrap());
         }
         assert_eq!(shared.load(Ordering::Acquire), MAX_PENDING_NOTIFICATIONS);
-        assert!(HttpProxyNotificationPermit::reserve(&shared).is_err());
+        assert!(HttpProxyPermit::reserve(&shared).is_err());
         drop(permits.pop().unwrap());
-        let replacement = HttpProxyNotificationPermit::reserve(&shared).unwrap();
-        assert!(HttpProxyNotificationPermit::reserve(&pending).is_err());
+        let replacement = HttpProxyPermit::reserve(&shared).unwrap();
+        assert!(HttpProxyPermit::reserve(&pending).is_err());
         drop(permits);
         assert_eq!(pending.load(Ordering::Acquire), 1);
         drop(replacement);
         assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn managed_operation_permits_remain_shared_until_the_owner_drops() {
+        let pending = Arc::new(AtomicUsize::new(0));
+        let sibling = Arc::clone(&pending);
+        let mut held = Vec::new();
+        for _ in 0..MAX_PENDING_MANAGED_OPERATIONS {
+            held.push(HttpProxyPermit::reserve_managed(&pending).unwrap());
+        }
+        assert!(HttpProxyPermit::reserve_managed(&sibling).is_err());
+        drop(held.pop().unwrap());
+        let admitted = HttpProxyPermit::reserve_managed(&sibling).unwrap();
+        assert!(HttpProxyPermit::reserve_managed(&pending).is_err());
+        drop(held);
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        drop(admitted);
+        assert_eq!(sibling.load(Ordering::Acquire), 0);
     }
 
     #[test]

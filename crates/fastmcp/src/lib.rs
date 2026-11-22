@@ -3863,6 +3863,44 @@ pub mod modern {
             .await
         }
 
+        /// Connects a typed extension gateway using a shared managed OAuth login.
+        ///
+        /// The upstream endpoint comes from the login's exact HTTPS resource.
+        /// This builder supplies the upstream identity, TLS and transport policy;
+        /// the managed session acquires and renews its own credentials. Initial
+        /// discovery seals the contract's effective settings, and every forwarded
+        /// operation negotiates them again under its current grant.
+        ///
+        /// Install the returned handle with a `typed_http_proxy_*` route. Requests,
+        /// request-owned notifications and standalone client notifications retain
+        /// independent cancellation lifetimes and bounded admission. The timeout
+        /// covers acquisition, discovery, callbacks and response I/O for each
+        /// operation. A failed operation is never replayed automatically.
+        #[cfg(all(feature = "extension-authoring", feature = "proxy"))]
+        pub async fn connect_managed_extension_http_upstream_with_cx<ClientSettings>(
+            self,
+            cx: &Cx,
+            session: fastmcp_client::http_auth::managed::ManagedOAuthSession,
+            registration: extensions::authoring::ExtensionRegistration,
+            client_settings: &ClientSettings,
+            operation_timeout: std::time::Duration,
+        ) -> McpResult<extensions::authoring::ExtensionHttpUpstream>
+        where
+            ClientSettings: serde::Serialize + Sync + ?Sized,
+        {
+            let plan = modern_http_plan(session.resource().clone()).map_err(|_| {
+                McpError::invalid_params("invalid managed HTTP extension upstream endpoint")
+            })?;
+            Box::pin(registration.connect_managed_http_upstream(
+                cx,
+                session,
+                self.inner.protocol_plan(plan),
+                client_settings,
+                operation_timeout,
+            ))
+            .await
+        }
+
         /// Connects a complete authored contract to a native Unix stdio child.
         ///
         /// Discovery and independent extension settings negotiation finish on
