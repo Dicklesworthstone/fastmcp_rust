@@ -1,6 +1,6 @@
-// Public ingress coverage for caller-owned asynchronous Task store controls.
+// Public ingress coverage for caller-owned asynchronous Task creation/controls.
 // The fixture delegates atomic state to the real in-memory store. It claims
-// neither filesystem persistence nor asynchronous worker/creation support.
+// neither filesystem persistence nor asynchronous worker/recovery support.
 use super::*;
 use fastmcp_protocol::tasks_extension::{
     Task as ControlTask, TaskInputResponses as ControlInputs,
@@ -18,6 +18,12 @@ struct AsyncControlHttpStore {
     snapshot_reads: AtomicUsize,
     updates: AtomicUsize,
     cancellations: AtomicUsize,
+    creation_calls: AtomicUsize,
+    creations: AtomicUsize,
+    last_created: Mutex<Option<FinalTaskSnapshot>>,
+    invalid_creation_receipt: AtomicBool,
+    creation_receipt_blocked: AtomicBool,
+    creation_receipt_waiter: Mutex<Option<Waker>>,
     blocked: AtomicBool,
     entered: AtomicBool,
     waiter: Mutex<Option<Waker>>,
@@ -39,6 +45,12 @@ impl AsyncControlHttpStore {
             snapshot_reads: AtomicUsize::new(0),
             updates: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
+            creation_calls: AtomicUsize::new(0),
+            creations: AtomicUsize::new(0),
+            last_created: Mutex::new(None),
+            invalid_creation_receipt: AtomicBool::new(false),
+            creation_receipt_blocked: AtomicBool::new(false),
+            creation_receipt_waiter: Mutex::new(None),
             blocked: AtomicBool::new(false),
             entered: AtomicBool::new(false),
             waiter: Mutex::new(None),
@@ -70,6 +82,14 @@ impl AsyncControlHttpStore {
         }
     }
 
+    fn release_creation_receipt(&self) {
+        self.creation_receipt_blocked
+            .store(false, Ordering::Release);
+        if let Some(waiter) = self.creation_receipt_waiter.lock().unwrap().take() {
+            waiter.wake();
+        }
+    }
+
     async fn wait_for_write(&self, ctx: &McpContext) -> McpResult<()> {
         self.write_entered.store(true, Ordering::Release);
         poll_fn(|task| {
@@ -89,6 +109,78 @@ impl AsyncControlHttpStore {
 }
 
 impl FinalTaskStore for AsyncControlHttpStore {
+    fn create_task_with_operation_with_context<'a>(
+        &'a self,
+        admission: FinalTaskCreationAdmission<'a>,
+        task: ControlTask,
+        notification: ControlNotification,
+        descriptor: FinalTaskWorkDescriptor,
+        principal: Option<fastmcp_core::crypto::Sha256Digest>,
+        operation: FinalTaskOperation,
+    ) -> FinalTaskStoreFuture<'a, FinalTaskSnapshot> {
+        self.creation_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let ctx = admission.context();
+            assert!(
+                ctx.cx().blocking_pool_handle().is_none(),
+                "native Task creation must not depend on a blocking pool"
+            );
+            self.wait_for_write(ctx).await?;
+            admission.checkpoint_before_write()?;
+            let committed = self.inner.create_task_with_operation(
+                task,
+                notification,
+                descriptor,
+                principal,
+                operation,
+            )?;
+            self.creations.fetch_add(1, Ordering::SeqCst);
+            *self.last_created.lock().unwrap() = Some(committed.clone());
+            if self.cancel_after_commit.load(Ordering::Acquire) {
+                assert!(ctx.request_cancellation().cancel());
+            }
+            // Once committed, preserve the original receipt even if service
+            // readiness or caller authority changes while it is in transit.
+            poll_fn(|task| {
+                let mut waiter = self.creation_receipt_waiter.lock().unwrap();
+                if self.creation_receipt_blocked.load(Ordering::Acquire) {
+                    *waiter = Some(task.waker().clone());
+                    TaskPoll::Pending
+                } else {
+                    TaskPoll::Ready(())
+                }
+            })
+            .await;
+            Ok(if self.invalid_creation_receipt.load(Ordering::Acquire) {
+                committed.with_original_operation(None)
+            } else {
+                committed
+            })
+        })
+    }
+
+    fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
+        self.inner.execution_limits()
+    }
+
+    fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.inner.next_expired_execution_snapshot()
+    }
+
+    fn next_initial_work_snapshot_after(
+        &self,
+        after: Option<&fastmcp_protocol::FinalTaskId>,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.inner.next_initial_work_snapshot_after(after)
+    }
+
+    fn next_accepted_input_snapshot_after(
+        &self,
+        after: Option<&fastmcp_protocol::FinalTaskId>,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        self.inner.next_accepted_input_snapshot_after(after)
+    }
+
     fn get_task_access_metadata_with_context<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -313,7 +405,7 @@ async fn async_control_http_rpc(
     if let Some(id) = request
         .params
         .as_ref()
-        .and_then(|params| params.get("taskId"))
+        .and_then(|params| params.get("taskId").or_else(|| params.get("name")))
         .and_then(serde_json::Value::as_str)
     {
         headers.push(("Mcp-Name", id));
@@ -323,6 +415,406 @@ async fn async_control_http_rpc(
     let response = serde_json::from_slice(live_http_response_body(&frame)?)
         .map_err(|error| error.to_string())?;
     Ok((response, frame))
+}
+
+struct AsyncTaskCreatingTool;
+
+impl ToolHandler for AsyncTaskCreatingTool {
+    fn definition(&self) -> Tool {
+        FinalTaskCreatingTool.definition()
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Async
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        FinalTaskCreatingTool.call(ctx, arguments)
+    }
+
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        FinalTaskCreatingTool.call_final_outcome(ctx, arguments)
+    }
+
+    fn declares_final_tasks(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn public_http_async_task_creation_keeps_siblings_live_and_retains_commit_receipts() {
+    for cancel_after_commit in [false, true] {
+        run_live_http_test_with_blocking_capacity(
+            move |cx| async move {
+                let store = Arc::new(AsyncControlHttpStore::new());
+                store.write_blocked.store(true, Ordering::Release);
+                store
+                    .cancel_after_commit
+                    .store(cancel_after_commit, Ordering::Release);
+                let emitted = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&emitted);
+                let runtime = FinalTaskRuntime::new(
+                    store.clone(),
+                    FinalTaskRuntimeConfig::new(60_000, None)
+                        .unwrap()
+                        .with_admission_capacity(1, 1, 16_384, 16_384)
+                        .unwrap(),
+                    Arc::new(move |_| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }),
+                );
+                // Enter a real caller-owned service and retain its future.
+                // This test proves creation, not asynchronous worker polling.
+                let mut runner = runtime
+                    .install_task_service(1, Arc::new(IdleHostedTaskSupervisor))
+                    .unwrap();
+                let service_cx = cx.clone();
+                let mut service = Box::pin(runner.run_service(&service_cx));
+                assert!(
+                    service
+                        .as_mut()
+                        .poll(&mut TaskContext::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                assert!(runtime.is_task_service_ready());
+                let bound = Server::new("async-task-creation", "1")
+                    .protocol_policy(ProtocolPolicy::ModernOnly)
+                    .unwrap()
+                    .mask_error_details(true)
+                    .tool(AsyncTaskCreatingTool)
+                    .final_tasks(runtime)
+                    .unwrap()
+                    .build()
+                    .bind_http(&cx, "127.0.0.1:0")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let address = bound.local_addr().map_err(|error| error.to_string())?;
+                let caller = cx.clone();
+                let mut client = cx
+                    .spawn(move |client_cx| async move {
+                        struct StopServer(Cx);
+                        impl Drop for StopServer {
+                            fn drop(&mut self) {
+                                self.0.cancel_with(
+                                    CancelKind::User,
+                                    Some("asynchronous Task creation probe finished"),
+                                );
+                            }
+                        }
+                        let _stop = StopServer(caller);
+                        let mut creation = client_cx
+                            .spawn(move |_| async move {
+                                async_control_http_rpc(
+                                    address,
+                                    final_task_creating_tool_request(true),
+                                )
+                                .await
+                            })
+                            .map_err(|error| error.to_string())?;
+                        let deadline = client_cx
+                            .now()
+                            .saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                        while !store.write_entered.load(Ordering::Acquire) {
+                            if client_cx.now() >= deadline {
+                                return Err("Task creation storage did not suspend".to_owned());
+                            }
+                            asupersync::time::sleep(client_cx.now(), Duration::from_millis(1))
+                                .await;
+                        }
+                        assert_eq!(store.inner.task_count(), 0);
+                        assert_eq!(store.creation_calls.load(Ordering::SeqCst), 1);
+                        let discover = JsonRpcRequest::new(
+                            SERVER_DISCOVER_METHOD,
+                            Some(serde_json::json!({"_meta": {
+                                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                                "io.modelcontextprotocol/clientCapabilities": {}
+                            }})),
+                            82_i64,
+                        );
+                        let (sibling, _) = async_control_http_rpc(address, discover).await?;
+                        assert!(sibling.error.is_none(), "{:?}", sibling.error);
+                        assert!(sibling.result.is_some());
+                        assert!(store.write_blocked.load(Ordering::Acquire));
+                        // Pending I/O keeps its single admission charge. A
+                        // second call cannot create a second provider future.
+                        let (full, _) =
+                            async_control_http_rpc(address, final_task_creating_tool_request(true))
+                                .await?;
+                        assert!(full.error.is_some());
+                        assert!(full.result.is_none());
+                        assert_eq!(store.creation_calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(store.creations.load(Ordering::SeqCst), 0);
+                        assert_eq!(store.inner.task_count(), 0);
+                        store.release_write();
+                        let (response, _) = creation
+                            .join(&client_cx)
+                            .await
+                            .map_err(|error| format!("Task creation child failed: {error:?}"))??;
+                        let retained = store.last_created.lock().unwrap().clone().unwrap();
+                        assert_eq!(store.creations.load(Ordering::SeqCst), 1);
+                        assert_eq!(store.inner.task_count(), 1);
+                        assert_eq!(retained.generation(), retained.creation_generation());
+                        assert_eq!(retained.authenticated_principal(), None);
+                        let operation = retained.original_operation().unwrap();
+                        assert_eq!(operation.method(), "tools/call");
+                        assert_eq!(operation.tool_name(), "durable_final_task");
+                        assert_eq!(
+                            store.inner.work_descriptor_if_current(&retained).unwrap(),
+                            Some(
+                                FinalTaskWorkDescriptor::new(serde_json::json!({
+                                    "operation": "durable-final-task-tool"
+                                }))
+                                .unwrap()
+                            )
+                        );
+                        assert_eq!(
+                            serde_json::to_value(
+                                &store
+                                    .inner
+                                    .latest_notification(&retained.task().base().task_id)
+                                    .unwrap()
+                                    .params
+                                    .task
+                            )
+                            .unwrap(),
+                            serde_json::to_value(retained.task()).unwrap()
+                        );
+                        if cancel_after_commit {
+                            assert!(response.result.is_none());
+                            let error = response.error.unwrap();
+                            assert_eq!(
+                                error.code.as_i32(),
+                                Some(i32::from(McpErrorCode::InternalError))
+                            );
+                            assert_eq!(
+                                error.data,
+                                Some(serde_json::json!({"reason": "TaskStateUnknown"}))
+                            );
+                            assert_eq!(emitted.load(Ordering::SeqCst), 0);
+                        } else {
+                            assert!(response.error.is_none(), "{:?}", response.error);
+                            let result = response.result.unwrap();
+                            assert_eq!(result["resultType"], "task");
+                            assert_eq!(result["taskId"], retained.task().base().task_id.as_str());
+                            assert_eq!(emitted.load(Ordering::SeqCst), 1);
+                        }
+                        // Settling the first creation releases admission even
+                        // if its request was cancelled after the exact commit.
+                        store.cancel_after_commit.store(false, Ordering::Release);
+                        let (next, _) =
+                            async_control_http_rpc(address, final_task_creating_tool_request(true))
+                                .await?;
+                        assert!(next.error.is_none(), "{:?}", next.error);
+                        assert_eq!(store.creation_calls.load(Ordering::SeqCst), 2);
+                        assert_eq!(store.creations.load(Ordering::SeqCst), 2);
+                        assert_eq!(store.inner.task_count(), 2);
+                        assert_eq!(
+                            store.synchronous.load(Ordering::SeqCst),
+                            0,
+                            "native creation and publication must use asynchronous storage hooks"
+                        );
+                        Ok::<(), String>(())
+                    })
+                    .map_err(|error| error.to_string())?;
+                let serve = bound.serve(&cx).await;
+                let client_result = client
+                    .join(&cx)
+                    .await
+                    .map_err(|error| format!("Task creation client failed: {error:?}"))?;
+                client_result?;
+                drop(service);
+                require_quiescent_http_shutdown(
+                    serve.map_err(|error| error.to_string())?,
+                    "asynchronous Task creation",
+                )
+                .await
+            },
+            0,
+        );
+    }
+}
+
+#[test]
+fn public_async_task_creation_fences_unpolled_cancellation_and_service_exit() {
+    for cancelled in [false, true] {
+        let store = Arc::new(AsyncControlHttpStore::new());
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(|_| panic!("unadmitted creation cannot publish")),
+        );
+        let mut service = Some(start_final_tasks_test_service(&runtime));
+        let server = Server::new("unpolled-task-creation", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .tool(AsyncTaskCreatingTool)
+            .final_tasks(runtime)
+            .unwrap()
+            .build();
+        let cx = Cx::for_testing();
+        let inbound = InboundRequestContext::new(cx.clone(), 81, InboundRequestTransport::Memory);
+        let request = final_task_creating_tool_request(true);
+        let mut future = Box::pin(server.dispatch_stateless(&inbound, &request));
+        assert_eq!(store.creation_calls.load(Ordering::SeqCst), 0);
+        if cancelled {
+            cx.set_cancel_requested(true);
+        } else {
+            drop(service.take());
+        }
+        let TaskPoll::Ready(response) = future
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(Waker::noop()))
+        else {
+            panic!("unadmitted creation must settle without polling storage");
+        };
+        let response = response.unwrap();
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        assert_eq!(store.creation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.creations.load(Ordering::SeqCst), 0);
+        assert_eq!(store.constructed.load(Ordering::SeqCst), 0);
+        assert_eq!(store.inner.task_count(), 0);
+        drop(future);
+        drop(service);
+    }
+}
+
+#[test]
+fn public_async_task_creation_drop_releases_uncommitted_admission() {
+    let store = Arc::new(AsyncControlHttpStore::new());
+    store.write_blocked.store(true, Ordering::Release);
+    let runtime = FinalTaskRuntime::new(
+        store.clone(),
+        FinalTaskRuntimeConfig::new(60_000, None)
+            .unwrap()
+            .with_admission_capacity(1, 1, 16_384, 16_384)
+            .unwrap(),
+        Arc::new(|_| {}),
+    );
+    let service = start_final_tasks_test_service(&runtime);
+    let server = Server::new("dropped-task-creation", "1")
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .unwrap()
+        .tool(AsyncTaskCreatingTool)
+        .final_tasks(runtime)
+        .unwrap()
+        .build();
+    let inbound =
+        InboundRequestContext::new(Cx::for_testing(), 81, InboundRequestTransport::Memory);
+    let request = final_task_creating_tool_request(true);
+    let mut future = Box::pin(server.dispatch_stateless(&inbound, &request));
+    let mut poll = TaskContext::from_waker(Waker::noop());
+    assert!(future.as_mut().poll(&mut poll).is_pending());
+    assert_eq!(store.creation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.inner.task_count(), 0);
+    // This fixture has not started an external write. Its dropped future
+    // owns no detached work, and the runtime must release its reservation.
+    drop(future);
+    store.release_write();
+    let replacement =
+        InboundRequestContext::new(Cx::for_testing(), 82, InboundRequestTransport::Memory);
+    let mut next = Box::pin(server.dispatch_stateless(&replacement, &request));
+    let TaskPoll::Ready(response) = next.as_mut().poll(&mut poll) else {
+        panic!("replacement creation must not inherit an abandoned admission charge");
+    };
+    let response = response.unwrap();
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert_eq!(store.creation_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(store.creations.load(Ordering::SeqCst), 1);
+    assert_eq!(store.inner.task_count(), 1);
+    assert_eq!(store.synchronous.load(Ordering::SeqCst), 0);
+    drop(next);
+    drop(service);
+}
+
+#[test]
+fn public_async_task_creation_rechecks_service_before_write_and_preserves_committed_receipts() {
+    for (committed_before_exit, invalid_receipt) in [(false, false), (true, false), (true, true)] {
+        let store = Arc::new(AsyncControlHttpStore::new());
+        store
+            .write_blocked
+            .store(!committed_before_exit, Ordering::Release);
+        store
+            .creation_receipt_blocked
+            .store(committed_before_exit, Ordering::Release);
+        store
+            .invalid_creation_receipt
+            .store(invalid_receipt, Ordering::Release);
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&emitted);
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let service = start_final_tasks_test_service(&runtime);
+        let server = Server::new("settled-task-creation", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .mask_error_details(true)
+            .tool(AsyncTaskCreatingTool)
+            .final_tasks(runtime.clone())
+            .unwrap()
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 81, InboundRequestTransport::Memory);
+        let request = final_task_creating_tool_request(true);
+        let mut future = Box::pin(server.dispatch_stateless(&inbound, &request));
+        let mut poll = TaskContext::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut poll).is_pending());
+        assert_eq!(store.creation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.inner.task_count(), usize::from(committed_before_exit));
+        drop(service);
+        assert!(!runtime.is_task_service_ready());
+        store.release_write();
+        store.release_creation_receipt();
+        let TaskPoll::Ready(response) = future.as_mut().poll(&mut poll) else {
+            panic!("creation must settle after the service exits");
+        };
+        let response = response.unwrap();
+        if !committed_before_exit {
+            assert!(response.error.is_some());
+            assert!(response.result.is_none());
+            assert_eq!(store.creations.load(Ordering::SeqCst), 0);
+            assert_eq!(store.inner.task_count(), 0);
+            assert!(store.last_created.lock().unwrap().is_none());
+            assert_eq!(emitted.load(Ordering::SeqCst), 0);
+            assert_eq!(store.synchronous.load(Ordering::SeqCst), 0);
+            continue;
+        }
+        assert_eq!(store.creations.load(Ordering::SeqCst), 1);
+        assert_eq!(store.inner.task_count(), 1);
+        let committed = store.last_created.lock().unwrap().clone().unwrap();
+        assert!(
+            store
+                .inner
+                .work_descriptor_if_current(&committed)
+                .unwrap()
+                .is_some()
+        );
+        if invalid_receipt {
+            assert!(response.result.is_none());
+            assert_eq!(
+                response.error.unwrap().data,
+                Some(serde_json::json!({"reason": "TaskStateUnknown"}))
+            );
+            assert_eq!(emitted.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(response.error.is_none(), "{:?}", response.error);
+            assert_eq!(
+                response.result.unwrap()["taskId"],
+                committed.task().base().task_id.as_str()
+            );
+            assert_eq!(emitted.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(store.synchronous.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]
