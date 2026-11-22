@@ -980,6 +980,46 @@ impl ExtensionSettingsCompatibilityResolver for BoxedExtensionSettingsResolver {
     }
 }
 
+/// Routes one sealed registration by its exact capability owner while
+/// preserving every previously installed resolver's activation disposition.
+#[cfg(feature = "extension-authoring")]
+struct ComposedExtensionSettingsResolver {
+    extension_id: ExtensionId,
+    selected: BoxedExtensionSettingsResolver,
+    fallback: BoxedExtensionSettingsResolver,
+}
+
+#[cfg(feature = "extension-authoring")]
+impl ExtensionSettingsCompatibilityResolver for ComposedExtensionSettingsResolver {
+    fn resolve(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+        if descriptor.id == self.extension_id {
+            self.selected.resolve(descriptor, client, server)
+        } else {
+            self.fallback.resolve(descriptor, client, server)
+        }
+    }
+
+    fn resolve_with_disposition(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettingsResolution, ExtensionNegotiationError> {
+        if descriptor.id == self.extension_id {
+            self.selected
+                .resolve_with_disposition(descriptor, client, server)
+        } else {
+            self.fallback
+                .resolve_with_disposition(descriptor, client, server)
+        }
+    }
+}
+
 /// Immutable server-owned extension runtime retained after builder freeze.
 pub(crate) struct ServerExtensionRuntime {
     handlers: ExtensionHandlerRegistry,
@@ -1061,6 +1101,59 @@ impl ServerExtensionRuntime {
             server_discovery,
             resolver: Mutex::new(resolver),
         })
+    }
+
+    /// Composes one sealed typed registration before the shared registry freezes.
+    ///
+    /// Raw caller registries keep their single-install contract. This path only
+    /// accepts a complete authoring registration, whose descriptor binds every
+    /// handler, notification schema, discovery setting, and resolver together.
+    #[cfg(feature = "extension-authoring")]
+    pub(crate) fn install_typed_extension(
+        &mut self,
+        registration: extensions::authoring::ExtensionRegistration,
+    ) -> Result<(), ServerExtensionConfigurationError> {
+        let extension_id = ExtensionId::parse(registration.descriptor().id())
+            .map_err(ServerExtensionConfigurationError::Registry)?;
+        let (handlers, discovery, resolver) = registration.into_parts();
+        let incoming = Self::new(handlers, discovery, resolver)?;
+        let selected = incoming
+            .resolver
+            .into_inner()
+            .map_err(|_| ServerExtensionConfigurationError::ResolverPoisoned)?;
+        // Check the lock before the transactional handler merge. Everything
+        // after that merge is an infallible transfer of the sealed owner.
+        let resolver = self
+            .resolver
+            .get_mut()
+            .map_err(|_| ServerExtensionConfigurationError::ResolverPoisoned)?;
+        self.handlers
+            .merge_authoring(incoming.handlers)
+            .map_err(ServerExtensionConfigurationError::Handler)?;
+        self.server_discovery
+            .extensions
+            .extend(incoming.server_discovery.extensions);
+        self.local_enablement.enable(extension_id.clone());
+
+        let fallback = std::mem::replace(
+            resolver,
+            BoxedExtensionSettingsResolver(Box::new(
+                |descriptor: &ExtensionDescriptor,
+                 _client: &ExtensionSettings,
+                 _server: &ExtensionSettings|
+                 -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                    Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                        descriptor.id.to_string(),
+                    ))
+                },
+            )),
+        );
+        *resolver = BoxedExtensionSettingsResolver(Box::new(ComposedExtensionSettingsResolver {
+            extension_id,
+            selected,
+            fallback,
+        }));
+        Ok(())
     }
 
     #[cfg(feature = "apps")]

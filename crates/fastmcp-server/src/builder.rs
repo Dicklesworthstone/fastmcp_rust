@@ -786,14 +786,22 @@ impl ServerBuilder {
     /// The registration owns its schemas, settings resolver, and restricted
     /// handlers. Installation grants no request authority: every call must
     /// advertise compatible settings and pass authentication and schema checks.
-    /// The resulting server freezes the registration before serving traffic.
+    /// Distinct registrations compose before the server freezes their shared
+    /// registry. Each extension retains its own settings resolver and schemas;
+    /// duplicate identifiers or wire ownership are rejected. Official Apps and
+    /// Tasks may be configured before or after these registrations.
     #[cfg(feature = "extension-authoring")]
     pub fn extension(
-        self,
+        mut self,
         registration: crate::extensions::authoring::ExtensionRegistration,
     ) -> Result<Self, ServerExtensionConfigurationError> {
-        let (handlers, discovery, resolver) = registration.into_parts();
-        self.extension_registry(handlers, discovery, resolver)
+        if let Some(runtime) = self.extension_runtime.as_mut() {
+            runtime.install_typed_extension(registration)?;
+            Ok(self)
+        } else {
+            let (handlers, discovery, resolver) = registration.into_parts();
+            self.extension_registry(handlers, discovery, resolver)
+        }
     }
 
     /// Installs the server's modern-only extension handlers and discovery settings.

@@ -1327,6 +1327,592 @@ fn sealed_extension_installation_preserves_existing_registration() {
     );
 }
 
+mod composition {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use fastmcp_rust::{
+        ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
+        ExtensionDirection, ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
+        ExtensionMethodDescriptor, ExtensionNegotiationError, ExtensionNegotiationResolver,
+        ExtensionNotificationDescriptor, ExtensionSettings, ExtensionSettingsSchema,
+        ModernHttpExtensionEvent, SseLimits,
+    };
+
+    const OFFSET_EXTENSION: &str = "com.example/typed-offset";
+    const OFFSET_METHOD: &str = "com.example/offset";
+    const SCALE_EVENT: &str = "com.example/composed-scale";
+    const OFFSET_EVENT: &str = "com.example/composed-offset";
+    const SCALE_OWNER: &str = "com.example/scale-request";
+    const OFFSET_OWNER: &str = "com.example/offset-request";
+
+    #[derive(Deserialize, Serialize, JsonSchema)]
+    #[serde(crate = "fastmcp_rust::serde", deny_unknown_fields)]
+    struct OffsetClientSettings {
+        revision: u32,
+    }
+
+    #[derive(Deserialize, Serialize, JsonSchema)]
+    #[serde(crate = "fastmcp_rust::serde", deny_unknown_fields)]
+    struct OffsetServerSettings {
+        revision: u32,
+        increment: u32,
+    }
+
+    #[derive(Deserialize, Serialize, JsonSchema)]
+    #[serde(crate = "fastmcp_rust::serde", deny_unknown_fields)]
+    struct OffsetSettings {
+        increment: u32,
+    }
+
+    #[derive(Deserialize, Serialize, JsonSchema)]
+    #[serde(crate = "fastmcp_rust::serde", deny_unknown_fields)]
+    struct OffsetNotice {
+        label: String,
+    }
+
+    fn registrations(
+        calls: &Arc<[AtomicUsize; 2]>,
+    ) -> (ExtensionRegistration, ExtensionRegistration) {
+        let scale_calls = Arc::clone(calls);
+        let scale = builder()
+            .typed_request_notification::<ScaleResponse>(
+                SCALE_EVENT,
+                "composition-scale-notice-v1",
+                SCALE_OWNER,
+            )
+            .unwrap()
+            .typed_request_sync(
+                METHOD,
+                "scale-params-v1",
+                "scale-result-v1",
+                move |context: ExtensionContext<'_, Settings>, request: ScaleRequest| {
+                    context.checkpoint()?;
+                    assert_eq!(context.descriptor().id(), EXTENSION);
+                    assert_eq!(context.settings().multiplier, 3);
+                    scale_calls[0].fetch_add(1, Ordering::SeqCst);
+                    let value = request.value * context.settings().multiplier;
+                    context.notify(&ScaleResponse { value })?;
+                    Ok(ScaleResponse { value })
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let offset_calls = Arc::clone(calls);
+        let offset = ExtensionBuilder::new(
+            OFFSET_EXTENSION,
+            1,
+            "composition-offset-client-v1",
+            "composition-offset-server-v1",
+            OffsetServerSettings {
+                revision: 2,
+                increment: 7,
+            },
+            |client: OffsetClientSettings, server: OffsetServerSettings| {
+                if client.revision != server.revision {
+                    return Err(McpError::invalid_params("incompatible offset revision"));
+                }
+                Ok(OffsetSettings {
+                    increment: server.increment,
+                })
+            },
+        )
+        .unwrap()
+        .typed_request_notification::<OffsetNotice>(
+            OFFSET_EVENT,
+            "composition-offset-notice-v1",
+            OFFSET_OWNER,
+        )
+        .unwrap()
+        .typed_request_sync(
+            OFFSET_METHOD,
+            "composition-offset-params-v1",
+            "composition-offset-result-v1",
+            move |context: ExtensionContext<'_, OffsetSettings>, request: ScaleRequest| {
+                context.checkpoint()?;
+                assert_eq!(context.descriptor().id(), OFFSET_EXTENSION);
+                assert_eq!(context.settings().increment, 7);
+                offset_calls[1].fetch_add(1, Ordering::SeqCst);
+                let value = request.value + context.settings().increment;
+                if request.value == 13 {
+                    // Valid for the other extension, invalid for this owner.
+                    context.notify(&ScaleResponse { value })?;
+                } else {
+                    context.notify(&OffsetNotice {
+                        label: format!("offset:{value}"),
+                    })?;
+                }
+                Ok(ScaleResponse { value })
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        (scale, offset)
+    }
+
+    fn server(calls: &Arc<[AtomicUsize; 2]>, reverse: bool) -> modern::Server {
+        let (scale, offset) = registrations(calls);
+        let server = modern::ServerBuilder::new("composed-typed-extensions", "1");
+        #[cfg(feature = "apps")]
+        let server = if reverse {
+            server.mcp_apps().unwrap()
+        } else {
+            server
+        };
+        let server = if reverse {
+            server.extension(offset).unwrap().extension(scale).unwrap()
+        } else {
+            server.extension(scale).unwrap().extension(offset).unwrap()
+        };
+        #[cfg(feature = "apps")]
+        let server = if reverse {
+            server
+        } else {
+            server.mcp_apps().unwrap()
+        };
+        server.try_build().unwrap()
+    }
+
+    fn message(
+        id: i64,
+        method: &str,
+        scale: Option<fastmcp_rust::JsonValue>,
+        offset: Option<fastmcp_rust::JsonValue>,
+        value: fastmcp_rust::JsonValue,
+    ) -> JsonRpcMessage {
+        let mut extensions = json!({});
+        if let Some(settings) = scale {
+            extensions[EXTENSION] = settings;
+        }
+        if let Some(settings) = offset {
+            extensions[OFFSET_EXTENSION] = settings;
+        }
+        let mut parameters = json!({"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": extensions
+            }
+        }});
+        if method != "server/discover" {
+            parameters["value"] = value;
+        }
+        JsonRpcMessage::Request(JsonRpcRequest::new(method, Some(parameters), id))
+    }
+
+    #[test]
+    fn typed_extensions_compose_on_memory_with_isolated_settings_and_notifications() {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+                for reverse in [false, true] {
+                    let calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+                    let server = server(&calls, reverse);
+                    let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+                    let mut serving = cx
+                        .spawn(move |server_cx| async move {
+                            server.serve_memory(&server_cx, transport).await
+                        })
+                        .unwrap();
+                    peer.send_async(
+                        &cx,
+                        &message(
+                            0,
+                            "server/discover",
+                            Some(json!({"version": 1})),
+                            Some(json!({"revision": 2})),
+                            json!(null),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    let discovery = response(&cx, &mut peer, 0).await;
+                    assert!(discovery.error.is_none(), "{discovery:?}");
+                    let advertised =
+                        &discovery.result.as_ref().unwrap()["capabilities"]["extensions"];
+                    assert_eq!(
+                        advertised[EXTENSION],
+                        json!({"version": 1, "multiplier": 3})
+                    );
+                    assert_eq!(
+                        advertised[OFFSET_EXTENSION],
+                        json!({"revision": 2, "increment": 7})
+                    );
+                    #[cfg(feature = "apps")]
+                    assert_eq!(advertised["io.modelcontextprotocol/ui"], json!({}));
+                    #[cfg(feature = "tasks")]
+                    assert_eq!(advertised["io.modelcontextprotocol/tasks"], json!({}));
+
+                    let cases = [
+                        (
+                            METHOD,
+                            Some(json!({"version": 1})),
+                            Some(json!({"revision": 2})),
+                            json!(7),
+                            Some(21),
+                        ),
+                        (
+                            OFFSET_METHOD,
+                            Some(json!({"version": 1})),
+                            Some(json!({"revision": 2})),
+                            json!(7),
+                            Some(14),
+                        ),
+                        (METHOD, None, Some(json!({"revision": 2})), json!(7), None),
+                        (
+                            OFFSET_METHOD,
+                            Some(json!({"version": 1})),
+                            None,
+                            json!(7),
+                            None,
+                        ),
+                        (
+                            METHOD,
+                            Some(json!({"version": 1})),
+                            Some(json!({"version": 1})),
+                            json!(7),
+                            None,
+                        ),
+                        (
+                            OFFSET_METHOD,
+                            Some(json!({"version": 1})),
+                            Some(json!({"revision": 2})),
+                            json!("bad"),
+                            None,
+                        ),
+                        (
+                            OFFSET_METHOD,
+                            Some(json!({"version": 1})),
+                            Some(json!({"revision": 2})),
+                            json!(13),
+                            None,
+                        ),
+                        (
+                            METHOD,
+                            Some(json!({"version": 1})),
+                            Some(json!({"revision": 2})),
+                            json!(11),
+                            Some(33),
+                        ),
+                        (
+                            OFFSET_METHOD,
+                            Some(json!({"version": 1})),
+                            Some(json!({"revision": 2})),
+                            json!(11),
+                            Some(18),
+                        ),
+                    ];
+                    for (index, (method, scale, offset, value, expected)) in
+                        cases.into_iter().enumerate()
+                    {
+                        let id = i64::try_from(index).unwrap() + 1;
+                        peer.send_async(&cx, &message(id, method, scale, offset, value))
+                            .await
+                            .unwrap();
+                        if let Some(value) = expected {
+                            let JsonRpcMessage::Request(notice) =
+                                peer.recv_async(&cx).await.unwrap()
+                            else {
+                                panic!("each composed handler emits its own notification first");
+                            };
+                            assert!(notice.id.is_none());
+                            let (event, owner, other_owner, application) = if method == METHOD {
+                                (
+                                    SCALE_EVENT,
+                                    SCALE_OWNER,
+                                    OFFSET_OWNER,
+                                    json!({"value": value}),
+                                )
+                            } else {
+                                (
+                                    OFFSET_EVENT,
+                                    OFFSET_OWNER,
+                                    SCALE_OWNER,
+                                    json!({"label": format!("offset:{value}")}),
+                                )
+                            };
+                            assert_eq!(notice.method, event);
+                            let mut parameters = notice.params.unwrap();
+                            let metadata =
+                                parameters.as_object_mut().unwrap().remove("_meta").unwrap();
+                            assert_eq!(metadata[owner], json!(id));
+                            assert!(metadata.get(other_owner).is_none());
+                            assert_eq!(parameters, application);
+                            let terminal = response(&cx, &mut peer, id).await;
+                            assert!(terminal.error.is_none(), "{terminal:?}");
+                            assert_eq!(terminal.result.as_ref().unwrap()["value"], value);
+                        } else {
+                            let terminal = response(&cx, &mut peer, id).await;
+                            assert!(terminal.error.is_some(), "{terminal:?}");
+                            assert!(terminal.result.is_none());
+                        }
+                    }
+                    assert_eq!(calls[0].load(Ordering::SeqCst), 2);
+                    assert_eq!(calls[1].load(Ordering::SeqCst), 3);
+                    assert!(cx.checkpoint().is_ok());
+                    let (mut input, output) = peer.into_split();
+                    drop(output);
+                    assert!(matches!(
+                        input.recv_async(&cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                    serving.join(&cx).await.unwrap().unwrap();
+                }
+            })
+            .await
+            .expect("composed requests, rejection and shutdown remain bounded");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    fn http_consumer() -> (ExtensionDescriptorRegistry, ClientExtensionDiscovery) {
+        let mut registry = ExtensionDescriptorRegistry::new();
+        for (id, method, event, client_schema, server_schema) in [
+            (
+                EXTENSION,
+                METHOD,
+                SCALE_EVENT,
+                "typed-math-client-v1",
+                "typed-math-server-v1",
+            ),
+            (
+                OFFSET_EXTENSION,
+                OFFSET_METHOD,
+                OFFSET_EVENT,
+                "composition-offset-client-v1",
+                "composition-offset-server-v1",
+            ),
+        ] {
+            registry
+                .register(ExtensionDescriptor {
+                    id: ExtensionId::parse(id).unwrap(),
+                    client_settings: ExtensionSettingsSchema {
+                        schema_id: client_schema.into(),
+                        codec_id: "client-codec-v1".into(),
+                    },
+                    server_settings: ExtensionSettingsSchema {
+                        schema_id: server_schema.into(),
+                        codec_id: "server-codec-v1".into(),
+                    },
+                    resolver: ExtensionNegotiationResolver {
+                        id: "composition-client-resolver-v1".into(),
+                        version: 1,
+                        fallback: ExtensionFallbackPolicy::RejectOneSided,
+                    },
+                    method: Some(ExtensionMethodDescriptor {
+                        name: method.into(),
+                        direction: ExtensionDirection::ClientToServer,
+                        http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
+                        legacy_fallback: false,
+                    }),
+                    notification: Some(ExtensionNotificationDescriptor {
+                        name: event.into(),
+                        direction: ExtensionDirection::ServerToClient,
+                        activation_proof: None,
+                    }),
+                    result_discriminator: None,
+                    routing_headers: vec![],
+                    stdio_correlation: None,
+                })
+                .unwrap();
+        }
+        let discovery = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([
+                (
+                    ExtensionId::parse(EXTENSION).unwrap(),
+                    ExtensionSettings::new(json!({"version": 1})).unwrap(),
+                ),
+                (
+                    ExtensionId::parse(OFFSET_EXTENSION).unwrap(),
+                    ExtensionSettings::new(json!({"revision": 2})).unwrap(),
+                ),
+            ]),
+        };
+        (registry, discovery)
+    }
+
+    fn compatible(
+        descriptor: &ExtensionDescriptor,
+        client: &ExtensionSettings,
+        server: &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+        let key = if descriptor.id.as_str() == EXTENSION {
+            "version"
+        } else if descriptor.id.as_str() == OFFSET_EXTENSION {
+            "revision"
+        } else {
+            return Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                descriptor.id.to_string(),
+            ));
+        };
+        if client.as_object().get(key) != server.as_object().get(key) {
+            return Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                descriptor.id.to_string(),
+            ));
+        }
+        Ok(server.clone())
+    }
+
+    #[test]
+    fn typed_extensions_compose_on_native_http_with_separate_notification_schemas() {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        let calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let observed = Arc::clone(&calls);
+        runtime.block_on(async move {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+                let server = server(&calls, false);
+                let bound = server.bind_http(&cx, "127.0.0.1:0").await.unwrap();
+                let endpoint = fastmcp_rust::CanonicalHttpUrl::parse(&format!(
+                    "http://{}/mcp",
+                    bound.local_addr().unwrap()
+                ))
+                .unwrap();
+                let (ready, mut receiver) = asupersync::channel::oneshot::channel();
+                let mut serving = cx
+                    .spawn(move |server_cx| async move {
+                        ready.send(&server_cx, server_cx.clone()).unwrap();
+                        bound.serve(&server_cx).await
+                    })
+                    .unwrap();
+                let server_cx = receiver.recv(&cx).await.unwrap();
+                let (registry, discovery) = http_consumer();
+                let client = modern::ClientBuilder::new()
+                    .extension_registry(registry, discovery, || compatible)
+                    .unwrap()
+                    .connect_http_with_cx(&cx, endpoint)
+                    .await
+                    .unwrap();
+                let limits = SseLimits::new(64 * 1024, 64 * 1024, 64).unwrap();
+                for (extension, method, event, expected, notification) in [
+                    (EXTENSION, METHOD, SCALE_EVENT, 21, json!({"value": 21})),
+                    (
+                        OFFSET_EXTENSION,
+                        OFFSET_METHOD,
+                        OFFSET_EVENT,
+                        14,
+                        json!({"label": "offset:14"}),
+                    ),
+                ] {
+                    let id = ExtensionId::parse(extension).unwrap();
+                    let mut execution = client
+                        .execute_final_extension(&cx, &id, method, json!({"value": 7}), limits)
+                        .unwrap();
+                    let Some(ModernHttpExtensionEvent::ExtensionNotification {
+                        notification: received,
+                        ..
+                    }) = execution.next_event(&cx).await.unwrap()
+                    else {
+                        panic!("each extension preserves its own HTTP notification");
+                    };
+                    assert_eq!(received.method, event);
+                    assert_eq!(received.params, Some(notification));
+                    assert!(matches!(
+                        execution.next_event(&cx).await.unwrap(),
+                        Some(ModernHttpExtensionEvent::Terminal(result))
+                            if result["value"] == expected
+                    ));
+                    assert!(execution.next_event(&cx).await.unwrap().is_none());
+                }
+
+                let id = ExtensionId::parse(OFFSET_EXTENSION).unwrap();
+                let mut invalid = client
+                    .execute_final_extension(&cx, &id, OFFSET_METHOD, json!({"value": 13}), limits)
+                    .unwrap();
+                assert!(
+                    invalid.next_event(&cx).await.is_err(),
+                    "a payload valid only for the other owner cannot be emitted"
+                );
+                assert!(invalid.next_event(&cx).await.unwrap().is_none());
+
+                let id = ExtensionId::parse(EXTENSION).unwrap();
+                let mut sibling = client
+                    .execute_final_extension(&cx, &id, METHOD, json!({"value": 9}), limits)
+                    .unwrap();
+                assert!(matches!(
+                    sibling.next_event(&cx).await.unwrap(),
+                    Some(ModernHttpExtensionEvent::ExtensionNotification { notification, .. })
+                        if notification.method == SCALE_EVENT
+                            && notification.params == Some(json!({"value": 27}))
+                ));
+                assert!(matches!(
+                    sibling.next_event(&cx).await.unwrap(),
+                    Some(ModernHttpExtensionEvent::Terminal(result))
+                        if result["value"] == 27
+                ));
+                assert!(sibling.next_event(&cx).await.unwrap().is_none());
+                drop(client);
+                server_cx.cancel_with(
+                    asupersync::types::CancelKind::Shutdown,
+                    Some("composed extension HTTP test complete"),
+                );
+                assert!(matches!(
+                    serving.join(&cx).await.unwrap().unwrap(),
+                    fastmcp_rust::HttpServerShutdown::Quiescent
+                ));
+            })
+            .await
+            .expect("composed HTTP handlers and cleanup remain bounded");
+        });
+        assert_eq!(observed[0].load(Ordering::SeqCst), 2);
+        assert_eq!(observed[1].load(Ordering::SeqCst), 2);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn typed_extensions_reject_a_second_owner_of_the_same_method() {
+        let first = registration(Arc::new(AtomicUsize::new(0)));
+        let second = ExtensionBuilder::new(
+            OFFSET_EXTENSION,
+            1,
+            "collision-client-v1",
+            "collision-server-v1",
+            ServerSettings {
+                version: 1,
+                multiplier: 5,
+            },
+            |client: ClientSettings, server: ServerSettings| {
+                if client.version != server.version {
+                    return Err(McpError::invalid_params("incompatible version"));
+                }
+                Ok(Settings {
+                    multiplier: server.multiplier,
+                })
+            },
+        )
+        .unwrap()
+        .typed_request_sync(
+            METHOD,
+            "scale-params-v1",
+            "scale-result-v1",
+            |context: ExtensionContext<'_, Settings>, request: ScaleRequest| {
+                Ok(ScaleResponse {
+                    value: request.value * context.settings().multiplier,
+                })
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(
+            modern::ServerBuilder::new("conflicting-extension-owner", "1")
+                .extension(first)
+                .unwrap()
+                .extension(second)
+                .is_err(),
+            "composition cannot replace another extension's method"
+        );
+    }
+}
+
 const NOTIFICATION: &str = "com.example/scaled";
 const ACTIVATION: &str = "com.example/activation";
 

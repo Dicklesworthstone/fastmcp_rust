@@ -669,7 +669,58 @@ impl ExtensionHandlerRegistry {
             .flatten()
     }
 
-    /// Returns the mutable descriptor registry before handler freeze.
+    /// Merges the complete handler registry from one sealed authoring registration.
+    ///
+    /// The caller must retain the registration's matching discovery and settings
+    /// resolver. Descriptor ownership and the aggregate canonical budget are
+    /// checked on a clone before any handler, schema, or metadata is moved.
+    #[cfg(feature = "extension-authoring")]
+    pub(crate) fn merge_authoring(
+        &mut self,
+        incoming: Self,
+    ) -> Result<(), ExtensionHandlerRegistrationError> {
+        if self.frozen || incoming.frozen {
+            return Err(ExtensionHandlerRegistrationError::Frozen);
+        }
+        let mut descriptors = self.descriptor_registry.clone();
+        for descriptor in incoming.descriptor_registry.descriptors() {
+            descriptors
+                .register(descriptor.clone())
+                .map_err(ExtensionHandlerRegistrationError::Registry)?;
+        }
+        // A sealed registration binds every additional request method to a
+        // typed handler. Copy those protocol entries as well as the primary
+        // descriptor, so they participate in ownership and receipt checks.
+        for key in incoming.handlers.keys() {
+            let method = incoming
+                .descriptor_registry
+                .method_descriptor(key.extension_id(), key.method())
+                .ok_or_else(|| ExtensionHandlerRegistrationError::MethodNotOwned(key.clone()))?;
+            if descriptors
+                .method_descriptor(key.extension_id(), key.method())
+                .is_none()
+            {
+                descriptors
+                    .register_method(key.extension_id(), method.clone())
+                    .map_err(ExtensionHandlerRegistrationError::Registry)?;
+            }
+        }
+        descriptors
+            .clone()
+            .freeze()
+            .map_err(ExtensionHandlerRegistrationError::Registry)?;
+
+        self.descriptor_registry = descriptors;
+        self.handlers.extend(incoming.handlers);
+        self.notification_handlers
+            .extend(incoming.notification_handlers);
+        self.request_notification_schemas
+            .extend(incoming.request_notification_schemas);
+        self.server_metadata.extend(incoming.server_metadata);
+        Ok(())
+    }
+
+/// Returns the mutable descriptor registry before handler freeze.
     ///
     /// Builder-only composition must add every descriptor before typed handlers
     /// are frozen under their shared receipt. Once frozen, neither descriptor

@@ -3101,6 +3101,424 @@ mod tests {
         );
     }
 
+    fn composition_builder(id: &str, offset: u32) -> Builder {
+        Builder::new(
+            id,
+            1,
+            "composition-client-v1",
+            "composition-server-v1",
+            ServerSettings { maximum: 4 },
+            move |client, server| {
+                if client.scale > server.maximum {
+                    return Err(McpError::invalid_params(
+                        "incompatible composition settings",
+                    ));
+                }
+                Ok(Settings {
+                    scale: client.scale + offset,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    fn composition_requests(id: &str, methods: &[&str], offset: u32) -> Builder {
+        let mut builder = composition_builder(id, offset);
+        for method in methods {
+            builder = builder
+                .typed_request_sync::<Input, Output, _>(
+                    *method,
+                    "composition-input-v1",
+                    "composition-output-v1",
+                    multiply,
+                )
+                .unwrap();
+        }
+        builder
+    }
+
+    fn composition_runtime(registration: ExtensionRegistration) -> crate::ServerExtensionRuntime {
+        let (handlers, discovery, resolver) = registration.into_parts();
+        crate::ServerExtensionRuntime::new(handlers, discovery, resolver).unwrap()
+    }
+
+    fn composition_receipt(
+        runtime: &crate::ServerExtensionRuntime,
+    ) -> fastmcp_protocol::extensions::ExtensionRegistryReceipt {
+        runtime
+            .handlers
+            .descriptor_registry()
+            .clone()
+            .freeze()
+            .unwrap()
+    }
+
+    fn composition_client(entries: &[(&str, u32)]) -> ClientExtensionDiscovery {
+        ClientExtensionDiscovery {
+            extensions: entries
+                .iter()
+                .map(|(id, scale)| {
+                    (
+                        ExtensionId::parse(*id).unwrap(),
+                        ExtensionSettings::new(json!({"scale": scale})).unwrap(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn typed_extension_composition_keeps_resolvers_and_schemas_owner_bound() {
+        const SECOND: &str = "dev.example/second";
+        const SECOND_METHOD: &str = "dev.example/second_scale";
+        const EXTRA_METHOD: &str = "dev.example/second_extra";
+        let first = composition_requests(ID, &[METHOD], 0)
+            .typed_request_notification::<Output>(
+                "dev.example/first_event",
+                "shared-event-schema",
+                "dev.example/first_request",
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut runtime = composition_runtime(first);
+        let first_receipt = composition_receipt(&runtime);
+        let second = composition_requests(SECOND, &[SECOND_METHOD, EXTRA_METHOD], 10)
+            .typed_request_notification::<Settings>(
+                "dev.example/second_event",
+                "shared-event-schema",
+                "dev.example/second_request",
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        runtime.install_typed_extension(second).unwrap();
+        let receipt = runtime.freeze().unwrap();
+        assert_ne!(receipt, first_receipt);
+        assert_eq!(receipt.descriptor_count(), 2);
+        let first_id = ExtensionId::parse(ID).unwrap();
+        let second_id = ExtensionId::parse(SECOND).unwrap();
+        let client = composition_client(&[(ID, 2), (SECOND, 3)]);
+        let negotiated = runtime.negotiate(&client).unwrap();
+        assert_eq!(
+            negotiated
+                .active(&first_id)
+                .unwrap()
+                .effective_settings()
+                .settings(),
+            &ExtensionSettings::new(json!({"scale": 2})).unwrap()
+        );
+        assert_eq!(
+            negotiated
+                .active(&second_id)
+                .unwrap()
+                .effective_settings()
+                .settings(),
+            &ExtensionSettings::new(json!({"scale": 13})).unwrap()
+        );
+        let context = McpContext::new(asupersync::Cx::for_testing(), 41);
+        for method in [SECOND_METHOD, EXTRA_METHOD] {
+            let request = JsonRpcRequest::new(
+                method,
+                Some(json!({
+                    "value": 7,
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {
+                            "extensions": {(ID): {"scale": 2}, (SECOND): {"scale": 3}},
+                        },
+                    },
+                })),
+                41_i64,
+            );
+            assert_eq!(
+                runtime
+                    .handlers
+                    .invoke(
+                        &context,
+                        &negotiated,
+                        ProtocolEra::Modern2026,
+                        &second_id,
+                        &request,
+                    )
+                    .unwrap(),
+                json!({"product": 91}),
+                "both primary and additional methods retain their typed owner"
+            );
+        }
+        let first_schema = runtime
+            .handlers
+            .request_notification_schema(&first_id)
+            .unwrap();
+        let second_schema = runtime
+            .handlers
+            .request_notification_schema(&second_id)
+            .unwrap();
+        assert!(first_schema.validate(&json!({"product": 7})).is_ok());
+        assert!(first_schema.validate(&json!({"scale": 7})).is_err());
+        assert!(second_schema.validate(&json!({"scale": 7})).is_ok());
+        assert!(second_schema.validate(&json!({"product": 7})).is_err());
+    }
+
+    #[test]
+    fn typed_extension_composition_keeps_notification_only_owners() {
+        const SECOND: &str = "dev.example/second";
+        let mut runtime = composition_runtime(
+            composition_requests(SECOND, &["dev.example/second_scale"], 10)
+                .build()
+                .unwrap(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let authorized = Arc::new(AtomicUsize::new(0));
+        runtime
+            .install_typed_extension(notification_registration(
+                Arc::clone(&calls),
+                Arc::clone(&authorized),
+            ))
+            .unwrap();
+        runtime.freeze().unwrap();
+        let owner = ExtensionId::parse(ID).unwrap();
+        let negotiated = runtime
+            .negotiate(&composition_client(&[(ID, 2), (SECOND, 3)]))
+            .unwrap();
+        let executor = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let context = McpContext::new(
+            executor.request_cx_with_budget(asupersync::Budget::default()),
+            41,
+        );
+        let notification = notification_frame(7, 2);
+        let admission = runtime
+            .handlers
+            .authorize_notification(&context, &owner, &notification)
+            .unwrap();
+        executor
+            .block_on(runtime.handlers.invoke_notification_async(
+                &context,
+                &negotiated,
+                &owner,
+                &notification,
+                admission,
+            ))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 14);
+        assert_eq!(authorized.load(Ordering::SeqCst), 1);
+        assert!(
+            runtime
+                .handlers
+                .authorize_notification(&context, &owner, &notification_frame(13, 2))
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 14);
+        assert_eq!(authorized.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn typed_extension_composition_conflicts_leave_runtime_unchanged() {
+        const SECOND: &str = "dev.example/second";
+        const EXTRA: &str = "dev.example/extra";
+        const EVENT: &str = "dev.example/event";
+        const CORRELATION: &str = "dev.example/request";
+        let initial = composition_requests(ID, &[METHOD, EXTRA], 0)
+            .typed_request_notification::<Output>(EVENT, "event-v1", CORRELATION)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut runtime = composition_runtime(initial);
+        let receipt = composition_receipt(&runtime);
+        let discovery = runtime.server_discovery.extensions.clone();
+        let conflicts = [
+            composition_requests(ID, &["dev.example/otherwise_free"], 10)
+                .build()
+                .unwrap(),
+            composition_requests(SECOND, &[METHOD], 10).build().unwrap(),
+            composition_requests(SECOND, &[EXTRA], 10).build().unwrap(),
+            composition_requests(SECOND, &["dev.example/free", EXTRA], 10)
+                .build()
+                .unwrap(),
+            composition_requests(SECOND, &["dev.example/free"], 10)
+                .typed_request_notification::<Output>(
+                    EVENT,
+                    "event-v1",
+                    "dev.example/other_request",
+                )
+                .unwrap()
+                .build()
+                .unwrap(),
+            composition_requests(SECOND, &["dev.example/free"], 10)
+                .typed_request_notification::<Output>(
+                    "dev.example/other_event",
+                    "event-v1",
+                    CORRELATION,
+                )
+                .unwrap()
+                .build()
+                .unwrap(),
+        ];
+        for registration in conflicts {
+            assert!(runtime.install_typed_extension(registration).is_err());
+            assert_eq!(composition_receipt(&runtime), receipt);
+            assert_eq!(runtime.server_discovery.extensions, discovery);
+            assert_eq!(runtime.handlers.len(), 2);
+            assert_eq!(runtime.handlers.server_metadata_len(), 1);
+            assert!(
+                !runtime
+                    .local_enablement
+                    .is_enabled(&ExtensionId::parse(SECOND).unwrap())
+            );
+        }
+        runtime.freeze().unwrap();
+        assert!(matches!(
+            runtime.install_typed_extension(
+                composition_requests(SECOND, &["dev.example/free"], 10)
+                    .build()
+                    .unwrap()
+            ),
+            Err(crate::ServerExtensionConfigurationError::Handler(
+                super::super::ExtensionHandlerRegistrationError::Frozen
+            ))
+        ));
+        assert_eq!(composition_receipt(&runtime), receipt);
+        let negotiated = runtime.negotiate(&composition_client(&[(ID, 2)])).unwrap();
+        assert_eq!(
+            negotiated
+                .active(&ExtensionId::parse(ID).unwrap())
+                .unwrap()
+                .effective_settings()
+                .settings(),
+            &ExtensionSettings::new(json!({"scale": 2})).unwrap(),
+            "a refused resolver never replaces the previously installed resolver"
+        );
+        assert!(
+            runtime
+                .handlers
+                .request_notification_schema(&ExtensionId::parse(ID).unwrap())
+                .unwrap()
+                .validate(&json!({"product": 7}))
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "apps")]
+    #[test]
+    fn typed_extension_composition_preserves_official_extensions_in_both_orders() {
+        use fastmcp_protocol::extensions::{
+            ExtensionInactiveReason, MCP_APPS_HTML_MIME_TYPE, official_mcp_apps_extension_id,
+        };
+
+        for official_first in [true, false] {
+            let registration = composition_requests(ID, &[METHOD], 0).build().unwrap();
+            #[cfg(feature = "tasks")]
+            let tasks = crate::FinalTaskRuntime::in_memory(
+                crate::FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+                Arc::new(|_| {}),
+            );
+            let mut runtime = if official_first {
+                let mut runtime = crate::ServerExtensionRuntime::with_official_mcp_apps().unwrap();
+                #[cfg(feature = "tasks")]
+                runtime.install_final_tasks(&tasks).unwrap();
+                runtime.install_typed_extension(registration).unwrap();
+                runtime
+            } else {
+                let mut runtime = composition_runtime(registration);
+                runtime.install_official_mcp_apps().unwrap();
+                #[cfg(feature = "tasks")]
+                runtime.install_final_tasks(&tasks).unwrap();
+                runtime
+            };
+            runtime.freeze().unwrap();
+            let apps_id = official_mcp_apps_extension_id();
+            let mut client = composition_client(&[(ID, 2)]);
+            client.extensions.insert(
+                apps_id.clone(),
+                ExtensionSettings::new(json!({"mimeTypes": ["text/plain"]})).unwrap(),
+            );
+            #[cfg(feature = "tasks")]
+            client.extensions.insert(
+                fastmcp_protocol::extensions::official_tasks_extension_id(),
+                fastmcp_protocol::extensions::official_tasks_empty_settings(),
+            );
+            let inactive = runtime.negotiate(&client).unwrap();
+            assert_eq!(
+                inactive.inactive_reason(&apps_id),
+                Some(ExtensionInactiveReason::SettingsInactiveFallback)
+            );
+            assert!(inactive.active(&ExtensionId::parse(ID).unwrap()).is_some());
+            #[cfg(feature = "tasks")]
+            assert!(
+                inactive
+                    .active(&fastmcp_protocol::extensions::official_tasks_extension_id())
+                    .is_some()
+            );
+            client.extensions.insert(
+                apps_id.clone(),
+                ExtensionSettings::new(json!({"mimeTypes": [MCP_APPS_HTML_MIME_TYPE]})).unwrap(),
+            );
+            assert!(
+                runtime
+                    .negotiate(&client)
+                    .unwrap()
+                    .active(&apps_id)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_extension_composition_enforces_aggregate_registry_budget() {
+        use super::super::ExtensionHandlerRegistrationError;
+        use fastmcp_protocol::extensions::ExtensionRegistryError;
+
+        let mut runtime =
+            composition_runtime(composition_requests(ID, &[METHOD], 0).build().unwrap());
+        for owner in 0..16 {
+            let id = format!("dev.example/budget_{owner}");
+            let mut builder = composition_builder(&id, 0);
+            for method in 0..MAX_AUTHORING_METHODS {
+                builder = builder
+                    .typed_request_sync::<Input, Output, _>(
+                        format!(
+                            "dev.example/owner_{owner}_method_{method}_{}",
+                            "x".repeat(420)
+                        ),
+                        "composition-input-v1",
+                        "composition-output-v1",
+                        multiply,
+                    )
+                    .unwrap();
+            }
+            let receipt = composition_receipt(&runtime);
+            let handler_count = runtime.handlers.len();
+            let discovery = runtime.server_discovery.extensions.clone();
+            match runtime.install_typed_extension(builder.build().unwrap()) {
+                Ok(()) => {}
+                Err(crate::ServerExtensionConfigurationError::Handler(
+                    ExtensionHandlerRegistrationError::Registry(
+                        ExtensionRegistryError::DigestTooLarge,
+                    ),
+                )) => {
+                    assert!(
+                        owner > 0,
+                        "individually bounded registries compose until the aggregate limit"
+                    );
+                    assert_eq!(composition_receipt(&runtime), receipt);
+                    assert_eq!(runtime.handlers.len(), handler_count);
+                    assert_eq!(runtime.server_discovery.extensions, discovery);
+                    assert!(
+                        !runtime
+                            .local_enablement
+                            .is_enabled(&ExtensionId::parse(id).unwrap())
+                    );
+                    runtime.freeze().unwrap();
+                    return;
+                }
+                Err(error) => panic!("unexpected composition rejection: {error}"),
+            }
+        }
+        panic!("the combined canonical descriptor budget must reject an oversized registry");
+    }
+
     #[test]
     fn typed_authoring_json_writer_enforces_encoded_byte_budget_before_growth() {
         let value = "abcdefghijklmnop";
