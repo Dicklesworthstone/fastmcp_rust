@@ -5,9 +5,11 @@
 //! The driver binds each protected grant to its original profile before
 //! serialization, requires durable identity-assertion reservation before ID-JAG
 //! exchange, keeps the three grant forms distinct, and consumes inputs on every
-//! outcome. It does not activate EMA or issue browser-flow, credential-custody,
-//! subject-mapping or deployment receipts. Those trust boundaries are
-//! additional requirements for the complete enterprise profile. Embeddings run
+//! outcome. Resource-AS redemption requires an exact preexisting subject mapping
+//! between the original verified OIDC identity and its returned signed ID-JAG.
+//! It does not activate EMA or issue browser-flow, credential-custody or external
+//! identity/deployment attestations. Those trust boundaries remain additional
+//! requirements for the complete enterprise profile. Embeddings run
 //! synchronous signature admission on their caller-owned bounded CPU lane.
 
 #[cfg(test)]
@@ -28,7 +30,7 @@ use asupersync::security::SecretString;
 use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::runtime::CallerContextFuture;
-use fastmcp_core::{AccessToken, CanonicalHttpUrl};
+use fastmcp_core::{AccessToken, CanonicalHttpUrl, Sha256Digest};
 #[cfg(test)]
 use fastmcp_transport::GuardedHttpFetchResponse;
 use fastmcp_transport::{
@@ -36,6 +38,10 @@ use fastmcp_transport::{
     GuardedHttpPeerProvenance, GuardedHttpRequest, GuardedHttpsUrl,
 };
 
+use super::identity::{
+    EnterpriseIdentityError, EnterpriseIdentitySnapshotKey, EnterpriseSubjectMappingTable,
+    LocalEnterpriseSubjectId,
+};
 use super::oidc::{OidcCodeFlowError, OidcCodeGrant};
 use super::policy::{
     EnterpriseClientAuthentication, EnterpriseProfile, ID_JAG_TOKEN_TYPE, IdJagGrantedScopeSet,
@@ -692,6 +698,7 @@ pub enum EnterpriseExchangeError {
     EncodingFailed,
     CodeFlowRejected(OidcCodeFlowError),
     ResponseRejected(EnterpriseResponseError),
+    SubjectMappingRejected(EnterpriseIdentityError),
     CredentialBindingFailed,
 }
 
@@ -730,6 +737,7 @@ impl fmt::Display for EnterpriseExchangeError {
             }
             Self::CodeFlowRejected(error) => error.fmt(formatter),
             Self::ResponseRejected(error) => error.fmt(formatter),
+            Self::SubjectMappingRejected(error) => error.fmt(formatter),
             Self::CredentialBindingFailed => {
                 formatter.write_str("enterprise access token could not be bound to HTTPS resource")
             }
@@ -771,11 +779,18 @@ impl fmt::Debug for EnterpriseExchangeObservation {
 /// Dropping it never releases the identity assertion's durable replay aliases.
 pub struct EnterpriseExchangedIdJag {
     response: EnterpriseIdJagResponse,
+    identity: VerifiedOidcIdToken,
     reservation: IdentityAssertionExchangeGuard,
     expires_at_monotonic: Instant,
 }
 
 impl EnterpriseExchangedIdJag {
+    /// Original signed OIDC facts from the exact reserved assertion dispatched
+    /// by stage one. No compact token, nonce or temporary access token survives.
+    pub fn identity(&self) -> &VerifiedOidcIdToken {
+        &self.identity
+    }
+
     /// Borrows signed facts and admitted grant metadata without extracting the
     /// protected assertion or bypassing second-stage ownership.
     pub fn response(&self) -> &EnterpriseIdJagResponse {
@@ -791,11 +806,65 @@ impl EnterpriseExchangedIdJag {
     }
 }
 
-/// Admitted final enterprise access-token grant paired with its sealed
-/// resource-bound bearer conversion.
+/// The exact reviewed mapping used by the guarded resource-AS redemption.
+///
+/// This owner binds the two same-flow signed-token digests to one preexisting
+/// local subject and the independently expected immutable snapshot. It cannot
+/// create an account or convert into a principal. This local resolution is not
+/// an external directory, deployment or browser attestation.
+pub struct EnterpriseSubjectBinding {
+    local_subject: LocalEnterpriseSubjectId,
+    snapshot: EnterpriseIdentitySnapshotKey,
+    oidc_digest: Sha256Digest,
+    id_jag_digest: Sha256Digest,
+    binding_digest: Sha256Digest,
+    checked_at: SystemTime,
+    expires_at: SystemTime,
+}
+
+impl EnterpriseSubjectBinding {
+    pub fn local_subject(&self) -> &LocalEnterpriseSubjectId {
+        &self.local_subject
+    }
+
+    pub fn snapshot(&self) -> &EnterpriseIdentitySnapshotKey {
+        &self.snapshot
+    }
+
+    pub const fn oidc_digest(&self) -> Sha256Digest {
+        self.oidc_digest
+    }
+
+    pub const fn id_jag_digest(&self) -> Sha256Digest {
+        self.id_jag_digest
+    }
+
+    pub const fn binding_digest(&self) -> Sha256Digest {
+        self.binding_digest
+    }
+
+    /// Earliest reviewed mapping, original identity and admitted ID-JAG expiry.
+    /// The final credential cannot extend this bound.
+    pub const fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
+
+    fn check(&self, now: SystemTime) -> Result<(), EnterpriseExchangeError> {
+        if now < self.checked_at || now >= self.expires_at {
+            return Err(EnterpriseExchangeError::SubjectMappingRejected(
+                EnterpriseIdentityError::TokenTimeInvalid,
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Admitted final enterprise access-token grant paired with its required
+/// same-flow subject mapping and sealed resource-bound bearer conversion.
 pub struct EnterpriseBoundAccessToken {
     response: EnterpriseAccessTokenResponse,
     profile: EnterpriseProfile,
+    subject_binding: EnterpriseSubjectBinding,
     reservation: IdentityAssertionExchangeGuard,
     received_at: SystemTime,
     expires_at_monotonic: Instant,
@@ -806,6 +875,11 @@ impl EnterpriseBoundAccessToken {
     #[must_use]
     pub fn response(&self) -> &EnterpriseAccessTokenResponse {
         &self.response
+    }
+
+    /// The reviewed mapping actually enforced before resource-AS dispatch.
+    pub fn subject_binding(&self) -> &EnterpriseSubjectBinding {
+        &self.subject_binding
     }
 
     /// Consumes an exchanged grant into a policy-owned native HTTP credential.
@@ -827,7 +901,7 @@ impl EnterpriseBoundAccessToken {
     ) -> Result<BoundBearerCredential, super::http::EnterpriseHttpPolicyError> {
         use super::http::EnterpriseHttpPolicyError;
 
-        policy.admit(&self.profile)?;
+        policy.admit(&self.profile, self.subject_binding.snapshot())?;
         let credential = self
             .into_guarded_bearer_credential(now_monotonic, received_at_wall)
             .map_err(|_| EnterpriseHttpPolicyError::CredentialUnavailable)?;
@@ -875,6 +949,7 @@ impl EnterpriseBoundAccessToken {
         if received_at_wall < self.received_at || Instant::now() >= self.expires_at_monotonic {
             return Err(EnterpriseExchangeError::CredentialBindingFailed);
         }
+        self.subject_binding.check(received_at_wall)?;
         let ttl = self
             .response
             .expires_at
@@ -936,7 +1011,9 @@ struct ExchangeDriverInner {
 /// 2. RFC 8693 (`token-exchange`) at the IdP token endpoint consumes
 ///    `ReservedIdentityAssertion` and produces `EnterpriseExchangedIdJag`.
 /// 3. RFC 7523 (`jwt-bearer`) at the Resource AS token endpoint consumes
-///    `EnterpriseExchangedIdJag` and produces `EnterpriseBoundAccessToken`.
+///    `EnterpriseExchangedIdJag` only after its original OIDC identity and
+///    returned ID-JAG match a preexisting row in the expected reviewed identity
+///    snapshot, then produces `EnterpriseBoundAccessToken`.
 ///
 /// Enforces single-flight execution, bounded deadlines, zero HTTP redirects,
 /// strict peer provenance verification, exact per-role client authentication
@@ -1197,6 +1274,7 @@ impl EnterpriseExchangeDriver {
                 EnterpriseResponseOutcome::Success {
                     value: EnterpriseExchangedIdJag {
                         response: value,
+                        identity: assertion.identity,
                         reservation,
                         expires_at_monotonic,
                     },
@@ -1220,10 +1298,20 @@ impl EnterpriseExchangeDriver {
     /// registered authentication representation. Its scope/resource authority
     /// remains in the signed assertion and response checks, never extra form
     /// fields. `received_at` is sampled at entry and advanced by elapsed time.
+    ///
+    /// The mapping must preexist in the independently selected current snapshot.
+    /// It joins the original stage-one OIDC facts to this exact returned ID-JAG;
+    /// equal subject text alone grants nothing and unequal pairwise subjects are
+    /// supported only through the reviewed row. Lookup precedes secret access,
+    /// form creation and HTTP effects. All outcomes consume the assertion owner
+    /// and retain its durable replay tombstone. The resulting grant and its
+    /// later credential conversions cannot outlive this reviewed binding.
     pub async fn exchange_id_jag_for_access_token(
         &self,
         cx: &Cx,
         exchanged: EnterpriseExchangedIdJag,
+        mappings: &EnterpriseSubjectMappingTable,
+        expected_snapshot: &EnterpriseIdentitySnapshotKey,
         resource_as_client_secret: &EnterpriseClientSecret,
         received_at: SystemTime,
     ) -> Result<
@@ -1238,6 +1326,7 @@ impl EnterpriseExchangeDriver {
         let profile = &self.inner.profile;
         let EnterpriseExchangedIdJag {
             response: id_jag,
+            identity,
             reservation,
             expires_at_monotonic,
         } = exchanged;
@@ -1249,7 +1338,31 @@ impl EnterpriseExchangeDriver {
         }
         let input_deadline = clock
             .input_deadline(id_jag.received_at, id_jag.effective_expires_at)?
-            .min(expires_at_monotonic);
+            .min(expires_at_monotonic)
+            .min(reservation.identity_deadline())
+            .min(mappings.review_deadline());
+        let checked_at = clock.wall_now()?;
+        let subject_binding = {
+            let resolved = mappings
+                .resolve(
+                    profile,
+                    &identity,
+                    id_jag.assertion(),
+                    expected_snapshot,
+                    checked_at,
+                )
+                .map_err(EnterpriseExchangeError::SubjectMappingRejected)?;
+            EnterpriseSubjectBinding {
+                local_subject: resolved.local_subject().clone(),
+                snapshot: resolved.snapshot().clone(),
+                oidc_digest: resolved.oidc_digest(),
+                id_jag_digest: resolved.id_jag_digest(),
+                binding_digest: resolved.binding_digest(),
+                checked_at: clock.wall,
+                expires_at: resolved.expires_at().min(id_jag.effective_expires_at),
+            }
+        };
+        let input_deadline = input_deadline.min(clock.deadline(subject_binding.expires_at)?);
         let deadline = ExchangeDeadline::new(
             &admitted,
             &clock,
@@ -1274,7 +1387,10 @@ impl EnterpriseExchangeDriver {
                 &request,
                 deadline,
                 Arc::clone(&permit),
-                || reservation.check().map_err(map_reservation_error),
+                || {
+                    reservation.check().map_err(map_reservation_error)?;
+                    subject_binding.check(clock.wall_now()?)
+                },
             )
             .await?;
         let observation = EnterpriseExchangeObservation {
@@ -1295,9 +1411,11 @@ impl EnterpriseExchangeDriver {
                 .map_err(EnterpriseExchangeError::ResponseRejected)
         })?;
         reservation.check().map_err(map_reservation_error)?;
+        subject_binding.check(clock.wall_now()?)?;
         let mapped = match outcome {
-            EnterpriseResponseOutcome::Success { value, cache } => {
-                let expires_at_monotonic = clock.deadline(value.expires_at)?;
+            EnterpriseResponseOutcome::Success { mut value, cache } => {
+                value.expires_at = value.expires_at.min(subject_binding.expires_at);
+                let expires_at_monotonic = clock.deadline(value.expires_at)?.min(input_deadline);
                 if Instant::now() >= expires_at_monotonic {
                     return Err(EnterpriseExchangeError::TimedOut);
                 }
@@ -1305,6 +1423,7 @@ impl EnterpriseExchangeDriver {
                     value: EnterpriseBoundAccessToken {
                         response: value,
                         profile: profile.clone(),
+                        subject_binding,
                         reservation,
                         received_at: clock.wall,
                         expires_at_monotonic,

@@ -2,6 +2,14 @@
 //! Only public key material and compact signatures are retained here.
 
 use super::*;
+use crate::http_auth::enterprise::identity::{
+    EnterpriseClientIdModel, EnterpriseGlobalClientRegistration, EnterpriseIdentityConfiguration,
+    EnterpriseIdentitySnapshotConfiguration, EnterpriseIdentityTrustDomains,
+    EnterpriseIdpTenancyConfiguration, EnterpriseOidcRelyingPartyConfiguration,
+    EnterpriseOidcSubjectType, EnterpriseResourceAsTenancyConfiguration,
+    EnterpriseTenantRelationshipConfiguration, PreexistingEnterpriseSubjectMapping,
+    ResourceAsIdpRelyingPartyConfiguration,
+};
 use crate::http_auth::enterprise::oidc::tests::{
     grant_for_exchange, token_body as oidc_token_body,
 };
@@ -138,6 +146,80 @@ fn profile_for_http_resource(
     EnterpriseProfile::from_documents(cfg, &docs[0], &docs[1], &docs[2], &docs[3], &docs[4])
         .unwrap()
 }
+fn subject_configuration(profile: &EnterpriseProfile) -> EnterpriseIdentityConfiguration {
+    EnterpriseIdentityConfiguration {
+        snapshot: EnterpriseIdentitySnapshotConfiguration {
+            id: "reviewed-directory".into(),
+            generation: 41,
+            reviewed_at: now(),
+            review_expires_at: now() + Duration::from_secs(600),
+        },
+        profile_policy_generation: profile.policy_generation(),
+        trust_domains: EnterpriseIdentityTrustDomains {
+            client: "idp-organization".into(),
+            idp: "idp-organization".into(),
+            resource_as: "resource-organization".into(),
+        },
+        idp_tenancy: EnterpriseIdpTenancyConfiguration::SingleTenant,
+        resource_as_tenancy: EnterpriseResourceAsTenancyConfiguration::SingleTenant {
+            identity: "resource-single".into(),
+        },
+        client_id_model: EnterpriseClientIdModel::Global {
+            registrations: vec![EnterpriseGlobalClientRegistration {
+                client_id: profile.resource_as_client_id().into(),
+                resource_as_tenant: "resource-single".into(),
+                registration_generation: profile.resource_as_registration_generation(),
+            }],
+        },
+        client_relying_party: EnterpriseOidcRelyingPartyConfiguration {
+            issuer: profile.idp_issuer().into(),
+            tenant: None,
+            client_id: profile.idp_client_id().into(),
+            registration_generation: profile.idp_registration_generation(),
+            subject_type: EnterpriseOidcSubjectType::Pairwise,
+            redirect_uris: vec!["https://client.example/callback".into()],
+        },
+        resource_as_relying_party: ResourceAsIdpRelyingPartyConfiguration {
+            relying_party: EnterpriseOidcRelyingPartyConfiguration {
+                issuer: profile.idp_issuer().into(),
+                tenant: None,
+                client_id: "resource-as-sso-rp".into(),
+                registration_generation: 51,
+                subject_type: EnterpriseOidcSubjectType::Pairwise,
+                redirect_uris: vec!["https://as.example/oidc/callback".into()],
+            },
+            resource_as_issuer: profile.resource_as_issuer().into(),
+            resource_as_tenant: "resource-single".into(),
+        },
+        tenant_relationship: EnterpriseTenantRelationshipConfiguration {
+            idp_tenant: None,
+            resource_as_tenant: "resource-single".into(),
+            generation: 52,
+        },
+        cross_domain_binding_generation: 53,
+        subject_continuity_generation: 54,
+    }
+}
+
+fn subject_mapping() -> PreexistingEnterpriseSubjectMapping {
+    PreexistingEnterpriseSubjectMapping {
+        client_subject: "client-facing".into(),
+        resource_subject: "resource-facing".into(),
+        resource_audience_subject: None,
+        local_subject: "preexisting-local-account".into(),
+    }
+}
+
+fn subject_mappings(profile: &EnterpriseProfile) -> EnterpriseSubjectMappingTable {
+    EnterpriseSubjectMappingTable::from_trusted_configuration(
+        profile,
+        subject_configuration(profile),
+        vec![subject_mapping()],
+        now(),
+    )
+    .unwrap()
+}
+
 fn keys() -> (OidcVerificationKeys, IdJagVerificationKeys) {
     let jwks = serde_json::to_vec(&fixtures()["jwks"]).unwrap();
     (
@@ -948,6 +1030,7 @@ fn enterprise_oidc_code_redemption_reaches_bearer_through_both_confidential_meth
             assert_eq!(identity.identity().subject().as_str(), "client-subject");
             assert_eq!(identity.identity().client_id(), "native-idp");
             assert_eq!(identity.identity().generation(), 21);
+            let original_oidc_digest = identity.identity().compact_digest();
             let replay = ExchangeReplayFixture::new(&cx);
             let reserved = replay
                 .reserve(&cx, &selected, identity, now() + Duration::from_secs(1))
@@ -965,16 +1048,32 @@ fn enterprise_oidc_code_redemption_reaches_bearer_through_both_confidential_meth
                 )
                 .await
                 .unwrap();
+            let exchanged = success(outcome);
+            assert_eq!(exchanged.identity().compact_digest(), original_oidc_digest);
+            let mut row = subject_mapping();
+            row.client_subject = "client-subject".into();
+            let mappings = EnterpriseSubjectMappingTable::from_trusted_configuration(
+                &selected,
+                subject_configuration(&selected),
+                vec![row],
+                now(),
+            )
+            .unwrap();
             let (outcome, _) = driver
                 .exchange_id_jag_for_access_token(
                     &cx,
-                    success(outcome),
+                    exchanged,
+                    &mappings,
+                    mappings.snapshot(),
                     &secret,
                     now() + Duration::from_secs(2),
                 )
                 .await
                 .unwrap();
-            let bearer = success(outcome)
+            let token = success(outcome);
+            assert_eq!(token.subject_binding().oidc_digest(), original_oidc_digest);
+            assert_eq!(token.subject_binding().snapshot(), mappings.snapshot());
+            let bearer = token
                 .into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(3))
                 .unwrap();
             assert_eq!(
@@ -1753,10 +1852,13 @@ fn enterprise_exchange_driver_full_two_stage_flow_positive_and_planted_negatives
         let id_jag = success(jag_outcome);
         assert_eq!(id_jag.granted_scopes(), ["read"]);
 
+        let mappings = subject_mappings(&selected);
         let (token_outcome, token_obs) = driver
             .exchange_id_jag_for_access_token(
                 &cx,
                 id_jag,
+                &mappings,
+                mappings.snapshot(),
                 &as_secret,
                 now() + Duration::from_secs(1),
             )
@@ -2001,6 +2103,271 @@ async fn exchanged_for_test(
     (success(outcome), replay)
 }
 
+/// These tests exercise the production driver and real signed assertions with
+/// an explicitly scripted external POST boundary, not a live IdP attestation.
+#[test]
+fn enterprise_exchange_requires_reviewed_pairwise_subject_binding_before_redemption() {
+    let selected = profile(&["read"]);
+    let secret = EnterpriseClientSecret::try_new("subject-gate-resource-secret").unwrap();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        for wrong_resource_subject in [false, true] {
+            let (exchanged, replay) = exchanged_for_test(&cx, &selected).await;
+            let oidc_digest = exchanged.identity().compact_digest();
+            let id_jag_digest = exchanged.response().assertion().compact_digest();
+            assert_eq!(
+                oidc_digest,
+                identity_for_exchange(&selected).identity().compact_digest()
+            );
+            assert_ne!(
+                exchanged.identity().subject().as_str(),
+                exchanged.response().assertion().subject().as_str()
+            );
+            let original_expiry = exchanged.effective_expires_at();
+            let original_jag_deadline = exchanged.expires_at_monotonic;
+            let original_oidc_deadline = exchanged.reservation.identity_deadline();
+            let mut row = subject_mapping();
+            if wrong_resource_subject {
+                // The signed inputs, profile and all other row fields stay the
+                // same. No equality-based or just-in-time mapping is allowed.
+                row.resource_subject = "different-resource-subject".into();
+            }
+            let mappings = EnterpriseSubjectMappingTable::from_trusted_configuration(
+                &selected,
+                subject_configuration(&selected),
+                vec![row],
+                now(),
+            )
+            .unwrap();
+            let original_snapshot = mappings.snapshot().clone();
+            let expected_binding = if wrong_resource_subject {
+                None
+            } else {
+                Some(
+                    mappings
+                        .resolve(
+                            &selected,
+                            exchanged.identity(),
+                            exchanged.response().assertion(),
+                            &original_snapshot,
+                            now(),
+                        )
+                        .unwrap()
+                        .binding_digest(),
+                )
+            };
+            let fetcher = test_fetcher();
+            let poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+                "as.example",
+                fetcher.root_identity(),
+                serde_json::to_vec(&access_body()).unwrap(),
+            ))]);
+            let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+            let result = driver
+                .exchange_id_jag_for_access_token(
+                    &cx,
+                    exchanged,
+                    &mappings,
+                    &original_snapshot,
+                    &secret,
+                    now() + Duration::from_secs(1),
+                )
+                .await;
+            if wrong_resource_subject {
+                assert_eq!(
+                    result.err(),
+                    Some(EnterpriseExchangeError::SubjectMappingRejected(
+                        EnterpriseIdentityError::MappingUnavailable,
+                    ))
+                );
+                assert!(poster.take_recorded().is_empty());
+                assert_eq!(poster.responses.lock().unwrap().len(), 1);
+            } else {
+                let (outcome, _) = result.unwrap();
+                let token = success(outcome);
+                let binding = token.subject_binding();
+                assert_eq!(binding.local_subject().as_str(), "preexisting-local-account");
+                assert_eq!(binding.snapshot(), &original_snapshot);
+                assert_eq!(binding.oidc_digest(), oidc_digest);
+                assert_eq!(binding.id_jag_digest(), id_jag_digest);
+                assert_eq!(Some(binding.binding_digest()), expected_binding);
+                assert_eq!(binding.expires_at(), original_expiry);
+                assert_eq!(token.response().expires_at(), original_expiry);
+                assert!(token.expires_at_monotonic <= original_jag_deadline);
+                assert!(token.expires_at_monotonic <= original_oidc_deadline);
+                assert!(token.expires_at_monotonic <= mappings.review_deadline());
+                let credential = token
+                    .into_bound_bearer_credential(
+                        Instant::now(),
+                        now() + Duration::from_secs(2),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    credential
+                        .authorization_for_target(
+                            &CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap()
+                        )
+                        .as_deref(),
+                    Some("Bearer final-opaque-token")
+                );
+                let recorded = poster.take_recorded();
+                assert_eq!(recorded.len(), 1);
+                assert_eq!(recorded[0].host, "as.example");
+            }
+            assert_eq!(mappings.snapshot(), &original_snapshot);
+            assert_eq!(replay.reserved_aliases(), 2);
+            assert!(!driver.inner.busy.load(Ordering::Acquire));
+        }
+    });
+}
+
+#[test]
+fn enterprise_exchange_refuses_missing_stale_or_noncurrent_mapping_before_post() {
+    let selected = profile(&["read"]);
+    let secret = EnterpriseClientSecret::try_new("subject-gate-resource-secret").unwrap();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        for expected_error in [
+            EnterpriseIdentityError::MappingUnavailable,
+            EnterpriseIdentityError::SnapshotMismatch,
+            EnterpriseIdentityError::ExpiredSnapshot,
+        ] {
+            let (exchanged, replay) = exchanged_for_test(&cx, &selected).await;
+            let mut configuration = subject_configuration(&selected);
+            let mut rows = vec![subject_mapping()];
+            if expected_error == EnterpriseIdentityError::MappingUnavailable {
+                rows.clear();
+            }
+            if expected_error == EnterpriseIdentityError::ExpiredSnapshot {
+                configuration.snapshot.review_expires_at = now() + Duration::from_secs(1);
+            }
+            let mappings = EnterpriseSubjectMappingTable::from_trusted_configuration(
+                &selected,
+                configuration,
+                rows,
+                now(),
+            )
+            .unwrap();
+            let original_snapshot = mappings.snapshot().clone();
+            let expected_snapshot = if expected_error == EnterpriseIdentityError::SnapshotMismatch {
+                let mut current = subject_configuration(&selected);
+                current.snapshot.generation = 42;
+                EnterpriseSubjectMappingTable::from_trusted_configuration(
+                    &selected,
+                    current,
+                    vec![subject_mapping()],
+                    now(),
+                )
+                .unwrap()
+                .snapshot()
+                .clone()
+            } else {
+                original_snapshot.clone()
+            };
+            let fetcher = test_fetcher();
+            let poster = ScriptedExchangePoster::new(vec![Ok(ok_exchange_response(
+                "as.example",
+                fetcher.root_identity(),
+                serde_json::to_vec(&access_body()).unwrap(),
+            ))]);
+            let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+            assert_eq!(
+                driver
+                    .exchange_id_jag_for_access_token(
+                        &cx,
+                        exchanged,
+                        &mappings,
+                        &expected_snapshot,
+                        &secret,
+                        now() + Duration::from_secs(2),
+                    )
+                    .await
+                    .err(),
+                Some(EnterpriseExchangeError::SubjectMappingRejected(expected_error))
+            );
+            assert!(poster.take_recorded().is_empty());
+            assert_eq!(poster.responses.lock().unwrap().len(), 1);
+            assert_eq!(mappings.snapshot(), &original_snapshot);
+            assert_eq!(replay.reserved_aliases(), 2);
+            assert!(!driver.inner.busy.load(Ordering::Acquire));
+        }
+    });
+}
+
+#[test]
+fn enterprise_exchange_preserves_original_mapping_review_ceiling_after_dispatch() {
+    let selected = profile(&["read"]);
+    let secret = EnterpriseClientSecret::try_new("subject-gate-resource-secret").unwrap();
+    let clock = Arc::new(asupersync::time::VirtualClock::new());
+    let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+        .with_timer_driver(timer)
+        .build()
+        .unwrap();
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    let poster = Arc::new(ParkedCodePoster {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        held_lifetime: std::sync::Mutex::new(None),
+    });
+    let fetch_policy = fastmcp_transport::GuardedHttpFetchPolicy::new(
+        MAX_ENTERPRISE_EXCHANGE_RESPONSE_BYTES,
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+        "test-root-rev-1",
+    )
+    .unwrap();
+    let mut driver = EnterpriseExchangeDriver::new(
+        selected.clone(),
+        GuardedHttpFetcher::new(fetch_policy).unwrap(),
+        EnterpriseResponsePolicy::default(),
+    )
+    .unwrap();
+    Arc::get_mut(&mut driver.inner).unwrap().test_post = Some(poster.clone());
+    runtime.block_on(async {
+        let (exchanged, replay) = exchanged_for_test(&cx, &selected).await;
+        let mut configuration = subject_configuration(&selected);
+        configuration.snapshot.review_expires_at = now() + Duration::from_secs(60);
+        // Only ten seconds remained when this reviewed table was imported.
+        // A later caller's older wall sample must not recreate sixty seconds.
+        let mappings = EnterpriseSubjectMappingTable::from_trusted_configuration(
+            &selected,
+            configuration,
+            vec![subject_mapping()],
+            now() + Duration::from_secs(50),
+        )
+        .unwrap();
+        let snapshot = mappings.snapshot().clone();
+        let mut exchange = std::pin::pin!(driver.exchange_id_jag_for_access_token(
+            &cx,
+            exchanged,
+            &mappings,
+            &snapshot,
+            &secret,
+            now() + Duration::from_secs(1),
+        ));
+        poll_fn(|task| {
+            assert!(exchange.as_mut().poll(task).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(poster.calls.load(Ordering::SeqCst), 1);
+        clock.advance(11_000_000_000);
+        let result = poll_fn(|task| match exchange.as_mut().poll(task) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => panic!("original review deadline must stop the pending redemption"),
+        })
+        .await;
+        assert_eq!(result.err(), Some(EnterpriseExchangeError::TimedOut));
+        assert_eq!(mappings.snapshot(), &snapshot);
+        assert_eq!(replay.reserved_aliases(), 2);
+    });
+    assert_eq!(poster.calls.load(Ordering::SeqCst), 1);
+    assert!(driver.inner.busy.load(Ordering::Acquire));
+    drop(poster.held_lifetime.lock().unwrap().take());
+    assert!(!driver.inner.busy.load(Ordering::Acquire));
+}
+
 #[test]
 fn enterprise_exchange_preflight_binds_profile_keys_and_tenancy_before_post() {
     let selected = profile(&["read"]);
@@ -2078,10 +2445,13 @@ fn enterprise_exchange_preflight_binds_profile_keys_and_tenancy_before_post() {
         let poster = ScriptedExchangePoster::new(vec![]);
         let (driver, _) = driver_with_poster(changed, Arc::clone(&poster));
         let (original, _) = exchanged_for_test(&cx, &selected).await;
+        let mappings = subject_mappings(&selected);
         let result = driver
             .exchange_id_jag_for_access_token(
                 &cx,
                 original,
+                &mappings,
+                mappings.snapshot(),
                 &secret,
                 now() + Duration::from_secs(1),
             )
@@ -2126,8 +2496,16 @@ fn enterprise_exchange_preflight_checks_input_lifetime_and_singleflight_before_p
             } else {
                 now() - Duration::from_secs(1)
             };
+            let mappings = subject_mappings(&selected);
             let result = driver
-                .exchange_id_jag_for_access_token(&cx, original, &secret, time)
+                .exchange_id_jag_for_access_token(
+                    &cx,
+                    original,
+                    &mappings,
+                    mappings.snapshot(),
+                    &secret,
+                    time,
+                )
                 .await;
             assert!(matches!(result, Err(error) if error == invalid_lifetime));
         }
@@ -2178,8 +2556,16 @@ fn enterprise_exchange_bearer_conversion_cannot_restart_or_backdate_lifetime() {
         let cx = Cx::current().unwrap();
         let (original, _) = exchanged_for_test(&cx, &selected).await;
         let stage_two_at = now() + Duration::from_secs(1);
+        let mappings = subject_mappings(&selected);
         let (outcome, _) = driver
-            .exchange_id_jag_for_access_token(&cx, original, &secret, stage_two_at)
+            .exchange_id_jag_for_access_token(
+                &cx,
+                original,
+                &mappings,
+                mappings.snapshot(),
+                &secret,
+                stage_two_at,
+            )
             .await
             .unwrap();
         let token = success(outcome);
@@ -2191,7 +2577,14 @@ fn enterprise_exchange_bearer_conversion_cannot_restart_or_backdate_lifetime() {
 
         let (original, _) = exchanged_for_test(&cx, &selected).await;
         let (outcome, _) = driver
-            .exchange_id_jag_for_access_token(&cx, original, &secret, stage_two_at)
+            .exchange_id_jag_for_access_token(
+                &cx,
+                original,
+                &mappings,
+                mappings.snapshot(),
+                &secret,
+                stage_two_at,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -2293,12 +2686,15 @@ fn enterprise_exchange_restore_quarantine_fences_each_disclosure_and_credential_
         assert_eq!(replay.reserved_aliases(), 2);
 
         let (exchanged, replay) = exchanged_for_test(&cx, &selected).await;
+        let mappings = subject_mappings(&selected);
         replay.quarantine(&cx).await;
         assert!(matches!(
             driver
                 .exchange_id_jag_for_access_token(
                     &cx,
                     exchanged,
+                    &mappings,
+                    mappings.snapshot(),
                     &secret,
                     now() + Duration::from_secs(1),
                 )
@@ -2320,6 +2716,8 @@ fn enterprise_exchange_restore_quarantine_fences_each_disclosure_and_credential_
             .exchange_id_jag_for_access_token(
                 &cx,
                 exchanged,
+                &mappings,
+                mappings.snapshot(),
                 &secret,
                 now() + Duration::from_secs(1),
             )
@@ -2353,7 +2751,8 @@ pub(in crate::http_auth) fn http_policy_credential_for_test(
         30,
     );
     let expiry = Instant::now() + Duration::from_secs(90);
-    let owner = EnterpriseHttpPolicy::new(selected, expiry, expiry).unwrap();
+    let snapshot = subject_mappings(&selected).snapshot().clone();
+    let owner = EnterpriseHttpPolicy::new(selected, snapshot, expiry, expiry).unwrap();
     let mut credential =
         BoundBearerCredential::bind_with_expiry(resource.clone(), "enterprise-http-secret", expiry)
             .unwrap()
@@ -2557,12 +2956,23 @@ fn enterprise_http_policy_rotation_and_drop_revoke_prepared_requests_and_clones(
     let fresh = Instant::now() + Duration::from_secs(90);
     for (idp_deadline, as_deadline) in [(Instant::now(), fresh), (fresh, Instant::now())] {
         assert_eq!(
-            EnterpriseHttpPolicy::new(owner.profile().clone(), idp_deadline, as_deadline).err(),
+            EnterpriseHttpPolicy::new(
+                owner.profile().clone(),
+                owner.identity_snapshot().clone(),
+                idp_deadline,
+                as_deadline,
+            )
+            .err(),
             Some(EnterpriseHttpPolicyError::StaleMetadata)
         );
     }
     assert_eq!(
-        owner.replace(owner.profile().clone(), fresh, fresh),
+        owner.replace(
+            owner.profile().clone(),
+            owner.identity_snapshot().clone(),
+            fresh,
+            fresh,
+        ),
         Err(EnterpriseHttpPolicyError::GenerationRollback)
     );
     assert!(has_enterprise_header(&request));
@@ -2573,12 +2983,59 @@ fn enterprise_http_policy_rotation_and_drop_revoke_prepared_requests_and_clones(
         resource.as_str(),
         31,
     );
+    let original_snapshot = owner.identity_snapshot().clone();
+    for generation in [40, 41] {
+        let mut configuration = subject_configuration(&replacement);
+        configuration.snapshot.generation = generation;
+        let rejected = EnterpriseSubjectMappingTable::from_trusted_configuration(
+            &replacement,
+            configuration,
+            vec![subject_mapping()],
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            owner.replace(
+                replacement.clone(),
+                rejected.snapshot().clone(),
+                fresh,
+                fresh,
+            ),
+            Err(EnterpriseHttpPolicyError::GenerationRollback)
+        );
+        assert_eq!(owner.identity_snapshot(), &original_snapshot);
+        assert_eq!(owner.profile().policy_generation(), 30);
+        assert!(has_enterprise_header(&request));
+    }
+    let mut configuration = subject_configuration(&replacement);
+    configuration.snapshot.generation = 42;
+    let replacement_mappings = EnterpriseSubjectMappingTable::from_trusted_configuration(
+        &replacement,
+        configuration,
+        vec![subject_mapping()],
+        now(),
+    )
+    .unwrap();
     assert_eq!(
-        owner.replace(replacement.clone(), Instant::now(), fresh),
+        owner.replace(
+            replacement.clone(),
+            replacement_mappings.snapshot().clone(),
+            Instant::now(),
+            fresh,
+        ),
         Err(EnterpriseHttpPolicyError::StaleMetadata)
     );
+    assert_eq!(owner.identity_snapshot(), &original_snapshot);
     assert!(has_enterprise_header(&request));
-    owner.replace(replacement, fresh, fresh).unwrap();
+    owner
+        .replace(
+            replacement,
+            replacement_mappings.snapshot().clone(),
+            fresh,
+            fresh,
+        )
+        .unwrap();
+    assert_eq!(owner.identity_snapshot(), replacement_mappings.snapshot());
     assert!(credential.is_revoked());
     assert!(!has_enterprise_header(&request));
 
@@ -2607,9 +3064,16 @@ fn enterprise_http_policy_rotation_and_drop_revoke_prepared_requests_and_clones(
         resource.as_str(),
         u64::MAX,
     );
-    let mut exhausted = EnterpriseHttpPolicy::new(exhausted_profile, fresh, fresh).unwrap();
+    let exhausted_snapshot = subject_mappings(&exhausted_profile).snapshot().clone();
+    let mut exhausted =
+        EnterpriseHttpPolicy::new(exhausted_profile, exhausted_snapshot, fresh, fresh).unwrap();
     assert_eq!(
-        exhausted.replace(profile(&["read"]), fresh, fresh),
+        exhausted.replace(
+            profile(&["read"]),
+            exhausted.identity_snapshot().clone(),
+            fresh,
+            fresh,
+        ),
         Err(EnterpriseHttpPolicyError::GenerationRollback)
     );
 }
@@ -2636,8 +3100,16 @@ async fn final_token_and_replay_for_http_binding(
     ))]);
     let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
     let secret = EnterpriseClientSecret::try_new("fixture-resource-secret").unwrap();
+    let mappings = subject_mappings(selected);
     let (outcome, _) = driver
-        .exchange_id_jag_for_access_token(cx, exchanged, &secret, now())
+        .exchange_id_jag_for_access_token(
+            cx,
+            exchanged,
+            &mappings,
+            mappings.snapshot(),
+            &secret,
+            now() + Duration::from_secs(1),
+        )
         .await
         .unwrap();
     assert_eq!(poster.take_recorded().len(), 1);
@@ -2669,7 +3141,7 @@ pub(in crate::http_auth) async fn http_exchange_credential_for_test(
 ) -> HttpExchangeCredentialFixture {
     let (token, replay) = final_token_and_replay_for_http_binding(cx, &profile(&["read"])).await;
     let mut credential = token
-        .into_bound_bearer_credential(Instant::now(), now())
+        .into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(1))
         .unwrap();
     credential.resource = resource.clone();
     assert!(!credential.requires_enterprise_declaration());
@@ -2687,7 +3159,7 @@ fn enterprise_exchange_bearer_conversion_retains_restore_fence_across_clones() {
         let cx = Cx::current().unwrap();
         let (token, replay) = final_token_and_replay_for_http_binding(&cx, &selected).await;
         let original = token
-            .into_bound_bearer_credential(Instant::now(), now())
+            .into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(1))
             .unwrap();
         let sibling = original.clone();
         let owner = fastmcp_core::McpRequestCancellation::new();
@@ -2703,7 +3175,7 @@ fn enterprise_exchange_bearer_conversion_retains_restore_fence_across_clones() {
         let (other_token, other_replay) =
             final_token_and_replay_for_http_binding(&cx, &selected).await;
         let independent = other_token
-            .into_bound_bearer_credential(Instant::now(), now())
+            .into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(1))
             .unwrap();
         for credential in [&sibling, &owned, &independent] {
             assert!(!credential.is_revoked());
@@ -2770,7 +3242,7 @@ fn enterprise_exchange_bearer_conversion_preserves_owner_isolation_and_redaction
         let (token, replay) = final_token_and_replay_for_http_binding(&cx, &selected).await;
         assert!(!format!("{token:?}").contains("final-opaque-token"));
         let credential = token
-            .into_bound_bearer_credential(Instant::now(), now())
+            .into_bound_bearer_credential(Instant::now(), now() + Duration::from_secs(1))
             .unwrap();
         let owner = fastmcp_core::McpRequestCancellation::new();
         let owned = credential.for_owner(&owner).unwrap();
@@ -2808,10 +3280,25 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
         let cx = Cx::current().unwrap();
         let idp_expiry = Instant::now() + Duration::from_secs(20);
         let as_expiry = idp_expiry + Duration::from_secs(10);
-        let owner = EnterpriseHttpPolicy::new(selected.clone(), idp_expiry, as_expiry).unwrap();
+        let current_snapshot = subject_mappings(&selected).snapshot().clone();
+        let owner = EnterpriseHttpPolicy::new(
+            selected.clone(),
+            current_snapshot.clone(),
+            idp_expiry,
+            as_expiry,
+        )
+        .unwrap();
         let token = final_token_for_http_binding(&cx, &selected).await;
+        assert_eq!(token.subject_binding().snapshot(), &current_snapshot);
+        // Use the exact stage-two entry sample again: subsecond admission work
+        // must not turn this valid conversion into a wall-clock rollback.
+        assert_eq!(token.received_at, now() + Duration::from_secs(1));
         let credential = token
-            .into_http_credential(&owner, Instant::now() + Duration::from_hours(1), now())
+            .into_http_credential(
+                &owner,
+                Instant::now() + Duration::from_hours(1),
+                now() + Duration::from_secs(1),
+            )
             .unwrap();
         assert_eq!(credential.expires_at(), Some(idp_expiry));
         let request = enterprise_raw_request(
@@ -2842,16 +3329,56 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
                 31,
             ),
         ] {
-            let other_owner =
-                EnterpriseHttpPolicy::new(wrong_profile, idp_expiry, as_expiry).unwrap();
+            let other_snapshot = subject_mappings(&wrong_profile).snapshot().clone();
+            let other_owner = EnterpriseHttpPolicy::new(
+                wrong_profile,
+                other_snapshot,
+                idp_expiry,
+                as_expiry,
+            )
+            .unwrap();
             let token = final_token_for_http_binding(&cx, &selected).await;
             assert_eq!(
                 token
-                    .into_http_credential(&other_owner, Instant::now(), now())
+                    .into_http_credential(
+                        &other_owner,
+                        Instant::now(),
+                        now() + Duration::from_secs(1),
+                    )
                     .err(),
                 Some(EnterpriseHttpPolicyError::ProfileMismatch)
             );
         }
+        let mut different_row = subject_mapping();
+        different_row.local_subject = "another-preexisting-local-account".into();
+        let other_mappings = EnterpriseSubjectMappingTable::from_trusted_configuration(
+            &selected,
+            subject_configuration(&selected),
+            vec![different_row],
+            now(),
+        )
+        .unwrap();
+        let other_owner = EnterpriseHttpPolicy::new(
+            selected.clone(),
+            other_mappings.snapshot().clone(),
+            idp_expiry,
+            as_expiry,
+        )
+        .unwrap();
+        let token = final_token_for_http_binding(&cx, &selected).await;
+        assert_eq!(
+            token
+                .into_http_credential(
+                    &other_owner,
+                    Instant::now(),
+                    now() + Duration::from_secs(1),
+                )
+                .err(),
+            Some(EnterpriseHttpPolicyError::IdentitySnapshotMismatch)
+        );
+        assert!(has_enterprise_header(&request));
+        assert_eq!(owner.identity_snapshot(), &current_snapshot);
+
         let token = final_token_for_http_binding(&cx, &selected).await;
         assert_eq!(
             token
@@ -2863,7 +3390,11 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
         expired.expires_at_monotonic = Instant::now();
         assert_eq!(
             expired
-                .into_http_credential(&owner, Instant::now() - Duration::from_secs(60), now())
+                .into_http_credential(
+                    &owner,
+                    Instant::now() - Duration::from_secs(60),
+                    now() + Duration::from_secs(1),
+                )
                 .err(),
             Some(EnterpriseHttpPolicyError::CredentialUnavailable)
         );
@@ -2871,7 +3402,11 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
         replay.quarantine(&cx).await;
         assert_eq!(
             token
-                .into_http_credential(&owner, Instant::now(), now())
+                .into_http_credential(
+                    &owner,
+                    Instant::now(),
+                    now() + Duration::from_secs(1),
+                )
                 .err(),
             Some(EnterpriseHttpPolicyError::CredentialUnavailable)
         );
@@ -2882,7 +3417,11 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
         );
         let (token, replay) = final_token_and_replay_for_http_binding(&cx, &selected).await;
         let guarded = token
-            .into_http_credential(&owner, Instant::now(), now())
+            .into_http_credential(
+                &owner,
+                Instant::now(),
+                now() + Duration::from_secs(1),
+            )
             .unwrap();
         let guarded_request = enterprise_raw_request(
             "https://mcp.example/mcp",
@@ -2914,7 +3453,11 @@ fn enterprise_http_binding_retains_exchange_profile_scope_and_original_deadlines
         let token = final_token_for_http_binding(&cx, &selected).await;
         assert_eq!(
             token
-                .into_http_credential(&owner, Instant::now(), now())
+                .into_http_credential(
+                    &owner,
+                    Instant::now(),
+                    now() + Duration::from_secs(1),
+                )
                 .err(),
             Some(EnterpriseHttpPolicyError::Revoked)
         );

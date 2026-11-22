@@ -88,7 +88,14 @@ fn profile_configuration() -> EnterpriseProfileConfiguration {
     }
 }
 fn admit_profile(configuration: EnterpriseProfileConfiguration) -> EnterpriseProfile {
-    let docs = [
+    admit_profile_with_document_change(configuration, None)
+}
+
+fn admit_profile_with_document_change(
+    configuration: EnterpriseProfileConfiguration,
+    changed_document: Option<usize>,
+) -> EnterpriseProfile {
+    let mut docs = [
         json!({
             "issuer":configuration.idp.issuer,
             "token_endpoint":configuration.idp.token_endpoint,
@@ -126,7 +133,13 @@ fn admit_profile(configuration: EnterpriseProfileConfiguration) -> EnterprisePro
             "grant_types":[JWT_BEARER_GRANT],
             "token_endpoint_auth_method":configuration.resource_as.authentication.as_str()
         }),
-    ].map(|doc| serde_json::to_vec(&doc).unwrap());
+    ]
+    .map(|doc| serde_json::to_vec(&doc).unwrap());
+    if let Some(index) = changed_document {
+        // A single admitted whitespace byte preserves every parsed field but
+        // changes the exact document identity retained by EnterpriseProfile.
+        docs[index].push(b' ');
+    }
     EnterpriseProfile::from_documents(
         configuration,
         &docs[0],
@@ -794,6 +807,187 @@ fn review_and_signed_expiry_boundaries_never_extend_a_resolved_identity() {
             .resolve(&profile, &oidc, &jag, table.snapshot(), at(ISSUED + 240))
             .unwrap_err(),
         EnterpriseIdentityError::TokenTimeInvalid
+    );
+}
+
+#[test]
+fn exact_metadata_documents_bind_snapshot_and_resolution() {
+    let original = profile();
+    let table = EnterpriseSubjectMappingTable::from_trusted_configuration(
+        &original,
+        configuration(&original),
+        vec![row()],
+        now(),
+    )
+    .unwrap();
+    let snapshot = table.snapshot().clone();
+    let (oidc, jag) = facts();
+    assert!(
+        table
+            .resolve(&original, &oidc, &jag, &snapshot, now())
+            .is_ok()
+    );
+    let repeated = EnterpriseSubjectMappingTable::from_trusted_configuration(
+        &original,
+        configuration(&original),
+        vec![row()],
+        now(),
+    )
+    .unwrap();
+    assert_eq!(repeated.snapshot(), &snapshot);
+
+    for index in 0..5 {
+        let changed = admit_profile_with_document_change(profile_configuration(), Some(index));
+        assert_ne!(changed, original);
+        assert_eq!(changed.requested_scopes(), original.requested_scopes());
+        let revised = EnterpriseSubjectMappingTable::from_trusted_configuration(
+            &changed,
+            configuration(&changed),
+            vec![row()],
+            now(),
+        )
+        .unwrap();
+        assert_ne!(revised.snapshot(), &snapshot);
+        assert_ne!(revised.snapshot().digest(), snapshot.digest());
+        assert_eq!(
+            table
+                .resolve(&changed, &oidc, &jag, &snapshot, now())
+                .err(),
+            Some(EnterpriseIdentityError::ProfileMismatch)
+        );
+        assert_eq!(
+            revised
+                .resolve(&changed, &oidc, &jag, &snapshot, now())
+                .err(),
+            Some(EnterpriseIdentityError::SnapshotMismatch)
+        );
+        let resolved = revised
+            .resolve(&changed, &oidc, &jag, revised.snapshot(), now())
+            .unwrap();
+        assert_eq!(resolved.local_subject().as_str(), "preexisting-local-account");
+        assert_eq!(table.snapshot(), &snapshot);
+    }
+    assert!(
+        table
+            .resolve(&original, &oidc, &jag, &snapshot, now())
+            .is_ok()
+    );
+}
+
+#[test]
+fn configured_scope_allowances_bind_snapshot_and_resolution() {
+    let original = profile();
+    let table = EnterpriseSubjectMappingTable::from_trusted_configuration(
+        &original,
+        configuration(&original),
+        vec![row()],
+        now(),
+    )
+    .unwrap();
+    let snapshot = table.snapshot().clone();
+    let (oidc, jag) = facts();
+    assert!(
+        table
+            .resolve(&original, &oidc, &jag, &snapshot, now())
+            .is_ok()
+    );
+
+    for role in 0..3 {
+        for reorder in [false, true] {
+            let mut configured = profile_configuration();
+            let allowance = match role {
+                0 => &mut configured.idp.scope_allowance,
+                1 => &mut configured.resource_as.scope_allowance,
+                _ => &mut configured.deployment_scope_allowance,
+            };
+            if reorder {
+                allowance.reverse();
+            } else {
+                allowance.retain(|scope| scope != "write");
+            }
+            let changed = admit_profile(configured);
+            assert_ne!(changed, original);
+            assert_eq!(changed.requested_scopes(), original.requested_scopes());
+            assert_eq!(changed.permits_oidc_openid(), original.permits_oidc_openid());
+            let revised = EnterpriseSubjectMappingTable::from_trusted_configuration(
+                &changed,
+                configuration(&changed),
+                vec![row()],
+                now(),
+            )
+            .unwrap();
+            assert_ne!(revised.snapshot(), &snapshot);
+            assert_ne!(revised.snapshot().digest(), snapshot.digest());
+            assert_eq!(
+                table
+                    .resolve(&changed, &oidc, &jag, &snapshot, now())
+                    .err(),
+                Some(EnterpriseIdentityError::ProfileMismatch)
+            );
+            assert_eq!(
+                revised
+                    .resolve(&changed, &oidc, &jag, &snapshot, now())
+                    .err(),
+                Some(EnterpriseIdentityError::SnapshotMismatch)
+            );
+            assert!(
+                revised
+                    .resolve(&changed, &oidc, &jag, revised.snapshot(), now())
+                    .is_ok()
+            );
+        }
+    }
+    assert_eq!(table.snapshot(), &snapshot);
+    assert!(
+        table
+            .resolve(&original, &oidc, &jag, &snapshot, now())
+            .is_ok()
+    );
+}
+
+#[test]
+fn imported_review_deadline_cannot_be_renewed_by_a_stale_wall_sample() {
+    let profile = profile();
+    let mut table = EnterpriseSubjectMappingTable::from_trusted_configuration(
+        &profile,
+        configuration(&profile),
+        vec![row()],
+        now(),
+    )
+    .unwrap();
+    let snapshot = table.snapshot().clone();
+    let original_deadline = table.review_deadline();
+    let (oidc, jag) = facts();
+    assert!(
+        table
+            .resolve(&profile, &oidc, &jag, &snapshot, now())
+            .is_ok()
+    );
+    assert_eq!(table.review_deadline(), original_deadline);
+
+    // Change only the original local deadline. The same signed inputs, wall
+    // sample and reviewed snapshot must not revive an expired imported owner.
+    table.review_expires_at_monotonic = Instant::now();
+    assert_eq!(
+        table
+            .resolve(&profile, &oidc, &jag, &snapshot, now())
+            .err(),
+        Some(EnterpriseIdentityError::ExpiredSnapshot)
+    );
+    assert_eq!(table.snapshot(), &snapshot);
+
+    let separately_imported = EnterpriseSubjectMappingTable::from_trusted_configuration(
+        &profile,
+        configuration(&profile),
+        vec![row()],
+        now(),
+    )
+    .unwrap();
+    assert_eq!(separately_imported.snapshot(), &snapshot);
+    assert!(
+        separately_imported
+            .resolve(&profile, &oidc, &jag, &snapshot, now())
+            .is_ok()
     );
 }
 

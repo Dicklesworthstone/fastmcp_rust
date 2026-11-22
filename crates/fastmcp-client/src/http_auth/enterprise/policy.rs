@@ -351,6 +351,20 @@ impl EnterpriseProfile {
         })
     }
 
+    // Exact admission inputs used by internal snapshot bindings. The
+    // document order and stored allowance order match this profile's equality.
+    pub(super) fn document_digests(&self) -> &[[u8; 32]; 5] {
+        &self.document_digests
+    }
+
+    pub(super) fn scope_allowances(&self) -> [&[String]; 3] {
+        [
+            self.configuration.idp.scope_allowance.as_slice(),
+            self.configuration.resource_as.scope_allowance.as_slice(),
+            self.configuration.deployment_scope_allowance.as_slice(),
+        ]
+    }
+
     /// Whether the original IdP deployment, metadata and registration scope
     /// allowances permit the separate OIDC openid request. MCP scope grants
     /// cannot fill a missing OIDC permission; later metadata cannot widen it.

@@ -1817,14 +1817,28 @@ code's original expiry, the caller's budget and the fetch policy. Redirects and
 automatic retries are refused; each outcome consumes the code grant.
 
 A successful identity still needs `IdentityAssertionReplay::reserve` before
-`exchange_identity_for_id_jag` can redeem it. The subsequent
-`exchange_id_jag_for_access_token` returns a credential bound to the configured
-MCP resource. Code redemption does not bypass that durable replay boundary.
+`exchange_identity_for_id_jag` can redeem it. Its sealed result retains the
+original verified OIDC identity alongside the verified ID-JAG. The subsequent
+`exchange_id_jag_for_access_token` requires the current
+`EnterpriseSubjectMappingTable` and an independently selected expected snapshot.
+It resolves that exact same-flow subject pair before constructing the
+resource-AS authenticated request, and checks the mapping again through
+dispatch and response admission. An absent row, changed subject, expired review
+or mismatched snapshot prevents redemption. Unequal pairwise subjects work
+only through an explicit preexisting row.
+
+The resulting resource-bound credential retains the resolved local subject,
+snapshot and signed-token binding digests. Its usable lifetime cannot exceed
+either signed assertion or the mapping review. Code redemption does not bypass
+the durable replay boundary, and successful mapping does not create or link an
+account.
 
 To use that result with the native MCP HTTP client, create an
-`http::EnterpriseHttpPolicy` from the same admitted `EnterpriseProfile` and
-the independently established monotonic freshness deadlines for the IdP and
-resource-AS metadata. Then consume the exchanged token with
+`http::EnterpriseHttpPolicy` from the same admitted `EnterpriseProfile`, the
+independently selected current identity snapshot, and the independently
+established monotonic freshness deadlines for the IdP and resource-AS metadata.
+The token's subject binding must match that policy snapshot exactly. Then consume
+the exchanged token with
 `EnterpriseBoundAccessToken::into_http_credential(&policy, now, wall_now)` and
 pass the result to `modern::ClientBuilder::http_bearer_credential`.
 
@@ -1838,8 +1852,10 @@ a `server/discover` capability or extension descriptor.
 Keep the policy owner alive for the client's lifetime. Revoking, replacing, or
 dropping it invalidates every credential lease, including a request prepared
 before revocation. Policy replacement must advance its policy generation and
-cannot roll back metadata, registration, or key generations. The complete
-exchange profile and original metadata document identities must match, and the
+cannot roll back metadata, registration, key or identity snapshot generations.
+Changing the identity snapshot requires advancing its generation; a rejected
+replacement leaves existing leases unchanged. The complete exchange profile,
+identity snapshot and original metadata document identities must match, and the
 earlier metadata deadline can only shorten the token's original lifetime.
 Raw HTTP requests must carry the exact current declaration in their encoded
 metadata before the credential can be attached; the target-only credential

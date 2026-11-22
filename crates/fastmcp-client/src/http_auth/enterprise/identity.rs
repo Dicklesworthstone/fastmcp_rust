@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, Sha256Digest, crypto::sha256_bounded};
 use fastmcp_protocol::jose::enterprise::{
@@ -329,6 +329,7 @@ impl ConfiguredResourceAsTenantId {
 }
 
 /// An identifier for an existing local account; it has no principal conversion.
+#[derive(Clone)]
 pub struct LocalEnterpriseSubjectId(String);
 impl LocalEnterpriseSubjectId {
     #[must_use]
@@ -468,6 +469,7 @@ pub struct EnterpriseSubjectMappingTable {
     snapshot: EnterpriseIdentitySnapshotKey,
     reviewed_at: SystemTime,
     review_expires_at: SystemTime,
+    review_expires_at_monotonic: Instant,
     client_rp: ClientIdpRelyingPartyKey,
     resource_client: EnterpriseClientKey,
     resource_rp: ResourceAsIdpRelyingPartyKey,
@@ -512,7 +514,16 @@ impl EnterpriseSubjectMappingTable {
         resource_sector: Option<&OidcSectorDocumentReview>,
         now: SystemTime,
     ) -> Result<Self, EnterpriseIdentityError> {
+        let admitted_at = Instant::now();
         admit_review(&configuration.snapshot, now)?;
+        let review_remaining = configuration
+            .snapshot
+            .review_expires_at
+            .duration_since(now)
+            .map_err(|_| EnterpriseIdentityError::InvalidSnapshot)?;
+        let review_expires_at_monotonic = admitted_at
+            .checked_add(review_remaining)
+            .ok_or(EnterpriseIdentityError::InvalidSnapshot)?;
         if configuration.profile_policy_generation != profile.policy_generation()
             || configuration.cross_domain_binding_generation == 0
             || configuration.subject_continuity_generation == 0
@@ -599,6 +610,7 @@ impl EnterpriseSubjectMappingTable {
             },
             reviewed_at: configuration.snapshot.reviewed_at,
             review_expires_at: configuration.snapshot.review_expires_at,
+            review_expires_at_monotonic,
             client_rp: ClientIdpRelyingPartyKey {
                 issuer: client.issuer.clone(),
                 tenant: idp_tenant.clone(),
@@ -626,6 +638,12 @@ impl EnterpriseSubjectMappingTable {
             expected_resource_claim_tenant: resource_claim_tenant,
             records,
         })
+    }
+
+    // This local deadline belongs to the original import, not a later wall
+    // sample. It never enters the stable snapshot digest or a persisted record.
+    pub(super) fn review_deadline(&self) -> Instant {
+        self.review_expires_at_monotonic
     }
 
     #[must_use]
@@ -658,8 +676,10 @@ impl EnterpriseSubjectMappingTable {
     /// two assertions were obtained in the same flow; the caller's operational
     /// owner must establish that separately, even when this mapping succeeds.
     ///
-    /// Both signed expiries and the review window are enforced again. This
-    /// local resolver grants no additional clock skew and refuses future iat.
+    /// Both signed expiries and the review window are enforced again. The
+    /// original monotonic review deadline prevents a stale wall sample from
+    /// renewing this imported snapshot. This local resolver grants no additional
+    /// clock skew and refuses future iat.
     /// Every missing/mismatched subject row has the same redacted error, with
     /// zero mutation. The returned borrowed result cannot outlive its exact
     /// table or verified facts.
@@ -674,15 +694,13 @@ impl EnterpriseSubjectMappingTable {
         if expected_snapshot != &self.snapshot {
             return Err(EnterpriseIdentityError::SnapshotMismatch);
         }
-        if now < self.reviewed_at || now >= self.review_expires_at {
+        if now < self.reviewed_at
+            || now >= self.review_expires_at
+            || Instant::now() >= self.review_expires_at_monotonic
+        {
             return Err(EnterpriseIdentityError::ExpiredSnapshot);
         }
-        if profile_names(current_profile) != profile_names(&self.profile)
-            || profile_generations(current_profile) != profile_generations(&self.profile)
-            || current_profile.requested_scopes().as_slice()
-                != self.profile.requested_scopes().as_slice()
-            || current_profile.permits_oidc_openid() != self.profile.permits_oidc_openid()
-        {
+        if current_profile != &self.profile {
             return Err(EnterpriseIdentityError::ProfileMismatch);
         }
         if now < oidc.issued_at()
@@ -1136,12 +1154,23 @@ fn profile_generations(profile: &EnterpriseProfile) -> [u64; 9] {
 }
 
 fn profile_digest(profile: &EnterpriseProfile) -> Result<Sha256Digest, EnterpriseIdentityError> {
-    let mut encoded = IdentityEncoding::new(b"fastmcp-enterprise-identity-profile-v1");
+    let mut encoded = IdentityEncoding::new(b"fastmcp-enterprise-identity-profile-v2");
     for value in profile_names(profile) {
         encoded.text(value)?;
     }
     for value in profile_generations(profile) {
         encoded.number(value)?;
+    }
+    for digest in profile.document_digests() {
+        encoded.field(digest)?;
+    }
+    // These admitted vectors intentionally retain their original order, just
+    // as EnterpriseProfile equality does. Each list has a separate length.
+    for allowance in profile.scope_allowances() {
+        encoded.number(allowance.len() as u64)?;
+        for scope in allowance {
+            encoded.text(scope)?;
+        }
     }
     encoded.field(&[u8::from(profile.permits_oidc_openid())])?;
     encoded.number(profile.requested_scopes().as_slice().len() as u64)?;

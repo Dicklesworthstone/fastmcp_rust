@@ -16,6 +16,7 @@ use fastmcp_protocol::{
     JsonRpcMessage, decode_strict_jsonrpc_message,
 };
 
+use super::identity::EnterpriseIdentitySnapshotKey;
 use super::policy::EnterpriseProfile;
 use super::replay::IdentityAssertionExchangeGuard;
 
@@ -48,6 +49,8 @@ pub enum EnterpriseHttpPolicyError {
     Revoked,
     /// The complete exchange profile differs from the current policy.
     ProfileMismatch,
+    /// The exchanged subject binding differs from the current reviewed mapping.
+    IdentitySnapshotMismatch,
     /// A replacement must advance policy and cannot roll back any generation.
     GenerationRollback,
     /// The exchanged token failed its existing expiry or replay-owner check.
@@ -60,6 +63,9 @@ impl fmt::Display for EnterpriseHttpPolicyError {
             Self::StaleMetadata => "enterprise authorization metadata is stale",
             Self::Revoked => "enterprise HTTP policy is revoked",
             Self::ProfileMismatch => "enterprise token does not match the HTTP policy",
+            Self::IdentitySnapshotMismatch => {
+                "enterprise subject mapping does not match the HTTP policy"
+            }
             Self::GenerationRollback => "enterprise HTTP policy generation did not advance",
             Self::CredentialUnavailable => "enterprise HTTP credential is unavailable",
         })
@@ -76,15 +82,21 @@ impl std::error::Error for EnterpriseHttpPolicyError {}
 /// earlier deadline bounds every credential, so reconnecting cannot refresh
 /// metadata or extend a token. Full profile equality binds scopes, resources,
 /// registrations, cryptographic purposes, document identities and generations.
+/// The identity snapshot must be selected from the embedding's current reviewed
+/// mapping configuration, independently of the incoming token. Exact equality
+/// prevents a grant from an older or different subject mapping from being bound
+/// to the current policy, even when its authorization profile is unchanged.
 ///
 /// This owner is deliberately not `Clone`: dropping it, revoking it or replacing
 /// it revokes every credential it issued. Credential clones are leases, and
 /// dropping one lease never revokes its siblings. A replacement requires a
 /// newer deployment policy generation and nondecreasing metadata, key and
-/// registration generations. The caller must reacquire a token under the new
+/// registration and identity snapshot generations. A changed identity snapshot
+/// must advance its generation. The caller must reacquire a token under the new
 /// profile; previously issued credentials cannot be reparented.
 pub struct EnterpriseHttpPolicy {
     profile: EnterpriseProfile,
+    identity_snapshot: EnterpriseIdentitySnapshotKey,
     metadata_valid_until: Instant,
     cancellation: McpRequestCancellation,
 }
@@ -104,6 +116,7 @@ impl EnterpriseHttpPolicy {
     /// does not prove assertion acquisition or end-to-end EMA activation.
     pub fn new(
         profile: EnterpriseProfile,
+        identity_snapshot: EnterpriseIdentitySnapshotKey,
         idp_metadata_valid_until: Instant,
         resource_as_metadata_valid_until: Instant,
     ) -> Result<Self, EnterpriseHttpPolicyError> {
@@ -113,6 +126,7 @@ impl EnterpriseHttpPolicy {
         }
         Ok(Self {
             profile,
+            identity_snapshot,
             metadata_valid_until,
             cancellation: McpRequestCancellation::new(),
         })
@@ -121,6 +135,11 @@ impl EnterpriseHttpPolicy {
     /// The current immutable, locally admitted authorization overlay.
     pub fn profile(&self) -> &EnterpriseProfile {
         &self.profile
+    }
+
+    /// The independently selected current subject-mapping snapshot.
+    pub fn identity_snapshot(&self) -> &EnterpriseIdentitySnapshotKey {
+        &self.identity_snapshot
     }
 
     /// Earliest of the two original metadata freshness deadlines.
@@ -138,6 +157,7 @@ impl EnterpriseHttpPolicy {
     pub fn replace(
         &mut self,
         profile: EnterpriseProfile,
+        identity_snapshot: EnterpriseIdentitySnapshotKey,
         idp_metadata_valid_until: Instant,
         resource_as_metadata_valid_until: Instant,
     ) -> Result<(), EnterpriseHttpPolicyError> {
@@ -153,11 +173,15 @@ impl EnterpriseHttpPolicy {
             || profile.oidc_key_generation() < self.profile.oidc_key_generation()
             || profile.id_jag_key_generation() < self.profile.id_jag_key_generation()
             || profile.id_jag_policy_generation() < self.profile.id_jag_policy_generation()
+            || identity_snapshot.generation() < self.identity_snapshot.generation()
+            || (identity_snapshot.generation() == self.identity_snapshot.generation()
+                && identity_snapshot != self.identity_snapshot)
         {
             return Err(EnterpriseHttpPolicyError::GenerationRollback);
         }
         let replacement = Self::new(
             profile,
+            identity_snapshot,
             idp_metadata_valid_until,
             resource_as_metadata_valid_until,
         )?;
@@ -169,6 +193,7 @@ impl EnterpriseHttpPolicy {
     pub(super) fn admit(
         &self,
         profile: &EnterpriseProfile,
+        identity_snapshot: &EnterpriseIdentitySnapshotKey,
     ) -> Result<(), EnterpriseHttpPolicyError> {
         if self.cancellation.is_cancel_requested() {
             return Err(EnterpriseHttpPolicyError::Revoked);
@@ -178,6 +203,9 @@ impl EnterpriseHttpPolicy {
         }
         if profile != &self.profile {
             return Err(EnterpriseHttpPolicyError::ProfileMismatch);
+        }
+        if identity_snapshot != &self.identity_snapshot {
+            return Err(EnterpriseHttpPolicyError::IdentitySnapshotMismatch);
         }
         Ok(())
     }
