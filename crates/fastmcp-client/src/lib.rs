@@ -43854,7 +43854,8 @@ exec sleep 2
     }
 
     #[cfg(all(feature = "websocket-experimental", unix))]
-    fn websocket_extension_notification_builder() -> (fastmcp_protocol::ExtensionId, ClientBuilder) {
+    fn websocket_extension_notification_builder() -> (fastmcp_protocol::ExtensionId, ClientBuilder)
+    {
         use fastmcp_protocol::extensions::{
             ExtensionDescriptorRegistry, ExtensionFallbackPolicy, ExtensionNotificationDescriptor,
             StdioCorrelationCodec, StdioCorrelationDescriptor,
@@ -43991,7 +43992,10 @@ exec sleep 2
                     )
                     .await
                     .unwrap();
-                assert_eq!(observed, [serde_json::json!("first"), serde_json::json!("second")]);
+                assert_eq!(
+                    observed,
+                    [serde_json::json!("first"), serde_json::json!("second")]
+                );
                 assert_eq!(result["echoed"], "complete");
                 assert!(!cancellation.is_cancel_requested());
                 assert!(client.final_server_notifications.is_empty());
@@ -44021,8 +44025,7 @@ exec sleep 2
                     let mut peer = cx
                         .spawn(move |peer_cx| async move {
                             let mut server = AsyncWsServerTransport::from_upgraded(server_io);
-                            websocket_extension_notification_discovery(&peer_cx, &mut server)
-                                .await;
+                            websocket_extension_notification_discovery(&peer_cx, &mut server).await;
                             let JsonRpcMessage::Request(request) =
                                 server.recv(&peer_cx).await.unwrap()
                             else {
@@ -44178,10 +44181,7 @@ exec sleep 2
                 .unwrap();
             let (id, builder) = websocket_extension_notification_builder();
             let mut client = builder
-                .connect_websocket_with_cx(
-                    &cx,
-                    AsyncWsClientTransport::from_upgraded(client_io),
-                )
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
                 .await
                 .unwrap();
             let pre_cancelled = McpRequestCancellation::new();
@@ -44253,7 +44253,10 @@ exec sleep 2
                     assert_eq!(error.code, McpErrorCode::RequestCancelled);
                 }
             }
-            assert_eq!(cancellation.is_cancel_requested(), !callback_error && !dropped);
+            assert_eq!(
+                cancellation.is_cancel_requested(),
+                !callback_error && !dropped
+            );
             assert_eq!(observed, [serde_json::json!("first")]);
             if dropped {
                 let owner = client.transient_request.as_ref().unwrap();
@@ -44283,7 +44286,10 @@ exec sleep 2
                 )
                 .await
                 .unwrap();
-            assert_eq!(observed, [serde_json::json!("first"), serde_json::json!("fresh")]);
+            assert_eq!(
+                observed,
+                [serde_json::json!("first"), serde_json::json!("fresh")]
+            );
             assert_eq!(result["echoed"], "live");
             assert!(client.retired_requests.is_empty());
             assert!(client.transient_request.is_none());
@@ -44337,8 +44343,7 @@ exec sleep 2
                     let mut peer = cx
                         .spawn(move |peer_cx| async move {
                             let mut server = AsyncWsServerTransport::from_upgraded(server_io);
-                            websocket_extension_notification_discovery(&peer_cx, &mut server)
-                                .await;
+                            websocket_extension_notification_discovery(&peer_cx, &mut server).await;
                             let JsonRpcMessage::Request(request) =
                                 server.recv(&peer_cx).await.unwrap()
                             else {
@@ -44508,11 +44513,8 @@ exec sleep 2
                     extension_admission: Some(admission),
                 });
                 let frame = ReceivedTransportFrame::admit(
-                    serde_json::to_vec(&websocket_extension_event(
-                        serde_json::json!(2),
-                        "late",
-                    ))
-                    .unwrap(),
+                    serde_json::to_vec(&websocket_extension_event(serde_json::json!(2), "late"))
+                        .unwrap(),
                 )
                 .unwrap();
                 {
@@ -44538,11 +44540,8 @@ exec sleep 2
                 // A near-identical frame with another exact owner acquires
                 // neither discard authority nor a cooperative-drain loop.
                 let foreign = ReceivedTransportFrame::admit(
-                    serde_json::to_vec(&websocket_extension_event(
-                        serde_json::json!(3),
-                        "unowned",
-                    ))
-                    .unwrap(),
+                    serde_json::to_vec(&websocket_extension_event(serde_json::json!(3), "unowned"))
+                        .unwrap(),
                 )
                 .unwrap();
                 {

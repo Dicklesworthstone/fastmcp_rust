@@ -606,12 +606,9 @@ mod websocket_proxy {
                     })
                     .unwrap();
                 for (id, value) in [(900, 7), (901, 9)] {
-                    peer.send_async(
-                        &cx,
-                        &request(id, Some(json!({"version": 1})), json!(value)),
-                    )
-                    .await
-                    .unwrap();
+                    peer.send_async(&cx, &request(id, Some(json!({"version": 1})), json!(value)))
+                        .await
+                        .unwrap();
                 }
 
                 let mut events = std::collections::BTreeMap::<i64, Vec<u64>>::new();
@@ -657,7 +654,10 @@ mod websocket_proxy {
 
                 let (mut input, output) = peer.into_split();
                 drop(output);
-                assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+                assert!(matches!(
+                    input.recv_async(&cx).await,
+                    Err(TransportError::Closed)
+                ));
                 serving.join(&cx).await.unwrap().unwrap();
                 upstream.close(&cx).await.unwrap();
             },
@@ -677,7 +677,8 @@ mod websocket_proxy {
                     "127.0.0.1:46201".parse().unwrap(),
                     "127.0.0.1:46202".parse().unwrap(),
                 );
-                let mut upstream_peer = fastmcp_rust::AsyncWsServerTransport::from_upgraded(peer_io);
+                let mut upstream_peer =
+                    fastmcp_rust::AsyncWsServerTransport::from_upgraded(peer_io);
                 let mut scripted = cx
                     .spawn(move |peer_cx| async move {
                         let JsonRpcMessage::Request(discovery) =
@@ -787,17 +788,22 @@ mod websocket_proxy {
                     .unwrap();
                 let rejected = response(&cx, &mut peer, 950).await;
                 assert!(rejected.result.is_none());
-                let error = rejected.error.expect("the notification schema rejects this payload");
+                let error = rejected
+                    .error
+                    .expect("the notification schema rejects this payload");
                 assert!(!error.message.contains("peer-private"));
                 assert!(
-                    !fastmcp_rust::serde_json::to_string(&error).unwrap().contains("peer-private"),
+                    !fastmcp_rust::serde_json::to_string(&error)
+                        .unwrap()
+                        .contains("peer-private"),
                     "neither upstream payload nor metadata belongs in downstream diagnostics"
                 );
 
                 peer.send_async(&cx, &request(951, Some(json!({"version": 1})), json!(9)))
                     .await
                     .unwrap();
-                let JsonRpcMessage::Request(notification) = peer.recv_async(&cx).await.unwrap() else {
+                let JsonRpcMessage::Request(notification) = peer.recv_async(&cx).await.unwrap()
+                else {
                     panic!("a valid sibling notification still crosses the reused connection");
                 };
                 assert!(notification.id.is_none());
@@ -813,7 +819,10 @@ mod websocket_proxy {
 
                 let (mut input, output) = peer.into_split();
                 drop(output);
-                assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+                assert!(matches!(
+                    input.recv_async(&cx).await,
+                    Err(TransportError::Closed)
+                ));
                 serving.join(&cx).await.unwrap().unwrap();
                 upstream.close(&cx).await.unwrap();
                 scripted.join(&cx).await.unwrap();
@@ -915,8 +924,8 @@ mod websocket_proxy {
                 .try_build()
                 .unwrap();
             let (mut peer, transport) = create_memory_transport_pair_with_capacity(4);
-            let mut serving = cx
-                .spawn(move |server_cx| async move {
+            let mut serving =
+                cx.spawn(move |server_cx| async move {
                     server.serve_memory(&server_cx, transport).await
                 })
                 .unwrap();
@@ -984,12 +993,14 @@ mod websocket_proxy {
 
             let (mut input, output) = peer.into_split();
             drop(output);
-            assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+            assert!(matches!(
+                input.recv_async(&cx).await,
+                Err(TransportError::Closed)
+            ));
             serving.join(&cx).await.unwrap().unwrap();
             upstream.close(&cx).await.unwrap();
         });
     }
-
 }
 
 use std::sync::Arc;

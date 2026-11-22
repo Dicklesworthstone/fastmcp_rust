@@ -429,11 +429,7 @@ where
             ));
         }
         let (method, parameter_schema, result_schema, total) = self
-            .prepare_method::<Request, Response>(
-                method,
-                parameter_schema_id,
-                result_schema_id,
-            )?;
+            .prepare_method::<Request, Response>(method, parameter_schema_id, result_schema_id)?;
         let index = self.pending.len();
         let effective_schema = Arc::clone(&self.effective_schema.admitted);
         retain_schema_identity(
@@ -597,7 +593,9 @@ impl WebSocketProxyNotification {
         let mut parameters =
             encode_application_value(&parameters, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)?;
         let object = parameters.as_object_mut().ok_or_else(|| {
-            McpError::invalid_request("WebSocket upstream notification parameters must be an object")
+            McpError::invalid_request(
+                "WebSocket upstream notification parameters must be an object",
+            )
         })?;
         object.remove("_meta");
         self.schema.validate(&parameters).map_err(|_| {
@@ -927,10 +925,7 @@ mod tests {
                 "com.example/private-proof": "upstream-only",
             },
         });
-        let admitted = JsonRpcRequest::notification(
-            "com.example/events",
-            Some(parameters.clone()),
-        );
+        let admitted = JsonRpcRequest::notification("com.example/events", Some(parameters.clone()));
         relay.relay(&context, admitted.clone()).unwrap();
         assert_eq!(
             *emitted.lock().unwrap(),

@@ -1891,8 +1891,8 @@ pub mod auto {
             method: &str,
             parameters: JsonValue,
             on_notification: &mut (
-                dyn FnMut(fastmcp_protocol::JsonRpcRequest) -> McpResult<()> + Send
-            ),
+                     dyn FnMut(fastmcp_protocol::JsonRpcRequest) -> McpResult<()> + Send
+                 ),
         ) -> McpResult<JsonValue>
         where
             IO: Send + 'static,
@@ -5193,8 +5193,8 @@ pub mod modern {
             method: &str,
             parameters: JsonValue,
             on_notification: &mut (
-                dyn FnMut(fastmcp_protocol::JsonRpcRequest) -> McpResult<()> + Send
-            ),
+                     dyn FnMut(fastmcp_protocol::JsonRpcRequest) -> McpResult<()> + Send
+                 ),
         ) -> McpResult<JsonValue>
         where
             IO: Send + 'static,
@@ -14931,7 +14931,10 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(client.selected_protocol_era(), super::ProtocolEra::Modern2026);
+            assert_eq!(
+                client.selected_protocol_era(),
+                super::ProtocolEra::Modern2026
+            );
             let cancellation = super::McpRequestCancellation::new();
             let mut observed = Vec::new();
             let result = client
