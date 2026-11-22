@@ -802,10 +802,11 @@ impl<F: Future> Future for CallerContextFuture<F> {
             // Latch before entering the user future, including when that poll
             // panics or yields. Later abandonment cannot widen its cleanup.
             this.caller = asupersync::Cx::current().expect("explicit caller context is installed");
-            this.wake.replace(Some(std::sync::Arc::new(CallerWakeTarget {
-                caller: this.caller.clone(),
-                waker: Some(task_cx.waker().clone()),
-            })));
+            this.wake
+                .replace(Some(std::sync::Arc::new(CallerWakeTarget {
+                    caller: this.caller.clone(),
+                    waker: Some(task_cx.waker().clone()),
+                })));
             let waker = std::task::Waker::from(std::sync::Arc::clone(&this.wake));
             let mut task_cx = std::task::Context::from_waker(&waker);
             let result = this
