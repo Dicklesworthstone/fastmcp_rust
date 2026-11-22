@@ -1101,6 +1101,11 @@ pub use fastmcp_server::bidirectional::{
 };
 
 // Re-export server middleware modules (no Docket/Redis in FND-01 surface).
+#[cfg(feature = "enterprise-auth")]
+pub use fastmcp_server::auth::enterprise::{
+    EnterpriseAuthProvider, EnterpriseResourceConfiguration, EnterpriseResourceError,
+    EnterpriseResourcePolicy,
+};
 pub use fastmcp_server::caching::ResponseCachingMiddleware;
 pub use fastmcp_server::providers;
 pub use fastmcp_server::rate_limiting::{

@@ -1848,6 +1848,54 @@ use `ModernHttpRequest::control` to omit request-only routing headers. This is t
 post-exchange MCP HTTP path; browser custody, deployment-provider qualification, SAML, and
 built-in enterprise token issuance retain their separate implementation gates.
 
+#### Protecting a native HTTP resource
+
+The facade's `enterprise-auth` feature also enables the resource-server path.
+Create an `EnterpriseResourceConfiguration` with the exact IdP and resource-AS
+issuer/token-endpoint pairs, the canonical MCP resource, and nonzero policy and
+metadata generations. `EnterpriseResourcePolicy::new` admits both bounded,
+duplicate-free metadata documents and their original monotonic freshness
+deadlines. The IdP must advertise token exchange and the ID-JAG requested token
+type; the resource AS must advertise the ID-JAG grant profile and JWT bearer
+grant. Metadata provenance remains the deployment's responsibility.
+
+Install the policy through the ordinary authentication hook:
+
+```rust
+use fastmcp_rust::{
+    EnterpriseResourceError, EnterpriseResourcePolicy, modern::ServerBuilder,
+    providers::JwtResourceVerifier,
+};
+
+fn protected_server(
+    policy: &EnterpriseResourcePolicy,
+    verifier: JwtResourceVerifier,
+) -> Result<ServerBuilder, EnterpriseResourceError> {
+    Ok(ServerBuilder::new("enterprise-resource", "1.0")
+        .auth_provider(policy.provider(verifier)?))
+}
+```
+
+The independently provisioned `JwtResourceVerifier` must match the configured
+resource-AS issuer and MCP resource. It verifies the real RS256 signature,
+`at+jwt` token type, issuer, resource audience and lifetime on each access token.
+Every modern MCP request must also carry the exact official enterprise
+declaration with `{}` settings. The provider accepts only native HTTP
+`Authorization`; an extension declaration, ID Token, or ID-JAG cannot substitute
+for a verified resource access token. This profile adds no `server/discover`
+RPC extension descriptor.
+
+Keep the policy owner alive while the server is serving. Revocation, owner drop
+or successful policy replacement invalidates previously issued authentication
+leases as well as new admission. Replacement advances the policy generation,
+rejects metadata generation rollback, and cannot change the resource or its
+token issuer. JWT key replacement and revocation independently retire leases
+from the old key generation. Refreshed authorization preserves the same verified
+owner identity, so rotation does not strand an otherwise authorized Task. These
+leases are enforced at request, Task and output checkpoints; already completed
+application effects cannot be recalled. SAML, browser custody, built-in
+enterprise issuance and durable deployment qualification remain separate work.
+
 The lower-level `OidcCodeGrant::write_token_form` and
 `OidcCodeResponseAdmission::admit_token_response` remain available to embeddings
 with their own dispatcher. That codec writes to a caller-selected confidential
@@ -3042,7 +3090,7 @@ fn commit_revision(
 | **Authentication Admission** | Native HTTP requires `Authorization` for protected requests and rejects recognized body/meta and query credential fields before provider invocation. Other adapters retain a stripped legacy fallback. Complete authorization, lease/revocation, and OAuth challenge qualification remain open |
 | **Tasks RPC** | `tasks/list` and `tasks/submit` stay `MethodNotFound`. Official `tasks/get`, `tasks/update`, and `tasks/cancel` run by default on a process-local in-memory store; `ServerBuilder::final_tasks` replaces that store. `ServerBuilder::task_supervisor(Arc::new(supervisor))` hosts the application's task service during each serve, waits for bounded readiness, and settles the service before returning. Without a ready service, task creation is refused |
 | **MCP Apps (opt-in `apps` feature)** | Off by default. The facade `apps` feature adds the official MCP Apps extension: server `ServerBuilder::mcp_apps` (bilateral capability negotiation and `server/discover` metadata; Apps owns no client-to-server method), `mcp_apps_ui_resource` for final-only `ui://` HTML documents and `mcp_apps_tool` for tools linked to one; client `ClientBuilder::mcp_apps` and the `mcp_apps` host bridge (`McpAppsHost`, `McpAppsBridgeTransport`). These are unit-tested (for example `builder_mcp_apps_ui_resource_binds_a_final_only_ui_catalog_entry`); Apps media rendering and Apps conformance are not claimed |
-| **Feature flags that gate nothing** | `fastmcp-server`'s `enterprise-auth` gates no server code; it only enables `fastmcp-protocol`'s `jose` feature. Its `jwt-resource-auth` **does** gate code and this row claimed the opposite until 2026-10-20: since 2026-10-14 it gates `providers::jwt_resource` and `providers::managed_jwks` (3,735 lines and 45 tests as of 2026-11-20) implementing two `TokenVerifier`s that install through the ordinary `TokenAuthProvider` hook, so an inbound-JWT resource-server path does exist for it to reach. A consumer reaches them as `fastmcp_rust::providers::JwtResourceVerifier` once the facade's own `jwt-resource-auth` equation — added 2026-10-20, because until then the published facade declared no such feature and Cargo refused to resolve it — is enabled. `fastmcp-server`'s `websocket-experimental` is also inert: it forwards only to `fastmcp-transport`'s empty feature and is a *different* feature from `fastmcp-server/websocket`, which does gate code. The CLI's `jwt-resource-auth` forwards to the server feature above and carries `dep:fastmcp-server`, linking the server crate into the CLI. `fastmcp-console`'s `enterprise-auth`, `oauth-client-credentials`, `builtin-auth-server`, `jwt-resource-auth`, `proxy` and `websocket-experimental` are empty, so its `proxy-legacy` and `proxy-tasks` reduce to `legacy-2024-11-05` and `tasks`. `fastmcp-transport`'s `websocket-experimental` is empty because `fastmcp_transport::websocket` is compiled unconditionally — but see **Experimental WebSocket framing** below: the always-compiled frame codec is not the one that ships. By contrast `fastmcp-server`'s `oauth-client-credentials` is **not** inert: together with `builtin-auth-server` it gates 34 sites, including the `client_credentials` arm of the token endpoint and the advertised `grant_types_supported` list. The facade and client `websocket-experimental` features gate code: `WebSocketClient`, `ClientBuilder::connect_websocket_with_cx`, and (through `fastmcp-server/websocket`) `bind_websocket`. This list is complete as measured 2026-11-05 over every declared feature in the nine crates that declare any (`fastmcp-core` declares exactly one, `test-runtime`, added 2026-11-02 by `0035bc4d`; it is not inert, carrying eight `cfg(feature = "test-runtime")` sites): the seven user-enableable features with zero `cfg(feature = ...)` sites in their own crate's `src` **and** an empty value list are exactly `fastmcp-console`'s six above plus `fastmcp-transport`'s `websocket-experimental` |
+| **Feature flags that gate nothing** | `fastmcp-server`'s `enterprise-auth` now gates `auth::enterprise` and enables `jwt-resource-auth`; the facade enables both the client exchange and resource-server policy. Its `jwt-resource-auth` **does** gate code and this row claimed the opposite until 2026-10-20: since 2026-10-14 it gates `providers::jwt_resource` and `providers::managed_jwks` (3,735 lines and 45 tests as of 2026-11-20) implementing two `TokenVerifier`s that install through the ordinary `TokenAuthProvider` hook, so an inbound-JWT resource-server path does exist for it to reach. A consumer reaches them as `fastmcp_rust::providers::JwtResourceVerifier` once the facade's own `jwt-resource-auth` equation — added 2026-10-20, because until then the published facade declared no such feature and Cargo refused to resolve it — is enabled. `fastmcp-server`'s `websocket-experimental` is also inert: it forwards only to `fastmcp-transport`'s empty feature and is a *different* feature from `fastmcp-server/websocket`, which does gate code. The CLI's `jwt-resource-auth` forwards to the server feature above and carries `dep:fastmcp-server`, linking the server crate into the CLI. `fastmcp-console`'s `enterprise-auth`, `oauth-client-credentials`, `builtin-auth-server`, `jwt-resource-auth`, `proxy` and `websocket-experimental` are empty, so its `proxy-legacy` and `proxy-tasks` reduce to `legacy-2024-11-05` and `tasks`. `fastmcp-transport`'s `websocket-experimental` is empty because `fastmcp_transport::websocket` is compiled unconditionally — but see **Experimental WebSocket framing** below: the always-compiled frame codec is not the one that ships. By contrast `fastmcp-server`'s `oauth-client-credentials` is **not** inert: together with `builtin-auth-server` it gates 34 sites, including the `client_credentials` arm of the token endpoint and the advertised `grant_types_supported` list. The facade and client `websocket-experimental` features gate code: `WebSocketClient`, `ClientBuilder::connect_websocket_with_cx`, and (through `fastmcp-server/websocket`) `bind_websocket`. This list is complete as measured 2026-11-05 over every declared feature in the nine crates that declare any (`fastmcp-core` declares exactly one, `test-runtime`, added 2026-11-02 by `0035bc4d`; it is not inert, carrying eight `cfg(feature = "test-runtime")` sites): the seven user-enableable features with zero `cfg(feature = ...)` sites in their own crate's `src` **and** an empty value list are exactly `fastmcp-console`'s six above plus `fastmcp-transport`'s `websocket-experimental` |
 | **HTTP as_proxy auto-follow** | A gateway HTTP `as_proxy` does not auto-follow an upstream server `input_required` task across POSTs; per-request dispatch is stateless and upstream request state cannot resume. Callers resume such upstream tasks through an explicit matching `tasks/update` |
 | **OAuth/OIDC Promotion** | Public source APIs exist, but production security and profile conformance remain unverified; they are quarantined from production-support claims |
 | **Early Development** | API may change before 1.0 |

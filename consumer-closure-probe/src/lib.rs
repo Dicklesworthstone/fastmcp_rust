@@ -699,6 +699,21 @@ pub fn probe_enterprise_auth_facade_closure() {
     let _: Option<EnterpriseHttpPolicy> = None;
     let _: Option<EnterpriseHttpPolicyError> = None;
     let _: &str = ENTERPRISE_AUTHORIZATION_EXTENSION_ID;
+    let _: Option<fastmcp_rust::EnterpriseAuthProvider> = None;
+    let _: Option<fastmcp_rust::EnterpriseResourceConfiguration> = None;
+    let _: Option<fastmcp_rust::EnterpriseResourcePolicy> = None;
+    let _: Option<fastmcp_rust::EnterpriseResourceError> = None;
+}
+
+/// Resource-side enterprise admission reaches the ordinary public auth hook.
+#[cfg(feature = "enterprise-auth")]
+pub fn probe_enterprise_resource_provider_consumer(
+    policy: &fastmcp_rust::EnterpriseResourcePolicy,
+    verifier: fastmcp_rust::providers::JwtResourceVerifier,
+) -> Result<fastmcp_rust::modern::ServerBuilder, fastmcp_rust::EnterpriseResourceError> {
+    let provider = policy.provider(verifier)?;
+    Ok(fastmcp_rust::modern::ServerBuilder::new("enterprise-resource", "1")
+        .auth_provider(provider))
 }
 
 /// The exchange result reaches the real era-pinned HTTP builder without

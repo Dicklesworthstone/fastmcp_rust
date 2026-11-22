@@ -6,6 +6,10 @@
 //! request-local [`McpContext`]; credentials and identity are never persisted
 //! in session state.
 
+/// Request-local enterprise authorization over a verified resource access token.
+#[cfg(feature = "enterprise-auth")]
+pub mod enterprise;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write as _;

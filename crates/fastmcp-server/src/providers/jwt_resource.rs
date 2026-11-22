@@ -38,9 +38,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use fastmcp_core::runtime::{ProcessBoundToken, ProcessGenerationGuard};
 use fastmcp_core::{
     AbsoluteUri, AccessToken, AuthContext, CanonicalResourceId, McpContext, McpError, McpErrorCode,
-    McpResult, Sha256Digest,
+    McpRequestCancellation, McpResult, Sha256Digest,
 };
 use fastmcp_protocol::jose::{AdmittedRsaJwks, VerifiedCompactJws, verify_compact_jws_rs256};
 use serde_json::{Value, json};
@@ -403,24 +404,81 @@ pub struct JwtResourceVerifier {
     policy: JwtResourcePolicy,
     // TokenVerifier is synchronous. These bounded in-memory critical sections
     // contain no RSA verification, I/O, await, or public application callback.
-    keys: Arc<RwLock<Option<Arc<AdmittedRsaJwks>>>>,
+    keys: Arc<JwtKeyRegistry>,
+}
+
+struct JwtKeyRegistry {
+    active: RwLock<Option<Arc<JwtKeyGeneration>>>,
+    process: ProcessBoundToken,
+}
+
+impl Drop for JwtKeyRegistry {
+    fn drop(&mut self) {
+        // Inherited facts are already unusable in a different process. Do not
+        // touch the inherited cancellation wait-state from a destructor there.
+        if self.process.verify().is_err() {
+            return;
+        }
+        // Revoke even if an in-flight signature still retains the generation.
+        // Dropping one verifier clone never reaches this last-owner boundary.
+        let active = self
+            .active
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(active) = active {
+            active.cancellation.cancel();
+        }
+    }
+}
+
+struct JwtKeyGeneration {
+    keys: AdmittedRsaJwks,
+    cancellation: McpRequestCancellation,
+}
+
+impl JwtKeyGeneration {
+    fn new(jwks: &[u8]) -> Result<Self, JwtResourceAuthError> {
+        Ok(Self {
+            keys: AdmittedRsaJwks::from_json(jwks)
+                .map_err(|_| JwtResourceAuthError::InvalidKeys)?,
+            cancellation: McpRequestCancellation::new(),
+        })
+    }
 }
 
 // Retaining the exact Arc both identifies its generation and prevents an ABA
 // address reuse while a signature verified with that generation is in flight.
 struct VerifiedJwt {
-    keys: Arc<AdmittedRsaJwks>,
+    keys: Arc<JwtKeyGeneration>,
     verified: VerifiedCompactJws,
 }
 
 impl JwtResourceVerifier {
+    /// Exact issuer whose signatures this verifier accepts.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.policy.issuer
+    }
+
+    /// Resource to which verified access tokens are bound, including when an
+    /// explicit accepted-audience mapping supplies their wire audience.
+    #[must_use]
+    pub fn resource(&self) -> &str {
+        &self.policy.resource
+    }
+
     /// Admits the complete bounded public JWKS before exposing a verifier.
     pub fn new(policy: JwtResourcePolicy, jwks: &[u8]) -> Result<Self, JwtResourceAuthError> {
-        let keys =
-            AdmittedRsaJwks::from_json(jwks).map_err(|_| JwtResourceAuthError::InvalidKeys)?;
+        let keys = JwtKeyGeneration::new(jwks)?;
+        let process = ProcessGenerationGuard::install()
+            .map_err(|_| JwtResourceAuthError::KeysUnavailable)?
+            .token();
         Ok(Self {
             policy,
-            keys: Arc::new(RwLock::new(Some(Arc::new(keys)))),
+            keys: Arc::new(JwtKeyRegistry {
+                active: RwLock::new(Some(Arc::new(keys))),
+                process,
+            }),
         })
     }
 
@@ -433,18 +491,24 @@ impl JwtResourceVerifier {
     /// In-flight old-generation candidates fail rather than retrying silently.
     ///
     /// This administrative grant also reinstalls keys after [`Self::revoke_all`].
-    /// It never changes issuer/resource policy, fetches keys, or cancels already
-    /// admitted work. A poisoned registry cannot be repaired through this API.
+    /// It never changes issuer/resource policy or fetches keys. Retained facts
+    /// from the old generation are invalidated at the framework's next auth
+    /// checkpoint. Completed effects cannot be recalled. A poisoned registry
+    /// cannot be repaired through this API.
     pub fn replace_jwks(&self, jwks: &[u8]) -> Result<(), JwtResourceAuthError> {
-        let replacement = Arc::new(
-            AdmittedRsaJwks::from_json(jwks).map_err(|_| JwtResourceAuthError::InvalidKeys)?,
-        );
+        self.check_process()?;
+        let replacement = Arc::new(JwtKeyGeneration::new(jwks)?);
         let mut active = self
             .keys
+            .active
             .write()
             .map_err(|_| JwtResourceAuthError::KeysUnavailable)?;
+        self.check_process()?;
         let retired = active.replace(replacement);
         drop(active);
+        if let Some(retired) = &retired {
+            retired.cancellation.cancel();
+        }
         drop(retired);
         Ok(())
     }
@@ -454,15 +518,22 @@ impl JwtResourceVerifier {
     /// administrator explicitly installs a valid set with [`Self::replace_jwks`].
     ///
     /// Candidates signed under revoked keys cannot finish admission. Existing
-    /// AuthContext values and work admitted before revocation cannot be recalled.
+    /// AuthContext leases are invalidated at their next authorization checkpoint;
+    /// already completed effects cannot be recalled.
     /// This is local trust revocation, not an OAuth revocation-endpoint request.
     pub fn revoke_all(&self) -> Result<bool, JwtResourceAuthError> {
+        self.check_process()?;
         let mut active = self
             .keys
+            .active
             .write()
             .map_err(|_| JwtResourceAuthError::KeysUnavailable)?;
+        self.check_process()?;
         let retired = active.take();
         drop(active);
+        if let Some(retired) = &retired {
+            retired.cancellation.cancel();
+        }
         Ok(retired.is_some())
     }
 
@@ -498,6 +569,7 @@ impl JwtResourceVerifier {
         ctx: &McpContext,
         token: &AccessToken,
     ) -> Result<VerifiedJwt, JwtResourceAuthError> {
+        self.check_process()?;
         checkpoint(ctx)?;
         if !token.scheme.eq_ignore_ascii_case("Bearer")
             || !AccessToken::is_valid_token68(&token.token)
@@ -506,13 +578,14 @@ impl JwtResourceVerifier {
         }
         let keys = self
             .keys
+            .active
             .read()
             .map_err(|_| JwtResourceAuthError::KeysUnavailable)?
             .as_ref()
             .cloned()
             .ok_or(JwtResourceAuthError::KeysUnavailable)?;
         // The snapshot guard was dropped above: RSA never delays key mutation.
-        let verified = verify_compact_jws_rs256(&token.token, &keys)
+        let verified = verify_compact_jws_rs256(&token.token, &keys.keys)
             .map_err(|_| JwtResourceAuthError::InvalidToken)?;
         require_access_token_type(&token.token)?;
         checkpoint(ctx)?;
@@ -535,8 +608,10 @@ impl JwtResourceVerifier {
         candidate: VerifiedJwt,
         clock: impl FnOnce() -> Result<Duration, JwtResourceAuthError>,
     ) -> Result<AuthContext, JwtResourceAuthError> {
+        self.check_process()?;
         let active = self
             .keys
+            .active
             .read()
             .map_err(|_| JwtResourceAuthError::KeysUnavailable)?;
         let current = active
@@ -549,7 +624,7 @@ impl JwtResourceVerifier {
         // The private clock seam is SystemTime in production, never an external
         // callback. Sample after lock acquisition so contention cannot preserve
         // a stale pre-lock expiry reading. Hold the generation through this
-        // bounded decision; revocation after it cannot recall returned facts.
+        // bounded decision; the returned lease retains its revocation domain.
         // Sample monotonic time first. Time spent taking the wall sample and
         // admitting claims can only shorten the resulting lease, never extend
         // it. Keeping the wall sample's fractional second avoids granting an
@@ -572,8 +647,22 @@ impl JwtResourceVerifier {
         if Instant::now() >= valid_until {
             return Err(JwtResourceAuthError::InvalidClaims);
         }
+        self.check_process()?;
+        let context = context
+            .with_verification_valid_until(valid_until)
+            .with_verification_cancellation(candidate.keys.cancellation.clone());
+        if !context.verification_is_current() {
+            return Err(JwtResourceAuthError::KeysUnavailable);
+        }
         drop(active);
-        Ok(context.with_verification_valid_until(valid_until))
+        Ok(context)
+    }
+
+    fn check_process(&self) -> Result<(), JwtResourceAuthError> {
+        self.keys
+            .process
+            .verify()
+            .map_err(|_| JwtResourceAuthError::KeysUnavailable)
     }
 }
 
@@ -581,9 +670,10 @@ impl fmt::Debug for JwtResourceVerifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key_count = self
             .keys
+            .active
             .try_read()
             .ok()
-            .map(|active| active.as_ref().map_or(0, |keys| keys.len()));
+            .map(|active| active.as_ref().map_or(0, |keys| keys.keys.len()));
         f.debug_struct("JwtResourceVerifier")
             .field("policy", &self.policy)
             .field("key_count", &key_count)
@@ -826,7 +916,7 @@ fn admit_claims(
 }
 
 #[cfg(test)]
-pub(in crate::providers) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::auth::{AuthProvider, TokenAuthProvider};
     use base64::engine::general_purpose::STANDARD;
@@ -837,7 +927,7 @@ pub(in crate::providers) mod tests {
     const RESOURCE: &str = "https://tools.example/mcp";
     const NOW: u64 = 1_800_000_000;
     // Public test-only RSA key. Never issue non-test credentials with it.
-    const PRIVATE_KEY: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC3wxLvB3SX9fKLLBY8rXXENHK3d78DfxpG7Uq1q9RbtvOHs2m/iU4p0xqHeD35ZG4FGXdzhQWtfp4ydwdqd098z5JHMWyR5naVmF37sykkkNSyBKA6eRYfurtlep9GVlrjpTbqEvo6777nSL9Ozq6hUzU4fPdmk8U1yZ/prSbiDbUcH8HgrgoOHfBM0vg9bM8EVtpKJtwjc1sAfG96k2TEB5tRSCaolhkpMpXdHF6zCZukHvK1DrLVpUvYlgrPfIfucb/8Ws4WxNMOg7M36actazuged0lVpNpbRNHIg+Wss+wUsRKgXhDCAlmWivcyhoLM+Jj5dnWZpeqNE4J6cXBAgMBAAECgf9ofHL3lrWk8iPHHnpGZhrgRTI1P9FMm6jFS4d/ZQSKYax3LHyke94FyhL7lFMoywIDxEc3WBuyWpx49VUyJET+Ish50pB5JSGoTcqio2xxbiiCUD8LAG6j+/kx6ldGFzP23Koszj2Z5VgXCjY9CSgicr2AMQ47NSqdOtfCdsH1Jf4A2D8U6sLFR1FDKZVie5SiZC41/91897QyySDdxEO2bbxb4ZA47EBF+dfQyEXtXDJ34oBrncVepELv9B5hWu+Z4Uf5DK78Ww8NiU1U1+bLVIL5yreK/UaHgVgEJQepTKAzTr4OMT0ZXTAZT5OfoMKmWbq6iQ5mukU8rLUg1xLECgYEA8g2q98V+XvyZQ5kFI/Skj6bxwbRw+mr0SbrWoCSP0VOV4gQ5ED7VnPwGFW8GPR3nqA4Rdx9qul7kttHQnEpbYgk4A2NTRzgqWeu0dfOS2+u+UB44SstamiZfxbNKzLHayJzPMZSZMq2fJhNs8FQtGa3ES3qRJavSOtB34meI4HECgYEAwlmY9AEthueuEaU4ZDHNeYaNwv+TO8QAixl6lj2vztTmVAAFOL7aXNWb+WCQ3SyyDkSty/Kk19e+e5s496keZLxUbyTsboP2LTu0H+45gIUkDAVp/ACXK5dOJT4Vj3jjPUuY9R3CxXvIUEDuzN2hmxTVOq7y53u71sYx5mRn4lECgYEAmNq8vp7/AKjveFqnfl89lGHOhY6XUew8vFq6soKkN4JbQlF8X5/ucaZNiTeFbw71fZD0wo8abPsD39d7r1bdgnlj3+/XZUA4rnREj7/zW+HxWtLapZDpdDMLg+OHNuCR0uIDjcHTRMeTmw3lW5csq+yp6yhJhMqOhgmjy1uqemECgYEAtNeWQYZPDLbL/FNW87R709bmVkpmgDhToRtmPCLOUpE8eXFDapf8rGF/rz6xzXxnemthpOL1jHqOHopDKgBN7cJodrtO3U8hZNmnNAcBrps0/ZKUGg+ams9BwdnRSh1cpY6Ql5THxeb2b+bbzfl1BM8P0nk0QT2bfbASgqVvHOECgYEA2D+89N+YGmI052k8Ow/QBjB/IBhO90syi3TvinbK4B2Y1wQDqt7f50lPvWzoUYFH0cq8RlroCou71gkiBxFnd7BFHVDFuyA24o7sPctQ322KMty/eSHXwQugJRRylNBXFvJXrIhfdiV+OvZ9NVXTESeVT0x5eGAI+1QTdjZCKiQ=";
+    const PRIVATE_KEY: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC3wxLvB3SX9fKLLBY8rXXENHK3d78DfxpG7Uq1q9RbtvOHs2m/iU4p0xqHeD35ZG4FGXdzhQWtfp4ydwdqd098z5JHMWyR5naVmF37sykkkNSyBKA6eRYfurtlep9GVlrjpTbqEvo6777nSL9Ozq6hUzU4fPdmk8U1yZ/prSbiDbUcH8HgrgoOHfBM0vg9bM8EVtpKJtwjc1sAfG96k2TEB5tRSCaolhkpMpXdHF6zCZukHvK1DrLVpUvYlgrPfIfucb/8Ws4WxNMOg7M36actazuged0lVpNpbRNHIg+Wss+wUsRKgXhDCAlmWivcyhoLM+Jj5dnWZpeqNE4J6cXBAgMBAAECgf9ofHL3lrWk8iPHHnpGZhrgRTI1P9FMm6jFS4d/ZQSKYax3LHyke94FyhL7lFMoywIDxEc3WBuyWpx49VUyJET+Ish50pB5JSGoTcqio2xxbiiCUD8LAG6j+/kx6ldGFzP23Koszj2Z5VgXCjY9CSgicr2AMQ47NSqdOtfCdsH1Jf4A2D8U6sLFR1FDKZVie5SiZC41/91897QyySDdxEO2bbxb4ZA47EBF+dfQyEXtXDJ34oBrncVepELv9B5hWu+Z4Uf5DK78Ww8NiU1U+bLVIL5yreK/UaHgVgEJQepTKAzTr4OMT0ZXTAZT5OfoMKmWbq6iQ5mukU8rLUg1xLECgYEA8g2q98V+XvyZQ5kFI/Skj6bxwbRw+mr0SbrWoCSP0VOV4gQ5ED7VnPwGFW8GPR3nqA4Rdx9qul7kttHQnEpbYgk4A2NTRzgqWeu0dfOS2+u+UB44SstamiZfxbNKzLHayJzPMZSZMq2fJhNs8FQtGa3ES3qRJavSOtB34meI4HECgYEAwlmY9AEthueuEaU4ZDHNeYaNwv+TO8QAixl6lj2vztTmVAAFOL7aXNWb+WCQ3SyyDkSty/Kk19e+e5s496keZLxUbyTsboP2LTu0H+45gIUkDAVp/ACXK5dOJT4Vj3jjPUuY9R3CxXvIUEDuzN2hmxTVOq7y53u71sYx5mRn4lECgYEAmNq8vp7/AKjveFqnfl89lGHOhY6XUew8vFq6soKkN4JbQlF8X5/ucaZNiTeFbw71fZD0wo8abPsD39d7r1bdgnlj3+/XZUA4rnREj7/zW+HxWtLapZDpdDMLg+OHNuCR0uIDjcHTRMeTmw3lW5csq+yp6yhJhMqOhgmjy1uqemECgYEAtNeWQYZPDLbL/FNW87R709bmVkpmgDhToRtmPCLOUpE8eXFDapf8rGF/rz6xzXxnemthpOL1jHqOHopDKgBN7cJodrtO3U8hZNmnNAcBrps0/ZKUGg+ams9BwdnRSh1cpY6Ql5THxeb2b+bbzfl1BM8P0nk0QT2bfbASgqVvHOECgYEA2D+89N+YGmI052k8Ow/QBjB/IBhO90syi3TvinbK4B2Y1wQDqt7f50lPvWzoUYFH0cq8RlroCou71gkiBxFnd7BFHVDFuyA24o7sPctQ322KMty/eSHXwQugJRRylNBXFvJXrIhfdiV+OvZ9NVXTESeVT0x5eGAI+1QTdjZCKiQ=";
     const MODULUS: &str = "t8MS7wd0l_XyiywWPK11xDRyt3e_A38aRu1KtavUW7bzh7Npv4lOKdMah3g9-WRuBRl3c4UFrX6eMncHandPfM-SRzFskeZ2lZhd-7MpJJDUsgSgOnkWH7q7ZXqfRlZa46U26hL6Ou--50i_Ts6uoVM1OHz3ZpPFNcmf6a0m4g21HB_B4K4KDh3wTNL4PWzPBFbaSibcI3NbAHxvepNkxAebUUgmqJYZKTKV3RxeswmbpB7ytQ6y1aVL2JYKz3yH7nG__FrOFsTTDoOzN-mnLWs7oHndJVaTaW0TRyIPlrLPsFLESoF4QwgJZlor3MoaCzPiY-XZ1maXqjROCenFwQ";
     // Independently signed test-only token under a second RSA key, deliberately
     // using the SAME kid. Its private key is not retained by these fixtures.
@@ -852,7 +942,7 @@ pub(in crate::providers) mod tests {
         JwtResourcePolicy::new(ISSUER, RESOURCE, Duration::from_secs(3600), Duration::ZERO).unwrap()
     }
 
-    pub(in crate::providers) fn jwks(kid: &str) -> Vec<u8> {
+    pub(crate) fn jwks(kid: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({"keys":[{
             "kty":"RSA", "alg":"RS256", "use":"sig", "kid":kid, "n":MODULUS, "e":"AQAB"
         }]}))
@@ -878,12 +968,12 @@ pub(in crate::providers) mod tests {
         JwtResourceVerifier::new(policy(), &jwks("one")).unwrap()
     }
 
-    pub(in crate::providers) fn claims(now: u64) -> Value {
+    pub(crate) fn claims(now: u64) -> Value {
         json!({"iss":ISSUER, "aud":RESOURCE, "sub":"alice", "client_id":"client-one",
             "iat":now - 10, "exp":now + 60, "jti":"test-token-one", "scope":"read write"})
     }
 
-    pub(in crate::providers) fn header() -> Value {
+    pub(crate) fn header() -> Value {
         json!({"alg":"RS256", "kid":"one", "typ":"at+jwt"})
     }
 
@@ -908,11 +998,52 @@ pub(in crate::providers) mod tests {
         }
     }
 
-    pub(in crate::providers) fn sign(header: &Value, claims: &Value) -> AccessToken {
+    pub(crate) fn sign(header: &Value, claims: &Value) -> AccessToken {
         sign_raw(
             &serde_json::to_vec(header).unwrap(),
             &serde_json::to_vec(claims).unwrap(),
         )
+    }
+
+    #[test]
+    fn jwt_key_retirement_revokes_retained_facts_without_changing_owner() {
+        let verifier = verifier();
+        let administrator = verifier.clone();
+        let token = sign(&header(), &claims(NOW));
+        let before = verifier
+            .verify_with_clock(&ctx(), &token, || Ok(NOW))
+            .unwrap();
+        let in_flight = verifier.prepare_verification(&ctx(), &token).unwrap();
+        assert!(before.verification_is_current());
+        assert!(administrator.replace_jwks(br#"{"keys":[]}"#).is_err());
+        assert!(before.verification_is_current());
+        administrator.replace_jwks(&jwks("one")).unwrap();
+        assert!(before.verification_is_revoked());
+        assert!(matches!(
+            verifier.admit_verified(&ctx(), in_flight, || Ok(NOW)),
+            Err(JwtResourceAuthError::KeysChanged)
+        ));
+        let after = verifier
+            .verify_with_clock(&ctx(), &token, || Ok(NOW))
+            .unwrap();
+        assert!(after.verification_is_current());
+        assert_eq!(before.session_owner(), after.session_owner());
+        assert!(administrator.revoke_all().unwrap());
+        assert!(after.verification_is_revoked());
+        assert!(!administrator.revoke_all().unwrap());
+        administrator.replace_jwks(&jwks("one")).unwrap();
+        let renewed = verifier
+            .verify_with_clock(&ctx(), &token, || Ok(NOW))
+            .unwrap();
+        assert_eq!(before.session_owner(), renewed.session_owner());
+        drop(administrator);
+        assert!(renewed.verification_is_current());
+        // A retained verification candidate cannot keep the administrative
+        // owner alive or prevent last-owner revocation of already returned facts.
+        let pending = verifier.prepare_verification(&ctx(), &token).unwrap();
+        drop(verifier);
+        assert!(renewed.verification_is_revoked());
+        assert!(pending.keys.cancellation.is_cancel_requested());
     }
 
     #[test]
@@ -2057,7 +2188,7 @@ pub(in crate::providers) mod tests {
         let token = sign(&header(), &claims(NOW));
         let candidate = installed.prepare_verification(&ctx(), &token).unwrap();
         let poisoned = std::panic::catch_unwind(|| {
-            let _guard = admin.keys.write().unwrap();
+            let _guard = admin.keys.active.write().unwrap();
             panic!("test-only registry poison");
         });
         assert!(poisoned.is_err());

@@ -562,6 +562,238 @@ fn https_native_enterprise_declaration_preserves_core_dispatch_without_rpc_descr
     });
 }
 
+#[cfg(feature = "enterprise-auth")]
+mod enterprise_resource {
+    use super::*;
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
+    use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
+    use fastmcp_server::auth::enterprise::{
+        ENTERPRISE_AUTHORIZATION_EXTENSION_ID, EnterpriseResourceConfiguration,
+        EnterpriseResourcePolicy,
+    };
+    use fastmcp_server::providers::jwt_resource::{AcceptedAudienceId, AcceptedAudiencePolicy};
+    use fastmcp_server::providers::{JwtResourcePolicy, JwtResourceVerifier};
+    use ring::rand::SystemRandom;
+    use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    // TEST ONLY: the same public fixture used by JwtResourceVerifier's signed
+    // known-answer tests. It is not related to the listener's TLS identity.
+    const SIGNING_KEY: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC3wxLvB3SX9fKLLBY8rXXENHK3d78DfxpG7Uq1q9RbtvOHs2m/iU4p0xqHeD35ZG4FGXdzhQWtfp4ydwdqd098z5JHMWyR5naVmF37sykkkNSyBKA6eRYfurtlep9GVlrjpTbqEvo6777nSL9Ozq6hUzU4fPdmk8U1yZ/prSbiDbUcH8HgrgoOHfBM0vg9bM8EVtpKJtwjc1sAfG96k2TEB5tRSCaolhkpMpXdHF6zCZukHvK1DrLVpUvYlgrPfIfucb/8Ws4WxNMOg7M36actazuged0lVpNpbRNHIg+Wss+wUsRKgXhDCAlmWivcyhoLM+Jj5dnWZpeqNE4J6cXBAgMBAAECgf9ofHL3lrWk8iPHHnpGZhrgRTI1P9FMm6jFS4d/ZQSKYax3LHyke94FyhL7lFMoywIDxEc3WBuyWpx49VUyJET+Ish50pB5JSGoTcqio2xxbiiCUD8LAG6j+/kx6ldGFzP23Koszj2Z5VgXCjY9CSgicr2AMQ47NSqdOtfCdsH1Jf4A2D8U6sLFR1FDKZVie5SiZC41/91897QyySDdxEO2bbxb4ZA47EBF+dfQyEXtXDJ34oBrncVepELv9B5hWu+Z4Uf5DK78Ww8NiU1U+bLVIL5yreK/UaHgVgEJQepTKAzTr4OMT0ZXTAZT5OfoMKmWbq6iQ5mukU8rLUg1xLECgYEA8g2q98V+XvyZQ5kFI/Skj6bxwbRw+mr0SbrWoCSP0VOV4gQ5ED7VnPwGFW8GPR3nqA4Rdx9qul7kttHQnEpbYgk4A2NTRzgqWeu0dfOS2+u+UB44SstamiZfxbNKzLHayJzPMZSZMq2fJhNs8FQtGa3ES3qRJavSOtB34meI4HECgYEAwlmY9AEthueuEaU4ZDHNeYaNwv+TO8QAixl6lj2vztTmVAAFOL7aXNWb+WCQ3SyyDkSty/Kk19e+e5s496keZLxUbyTsboP2LTu0H+45gIUkDAVp/ACXK5dOJT4Vj3jjPUuY9R3CxXvIUEDuzN2hmxTVOq7y53u71sYx5mRn4lECgYEAmNq8vp7/AKjveFqnfl89lGHOhY6XUew8vFq6soKkN4JbQlF8X5/ucaZNiTeFbw71fZD0wo8abPsD39d7r1bdgnlj3+/XZUA4rnREj7/zW+HxWtLapZDpdDMLg+OHNuCR0uIDjcHTRMeTmw3lW5csq+yp6yhJhMqOhgmjy1uqemECgYEAtNeWQYZPDLbL/FNW87R709bmVkpmgDhToRtmPCLOUpE8eXFDapf8rGF/rz6xzXxnemthpOL1jHqOHopDKgBN7cJodrtO3U8hZNmnNAcBrps0/ZKUGg+ams9BwdnRSh1cpY6Ql5THxeb2b+bbzfl1BM8P0nk0QT2bfbASgqVvHOECgYEA2D+89N+YGmI052k8Ow/QBjB/IBhO90syi3TvinbK4B2Y1wQDqt7f50lPvWzoUYFH0cq8RlroCou71gkiBxFnd7BFHVDFuyA24o7sPctQ322KMty/eSHXwQugJRRylNBXFvJXrIhfdiV+OvZ9NVXTESeVT0x5eGAI+1QTdjZCKiQ=";
+    const MODULUS: &str = "t8MS7wd0l_XyiywWPK11xDRyt3e_A38aRu1KtavUW7bzh7Npv4lOKdMah3g9-WRuBRl3c4UFrX6eMncHandPfM-SRzFskeZ2lZhd-7MpJJDUsgSgOnkWH7q7ZXqfRlZa46U26hL6Ou--50i_Ts6uoVM1OHz3ZpPFNcmf6a0m4g21HB_B4K4KDh3wTNL4PWzPBFbaSibcI3NbAHxvepNkxAebUUgmqJYZKTKV3RxeswmbpB7ytQ6y1aVL2JYKz3yH7nG__FrOFsTTDoOzN-mnLWs7oHndJVaTaW0TRyIPlrLPsFLESoF4QwgJZlor3MoaCzPiY-XZ1maXqjROCenFwQ";
+    const ISSUER: &str = "https://issuer.example/tenant";
+    const RESOURCE: &str = "https://localhost/mcp";
+    const AUDIENCE: &str = "urn:example:enterprise-api";
+
+    fn configuration(generation: u64) -> EnterpriseResourceConfiguration {
+        let endpoint = CanonicalHttpUrl::parse(RESOURCE).unwrap();
+        EnterpriseResourceConfiguration {
+            idp_issuer: "https://idp.example".to_owned(),
+            idp_token_endpoint: "https://idp.example/token".to_owned(),
+            resource_as_issuer: ISSUER.to_owned(),
+            resource_as_token_endpoint: "https://issuer.example/tenant/token".to_owned(),
+            resource: CanonicalResourceId::parse_for_endpoint(
+                RESOURCE,
+                &endpoint,
+                CanonicalResourceIdPolicy::default(),
+            )
+            .unwrap(),
+            policy_generation: generation,
+            idp_metadata_generation: generation,
+            resource_as_metadata_generation: generation,
+        }
+    }
+
+    fn documents() -> [Vec<u8>; 2] {
+        [
+            serde_json::to_vec(&json!({
+                "issuer":"https://idp.example", "token_endpoint":"https://idp.example/token",
+                "grant_types_supported":["urn:ietf:params:oauth:grant-type:token-exchange"],
+                "identity_chaining_requested_token_types_supported":["urn:ietf:params:oauth:token-type:id-jag"]
+            })).unwrap(),
+            serde_json::to_vec(&json!({
+                "issuer":ISSUER, "token_endpoint":"https://issuer.example/tenant/token",
+                "authorization_grant_profiles_supported":["urn:ietf:params:oauth:grant-profile:id-jag"],
+                "grant_types_supported":["urn:ietf:params:oauth:grant-type:jwt-bearer"]
+            })).unwrap(),
+        ]
+    }
+
+    fn verifier() -> JwtResourceVerifier {
+        let audiences = AcceptedAudiencePolicy::new(
+            ISSUER,
+            configuration(1).resource,
+            "enterprise-test-verifier",
+            "enterprise-test-deployment",
+            1,
+            [AcceptedAudienceId::new(AUDIENCE).unwrap()],
+        )
+        .unwrap();
+        let policy =
+            JwtResourcePolicy::new(ISSUER, RESOURCE, Duration::from_secs(3600), Duration::ZERO)
+                .unwrap()
+                .with_accepted_audiences(audiences)
+                .unwrap();
+        JwtResourceVerifier::new(
+            policy,
+            &serde_json::to_vec(&json!({"keys":[{
+                "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"enterprise-access",
+                "n":MODULUS, "e":"AQAB"
+            }]}))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn signed(typ: &str, issuer: &str, audience: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let key = RsaKeyPair::from_pkcs8(&STANDARD.decode(SIGNING_KEY).unwrap()).unwrap();
+        let header = json!({"alg":"RS256", "kid":"enterprise-access", "typ":typ});
+        let claims = json!({
+            "iss":issuer, "aud":audience, "sub":SUBJECT, "client_id":"enterprise-native-client",
+            "iat":now - 10, "exp":now + 300, "jti":"enterprise-native-test-token", "scope":"tools:read"
+        });
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let mut signature = vec![0_u8; 256];
+        key.sign(
+            &RSA_PKCS1_SHA256,
+            &SystemRandom::new(),
+            input.as_bytes(),
+            &mut signature,
+        )
+        .unwrap();
+        format!("Bearer {input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    fn declared(authorization: &str, settings: Option<Value>) -> HttpRequest {
+        let request = request(false).with_header("authorization", authorization);
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+        if let Some(settings) = settings {
+            body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"] =
+                json!({ENTERPRISE_AUTHORIZATION_EXTENSION_ID:settings});
+        }
+        request.with_body(serde_json::to_vec(&body).unwrap())
+    }
+
+    #[test]
+    fn https_native_enterprise_resource_enforces_signed_token_overlay_and_live_revocation() {
+        run(|cx| async move {
+            let documents = documents();
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let mut owner = EnterpriseResourcePolicy::new(
+                configuration(1),
+                &documents[0],
+                &documents[1],
+                deadline,
+                deadline,
+            )
+            .unwrap();
+            let provider = owner.provider(verifier()).unwrap();
+            let probe = Probe::new();
+            let server = Server::new("enterprise-resource", "1")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
+                .auth_provider(provider)
+                .tool(probe.clone())
+                .build();
+            let running = Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+            let token = signed("at+jwt", ISSUER, AUDIENCE);
+            let accepted = exchange(&cx, running.address, declared(&token, Some(json!({}))))
+                .await
+                .unwrap();
+            success(&decode_wire(&accepted), false);
+            assert_eq!(probe.effects.load(Ordering::SeqCst), 1);
+            for rejected in [
+                declared(&token, None),
+                declared(&token, Some(Value::Null)),
+                declared(&token, Some(json!({"enabled":true}))),
+                declared(
+                    &signed("oauth-id-jag+jwt", ISSUER, AUDIENCE),
+                    Some(json!({})),
+                ),
+                declared(&signed("JWT", ISSUER, AUDIENCE), Some(json!({}))),
+                declared(
+                    &signed("at+jwt", "https://idp.example", AUDIENCE),
+                    Some(json!({})),
+                ),
+                declared(
+                    &signed("at+jwt", ISSUER, "urn:example:another-api"),
+                    Some(json!({})),
+                ),
+            ] {
+                let rejected = exchange(&cx, running.address, rejected).await.unwrap();
+                assert_eq!(decode_wire(&rejected).status.0, 401);
+                assert_eq!(probe.effects.load(Ordering::SeqCst), 1);
+            }
+            let duplicate = declared(&token, Some(json!({})));
+            let body = String::from_utf8(duplicate.body.clone()).unwrap().replace(
+                "\"extensions\":{",
+                &format!("\"extensions\":{{\"{ENTERPRISE_AUTHORIZATION_EXTENSION_ID}\":{{}},"),
+            );
+            let rejected = exchange(&cx, running.address, duplicate.with_body(body.into_bytes()))
+                .await
+                .unwrap();
+            assert_eq!(decode_wire(&rejected).status.0, 400);
+            assert_eq!(probe.effects.load(Ordering::SeqCst), 1);
+
+            // A bad administrative refresh leaves the old policy operational.
+            assert!(
+                owner
+                    .replace(
+                        configuration(1),
+                        &documents[0],
+                        &documents[1],
+                        deadline,
+                        deadline
+                    )
+                    .is_err()
+            );
+            let recovered = exchange(&cx, running.address, declared(&token, Some(json!({}))))
+                .await
+                .unwrap();
+            success(&decode_wire(&recovered), false);
+            assert_eq!(probe.effects.load(Ordering::SeqCst), 2);
+            owner.revoke();
+            let revoked = exchange(&cx, running.address, declared(&token, Some(json!({}))))
+                .await
+                .unwrap();
+            assert_eq!(decode_wire(&revoked).status.0, 401);
+            assert_eq!(probe.effects.load(Ordering::SeqCst), 2);
+            owner
+                .replace(
+                    configuration(2),
+                    &documents[0],
+                    &documents[1],
+                    deadline,
+                    deadline,
+                )
+                .unwrap();
+            let renewed = exchange(&cx, running.address, declared(&token, Some(json!({}))))
+                .await
+                .unwrap();
+            success(&decode_wire(&renewed), false);
+            assert_eq!(probe.effects.load(Ordering::SeqCst), 3);
+            drop(owner);
+            let abandoned = exchange(&cx, running.address, declared(&token, Some(json!({}))))
+                .await
+                .unwrap();
+            assert_eq!(decode_wire(&abandoned).status.0, 401);
+            assert_eq!(probe.effects.load(Ordering::SeqCst), 3);
+            running.stop(&cx).await;
+        });
+    }
+}
+
 #[test]
 fn https_native_credential_and_origin_refusals_leave_handler_state_unchanged() {
     run(|cx| async move {

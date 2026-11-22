@@ -40,7 +40,7 @@ apps = ["fastmcp-protocol/apps", "fastmcp-console?/apps", "dep:html5ever"]
 # Typed, capability-restricted out-of-tree extension handlers. This does not
 # activate an extension without explicit installation and per-request negotiation.
 extension-authoring = []
-enterprise-auth = ["fastmcp-protocol/jose"]
+enterprise-auth = ["jwt-resource-auth"]
 oauth-client-credentials = ["fastmcp-protocol/jose"]
 builtin-auth-server = ["fastmcp-protocol/jose", "dep:argon2"]
 proxy = ["dep:fastmcp-client"]
