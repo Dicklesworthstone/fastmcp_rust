@@ -1043,7 +1043,10 @@ impl SchemaAdmissionError {
     /// Stable category without retaining the rejected schema or reference.
     #[must_use]
     pub fn code(&self) -> &'static str {
-        if self.reason == "unsupported schema dialect" {
+        if matches!(
+            self.reason,
+            "unsupported schema dialect" | "cross-dialect meta-schema traversal is unsupported"
+        ) {
             "UnsupportedSchemaDialect"
         } else if self.reason.contains("limit") || self.reason.contains("exceeds") {
             "SchemaResourceLimit"
@@ -1173,23 +1176,120 @@ impl FinalCoreResultType {
     }
 }
 
+struct SchemaDialectCheck<'a> {
+    schema: &'a Value,
+    dialect: &'a str,
+    path: String,
+}
+
+#[derive(Default)]
+struct SchemaAdmissionContext<'a> {
+    node_count: usize,
+    dialect_checks: Vec<SchemaDialectCheck<'a>>,
+}
+
 /// Validates a final-dialect schema before any caller uses it for tool input,
 /// tool output, or another final core schema-bearing field.
 ///
 /// The final wire boundary accepts only JSON Schema booleans or objects. A
-/// present `$schema` must identify the canonical Draft 2020-12 dialect, and
-/// every structural keyword consumed by this validator is checked before the
+/// present `$schema` must identify the canonical Draft 2020-12 dialect or a
+/// locally bundled meta-schema using the supported vocabulary. Every
+/// structural keyword consumed by this validator is checked before the
 /// schema can be retained. External references are refused rather than being
 /// interpreted as I/O authority. Under the canonical/default dialect, unknown
 /// keywords are retained as bounded annotations, never interpreted as schemas.
 /// Locally selected custom dialects retain their existing closed keyword policy.
+/// Each resource is also checked against its effective local meta-schema after
+/// structural admission. Resource lookup and evaluation share one work budget.
+/// A custom meta-schema cannot recursively inspect an embedded resource using
+/// a different dialect: this bounded evaluator refuses that traversal instead
+/// of applying the enclosing dialect's constraints to the embedded resource.
 pub fn admit_final_schema(schema: Value) -> Result<AdmittedSchema, SchemaAdmissionError> {
     bound_schema_document(&schema)?;
-    let mut node_count = 0;
-    validate_final_schema_node(&schema, &schema, "$", true, true, 0, &mut node_count)?;
+    let mut admission = SchemaAdmissionContext::default();
+    validate_final_schema_node(
+        &schema,
+        &schema,
+        "$",
+        true,
+        FINAL_JSON_SCHEMA_DIALECT,
+        0,
+        &mut admission,
+    )?;
     validate_unique_local_anchors(&schema, "$", 0, &mut HashSet::new())?;
     validate_unique_local_resource_ids(&schema, "$", 0, None, &mut HashSet::new())?;
+    validate_schema_dialect_checks(&schema, admission.dialect_checks)?;
     Ok(AdmittedSchema { schema })
+}
+
+fn validate_schema_dialect_checks<'a>(
+    root_schema: &'a Value,
+    checks: Vec<SchemaDialectCheck<'a>>,
+) -> Result<(), SchemaAdmissionError> {
+    let mut remaining_work = MAX_SCHEMA_VALIDATION_WORK;
+    for check in &checks {
+        if check.dialect == FINAL_JSON_SCHEMA_DIALECT {
+            continue;
+        }
+        // A new resource starts with empty reference and dynamic scopes, but
+        // consumes the same monotonic fuel remaining from earlier resources.
+        let mut context = ValidationContext::new(root_schema, true);
+        context.remaining_work = remaining_work;
+        let mut charge = || {
+            if context.consume_work() {
+                Ok(())
+            } else {
+                Err("schema meta-validation work limit exceeded")
+            }
+        };
+        let meta_schema =
+            find_local_schema_resource_with_charge(root_schema, check.dialect, &mut charge)
+                .map_err(|reason| SchemaAdmissionError::new(&check.path, reason))?
+                .ok_or_else(|| {
+                    SchemaAdmissionError::new(&check.path, "unsupported schema dialect")
+                })?;
+        context.meta_validation = Some(MetaSchemaValidationScope {
+            resource: check.schema,
+            dialect: check.dialect,
+            resources: &checks,
+        });
+
+        // Keep the entire admitted document as the reference-resolution root.
+        // A selected meta-schema can refer to its own resource or a sibling;
+        // validating a detached clone would change those reference identities.
+        // Do not call admission recursively: self-describing dialects are
+        // finite validation inputs, while evaluation cycles use the ordinary
+        // reference/depth limits and cannot acquire a fresh work budget.
+        let result = validate_with_context(meta_schema, check.schema, &mut context);
+        let limited = context.work_exhausted
+            || context.pattern_input_exceeded
+            || context.recursion_limit_exceeded.is_some()
+            || result.as_ref().err().is_some_and(|issues| {
+                issues.iter().any(|issue| issue.code() == "SchemaResourceLimit")
+            });
+        if limited {
+            return Err(SchemaAdmissionError::new(
+                &check.path,
+                "schema meta-validation resource limit exceeded",
+            ));
+        }
+        // Speculative branches discard ordinary mismatches. They must never
+        // turn an unsupported resource boundary into successful admission.
+        if context.unsupported_meta_resource {
+            return Err(SchemaAdmissionError::new(
+                &check.path,
+                "cross-dialect meta-schema traversal is unsupported",
+            ));
+        }
+        if result.is_err() {
+            return Err(SchemaAdmissionError::new(
+                &check.path,
+                "schema does not satisfy its declared dialect",
+            ));
+        }
+        remaining_work = context.remaining_work;
+    }
+    Ok(())
 }
 
 pub(crate) fn bound_schema_document(schema: &Value) -> Result<(), SchemaAdmissionError> {
@@ -1437,14 +1537,14 @@ pub fn validate_final_core_result(
     }
 }
 
-fn validate_final_schema_node(
-    schema: &Value,
+fn validate_final_schema_node<'a>(
+    schema: &'a Value,
     root_schema: &Value,
     path: &str,
     root: bool,
-    unknown_annotations: bool,
+    inherited_dialect: &'a str,
     depth: usize,
-    node_count: &mut usize,
+    admission: &mut SchemaAdmissionContext<'a>,
 ) -> Result<(), SchemaAdmissionError> {
     if depth >= MAX_SCHEMA_VALIDATION_DEPTH {
         return Err(SchemaAdmissionError::new(
@@ -1452,8 +1552,8 @@ fn validate_final_schema_node(
             "schema admission nesting limit exceeded",
         ));
     }
-    *node_count += 1;
-    if *node_count > MAX_SCHEMA_ADMISSION_NODES {
+    admission.node_count += 1;
+    if admission.node_count > MAX_SCHEMA_ADMISSION_NODES {
         return Err(SchemaAdmissionError::new(
             path,
             "schema admission node limit exceeded",
@@ -1466,17 +1566,33 @@ fn validate_final_schema_node(
         .as_object()
         .ok_or_else(|| SchemaAdmissionError::new(path, "schema must be an object or boolean"))?;
 
-    // A selected custom meta-schema may impose a closed keyword contract.
-    // Preserve that existing restriction until custom-dialect admission also
-    // enforces its complete meta-schema; do not infer it from $vocabulary alone.
+    // Preserve the selected dialect's keyword policy through ordinary
+    // subschemas. A resource can explicitly select the canonical dialect;
+    // $vocabulary alone never changes the inherited dialect.
     let unknown_annotations = object
         .get("$schema")
-        .map_or(unknown_annotations, |dialect| {
+        .map_or(inherited_dialect == FINAL_JSON_SCHEMA_DIALECT, |dialect| {
             dialect.as_str() == Some(FINAL_JSON_SCHEMA_DIALECT)
         });
     validate_supported_schema_keywords(object, path, root, unknown_annotations)?;
     validate_schema_id_keyword(object, path)?;
     validate_schema_dialect_keyword(object, root_schema, path)?;
+
+    let dialect = object
+        .get("$schema")
+        .and_then(Value::as_str)
+        .unwrap_or(inherited_dialect);
+    if root || object.contains_key("$id") {
+        // Retain borrowed resource identities, not clones. All structural
+        // checks and duplicate-resource checks finish before these run.
+        // Ordinary subschemas are governed by the meta-schema's applicators;
+        // an embedded resource separately inherits or declares its dialect.
+        admission.dialect_checks.push(SchemaDialectCheck {
+            schema,
+            dialect,
+            path: bounded_diagnostic_path(&format!("{path}.$schema"), "$"),
+        });
+    }
 
     validate_local_reference_keyword(object, "$ref", root_schema, path)?;
     validate_local_reference_keyword(object, "$dynamicRef", root_schema, path)?;
@@ -1525,7 +1641,12 @@ fn validate_final_schema_node(
     validate_boolean_keywords(object, path, &["uniqueItems"])?;
     validate_enum_keyword(object, path)?;
     if let Some(value) = object.get("const") {
-        validate_exact_equality_value(value, &format!("{path}.const"), depth + 1, node_count)?;
+        validate_exact_equality_value(
+            value,
+            &format!("{path}.const"),
+            depth + 1,
+            &mut admission.node_count,
+        )?;
     }
     if let Some(values) = object.get("enum").and_then(Value::as_array) {
         for (index, value) in values.iter().enumerate() {
@@ -1533,7 +1654,7 @@ fn validate_final_schema_node(
                 value,
                 &format!("{path}.enum[{index}]"),
                 depth + 1,
-                node_count,
+                &mut admission.node_count,
             )?;
         }
     }
@@ -1589,9 +1710,9 @@ fn validate_final_schema_node(
                     root_schema,
                     &diagnostic_schema_member_path(path, keyword, name),
                     false,
-                    unknown_annotations,
+                    dialect,
                     depth + 1,
-                    node_count,
+                    admission,
                 )?;
             }
         }
@@ -1616,9 +1737,9 @@ fn validate_final_schema_node(
                 root_schema,
                 &format!("{path}.{keyword}"),
                 false,
-                unknown_annotations,
+                dialect,
                 depth + 1,
-                node_count,
+                admission,
             )?;
         }
     }
@@ -1651,9 +1772,9 @@ fn validate_final_schema_node(
                     root_schema,
                     &format!("{path}.{keyword}[{index}]"),
                     false,
-                    unknown_annotations,
+                    dialect,
                     depth + 1,
-                    node_count,
+                    admission,
                 )?;
             }
         }
@@ -3043,8 +3164,17 @@ fn validate_with_schema_features(
     value: &Value,
     enforce_unevaluated_properties: bool,
 ) -> ValidationResult {
-    let mut errors = Vec::new();
     let mut context = ValidationContext::new(schema, enforce_unevaluated_properties);
+    validate_with_context(schema, value, &mut context)
+}
+
+fn validate_with_context<'a>(
+    schema: &'a Value,
+    value: &Value,
+    context: &mut ValidationContext<'a>,
+) -> ValidationResult {
+    let enforce_unevaluated_properties = context.enforce_unevaluated_properties;
+    let mut errors = Vec::new();
     let mut instance_nodes = 0;
     let mut instance_string_work = 0;
     if !validate_instance_bounds(
@@ -3068,10 +3198,10 @@ fn validate_with_schema_features(
         } else {
             0
         };
-    if !consume_required_work_units(&mut context, preflight_work, "root", &mut errors) {
+    if !consume_required_work_units(context, preflight_work, "root", &mut errors) {
         return Err(errors);
     }
-    validate_internal(schema, value, "root", &mut errors, &mut context);
+    validate_internal(schema, value, "root", &mut errors, context);
     if context.work_exhausted
         && !errors
             .iter()
@@ -3214,6 +3344,13 @@ fn make_strict_schema(schema: &Value) -> Value {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MetaSchemaValidationScope<'a> {
+    resource: &'a Value,
+    dialect: &'a str,
+    resources: &'a [SchemaDialectCheck<'a>],
+}
+
 struct ValidationContext<'a> {
     root_schema: &'a Value,
     schema_depth: usize,
@@ -3224,6 +3361,8 @@ struct ValidationContext<'a> {
     pattern_input_exceeded: bool,
     recursion_limit_exceeded: Option<&'static str>,
     enforce_unevaluated_properties: bool,
+    meta_validation: Option<MetaSchemaValidationScope<'a>>,
+    unsupported_meta_resource: bool,
 }
 
 impl<'a> ValidationContext<'a> {
@@ -3238,6 +3377,8 @@ impl<'a> ValidationContext<'a> {
             pattern_input_exceeded: false,
             recursion_limit_exceeded: None,
             enforce_unevaluated_properties,
+            meta_validation: None,
+            unsupported_meta_resource: false,
         }
     }
 
@@ -3248,6 +3389,28 @@ impl<'a> ValidationContext<'a> {
         };
         self.remaining_work = remaining_work;
         true
+    }
+
+    fn meta_resource_error(&mut self, value: &Value) -> Option<&'static str> {
+        let scope = self.meta_validation?;
+        if std::ptr::eq(value, scope.resource) || value.get("$id").is_none() {
+            return None;
+        }
+        for resource in scope.resources {
+            if !self.consume_work() {
+                return Some("schema validation work limit exceeded");
+            }
+            // Only the structural admission walk establishes resource roots.
+            // An annotation containing an identical $id remains ordinary data.
+            if std::ptr::eq(value, resource.schema) {
+                if resource.dialect != scope.dialect {
+                    self.unsupported_meta_resource = true;
+                    return Some("cross-dialect meta-schema traversal is unsupported");
+                }
+                return None;
+            }
+        }
+        None
     }
 
     fn enter_schema(&mut self) -> bool {
@@ -3589,6 +3752,12 @@ fn validate_internal<'a>(
         context.leave_schema();
         return; // Invalid schema, skip validation
     };
+
+    if let Some(reason) = context.meta_resource_error(value) {
+        push_error(errors, path, reason);
+        context.leave_schema();
+        return;
+    }
 
     // Check type constraint
     if let Some(type_val) = schema_obj.get("type") {
@@ -8245,6 +8414,329 @@ mod tests {
         let mut dialect = source;
         dialect["$schema"] = json!("https://schemas.example/annotation");
         assert!(admit_final_schema(dialect).is_err());
+    }
+
+    fn custom_dialect_annotated_schema() -> Value {
+        json!({
+            "$id": "https://schemas.example.test/annotated",
+            "$schema": "https://schemas.example.test/meta",
+            "$defs": {"meta": {
+                "$id": "https://schemas.example.test/meta",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "$vocabulary": {
+                    CORE_VOCABULARY_URI: true,
+                    APPLICATOR_VOCABULARY_URI: true,
+                    VALIDATION_VOCABULARY_URI: true
+                },
+                "type": "object",
+                "properties": {"default": {
+                    "type": "object",
+                    "properties": {"label": {"const": "approved"}},
+                    "required": ["label"]
+                }},
+                "required": ["default"]
+            }},
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "default": {
+                "$id": "https://schemas.example.test/meta",
+                "label": "approved", "type": 17
+            }
+        })
+    }
+
+    #[test]
+    fn admitted_custom_dialect_meta_schema_positive() {
+        let source = custom_dialect_annotated_schema();
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert_eq!(admitted.schema(), &source);
+        assert!(admitted.validate(&json!({"value": 3})).is_ok());
+        assert!(admitted.validate(&json!({"value": "3"})).is_err());
+        assert_eq!(admitted.schema()["default"]["type"], 17);
+    }
+
+    #[test]
+    fn admitted_custom_dialect_meta_schema_planted_negative() {
+        let source = custom_dialect_annotated_schema();
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        let mut planted = source.clone();
+        let secret = "private-schema-default-canary";
+        planted["default"]["label"] = json!(secret);
+        let error = admit_final_schema(planted)
+            .expect_err("an annotation that violates the declared meta-schema must not admit");
+        assert_eq!(error.code(), "InvalidSchema");
+        assert_eq!(error.path(), "$.$schema");
+        assert_eq!(error.reason(), "schema does not satisfy its declared dialect");
+        assert!(!format!("{error} {error:?}").contains(secret));
+        assert_eq!(admitted.schema(), &source);
+        assert!(admitted.validate(&json!({"value": 3})).is_ok());
+
+        let mut rejecting_meta = source;
+        rejecting_meta["$defs"]["meta"]["const"] = json!(false);
+        assert_eq!(
+            admit_final_schema(rejecting_meta).unwrap_err().code(),
+            "InvalidSchema"
+        );
+    }
+
+    #[test]
+    fn admitted_custom_dialect_meta_references_keep_original_resource_scope() {
+        let source = json!({
+            "$id": "https://schemas.example.test/root",
+            "$schema": "https://schemas.example.test/meta",
+            "$defs": {
+                "meta": {
+                    "$id": "meta", "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                    "$ref": "constraints#/$defs/rule"
+                },
+                "constraints": {
+                    "$id": "constraints", "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                    "$defs": {"rule": {
+                        "type": "object",
+                        "properties": {"title": {"const": "approved"}},
+                        "required": ["title"]
+                    }}
+                }
+            },
+            "type": "object", "title": "approved"
+        });
+        let admitted = admit_final_schema(source.clone())
+            .expect("relative sibling resources resolve from the complete schema document");
+        assert_eq!(admitted.schema(), &source);
+        assert!(admitted.validate(&json!({})).is_ok());
+        let mut planted = source;
+        planted["title"] = json!("refused");
+        assert_eq!(
+            admit_final_schema(planted).unwrap_err().reason(),
+            "schema does not satisfy its declared dialect"
+        );
+    }
+
+    #[test]
+    fn admitted_custom_dialect_meta_constraints_follow_resource_inheritance() {
+        let source = json!({
+            "$id": "https://schemas.example.test/root",
+            "$schema": "https://schemas.example.test/meta",
+            "$defs": {"meta": {
+                "$id": "https://schemas.example.test/meta",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "type": "object",
+                "properties": {"title": {"type": "string", "minLength": 3}},
+                "required": ["title"]
+            }},
+            "type": "object", "title": "root",
+            "properties": {"value": {
+                "$id": "child", "type": "integer", "title": "child"
+            }}
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!({"value": 3})).is_ok());
+
+        let mut planted = source;
+        planted["properties"]["value"]["title"] = json!("x");
+        let error = admit_final_schema(planted.clone())
+            .expect_err("an embedded resource inherits its enclosing custom dialect");
+        assert_eq!(error.code(), "InvalidSchema");
+        assert_eq!(error.path(), "$.properties.value.$schema");
+
+        planted["properties"]["value"]["$schema"] = json!(FINAL_JSON_SCHEMA_DIALECT);
+        let reset = admit_final_schema(planted)
+            .expect("an explicit canonical dialect resets inherited meta constraints");
+        assert!(reset.validate(&json!({"value": 3})).is_ok());
+        assert!(reset.validate(&json!({"value": "3"})).is_err());
+    }
+
+    fn recursive_custom_dialect_schema(reference_keyword: &str) -> Value {
+        json!({
+            "$id": "https://schemas.example.test/root",
+            "$schema": "https://schemas.example.test/meta",
+            "$defs": {"meta": {
+                "$id": "https://schemas.example.test/meta",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "$dynamicAnchor": "meta",
+                "type": "object",
+                "required": ["title"],
+                "properties": {"properties": {
+                    "type": "object",
+                    "additionalProperties": {reference_keyword: "#meta"}
+                }}
+            }},
+            "type": "object", "title": "root",
+            "properties": {"value": {
+                "$id": "child", "type": "integer", "title": "child"
+            }}
+        })
+    }
+
+    #[test]
+    fn admitted_custom_dialect_recursive_resource_boundaries_fail_closed() {
+        for reference_keyword in ["$ref", "$dynamicRef"] {
+            let source = recursive_custom_dialect_schema(reference_keyword);
+            let admitted = admit_final_schema(source.clone())
+                .expect("same-dialect resources support recursive meta validation");
+            assert_eq!(admitted.schema(), &source);
+            assert!(admitted.validate(&json!({"value": 3})).is_ok());
+            assert!(admitted.validate(&json!({"value": "3"})).is_err());
+
+            let mut mixed = source.clone();
+            mixed["properties"]["value"]["$schema"] = json!(FINAL_JSON_SCHEMA_DIALECT);
+            mixed["properties"]["value"]
+                .as_object_mut()
+                .unwrap()
+                .remove("title");
+            let error = admit_final_schema(mixed)
+                .expect_err("mixed-dialect recursive meta traversal is explicitly unsupported");
+            assert_eq!(error.code(), "UnsupportedSchemaDialect");
+            assert_eq!(error.path(), "$.$schema");
+            assert_eq!(
+                error.reason(),
+                "cross-dialect meta-schema traversal is unsupported"
+            );
+
+            let mut inherited = source;
+            inherited["properties"]["value"]
+                .as_object_mut()
+                .unwrap()
+                .remove("title");
+            assert_eq!(
+                admit_final_schema(inherited).unwrap_err().code(),
+                "InvalidSchema"
+            );
+            assert!(admitted.validate(&json!({"value": 3})).is_ok());
+        }
+    }
+
+    #[test]
+    fn admitted_custom_dialect_resource_boundary_refusal_survives_branch_probes() {
+        for branch_keyword in ["anyOf", "not"] {
+            let mut source = recursive_custom_dialect_schema("$dynamicRef");
+            source["properties"]["value"]["$schema"] = json!(FINAL_JSON_SCHEMA_DIALECT);
+            let meta = source["$defs"]["meta"].as_object_mut().unwrap();
+            let recursive_properties = meta.remove("properties").unwrap();
+            let probe = json!({"properties": recursive_properties});
+            meta.insert(
+                branch_keyword.to_owned(),
+                if branch_keyword == "anyOf" {
+                    json!([probe, true])
+                } else {
+                    probe
+                },
+            );
+            let error = admit_final_schema(source)
+                .expect_err("a speculative mismatch cannot authorize an unsupported traversal");
+            assert_eq!(error.code(), "UnsupportedSchemaDialect");
+            assert_eq!(
+                error.reason(),
+                "cross-dialect meta-schema traversal is unsupported"
+            );
+        }
+
+        let mut direct_false = recursive_custom_dialect_schema("$ref");
+        direct_false["properties"]["value"]["$schema"] = json!(FINAL_JSON_SCHEMA_DIALECT);
+        direct_false["$defs"]["meta"]["properties"]["properties"]["additionalProperties"] =
+            json!(false);
+        assert_eq!(
+            admit_final_schema(direct_false).unwrap_err().code(),
+            "InvalidSchema",
+            "resource identity must not bypass a literal rejecting constraint"
+        );
+
+        let mut limited = recursive_custom_dialect_schema("$ref");
+        limited["properties"]["value"]["$schema"] = json!(FINAL_JSON_SCHEMA_DIALECT);
+        let meta = limited["$defs"]["meta"].as_object_mut().unwrap();
+        let recursive_properties = meta.remove("properties").unwrap();
+        meta.insert(
+            "anyOf".to_owned(),
+            json!([
+                {"properties": recursive_properties},
+                {"$ref": "#"}
+            ]),
+        );
+        assert_eq!(
+            admit_final_schema(limited).unwrap_err().code(),
+            "SchemaResourceLimit",
+            "exhausted work or recursion takes precedence over a crossed resource boundary"
+        );
+    }
+
+    #[test]
+    fn admitted_custom_dialect_self_description_does_not_reenter_admission() {
+        let source = json!({
+            "$id": "https://schemas.example.test/self-meta",
+            "$schema": "https://schemas.example.test/self-meta",
+            "type": "object",
+            "properties": {"type": {"const": "object"}},
+            "required": ["type"]
+        });
+        let admitted = admit_final_schema(source.clone())
+            .expect("a self-describing schema is one bounded meta-validation input");
+        assert_eq!(admitted.schema(), &source);
+        assert!(admitted.validate(&json!({"type": "object"})).is_ok());
+        assert!(admitted.validate(&json!({"type": "string"})).is_err());
+    }
+
+    #[test]
+    fn admitted_custom_dialect_meta_evaluation_cycles_fail_closed() {
+        let source = json!({
+            "$id": "https://schemas.example.test/root",
+            "$schema": "https://schemas.example.test/meta",
+            "$defs": {"meta": {
+                "$id": "https://schemas.example.test/meta",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "$defs": {"rule": {"type": "object"}},
+                "$ref": "#/$defs/rule"
+            }},
+            "type": "object"
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!({})).is_ok());
+        let mut planted = source;
+        planted["$defs"]["meta"]["$ref"] = json!("#");
+        let error = admit_final_schema(planted)
+            .expect_err("a meta-schema evaluation cycle cannot become successful admission");
+        assert_eq!(error.code(), "SchemaResourceLimit");
+        assert_eq!(error.path(), "$.$schema");
+        assert_eq!(error.reason(), "schema meta-validation resource limit exceeded");
+        assert!(admitted.validate(&json!({})).is_ok());
+    }
+
+    fn shared_meta_schema_resource_document(count: usize) -> Value {
+        let mut definitions = serde_json::Map::new();
+        for index in 0..count {
+            definitions.insert(
+                format!("item_{index:03}"),
+                json!({
+                    "$id": format!("item_{index}"),
+                    "$schema": "https://schemas.example.test/shared-meta",
+                    "type": "object"
+                }),
+            );
+        }
+        definitions.insert(
+            "zz_meta".to_owned(),
+            json!({
+                "$id": "https://schemas.example.test/shared-meta",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "type": "object"
+            }),
+        );
+        json!({
+            "$id": "https://schemas.example.test/root",
+            "type": "object",
+            "$defs": definitions
+        })
+    }
+
+    #[test]
+    fn admitted_custom_dialect_meta_resources_share_one_work_budget() {
+        let admitted = admit_final_schema(shared_meta_schema_resource_document(60))
+            .expect("bounded custom resources fit the shared lookup and validation budget");
+        assert!(admitted.validate(&json!({})).is_ok());
+        let error = admit_final_schema(shared_meta_schema_resource_document(61))
+            .expect_err("resource fan-out must not refresh the meta-validation budget");
+        assert_eq!(error.code(), "SchemaResourceLimit");
+        assert!(admitted.validate(&json!({})).is_ok());
     }
 
     #[test]
