@@ -2256,10 +2256,17 @@ mod native_tests {
                 );
                 if mode == "empty" {
                     let mut byte = [0_u8; 1];
-                    assert_eq!(
-                        events.read(&mut byte).unwrap(),
-                        0,
-                        "empty acceptance must release the listener before fallback"
+                    let closed = events.read(&mut byte);
+                    // Abandoning an incomplete SSE exchange resets the socket
+                    // so the peer cannot mistake teardown for a request half-close.
+                    assert!(
+                        matches!(closed, Ok(0))
+                            || matches!(&closed, Err(error) if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            )),
+                        "empty acceptance must release the listener before fallback: {closed:?}"
                     );
                 }
                 let (mut stream, _) = watch_request(&listener, "tasks/get", 4);
