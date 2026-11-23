@@ -3118,15 +3118,29 @@ record, claim, owner, dispatch fence, cancellation disposition, and execution
 budgets while enforcing the existing quotas and input-history rules.
 
 Pending reads and unadmitted writes observe caller cancellation and deadlines.
-Once a write may have committed, the framework settles that original
-operation; a validated commit receipt survives late cancellation or policy
-revocation. A notification-delivery failure cannot undo it. The bounded
+Each elected handoff admits at most one pending asynchronous mutation. Once a
+write may have committed, a framework-owned slot retains that provider
+operation independently of the application's observing future. Cancellation,
+revocation, execution expiry, and application drop cannot discard its pending
+receipt. During shutdown the framework closes application admission before
+settling the provider alone; it does not resume application code merely to
+learn whether a write committed.
+
+A validated commit receipt survives late cancellation or policy revocation,
+and a notification-delivery failure cannot undo it. Working-status receipts
+preserve the live claim; terminal and input-required receipts consume it.
+An ambiguous admitted error, invalid receipt, or provider panic leaves an
+uncertain outcome. The framework suppresses restoration of that invocation
+as though rollback were established; reconcile the exact fenced operation
+before retrying it. Providers must settle their original operation and must
+not leave detached writes running after returning. The bounded
 `retention_clock_now` hook must remain nonblocking and perform no storage I/O.
 
 The built-in in-memory store uses bounded synchronous defaults for these
-hooks. Service recovery, lease maintenance, and execution-guard cleanup still
-use their existing bounded synchronous interfaces. These worker transitions
-do not provide restart persistence or a fully asynchronous Task service.
+hooks. Service recovery, claim election, lease maintenance, and final store
+cleanup still use their existing bounded synchronous interfaces. These worker
+transitions do not provide restart persistence or a fully asynchronous Task
+service.
 
 ### Tasks retention administration
 

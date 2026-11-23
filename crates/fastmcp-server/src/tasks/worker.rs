@@ -8,10 +8,13 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use std::task::Poll;
+use std::task::{Context, Poll, Waker};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod custody_tests;
 
 /// Sealed authority for one asynchronous mutation by an elected Task worker.
 ///
@@ -21,17 +24,21 @@ mod tests;
 /// its write. Call [`Self::checkpoint_before_write`] immediately before the
 /// first irreversible write, including after any suspension. Once admitted,
 /// settle the original operation and its exact receipt; cancellation alone
-/// cannot establish that nothing committed.
+/// cannot establish that nothing committed. Framework custody retains one
+/// admitted provider future independently of the application future and polls
+/// only that provider after application execution stops. Providers must settle
+/// their original operation without leaving detached writes running.
 ///
 /// This value cannot be constructed or cloned by application code. Its context
 /// carries the worker's caller-owned `Cx`, not a retained ingress credential.
 pub struct FinalTaskWorkerAdmission<'a> {
-    authority: &'a FinalTaskHandoffAuthority,
+    authority: &'a WorkerAuthority,
     ctx: &'a McpContext,
     expected: &'a FinalTaskSnapshot,
     metadata: &'a FinalTaskAccessMetadata,
     cancellation_required: bool,
     write_admitted: &'a AtomicBool,
+    abort: &'a AtomicBool,
 }
 
 impl<'a> FinalTaskWorkerAdmission<'a> {
@@ -76,6 +83,9 @@ impl<'a> FinalTaskWorkerAdmission<'a> {
     /// No storage I/O is performed here. The backend must independently compare
     /// the record, owner, fence, cancellation and budgets in its transaction.
     pub fn checkpoint_before_write(&self) -> McpResult<()> {
+        if self.abort.load(TaskServiceOrdering::Acquire) {
+            return Err(McpError::request_cancelled());
+        }
         if self
             .authority
             .transition_committed
@@ -191,7 +201,37 @@ impl FinalTaskAcceptedInput {
     asynchronous_worker_methods!();
 }
 
-impl FinalTaskHandoffAuthority {
+/// Owned authorization facts only. The provider slot is deliberately excluded
+/// so retaining an in-flight provider cannot form an Arc cycle through itself.
+struct WorkerAuthority {
+    runtime: FinalTaskRuntime,
+    task_id: FinalTaskId,
+    generation: u64,
+    owner_id: String,
+    dispatch_fence: u64,
+    transition_committed: Arc<AtomicBool>,
+    execution_budget: FinalTaskExecutionBudget,
+    execution_authorization: FinalTaskAccessMetadata,
+    execution_revoked: Arc<AtomicBool>,
+    application_closed: Arc<AtomicBool>,
+}
+
+impl WorkerAuthority {
+    fn capture(authority: &FinalTaskHandoffAuthority) -> Self {
+        Self {
+            runtime: authority.runtime.clone(),
+            task_id: authority.task_id.clone(),
+            generation: authority.generation,
+            owner_id: authority.owner_id.clone(),
+            dispatch_fence: authority.dispatch_fence,
+            transition_committed: Arc::clone(&authority.transition_committed),
+            execution_budget: authority.execution_budget,
+            execution_authorization: authority.execution_authorization.clone(),
+            execution_revoked: Arc::clone(&authority.execution_revoked),
+            application_closed: Arc::clone(&authority.pending_write.application_closed),
+        }
+    }
+
     /// A current policy decision is separate from the backend's atomic fence.
     /// Policy callbacks are bounded and synchronous by their public contract.
     fn authorize_worker(
@@ -199,6 +239,9 @@ impl FinalTaskHandoffAuthority {
         ctx: &McpContext,
         metadata: &FinalTaskAccessMetadata,
     ) -> McpResult<()> {
+        if self.application_closed.load(TaskServiceOrdering::Acquire) {
+            return Err(McpError::request_cancelled());
+        }
         ctx.ensure_live()
             .map_err(|_| McpError::request_cancelled())?;
         let now = self.runtime.retention_clock_now();
@@ -324,97 +367,127 @@ impl FinalTaskHandoffAuthority {
         }
         Ok((metadata, snapshot))
     }
+}
 
+impl FinalTaskHandoffAuthority {
     fn mutate_with_cx<'a>(
         &'a self,
         cx: &'a Cx,
         mutation: WorkerMutation,
     ) -> impl Future<Output = McpResult<FinalTask>> + Send + 'a {
         CallerContextFuture::new(cx, async move {
-            let ctx = McpContext::new(cx.clone(), 0);
+            // Capture the effective caller after the public wrapper intersects
+            // its authority with the polling host, including resumed limits.
+            let caller = Cx::current().ok_or_else(|| {
+                McpError::internal_error("Task worker has no installed caller")
+            })?;
+            let ctx = Arc::new(McpContext::new(caller, 0));
+            let authority = Arc::new(WorkerAuthority::capture(self));
             if self.transition_committed.load(TaskServiceOrdering::Acquire) {
                 return Err(stale_final_task_handoff_error());
             }
             let status_only = matches!(&mutation, WorkerMutation::Status(_));
             let cancellation_required = matches!(&mutation, WorkerMutation::Cancel(_));
-            let (metadata, current) = self.load_worker_snapshot(&ctx).await?;
+            let (metadata, current) = authority.load_worker_snapshot(&ctx).await?;
             let task = prepare_worker_transition(&current, mutation)?;
             let notification = final_task_notification(&task);
             self.runtime
                 .validate_task_transition_write(&current, &task, &notification)?;
-            self.authorize_worker(&ctx, &metadata)?;
-            let write_admitted = AtomicBool::new(false);
-            let admission = FinalTaskWorkerAdmission {
-                authority: self,
-                ctx: &ctx,
-                expected: &current,
-                metadata: &metadata,
-                cancellation_required,
-                write_admitted: &write_admitted,
-            };
-            let operation = if status_only {
-                self.runtime
-                    .store
-                    .update_working_status_for_handoff_with_context(
-                        admission,
-                        task.clone(),
-                        notification.clone(),
-                    )
-            } else {
-                self.runtime
-                    .store
-                    .replace_task_and_clear_input_for_handoff_with_context(
-                        admission,
-                        task.clone(),
-                        notification.clone(),
-                    )
-            };
-            let outcome = await_worker_write(
-                &ctx,
-                self.wait_deadline(&ctx),
-                operation,
-                &write_admitted,
-                || self.authorize_worker(&ctx, &metadata),
-            )
-            .await;
-            let returned = match outcome {
-                Ok(Some(committed)) => {
-                    if !write_admitted.load(TaskServiceOrdering::Acquire) {
-                        return Err(McpError::internal_error(
-                            "Task store returned an unadmitted worker mutation",
-                        ));
+            authority.authorize_worker(&ctx, &metadata)?;
+            // Reserve before invoking a provider factory. This owned future
+            // survives the observing application future being dropped.
+            let write = self.pending_write.reserve()?;
+            let observer = WorkerWriteObserver(Arc::clone(&write));
+            let write_admitted = Arc::clone(&write.admitted);
+            let abort = Arc::clone(&write.abort);
+            let uncertain = Arc::clone(&self.pending_write.uncertain);
+            let provider_ctx = Arc::clone(&ctx);
+            let provider_authority = Arc::clone(&authority);
+            let provider_notification = notification.clone();
+            let future = CallerContextFuture::new(ctx.cx(), async move {
+                let authorize = || {
+                    if abort.load(TaskServiceOrdering::Acquire) {
+                        return Err(McpError::request_cancelled());
                     }
-                    committed
-                }
-                Ok(None) => {
-                    self.authorize_worker(&ctx, &metadata)?;
-                    return Err(stale_final_task_handoff_error());
-                }
-                Err(error) => {
-                    if write_admitted.load(TaskServiceOrdering::Acquire)
-                        && (ctx.ensure_live().is_err()
-                            || self.execution_revoked.load(TaskServiceOrdering::Acquire)
-                            || error.code == McpError::request_cancelled().code)
-                    {
-                        return Err(McpError::internal_error(
-                            "Task worker mutation may have committed; reconcile its original Task before retrying",
-                        ));
+                    provider_authority.authorize_worker(&provider_ctx, &metadata)
+                };
+                authorize()?;
+                let admission = FinalTaskWorkerAdmission {
+                    authority: &provider_authority,
+                    ctx: &provider_ctx,
+                    expected: &current,
+                    metadata: &metadata,
+                    cancellation_required,
+                    write_admitted: &write_admitted,
+                    abort: &abort,
+                };
+                let operation = if status_only {
+                    provider_authority.runtime.store.update_working_status_for_handoff_with_context(
+                        admission, task.clone(), provider_notification,
+                    )
+                } else {
+                    provider_authority.runtime.store.replace_task_and_clear_input_for_handoff_with_context(
+                        admission, task.clone(), provider_notification,
+                    )
+                };
+                let outcome = await_worker_write(
+                    &provider_ctx,
+                    provider_authority.wait_deadline(&provider_ctx),
+                    operation,
+                    &write_admitted,
+                    &authorize,
+                ).await;
+                let returned = match outcome {
+                    Ok(Some(committed)) => {
+                        if !write_admitted.load(TaskServiceOrdering::Acquire) {
+                            uncertain.store(true, TaskServiceOrdering::Release);
+                            return Err(McpError::internal_error(
+                                "Task store returned an unadmitted worker mutation",
+                            ));
+                        }
+                        committed
                     }
-                    return Err(error);
+                    Ok(None) => {
+                        // A failed comparison is not a committed receipt and
+                        // must still satisfy current caller authority.
+                        authorize()?;
+                        return Err(stale_final_task_handoff_error());
+                    }
+                    Err(error) => {
+                        if write_admitted.load(TaskServiceOrdering::Acquire) {
+                            uncertain.store(true, TaskServiceOrdering::Release);
+                            return Err(worker_outcome_unknown());
+                        }
+                        return Err(error);
+                    }
+                };
+                let committed = match provider_authority.runtime
+                    .validate_committed_transition(&current, &task, returned)
+                {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        uncertain.store(true, TaskServiceOrdering::Release);
+                        return Err(error);
+                    }
+                };
+                if !status_only {
+                    provider_authority.transition_committed.store(true, TaskServiceOrdering::Release);
                 }
-            };
-            let committed = self
-                .runtime
-                .validate_committed_transition(&current, &task, returned)?;
-            if !status_only {
-                self.transition_committed
-                    .store(true, TaskServiceOrdering::Release);
-            }
+                Ok(committed)
+            });
+            *write.future.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::pin(future));
+            let committed = std::future::poll_fn(|poll| {
+                if write.poll(poll).is_pending() { return Poll::Pending; }
+                self.pending_write.clear(&write);
+                Poll::Ready(write.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take().ok_or_else(|| McpError::internal_error("Task worker receipt was already consumed"))?)
+            }).await?;
+            drop(observer);
             // A validated committed receipt is authoritative. Publication is
             // best effort and cannot replace it with a late cancellation.
-            self.emit_worker_commit(&ctx, notification, &committed)
+            authority.emit_worker_commit(&ctx, notification, &committed)
                 .await;
-            Ok(task)
+            Ok(committed.task().clone())
         })
     }
 
@@ -423,24 +496,30 @@ impl FinalTaskHandoffAuthority {
         cx: &'a Cx,
     ) -> impl Future<Output = McpResult<bool>> + Send + 'a {
         CallerContextFuture::new(cx, async move {
-            let ctx = McpContext::new(cx.clone(), 0);
-            let (metadata, _) = self.load_worker_snapshot(&ctx).await?;
+            let caller = Cx::current().ok_or_else(|| {
+                McpError::internal_error("Task worker has no installed caller")
+            })?;
+            let ctx = McpContext::new(caller, 0);
+            let authority = WorkerAuthority::capture(self);
+            let (metadata, _) = authority.load_worker_snapshot(&ctx).await?;
             let requested = await_worker_read(
                 &ctx,
-                self.wait_deadline(&ctx),
+                authority.wait_deadline(&ctx),
                 self.runtime
                     .store
                     .is_cancellation_requested_with_context(&ctx, &self.task_id),
-                || self.authorize_worker(&ctx, &metadata),
+                || authority.authorize_worker(&ctx, &metadata),
             )
             .await?;
             // A successor or reclaimed incarnation cannot lend its cancellation
             // state to the old handoff while the provider was suspended.
-            self.load_worker_snapshot(&ctx).await?;
+            authority.load_worker_snapshot(&ctx).await?;
             Ok(requested)
         })
     }
+}
 
+impl WorkerAuthority {
     async fn emit_worker_commit(
         &self,
         ctx: &McpContext,
@@ -637,6 +716,278 @@ fn prepare_worker_transition(
             )?))
         }
     }
+}
+
+/// One bounded provider slot per elected handoff. Neither application drop nor
+/// an observing future's cancellation releases an admitted provider operation.
+#[derive(Default)]
+pub(super) struct FinalTaskWorkerWrites {
+    current: Mutex<Option<Arc<WorkerWrite>>>,
+    uncertain: Arc<AtomicBool>,
+    application_closed: Arc<AtomicBool>,
+}
+
+impl FinalTaskWorkerWrites {
+    fn reserve(&self) -> McpResult<Arc<WorkerWrite>> {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.application_closed() {
+            return Err(McpError::request_cancelled());
+        }
+        if current
+            .as_ref()
+            .is_some_and(|write| !write.settled.load(TaskServiceOrdering::Acquire))
+        {
+            return Err(McpError::invalid_request(
+                "An asynchronous Task handoff mutation is already pending",
+            ));
+        }
+        if self.uncertain.load(TaskServiceOrdering::Acquire) {
+            return Err(worker_outcome_unknown());
+        }
+        let write = Arc::new(WorkerWrite {
+            uncertain: Arc::clone(&self.uncertain),
+            ..WorkerWrite::default()
+        });
+        *current = Some(Arc::clone(&write));
+        Ok(write)
+    }
+
+    fn clear(&self, write: &Arc<WorkerWrite>) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, write))
+        {
+            *current = None;
+        }
+    }
+
+    pub(super) fn outcome_uncertain(&self) -> bool {
+        self.uncertain.load(TaskServiceOrdering::Acquire)
+    }
+
+    pub(super) fn application_closed(&self) -> bool {
+        self.application_closed.load(TaskServiceOrdering::Acquire)
+    }
+
+    pub(super) fn admitted_pending(&self) -> bool {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|write| {
+                write.admitted.load(TaskServiceOrdering::Acquire)
+                    && !write.settled.load(TaskServiceOrdering::Acquire)
+            })
+    }
+
+    /// Polls only the provider. Application code is never resumed by this path.
+    /// During shutdown, an unadmitted operation is aborted before its factory
+    /// or another provider poll; an admitted operation retains its custody.
+    pub(super) fn poll_settlement(
+        &self,
+        poll: &mut Context<'_>,
+        abort_unadmitted: bool,
+    ) -> Poll<()> {
+        if abort_unadmitted {
+            // A parent may be cancelled before child-region cancellation has
+            // propagated. Close application entry before polling any receipt
+            // which could wake that still-live application task.
+            self.application_closed
+                .store(true, TaskServiceOrdering::Release);
+        }
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(write) = current else {
+            return Poll::Ready(());
+        };
+        if abort_unadmitted {
+            write.abort.store(true, TaskServiceOrdering::Release);
+        }
+        if !abort_unadmitted
+            && !write.admitted.load(TaskServiceOrdering::Acquire)
+            && !write.abort.load(TaskServiceOrdering::Acquire)
+        {
+            return Poll::Ready(());
+        }
+        let result = write.poll(poll);
+        if result.is_ready() {
+            self.clear(&write);
+        }
+        result
+    }
+}
+
+#[derive(Default)]
+struct WorkerWrite {
+    future: Mutex<Option<FinalTaskStoreFuture<'static, FinalTaskSnapshot>>>,
+    result: Mutex<Option<McpResult<FinalTaskSnapshot>>>,
+    admitted: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
+    settled: AtomicBool,
+    polling: AtomicBool,
+    repoll: AtomicBool,
+    uncertain: Arc<AtomicBool>,
+    waiters: Mutex<Vec<Waker>>,
+}
+
+fn catch_worker_provider<R>(callback: impl FnOnce() -> R) -> Result<R, ()> {
+    match crate::catch_extension_unwind(callback) {
+        Ok(result) => Ok(result),
+        Err(payload) => {
+            // A provider can panic with an application-defined payload whose
+            // destructor also panics. Dispose of that payload inside the same
+            // redacted boundary; never let a second destructor strand custody.
+            if let Err(second) = crate::catch_extension_unwind(|| drop(payload)) {
+                std::mem::forget(second);
+            }
+            Err(())
+        }
+    }
+}
+
+impl WorkerWrite {
+    fn wake_observers(&self) {
+        let waiters = std::mem::take(
+            &mut *self
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+
+    fn poll(&self, poll: &mut Context<'_>) -> Poll<()> {
+        if self.settled.load(TaskServiceOrdering::Acquire) {
+            return Poll::Ready(());
+        }
+        let evicted = {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !waiters.iter().any(|waiter| waiter.will_wake(poll.waker())) {
+                // The application/heartbeat task and its region custodian are
+                // the only two polling owners. Keep the collection bounded.
+                let evicted = if waiters.len() == 2 {
+                    Some(waiters.remove(0))
+                } else {
+                    None
+                };
+                waiters.push(poll.waker().clone());
+                evicted
+            } else {
+                None
+            }
+        };
+        if let Some(evicted) = evicted {
+            evicted.wake();
+        }
+        if self
+            .polling
+            .compare_exchange(
+                false,
+                true,
+                TaskServiceOrdering::AcqRel,
+                TaskServiceOrdering::Acquire,
+            )
+            .is_err()
+        {
+            self.repoll.store(true, TaskServiceOrdering::Release);
+            // Close the race where the other polling owner released its
+            // future immediately before this repoll request was published.
+            if !self.polling.load(TaskServiceOrdering::Acquire) {
+                self.wake_observers();
+            }
+            return Poll::Pending;
+        }
+        // No slot or provider mutex is retained while backend code is polled.
+        let future = self
+            .future
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(mut future) = future else {
+            self.polling.store(false, TaskServiceOrdering::Release);
+            return if self.settled.load(TaskServiceOrdering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            };
+        };
+        let panicked = || {
+            if self.admitted.load(TaskServiceOrdering::Acquire) {
+                self.uncertain.store(true, TaskServiceOrdering::Release);
+                Err(worker_outcome_unknown())
+            } else {
+                Err(McpError::internal_error(
+                    "Task handoff storage provider panicked",
+                ))
+            }
+        };
+        let result = match catch_worker_provider(|| future.as_mut().poll(poll)) {
+            Ok(Poll::Pending) => {
+                *self
+                    .future
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(future);
+                self.polling.store(false, TaskServiceOrdering::Release);
+                if self.repoll.swap(false, TaskServiceOrdering::AcqRel) {
+                    self.wake_observers();
+                }
+                return Poll::Pending;
+            }
+            Ok(Poll::Ready(result)) => {
+                if catch_worker_provider(|| drop(future)).is_err() {
+                    panicked()
+                } else {
+                    result
+                }
+            }
+            Err(()) => {
+                // A panicking poll can leave its owned provider future live.
+                // Contain that future's destructor before publishing settlement.
+                let _ = catch_worker_provider(|| drop(future));
+                panicked()
+            }
+        };
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+        self.settled.store(true, TaskServiceOrdering::Release);
+        self.polling.store(false, TaskServiceOrdering::Release);
+        self.wake_observers();
+        Poll::Ready(())
+    }
+}
+
+struct WorkerWriteObserver(Arc<WorkerWrite>);
+
+impl Drop for WorkerWriteObserver {
+    fn drop(&mut self) {
+        if !self.0.settled.load(TaskServiceOrdering::Acquire) {
+            self.0.abort.store(true, TaskServiceOrdering::Release);
+            self.0.wake_observers();
+        }
+    }
+}
+
+pub(super) fn worker_outcome_unknown() -> McpError {
+    McpError::internal_error(
+        "Task handoff mutation may have committed; reconcile its exact fenced operation before retrying",
+    )
 }
 
 fn poll_worker_deadline(

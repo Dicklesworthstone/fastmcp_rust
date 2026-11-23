@@ -6578,6 +6578,7 @@ struct FinalTaskHandoffAuthority {
     execution_budget: FinalTaskExecutionBudget,
     execution_authorization: FinalTaskAccessMetadata,
     execution_revoked: Arc<AtomicBool>,
+    pending_write: Arc<worker::FinalTaskWorkerWrites>,
 }
 
 impl std::fmt::Debug for FinalTaskHandoffAuthority {
@@ -10983,6 +10984,13 @@ impl FinalTaskHandoffExecutor {
         cancellation_wake: FinalTaskCancellationWakeRegistration,
         budget: Budget,
     ) -> McpResult<()> {
+        let pending_write = Arc::clone(
+            &custody
+                .guard
+                .as_ref()
+                .ok_or_else(|| McpError::internal_error("Task attempt custody is unavailable"))?
+                .pending_write,
+        );
         // The runtime-owned custodian retains a raw opening through publication.
         // In asupersync 0.5 an abandoned ChildRegionOpening does not reclaim an
         // admitted-but-unobserved region. Service cancellation is observed only
@@ -11040,17 +11048,32 @@ impl FinalTaskHandoffExecutor {
                 });
             match worker {
                 Ok(mut worker) => {
+                    let mut joined = None;
                     std::future::poll_fn(|context| {
                         // A committed transition followed by successful cleanup
                         // takes precedence over simultaneous service shutdown.
-                        if let std::task::Poll::Ready(result) = worker.poll_join(context) {
-                            return std::task::Poll::Ready(result.unwrap_or_else(|_| {
+                        if joined.is_none()
+                            && let std::task::Poll::Ready(result) = worker.poll_join(context)
+                        {
+                            joined = Some(result.unwrap_or_else(|_| {
                                 Err(McpError::internal_error(
                                     "Task attempt application did not finish normally",
                                 ))
                             }));
                         }
+                        if joined.is_some() {
+                            if pending_write.poll_settlement(context, true).is_pending() {
+                                return std::task::Poll::Pending;
+                            }
+                            return std::task::Poll::Ready(joined.take().expect("joined result"));
+                        }
                         if cx.checkpoint().is_err() {
+                            // Close application entry before draining a write
+                            // which could wake the still-live worker. Only the
+                            // provider may continue across this boundary.
+                            if pending_write.poll_settlement(context, true).is_pending() {
+                                return std::task::Poll::Pending;
+                            }
                             return std::task::Poll::Ready(Err(McpError::request_cancelled()));
                         }
                         std::task::Poll::Pending
@@ -11065,6 +11088,9 @@ impl FinalTaskHandoffExecutor {
         // permit is retained until these children and finalizers have settled;
         // custom stores own their corresponding cross-owner admission policy.
         let cancellation = region.cancel(CancelReason::user("Task attempt execution finished"));
+        // Cover application panic/drop and registration racing cancellation.
+        // This polls framework-owned storage settlement, never application work.
+        std::future::poll_fn(|poll| pending_write.poll_settlement(poll, true)).await;
         let settled = region.close().await;
         let guard = returned
             .lock()
@@ -11081,6 +11107,12 @@ impl FinalTaskHandoffExecutor {
     }
 
     fn finish_handoff(mut guard: FinalTaskExecutionGuard, result: McpResult<()>) -> McpResult<()> {
+        if guard.pending_write.outcome_uncertain() {
+            // A failed observer does not establish that an admitted transaction
+            // rolled back. Leave its exact store fence for reconciliation.
+            guard.disarm();
+            return Err(worker::worker_outcome_unknown());
+        }
         match result {
             Ok(()) => {
                 if guard.retire_if_execution_authorization_lost()? {
@@ -11150,6 +11182,9 @@ impl FinalTaskHandoffExecutor {
         guard: &mut FinalTaskExecutionGuard,
         cancellation_wake: &FinalTaskCancellationWakeRegistration,
     ) -> McpResult<()> {
+        if guard.pending_write.application_closed() {
+            return Err(McpError::request_cancelled());
+        }
         // A stalled service may lose its claim even before the application
         // constructs its future. Revalidate the exact owner fence at every
         // application entry, rather than relying on a timer being polled first.
@@ -11164,12 +11199,22 @@ impl FinalTaskHandoffExecutor {
             return Ok(());
         }
         guard.ensure_live_dispatch_for_application()?;
+        if guard.pending_write.application_closed() {
+            return Err(McpError::request_cancelled());
+        }
         let mut supervisor = self.supervisor.resume(cx, handoff);
         let mut supervisor_started = false;
         // Keep this timer across lease heartbeats. Resetting it at every
         // heartbeat would let a pending callback postpone cancellation forever.
         let mut cancellation_grace: Option<Pin<Box<asupersync::time::Sleep>>> = None;
         loop {
+            std::future::poll_fn(|poll| guard.pending_write.poll_settlement(poll, false)).await;
+            if guard.pending_write.outcome_uncertain() {
+                return Err(worker::worker_outcome_unknown());
+            }
+            if guard.pending_write.application_closed() {
+                return Err(McpError::request_cancelled());
+            }
             // The application callback is allowed to be pending for longer
             // than one lease interval. The attempt context is nevertheless
             // authoritative: observe its cancellation before polling more
@@ -11197,6 +11242,18 @@ impl FinalTaskHandoffExecutor {
                     });
             let mut heartbeat = Box::pin(asupersync::time::sleep(cx.now(), heartbeat_interval));
             let completed = std::future::poll_fn(|task_context| {
+                // A backend may have committed and parked its receipt. Settle
+                // only that provider before checking the now-consumed lease;
+                // all application checkpoints below still apply afterward.
+                if guard.pending_write.poll_settlement(task_context, false).is_pending() {
+                    return std::task::Poll::Pending;
+                }
+                if guard.pending_write.outcome_uncertain() {
+                    return std::task::Poll::Ready(Some(Err(worker::worker_outcome_unknown())));
+                }
+                if guard.pending_write.application_closed() {
+                    return std::task::Poll::Ready(Some(Err(McpError::request_cancelled())));
+                }
                 if let Err(error) = cx.checkpoint() {
                     return std::task::Poll::Ready(Some(Err(McpError::internal_error(
                         error.to_string(),
@@ -11252,6 +11309,9 @@ impl FinalTaskHandoffExecutor {
                 {
                     return std::task::Poll::Ready(Some(Ok(())));
                 }
+                if guard.pending_write.application_closed() {
+                    return std::task::Poll::Ready(Some(Err(McpError::request_cancelled())));
+                }
                 supervisor_started = true;
                 if let std::task::Poll::Ready(result) = supervisor.as_mut().poll(task_context) {
                     match guard.retire_if_execution_authorization_lost() {
@@ -11270,6 +11330,9 @@ impl FinalTaskHandoffExecutor {
                     // here would overwrite the success and restore a durable
                     // handoff the application already consumed.
                     return std::task::Poll::Ready(Some(result));
+                }
+                if guard.pending_write.admitted_pending() {
+                    return std::task::Poll::Pending;
                 }
                 match guard.retire_if_execution_expired() {
                     Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
@@ -11329,6 +11392,7 @@ impl FinalTaskHandoffExecutor {
                 continue;
             };
             drop(supervisor);
+            std::future::poll_fn(|poll| guard.pending_write.poll_settlement(poll, true)).await;
             if let Err(error) = result {
                 if guard.is_authoritatively_expired() {
                     guard.disarm();
@@ -11673,6 +11737,7 @@ struct FinalTaskExecutionGuard {
     execution_budget: Option<FinalTaskExecutionBudget>,
     execution_authorization: Option<FinalTaskAccessMetadata>,
     execution_revoked: Arc<AtomicBool>,
+    pending_write: Arc<worker::FinalTaskWorkerWrites>,
     restoration: Option<FinalTaskHandoffRestoration>,
     // Held through guard/future destruction, never cleared by disarm or by a
     // terminal transition. The supervisor future is destroyed before its
@@ -11758,6 +11823,7 @@ impl FinalTaskExecutionGuard {
                 }
             }),
             execution_revoked: Arc::new(AtomicBool::new(false)),
+            pending_write: Arc::new(worker::FinalTaskWorkerWrites::default()),
             restoration: (!execution_admission_lost).then_some(restoration),
             _execution_permit: execution_permit,
             execution_admission_lost,
@@ -12040,6 +12106,7 @@ impl FinalTaskExecutionGuard {
                 )
             })?,
             execution_revoked: Arc::clone(&self.execution_revoked),
+            pending_write: Arc::clone(&self.pending_write),
         })
     }
 
@@ -12096,6 +12163,11 @@ impl FinalTaskExecutionGuard {
 
 impl Drop for FinalTaskExecutionGuard {
     fn drop(&mut self) {
+        if self.pending_write.admitted_pending() || self.pending_write.outcome_uncertain() {
+            // The caller-owned custodian retains admitted storage work. An
+            // uncertain operation must not replay the original invocation.
+            return;
+        }
         // A stale weak receipt may name the same generation/owner as a new
         // pre-dispatch claim after explicit restoration. It has no right to
         // retire or restore that successor, even if this future was never polled.
@@ -27211,6 +27283,7 @@ mod tests {
                 retained.original_operation().cloned(),
             )),
             execution_revoked: Arc::new(AtomicBool::new(false)),
+            pending_write: Arc::new(worker::FinalTaskWorkerWrites::default()),
             restoration: None,
             _execution_permit: None,
             execution_admission_lost: false,
@@ -27249,6 +27322,7 @@ mod tests {
                 retained.original_operation().cloned(),
             )),
             execution_revoked: Arc::new(AtomicBool::new(false)),
+            pending_write: Arc::new(worker::FinalTaskWorkerWrites::default()),
             restoration: None,
             _execution_permit: None,
             execution_admission_lost: false,
