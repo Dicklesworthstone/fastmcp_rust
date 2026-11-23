@@ -2017,6 +2017,63 @@ pub mod auto {
             }
         }
 
+        /// Calls a Tasks-capable tool through an Auto-selected modern session,
+        /// answering bounded input-required rounds with installed handlers.
+        ///
+        /// Exact-2024 sessions reject before allocating a request or writing a
+        /// frame. The original capabilities, deadline, and cancellation token
+        /// apply to every round. An admitted Task receipt is returned without
+        /// polling it, including when cancellation arrives in the same poll.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_handlers(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<crate::FinalToolCallOutcome>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_final_outcome_with_handlers(cx, cancellation, name, arguments)
+                .await
+        }
+
+        /// Calls a Tasks-capable tool through an Auto-selected modern session,
+        /// answering bounded input-required rounds with a local responder.
+        ///
+        /// Exact-2024 sessions reject before allocating a request or writing a
+        /// frame. The deadline can tighten the configured timeout, and the
+        /// original capabilities are checked before invoking the responder.
+        /// The result retains the distinct Complete, Task, and InputRequired
+        /// variants; uncertain sends are never replayed.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<crate::FinalToolCallOutcome>
+        where
+            F: FnMut(&crate::InputRequiredResult) -> McpResult<fastmcp_client::MrtrInputResponses>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_final_outcome_with_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    name,
+                    arguments,
+                    respond,
+                )
+                .await
+        }
+
         /// Drains exact final progress notifications received by modern requests.
         #[must_use]
         pub fn take_progress_notifications(
@@ -4995,6 +5052,63 @@ pub mod modern {
         {
             self.inner
                 .call_tool_final_outcome_with_cancellation(cx, cancellation, name, arguments)
+                .await
+        }
+
+        /// Calls a Tasks-capable tool and answers bounded input-required rounds
+        /// through the installed modern handlers.
+        ///
+        /// The complete operation retains its original capabilities, deadline,
+        /// and cancellation token. Without installed handlers, input-required
+        /// is returned intact. An admitted Task receipt survives simultaneous
+        /// cancellation; the caller owns its subsequent observation or cancellation.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_handlers(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalToolCallOutcome>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_final_outcome_with_handlers(cx, cancellation, name, arguments)
+                .await
+        }
+
+        /// Calls a Tasks-capable tool and answers bounded input-required rounds
+        /// through an operation-local responder.
+        ///
+        /// The absolute deadline can tighten the configured timeout. Every
+        /// input batch is admitted against the original capabilities before
+        /// the responder runs. Complete and Task results retain their exact
+        /// wire fields; this method neither polls a created Task nor replays
+        /// an uncertain tool call.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<FinalToolCallOutcome>
+        where
+            F: FnMut(&crate::InputRequiredResult) -> McpResult<MrtrInputResponses>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_final_outcome_with_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    name,
+                    arguments,
+                    respond,
+                )
                 .await
         }
 

@@ -1747,6 +1747,24 @@ variant returns input-required directly. An already-admitted Task receipt
 survives cancellation in the same final poll; these methods do not poll or
 persist the Task, or repeat a call after uncertain delivery.
 
+With `tasks` and `websocket-experimental` enabled, `modern::WebSocketClient`
+also exposes `call_tool_outcome_with_handlers` and
+`call_tool_outcome_with_mrtr_retry`. The underlying
+`fastmcp_client::WebSocketClient` exposes the corresponding
+`call_tool_final_outcome_with_handlers` and
+`call_tool_final_outcome_with_mrtr_retry` methods. These submit the original
+tool and each input continuation through the native WebSocket request owner,
+preserving the initial capability advertisement, arguments, and absolute
+deadline. A server may create a Task after any input round. Task receipts and
+complete results retain their original result fields, metadata, and numeric
+spellings. A Task receipt already admitted by the receiver survives
+cancellation in the same receive poll; other outcomes still observe the
+operation's cancellation and timeout. The caller owns subsequent Task
+observation and cancellation. These calls neither use the result cache nor
+repeat an uncertain send. The `auto::WebSocketClient` wrapper provides the
+same two methods when legacy interoperability is enabled; a connection
+selected to exact 2024 rejects them before sending a request.
+
 Use `FinalTaskHandle::from_created(&created)` to retain that Task on the same
 client without sending an extra `tasks/get` or repeating the tool call.
 The creation receipt remains yours, including its metadata and unknown

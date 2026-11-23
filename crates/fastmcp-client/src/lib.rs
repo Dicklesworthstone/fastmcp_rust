@@ -6469,6 +6469,12 @@ impl WebSocketConnectDeadline {
     }
 }
 
+#[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+enum WebSocketTaskMrtrResponder<F = fn(&InputRequiredResult) -> McpResult<MrtrInputResponses>> {
+    Installed(ReverseRequestHandlers),
+    Caller(F),
+}
+
 /// Caller-`Cx` asynchronous MCP client over a native WebSocket transport.
 ///
 /// The client owns one source-preserving receive half and one independently
@@ -12081,6 +12087,182 @@ where
         }
     }
 
+    /// Calls a Tasks-capable tool and answers input-required rounds with the
+    /// installed modern handlers.
+    ///
+    /// The complete operation shares one absolute timeout and caller
+    /// cancellation token. Every input batch must fit the original advertised
+    /// capabilities and bounded MRTR budget before any handler runs. With no
+    /// modern handlers installed, an input-required result is returned intact.
+    ///
+    /// An admitted Task receipt is returned immediately, including when
+    /// cancellation becomes visible in the same receive poll. The caller then
+    /// owns that task; this method does not poll it or replay its tool call.
+    #[cfg(feature = "tasks")]
+    pub async fn call_tool_final_outcome_with_handlers(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        IO: Send + 'static,
+    {
+        let deadline = mrtr_operation_deadline(cx, self.request_timeout_policy)?;
+        let responder: WebSocketTaskMrtrResponder =
+            WebSocketTaskMrtrResponder::Installed(self.reverse_request_handlers.clone());
+        self.follow_tasks_mrtr(cx, cancellation, deadline, name, arguments, responder)
+            .await
+    }
+
+    /// Calls a Tasks-capable tool and answers bounded input-required rounds
+    /// with an operation-local responder.
+    ///
+    /// `deadline` may tighten the configured absolute timeout; neither a
+    /// continuation nor a responder restarts it. The whole input batch is
+    /// admitted against the initial capability advertisement before `respond`
+    /// runs, and its answers must exactly match the requested keys. A
+    /// synchronous responder must return cooperatively; its result is checked
+    /// for cancellation and timeout before a continuation is sent.
+    ///
+    /// Returns the exact Complete, Task, or InputRequired result algebra.
+    /// Task receipts elected by the native receiver survive a same-poll
+    /// cancellation, leaving explicit task cancellation to the caller. No task
+    /// polling, transport replay, or detached responder is started here.
+    #[cfg(feature = "tasks")]
+    pub async fn call_tool_final_outcome_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        respond: F,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        IO: Send + 'static,
+    {
+        let deadline = deadline.min(mrtr_operation_deadline(cx, self.request_timeout_policy)?);
+        self.follow_tasks_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            name,
+            arguments,
+            WebSocketTaskMrtrResponder::Caller(respond),
+        )
+        .await
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn follow_tasks_mrtr<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        mut responder: WebSocketTaskMrtrResponder<F>,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        IO: Send + 'static,
+    {
+        self.require_final_tasks_result(OFFICIAL_TASKS_RESULT_DISCRIMINATOR)?;
+        check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        let original_parameters = self.with_final_tasks_client_capability(serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        }))?;
+        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
+        let mut parameters = original_parameters.clone();
+        let mut driver = MrtrDriver::new(
+            cx,
+            deadline,
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?,
+        )?;
+
+        fastmcp_core::runtime::CallerContextFuture::new(cx, async {
+            loop {
+                driver.before_request()?;
+                check_mrtr_operation(cx, Some(cancellation), deadline)?;
+                let result = self
+                    .request_final_core_prepared_with_options(
+                        cx,
+                        "tools/call",
+                        parameters,
+                        Some(cancellation),
+                        Some(deadline),
+                    )
+                    .await?;
+                // The native receive owner has already elected and retired
+                // this response. Preserve its durable task identity before a
+                // late cancellation can hide admitted server-side work.
+                if let CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) = result {
+                    return Ok(FinalToolCallOutcome::Task(result));
+                }
+                check_mrtr_operation(cx, Some(cancellation), deadline)?;
+                let input_required = match result {
+                    CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                        return Ok(FinalToolCallOutcome::Complete(result));
+                    }
+                    CoreResult::Final(FinalCoreResult::ToolsCallInputRequired {
+                        result, ..
+                    }) => result,
+                    _ => return Err(unexpected_convenience_result("tools/call")),
+                };
+                if matches!(
+                    &responder,
+                    WebSocketTaskMrtrResponder::Installed(handlers)
+                        if !handlers.has_modern_handlers()
+                ) {
+                    return Ok(FinalToolCallOutcome::InputRequired(input_required));
+                }
+                driver.begin_continuation()?;
+                let input_responses = match &mut responder {
+                    WebSocketTaskMrtrResponder::Installed(handlers) => {
+                        driver.admit_input_responses(
+                            input_required
+                                .input_requests()
+                                .map_or(0, |inputs| inputs.members().len()),
+                        )?;
+                        wait_for_mrtr_operation(
+                            cx,
+                            Some(cancellation),
+                            deadline,
+                            handlers.respond_to_input_required_async(
+                                cx,
+                                &capabilities,
+                                &input_required,
+                                || check_mrtr_operation(cx, Some(cancellation), deadline),
+                            ),
+                        )
+                        .await?
+                    }
+                    WebSocketTaskMrtrResponder::Caller(respond) => {
+                        admit_complete_mrtr_input_batch(
+                            &mut driver,
+                            &capabilities,
+                            &input_required,
+                        )?;
+                        check_mrtr_operation(cx, Some(cancellation), deadline)?;
+                        let responses = respond(&input_required)?;
+                        check_mrtr_operation(cx, Some(cancellation), deadline)?;
+                        responses
+                    }
+                };
+                parameters = mrtr_retry_parameters(
+                    original_parameters.clone(),
+                    &input_required,
+                    input_responses,
+                )?;
+            }
+        })
+        .await
+    }
+
     /// Calls a Tasks-capable modern tool while stamping the caller's progress token.
     #[cfg(feature = "tasks")]
     pub async fn call_tool_final_outcome_with_progress_marker(
@@ -12486,6 +12668,21 @@ where
     where
         IO: Send + 'static,
     {
+        self.request_final_core_prepared_with_options(cx, method, params, None, None)
+            .await
+    }
+
+    async fn request_final_core_prepared_with_options(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        mut params: serde_json::Value,
+        cancellation: Option<&McpRequestCancellation>,
+        deadline: Option<Instant>,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         self.require_modern(method)?;
         let request =
             CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).map_err(|_| {
@@ -12493,8 +12690,30 @@ where
                     "Modern WebSocket request parameters do not match the method contract",
                 )
             })?;
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
+            return Err(McpError::request_cancelled());
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        if let Some(deadline) = deadline {
+            check_mrtr_operation(cx, cancellation, deadline)?;
+        }
+        trace::apply_parameters(&mut params, self.session.outbound_trace_context.as_ref());
+        self.admit_raw_client_request(method, Some(&params))?;
+        // Settling an abandoned request retains its own bounded cleanup
+        // custody. The native request owner rechecks this operation's deadline
+        // after allocation and before any new frame can be sent.
+        let request_id = self.allocate_request_id().await?;
         let received = self
-            .request_with_raw_result(cx, method, Some(params))
+            .request_admitted_with_raw_result_with_deadline(
+                cx,
+                JsonRpcRequest::new(method, Some(params), request_id),
+                cancellation,
+                deadline,
+            )
             .await?;
         if let Some(error) = received.response.error {
             return Err(json_rpc_error_to_mcp(error));
@@ -34779,6 +34998,7 @@ exec sleep 2
         sent_text_frames: usize,
         text_frames_before_stall: usize,
         cancel_listener_on_response_read: Option<Cx>,
+        cancel_request_on_response_read: Option<McpRequestCancellation>,
     }
 
     #[cfg(feature = "websocket-experimental")]
@@ -34794,11 +35014,15 @@ exec sleep 2
             if this.sent_text_frames >= this.text_frames_before_stall
                 && matches!(result, Poll::Ready(Ok(())))
                 && buf.filled()[before..].ends_with(b"}}")
-                && let Some(listener) = this.cancel_listener_on_response_read.take()
             {
                 // Elect listener cancellation while the ordinary response is
                 // becoming ready, before the client can start cleanup.
-                listener.set_cancel_requested(true);
+                if let Some(listener) = this.cancel_listener_on_response_read.take() {
+                    listener.set_cancel_requested(true);
+                }
+                if let Some(cancellation) = this.cancel_request_on_response_read.take() {
+                    cancellation.cancel();
+                }
             }
             result
         }
@@ -34842,6 +35066,7 @@ exec sleep 2
                 sent_text_frames: 0,
                 text_frames_before_stall: 2,
                 cancel_listener_on_response_read: None,
+                cancel_request_on_response_read: None,
             },
             peer,
         )
@@ -39318,6 +39543,907 @@ exec sleep 2
                 .expect("MRTR retry consumes the peer input request and final result");
             assert!(matches!(result, FinalCoreResult::ToolsCall { .. }));
             client.close(&cx).await.expect("close MRTR client");
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    async fn websocket_tasks_mrtr_fixture(
+        cx: &Cx,
+        tasks: bool,
+        handlers: ReverseRequestHandlers,
+    ) -> (
+        WebSocketClient<asupersync::net::tcp::VirtualTcpStream>,
+        AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream>,
+    ) {
+        let (client_io, mut peer_io) = async_websocket_pair();
+        let mut discovery = async_modern_discovery_result();
+        if tasks {
+            discovery["capabilities"]["extensions"] =
+                serde_json::json!({"io.modelcontextprotocol/tasks": {}});
+        }
+        write_server_text_frame(
+            &mut peer_io,
+            &serde_json::json!({"jsonrpc":"2.0", "id":1, "result":discovery}).to_string(),
+        )
+        .await;
+        let client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+            cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            async_websocket_client_info(),
+            serde_json::from_value(serde_json::json!({"roots": {}})).unwrap(),
+            handlers,
+            AsyncWsClientTransport::from_upgraded(client_io),
+        )
+        .await
+        .unwrap();
+        let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+        let JsonRpcMessage::Request(discovery) = peer.recv(cx).await.unwrap() else {
+            panic!("modern connection starts with discovery");
+        };
+        assert_eq!(discovery.method, "server/discover");
+        assert_eq!(discovery.id, Some(RequestId::Number(1)));
+        (client, peer)
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    async fn websocket_tasks_mrtr_request(
+        cx: &Cx,
+        peer: &mut AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream>,
+        method: &str,
+        id: i64,
+    ) -> JsonRpcRequest {
+        let JsonRpcMessage::Request(request) = peer.recv(cx).await.unwrap() else {
+            panic!("the next frame must be the expected request");
+        };
+        assert_eq!(request.method, method);
+        assert_eq!(request.id, Some(RequestId::Number(id)));
+        request
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    async fn websocket_tasks_mrtr_reply(
+        cx: &Cx,
+        peer: &mut AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream>,
+        id: i64,
+        result: serde_json::Value,
+    ) {
+        peer.send(
+            cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(id), result)),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    fn websocket_tasks_mrtr_answers(input: &InputRequiredResult) -> MrtrInputResponses {
+        input
+            .input_requests()
+            .into_iter()
+            .flat_map(|requests| requests.members())
+            .map(|member| (member.name.clone(), serde_json::json!({"roots": []})))
+            .collect()
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    fn websocket_tasks_mrtr_terminal(task: bool) -> serde_json::Value {
+        let mut result = if task {
+            let mut result = websocket_handle_task("working");
+            result["resultType"] = serde_json::json!("task");
+            result
+        } else {
+            serde_json::json!({"resultType":"complete", "content":[], "isError":false})
+        };
+        result["_meta"] = serde_json::json!({"com.example/receipt":"résumé 東京"});
+        result["com.example/exact"] = serde_json::Value::Number(
+            serde_json::Number::from_string_unchecked("1.20e+4".to_owned()),
+        );
+        result
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_mrtr_pending_rounds_preserve_authority_and_exact_outcomes() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for installed in [false, true] {
+                for create_task in [false, true] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let observed = Arc::clone(&calls);
+                    let handlers = ReverseRequestHandlers::new().with_modern_roots_list(
+                        move |caller, _, _| {
+                            assert!(!caller.capabilities().spawn);
+                            assert!(!Cx::current().unwrap().capabilities().spawn);
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            Box::pin(async {
+                                assert!(!Cx::current().unwrap().capabilities().spawn);
+                                Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                            })
+                        },
+                    );
+                    let (mut client, mut peer) =
+                        websocket_tasks_mrtr_fixture(&cx, true, handlers).await;
+                    let caller = {
+                        let _restricted =
+                            Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+                        Cx::current().unwrap()
+                    };
+                    let cancellation = McpRequestCancellation::new();
+                    let mut responder_calls = 0;
+                    let mut operation: Pin<
+                        Box<dyn Future<Output = McpResult<FinalToolCallOutcome>> + '_>,
+                    > = if installed {
+                        Box::pin(client.call_tool_final_outcome_with_handlers(
+                            &caller,
+                            &cancellation,
+                            "interactive",
+                            serde_json::json!({"text":"résumé 東京"}),
+                        ))
+                    } else {
+                        Box::pin(client.call_tool_final_outcome_with_mrtr_retry(
+                            &caller,
+                            &cancellation,
+                            Instant::now() + Duration::from_secs(3),
+                            "interactive",
+                            serde_json::json!({"text":"résumé 東京"}),
+                            |input| {
+                                assert!(!Cx::current().unwrap().capabilities().spawn);
+                                responder_calls += 1;
+                                Ok(websocket_tasks_mrtr_answers(input))
+                            },
+                        ))
+                    };
+                    assert!(
+                        std::future::poll_fn(|task| { Poll::Ready(operation.as_mut().poll(task)) })
+                            .await
+                            .is_pending()
+                    );
+                    let original = websocket_tasks_mrtr_request(&cx, &mut peer, "tools/call", 2)
+                        .await
+                        .params
+                        .unwrap();
+                    assert_eq!(original["name"], "interactive");
+                    assert_eq!(
+                        original["arguments"],
+                        serde_json::json!({"text":"résumé 東京"})
+                    );
+                    assert_eq!(
+                        original["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]["io.modelcontextprotocol/tasks"],
+                        serde_json::json!({})
+                    );
+                    assert!(
+                        original["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"].is_object()
+                    );
+                    for (id, challenge) in [
+                        (
+                            2,
+                            serde_json::json!({"resultType":"input_required", "requestState":"first-state",
+                            "inputRequests":{"roots":{"method":"roots/list"}}}),
+                        ),
+                        (
+                            3,
+                            serde_json::json!({"resultType":"input_required", "requestState":"second-state"}),
+                        ),
+                    ] {
+                        websocket_tasks_mrtr_reply(&cx, &mut peer, id, challenge.clone()).await;
+                        assert!(
+                            std::future::poll_fn(|task| {
+                                Poll::Ready(operation.as_mut().poll(task))
+                            })
+                            .await
+                            .is_pending()
+                        );
+                        let mut retry =
+                            websocket_tasks_mrtr_request(&cx, &mut peer, "tools/call", id + 1)
+                                .await
+                                .params
+                                .unwrap();
+                        assert_eq!(retry["requestState"], challenge["requestState"]);
+                        let responses = retry.as_object_mut().unwrap().remove("inputResponses");
+                        assert_eq!(
+                            responses,
+                            if id == 2 {
+                                Some(serde_json::json!({"roots":{"roots":[]}}))
+                            } else {
+                                None
+                            }
+                        );
+                        retry.as_object_mut().unwrap().remove("requestState");
+                        assert_eq!(
+                            retry, original,
+                            "each round retains the original authority and arguments"
+                        );
+                    }
+                    websocket_tasks_mrtr_reply(
+                        &cx,
+                        &mut peer,
+                        4,
+                        websocket_tasks_mrtr_terminal(create_task),
+                    )
+                    .await;
+                    let source = match operation.await.unwrap() {
+                        FinalToolCallOutcome::Task(result) if create_task => {
+                            assert_eq!(result.task.base().task_id.as_str(), "handle-task");
+                            serde_json::to_string(&result).unwrap()
+                        }
+                        FinalToolCallOutcome::Complete(result) if !create_task => {
+                            fastmcp_protocol::encode_complete_result(
+                                &result.meta,
+                                Vec::new(),
+                                &[],
+                                &result.extras,
+                            )
+                            .unwrap()
+                        }
+                        result => panic!("unexpected final outcome: {result:?}"),
+                    };
+                    assert!(
+                        source.contains("1.20e+4"),
+                        "result number spelling remains exact"
+                    );
+                    assert!(source.contains("résumé 東京"));
+                    assert_eq!(calls.load(Ordering::SeqCst), usize::from(installed));
+                    assert_eq!(responder_calls, if installed { 0 } else { 2 });
+                    assert_eq!(client.next_id, 5, "no implicit task polling or replay");
+                    assert!(client.retired_requests.is_empty());
+                    client.close(&cx).await.unwrap();
+                    assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                    assert!(!cx.is_cancel_requested());
+                }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_mrtr_requires_negotiation_and_live_caller_before_contact() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for installed in [false, true] {
+                for tasks in [false, true] {
+                    let (mut client, mut peer) =
+                        websocket_tasks_mrtr_fixture(&cx, tasks, ReverseRequestHandlers::new())
+                            .await;
+                    let cancellation = McpRequestCancellation::new();
+                    if tasks {
+                        cancellation.cancel();
+                    }
+                    let result = if installed {
+                        client
+                            .call_tool_final_outcome_with_handlers(
+                                &cx,
+                                &cancellation,
+                                "unreachable",
+                                serde_json::json!({}),
+                            )
+                            .await
+                    } else {
+                        client
+                            .call_tool_final_outcome_with_mrtr_retry(
+                                &cx,
+                                &cancellation,
+                                Instant::now() + Duration::from_secs(1),
+                                "unreachable",
+                                serde_json::json!({}),
+                                |_| panic!("rejected operation cannot invoke the responder"),
+                            )
+                            .await
+                    };
+                    let error = result.unwrap_err();
+                    if tasks {
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    }
+                    assert_eq!(
+                        client.next_id, 2,
+                        "rejected operation allocates no request ID"
+                    );
+                    assert!(!client.closed);
+                    client.close(&cx).await.unwrap();
+                    assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                    assert!(!cx.is_cancel_requested());
+                }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_mrtr_without_handlers_preserves_input_required() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (mut client, mut peer) =
+                websocket_tasks_mrtr_fixture(&cx, true, ReverseRequestHandlers::new()).await;
+            let challenge = serde_json::json!({"resultType":"input_required", "requestState":"opaque-state",
+                "inputRequests":{"roots":{"method":"roots/list"}}, "com.example/hint":"résumé 東京"});
+            websocket_tasks_mrtr_reply(&cx, &mut peer, 2, challenge.clone()).await;
+            let outcome = client
+                .call_tool_final_outcome_with_handlers(
+                    &cx,
+                    &McpRequestCancellation::new(),
+                    "manual-input",
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+            let FinalToolCallOutcome::InputRequired(input) = outcome else {
+                panic!("an unhandled input-required result belongs to the caller");
+            };
+            assert_eq!(input.request_state(), Some("opaque-state"));
+            let requests = input.input_requests().unwrap().members();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].name, "roots");
+            assert_eq!(
+                exact_json_to_serde(&requests[0].value).unwrap(),
+                challenge["inputRequests"]["roots"]
+            );
+            let hint = input
+                .extras
+                .members()
+                .iter()
+                .find(|member| member.name == "com.example/hint")
+                .unwrap();
+            assert_eq!(
+                exact_json_to_serde(&hint.value).unwrap(),
+                challenge["com.example/hint"]
+            );
+            assert_eq!(client.next_id, 3);
+            websocket_tasks_mrtr_request(&cx, &mut peer, "tools/call", 2).await;
+            client.close(&cx).await.unwrap();
+            assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_mrtr_rejects_entire_unadvertised_batch_before_effects() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for installed in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&calls);
+                let handlers =
+                    ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }) })
+                    });
+                let (mut client, mut peer) =
+                    websocket_tasks_mrtr_fixture(&cx, true, handlers).await;
+                websocket_tasks_mrtr_reply(
+                    &cx,
+                    &mut peer,
+                    2,
+                    serde_json::json!({"resultType":"input_required", "requestState":"denied",
+                        "inputRequests":{
+                            "a-roots":{"method":"roots/list"},
+                            "z-sampling":{"method":"sampling/createMessage", "params":{"messages":[], "maxTokens":1}}
+                        }}),
+                )
+                .await;
+                let cancellation = McpRequestCancellation::new();
+                let result = if installed {
+                    client
+                        .call_tool_final_outcome_with_handlers(
+                            &cx,
+                            &cancellation,
+                            "denied",
+                            serde_json::json!({}),
+                        )
+                        .await
+                } else {
+                    client
+                        .call_tool_final_outcome_with_mrtr_retry(
+                            &cx,
+                            &cancellation,
+                            Instant::now() + Duration::from_secs(1),
+                            "denied",
+                            serde_json::json!({}),
+                            |input| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                Ok(websocket_tasks_mrtr_answers(input))
+                            },
+                        )
+                        .await
+                };
+                assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "no member may run before batch admission"
+                );
+                assert_eq!(
+                    client.next_id, 3,
+                    "denied batch cannot allocate a continuation"
+                );
+                websocket_tasks_mrtr_request(&cx, &mut peer, "tools/call", 2).await;
+                websocket_tasks_mrtr_reply(&cx, &mut peer, 3, async_modern_tools_list_result())
+                    .await;
+                client.list_tools(&cx, None).await.unwrap();
+                websocket_tasks_mrtr_request(&cx, &mut peer, "tools/list", 3).await;
+                assert!(!client.closed);
+                client.close(&cx).await.unwrap();
+                assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_mrtr_invalid_or_cancelled_answers_never_send_a_continuation() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for cancel in [false, true] {
+                let (mut client, mut peer) =
+                    websocket_tasks_mrtr_fixture(&cx, true, ReverseRequestHandlers::new()).await;
+                websocket_tasks_mrtr_reply(
+                    &cx,
+                    &mut peer,
+                    2,
+                    serde_json::json!({"resultType":"input_required", "requestState":"first",
+                        "inputRequests":{"roots":{"method":"roots/list"}}}),
+                )
+                .await;
+                let cancellation = McpRequestCancellation::new();
+                let error = client
+                    .call_tool_final_outcome_with_mrtr_retry(
+                        &cx,
+                        &cancellation,
+                        Instant::now() + Duration::from_secs(1),
+                        "interactive",
+                        serde_json::json!({}),
+                        |input| {
+                            if cancel {
+                                cancellation.cancel();
+                                Ok(websocket_tasks_mrtr_answers(input))
+                            } else {
+                                Ok(BTreeMap::from([(
+                                    "wrong-key".to_owned(),
+                                    serde_json::json!({"roots":[]}),
+                                )]))
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    if cancel {
+                        McpErrorCode::RequestCancelled
+                    } else {
+                        McpErrorCode::InvalidParams
+                    }
+                );
+                assert_eq!(client.next_id, 3);
+                assert!(
+                    client.retired_requests.is_empty(),
+                    "completed input rounds need no cancellation control"
+                );
+                websocket_tasks_mrtr_request(&cx, &mut peer, "tools/call", 2).await;
+                websocket_tasks_mrtr_reply(&cx, &mut peer, 3, async_modern_tools_list_result())
+                    .await;
+                client.list_tools(&cx, None).await.unwrap();
+                websocket_tasks_mrtr_request(&cx, &mut peer, "tools/list", 3).await;
+                client.close(&cx).await.unwrap();
+                assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                assert!(!cx.is_cancel_requested());
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_mrtr_admitted_task_wins_same_receive_poll_cancellation() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for installed in [false, true] {
+                for create_task in [false, true] {
+                    let cancellation = McpRequestCancellation::new();
+                    let (mut client_io, mut peer_io) = stalled_cancellation_async_websocket_pair();
+                    client_io.text_frames_before_stall = 3;
+                    client_io.cancel_request_on_response_read = Some(cancellation.clone());
+                    let mut discovery = async_modern_discovery_result();
+                    discovery["capabilities"]["extensions"] =
+                        serde_json::json!({"io.modelcontextprotocol/tasks":{}});
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &serde_json::json!({"jsonrpc":"2.0", "id":1, "result":discovery})
+                            .to_string(),
+                    )
+                    .await;
+                    let handlers =
+                        ReverseRequestHandlers::new().with_modern_roots_list(|_, _, _| {
+                            Box::pin(async {
+                                Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                            })
+                        });
+                    let mut client =
+                        WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                            &cx,
+                            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                            async_websocket_client_info(),
+                            serde_json::from_value(serde_json::json!({"roots":{}})).unwrap(),
+                            handlers,
+                            AsyncWsClientTransport::from_upgraded(client_io),
+                        )
+                        .await
+                        .unwrap();
+                    write_server_text_frame(
+                        &mut peer_io,
+                        r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"before-task"}}"#,
+                    )
+                    .await;
+                    let mut operation: Pin<
+                        Box<dyn Future<Output = McpResult<FinalToolCallOutcome>> + '_>,
+                    > = if installed {
+                        Box::pin(client.call_tool_final_outcome_with_handlers(
+                            &cx,
+                            &cancellation,
+                            "interactive",
+                            serde_json::json!({}),
+                        ))
+                    } else {
+                        Box::pin(client.call_tool_final_outcome_with_mrtr_retry(
+                            &cx,
+                            &cancellation,
+                            Instant::now() + Duration::from_secs(2),
+                            "interactive",
+                            serde_json::json!({}),
+                            |input| Ok(websocket_tasks_mrtr_answers(input)),
+                        ))
+                    };
+                    assert!(
+                        std::future::poll_fn(|task| Poll::Ready(operation.as_mut().poll(task)))
+                            .await
+                            .is_pending()
+                    );
+                    assert!(!cancellation.is_cancel_requested());
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &serde_json::json!({"jsonrpc":"2.0", "id":3,
+                            "result":websocket_tasks_mrtr_terminal(create_task)})
+                        .to_string(),
+                    )
+                    .await;
+                    let result = operation.await;
+                    assert!(
+                        cancellation.is_cancel_requested(),
+                        "cancellation is injected inside the result read"
+                    );
+                    if create_task {
+                        let FinalToolCallOutcome::Task(receipt) = result.unwrap() else {
+                            panic!("admitted task work must remain addressable by the caller");
+                        };
+                        assert_eq!(receipt.task.base().task_id.as_str(), "handle-task");
+                        assert!(serde_json::to_string(&receipt).unwrap().contains("1.20e+4"));
+                    } else {
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    }
+                    assert!(client.transient_request.is_none());
+                    assert!(
+                        client.retired_requests.is_empty(),
+                        "the elected response needs no cancellation control"
+                    );
+                    assert_eq!(client.next_id, 4);
+                    assert!(
+                        !client.closed,
+                        "the driver cannot attempt a stalled fourth text frame"
+                    );
+                    client.close(&cx).await.unwrap();
+                    websocket_handle_trace(
+                        &cx,
+                        peer_io,
+                        &[
+                            ("server/discover", Some(1)),
+                            ("tools/call", Some(2)),
+                            ("tools/call", Some(3)),
+                        ],
+                    )
+                    .await;
+                    assert!(!cx.is_cancel_requested());
+                }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_mrtr_pending_handler_observes_cancellation_and_absolute_timeout() {
+        struct Dropped(Arc<AtomicBool>, ReverseRequestCancellation);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                assert!(
+                    self.1.is_cancel_requested(),
+                    "an abandoned host callback is cancelled before drop"
+                );
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for cancel in [false, true] {
+                let entered = Arc::new(AtomicBool::new(false));
+                let dropped = Arc::new(AtomicBool::new(false));
+                let observed = Arc::clone(&entered);
+                let abandoned = Arc::clone(&dropped);
+                let handlers =
+                    ReverseRequestHandlers::new().with_modern_roots_list(move |_, token, _| {
+                        let observed = Arc::clone(&observed);
+                        let abandoned = Arc::clone(&abandoned);
+                        Box::pin(async move {
+                            let _dropped = Dropped(abandoned, token);
+                            observed.store(true, Ordering::SeqCst);
+                            std::future::pending::<McpResult<FinalEmbeddedRootsListResult>>().await
+                        })
+                    });
+                let (mut client, mut peer) =
+                    websocket_tasks_mrtr_fixture(&cx, true, handlers).await;
+                client.request_timeout_policy =
+                    RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_millis(200))
+                        .unwrap();
+                websocket_tasks_mrtr_reply(
+                    &cx,
+                    &mut peer,
+                    2,
+                    serde_json::json!({"resultType":"input_required", "inputRequests":{"roots":{"method":"roots/list"}}}),
+                )
+                .await;
+                let cancellation = McpRequestCancellation::new();
+                let mut operation = Box::pin(client.call_tool_final_outcome_with_handlers(
+                    &cx,
+                    &cancellation,
+                    "pending-handler",
+                    serde_json::json!({}),
+                ));
+                assert!(
+                    std::future::poll_fn(|task| Poll::Ready(operation.as_mut().poll(task)))
+                        .await
+                        .is_pending()
+                );
+                assert!(entered.load(Ordering::SeqCst));
+                assert!(!dropped.load(Ordering::SeqCst));
+                if cancel {
+                    cancellation.cancel();
+                }
+                let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), operation)
+                    .await
+                    .expect(
+                        "caller cancellation or its timer wakes a handler that never wakes itself",
+                    )
+                    .unwrap_err();
+                if cancel {
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                } else {
+                    assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+                }
+                assert!(dropped.load(Ordering::SeqCst));
+                assert_eq!(
+                    client.next_id, 3,
+                    "an interrupted callback publishes no continuation"
+                );
+                assert!(client.retired_requests.is_empty());
+                websocket_tasks_mrtr_request(&cx, &mut peer, "tools/call", 2).await;
+                websocket_tasks_mrtr_reply(&cx, &mut peer, 3, async_modern_tools_list_result())
+                    .await;
+                client.list_tools(&cx, None).await.unwrap();
+                websocket_tasks_mrtr_request(&cx, &mut peer, "tools/list", 3).await;
+                client.close(&cx).await.unwrap();
+                assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                assert!(!cx.is_cancel_requested());
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_mrtr_pending_continuation_retires_once_and_preserves_connection() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for installed in [false, true] {
+                for cancel in [false, true] {
+                    let handlers =
+                        ReverseRequestHandlers::new().with_modern_roots_list(|_, _, _| {
+                            Box::pin(async {
+                                Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                            })
+                        });
+                    let (mut client, mut peer) =
+                        websocket_tasks_mrtr_fixture(&cx, true, handlers).await;
+                    client.request_timeout_policy = RequestTimeoutPolicy::new(
+                        Duration::from_secs(1),
+                        Duration::from_millis(200),
+                    )
+                    .unwrap();
+                    let cancellation = McpRequestCancellation::new();
+                    let mut operation: Pin<
+                        Box<dyn Future<Output = McpResult<FinalToolCallOutcome>> + '_>,
+                    > = if installed {
+                        Box::pin(client.call_tool_final_outcome_with_handlers(
+                            &cx,
+                            &cancellation,
+                            "interactive",
+                            serde_json::json!({}),
+                        ))
+                    } else {
+                        Box::pin(client.call_tool_final_outcome_with_mrtr_retry(
+                            &cx,
+                            &cancellation,
+                            Instant::now() + Duration::from_secs(2),
+                            "interactive",
+                            serde_json::json!({}),
+                            |input| Ok(websocket_tasks_mrtr_answers(input)),
+                        ))
+                    };
+                    assert!(
+                        std::future::poll_fn(|task| Poll::Ready(operation.as_mut().poll(task)))
+                            .await
+                            .is_pending()
+                    );
+                    websocket_tasks_mrtr_request(&cx, &mut peer, "tools/call", 2).await;
+                    websocket_tasks_mrtr_reply(
+                        &cx,
+                        &mut peer,
+                        2,
+                        serde_json::json!({"resultType":"input_required", "requestState":"first",
+                            "inputRequests":{"roots":{"method":"roots/list"}}}),
+                    )
+                    .await;
+                    assert!(
+                        std::future::poll_fn(|task| Poll::Ready(operation.as_mut().poll(task)))
+                            .await
+                            .is_pending()
+                    );
+                    websocket_tasks_mrtr_request(&cx, &mut peer, "tools/call", 3).await;
+                    if cancel {
+                        cancellation.cancel();
+                    }
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(2),
+                        operation,
+                    )
+                    .await
+                    .expect("pending transport work observes the shared original deadline or token")
+                    .unwrap_err();
+                    if cancel {
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    } else {
+                        assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+                    }
+                    let JsonRpcMessage::Request(control) = peer.recv(&cx).await.unwrap() else {
+                        panic!("only the committed pending continuation is cancelled");
+                    };
+                    assert_eq!(control.method, "notifications/cancelled");
+                    assert!(control.id.is_none());
+                    assert_eq!(control.params.unwrap()["requestId"], 3);
+                    assert_eq!(client.retired_requests.len(), 1);
+                    assert_eq!(client.next_id, 4);
+                    assert!(!client.closed);
+                    websocket_tasks_mrtr_reply(
+                        &cx,
+                        &mut peer,
+                        3,
+                        websocket_tasks_mrtr_terminal(false),
+                    )
+                    .await;
+                    websocket_tasks_mrtr_reply(&cx, &mut peer, 4, async_modern_tools_list_result())
+                        .await;
+                    client.list_tools(&cx, None).await.unwrap();
+                    websocket_tasks_mrtr_request(&cx, &mut peer, "tools/list", 4).await;
+                    assert!(
+                        client.retired_requests.is_empty(),
+                        "late response cannot satisfy the reused request"
+                    );
+                    client.close(&cx).await.unwrap();
+                    assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                    assert!(!cx.is_cancel_requested());
+                }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_mrtr_bounds_rounds_and_total_inputs_before_effects() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for installed in [false, true] {
+                for total_inputs in [false, true] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let observed = Arc::clone(&calls);
+                    let handlers =
+                        ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            Box::pin(async {
+                                Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                            })
+                        });
+                    let (mut client, mut peer) =
+                        websocket_tasks_mrtr_fixture(&cx, true, handlers).await;
+                    let rounds = if total_inputs {
+                        2
+                    } else {
+                        MAX_MRTR_CONTINUATION_ROUNDS + 1
+                    };
+                    for round in 0..rounds {
+                        let count = if total_inputs && round == 0 {
+                            MAX_MRTR_TOTAL_INPUT_RESPONSES
+                        } else {
+                            1
+                        };
+                        let inputs: serde_json::Map<String, serde_json::Value> = (0..count)
+                            .map(|index| {
+                                (
+                                    format!("roots-{index}"),
+                                    serde_json::json!({"method":"roots/list"}),
+                                )
+                            })
+                            .collect();
+                        websocket_tasks_mrtr_reply(
+                            &cx,
+                            &mut peer,
+                            i64::try_from(round).unwrap() + 2,
+                            serde_json::json!({"resultType":"input_required", "inputRequests":inputs}),
+                        )
+                        .await;
+                    }
+                    let cancellation = McpRequestCancellation::new();
+                    let mut responder_calls = 0;
+                    let result = if installed {
+                        client
+                            .call_tool_final_outcome_with_handlers(
+                                &cx,
+                                &cancellation,
+                                "bounded",
+                                serde_json::json!({}),
+                            )
+                            .await
+                    } else {
+                        client
+                            .call_tool_final_outcome_with_mrtr_retry(
+                                &cx,
+                                &cancellation,
+                                Instant::now() + Duration::from_secs(3),
+                                "bounded",
+                                serde_json::json!({}),
+                                |input| {
+                                    responder_calls += 1;
+                                    Ok(websocket_tasks_mrtr_answers(input))
+                                },
+                            )
+                            .await
+                    };
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidParams);
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        if installed {
+                            if total_inputs {
+                                MAX_MRTR_TOTAL_INPUT_RESPONSES
+                            } else {
+                                MAX_MRTR_CONTINUATION_ROUNDS
+                            }
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(responder_calls, if installed { 0 } else { rounds - 1 });
+                    assert_eq!(client.next_id, u64::try_from(rounds).unwrap() + 2);
+                    for round in 0..rounds {
+                        websocket_tasks_mrtr_request(
+                            &cx,
+                            &mut peer,
+                            "tools/call",
+                            i64::try_from(round).unwrap() + 2,
+                        )
+                        .await;
+                    }
+                    assert!(!client.closed);
+                    assert!(client.retired_requests.is_empty());
+                    client.close(&cx).await.unwrap();
+                    assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                }
+            }
         });
     }
 
