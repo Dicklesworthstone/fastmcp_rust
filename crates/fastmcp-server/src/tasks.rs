@@ -2795,12 +2795,52 @@ struct InMemoryFinalTaskState {
     accepted_inputs: BTreeMap<FinalTaskId, FinalTaskInputResponses>,
     input_key_history: BTreeMap<FinalTaskId, InMemoryFinalTaskInputKeyHistory>,
     handoff_leases: BTreeMap<FinalTaskId, InMemoryFinalTaskHandoffLease>,
+    handoff_expirations: BTreeSet<(Instant, FinalTaskId)>,
     cancellation_requests: BTreeSet<FinalTaskId>,
     latest_notifications: BTreeMap<FinalTaskId, FinalTaskStatusNotification>,
     expires_at: BTreeMap<FinalTaskId, Instant>,
+    retention_expirations: BTreeSet<(Instant, FinalTaskId)>,
     execution_budgets: BTreeMap<FinalTaskId, FinalTaskExecutionBudget>,
     payload_accounting: InMemoryFinalTaskPayloadAccounting,
     retention_journal: InMemoryTaskRetentionJournal,
+}
+
+impl InMemoryFinalTaskState {
+    /// Keep exactly one ordered entry per retained deadline. Replacing a
+    /// deadline must retire the old entry immediately, so repeated renewals
+    /// cannot turn a bounded store into an unbounded expiry queue.
+    fn set_retention_deadline(&mut self, task_id: FinalTaskId, expires_at: Instant) {
+        if let Some(previous) = self.expires_at.insert(task_id.clone(), expires_at) {
+            self.retention_expirations.remove(&(previous, task_id.clone()));
+        }
+        self.retention_expirations.insert((expires_at, task_id));
+    }
+
+    fn remove_retention_deadline(&mut self, task_id: &FinalTaskId) {
+        if let Some(expires_at) = self.expires_at.remove(task_id) {
+            self.retention_expirations.remove(&(expires_at, task_id.clone()));
+        }
+    }
+
+    fn remove_handoff_lease(&mut self, task_id: &FinalTaskId) {
+        if let Some(lease) = self.handoff_leases.remove(task_id)
+            && let Some(expires_at) = lease.recovery_expires_at
+        {
+            self.handoff_expirations.remove(&(expires_at, task_id.clone()));
+        }
+    }
+
+    fn replace_handoff_deadline(
+        &mut self,
+        task_id: &FinalTaskId,
+        previous: Option<Instant>,
+        expires_at: Instant,
+    ) {
+        if let Some(previous) = previous {
+            self.handoff_expirations.remove(&(previous, task_id.clone()));
+        }
+        self.handoff_expirations.insert((expires_at, task_id.clone()));
+    }
 }
 
 #[derive(Default)]
@@ -4033,7 +4073,7 @@ impl InMemoryFinalTaskStore {
             state.original_operations.insert(task_id.clone(), operation);
         }
         if let Some(expires_at) = expires_at {
-            state.expires_at.insert(task_id.clone(), expires_at);
+            state.set_retention_deadline(task_id.clone(), expires_at);
         }
         committed_in_memory_final_task_snapshot(&state, &task_id)
     }
@@ -4350,7 +4390,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .execution_budgets
             .insert(task_id.clone(), execution_budget);
         if let Some(expires_at) = expires_at {
-            state.expires_at.insert(task_id, expires_at);
+            state.set_retention_deadline(task_id, expires_at);
         }
         Ok(())
     }
@@ -5097,7 +5137,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         // Restoration relinquishes this exact owner's live claim. Validate
         // the retained payload before releasing it: a rejected substitution
         // must not let another runner start the still-owned operation.
-        state.handoff_leases.remove(task_id);
+        state.remove_handoff_lease(task_id);
         if let Some(budget) = state.execution_budgets.get_mut(task_id) {
             budget.attempt_deadline = None;
         }
@@ -5225,7 +5265,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         // Input equality is part of the atomic restoration predicate, not a
         // post-release result. A mismatched response leaves the owner and its
         // dispatch fence live for a matching retry or terminal transition.
-        state.handoff_leases.remove(task_id);
+        state.remove_handoff_lease(task_id);
         if let Some(budget) = state.execution_budgets.get_mut(task_id) {
             budget.attempt_deadline = None;
         }
@@ -5288,7 +5328,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         // The elected owner renews this durable lease while application work
         // is pending. If its process dies, expiry advances the generation
         // before a later service may take the retained payload.
-        lease.recovery_expires_at = Some(dispatch_expires_at);
+        let previous = lease.recovery_expires_at.replace(dispatch_expires_at);
+        state.replace_handoff_deadline(task_id, previous, dispatch_expires_at);
         Ok(Some(dispatch_fence))
     }
 
@@ -5331,7 +5372,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let Some(lease) = state.handoff_leases.get_mut(task_id) else {
             return Ok(false);
         };
-        lease.recovery_expires_at = Some(renewed_expires_at);
+        let previous = lease.recovery_expires_at.replace(renewed_expires_at);
+        state.replace_handoff_deadline(task_id, previous, renewed_expires_at);
         Ok(true)
     }
 
@@ -5394,7 +5436,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 .is_some_and(|task| matches!(task, FinalTask::Working(_)))
             && !state.cancellation_requests.contains(task_id);
         let kind = lease.kind;
-        state.handoff_leases.remove(task_id);
+        state.remove_handoff_lease(task_id);
         if let Some(budget) = state.execution_budgets.get_mut(task_id) {
             budget.attempt_deadline = None;
         }
@@ -5864,7 +5906,7 @@ fn record_in_memory_final_task_cancellation(
         .payload_accounting
         .release_handoff(task_id, true, true);
     if !dispatch_elected {
-        state.handoff_leases.remove(task_id);
+        state.remove_handoff_lease(task_id);
     }
     state.cancellation_requests.insert(task_id.clone());
     if let Some(next_generation) = next_generation {
@@ -5959,7 +6001,7 @@ fn replace_in_memory_final_task(
     record_task_state_change(&mut state.task_states, previous, Some(task.base().status));
     state.tasks.insert(task_id.clone(), task);
     state.generations.insert(task_id.clone(), generation);
-    state.handoff_leases.remove(&task_id);
+    state.remove_handoff_lease(&task_id);
     if let Some(budget) = state.execution_budgets.get_mut(&task_id) {
         budget.attempt_deadline = None;
     }
@@ -5991,15 +6033,15 @@ fn replace_in_memory_final_task(
 }
 
 fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now: Instant) {
+    // Visit only due entries while holding the shared store lock. Retaining
+    // an expired entry until its transition succeeds preserves retryability
+    // on generation exhaustion and cancellation-retirement failure. Collect
+    // this prefix once so one such entry cannot starve later due leases.
     let expired_handoff_task_ids = state
-        .handoff_leases
+        .handoff_expirations
         .iter()
-        .filter(|(_, lease)| {
-            lease
-                .recovery_expires_at
-                .is_some_and(|expires_at| expires_at <= now)
-        })
-        .map(|(task_id, _)| task_id.clone())
+        .take_while(|(expires_at, _)| *expires_at <= now)
+        .map(|(_, task_id)| task_id.clone())
         .collect::<Vec<_>>();
     for task_id in expired_handoff_task_ids {
         // An execution timeout is a terminal outcome, not a retryable lease
@@ -6039,21 +6081,21 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
             // the retained payload. Without this generation advance, a late
             // drop from the old worker could release a newer worker's lease.
             if let Ok(generation) = next_in_memory_final_task_generation(state) {
-                state.handoff_leases.remove(&task_id);
+                state.remove_handoff_lease(&task_id);
                 if let Some(budget) = state.execution_budgets.get_mut(&task_id) {
                     budget.attempt_deadline = None;
                 }
                 state.generations.insert(task_id, generation);
             }
         } else {
-            state.handoff_leases.remove(&task_id);
+            state.remove_handoff_lease(&task_id);
         }
     }
     let expired_task_ids = state
-        .expires_at
+        .retention_expirations
         .iter()
-        .filter(|(_, expires_at)| **expires_at <= now)
-        .map(|(task_id, _)| task_id.clone())
+        .take_while(|(expires_at, _)| *expires_at <= now)
+        .map(|(_, task_id)| task_id.clone())
         .collect::<Vec<_>>();
     for task_id in expired_task_ids {
         remove_in_memory_final_task(state, &task_id);
@@ -6062,7 +6104,7 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
 
 fn remove_in_memory_final_task(state: &mut InMemoryFinalTaskState, task_id: &FinalTaskId) {
     state.payload_accounting.release_task(task_id);
-    state.expires_at.remove(task_id);
+    state.remove_retention_deadline(task_id);
     state.execution_budgets.remove(task_id);
     if let Some(task) = state.tasks.remove(task_id) {
         record_task_state_change(&mut state.task_states, Some(task.base().status), None);
@@ -6075,7 +6117,7 @@ fn remove_in_memory_final_task(state: &mut InMemoryFinalTaskState, task_id: &Fin
     state.initial_work.remove(task_id);
     state.accepted_inputs.remove(task_id);
     state.input_key_history.remove(task_id);
-    state.handoff_leases.remove(task_id);
+    state.remove_handoff_lease(task_id);
     state.cancellation_requests.remove(task_id);
     state.latest_notifications.remove(task_id);
 }
@@ -6159,7 +6201,7 @@ fn insert_in_memory_final_task_handoff_lease(
     if state
         .handoff_leases
         .insert(
-            task_id,
+            task_id.clone(),
             InMemoryFinalTaskHandoffLease {
                 generation,
                 current_generation: generation,
@@ -6177,6 +6219,7 @@ fn insert_in_memory_final_task_handoff_lease(
             "In-memory final task store overwrote a live handoff lease",
         ));
     }
+    state.handoff_expirations.insert((expires_at, task_id));
     Ok(Some(Arc::downgrade(&execution_permit)))
 }
 
@@ -18176,6 +18219,271 @@ mod tests {
         )
     }
 
+    #[test]
+    fn task_02_expiry_index_reclaims_deadline_order_and_preserves_reused_ids() {
+        let (store, now) = in_memory_store_with_test_clock(4);
+        let started = *now.lock().unwrap();
+        let tasks = [
+            final_working_task_with_ttl("a-later", 2_000),
+            final_working_task_with_ttl("z-earlier", 1_000),
+            final_working_task_with_ttl("m-earlier", 1_000),
+            final_working_task_without_ttl("unlimited"),
+        ];
+        for task in &tasks {
+            store
+                .create_task(task.clone(), final_task_notification(task))
+                .unwrap();
+        }
+        *now.lock().unwrap() = started + StdDuration::from_millis(999);
+        assert_eq!(store.task_count(), 4);
+        assert_final_task_payload_accounting(&store);
+        assert_eq!(store.state.lock().unwrap().retention_expirations.len(), 3);
+
+        *now.lock().unwrap() = started + StdDuration::from_millis(1_000);
+        assert_eq!(store.task_count(), 2);
+        for task in &tasks[1..3] {
+            assert!(store.get_task(&task.base().task_id).unwrap().is_none());
+        }
+        assert!(store.get_task(&tasks[0].base().task_id).unwrap().is_some());
+        assert_eq!(store.state.lock().unwrap().retention_expirations.len(), 1);
+        assert_final_task_payload_accounting(&store);
+
+        // A reclaimed ID may be reused. An obsolete queue entry must never
+        // remove the new generation, including one with unlimited retention.
+        let replacement = final_working_task_without_ttl("z-earlier");
+        store
+            .create_task(replacement.clone(), final_task_notification(&replacement))
+            .unwrap();
+        *now.lock().unwrap() = started + StdDuration::from_millis(2_000);
+        assert_eq!(store.task_count(), 2);
+        assert!(store.get_task(&tasks[0].base().task_id).unwrap().is_none());
+        assert_eq!(
+            serde_json::to_value(store.get_task(&replacement.base().task_id).unwrap().unwrap())
+                .unwrap(),
+            serde_json::to_value(replacement).unwrap()
+        );
+        assert!(store.state.lock().unwrap().retention_expirations.is_empty());
+        assert_final_task_payload_accounting(&store);
+    }
+
+    #[test]
+    fn task_02_expiry_index_renewal_replaces_old_deadlines_without_queue_growth() {
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let started = *now.lock().unwrap();
+        let task = final_working_task_with_ttl("renewed-expiry-index", 120_000);
+        let task_id = task.base().task_id.clone();
+        let snapshot = store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                final_test_work_descriptor(),
+            )
+            .unwrap();
+        let claim = store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "owner")
+            .unwrap()
+            .unwrap();
+        *now.lock().unwrap() += StdDuration::from_secs(1);
+        let fence = store
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, claim.generation, "owner")
+            .unwrap()
+            .unwrap();
+        for _ in 0..1_000 {
+            *now.lock().unwrap() += StdDuration::from_millis(10);
+            assert!(
+                store
+                    .renew_handoff_dispatch_if_current(&task_id, claim.generation, "owner", fence)
+                    .unwrap()
+            );
+            assert_eq!(store.state.lock().unwrap().handoff_expirations.len(), 1);
+        }
+        let expires_at = *now.lock().unwrap() + IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+        {
+            let state = store.state.lock().unwrap();
+            assert_eq!(
+                state.handoff_expirations.first(),
+                Some(&(expires_at, task_id.clone()))
+            );
+        }
+        let before = final_task_restoration_snapshot(&store, &task_id);
+        assert!(
+            !store
+                .renew_handoff_dispatch_if_current(&task_id, claim.generation, "owner", fence + 1)
+                .unwrap()
+        );
+        assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+        assert_final_task_payload_accounting(&store);
+
+        // The original claim's deadline is no longer authoritative.
+        *now.lock().unwrap() = started + IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+        assert_eq!(
+            store
+                .get_task_snapshot(&task_id)
+                .unwrap()
+                .unwrap()
+                .generation(),
+            claim.generation
+        );
+        *now.lock().unwrap() = expires_at - StdDuration::from_millis(1);
+        assert!(store.next_initial_work_snapshot().unwrap().is_none());
+        *now.lock().unwrap() = expires_at;
+        let recovered = store.next_initial_work_snapshot().unwrap().unwrap();
+        assert_ne!(recovered.generation(), claim.generation);
+        assert!(store.state.lock().unwrap().handoff_expirations.is_empty());
+        assert_final_task_payload_accounting(&store);
+        assert!(
+            !store
+                .renew_handoff_dispatch_if_current(&task_id, claim.generation, "owner", fence)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn task_02_expiry_index_failed_generation_fence_remains_retryable() {
+        for cancelled in [false, true] {
+            let (store, now) = in_memory_store_with_test_clock(2);
+            let task = final_working_task_without_ttl("retry-expired-fence");
+            let task_id = task.base().task_id.clone();
+            let snapshot = store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    final_test_work_descriptor(),
+                )
+                .unwrap();
+            store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "owner")
+                .unwrap()
+                .unwrap();
+            store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    snapshot.generation(),
+                    "owner",
+                )
+                .unwrap()
+                .unwrap();
+            if cancelled {
+                store.request_cancellation(&task_id).unwrap();
+            }
+            let expiring = final_working_task_with_ttl("z-independent-retention", 1);
+            store
+                .create_task(expiring.clone(), final_task_notification(&expiring))
+                .unwrap();
+            let next_generation = {
+                let mut state = store.state.lock().unwrap();
+                let next_generation = state.next_generation;
+                state.next_generation = u64::MAX;
+                next_generation
+            };
+            *now.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+            assert_eq!(store.task_count(), 1);
+            let before = final_task_restoration_snapshot(&store, &task_id);
+            for _ in 0..2 {
+                assert_eq!(store.task_count(), 1);
+                assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+                let state = store.state.lock().unwrap();
+                assert_eq!(state.handoff_expirations.len(), 1);
+                assert!(state.retention_expirations.is_empty());
+            }
+            assert!(store.get_task(&expiring.base().task_id).unwrap().is_none());
+            store.state.lock().unwrap().next_generation = next_generation;
+            let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            assert_ne!(recovered.generation(), snapshot.generation());
+            assert_eq!(matches!(recovered.task(), FinalTask::Cancelled(_)), cancelled);
+            assert!(store.state.lock().unwrap().handoff_expirations.is_empty());
+            assert_final_task_payload_accounting(&store);
+        }
+    }
+
+    #[test]
+    fn task_02_expiry_index_handoff_release_and_retention_remove_all_entries() {
+        for operation in ["restore", "cancel", "finish", "terminal", "expire"] {
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let task = final_working_task_with_ttl("released-expiry-index", 1_000);
+            let task_id = task.base().task_id.clone();
+            let descriptor = final_test_work_descriptor();
+            let snapshot = store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    descriptor.clone(),
+                )
+                .unwrap();
+            store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "owner")
+                .unwrap()
+                .unwrap();
+            match operation {
+                "restore" => assert!(
+                    store
+                        .restore_initial_work_for_owner_if_current(
+                            &task_id,
+                            snapshot.generation(),
+                            "owner",
+                            None,
+                            descriptor,
+                        )
+                        .unwrap()
+                ),
+                "cancel" => store.request_cancellation(&task_id).unwrap(),
+                "finish" => {
+                    let fence = store
+                        .begin_handoff_dispatch_for_owner_if_current(
+                            &task_id,
+                            snapshot.generation(),
+                            "owner",
+                        )
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        store
+                            .finish_handoff_dispatch_for_owner_if_current(
+                                &task_id,
+                                snapshot.generation(),
+                                "owner",
+                                fence,
+                            )
+                            .unwrap()
+                    );
+                }
+                "terminal" => {
+                    let terminal = FinalTask::Cancelled(
+                        transition_terminal_final_task_base(
+                            task.base().clone(),
+                            FinalTaskStatus::Cancelled,
+                            None,
+                        )
+                        .unwrap(),
+                    );
+                    store
+                        .replace_task_and_clear_input_if_current(
+                            &snapshot,
+                            terminal.clone(),
+                            final_task_notification(&terminal),
+                        )
+                        .unwrap()
+                        .unwrap();
+                }
+                "expire" => {
+                    *now.lock().unwrap() += StdDuration::from_secs(1);
+                    assert!(store.get_task(&task_id).unwrap().is_none());
+                }
+                _ => unreachable!("fixed test operation"),
+            }
+            {
+                let state = store.state.lock().unwrap();
+                assert!(state.handoff_expirations.is_empty(), "{operation}");
+                assert!(state.handoff_leases.is_empty(), "{operation}");
+            }
+            assert_final_task_payload_accounting(&store);
+            *now.lock().unwrap() += StdDuration::from_secs(1);
+            assert_eq!(store.task_count(), 0);
+            assert!(store.state.lock().unwrap().retention_expirations.is_empty());
+            assert_final_task_payload_accounting(&store);
+        }
+    }
+
     fn final_task_restoration_snapshot(
         store: &InMemoryFinalTaskStore,
         task_id: &FinalTaskId,
@@ -18232,6 +18540,28 @@ mod tests {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state.retention_expirations,
+            state
+                .expires_at
+                .iter()
+                .map(|(task_id, expires_at)| (*expires_at, task_id.clone()))
+                .collect(),
+            "retention indexing must retain exactly one entry per live deadline"
+        );
+        assert_eq!(
+            state.handoff_expirations,
+            state
+                .handoff_leases
+                .iter()
+                .filter_map(|(task_id, lease)| {
+                    lease
+                        .recovery_expires_at
+                        .map(|expires_at| (expires_at, task_id.clone()))
+                })
+                .collect(),
+            "handoff indexing must retain exactly one entry per live lease deadline"
+        );
         let mut total = 0;
         let mut reserved = 0;
         let mut owners: BTreeMap<Option<[u8; 32]>, InMemoryFinalTaskOwnerCharge> = BTreeMap::new();
@@ -27705,7 +28035,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.expires_at.insert(
+            state.set_retention_deadline(
                 first_id.clone(),
                 std::time::Instant::now()
                     .checked_sub(std::time::Duration::from_millis(1))
