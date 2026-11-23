@@ -446,7 +446,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(waiting_for_input: bool) -> Self {
-        let store = Arc::new(AsyncControlStore::new());
+        Self::with_store(waiting_for_input, Arc::new(AsyncControlStore::new()))
+    }
+
+    fn with_store(waiting_for_input: bool, store: Arc<AsyncControlStore>) -> Self {
         let ctx = McpContext::with_state(Cx::for_testing(), 1, fastmcp_core::SessionState::new())
             .with_auth(
                 fastmcp_core::AuthContext::with_subject("async-task-owner")
@@ -1029,7 +1032,10 @@ impl TaskRetentionAdministrator for RetentionAdmin {
 }
 
 fn terminal_retention_fixture() -> (Fixture, Arc<RetentionAdmin>) {
-    let fixture = Fixture::new(false);
+    terminal_retention_fixture_from(Fixture::new(false))
+}
+
+fn terminal_retention_fixture_from(fixture: Fixture) -> (Fixture, Arc<RetentionAdmin>) {
     let current = fixture.snapshot();
     let terminal = FinalTask::Cancelled(
         transition_terminal_final_task_base(
@@ -1186,21 +1192,40 @@ fn async_retention_reclamation_revalidates_before_first_write() {
         let (fixture, administrator) = terminal_retention_fixture();
         let target = inspect_retention(&fixture);
         let before = fixture.snapshot();
+        let retained = fixture.store.inner.retained_payload_bytes();
         fixture.store.write_gate.close();
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut poll = Context::from_waker(&waker);
         let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
             &fixture.ctx,
             &target,
             TaskRetentionReason::OperatorRequest,
         ));
-        assert!(poll_once(reclaim.as_mut()).is_pending());
+        assert!(reclaim.as_mut().poll(&mut poll).is_pending());
         if cancel {
             fixture.ctx.request_cancellation().cancel();
+            assert!(
+                wakes.0.load(Ordering::SeqCst) > 0,
+                "prewrite cancellation must wake the caller without storage progress"
+            );
         } else {
             administrator.allowed.store(false, Ordering::SeqCst);
         }
-        fixture.store.write_gate.release();
-        assert!(ready(poll_once(reclaim.as_mut())).is_err());
+        // Leave the provider parked. The runtime must settle a read-only wait
+        // without requiring an unrelated storage wake or claiming a mutation.
+        let error = ready(reclaim.as_mut().poll(&mut poll)).unwrap_err();
+        if cancel {
+            assert_eq!(error.code, McpError::request_cancelled().code);
+        } else {
+            assert_eq!(
+                error.message,
+                "Task retention administration is not authorized"
+            );
+        }
+        assert!(!error.message.contains("may have committed"));
         assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.store.inner.retained_payload_bytes(), retained);
         let after = fixture.snapshot();
         assert_eq!(after.generation(), before.generation());
         assert!(final_tasks_match_exactly(after.task(), before.task()).unwrap());
@@ -1216,46 +1241,138 @@ fn async_retention_reclamation_revalidates_before_first_write() {
 
 #[test]
 fn async_retention_committed_receipt_survives_cancellation_and_retry_is_idempotent() {
-    let (fixture, administrator) = terminal_retention_fixture();
-    let target = inspect_retention(&fixture);
-    fixture.store.retention_receipt_gate.close();
-    let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
-        &fixture.ctx,
-        &target,
-        TaskRetentionReason::OperatorRequest,
-    ));
-    assert!(poll_once(reclaim.as_mut()).is_pending());
-    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.store.inner.task_count(), 0);
-    fixture.ctx.request_cancellation().cancel();
-    administrator.allowed.store(false, Ordering::SeqCst);
-    fixture.store.retention_receipt_gate.release();
-    let committed = ready(poll_once(reclaim.as_mut())).unwrap();
-    let TaskRetentionReclamation::Reclaimed(receipt) = committed else {
-        panic!("a proven commit must retain its receipt");
-    };
-    administrator.allowed.store(true, Ordering::SeqCst);
-    let fresh = McpContext::with_state(Cx::for_testing(), 2, fastmcp_core::SessionState::new());
-    let mut retry = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
-        &fresh,
-        &target,
-        TaskRetentionReason::SubjectRemoved,
-    ));
-    assert_eq!(
-        ready(poll_once(retry.as_mut())).unwrap(),
-        TaskRetentionReclamation::AlreadyReclaimed(receipt.clone()),
-    );
-    let mut audit = Box::pin(
-        fixture
-            .runtime
-            .task_retention_audit_with_context(&fresh, None, 1),
-    );
-    assert_eq!(
-        ready(poll_once(audit.as_mut())).unwrap().records(),
-        &[receipt]
-    );
-    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
-    fixture.store.assert_async_only();
+    for cancel_in_commit_poll in [false, true] {
+        let (fixture, administrator) = terminal_retention_fixture();
+        let target = inspect_retention(&fixture);
+        if cancel_in_commit_poll {
+            let cancellation = fixture.ctx.request_cancellation();
+            let revoked = Arc::clone(&administrator);
+            *fixture.store.after_write.lock().unwrap() = Some(Box::new(move || {
+                cancellation.cancel();
+                revoked.allowed.store(false, Ordering::SeqCst);
+            }));
+        }
+        fixture.store.retention_receipt_gate.close();
+        let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+            &fixture.ctx,
+            &target,
+            TaskRetentionReason::OperatorRequest,
+        ));
+        assert!(poll_once(reclaim.as_mut()).is_pending());
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.inner.task_count(), 0);
+        if !cancel_in_commit_poll {
+            fixture.ctx.request_cancellation().cancel();
+            administrator.allowed.store(false, Ordering::SeqCst);
+        }
+        assert!(fixture.ctx.ensure_live().is_err());
+        fixture.store.retention_receipt_gate.release();
+        let committed = ready(poll_once(reclaim.as_mut())).unwrap();
+        let TaskRetentionReclamation::Reclaimed(receipt) = committed else {
+            panic!("a proven commit must retain its receipt");
+        };
+        administrator.allowed.store(true, Ordering::SeqCst);
+        let fresh = McpContext::with_state(Cx::for_testing(), 2, fastmcp_core::SessionState::new());
+        let mut retry = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+            &fresh,
+            &target,
+            TaskRetentionReason::SubjectRemoved,
+        ));
+        assert_eq!(
+            ready(poll_once(retry.as_mut())).unwrap(),
+            TaskRetentionReclamation::AlreadyReclaimed(receipt.clone()),
+        );
+        let mut audit = Box::pin(
+            fixture
+                .runtime
+                .task_retention_audit_with_context(&fresh, None, 1),
+        );
+        assert_eq!(
+            ready(poll_once(audit.as_mut())).unwrap().records(),
+            &[receipt]
+        );
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        fixture.store.assert_async_only();
+    }
+}
+
+#[test]
+fn async_retention_nonmutating_receipts_require_authority_after_write_admission() {
+    for receipt_expired in [false, true] {
+        for cancelled in [None, Some(false), Some(true)] {
+            let now = Arc::new(Mutex::new(Instant::now()));
+            let clock = Arc::clone(&now);
+            let inner = InMemoryFinalTaskStore::with_clock(
+                16,
+                Arc::new(move || *clock.lock().unwrap()),
+            )
+            .unwrap();
+            let store = Arc::new(AsyncControlStore {
+                inner,
+                ..AsyncControlStore::new()
+            });
+            let (fixture, administrator) =
+                terminal_retention_fixture_from(Fixture::with_store(false, store));
+            let target = inspect_retention(&fixture);
+            let mut first = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+                &fixture.ctx,
+                &target,
+                TaskRetentionReason::RetentionPolicy,
+            ));
+            let TaskRetentionReclamation::Reclaimed(receipt) =
+                ready(poll_once(first.as_mut())).unwrap()
+            else {
+                panic!("the original terminal generation must reclaim");
+            };
+            if receipt_expired {
+                let mut now = now.lock().unwrap();
+                *now = now.checked_add(StdDuration::from_hours(48)).unwrap();
+            }
+            // The provider runs its write-admission checkpoint in both cases.
+            // The exact store transaction then returns an old receipt or a
+            // failed comparison, without performing another reclamation.
+            fixture.store.retention_receipt_gate.close();
+            let mut repeated = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+                &fixture.ctx,
+                &target,
+                TaskRetentionReason::OperatorRequest,
+            ));
+            assert!(poll_once(repeated.as_mut()).is_pending());
+            assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+            if let Some(cancel) = cancelled {
+                if cancel {
+                    fixture.ctx.request_cancellation().cancel();
+                } else {
+                    administrator.allowed.store(false, Ordering::SeqCst);
+                }
+            }
+            fixture.store.retention_receipt_gate.release();
+            let outcome = ready(poll_once(repeated.as_mut()));
+            if let Some(cancel) = cancelled {
+                let error = outcome.expect_err("a nonmutating receipt needs current authority");
+                if cancel {
+                    assert_eq!(error.code, McpError::request_cancelled().code);
+                } else {
+                    assert_eq!(
+                        error.message,
+                        "Task retention administration is not authorized"
+                    );
+                }
+                assert!(!error.message.contains("may have committed"));
+            } else if receipt_expired {
+                assert_eq!(outcome.unwrap(), TaskRetentionReclamation::NotCurrent);
+            } else {
+                assert_eq!(
+                    outcome.unwrap(),
+                    TaskRetentionReclamation::AlreadyReclaimed(receipt)
+                );
+            }
+            assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.store.inner.task_count(), 0);
+            assert_eq!(fixture.store.inner.retained_payload_bytes(), 0);
+            fixture.store.assert_async_only();
+        }
+    }
 }
 
 #[test]

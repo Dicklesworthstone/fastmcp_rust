@@ -24,6 +24,7 @@ pub struct FinalTaskRetentionAdmission<'a> {
     ctx: &'a McpContext,
     target: &'a TaskRetentionTarget,
     reason: TaskRetentionReason,
+    write_admitted: &'a AtomicBool,
 }
 
 impl<'a> FinalTaskRetentionAdmission<'a> {
@@ -61,6 +62,8 @@ impl<'a> FinalTaskRetentionAdmission<'a> {
                 reason: self.reason,
             },
         )?;
+        self.write_admitted
+            .store(true, TaskServiceOrdering::Release);
         Ok(())
     }
 }
@@ -112,6 +115,9 @@ impl FinalTaskRuntime {
     /// committed receipt remains successful if cancellation or revocation
     /// arrives after that write; neither can safely imply a rolled-back
     /// reclamation. Repeating a retained receipt preserves its original reason.
+    /// Before write admission, cancellation wakes a suspended provider without
+    /// waiting for storage progress. Nonmutating outcomes still require current
+    /// authority when their original operation completes.
     /// These hooks do not establish a persistent backend or durability claim.
     pub fn reclaim_task_retention_with_context<'a>(
         &'a self,
@@ -120,25 +126,57 @@ impl FinalTaskRuntime {
         reason: TaskRetentionReason,
     ) -> impl Future<Output = McpResult<TaskRetentionReclamation>> + Send + 'a {
         CallerContextFuture::new(ctx.cx(), async move {
-            let admission = FinalTaskRetentionAdmission {
-                runtime: self,
-                ctx,
-                target,
-                reason,
+            let authorize = || {
+                self.authorize_task_retention(
+                    ctx,
+                    &TaskRetentionAuthorization::Reclaim {
+                        task_id: &target.task_id,
+                        generation: target.generation,
+                        reason,
+                    },
+                )
+                .map(|_| ())
             };
-            admission.checkpoint_before_write()?;
+            authorize()?;
             if !Arc::ptr_eq(&target.runtime, &self.retention_administration) {
                 return Err(McpError::invalid_params(
                     "Task retention target belongs to another runtime",
                 ));
             }
-            // The provider owns settling any write it starts. A read-style
-            // cancellation guard could abandon an already committed mutation.
-            let outcome = self
-                .store
-                .reclaim_terminal_task_with_context(admission)
-                .await
-                .map_err(|error| control_write_error(ctx, "Task retention reclamation", error))?;
+            let write_admitted = AtomicBool::new(false);
+            let admission = FinalTaskRetentionAdmission {
+                runtime: self,
+                ctx,
+                target,
+                reason,
+                write_admitted: &write_admitted,
+            };
+            let outcome = await_retention_reclaim(
+                ctx,
+                self.store.reclaim_terminal_task_with_context(admission),
+                &write_admitted,
+                &authorize,
+            )
+            .await
+            .map_err(|error| {
+                if write_admitted.load(TaskServiceOrdering::Acquire) {
+                    control_write_error(ctx, "Task retention reclamation", error)
+                } else {
+                    error
+                }
+            })?;
+            if matches!(&outcome, TaskRetentionReclamation::Reclaimed(_)) {
+                if !write_admitted.load(TaskServiceOrdering::Acquire) {
+                    return Err(McpError::internal_error(
+                        "Task retention backend reported an unadmitted reclamation",
+                    ));
+                }
+            } else {
+                // An admitted potential write can finish as a failed comparison
+                // or a retained retry receipt. Neither outcome changed storage,
+                // so require current authority before disclosing it.
+                authorize()?;
+            }
             if let Some(receipt) = outcome.receipt() {
                 if matches!(&outcome, TaskRetentionReclamation::Reclaimed(_))
                     && receipt.reason != reason
@@ -750,6 +788,39 @@ async fn await_control_read<T>(
         let result = future.as_mut().poll(poll);
         if let Err(error) = admit() {
             return Poll::Ready(Err(error));
+        }
+        result
+    })
+    .await
+}
+
+/// Cancellation can abandon a prewrite wait, but cannot erase a committed
+/// result. A provider may admit its write, cancel the caller, and first return
+/// Pending in a single poll, so check the boundary again after polling it.
+async fn await_retention_reclaim(
+    ctx: &McpContext,
+    mut future: FinalTaskStoreFuture<'_, TaskRetentionReclamation>,
+    write_admitted: &AtomicBool,
+    admit: impl Fn() -> McpResult<()> + Send,
+) -> McpResult<TaskRetentionReclamation> {
+    let mut cancelled = Box::pin(ctx.request_cancelled());
+    std::future::poll_fn(move |poll| {
+        if !write_admitted.load(TaskServiceOrdering::Acquire) {
+            if let Err(error) = admit() {
+                return Poll::Ready(Err(error));
+            }
+            if cancelled.as_mut().poll(poll).is_ready() {
+                return Poll::Ready(Err(McpError::request_cancelled()));
+            }
+        }
+        let result = future.as_mut().poll(poll);
+        if !write_admitted.load(TaskServiceOrdering::Acquire) {
+            if let Err(error) = admit() {
+                return Poll::Ready(Err(error));
+            }
+            if cancelled.as_mut().poll(poll).is_ready() {
+                return Poll::Ready(Err(McpError::request_cancelled()));
+            }
         }
         result
     })
