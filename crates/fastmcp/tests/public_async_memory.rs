@@ -2342,4 +2342,101 @@ mod retention_administration {
         });
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
+
+    #[test]
+    fn facade_async_task_retention_preserves_authority_and_exact_receipts() {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            assert!(cx.blocking_pool_handle().is_none());
+            let store = Arc::new(InMemoryFinalTaskStore::new(1).unwrap());
+            let operator = Arc::new(Operator {
+                enabled: AtomicBool::new(true),
+            });
+            let tasks = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::with_unlimited_ttl(operator.as_ref(), None).unwrap(),
+                Arc::new(|_| {}),
+            );
+            tasks
+                .install_retention_administrator(&cx, operator.clone())
+                .unwrap();
+            let task = retained_task("async-retained-terminal", "retained result");
+            let id = task.base().task_id.clone();
+            retain(store.as_ref(), task).unwrap();
+            let retained_bytes = store.retained_payload_bytes();
+
+            let mut auth = AuthContext::with_subject("operator");
+            auth.scopes.push("tasks:retention:admin".to_owned());
+            let admin = McpContext::new(cx.clone(), 1).with_auth(auth);
+            let owner =
+                McpContext::new(cx.clone(), 2).with_auth(AuthContext::with_subject("task-owner"));
+            assert!(
+                tasks
+                    .inspect_task_retention_with_context(&owner, &id)
+                    .await
+                    .is_err()
+            );
+            let target = tasks
+                .inspect_task_retention_with_context(&admin, &id)
+                .await
+                .unwrap();
+            operator.enabled.store(false, Ordering::Release);
+            assert!(
+                tasks
+                    .reclaim_task_retention_with_context(
+                        &admin,
+                        &target,
+                        TaskRetentionReason::OperatorRequest,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.retained_payload_bytes(), retained_bytes);
+            assert!(store.get_task(&id).unwrap().is_some());
+
+            operator.enabled.store(true, Ordering::Release);
+            let TaskRetentionReclamation::Reclaimed(receipt) = tasks
+                .reclaim_task_retention_with_context(
+                    &admin,
+                    &target,
+                    TaskRetentionReason::OperatorRequest,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("the authorized terminal generation must reclaim");
+            };
+            assert_eq!(receipt.released_payload_bytes(), retained_bytes);
+            assert_eq!(store.retained_payload_bytes(), 0);
+            assert!(store.get_task(&id).unwrap().is_none());
+            assert_eq!(
+                tasks
+                    .reclaim_task_retention_with_context(
+                        &admin,
+                        &target,
+                        TaskRetentionReason::RetentionPolicy,
+                    )
+                    .await
+                    .unwrap(),
+                TaskRetentionReclamation::AlreadyReclaimed(receipt.clone())
+            );
+            let audit = tasks
+                .task_retention_audit_with_context(&admin, None, 1)
+                .await
+                .unwrap();
+            assert_eq!(audit.records(), std::slice::from_ref(&receipt));
+            assert!(
+                tasks
+                    .task_retention_audit_with_context(&owner, None, 1)
+                    .await
+                    .is_err()
+            );
+            assert!(cx.checkpoint().is_ok());
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
 }

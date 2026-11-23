@@ -515,14 +515,15 @@ pub mod server {
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCreationAdmission,
-        FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskNotificationEmitter,
-        FinalTaskOperation, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
-        FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
-        FinalTaskStoreFuture, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer,
-        TaskExecutionAuthorizer, TaskOperatorHandle, TaskRetentionAdministrator,
-        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy,
-        TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+        FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
+        FinalTaskNotificationEmitter, FinalTaskOperation, FinalTaskRetentionAdmission,
+        FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskStoreFuture,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+        InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
+        TaskOperatorHandle, TaskRetentionAdministrator, TaskRetentionAuditPage,
+        TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
+        TaskRetentionReclamation, TaskRetentionTarget,
     };
     /// WebSocket server listener and lifecycle APIs.
     #[cfg(feature = "websocket-experimental")]
@@ -1023,15 +1024,15 @@ pub use fastmcp_server::{
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
     FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskAccessMetadata,
-    FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
-    FinalTaskInitialWorkClaim, FinalTaskNotificationEmitter, FinalTaskOperation,
-    FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
-    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskStoreFuture,
-    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
-    TaskOperatorHandle, TaskRetentionAdministrator, TaskRetentionAuditPage,
-    TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
-    TaskRetentionReclamation, TaskRetentionTarget,
+    FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
+    FinalTaskInitialWork, FinalTaskInitialWorkClaim, FinalTaskNotificationEmitter,
+    FinalTaskOperation, FinalTaskRetentionAdmission, FinalTaskRetentionAuthority,
+    FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+    FinalTaskStore, FinalTaskStoreFuture, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+    FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer,
+    TaskExecutionAuthorizer, TaskOperatorHandle, TaskRetentionAdministrator,
+    TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
+    TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
 };
 
 /// Proxy APIs are available only with the proxy profile.
@@ -3587,14 +3588,15 @@ pub mod modern {
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCreationAdmission,
-        FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskNotificationEmitter,
-        FinalTaskOperation, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
-        FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
-        FinalTaskStoreFuture, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer,
-        TaskExecutionAuthorizer, TaskOperatorHandle, TaskRetentionAdministrator,
-        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy,
-        TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+        FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
+        FinalTaskNotificationEmitter, FinalTaskOperation, FinalTaskRetentionAdmission,
+        FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskStoreFuture,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+        InMemoryFinalTaskStore, TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
+        TaskOperatorHandle, TaskRetentionAdministrator, TaskRetentionAuditPage,
+        TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
+        TaskRetentionReclamation, TaskRetentionTarget,
     };
 
     #[cfg(all(feature = "apps", feature = "tasks"))]
@@ -13904,6 +13906,8 @@ pub mod testing;
 pub mod prelude {
     #[cfg(all(feature = "proxy", feature = "websocket-experimental"))]
     pub use crate::ProxyWebSocketClient;
+    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+    pub use crate::WebSocketTaskSubscriptionOwner;
     pub use crate::{
         // Context and errors
         AccessToken,
@@ -14140,19 +14144,19 @@ pub mod prelude {
     pub use crate::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTask, FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCallToolResult,
-        FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId,
-        FinalTaskInitialWork, FinalTaskInputResponses, FinalTaskNotificationEmitter,
-        FinalTaskOperation, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
-        FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStatusNotification,
-        FinalTaskStore, FinalTaskStoreFuture, FinalTaskSupervisorFuture,
-        FinalTaskSupervisorHandoff, FinalTaskWatch, FinalTaskWatchEvent, FinalTaskWorkDescriptor,
-        FinalToolCallOutcome, FinalUpdateTaskResult, InMemoryFinalTaskStore,
-        OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver, TASK_UPDATE,
-        TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer,
-        TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
-        TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
-        TaskRetentionTarget, official_tasks_descriptor, official_tasks_empty_settings,
-        register_official_tasks_extension, tasks_extension,
+        FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
+        FinalTaskHandle, FinalTaskId, FinalTaskInitialWork, FinalTaskInputResponses,
+        FinalTaskNotificationEmitter, FinalTaskOperation, FinalTaskRetentionAdmission,
+        FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStatusNotification, FinalTaskStore,
+        FinalTaskStoreFuture, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+        FinalTaskWatch, FinalTaskWatchEvent, FinalTaskWorkDescriptor, FinalToolCallOutcome,
+        FinalUpdateTaskResult, InMemoryFinalTaskStore, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        OfficialTasksNegotiationResolver, TASK_UPDATE, TaskAccessAction, TaskAccessAuthorizer,
+        TaskExecutionAuthorizer, TaskRetentionAdministrator, TaskRetentionAuditPage,
+        TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
+        TaskRetentionReclamation, TaskRetentionTarget, official_tasks_descriptor,
+        official_tasks_empty_settings, register_official_tasks_extension, tasks_extension,
     };
     pub use crate::{
         BaggageForwardingLimits, OutboundTraceDecision, OutboundTracePolicy, TraceContext,
@@ -14164,8 +14168,6 @@ pub mod prelude {
         BoundWebSocketServer, WebSocketCatalogSubscriptionOwner, WebSocketClient,
         WebSocketNonquiescentShutdown, WebSocketResponse, WebSocketServerShutdown,
     };
-    #[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
-    pub use crate::WebSocketTaskSubscriptionOwner;
     pub use crate::{
         CachePartitionKey, ClientCapabilityInfo, ClientImplementationInfo,
         ContextNotificationSender, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,

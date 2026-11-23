@@ -2929,6 +2929,34 @@ surface. These client observations cover the executor-backed stdio and memory
 paths; they do not imply readiness of other client transports, durable task
 workers, credentials, or the entire application.
 
+### Tasks retention administration
+
+With `tasks` enabled, install a `TaskRetentionAdministrator` on the
+`FinalTaskRuntime` to inspect and reclaim a terminal Task under separate,
+current administrative authority. The asynchronous methods
+`inspect_task_retention_with_context`, `reclaim_task_retention_with_context`,
+and `task_retention_audit_with_context` run on the caller's `McpContext` and
+allow an application store to suspend its I/O without blocking sibling work.
+The inspection returns an exact generation-bound target; reusing an old
+target cannot remove a successor Task with the same identifier.
+
+An asynchronous `FinalTaskStore` overrides `get_task_snapshot_with_context`,
+`reclaim_terminal_task_with_context`, and `task_retention_audit_with_context`.
+The reclamation hook receives a sealed `FinalTaskRetentionAdmission`. Use
+its context for I/O and call `checkpoint_before_write()` immediately before
+the first irreversible write, including after a suspension. Once a write may
+have committed, settle its original receipt. A verified committed receipt is
+preserved if cancellation arrives afterward; cancellation does not imply that
+the Task was retained. Repeated reclamation within the journal's lifetime
+returns the original receipt and reason. Audit reads remain bounded and
+require current administrative authorization.
+
+The built-in `InMemoryFinalTaskStore` supports these methods through bounded
+synchronous operations. Retention and handoff-lease expiry checks use ordered
+deadlines to inspect only due entries; renewing a lease replaces its previous
+deadline entry. Storage and the reclamation journal remain process-local;
+these APIs do not add a durable or distributed backend.
+
 ### Tasks store observations
 
 With `tasks` enabled, `FinalTaskRuntime::task_operator_handle()` returns an

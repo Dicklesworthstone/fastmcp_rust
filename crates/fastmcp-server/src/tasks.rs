@@ -50,6 +50,7 @@ pub use authorization::{
     FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
     TaskExecutionAuthorizer,
 };
+pub use control::FinalTaskRetentionAdmission;
 pub use creation::FinalTaskCreationAdmission;
 
 #[cfg(test)]
@@ -1741,6 +1742,27 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Reclaims one exact terminal generation under request-owned authority.
+    /// An asynchronous backend must call `admission.checkpoint_before_write()`
+    /// immediately before its first irreversible write after any suspension.
+    /// Settle the operation and preserve its committed receipt; cancellation
+    /// alone never proves that an admitted write was rolled back. The default
+    /// delegates to the bounded synchronous backend.
+    fn reclaim_terminal_task_with_context<'a>(
+        &'a self,
+        admission: FinalTaskRetentionAdmission<'a>,
+    ) -> FinalTaskStoreFuture<'a, TaskRetentionReclamation> {
+        Box::pin(async move {
+            admission.checkpoint_before_write()?;
+            self.reclaim_terminal_task_if_current(
+                admission.context().cx(),
+                admission.task_id(),
+                admission.generation(),
+                admission.reason(),
+            )
+        })
+    }
+
     /// Returns an ordered bounded page of redacted retention receipts. The
     /// cursor is a sequence, not an offset, and does not pin a store snapshot.
     /// Expired receipts may disappear between pages; later receipts cannot be
@@ -1754,6 +1776,22 @@ pub trait FinalTaskStore: Send + Sync {
         Err(McpError::internal_error(
             "Final task store does not implement retention audit",
         ))
+    }
+
+    /// Reads a bounded, redacted retention-audit page on the current caller's
+    /// context. The synchronous sequence, policy and page-validation contract
+    /// also applies to asynchronous overrides.
+    fn task_retention_audit_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        after: Option<u64>,
+        limit: usize,
+    ) -> FinalTaskStoreFuture<'a, TaskRetentionAuditPage> {
+        Box::pin(async move {
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
+            self.task_retention_audit(ctx.cx(), after, limit)
+        })
     }
 
     /// Attests finite, immutable execution limits for newly admitted tasks.
@@ -2811,14 +2849,16 @@ impl InMemoryFinalTaskState {
     /// cannot turn a bounded store into an unbounded expiry queue.
     fn set_retention_deadline(&mut self, task_id: FinalTaskId, expires_at: Instant) {
         if let Some(previous) = self.expires_at.insert(task_id.clone(), expires_at) {
-            self.retention_expirations.remove(&(previous, task_id.clone()));
+            self.retention_expirations
+                .remove(&(previous, task_id.clone()));
         }
         self.retention_expirations.insert((expires_at, task_id));
     }
 
     fn remove_retention_deadline(&mut self, task_id: &FinalTaskId) {
         if let Some(expires_at) = self.expires_at.remove(task_id) {
-            self.retention_expirations.remove(&(expires_at, task_id.clone()));
+            self.retention_expirations
+                .remove(&(expires_at, task_id.clone()));
         }
     }
 
@@ -2826,7 +2866,8 @@ impl InMemoryFinalTaskState {
         if let Some(lease) = self.handoff_leases.remove(task_id)
             && let Some(expires_at) = lease.recovery_expires_at
         {
-            self.handoff_expirations.remove(&(expires_at, task_id.clone()));
+            self.handoff_expirations
+                .remove(&(expires_at, task_id.clone()));
         }
     }
 
@@ -2837,9 +2878,11 @@ impl InMemoryFinalTaskState {
         expires_at: Instant,
     ) {
         if let Some(previous) = previous {
-            self.handoff_expirations.remove(&(previous, task_id.clone()));
+            self.handoff_expirations
+                .remove(&(previous, task_id.clone()));
         }
-        self.handoff_expirations.insert((expires_at, task_id.clone()));
+        self.handoff_expirations
+            .insert((expires_at, task_id.clone()));
     }
 }
 
@@ -18258,8 +18301,13 @@ mod tests {
         assert_eq!(store.task_count(), 2);
         assert!(store.get_task(&tasks[0].base().task_id).unwrap().is_none());
         assert_eq!(
-            serde_json::to_value(store.get_task(&replacement.base().task_id).unwrap().unwrap())
-                .unwrap(),
+            serde_json::to_value(
+                store
+                    .get_task(&replacement.base().task_id)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
             serde_json::to_value(replacement).unwrap()
         );
         assert!(store.state.lock().unwrap().retention_expirations.is_empty());
@@ -18390,7 +18438,10 @@ mod tests {
             store.state.lock().unwrap().next_generation = next_generation;
             let recovered = store.get_task_snapshot(&task_id).unwrap().unwrap();
             assert_ne!(recovered.generation(), snapshot.generation());
-            assert_eq!(matches!(recovered.task(), FinalTask::Cancelled(_)), cancelled);
+            assert_eq!(
+                matches!(recovered.task(), FinalTask::Cancelled(_)),
+                cancelled
+            );
             assert!(store.state.lock().unwrap().handoff_expirations.is_empty());
             assert_final_task_payload_accounting(&store);
         }

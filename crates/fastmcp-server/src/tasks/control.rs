@@ -9,7 +9,197 @@ use super::*;
 use crate::extensions::TaskControlReceipt;
 use std::task::Poll;
 
+/// Request-owned authority for one exact terminal Task reclamation.
+///
+/// The framework creates this admission only after authorizing the current
+/// administrator and binding the inspected target to its originating runtime.
+/// An asynchronous store uses [`Self::context`] for I/O and calls
+/// [`Self::checkpoint_before_write`] immediately before its first irreversible
+/// write, including after a suspension. Once a write may have committed, the
+/// backend must settle that original receipt instead of reporting cancellation
+/// as proof that nothing changed. This value cannot be cloned or constructed
+/// by application code.
+pub struct FinalTaskRetentionAdmission<'a> {
+    runtime: &'a FinalTaskRuntime,
+    ctx: &'a McpContext,
+    target: &'a TaskRetentionTarget,
+    reason: TaskRetentionReason,
+}
+
+impl<'a> FinalTaskRetentionAdmission<'a> {
+    /// Returns the original caller's context and cancellation authority.
+    #[must_use]
+    pub fn context(&self) -> &'a McpContext {
+        self.ctx
+    }
+
+    /// Returns the exact inspected Task identifier.
+    #[must_use]
+    pub fn task_id(&self) -> &'a FinalTaskId {
+        &self.target.task_id
+    }
+
+    /// Returns the generation that the backend must compare atomically.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.target.generation
+    }
+
+    /// Returns the closed administrative reason bound to this operation.
+    #[must_use]
+    pub const fn reason(&self) -> TaskRetentionReason {
+        self.reason
+    }
+
+    /// Revalidates current administrative authority before the first write.
+    pub fn checkpoint_before_write(&self) -> McpResult<()> {
+        self.runtime.authorize_task_retention(
+            self.ctx,
+            &TaskRetentionAuthorization::Reclaim {
+                task_id: &self.target.task_id,
+                generation: self.target.generation,
+                reason: self.reason,
+            },
+        )?;
+        Ok(())
+    }
+}
+
 impl FinalTaskRuntime {
+    /// Inspects one terminal Task through the caller-owned asynchronous store.
+    ///
+    /// Administrative authority is checked before storage is invoked, on every
+    /// poll, and before returning the non-payload comparison target. A suspended
+    /// read can be cancelled without waiting for an unrelated storage wakeup.
+    pub fn inspect_task_retention_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        task_id: &'a FinalTaskId,
+    ) -> impl Future<Output = McpResult<TaskRetentionTarget>> + Send + 'a {
+        CallerContextFuture::new(ctx.cx(), async move {
+            let authorize = || {
+                self.authorize_task_retention(ctx, &TaskRetentionAuthorization::Inspect { task_id })
+                    .map(|_| ())
+            };
+            authorize()?;
+            let snapshot = await_control_read(
+                ctx,
+                self.store.get_task_snapshot_with_context(ctx, task_id),
+                authorize,
+            )
+            .await?
+            .ok_or_else(|| {
+                McpError::invalid_params("Task has no reclaimable terminal generation")
+            })?;
+            let snapshot = self.validate_loaded_task_snapshot(snapshot, Some(task_id))?;
+            if snapshot.generation() == 0 || !final_task_is_terminal(snapshot.task()) {
+                return Err(McpError::invalid_params(
+                    "Task has no reclaimable terminal generation",
+                ));
+            }
+            Ok(TaskRetentionTarget {
+                task_id: task_id.clone(),
+                generation: snapshot.generation(),
+                runtime: Arc::clone(&self.retention_administration),
+            })
+        })
+    }
+
+    /// Reclaims an inspected terminal generation without blocking its caller.
+    ///
+    /// The backend receives a fresh administrative admission and must compare
+    /// the exact target within its atomic reclamation transaction. A validated
+    /// committed receipt remains successful if cancellation or revocation
+    /// arrives after that write; neither can safely imply a rolled-back
+    /// reclamation. Repeating a retained receipt preserves its original reason.
+    /// These hooks do not establish a persistent backend or durability claim.
+    pub fn reclaim_task_retention_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        target: &'a TaskRetentionTarget,
+        reason: TaskRetentionReason,
+    ) -> impl Future<Output = McpResult<TaskRetentionReclamation>> + Send + 'a {
+        CallerContextFuture::new(ctx.cx(), async move {
+            let admission = FinalTaskRetentionAdmission {
+                runtime: self,
+                ctx,
+                target,
+                reason,
+            };
+            admission.checkpoint_before_write()?;
+            if !Arc::ptr_eq(&target.runtime, &self.retention_administration) {
+                return Err(McpError::invalid_params(
+                    "Task retention target belongs to another runtime",
+                ));
+            }
+            // The provider owns settling any write it starts. A read-style
+            // cancellation guard could abandon an already committed mutation.
+            let outcome = self
+                .store
+                .reclaim_terminal_task_with_context(admission)
+                .await
+                .map_err(|error| control_write_error(ctx, "Task retention reclamation", error))?;
+            if let Some(receipt) = outcome.receipt() {
+                if matches!(&outcome, TaskRetentionReclamation::Reclaimed(_))
+                    && receipt.reason != reason
+                {
+                    return Err(McpError::internal_error(
+                        "Task retention backend substituted the committed reason",
+                    ));
+                }
+                let expected = TaskRetentionReceipt::new(
+                    receipt.sequence,
+                    &target.task_id,
+                    target.generation,
+                    receipt.reason,
+                    receipt.released_payload_bytes,
+                )?;
+                if *receipt != expected {
+                    return Err(McpError::internal_error(
+                        "Task retention backend returned an unrelated receipt",
+                    ));
+                }
+            }
+            Ok(outcome)
+        })
+    }
+
+    /// Reads a bounded redacted audit page through the asynchronous store.
+    ///
+    /// Current administrative authority fences every provider poll and the
+    /// returned page. The backend cannot widen the requested page, configured
+    /// journal limits, or exclusive sequence cursor.
+    pub fn task_retention_audit_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        after: Option<u64>,
+        limit: usize,
+    ) -> impl Future<Output = McpResult<TaskRetentionAuditPage>> + Send + 'a {
+        CallerContextFuture::new(ctx.cx(), async move {
+            validate_task_retention_page_limit(limit)?;
+            let action = TaskRetentionAuthorization::Audit { after, limit };
+            let policy = self.authorize_task_retention(ctx, &action)?;
+            let page = await_control_read(
+                ctx,
+                self.store
+                    .task_retention_audit_with_context(ctx, after, limit),
+                || self.authorize_task_retention(ctx, &action).map(|_| ()),
+            )
+            .await?;
+            if page.records.len() > limit
+                || page.retained_records > policy.max_records
+                || page.retained_bytes > policy.max_bytes
+                || after
+                    .is_some_and(|after| page.records.iter().any(|record| record.sequence <= after))
+            {
+                return Err(McpError::internal_error(
+                    "Task retention backend exceeded its audit bounds",
+                ));
+            }
+            Ok(page)
+        })
+    }
+
     pub(crate) fn task_for_request_with_cx<'a>(
         &'a self,
         ctx: &'a McpContext,

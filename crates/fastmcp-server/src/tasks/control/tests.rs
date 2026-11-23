@@ -52,12 +52,16 @@ struct AsyncControlStore {
     metadata_gate: Gate,
     payload_gate: Gate,
     write_gate: Gate,
+    audit_gate: Gate,
+    retention_receipt_gate: Gate,
     metadata_calls: AtomicUsize,
     payload_calls: AtomicUsize,
     update_calls: AtomicUsize,
     cancel_calls: AtomicUsize,
     intent_reads: AtomicUsize,
     committed_writes: AtomicUsize,
+    retention_calls: AtomicUsize,
+    audit_calls: AtomicUsize,
     synchronous_calls: AtomicUsize,
     change_principal: AtomicBool,
     strip_operation: AtomicBool,
@@ -67,6 +71,9 @@ struct AsyncControlStore {
     request_cancellation_observed: AtomicBool,
     after_write: Mutex<Option<Hook>>,
     before_intent_read: Mutex<Option<Hook>>,
+    audit_override: Mutex<Option<TaskRetentionAuditPage>>,
+    substitute_retention_receipt: AtomicBool,
+    fail_reclamation_after_write: AtomicBool,
 }
 
 impl AsyncControlStore {
@@ -76,12 +83,16 @@ impl AsyncControlStore {
             metadata_gate: Gate::new(),
             payload_gate: Gate::new(),
             write_gate: Gate::new(),
+            audit_gate: Gate::new(),
+            retention_receipt_gate: Gate::new(),
             metadata_calls: AtomicUsize::new(0),
             payload_calls: AtomicUsize::new(0),
             update_calls: AtomicUsize::new(0),
             cancel_calls: AtomicUsize::new(0),
             intent_reads: AtomicUsize::new(0),
             committed_writes: AtomicUsize::new(0),
+            retention_calls: AtomicUsize::new(0),
+            audit_calls: AtomicUsize::new(0),
             synchronous_calls: AtomicUsize::new(0),
             change_principal: AtomicBool::new(false),
             strip_operation: AtomicBool::new(false),
@@ -91,6 +102,9 @@ impl AsyncControlStore {
             request_cancellation_observed: AtomicBool::new(false),
             after_write: Mutex::new(None),
             before_intent_read: Mutex::new(None),
+            audit_override: Mutex::new(None),
+            substitute_retention_receipt: AtomicBool::new(false),
+            fail_reclamation_after_write: AtomicBool::new(false),
         }
     }
 
@@ -112,6 +126,84 @@ impl AsyncControlStore {
 }
 
 impl FinalTaskStore for AsyncControlStore {
+    fn retention_administration_policy(&self) -> McpResult<TaskRetentionPolicy> {
+        self.inner.retention_administration_policy()
+    }
+
+    fn reclaim_terminal_task_with_context<'a>(
+        &'a self,
+        admission: FinalTaskRetentionAdmission<'a>,
+    ) -> FinalTaskStoreFuture<'a, TaskRetentionReclamation> {
+        self.retention_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.write_gate.wait().await;
+            assert!(Cx::current().is_some(), "retention polls retain the caller");
+            admission.checkpoint_before_write()?;
+            let outcome = self.inner.reclaim_terminal_task_if_current(
+                admission.context().cx(),
+                admission.task_id(),
+                admission.generation(),
+                admission.reason(),
+            )?;
+            if matches!(&outcome, TaskRetentionReclamation::Reclaimed(_)) {
+                self.committed_writes.fetch_add(1, Ordering::SeqCst);
+                self.after_write();
+            }
+            self.retention_receipt_gate.wait().await;
+            if self.fail_reclamation_after_write.load(Ordering::SeqCst) {
+                return Err(McpError::request_cancelled());
+            }
+            if self.substitute_retention_receipt.load(Ordering::SeqCst) {
+                return Ok(TaskRetentionReclamation::Reclaimed(
+                    TaskRetentionReceipt::new(
+                        1,
+                        &FinalTaskId::parse("unrelated-retained-task").unwrap(),
+                        admission.generation(),
+                        admission.reason(),
+                        0,
+                    )?,
+                ));
+            }
+            Ok(outcome)
+        })
+    }
+
+    fn task_retention_audit_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        after: Option<u64>,
+        limit: usize,
+    ) -> FinalTaskStoreFuture<'a, TaskRetentionAuditPage> {
+        self.audit_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.audit_gate.wait().await;
+            assert!(Cx::current().is_some(), "audit polls retain the caller");
+            if let Some(page) = self.audit_override.lock().unwrap().take() {
+                return Ok(page);
+            }
+            self.inner.task_retention_audit(ctx.cx(), after, limit)
+        })
+    }
+
+    fn reclaim_terminal_task_if_current(
+        &self,
+        _cx: &Cx,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+        _reason: TaskRetentionReason,
+    ) -> McpResult<TaskRetentionReclamation> {
+        self.unexpected_sync()
+    }
+
+    fn task_retention_audit(
+        &self,
+        _cx: &Cx,
+        _after: Option<u64>,
+        _limit: usize,
+    ) -> McpResult<TaskRetentionAuditPage> {
+        self.unexpected_sync()
+    }
+
     fn get_task_access_metadata_with_context<'a>(
         &'a self,
         _ctx: &'a McpContext,
@@ -916,4 +1008,406 @@ fn async_control_update_and_terminal_cancel_publish_through_async_hooks() {
     assert_eq!(fixture.notifications.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 2);
     fixture.store.assert_async_only();
+}
+
+struct RetentionAdmin {
+    allowed: AtomicBool,
+}
+
+impl TaskRetentionAdministrator for RetentionAdmin {
+    fn authorize(
+        &self,
+        _ctx: &McpContext,
+        _action: &TaskRetentionAuthorization<'_>,
+    ) -> McpResult<()> {
+        if self.allowed.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(McpError::invalid_request("test administrator was revoked"))
+        }
+    }
+}
+
+fn terminal_retention_fixture() -> (Fixture, Arc<RetentionAdmin>) {
+    let fixture = Fixture::new(false);
+    let current = fixture.snapshot();
+    let terminal = FinalTask::Cancelled(
+        transition_terminal_final_task_base(
+            current.task().base().clone(),
+            FinalTaskStatus::Cancelled,
+            None,
+        )
+        .unwrap(),
+    );
+    fixture
+        .store
+        .inner
+        .replace_task_and_clear_input_if_current(
+            &current,
+            terminal.clone(),
+            final_task_notification(&terminal),
+        )
+        .unwrap()
+        .expect("terminal fixture commits");
+    let administrator = Arc::new(RetentionAdmin {
+        allowed: AtomicBool::new(true),
+    });
+    fixture
+        .runtime
+        .install_retention_administrator(fixture.ctx.cx(), administrator.clone())
+        .unwrap();
+    (fixture, administrator)
+}
+
+fn inspect_retention(fixture: &Fixture) -> TaskRetentionTarget {
+    let mut inspect = Box::pin(
+        fixture
+            .runtime
+            .inspect_task_retention_with_context(&fixture.ctx, &fixture.task_id),
+    );
+    ready(poll_once(inspect.as_mut())).expect("authorized terminal inspection")
+}
+
+#[test]
+fn async_retention_inspection_suspends_without_blocking_sibling_audit() {
+    let (fixture, _administrator) = terminal_retention_fixture();
+    fixture.store.payload_gate.close();
+    let mut inspect = Box::pin(
+        fixture
+            .runtime
+            .inspect_task_retention_with_context(&fixture.ctx, &fixture.task_id),
+    );
+    assert!(poll_once(inspect.as_mut()).is_pending());
+    let mut audit = Box::pin(fixture.runtime.task_retention_audit_with_context(
+        &fixture.ctx,
+        None,
+        1,
+    ));
+    assert!(
+        ready(poll_once(audit.as_mut()))
+            .unwrap()
+            .records()
+            .is_empty()
+    );
+    fixture.store.payload_gate.release();
+    let target = ready(poll_once(inspect.as_mut())).unwrap();
+    assert_eq!(target.task_id(), &fixture.task_id);
+    assert_eq!(target.generation(), fixture.snapshot().generation());
+    assert_eq!(fixture.store.payload_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.store.audit_calls.load(Ordering::SeqCst), 1);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_denied_administrator_never_opens_payload_or_audit() {
+    let (fixture, administrator) = terminal_retention_fixture();
+    administrator.allowed.store(false, Ordering::SeqCst);
+    let mut inspect = Box::pin(
+        fixture
+            .runtime
+            .inspect_task_retention_with_context(&fixture.ctx, &fixture.task_id),
+    );
+    assert!(ready(poll_once(inspect.as_mut())).is_err());
+    let mut audit = Box::pin(fixture.runtime.task_retention_audit_with_context(
+        &fixture.ctx,
+        None,
+        1,
+    ));
+    assert!(ready(poll_once(audit.as_mut())).is_err());
+    assert_eq!(fixture.store.payload_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.store.audit_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.store.inner.task_count(), 1);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_suspended_reads_reject_revocation_before_returning_data() {
+    for inspect in [true, false] {
+        let (fixture, administrator) = terminal_retention_fixture();
+        fixture.store.payload_gate.close();
+        fixture.store.audit_gate.close();
+        let mut read: Pin<Box<dyn Future<Output = McpResult<()>> + Send + '_>> = if inspect {
+            Box::pin(async {
+                fixture
+                    .runtime
+                    .inspect_task_retention_with_context(&fixture.ctx, &fixture.task_id)
+                    .await
+                    .map(|_| ())
+            })
+        } else {
+            Box::pin(async {
+                fixture
+                    .runtime
+                    .task_retention_audit_with_context(&fixture.ctx, None, 1)
+                    .await
+                    .map(|_| ())
+            })
+        };
+        assert!(
+            read.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        administrator.allowed.store(false, Ordering::SeqCst);
+        let error = ready(read.as_mut().poll(&mut Context::from_waker(Waker::noop())))
+            .expect_err("revocation fences the still-parked read");
+        assert_eq!(
+            error.message,
+            "Task retention administration is not authorized"
+        );
+        assert_eq!(fixture.store.inner.task_count(), 1);
+        fixture.store.assert_async_only();
+    }
+}
+
+#[test]
+fn async_retention_cancelled_read_wakes_without_a_store_wakeup() {
+    let (fixture, _administrator) = terminal_retention_fixture();
+    fixture.store.payload_gate.close();
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut poll = Context::from_waker(&waker);
+    let mut inspect = Box::pin(
+        fixture
+            .runtime
+            .inspect_task_retention_with_context(&fixture.ctx, &fixture.task_id),
+    );
+    assert!(inspect.as_mut().poll(&mut poll).is_pending());
+    fixture.ctx.request_cancellation().cancel();
+    assert!(wakes.0.load(Ordering::SeqCst) > 0);
+    assert!(ready(inspect.as_mut().poll(&mut poll)).is_err());
+    assert_eq!(fixture.store.inner.task_count(), 1);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_reclamation_revalidates_before_first_write() {
+    for cancel in [false, true] {
+        let (fixture, administrator) = terminal_retention_fixture();
+        let target = inspect_retention(&fixture);
+        let before = fixture.snapshot();
+        fixture.store.write_gate.close();
+        let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+            &fixture.ctx,
+            &target,
+            TaskRetentionReason::OperatorRequest,
+        ));
+        assert!(poll_once(reclaim.as_mut()).is_pending());
+        if cancel {
+            fixture.ctx.request_cancellation().cancel();
+        } else {
+            administrator.allowed.store(false, Ordering::SeqCst);
+        }
+        fixture.store.write_gate.release();
+        assert!(ready(poll_once(reclaim.as_mut())).is_err());
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+        let after = fixture.snapshot();
+        assert_eq!(after.generation(), before.generation());
+        assert!(final_tasks_match_exactly(after.task(), before.task()).unwrap());
+        let audit = fixture
+            .store
+            .inner
+            .task_retention_audit(&Cx::for_testing(), None, 1)
+            .unwrap();
+        assert!(audit.records().is_empty());
+        fixture.store.assert_async_only();
+    }
+}
+
+#[test]
+fn async_retention_committed_receipt_survives_cancellation_and_retry_is_idempotent() {
+    let (fixture, administrator) = terminal_retention_fixture();
+    let target = inspect_retention(&fixture);
+    fixture.store.retention_receipt_gate.close();
+    let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+        &fixture.ctx,
+        &target,
+        TaskRetentionReason::OperatorRequest,
+    ));
+    assert!(poll_once(reclaim.as_mut()).is_pending());
+    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.store.inner.task_count(), 0);
+    fixture.ctx.request_cancellation().cancel();
+    administrator.allowed.store(false, Ordering::SeqCst);
+    fixture.store.retention_receipt_gate.release();
+    let committed = ready(poll_once(reclaim.as_mut())).unwrap();
+    let TaskRetentionReclamation::Reclaimed(receipt) = committed else {
+        panic!("a proven commit must retain its receipt");
+    };
+    administrator.allowed.store(true, Ordering::SeqCst);
+    let fresh = McpContext::with_state(Cx::for_testing(), 2, fastmcp_core::SessionState::new());
+    let mut retry = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+        &fresh,
+        &target,
+        TaskRetentionReason::SubjectRemoved,
+    ));
+    assert_eq!(
+        ready(poll_once(retry.as_mut())).unwrap(),
+        TaskRetentionReclamation::AlreadyReclaimed(receipt.clone()),
+    );
+    let mut audit = Box::pin(
+        fixture
+            .runtime
+            .task_retention_audit_with_context(&fresh, None, 1),
+    );
+    assert_eq!(
+        ready(poll_once(audit.as_mut())).unwrap().records(),
+        &[receipt]
+    );
+    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_rejects_foreign_runtime_target_before_backend_mutation() {
+    let (fixture, _administrator) = terminal_retention_fixture();
+    let target = inspect_retention(&fixture);
+    let other = FinalTaskRuntime::new(
+        fixture.store.clone(),
+        FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+        Arc::new(|_| {}),
+    );
+    other
+        .install_retention_administrator(
+            fixture.ctx.cx(),
+            Arc::new(RetentionAdmin {
+                allowed: AtomicBool::new(true),
+            }),
+        )
+        .unwrap();
+    let mut reclaim = Box::pin(other.reclaim_task_retention_with_context(
+        &fixture.ctx,
+        &target,
+        TaskRetentionReason::OperatorRequest,
+    ));
+    let error = ready(poll_once(reclaim.as_mut())).unwrap_err();
+    assert_eq!(
+        error.message,
+        "Task retention target belongs to another runtime"
+    );
+    assert_eq!(fixture.store.retention_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.store.inner.task_count(), 1);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_old_target_cannot_reclaim_a_reused_task_identifier() {
+    let (fixture, _administrator) = terminal_retention_fixture();
+    let target = inspect_retention(&fixture);
+    let original = fixture.snapshot();
+    let old_receipt = fixture
+        .store
+        .inner
+        .reclaim_terminal_task_if_current(
+            fixture.ctx.cx(),
+            &fixture.task_id,
+            target.generation(),
+            TaskRetentionReason::RetentionPolicy,
+        )
+        .unwrap()
+        .receipt()
+        .unwrap()
+        .clone();
+    fixture
+        .store
+        .inner
+        .create_task(
+            original.task().clone(),
+            final_task_notification(original.task()),
+        )
+        .unwrap();
+    let successor = fixture.snapshot();
+    assert!(successor.generation() > target.generation());
+    let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+        &fixture.ctx,
+        &target,
+        TaskRetentionReason::SubjectRemoved,
+    ));
+    assert_eq!(
+        ready(poll_once(reclaim.as_mut())).unwrap(),
+        TaskRetentionReclamation::AlreadyReclaimed(old_receipt),
+    );
+    assert_eq!(fixture.snapshot().generation(), successor.generation());
+    assert_eq!(fixture.store.inner.task_count(), 1);
+    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_rejects_substituted_receipts_and_ambiguous_write_errors() {
+    for substitute in [true, false] {
+        let (fixture, _administrator) = terminal_retention_fixture();
+        let target = inspect_retention(&fixture);
+        fixture
+            .store
+            .substitute_retention_receipt
+            .store(substitute, Ordering::SeqCst);
+        fixture
+            .store
+            .fail_reclamation_after_write
+            .store(!substitute, Ordering::SeqCst);
+        let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+            &fixture.ctx,
+            &target,
+            TaskRetentionReason::RetentionPolicy,
+        ));
+        let error = ready(poll_once(reclaim.as_mut())).unwrap_err();
+        assert_eq!(error.code, McpError::internal_error("").code);
+        if substitute {
+            assert_eq!(
+                error.message,
+                "Task retention backend returned an unrelated receipt"
+            );
+        } else {
+            assert!(
+                error
+                    .message
+                    .contains("Task retention reclamation may have committed")
+            );
+        }
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.inner.task_count(), 0);
+        fixture.store.assert_async_only();
+    }
+}
+
+#[test]
+fn async_retention_audit_rejects_backend_page_and_cursor_widening() {
+    for violation in 0..4 {
+        let (fixture, _administrator) = terminal_retention_fixture();
+        let receipt = TaskRetentionReceipt::new(
+            1,
+            &fixture.task_id,
+            fixture.snapshot().generation(),
+            TaskRetentionReason::OperatorRequest,
+            0,
+        )
+        .unwrap();
+        let mut page = TaskRetentionAuditPage::new(vec![receipt.clone()], None, 1, 128).unwrap();
+        let mut after = None;
+        match violation {
+            0 => {
+                let mut second = receipt;
+                second.sequence = 2;
+                page.records.push(second);
+                page.retained_records = 2;
+            }
+            1 => page.retained_records = TaskRetentionPolicy::default().max_records() + 1,
+            2 => page.retained_bytes = TaskRetentionPolicy::default().max_bytes() + 1,
+            _ => after = Some(1),
+        }
+        *fixture.store.audit_override.lock().unwrap() = Some(page);
+        let mut audit = Box::pin(fixture.runtime.task_retention_audit_with_context(
+            &fixture.ctx,
+            after,
+            1,
+        ));
+        let error = ready(poll_once(audit.as_mut())).unwrap_err();
+        assert_eq!(
+            error.message,
+            "Task retention backend exceeded its audit bounds"
+        );
+        assert_eq!(fixture.store.inner.task_count(), 1);
+        fixture.store.assert_async_only();
+    }
 }
