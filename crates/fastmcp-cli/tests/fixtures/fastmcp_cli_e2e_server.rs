@@ -179,12 +179,13 @@ impl fastmcp_rust::Middleware for WebSocketObservations {
             .append(true)
             .open(&self.path)
             .expect("open public WebSocket request observations");
-        writeln!(
-            output,
-            "{}",
+        let record = format!(
+            "{}\n",
             serde_json::json!({"method": request.method, "id": request.id, "params": request.params}),
-        )
-        .expect("retain public WebSocket request observation");
+        );
+        output
+            .write_all(record.as_bytes())
+            .expect("retain public WebSocket request observation");
         Ok(fastmcp_rust::MiddlewareDecision::Continue)
     }
 }
@@ -201,6 +202,17 @@ fn background(message: String, is_error: bool, delay_ms: u64) -> McpResult<fastm
 }
 
 #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+#[tool(tasks)]
+fn background_with_input(message: String) -> McpResult<fastmcp_rust::FinalToolOutcome> {
+    Ok(fastmcp_rust::FinalToolOutcome::CreateTask {
+        work_descriptor: fastmcp_rust::FinalTaskWorkDescriptor::new(serde_json::json!({
+            "message": message, "requires_input": true, "delay_ms": 0, "is_error": false,
+        }))?,
+        status_message: None,
+    })
+}
+
+#[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
 struct WebSocketTaskSupervisor;
 
 #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
@@ -211,12 +223,42 @@ impl fastmcp_rust::ApplicationTaskSupervisor for WebSocketTaskSupervisor {
         handoff: fastmcp_rust::FinalTaskSupervisorHandoff,
     ) -> fastmcp_rust::FinalTaskSupervisorFuture<'a> {
         Box::pin(async move {
-            let fastmcp_rust::FinalTaskSupervisorHandoff::Initial(work) = handoff else {
-                return Err(McpError::invalid_params("fixture work does not request input"));
+            let work = match handoff {
+                fastmcp_rust::FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                    let result = serde_json::from_value(serde_json::json!({
+                        "content": [{"type": "text", "text": serde_json::to_string(
+                            accepted.input_responses()
+                        ).expect("encode the actual accepted input")}],
+                    }))
+                    .expect("typed resumed task result");
+                    accepted.complete_task(result, None)?;
+                    return Ok(());
+                }
+                fastmcp_rust::FinalTaskSupervisorHandoff::Initial(work) => work,
             };
             let descriptor = work.work_descriptor().as_value().clone();
+            if descriptor["requires_input"] == true {
+                work.require_input(
+                    serde_json::from_value(serde_json::json!({
+                        "roots": {"method": "roots/list"},
+                    }))
+                    .expect("typed input request"),
+                    Some("waiting for explicit CLI input".to_owned()),
+                )?;
+                return Ok(());
+            }
             let delay_ms = descriptor["delay_ms"].as_u64().unwrap().min(10_000);
-            asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(delay_ms)).await;
+            let started = std::time::Instant::now();
+            loop {
+                if work.is_cancellation_requested()? {
+                    work.honor_cancellation(Some("cancelled by supervisor".to_owned()))?;
+                    return Ok(());
+                }
+                if started.elapsed() >= std::time::Duration::from_millis(delay_ms) {
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
+            }
             let result = serde_json::from_value(serde_json::json!({
                 "content": [{"type": "text", "text": descriptor["message"]}],
                 "isError": descriptor["is_error"],
@@ -231,7 +273,10 @@ impl fastmcp_rust::ApplicationTaskSupervisor for WebSocketTaskSupervisor {
 #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
 fn install_websocket_task_fixture(
     builder: ServerBuilder,
-) -> (ServerBuilder, Option<fastmcp_rust::AuthorizedTaskServiceRunner>) {
+) -> (
+    ServerBuilder,
+    Option<fastmcp_rust::AuthorizedTaskServiceRunner>,
+) {
     use std::sync::Arc;
     let runtime = fastmcp_rust::FinalTaskRuntime::new(
         Arc::new(fastmcp_rust::InMemoryFinalTaskStore::default()),
@@ -239,7 +284,11 @@ fn install_websocket_task_fixture(
         Arc::new(|_| {}),
     );
     let runner = runtime.install_task_service(16, Arc::new(WebSocketTaskSupervisor)).unwrap();
-    let builder = builder.tool(Background).final_tasks(runtime).unwrap();
+    let builder = builder
+        .tool(Background)
+        .tool(BackgroundWithInput)
+        .final_tasks(runtime)
+        .unwrap();
     (builder, Some(runner))
 }
 

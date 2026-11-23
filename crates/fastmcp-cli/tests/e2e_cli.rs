@@ -62,6 +62,42 @@ fn websocket_cli_without_feature_refuses_before_contact() {
     }
 }
 
+#[cfg(all(feature = "tasks", not(feature = "websocket-experimental")))]
+#[test]
+fn websocket_tasks_cli_without_feature_refuses_before_contact() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("ws://{}/mcp", listener.local_addr().unwrap());
+    for prefix in [
+        vec!["tasks", "get", "uncontacted-task"],
+        vec!["tasks", "watch", "uncontacted-task"],
+        vec!["tasks", "cancel", "uncontacted-task"],
+        vec![
+            "tasks",
+            "update",
+            "uncontacted-task",
+            "--input-file",
+            "/no-input-read",
+        ],
+    ] {
+        let mut arguments = prefix;
+        arguments.extend(["--websocket-url", &endpoint, "--json"]);
+        let output = run_cli(&arguments);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let diagnostics = stderr_str(&output);
+        assert!(diagnostics.contains("FeatureUnavailable"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("websocket-experimental"),
+            "{diagnostics}"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
 struct TestTempDir {
     path: PathBuf,
 }

@@ -58,10 +58,60 @@ impl Fixture {
         run_with_deadline(command, Duration::from_secs(15)).expect("bounded WebSocket CLI child")
     }
 
+    #[cfg(feature = "tasks")]
+    fn create_input_task(&self) -> String {
+        let arguments = json!({
+            "message": self.root.file_name().unwrap().to_string_lossy(),
+        })
+        .to_string();
+        let output = self.run(
+            &[
+                "call",
+                "background_with_input",
+                "--wait",
+                "--arguments",
+                &arguments,
+                "--json",
+            ],
+            5,
+        );
+        // The real --wait command stops at input-required and preserves its
+        // accepted receipt. Subsequent commands attach without recreating work.
+        assert!(!output.status.success());
+        let documents: Vec<Value> = stdout_str(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let result = &documents[0];
+        assert_eq!(result["resultType"], "task");
+        let id = result["taskId"].as_str().unwrap().to_owned();
+        self.wait_for_task_status(&id, "input_required");
+        id
+    }
+
+    #[cfg(feature = "tasks")]
+    fn wait_for_task_status(&self, id: &str, status: &str) -> Value {
+        let started = Instant::now();
+        loop {
+            let output = run_task_cli(&self.endpoint, &["get", id], 5);
+            assert!(output.status.success(), "{}", stderr_str(&output));
+            let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(document["event"], "snapshot");
+            assert_eq!(document["data"]["taskId"], id);
+            if document["data"]["status"] == status {
+                return document["data"].clone();
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "{document}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn requests(&self) -> Vec<Value> {
         std::fs::read_to_string(self.root.join("backend.requests.jsonl"))
             .unwrap_or_default()
-            .lines()
+            .split_inclusive('\n')
+            // The live fixture may still be appending its final record.
+            .filter(|line| line.ends_with('\n'))
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
@@ -70,6 +120,218 @@ impl Fixture {
         self.process
             .kill_and_reap()
             .expect("real WebSocket fixture cleanup");
+    }
+}
+
+#[cfg(feature = "tasks")]
+fn run_task_cli(endpoint: &str, arguments: &[&str], timeout: u64) -> Output {
+    let mut command = Command::new(get_binary_path());
+    command.arg("tasks").args(arguments).args([
+        "--websocket-url",
+        endpoint,
+        "--json",
+        "--timeout",
+        &timeout.to_string(),
+    ]);
+    run_with_deadline(command, Duration::from_secs(15)).expect("bounded WebSocket Tasks CLI child")
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn websocket_cli_tasks_get_watch_and_cancel_existing_work() {
+    let fixture = Fixture::start();
+    let id = fixture.create_input_task();
+    let endpoint = fixture.endpoint.clone();
+    let watch_id = id.clone();
+    let previous_listeners = fixture
+        .requests()
+        .iter()
+        .filter(|request| request["method"] == "subscriptions/listen")
+        .count();
+    std::thread::scope(|scope| {
+        let watch = scope.spawn(move || run_task_cli(&endpoint, &["watch", &watch_id], 8));
+        let started = Instant::now();
+        while fixture
+            .requests()
+            .iter()
+            .filter(|request| request["method"] == "subscriptions/listen")
+            .count()
+            <= previous_listeners
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "watch did not open its listener"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = run_task_cli(&fixture.endpoint, &["cancel", &id], 5);
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["event"], "cancellation-acknowledged");
+        let output = watch.join().expect("watch thread completes");
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let documents: Vec<Value> = stdout_str(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(documents[0]["event"], "snapshot");
+        assert!(
+            documents
+                .iter()
+                .any(|event| event["event"] == "watch-acknowledged")
+        );
+        assert!(documents.iter().any(|event| {
+            event["event"] == "task-updated"
+                && event["data"]["status"] == "cancelled"
+                && event["data"]["taskId"] == id
+        }));
+        let last = documents.last().unwrap();
+        assert_eq!(last["event"], "watch-ended");
+        assert_eq!(last["data"]["reason"], "task-terminal");
+    });
+    fixture.wait_for_task_status(&id, "cancelled");
+    let wrong_id = format!("missing-{id}");
+    let refused = run_task_cli(&fixture.endpoint, &["get", &wrong_id], 5);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    let requests = fixture.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "tools/call")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "tasks/cancel")
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r["method"] == "tasks/update" || r["method"] == "initialize")
+    );
+    fixture.stop();
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn websocket_cli_tasks_update_resumes_only_matching_input() {
+    let fixture = Fixture::start();
+    let id = fixture.create_input_task();
+    let before = fixture.wait_for_task_status(&id, "input_required");
+    let input = fixture.root.join("responses.json");
+    std::fs::write(&input, br#"{"foreign":{"roots":[]}}"#).unwrap();
+    let output = run_task_cli(
+        &fixture.endpoint,
+        &["update", &id, "--input-file", input.to_str().unwrap()],
+        5,
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        !fixture
+            .requests()
+            .iter()
+            .any(|r| r["method"] == "tasks/update")
+    );
+    assert_eq!(fixture.wait_for_task_status(&id, "input_required"), before);
+
+    let responses = json!({"roots": {"roots": [{
+        "uri": format!("file://{}", fixture.root.as_ref().display()),
+        "name": "explicit caller-selected root",
+    }]}});
+    std::fs::write(&input, serde_json::to_vec(&responses).unwrap()).unwrap();
+    let output = run_task_cli(
+        &fixture.endpoint,
+        &["update", &id, "--input-file", input.to_str().unwrap()],
+        5,
+    );
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["event"], "update-acknowledged");
+    let completed = fixture.wait_for_task_status(&id, "completed");
+    let accepted: Value =
+        serde_json::from_str(completed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(accepted, responses);
+    let requests = fixture.requests();
+    let updates: Vec<_> = requests
+        .iter()
+        .filter(|r| r["method"] == "tasks/update")
+        .collect();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0]["params"]["inputResponses"], responses);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "tools/call")
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r["method"] == "tasks/cancel" || r["method"] == "initialize")
+    );
+    fixture.stop();
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn websocket_cli_tasks_watch_timeout_preserves_remote_work() {
+    let fixture = Fixture::start();
+    let id = fixture.create_input_task();
+    let before = fixture.wait_for_task_status(&id, "input_required");
+    let started = Instant::now();
+    let output = run_task_cli(&fixture.endpoint, &["watch", &id], 1);
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(8));
+    let documents: Vec<Value> = stdout_str(&output)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(documents[0]["event"], "snapshot");
+    assert_eq!(documents[0]["data"]["taskId"], id);
+    assert!(
+        !documents
+            .iter()
+            .any(|event| event["event"] == "watch-ended")
+    );
+    assert_eq!(fixture.wait_for_task_status(&id, "input_required"), before);
+    assert!(
+        !fixture
+            .requests()
+            .iter()
+            .any(|r| r["method"] == "tasks/cancel" || r["method"] == "tasks/update")
+    );
+    fixture.stop();
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn websocket_cli_tasks_incompatible_options_fail_before_contact() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("ws://{}/mcp", listener.local_addr().unwrap());
+    for extra in [
+        vec!["--http-url", "http://127.0.0.1:1/mcp"],
+        vec!["--server", "unused-child"],
+        vec!["--bearer-token-file", "/no-credential-read"],
+        vec!["--protocol-policy", "legacy-only"],
+        vec!["--timeout", "0"],
+    ] {
+        let mut command = Command::new(get_binary_path());
+        command.args(["tasks", "get", "unused-task", "--websocket-url", &endpoint]);
+        command.args(extra);
+        let output = run_with_deadline(command, Duration::from_secs(5)).unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }
 

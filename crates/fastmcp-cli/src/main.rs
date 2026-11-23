@@ -1089,8 +1089,10 @@ struct OperationArguments {
 #[cfg(feature = "tasks")]
 #[derive(clap::Args, Clone)]
 struct TaskConnection {
-    /// Stdio server executable; choose this or --http-url.
-    #[arg(long, global = true, conflicts_with_all = ["http_url", "bearer_token_file"])]
+    /// Stdio server executable; choose one explicit transport.
+    #[arg(long, global = true, conflicts_with_all = [
+        "http_url", "websocket_url", "bearer_token_file",
+    ])]
     server: Option<String>,
     /// Argument passed literally to the stdio server (repeatable).
     #[arg(long, global = true, requires = "server", allow_hyphen_values = true)]
@@ -1098,6 +1100,12 @@ struct TaskConnection {
     /// Explicit modern Streamable HTTP POST endpoint.
     #[arg(long, global = true)]
     http_url: Option<String>,
+    /// Explicit ws:// or wss:// MCP endpoint; requires websocket-experimental.
+    /// Tasks always use modern-only. TLS uses WebPKI trust roots.
+    #[arg(long, global = true, value_name = "URL", conflicts_with_all = [
+        "server", "http_url", "bearer_token_file",
+    ])]
+    websocket_url: Option<String>,
     /// Read a bearer token from a regular file (at most 16 KiB); HTTPS only.
     #[arg(long, global = true, value_name = "PATH", requires = "http_url")]
     bearer_token_file: Option<PathBuf>,
@@ -8030,16 +8038,38 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
             "task ID must contain 1-1024 UTF-8 bytes and no control characters",
         )
     })?;
-    if connection.server.is_none() == connection.http_url.is_none() {
+    if [
+        connection.server.is_some(),
+        connection.http_url.is_some(),
+        connection.websocket_url.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count()
+        != 1
+    {
         return Err(fastmcp_core::McpError::invalid_params(
-            "tasks requires exactly one of --server or --http-url",
+            "tasks requires exactly one of --server, --http-url or --websocket-url",
         ));
+    }
+    if connection.websocket_url.is_some() {
+        // Feature admission precedes credential/input reads and socket effects.
+        validate_websocket_cli_policy(CliProtocolPolicy::ModernOnly)?;
     }
     let output = TaskOutput::new(connection, budget);
     let inputs = match action {
         TaskAction::Update { input_file, .. } => Some(read_task_inputs(input_file)?),
         _ => None,
     };
+    if let Some(url) = &connection.websocket_url {
+        #[cfg(feature = "websocket-experimental")]
+        return websocket::tasks(cx, url, &output, budget, action, task_id, inputs).await;
+        #[cfg(not(feature = "websocket-experimental"))]
+        {
+            let _ = url;
+            unreachable!("WebSocket feature admission returned before dispatch");
+        }
+    }
     if let Some(server) = &connection.server {
         if connection.bearer_token_file.is_some() {
             return Err(fastmcp_core::McpError::invalid_params(
@@ -16686,7 +16716,7 @@ IFS= read -r end
                     Some(second)
                 }).unwrap();
                 let task_id = TaskId::parse(subject.clone()).unwrap();
-                let connection = TaskConnection { server: Some("sh".to_owned()), server_arg: Vec::new(), http_url: None, bearer_token_file: None, json: true, timeout: 5 };
+                let connection = TaskConnection { server: Some("sh".to_owned()), server_arg: Vec::new(), http_url: None, websocket_url: None, bearer_token_file: None, json: true, timeout: 5 };
                 let budget = TaskCommandBudget::new(&connection).unwrap();
                 let output = TaskOutput::new(&connection, budget);
                 let action = TaskAction::Watch { task_id: subject.clone(), max_events: 1 };
@@ -16770,6 +16800,7 @@ IFS= read -r end
                 server: None,
                 server_arg: Vec::new(),
                 http_url: Some("http://127.0.0.1:8080".to_owned()),
+                websocket_url: None,
                 bearer_token_file: None,
                 json: true,
                 timeout: 1,
@@ -16800,6 +16831,7 @@ IFS= read -r end
                     server: None,
                     server_arg: Vec::new(),
                     http_url: Some("http://127.0.0.1:8080".to_owned()),
+                    websocket_url: None,
                     bearer_token_file: None,
                     json: true,
                     timeout: 2,
@@ -16879,6 +16911,7 @@ IFS= read -r end
                 server: None,
                 server_arg: Vec::new(),
                 http_url: Some("http://127.0.0.1:8080".to_owned()),
+                websocket_url: None,
                 bearer_token_file: None,
                 json: true,
                 timeout: 10,
