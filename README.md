@@ -405,6 +405,9 @@ scenarios, including every input-required one, so a measurement taken without
   input or finish. Current authorization, cancellation and the elected fence
   are checked before a write. The built-in store supports this path; custom
   stores must implement the atomic working-status and handoff-continuity hooks.
+  For stores that need to await I/O, both handoff types also provide
+  `update_status_message_with_cx` and the other
+  [asynchronous worker transitions](#asynchronous-task-worker-transitions).
 - **Authenticated local Tasks retain their caller:** task creation atomically
   stores a private principal binding, original tool registration, and immutable
   creation generation. Protected task-producing tools require both
@@ -3029,6 +3032,57 @@ HTTP listeners retain their existing `OperatorSnapshot` connection-admission
 surface. These client observations cover the executor-backed stdio and memory
 paths; they do not imply readiness of other client transports, durable task
 workers, credentials, or the entire application.
+
+### Asynchronous Task worker transitions
+
+With `tasks` enabled, an elected `FinalTaskInitialWork` or
+`FinalTaskAcceptedInput` can await storage through the caller's `Cx` when
+publishing progress, requesting input, completing, failing, or honoring
+cancellation. Each method preserves the original execution authorization,
+claim generation, owner, and dispatch fence across suspension. For example,
+an application supervisor can publish a result through its elected handoff:
+
+```rust
+async fn publish_result(
+    cx: &fastmcp_rust::Cx,
+    mut work: fastmcp_rust::FinalTaskInitialWork,
+    result: fastmcp_rust::FinalTaskCallToolResult,
+) -> fastmcp_rust::McpResult<fastmcp_rust::FinalTask> {
+    work.update_status_message_with_cx(cx, Some("Publishing result".into()))
+        .await?;
+    if work.is_cancellation_requested_with_cx(cx).await? {
+        return work.honor_cancellation_with_cx(cx, None).await;
+    }
+    work.complete_task_with_cx(cx, result, None).await
+}
+```
+
+Use `require_input_with_cx` to suspend for a validated input batch, or
+`fail_task_with_cx` to retain a typed failure. The same methods are available
+on resumed work. Cancellation-intent reads check the exact Task incarnation
+before and after awaiting storage, so a reused identifier cannot substitute
+another Task's cancellation state.
+
+An asynchronous `FinalTaskStore` overrides the snapshot, access-metadata,
+handoff-metadata, and cancellation-read hooks, plus
+`replace_task_and_clear_input_for_handoff_with_context` and
+`update_working_status_for_handoff_with_context`. The mutation hooks receive
+a sealed `FinalTaskWorkerAdmission`. Use its context for I/O and call
+`checkpoint_before_write()` immediately before the first irreversible write,
+including after suspension. The store must atomically compare the expected
+record, claim, owner, dispatch fence, cancellation disposition, and execution
+budgets while enforcing the existing quotas and input-history rules.
+
+Pending reads and unadmitted writes observe caller cancellation and deadlines.
+Once a write may have committed, the framework settles that original
+operation; a validated commit receipt survives late cancellation or policy
+revocation. A notification-delivery failure cannot undo it. The bounded
+`retention_clock_now` hook must remain nonblocking and perform no storage I/O.
+
+The built-in in-memory store uses bounded synchronous defaults for these
+hooks. Service recovery, lease maintenance, and execution-guard cleanup still
+use their existing bounded synchronous interfaces. These worker transitions
+do not provide restart persistence or a fully asynchronous Task service.
 
 ### Tasks retention administration
 

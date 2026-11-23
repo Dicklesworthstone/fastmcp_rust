@@ -212,11 +212,12 @@ pub use tasks::{
     FinalTaskOperation, FinalTaskRetentionAdmission, FinalTaskRetentionAuthority,
     FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
     FinalTaskStore, FinalTaskStoreFuture, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-    FinalTaskWorkDescriptor, InMemoryFinalTaskStore, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES,
-    MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS, TaskAccessAction, TaskAccessAuthorizer,
-    TaskExecutionAuthorizer, TaskOperatorHandle, TaskRetentionAdministrator,
-    TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason,
-    TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
+    FinalTaskWorkDescriptor, FinalTaskWorkerAdmission, InMemoryFinalTaskStore,
+    MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
+    TaskAccessAction, TaskAccessAuthorizer, TaskExecutionAuthorizer, TaskOperatorHandle,
+    TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
+    TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
+    TaskRetentionTarget,
 };
 #[cfg(all(test, feature = "tasks"))]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};

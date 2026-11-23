@@ -1326,7 +1326,13 @@ mod typed_tasks {
             Box::pin(async move {
                 assert!(cx.blocking_pool_handle().is_none());
                 match handoff {
-                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                    FinalTaskSupervisorHandoff::Initial(mut initial) => {
+                        initial
+                            .update_status_message_with_cx(
+                                cx,
+                                Some("running on the caller runtime".to_owned()),
+                            )
+                            .await?;
                         let mode = initial.work_descriptor().as_value()["mode"].as_str();
                         if matches!(mode, Some("input" | "input-batch")) {
                             let requests = if mode == Some("input-batch") {
@@ -1340,12 +1346,12 @@ mod typed_tasks {
                             };
                             let requests: FinalTaskInputRequests =
                                 serde_json::from_value(requests).unwrap();
-                            initial.require_input(requests, None)?;
+                            initial.require_input_with_cx(cx, requests, None).await?;
                         } else {
                             self.0.holding.fetch_add(1, Ordering::AcqRel);
                             loop {
-                                if initial.is_cancellation_requested()? {
-                                    initial.honor_cancellation(None)?;
+                                if initial.is_cancellation_requested_with_cx(cx).await? {
+                                    initial.honor_cancellation_with_cx(cx, None).await?;
                                     self.0.cancelled.fetch_add(1, Ordering::AcqRel);
                                     break;
                                 }
@@ -1354,7 +1360,13 @@ mod typed_tasks {
                             }
                         }
                     }
-                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                    FinalTaskSupervisorHandoff::Resumed(mut accepted) => {
+                        accepted
+                            .update_status_message_with_cx(
+                                cx,
+                                Some("resuming on the caller runtime".to_owned()),
+                            )
+                            .await?;
                         let expected =
                             if accepted.work_descriptor().as_value()["mode"] == "input-batch" {
                                 json!({
@@ -1375,7 +1387,7 @@ mod typed_tasks {
                             "receipt": {"source": "caller runtime", "items": 0},
                         }))
                         .unwrap();
-                        accepted.complete_task(result, None)?;
+                        accepted.complete_task_with_cx(cx, result, None).await?;
                     }
                 }
                 Ok(())
@@ -1427,13 +1439,15 @@ mod typed_tasks {
                 assert!(cx.blocking_pool_handle().is_none());
                 match handoff {
                     FinalTaskSupervisorHandoff::Initial(initial) => {
-                        initial.require_input(
+                        initial.require_input_with_cx(
+                            cx,
                             serde_json::from_value(json!({
                                 "roots": {"method": "roots/list"},
                             }))
                             .unwrap(),
                             None,
-                        )?;
+                        )
+                        .await?;
                     }
                     FinalTaskSupervisorHandoff::Resumed(accepted) => {
                         assert_eq!(
@@ -1445,7 +1459,7 @@ mod typed_tasks {
                             "L".repeat(self.0),
                         );
                         let result: FinalTaskCallToolResult = serde_json::from_str(&wire).unwrap();
-                        accepted.complete_task(result, None)?;
+                        accepted.complete_task_with_cx(cx, result, None).await?;
                     }
                 }
                 Ok(())

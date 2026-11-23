@@ -46,12 +46,14 @@
 mod authorization;
 mod control;
 mod creation;
+mod worker;
 pub use authorization::{
     FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
     TaskExecutionAuthorizer,
 };
 pub use control::FinalTaskRetentionAdmission;
 pub use creation::FinalTaskCreationAdmission;
+pub use worker::FinalTaskWorkerAdmission;
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -1603,8 +1605,10 @@ pub trait FinalTaskStore: Send + Sync {
     /// `ctx.request_cancelled()` when a pending operation must settle after
     /// request-local cancellation. A write that may have committed must report
     /// that uncertainty instead of treating cancellation as proof of rollback.
-    /// The worker and subscription callback interfaces remain synchronous;
-    /// these hooks alone do not establish a persistent Task backend.
+    /// Worker mutations also have explicit asynchronous entrypoints. Service
+    /// recovery, lease maintenance, and drop-time restoration remain bounded
+    /// synchronous operations; these hooks do not establish a persistent or
+    /// completely asynchronous Task backend.
     fn get_task_access_metadata_with_context<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -2054,6 +2058,35 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Suspends a worker transition under the exact elected handoff authority.
+    ///
+    /// Compare the admission's expected record generation, owner, dispatch
+    /// fence, cancellation disposition, execution deadline and quota in the
+    /// same atomic write as the Task, notification and input cleanup. Call
+    /// [`FinalTaskWorkerAdmission::checkpoint_before_write`] immediately before
+    /// the first irreversible write, including after a suspension. Once that
+    /// boundary is crossed, settle the original receipt; cancellation does not
+    /// prove rollback. Return the snapshot captured by that exact commit.
+    /// The default runs the existing bounded synchronous store operation.
+    fn replace_task_and_clear_input_for_handoff_with_context<'a>(
+        &'a self,
+        admission: FinalTaskWorkerAdmission<'a>,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            admission.checkpoint_before_write()?;
+            self.replace_task_and_clear_input_for_handoff_if_current(
+                admission.expected(),
+                admission.owner_id(),
+                admission.dispatch_fence(),
+                admission.cancellation_required(),
+                task,
+                notification,
+            )
+        })
+    }
+
     /// Atomically updates only a working Task's status message and freshness
     /// timestamp under the exact live elected owner and dispatch fence.
     ///
@@ -2081,6 +2114,28 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Asynchronously publishes only working status metadata while preserving
+    /// the elected claim, inputs, work, execution permit and every deadline.
+    /// The same prewrite admission and exact committed-receipt contract as
+    /// [`Self::replace_task_and_clear_input_for_handoff_with_context`] applies.
+    fn update_working_status_for_handoff_with_context<'a>(
+        &'a self,
+        admission: FinalTaskWorkerAdmission<'a>,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            admission.checkpoint_before_write()?;
+            self.update_working_status_for_handoff_if_current(
+                admission.expected(),
+                admission.owner_id(),
+                admission.dispatch_fence(),
+                task,
+                notification,
+            )
+        })
+    }
+
     /// Returns payload-free current metadata for this exact elected claim.
     ///
     /// A store supporting working-status updates must prove the immutable
@@ -2101,6 +2156,24 @@ pub trait FinalTaskStore: Send + Sync {
         _dispatch_fence: u64,
     ) -> McpResult<Option<FinalTaskAccessMetadata>> {
         Ok(None)
+    }
+
+    /// Asynchronously reads payload-free continuity metadata for one exact
+    /// elected claim. An override must atomically attest the same claim
+    /// generation, owner and dispatch fence as the synchronous operation.
+    fn get_handoff_access_metadata_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        task_id: &'a FinalTaskId,
+        claim_generation: u64,
+        owner_id: &'a str,
+        dispatch_fence: u64,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAccessMetadata>> {
+        Box::pin(async move {
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
+            self.get_handoff_access_metadata(task_id, claim_generation, owner_id, dispatch_fence)
+        })
     }
 
     /// Legacy raw accepted-input claim.
@@ -2480,6 +2553,11 @@ pub trait FinalTaskStore: Send + Sync {
     fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool>;
 
     /// Returns the store's authoritative monotonic clock reading for retention and lease checks.
+    ///
+    /// This synchronous sample must be bounded and non-blocking, without
+    /// storage I/O. Asynchronous worker admission also uses it to bound a
+    /// pending operation; atomic backend mutations still enforce the stored
+    /// retention and execution deadlines at their write boundary.
     fn retention_clock_now(&self) -> Instant;
 
     /// Reads the store-issued retention deadline for this exact task generation.
