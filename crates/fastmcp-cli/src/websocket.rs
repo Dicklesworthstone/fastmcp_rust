@@ -175,6 +175,13 @@ where
     }
     let request = async {
         match operation {
+            CoreOperation::Complete(_) => {
+                let parameters = serde_json::from_value::<fastmcp_client::CompletionParams>(parameters)
+                    .map_err(|_| McpError::invalid_params("completion parameters are invalid"))?;
+                client
+                    .complete_with_cancellation(cx, &cancellation, parameters)
+                    .await
+            }
             CoreOperation::Call(name) => {
                 client
                     .call_tool_with_cancellation(

@@ -119,6 +119,7 @@ const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
     "call Invoke one MCP tool ",
     "read Read one MCP resource ",
     "prompt Render one MCP prompt ",
+    "complete Complete one prompt argument or resource-template variable ",
     "install Install server configuration into Claude Desktop or other clients ",
     "list List configured MCP servers ",
     "test Test MCP server connectivity ",
@@ -137,6 +138,7 @@ const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
     "call Invoke one MCP tool ",
     "read Read one MCP resource ",
     "prompt Render one MCP prompt ",
+    "complete Complete one prompt argument or resource-template variable ",
     "tasks Get, watch, update, or cancel an official MCP task ",
     "install Install server configuration into Claude Desktop or other clients ",
     "list List configured MCP servers ",
@@ -749,6 +751,17 @@ enum Commands {
         arguments: OperationArguments,
     },
 
+    /// Complete one prompt argument or resource-template variable.
+    ///
+    /// Sends one completion/complete request. Suggestions retain provider order;
+    /// completion context requires modern-only. No input continuation is accepted.
+    Complete {
+        #[command(flatten)]
+        completion: CompletionArguments,
+        #[command(flatten)]
+        connection: OperationConnection,
+    },
+
     /// Get, watch, update, or cancel an official MCP task.
     #[cfg(feature = "tasks")]
     Tasks {
@@ -962,7 +975,8 @@ impl Commands {
             } => Some(*protocol_policy),
             Self::Call { connection, .. }
             | Self::Read { connection, .. }
-            | Self::Prompt { connection, .. } => Some(connection.protocol_policy),
+            | Self::Prompt { connection, .. }
+            | Self::Complete { connection, .. } => Some(connection.protocol_policy),
             Self::List { .. } => None,
             #[cfg(feature = "tasks")]
             Self::Tasks { .. } => Some(CliProtocolPolicy::ModernOnly),
@@ -981,6 +995,7 @@ impl Commands {
             Self::Call { connection, .. } if connection.json => Some("call"),
             Self::Read { connection, .. } if connection.json => Some("read"),
             Self::Prompt { connection, .. } if connection.json => Some("prompt"),
+            Self::Complete { connection, .. } if connection.json => Some("complete"),
             Self::Test { json: true, .. } => Some("test"),
             _ => None,
         }
@@ -1091,6 +1106,31 @@ struct OperationArguments {
     /// Read arguments from a regular JSON object file (at most 1 MiB).
     #[arg(long, value_name = "PATH")]
     arguments_file: Option<PathBuf>,
+}
+
+/// Completion selectors remain separate from tool/prompt invocation arguments.
+#[derive(clap::Args)]
+struct CompletionArguments {
+    /// Exact prompt name; choose this or --resource-template.
+    #[arg(long, value_name = "NAME", required_unless_present = "resource_template",
+        conflicts_with = "resource_template")]
+    prompt: Option<String>,
+    /// Exact RFC 6570 resource-template URI; it is never fetched independently.
+    #[arg(long, value_name = "URI", required_unless_present = "prompt")]
+    resource_template: Option<String>,
+    /// Name of the prompt argument or resource-template variable to complete.
+    #[arg(long, value_name = "NAME")]
+    argument: String,
+    /// Partial UTF-8 value (at most 16 KiB); an explicitly empty string is valid.
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    value: String,
+    /// Completion context JSON, e.g. {"arguments":{"region":"us-east-1"}}.
+    /// Requires modern-only; omitted, {}, and {"arguments":{}} remain distinct.
+    #[arg(long, value_name = "JSON", conflicts_with = "context_file")]
+    context: Option<String>,
+    /// Read context from a regular JSON file (at most 1 MiB); use for sensitive input.
+    #[arg(long, value_name = "PATH")]
+    context_file: Option<PathBuf>,
 }
 
 /// Tasks never fall back to a legacy custom task protocol.
@@ -1515,6 +1555,19 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 &connection,
                 CoreOperation::Prompt(&name),
                 &arguments,
+                false,
+            ))
+            .await
+        }
+        Commands::Complete {
+            completion,
+            connection,
+        } => {
+            Box::pin(cmd_operation(
+                cx,
+                &connection,
+                CoreOperation::Complete(&completion),
+                &OperationArguments::default(),
                 false,
             ))
             .await
@@ -6649,6 +6702,7 @@ enum CoreOperation<'a> {
     Call(&'a str),
     Read(&'a str),
     Prompt(&'a str),
+    Complete(&'a CompletionArguments),
 }
 
 impl CoreOperation<'_> {
@@ -6657,6 +6711,7 @@ impl CoreOperation<'_> {
             Self::Call(_) => "tools/call",
             Self::Read(_) => "resources/read",
             Self::Prompt(_) => "prompts/get",
+            Self::Complete(_) => "completion/complete",
         }
     }
 
@@ -6664,6 +6719,14 @@ impl CoreOperation<'_> {
         let arguments = read_operation_arguments(arguments)?;
         let mut parameters = serde_json::Map::new();
         match self {
+            Self::Complete(completion) => {
+                if arguments.is_some() {
+                    return Err(fastmcp_core::McpError::invalid_params(
+                        "completion uses --context, not tool or prompt invocation arguments",
+                    ));
+                }
+                return completion_parameters(completion);
+            }
             Self::Read(uri) => {
                 if arguments.is_some() {
                     return Err(fastmcp_core::McpError::invalid_params(
@@ -6698,6 +6761,72 @@ impl CoreOperation<'_> {
         }
         Ok(parameters.into())
     }
+}
+
+/// Preserve raw context until the protocol's completion-specific admission has
+/// checked duplicate members, nulls, received-byte limits, and typed map bounds.
+/// A local metadata placeholder activates final admission and is then removed;
+/// only the selected transport's client may supply real request metadata.
+fn completion_parameters(completion: &CompletionArguments) -> McpResult<serde_json::Value> {
+    const MAX_INPUT_BYTES: usize = 1024 * 1024;
+    let invalid = || {
+        fastmcp_core::McpError::invalid_params(
+            "completion requires one valid prompt or resource template, a bounded argument and value, and an optional bounded context object with string arguments",
+        )
+    };
+    let valid_name = |name: &str| {
+        !name.is_empty() && name.len() <= 1024 && !name.chars().any(char::is_control)
+    };
+    if !valid_name(&completion.argument) || completion.value.len() > 16 * 1024 {
+        return Err(invalid());
+    }
+    let reference = match (&completion.prompt, &completion.resource_template) {
+        (Some(name), None) if valid_name(name) => {
+            fastmcp_protocol::FinalCompletionReference::Prompt { name: name.clone() }
+        }
+        (None, Some(uri)) => fastmcp_protocol::FinalCompletionReference::resource(uri.clone())
+            .map_err(|_| invalid())?,
+        _ => return Err(invalid()),
+    };
+    let mut parameters = serde_json::to_string(&serde_json::json!({
+        "_meta": {},
+        "ref": reference,
+        "argument": {"name": completion.argument, "value": completion.value},
+    }))
+    .map_err(|_| invalid())?;
+    let context = match (&completion.context, &completion.context_file) {
+        (None, None) => None,
+        (Some(document), None) if document.len() <= MAX_INPUT_BYTES => {
+            Some(document.as_bytes().to_vec())
+        }
+        (None, Some(path)) => Some(read_operation_resume_file(
+            path,
+            MAX_INPUT_BYTES,
+            "completion context must be a readable regular JSON file of at most 1 MiB",
+        )?),
+        _ => return Err(invalid()),
+    };
+    if let Some(context) = context {
+        let context = std::str::from_utf8(&context).map_err(|_| invalid())?;
+        // Append the original context source, never a Value that has already
+        // erased duplicate keys or shortened escape sequences.
+        parameters.pop();
+        parameters.push_str(",\"context\":");
+        parameters.push_str(context);
+        parameters.push('}');
+    }
+    let wire = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"completion/complete\",\"params\":{parameters}}}"
+    );
+    let fastmcp_protocol::JsonRpcMessage::Request(request) =
+        fastmcp_protocol::decode_strict_jsonrpc_message(wire.as_bytes(), MAX_INPUT_BYTES)
+            .map_err(|_| invalid())?
+    else {
+        return Err(invalid());
+    };
+    let mut parameters = request.params.ok_or_else(invalid)?;
+    parameters.as_object_mut().ok_or_else(invalid)?.remove("_meta");
+    Ok(parameters)
 }
 
 /// Admit the original document before a JSON map can discard duplicate members.
@@ -6990,6 +7119,23 @@ async fn cmd_operation(
     validate_cli_protocol_policy(connection.protocol_policy)?;
     if connection.websocket_url.is_some() {
         validate_websocket_cli_policy(connection.protocol_policy)?;
+    }
+    if let CoreOperation::Complete(completion) = operation {
+        if !connection.input_capability.is_empty()
+            || connection.resume_result_file.is_some()
+            || connection.input_responses_file.is_some()
+        {
+            return Err(fastmcp_core::McpError::invalid_params(
+                "completion does not accept input capabilities or resume files",
+            ));
+        }
+        if (completion.context.is_some() || completion.context_file.is_some())
+            && connection.protocol_policy != CliProtocolPolicy::ModernOnly
+        {
+            return Err(fastmcp_core::McpError::invalid_params(
+                "completion context requires --protocol-policy modern-only",
+            ));
+        }
     }
     validate_operation_input_policy(connection)?;
     #[cfg(not(unix))]
@@ -7591,10 +7737,14 @@ fn operation_outcome(
             OperationOutcome::Complete
         }),
         CoreResult::Final(
-            FinalCoreResult::ResourcesRead { .. } | FinalCoreResult::PromptsGet { .. },
+            FinalCoreResult::ResourcesRead { .. }
+            | FinalCoreResult::PromptsGet { .. }
+            | FinalCoreResult::Completion { .. },
         )
         | CoreResult::Legacy(
-            LegacyCoreResult::ResourcesRead(_) | LegacyCoreResult::PromptsGet(_),
+            LegacyCoreResult::ResourcesRead(_)
+            | LegacyCoreResult::PromptsGet(_)
+            | LegacyCoreResult::Completion(_),
         ) => Ok(OperationOutcome::Complete),
         CoreResult::Final(
             FinalCoreResult::ToolsCallInputRequired { .. }

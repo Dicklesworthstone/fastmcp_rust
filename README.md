@@ -989,6 +989,44 @@ rustup toolchain install nightly-2026-08-25
 cargo +nightly-2026-08-25 install fastmcp-cli --version 0.14.0 --locked
 ```
 
+### Completing prompt and resource-template arguments (current source tree)
+
+`fastmcp complete` sends one `completion/complete` request and returns suggestions
+in the provider's order. Select an exact prompt name or RFC 6570 resource-template
+URI, the argument to complete, and its partial value (which may be empty):
+
+```bash
+fastmcp complete --prompt deploy --argument environment --value sta \
+  --server ./my-server --protocol-policy modern-only --json
+
+fastmcp complete --resource-template 'files:///{region}/{name}' \
+  --argument name --value '' --context '{"arguments":{"region":"us-east-1"}}' \
+  --http-url https://mcp.example/mcp --protocol-policy modern-only --json
+```
+
+Build the current checkout to use this command; for example:
+
+```bash
+cargo run -p fastmcp-cli -- complete --prompt deploy --argument environment \
+  --value sta --server ./my-server --protocol-policy modern-only --json
+```
+
+Use `--context-file context.json` for sensitive or larger context. Omitted context,
+`{}`, and `{"arguments":{}}` remain distinct; values are strings and the existing
+protocol bounds apply (256 sibling arguments, 1 KiB keys, 16 KiB values, and
+256 KiB of encoded argument data). The file must be regular and at most 1 MiB.
+Prompt and argument names are bounded to 1 KiB; the partial value is bounded
+to 16 KiB.
+
+The existing connection options also support `--websocket-url` with
+`websocket-experimental` and explicit `modern-only`. Context requires
+`modern-only` on every transport. Context-free stdio and configured HTTP
+connections retain existing Auto and exact MCP 2024-11-05 behavior when the
+legacy feature is enabled. Completion does not accept input-capability or
+resume-file flags. `--json` preserves the admitted result, including metadata,
+exact numeric values, and the selected era's envelope. The existing
+`--timeout` budget and connection cleanup apply.
+
 ### Manual CLI input continuations (current source tree)
 
 `fastmcp call`, `fastmcp read`, and `fastmcp prompt` can complete MCP 2026-07-28

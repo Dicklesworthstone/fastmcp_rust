@@ -33,6 +33,9 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(unix)]
 const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
 static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(unix)]
+#[path = "support/completion_cli.rs"]
+mod completion_cli;
 #[cfg(all(unix, feature = "e2e-fixture", feature = "websocket-experimental"))]
 #[path = "support/websocket_cli.rs"]
 mod websocket_cli;
@@ -51,6 +54,7 @@ fn websocket_cli_without_feature_refuses_before_contact() {
         vec!["call", "echo", "--json"],
         vec!["read", "test://status", "--json"],
         vec!["prompt", "greeting", "--json"],
+        vec!["complete", "--prompt", "greeting", "--argument", "name", "--value", "Al", "--json"],
     ] {
         let mut arguments = prefix;
         arguments.extend(["--websocket-url", &endpoint, "--protocol-policy", "modern-only"]);
