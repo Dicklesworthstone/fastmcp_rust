@@ -3361,10 +3361,14 @@ impl ServerBuilder {
         let console = fastmcp_console::console::FastMcpConsole::with_enabled(
             self.console_config.should_use_rich(),
         );
-        let final_subscriptions = Arc::new(FinalSubscriptionRegistry::with_capacity(
-            self.max_subscription_streams,
-            self.max_subscription_streams_per_principal,
-        ));
+        let middleware = Arc::new(self.middleware);
+        let final_subscriptions = Arc::new(
+            FinalSubscriptionRegistry::with_capacity(
+                self.max_subscription_streams,
+                self.max_subscription_streams_per_principal,
+            )
+            .with_cache_invalidation(&middleware),
+        );
         #[cfg(feature = "proxy")]
         let catalog_relay = self.catalog_relay.clone();
         #[cfg(feature = "tasks")]
@@ -3470,7 +3474,7 @@ impl ServerBuilder {
             console,
             lifespan: Mutex::new(Some(self.lifespan)),
             auth_provider: self.auth_provider,
-            middleware: Arc::new(self.middleware),
+            middleware,
             active_requests: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(test, feature = "tasks"))]
             task_manager: self.task_manager,

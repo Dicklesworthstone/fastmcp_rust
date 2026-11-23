@@ -18,6 +18,9 @@
 //! cannot reuse data affected by another request's trace or forwarding policy.
 //! A modern cache hit advertises only its remaining whole-millisecond TTL;
 //! replaying it cannot renew freshness in a downstream client or gateway.
+//! Trusted catalog/resource change publications invalidate affected entries
+//! before notifying subscribers, even when no subscriber is listening. The
+//! same transition fences fills that began before the change.
 //!
 //! # Cached Methods
 //!
@@ -69,7 +72,7 @@ use fastmcp_core::{
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CacheTtl, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY, JsonRpcRequest,
-    SERVER_DISCOVER_METHOD,
+    SERVER_DISCOVER_METHOD, ServerNotification,
 };
 
 use crate::{Middleware, MiddlewareDecision};
@@ -104,6 +107,7 @@ const CACHE_ENTRY_METADATA_BYTES: usize = 512;
 /// Domain separators for cache request and authorization/session partitions.
 const CACHE_REQUEST_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-request-v2\0";
 const CACHE_INVALIDATION_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-invalidation-v1\0";
+const CACHE_RESOURCE_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-resource-v1\0";
 const CACHE_PARTITION_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-partition-v2\0";
 const CACHE_STATELESS_PARTITION_DOMAIN: &[u8] = b"fastmcp-response-cache-stateless-partition-v1\0";
 
@@ -178,6 +182,22 @@ struct CacheKey {
     invalidation_digest: Sha256Digest,
     partition_digest: Sha256Digest,
     binding: CacheEntryBinding,
+    notification_scope: CacheNotificationScope,
+}
+
+/// Bounded change identity, independent of request metadata, cursors and auth
+/// partitions. Resource URI bytes are retained only as a domain-separated hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheNotificationScope {
+    Discovery,
+    ToolsList,
+    ResourcesList,
+    ResourceTemplatesList,
+    PromptsList,
+    ResourceRead(Option<Sha256Digest>),
+    ToolCall,
+    PromptGet,
+    Other,
 }
 
 /// Extra identity attached only to final discovery cache entries.
@@ -259,11 +279,29 @@ impl CacheKey {
         partition_digest: Sha256Digest,
         binding: CacheEntryBinding,
     ) -> Option<Self> {
+        let notification_scope = match method {
+            SERVER_DISCOVER_METHOD => CacheNotificationScope::Discovery,
+            "tools/list" => CacheNotificationScope::ToolsList,
+            "resources/list" => CacheNotificationScope::ResourcesList,
+            "resources/templates/list" => CacheNotificationScope::ResourceTemplatesList,
+            "prompts/list" => CacheNotificationScope::PromptsList,
+            "tools/call" => CacheNotificationScope::ToolCall,
+            "prompts/get" => CacheNotificationScope::PromptGet,
+            "resources/read" => CacheNotificationScope::ResourceRead(
+                params.and_then(|params| params.get("uri")).and_then(|uri| {
+                    uri.is_string()
+                        .then(|| Self::try_digest(CACHE_RESOURCE_KEY_DOMAIN, method, Some(uri)))
+                        .flatten()
+                }),
+            ),
+            _ => CacheNotificationScope::Other,
+        };
         Some(Self {
             request_digest: Self::try_request_digest(method, params)?,
             invalidation_digest: Self::try_invalidation_digest(method, params)?,
             partition_digest,
             binding,
+            notification_scope,
         })
     }
 
@@ -940,33 +978,25 @@ impl LruCache {
     }
 
     fn remove_invalidation_digest(&mut self, invalidation_digest: Sha256Digest) {
+        self.remove_matching(|key| key.invalidation_digest == invalidation_digest);
+    }
+
+    fn remove_matching(&mut self, matches: impl Fn(&CacheKey) -> bool) {
         let mut retained_size = self.current_size_bytes;
         self.entries.retain(|key, entry| {
-            if key.invalidation_digest == invalidation_digest {
+            if matches(key) {
                 retained_size = retained_size.saturating_sub(entry.size_bytes);
                 false
             } else {
                 true
             }
         });
-        self.order
-            .retain(|key| key.invalidation_digest != invalidation_digest);
+        self.order.retain(|key| !matches(key));
         self.current_size_bytes = retained_size;
     }
 
     fn remove_discovery_entries(&mut self) {
-        let mut retained_size = self.current_size_bytes;
-        self.entries.retain(|key, entry| {
-            if matches!(key.binding, CacheEntryBinding::Discovery(_)) {
-                retained_size = retained_size.saturating_sub(entry.size_bytes);
-                false
-            } else {
-                true
-            }
-        });
-        self.order
-            .retain(|key| !matches!(key.binding, CacheEntryBinding::Discovery(_)));
-        self.current_size_bytes = retained_size;
+        self.remove_matching(|key| matches!(key.binding, CacheEntryBinding::Discovery(_)));
     }
 
     fn evict_expired(&mut self) {
@@ -1392,6 +1422,54 @@ impl ResponseCachingMiddleware {
         cache.remove_invalidation_digest(invalidation_digest);
     }
 
+    fn invalidate_server_notification(&self, notification: &ServerNotification) {
+        let changed = match notification {
+            ServerNotification::ToolsListChanged(_) => CacheNotificationScope::ToolsList,
+            ServerNotification::ResourcesListChanged(_) => CacheNotificationScope::ResourcesList,
+            ServerNotification::PromptsListChanged(_) => CacheNotificationScope::PromptsList,
+            ServerNotification::ResourceUpdated(params) => {
+                let uri = serde_json::Value::String(params.uri.as_str().to_owned());
+                let Some(digest) =
+                    CacheKey::try_digest(CACHE_RESOURCE_KEY_DOMAIN, "resources/read", Some(&uri))
+                else {
+                    return;
+                };
+                CacheNotificationScope::ResourceRead(Some(digest))
+            }
+            _ => return,
+        };
+        let catalog_changed = !matches!(changed, CacheNotificationScope::ResourceRead(_));
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Invalidation and fill admission use the same lock and generation.
+        // Removing retained values alone would let an older handler repopulate
+        // them after the change notification has reached its subscribers.
+        cache.advance_fill_generation();
+        if catalog_changed {
+            self.advance_discovery_generation();
+        }
+        cache.remove_matching(|key| {
+            key.notification_scope == changed
+                || (catalog_changed && key.notification_scope == CacheNotificationScope::Discovery)
+                || matches!(
+                    (changed, key.notification_scope),
+                    (
+                        CacheNotificationScope::ToolsList,
+                        CacheNotificationScope::ToolCall
+                    ) | (
+                        CacheNotificationScope::ResourcesList,
+                        CacheNotificationScope::ResourceTemplatesList
+                            | CacheNotificationScope::ResourceRead(_)
+                    ) | (
+                        CacheNotificationScope::PromptsList,
+                        CacheNotificationScope::PromptGet
+                    )
+                )
+        });
+    }
+
     /// Checks if a method should be cached.
     fn should_cache_method(&self, method: &str, params: Option<&serde_json::Value>) -> bool {
         match method {
@@ -1771,6 +1849,14 @@ impl Middleware for ResponseCachingMiddleware {
         // Don't cache errors, just pass them through
         error
     }
+
+    fn invalidate_for_server_notification(
+        &self,
+        notification: &ServerNotification,
+        _: crate::middleware::seal::Sealed,
+    ) {
+        self.invalidate_server_notification(notification);
+    }
 }
 
 #[cfg(test)]
@@ -1871,6 +1957,354 @@ mod tests {
             "ttlMs": ttl_ms,
             "cacheScope": cache_scope,
         })
+    }
+
+    fn resource_change(uri: &str) -> ServerNotification {
+        ServerNotification::ResourceUpdated(
+            fastmcp_protocol::FinalResourceUpdatedNotificationParams {
+                uri: fastmcp_protocol::common_types::AbsoluteUri::parse(uri).unwrap(),
+                meta: None,
+                additional: std::collections::BTreeMap::new(),
+            },
+        )
+    }
+
+    fn fill_notification_fixture(
+        cache: &ResponseCachingMiddleware,
+        ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) {
+        assert!(matches!(
+            cache.on_request(ctx, request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        let response = if request.method == SERVER_DISCOVER_METHOD {
+            final_discovery_response(30_000, "private")
+        } else {
+            let member = match request.method.as_str() {
+                "tools/list" => "tools",
+                "resources/list" => "resources",
+                "resources/templates/list" => "resourceTemplates",
+                "prompts/list" => "prompts",
+                "resources/read" => "contents",
+                "prompts/get" => "messages",
+                "tools/call" => "content",
+                _ => panic!("unexpected cache fixture method"),
+            };
+            let mut response = serde_json::json!({"resultType": "complete"});
+            response[member] = serde_json::json!([]);
+            if method_requires_protocol_cache_hints(&request.method) {
+                response["ttlMs"] = serde_json::json!(30_000);
+                response["cacheScope"] = serde_json::json!("private");
+            }
+            response
+        };
+        cache.on_response(ctx, request, response).unwrap();
+    }
+
+    #[test]
+    fn server_resource_changes_invalidate_every_uri_variant_and_auth_partition() {
+        let cache = Arc::new(ResponseCachingMiddleware::new());
+        let server = crate::Server::new("cache-resource-events", "1")
+            .middleware(Arc::clone(&cache))
+            .build();
+        let uri = "file:///changed";
+        let requests = [
+            test_request("resources/read", Some(serde_json::json!({"uri": uri}))),
+            test_request(
+                "resources/read",
+                Some(serde_json::json!({"uri": uri, "cursor": "opaque-page-two"})),
+            ),
+            test_request(
+                "resources/read",
+                Some(serde_json::json!({"uri": uri, "_meta": {"example/shape": "expanded"}})),
+            ),
+            test_request(
+                "resources/read",
+                Some(serde_json::json!({"uri": "file:///unchanged"})),
+            ),
+        ];
+        for subject in ["alice", "bob"] {
+            for request in &requests {
+                let ctx = McpContext::new(Cx::for_testing(), 1)
+                    .with_auth(AuthContext::with_subject(subject));
+                fill_notification_fixture(&cache, &ctx, request);
+            }
+        }
+        assert_eq!(cache.stats().entries, 8);
+
+        let publisher = server.subscription_publisher();
+        let mut malformed = resource_change(uri);
+        let ServerNotification::ResourceUpdated(params) = &mut malformed else {
+            unreachable!();
+        };
+        params
+            .additional
+            .insert("uri".to_owned(), serde_json::json!(uri));
+        let unchanged = cache.stats();
+        assert!(publisher.publish(malformed).is_err());
+        assert_eq!(
+            cache.stats(),
+            unchanged,
+            "rejected events have no cache effect"
+        );
+
+        assert_eq!(publisher.publish(resource_change(uri)).unwrap(), 0);
+        assert_eq!(
+            cache.stats().entries,
+            2,
+            "zero listeners must not suppress invalidation"
+        );
+        for subject in ["alice", "bob"] {
+            for (index, request) in requests.iter().enumerate() {
+                let ctx = McpContext::new(Cx::for_testing(), 2)
+                    .with_auth(AuthContext::with_subject(subject));
+                let hit = matches!(
+                    cache.on_request(&ctx, request).unwrap(),
+                    MiddlewareDecision::Respond(_)
+                );
+                assert_eq!(hit, index == 3, "only the unrelated URI remains cacheable");
+            }
+        }
+    }
+
+    #[test]
+    fn server_catalog_changes_evict_all_pages_and_affected_method_families() {
+        for (notification, affected) in [
+            (
+                ServerNotification::ToolsListChanged(None),
+                vec!["tools/list", "tools/call"],
+            ),
+            (
+                ServerNotification::ResourcesListChanged(None),
+                vec![
+                    "resources/list",
+                    "resources/templates/list",
+                    "resources/read",
+                ],
+            ),
+            (
+                ServerNotification::PromptsListChanged(None),
+                vec!["prompts/list", "prompts/get"],
+            ),
+        ] {
+            let cache =
+                Arc::new(ResponseCachingMiddleware::new().include_tools(vec!["pure".to_owned()]));
+            let server = crate::Server::new("cache-catalog-events", "1")
+                .middleware(Arc::clone(&cache))
+                .build();
+            let mut requests = Vec::new();
+            for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+                "resources/read",
+                "tools/call",
+                "prompts/get",
+            ] {
+                for variant in [false, true] {
+                    let mut params = match method {
+                        "resources/read" => serde_json::json!({"uri": "file:///data"}),
+                        "tools/call" | "prompts/get" => serde_json::json!({"name": "pure"}),
+                        _ => serde_json::json!({}),
+                    };
+                    if variant {
+                        params["cursor"] = serde_json::json!("opaque-page");
+                        params["_meta"] = serde_json::json!({"example/filter": "narrow"});
+                    }
+                    requests.push(test_request(method, Some(params)));
+                }
+            }
+            requests.push(final_discovery_request(FINAL_PROTOCOL_VERSION));
+            for request in &requests {
+                fill_notification_fixture(&cache, &test_context(), request);
+            }
+            assert_eq!(cache.stats().entries, requests.len());
+            assert_eq!(
+                server
+                    .publish_subscription_notification(notification)
+                    .unwrap(),
+                0
+            );
+            let expected = requests.len() - affected.len() * 2 - 1;
+            assert_eq!(cache.stats().entries, expected);
+            for request in &requests {
+                let hit = matches!(
+                    cache.on_request(&test_context(), request).unwrap(),
+                    MiddlewareDecision::Respond(_)
+                );
+                assert_eq!(
+                    hit,
+                    request.method != SERVER_DISCOVER_METHOD
+                        && !affected.contains(&request.method.as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn handler_changes_invalidate_before_reentrant_legacy_subscribers() {
+        struct ReentrantSender {
+            cache: Arc<ResponseCachingMiddleware>,
+            misses: AtomicU64,
+        }
+        impl ReentrantSender {
+            fn observe(&self, request: JsonRpcRequest) {
+                assert!(
+                    matches!(
+                        self.cache.on_request(&test_context(), &request).unwrap(),
+                        MiddlewareDecision::Continue
+                    ),
+                    "a notified subscriber must not observe the previous cache value"
+                );
+                self.misses.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl fastmcp_core::NotificationSender for ReentrantSender {
+            fn send_progress(&self, _: f64, _: Option<f64>, _: Option<&str>) {}
+            fn send_resource_updated(&self, uri: &str) {
+                self.observe(test_request(
+                    "resources/read",
+                    Some(serde_json::json!({"uri": uri})),
+                ));
+            }
+            fn send_catalog_changed(&self, _: fastmcp_core::McpCatalogKind) {
+                self.observe(test_request("tools/list", None));
+            }
+        }
+
+        let cache = Arc::new(ResponseCachingMiddleware::new());
+        let server = crate::Server::new("cache-handler-events", "1")
+            .middleware(Arc::clone(&cache))
+            .build();
+        let uri = "file:///handler-change";
+        for request in [
+            test_request("resources/read", Some(serde_json::json!({"uri": uri}))),
+            test_request("tools/list", None),
+        ] {
+            fill_notification_fixture(&cache, &test_context(), &request);
+        }
+        let sender = Arc::new(ReentrantSender {
+            cache: Arc::clone(&cache),
+            misses: AtomicU64::new(0),
+        });
+        let ctx = server.with_final_catalog_publisher(
+            McpContext::with_state(Cx::for_testing(), 3, SessionState::new())
+                .with_resource_subscriptions([uri])
+                .with_log_sender(sender.clone()),
+        );
+        assert!(ctx.notify_resource_updated(uri));
+        assert!(ctx.disable_tool("changed-tool"));
+        assert_eq!(sender.misses.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.stats().entries, 0);
+    }
+
+    #[test]
+    fn server_cache_invalidation_precedes_broadcast_and_excludes_listener_relays() {
+        use fastmcp_core::McpRequestCancellation;
+        use fastmcp_protocol::{FinalEmptyNotificationParams, RequestId, SubscriptionFilter};
+
+        let cache = Arc::new(ResponseCachingMiddleware::new());
+        let server = crate::Server::new("cache-broadcast-authority", "1")
+            .middleware(Arc::clone(&cache))
+            .build();
+        let request = test_request("tools/list", None);
+        fill_notification_fixture(&cache, &test_context(), &request);
+        let broadcast = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::new(AtomicU64::new(0));
+        let callback_cache = Arc::clone(&cache);
+        let callback_broadcast = Arc::clone(&broadcast);
+        let callback_observed = Arc::clone(&observed);
+        let listener = server
+            .final_subscriptions
+            .open(
+                RequestId::Number(71),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                false,
+                None,
+                McpRequestCancellation::new(),
+                None,
+                Arc::new(move |notification| {
+                    if notification.method != "notifications/tools/list_changed" {
+                        return;
+                    }
+                    let miss = matches!(
+                        callback_cache
+                            .on_request(&test_context(), &test_request("tools/list", None))
+                            .unwrap(),
+                        MiddlewareDecision::Continue
+                    );
+                    assert_eq!(miss, callback_broadcast.load(Ordering::SeqCst));
+                    callback_observed.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .unwrap();
+
+        let before = cache.stats();
+        assert_eq!(
+            server
+                .final_subscriptions
+                .publish_selected(
+                    ServerNotification::ToolsListChanged(None),
+                    Some((listener.key, &listener.election)),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.stats().entries, before.entries);
+        assert_eq!(cache.stats().size_bytes, before.size_bytes);
+
+        let mut oversized = FinalEmptyNotificationParams::default();
+        oversized.additional.insert(
+            "example/payload".to_owned(),
+            serde_json::json!("x".repeat(crate::MAX_FINAL_SUBSCRIPTION_EVENT_BYTES + 1)),
+        );
+        let before_rejection = cache.stats();
+        assert!(
+            server
+                .publish_subscription_notification(ServerNotification::ToolsListChanged(Some(
+                    oversized
+                )),)
+                .is_err()
+        );
+        assert_eq!(cache.stats(), before_rejection);
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+
+        broadcast.store(true, Ordering::SeqCst);
+        assert_eq!(
+            server
+                .publish_subscription_notification(ServerNotification::ToolsListChanged(None),)
+                .unwrap(),
+            1
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.stats().entries, 0);
+    }
+
+    #[test]
+    fn retained_subscription_registry_does_not_retain_server_cache() {
+        let cache = Arc::new(ResponseCachingMiddleware::new());
+        let weak_cache = Arc::downgrade(&cache);
+        let server = crate::Server::new("cache-publisher-lifetime", "1")
+            .middleware(Arc::clone(&cache))
+            .build();
+        let publisher = server.subscription_publisher();
+        let registry = Arc::clone(&server.final_subscriptions);
+        drop(server);
+        drop(cache);
+        assert!(weak_cache.upgrade().is_none());
+        assert!(publisher.is_closed());
+        assert!(
+            publisher
+                .publish(ServerNotification::ToolsListChanged(None))
+                .is_err()
+        );
+        assert!(registry.cache_invalidation_middleware.upgrade().is_none());
     }
 
     const OBS_01_TRACE_PARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -2397,11 +2831,11 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum FillInvalidation {
-        None,
+    enum FillInvalidation {        None,
         Method,
         Clear,
         Discovery,
+        Notification,
     }
 
     fn assert_response_cache_fill_invalidation(invalidation: FillInvalidation) {
@@ -2415,8 +2849,9 @@ mod tests {
             "tools/call",
             SERVER_DISCOVER_METHOD,
         ] {
-            let middleware =
-                ResponseCachingMiddleware::new().include_tools(vec!["deterministic".to_owned()]);
+            let middleware = Arc::new(
+                ResponseCachingMiddleware::new().include_tools(vec!["deterministic".to_owned()]),
+            );
             let request = match method {
                 SERVER_DISCOVER_METHOD => final_discovery_request(FINAL_PROTOCOL_VERSION),
                 "resources/read" => test_request(
@@ -2471,6 +2906,18 @@ mod tests {
                 }
                 FillInvalidation::Clear => middleware.clear(),
                 FillInvalidation::Discovery => middleware.invalidate_discovery(),
+                FillInvalidation::Notification => {
+                    let server = crate::Server::new("cache-notification-fill-fence", "1")
+                        .middleware(Arc::clone(&middleware))
+                        .build();
+                    let notification = match method {
+                        "resources/list" | "resources/templates/list" => ServerNotification::ResourcesListChanged(None),
+                        "resources/read" => resource_change("file:///generation-test"),
+                        "prompts/list" | "prompts/get" => ServerNotification::PromptsListChanged(None),
+                        _ => ServerNotification::ToolsListChanged(None),
+                    };
+                    assert_eq!(server.publish_subscription_notification(notification).unwrap(), 0);
+                }
             }
 
             assert_eq!(
@@ -2563,6 +3010,11 @@ mod tests {
     #[test]
     fn response_cache_discovery_invalidation_rejects_late_fill() {
         assert_response_cache_fill_invalidation(FillInvalidation::Discovery);
+    }
+
+    #[test]
+    fn response_cache_server_notifications_reject_late_fill() {
+        assert_response_cache_fill_invalidation(FillInvalidation::Notification);
     }
 
     #[test]

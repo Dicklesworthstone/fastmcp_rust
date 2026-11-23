@@ -27,7 +27,7 @@ pub(crate) mod seal {
 }
 
 use fastmcp_core::{McpContext, McpError, McpResult};
-use fastmcp_protocol::JsonRpcRequest;
+use fastmcp_protocol::{JsonRpcRequest, ServerNotification};
 
 use std::sync::Arc;
 
@@ -84,6 +84,17 @@ pub trait Middleware: Send + Sync {
     fn replays_router_minted_continuation(&self, _: seal::Sealed) -> bool {
         false
     }
+
+    /// Invalidates internal memoization before a trusted server change is
+    /// published. This sealed hook cannot be supplied by application
+    /// middleware or used by a peer notification to mint invalidation authority.
+    #[doc(hidden)]
+    fn invalidate_for_server_notification(
+        &self,
+        _notification: &ServerNotification,
+        _: seal::Sealed,
+    ) {
+    }
 }
 
 impl<T> Middleware for Arc<T>
@@ -113,6 +124,14 @@ where
 
     fn replays_router_minted_continuation(&self, seal: seal::Sealed) -> bool {
         (**self).replays_router_minted_continuation(seal)
+    }
+
+    fn invalidate_for_server_notification(
+        &self,
+        notification: &ServerNotification,
+        seal: seal::Sealed,
+    ) {
+        (**self).invalidate_for_server_notification(notification, seal);
     }
 }
 

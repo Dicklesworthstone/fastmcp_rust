@@ -3318,24 +3318,23 @@ impl McpContext {
         }
         let uri = uri.as_ref();
         let mut delivered = false;
-        if self
-            .resource_subscriptions
-            .as_ref()
-            .is_some_and(|uris| uris.contains(uri))
+        // The server-wide publisher retires stale memoized data before it
+        // fans out the change. It must run before either era's subscriber can
+        // react by issuing another read, including a reentrant session sink.
+        if let Some(publisher) = self.catalog_publisher.as_ref() {
+            self.note_notification_emission();
+            delivered |= publisher.publish_resource_updated(uri);
+        }
+        if self.ensure_capability_live().is_ok()
+            && self
+                .resource_subscriptions
+                .as_ref()
+                .is_some_and(|uris| uris.contains(uri))
             && let Some(sender) = self.log_sender.as_ref()
         {
             self.note_notification_emission();
             sender.send_resource_updated(uri);
             delivered = true;
-        }
-        if self.ensure_capability_live().is_ok()
-            && let Some(publisher) = self.catalog_publisher.as_ref()
-        {
-            // A preceding session sender may have revoked this request.
-            // Mark before calling a user-supplied sink: it may deliver an
-            // event before returning, or fail after partial delivery.
-            self.note_notification_emission();
-            delivered |= publisher.publish_resource_updated(uri);
         }
         delivered
     }
@@ -4067,17 +4066,20 @@ impl McpContext {
         // sender, a `subscriptions/listen` catalog publisher, or both, and
         // each owns its own delivery decision. Suppressing either one here
         // silently drops catalog changes for the sessions that rely on it.
-        if let Some(sender) = self.log_sender.as_ref() {
+        // The server-wide publisher also invalidates response caches. Retire
+        // the old catalog before either sink can observe the change and issue
+        // another request; both sinks still receive exactly one event.
+        if let Some(publisher) = self.catalog_publisher.as_ref() {
             self.note_notification_emission();
-            sender.send_catalog_changed(kind);
+            let _ = publisher.publish_catalog_changed(kind);
         }
         // The first callback can revoke the producer's authority before
         // this independent publication enters a different installed sink.
         if self.ensure_capability_live().is_ok()
-            && let Some(publisher) = self.catalog_publisher.as_ref()
+            && let Some(sender) = self.log_sender.as_ref()
         {
             self.note_notification_emission();
-            let _ = publisher.publish_catalog_changed(kind);
+            sender.send_catalog_changed(kind);
         }
     }
 
@@ -7341,11 +7343,11 @@ mod tests {
                 "progress",
                 "exact_progress",
                 "log",
-                "resource_sender",
                 "resource_publisher",
+                "resource_sender",
             ];
             for _ in 0..6 {
-                expected.extend(["catalog_sender", "catalog_publisher"]);
+                expected.extend(["catalog_publisher", "catalog_sender"]);
             }
             expected.push("extension");
             assert_eq!(*probe.events.lock().unwrap(), expected);
@@ -7421,10 +7423,10 @@ mod tests {
             ));
             if resource_update {
                 assert!(context.notify_resource_updated("file:///private"));
-                assert_eq!(*probe.events.lock().unwrap(), vec!["resource_sender"]);
+                assert_eq!(*probe.events.lock().unwrap(), vec!["resource_publisher"]);
             } else {
                 assert!(context.disable_tool("later"));
-                assert_eq!(*probe.events.lock().unwrap(), vec!["catalog_sender"]);
+                assert_eq!(*probe.events.lock().unwrap(), vec!["catalog_publisher"]);
                 assert_eq!(
                     state.get::<std::collections::HashSet<String>>(McpContext::DISABLED_TOOLS_KEY),
                     Some(std::collections::HashSet::from([

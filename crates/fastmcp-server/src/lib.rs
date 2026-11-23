@@ -5795,6 +5795,9 @@ struct FinalSubscriptionRegistry {
     max_event_bytes: usize,
     max_event_bytes_per_principal: usize,
     terminating: AtomicBool,
+    /// The server owns middleware. Publishers and retained listen handles must
+    /// not keep it alive after the server's own lifetime has ended.
+    cache_invalidation_middleware: std::sync::Weak<Vec<Box<dyn Middleware>>>,
     /// The server and its live listen handles own Task observation. The
     /// runtime keeps only a weak reference; this observer also reaches this
     /// registry weakly so neither edge can retain a retired subscription.
@@ -6535,9 +6538,15 @@ impl FinalSubscriptionRegistry {
             max_event_bytes: MAX_FINAL_SUBSCRIPTION_TOTAL_EVENT_BYTES,
             max_event_bytes_per_principal: MAX_FINAL_SUBSCRIPTION_PRINCIPAL_EVENT_BYTES,
             terminating: AtomicBool::new(false),
+            cache_invalidation_middleware: std::sync::Weak::new(),
             #[cfg(feature = "tasks")]
             task_notification_emitter: OnceLock::new(),
         }
+    }
+
+    fn with_cache_invalidation(mut self, middleware: &Arc<Vec<Box<dyn Middleware>>>) -> Self {
+        self.cache_invalidation_middleware = Arc::downgrade(middleware);
+        self
     }
 
     fn reserve(&self, principal: Option<[u8; 32]>) -> McpResult<Arc<FinalSubscriptionReservation>> {
@@ -7066,6 +7075,17 @@ impl FinalSubscriptionRegistry {
                 "subscription event byte limit exceeded",
             )
         })?;
+        if target_subscription.is_none()
+            && let Some(middleware) = self.cache_invalidation_middleware.upgrade()
+        {
+            // Only trusted application-wide publishers carry invalidation
+            // authority. A proxy's per-listener upstream event may not flush
+            // another owner's cache. Run before any recipient callback (and
+            // even with no listeners), outside the subscription registry lock.
+            for entry in middleware.iter() {
+                entry.invalidate_for_server_notification(&notification, middleware::seal::Sealed);
+            }
+        }
         let targets = {
             let state = self
                 .inner
@@ -17548,6 +17568,8 @@ impl Server {
     /// The server tags each delivered notification with that request's exact
     /// subscription ID. Request-scoped notifications such as progress and
     /// messages are rejected rather than being broadcast.
+    /// A valid trusted change also invalidates affected response-cache entries
+    /// before delivery, including when no listener accepts the notification.
     ///
     /// Each listener retains at most 64 events and 256 KiB of encoded event
     /// data, including its active callback. Concurrent and reentrant publishes
