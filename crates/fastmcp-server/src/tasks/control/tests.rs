@@ -1669,3 +1669,96 @@ fn async_retention_committed_receipt_survives_caller_cancellation() {
         fixture.store.assert_async_only();
     }
 }
+
+
+#[test]
+fn async_retention_inspection_preserves_zero_cost_and_sibling_authority() {
+    let (fixture, _administrator) = terminal_retention_fixture();
+    let cx = Cx::for_testing_with_budget(
+        asupersync::Budget::new()
+            .with_poll_quota(32)
+            .with_cost_quota(0),
+    );
+    let ctx = McpContext::new(cx.clone(), 2);
+    let sibling = McpContext::new(cx.clone(), 3);
+    let mut inspect = Box::pin(
+        fixture
+            .runtime
+            .inspect_task_retention_with_context(&ctx, &fixture.task_id),
+    );
+    let target = ready(poll_once(inspect.as_mut()))
+        .expect("inspection spends poll authority without inventing a cost charge");
+    assert_eq!(target.task_id(), &fixture.task_id);
+    assert_eq!(target.generation(), fixture.snapshot().generation());
+    assert!(
+        ctx.budget().poll_quota < 32,
+        "request admission is charged locally"
+    );
+    assert_eq!(ctx.budget().cost_quota, Some(0));
+    assert_eq!(cx.budget().poll_quota, 32, "the ambient budget is unchanged");
+    assert!(!cx.is_cancel_requested());
+    assert!(
+        sibling.checkpoint().is_ok(),
+        "a sibling keeps its own poll ledger"
+    );
+    assert_eq!(fixture.store.payload_calls.load(Ordering::SeqCst), 1);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_exhausted_request_is_refused_before_provider_lookup() {
+    let (fixture, _administrator) = terminal_retention_fixture();
+    let cx = Cx::for_testing();
+    let ctx = McpContext::new(cx.clone(), 2)
+        .with_budget_ceiling(asupersync::Budget::new().with_poll_quota(0));
+    let sibling = McpContext::new(cx.clone(), 3);
+    let before = fixture.snapshot();
+    let mut inspect = Box::pin(
+        fixture
+            .runtime
+            .inspect_task_retention_with_context(&ctx, &fixture.task_id),
+    );
+    let error = ready(poll_once(inspect.as_mut()))
+        .expect_err("an exhausted request-local poll ceiling cannot authorize a lookup");
+    assert_eq!(error.code, McpError::request_cancelled().code);
+    assert_eq!(fixture.store.payload_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.snapshot().generation(), before.generation());
+    assert_eq!(fixture.store.inner.task_count(), 1);
+    assert!(!cx.is_cancel_requested());
+    assert!(sibling.checkpoint().is_ok());
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_inspection_observes_clone_shared_quota_after_suspension() {
+    let (fixture, _administrator) = terminal_retention_fixture();
+    let cx = Cx::for_testing();
+    let ctx = McpContext::new(cx.clone(), 2)
+        .with_budget_ceiling(asupersync::Budget::new().with_poll_quota(32));
+    let sibling = McpContext::new(cx.clone(), 3);
+    let before = fixture.snapshot();
+    fixture.store.payload_gate.close();
+    let mut inspect = Box::pin(
+        fixture
+            .runtime
+            .inspect_task_retention_with_context(&ctx, &fixture.task_id),
+    );
+    assert!(poll_once(inspect.as_mut()).is_pending());
+    assert!(
+        ctx.budget().poll_quota < 32,
+        "pending admission charges the shared request ledger"
+    );
+    let tightened = ctx
+        .clone()
+        .with_budget_ceiling(asupersync::Budget::new().with_poll_quota(0));
+    fixture.store.payload_gate.release();
+    let error = ready(poll_once(inspect.as_mut()))
+        .expect_err("a stored reply cannot escape after a clone exhausts request authority");
+    assert_eq!(error.code, McpError::request_cancelled().code);
+    assert_eq!(tightened.budget().poll_quota, 0);
+    assert_eq!(fixture.store.payload_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.snapshot().generation(), before.generation());
+    assert!(!cx.is_cancel_requested());
+    assert!(sibling.checkpoint().is_ok());
+    fixture.store.assert_async_only();
+}

@@ -8048,10 +8048,7 @@ impl FinalTaskRuntime {
         ctx: &McpContext,
         action: &TaskRetentionAuthorization<'_>,
     ) -> McpResult<TaskRetentionPolicy> {
-        ctx.ensure_live()?;
-        ctx.cx()
-            .checkpoint()
-            .map_err(|_| McpError::request_cancelled())?;
+        ctx.checkpoint()?;
         let (administrator, policy) = self
             .retention_administration
             .installed
@@ -8065,10 +8062,7 @@ impl FinalTaskRuntime {
         // No provider runs under the installation lock or the store lock.
         let authorized = catch_unwind(AssertUnwindSafe(|| administrator.authorize(ctx, action)))
             .is_ok_and(|result| result.is_ok());
-        ctx.ensure_live()?;
-        ctx.cx()
-            .checkpoint()
-            .map_err(|_| McpError::request_cancelled())?;
+        ctx.checkpoint()?;
         if !authorized {
             return Err(McpError::invalid_request(
                 "Task retention administration is not authorized",
@@ -8094,10 +8088,7 @@ impl FinalTaskRuntime {
                 "Task has no reclaimable terminal generation",
             ));
         }
-        ctx.ensure_live()?;
-        ctx.cx()
-            .checkpoint()
-            .map_err(|_| McpError::request_cancelled())?;
+        ctx.checkpoint()?;
         Ok(TaskRetentionTarget {
             task_id: task_id.clone(),
             generation: snapshot.generation(),
@@ -8175,10 +8166,7 @@ impl FinalTaskRuntime {
         let policy = self
             .authorize_task_retention(ctx, &TaskRetentionAuthorization::Audit { after, limit })?;
         let page = self.store.task_retention_audit(ctx.cx(), after, limit)?;
-        ctx.ensure_live()?;
-        ctx.cx()
-            .checkpoint()
-            .map_err(|_| McpError::request_cancelled())?;
+        ctx.checkpoint()?;
         if page.records.len() > limit
             || page.retained_records > policy.max_records
             || page.retained_bytes > policy.max_bytes
