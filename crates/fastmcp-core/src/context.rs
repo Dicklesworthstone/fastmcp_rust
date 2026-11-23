@@ -2868,12 +2868,25 @@ impl McpContext {
         self.request_cancellation.clone()
     }
 
-    /// Waits for request-local cancellation to become visible outside a
-    /// framework mask. Completion is the visibility observation; callers
+    /// Waits for request-local or caller cancellation to become visible outside
+    /// a framework mask. Completion is the visibility observation; callers
     /// must act on it rather than rechecking a possibly newly entered mask.
+    ///
+    /// Observing the caller does not cancel it or copy its cancellation into
+    /// the request-local domain. Independently cancelled sibling requests keep
+    /// their own authority. Deadline-only waits still require a caller timer.
     #[doc(hidden)]
     pub async fn request_cancelled(&self) {
-        self.request_cancellation.cancelled().await;
+        let mut request = std::pin::pin!(self.request_cancellation.cancelled());
+        let mut caller = std::pin::pin!(self.cx.cancelled());
+        std::future::poll_fn(|poll| {
+            if request.as_mut().poll(poll).is_ready() || caller.as_mut().poll(poll).is_ready() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
         self.framework_mask_released
             .wait_until(|| self.ensure_live().is_err())
             .await;
@@ -5129,6 +5142,108 @@ mod tests {
 
         assert!(checkpoint.is_ok());
         assert!(ctx.ensure_live().is_err());
+    }
+
+    #[test]
+    fn request_cancelled_wakes_for_both_cancellation_domains() {
+        struct WakeFlag(AtomicBool);
+
+        impl std::task::Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        for cancel_caller in [false, true] {
+            let cx = Cx::for_testing();
+            let request = McpContext::new(cx.clone(), 1);
+            let sibling = McpContext::new(cx.clone(), 2);
+            let wake_flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+            let waker = std::task::Waker::from(Arc::clone(&wake_flag));
+            let mut poll = std::task::Context::from_waker(&waker);
+            let mut cancelled = std::pin::pin!(request.request_cancelled());
+            let mut sibling_cancelled = std::pin::pin!(sibling.request_cancelled());
+
+            assert!(cancelled.as_mut().poll(&mut poll).is_pending());
+            assert!(sibling_cancelled.as_mut().poll(&mut poll).is_pending());
+            assert!(!wake_flag.0.load(Ordering::Acquire));
+            if cancel_caller {
+                cx.set_cancel_requested(true);
+            } else {
+                assert!(request.request_cancellation().cancel());
+            }
+
+            assert!(
+                wake_flag.0.load(Ordering::Acquire),
+                "cancellation must wake a parked caller without a provider wake"
+            );
+            assert!(cancelled.as_mut().poll(&mut poll).is_ready());
+            assert_eq!(
+                sibling_cancelled.as_mut().poll(&mut poll).is_ready(),
+                cancel_caller,
+                "request-local cancellation must leave its sibling pending"
+            );
+            assert_eq!(cx.is_cancel_requested(), cancel_caller);
+            assert_eq!(
+                request.request_cancellation().is_cancel_requested(),
+                !cancel_caller,
+                "observing caller cancellation must not mutate request-local authority"
+            );
+            assert!(!sibling.request_cancellation().is_cancel_requested());
+        }
+    }
+
+    #[test]
+    fn request_cancelled_observes_preexisting_caller_cancellation() {
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let request = McpContext::new(cx, 1);
+        let mut cancelled = std::pin::pin!(request.request_cancelled());
+        let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(cancelled.as_mut().poll(&mut poll).is_ready());
+        assert!(!request.request_cancellation().is_cancel_requested());
+    }
+
+    #[test]
+    fn request_cancelled_defers_both_domains_until_framework_mask_release() {
+        struct WakeFlag(AtomicBool);
+
+        impl std::task::Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        for cancel_caller in [false, true] {
+            let cx = Cx::for_testing();
+            let request = McpContext::new(cx.clone(), 1);
+            let wake_flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+            let waker = std::task::Waker::from(Arc::clone(&wake_flag));
+            let mut poll = std::task::Context::from_waker(&waker);
+            let mut cancelled = std::pin::pin!(request.request_cancelled());
+
+            assert!(cancelled.as_mut().poll(&mut poll).is_pending());
+            request
+                .masked(|| {
+                    if cancel_caller {
+                        cx.set_cancel_requested(true);
+                    } else {
+                        assert!(request.request_cancellation().cancel());
+                    }
+                    assert!(request.ensure_live().is_ok());
+                    assert!(cancelled.as_mut().poll(&mut poll).is_pending());
+                    wake_flag.0.store(false, Ordering::Release);
+                })
+                .expect("the critical section was admitted before cancellation");
+
+            assert!(
+                wake_flag.0.load(Ordering::Acquire),
+                "releasing the mask must wake a deferred cancellation observer"
+            );
+            assert!(cancelled.as_mut().poll(&mut poll).is_ready());
+            assert!(request.ensure_live().is_err());
+        }
     }
 
     #[test]

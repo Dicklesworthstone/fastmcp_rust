@@ -1528,3 +1528,144 @@ fn async_retention_audit_rejects_backend_page_and_cursor_widening() {
         fixture.store.assert_async_only();
     }
 }
+
+
+#[test]
+fn async_control_caller_cancellation_wakes_parked_metadata_and_payload_reads() {
+    for metadata in [true, false] {
+        let fixture = Fixture::new(true);
+        let before = fixture.snapshot();
+        if metadata {
+            fixture.store.metadata_gate.close();
+        } else {
+            fixture.store.payload_gate.close();
+        }
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut poll = Context::from_waker(&waker);
+        let mut request = Box::pin(fixture.runtime.task_for_request_with_cx(
+            &fixture.ctx,
+            &fixture.task_id,
+            TaskAccessAction::Get,
+        ));
+        assert!(request.as_mut().poll(&mut poll).is_pending());
+        let before_cancel = wakes.0.load(Ordering::SeqCst);
+        fixture.ctx.cx().set_cancel_requested(true);
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > before_cancel,
+            "caller cancellation must wake the parked read without storage progress"
+        );
+        assert!(!fixture.ctx.request_cancellation().is_cancel_requested());
+        let error = ready(request.as_mut().poll(&mut poll)).unwrap_err();
+        assert_eq!(error.code, McpError::request_cancelled().code);
+        if metadata {
+            assert_eq!(fixture.store.payload_calls.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+        let after = fixture.snapshot();
+        assert_eq!(after.generation(), before.generation());
+        assert!(final_tasks_match_exactly(after.task(), before.task()).unwrap());
+        let after_completion = wakes.0.load(Ordering::SeqCst);
+        fixture.store.metadata_gate.release();
+        fixture.store.payload_gate.release();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), after_completion);
+        fixture.store.assert_async_only();
+    }
+}
+
+#[test]
+fn async_retention_caller_cancellation_wakes_prewrite_without_mutation() {
+    let (fixture, _administrator) = terminal_retention_fixture();
+    let target = inspect_retention(&fixture);
+    let before = fixture.snapshot();
+    let retained = fixture.store.inner.retained_payload_bytes();
+    fixture.store.write_gate.close();
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut poll = Context::from_waker(&waker);
+    let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+        &fixture.ctx,
+        &target,
+        TaskRetentionReason::OperatorRequest,
+    ));
+    assert!(reclaim.as_mut().poll(&mut poll).is_pending());
+    let before_cancel = wakes.0.load(Ordering::SeqCst);
+    fixture.ctx.cx().set_cancel_requested(true);
+    assert!(wakes.0.load(Ordering::SeqCst) > before_cancel);
+    let error = ready(reclaim.as_mut().poll(&mut poll)).unwrap_err();
+    assert_eq!(error.code, McpError::request_cancelled().code);
+    assert!(!error.message.contains("may have committed"));
+    assert!(!fixture.ctx.request_cancellation().is_cancel_requested());
+    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.store.inner.retained_payload_bytes(), retained);
+    let after = fixture.snapshot();
+    assert_eq!(after.generation(), before.generation());
+    assert!(final_tasks_match_exactly(after.task(), before.task()).unwrap());
+    let audit = fixture
+        .store
+        .inner
+        .task_retention_audit(&Cx::for_testing(), None, 1)
+        .unwrap();
+    assert!(audit.records().is_empty());
+    let after_completion = wakes.0.load(Ordering::SeqCst);
+    fixture.store.write_gate.release();
+    assert_eq!(wakes.0.load(Ordering::SeqCst), after_completion);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_committed_receipt_survives_caller_cancellation() {
+    for cancel_in_commit_poll in [false, true] {
+        let (fixture, _administrator) = terminal_retention_fixture();
+        let target = inspect_retention(&fixture);
+        if cancel_in_commit_poll {
+            let caller = fixture.ctx.cx().clone();
+            *fixture.store.after_write.lock().unwrap() = Some(Box::new(move || {
+                caller.set_cancel_requested(true);
+            }));
+        }
+        fixture.store.retention_receipt_gate.close();
+        let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+            &fixture.ctx,
+            &target,
+            TaskRetentionReason::OperatorRequest,
+        ));
+        assert!(poll_once(reclaim.as_mut()).is_pending());
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.inner.task_count(), 0);
+        if !cancel_in_commit_poll {
+            fixture.ctx.cx().set_cancel_requested(true);
+        }
+        assert!(fixture.ctx.ensure_live().is_err());
+        assert!(!fixture.ctx.request_cancellation().is_cancel_requested());
+        assert!(
+            poll_once(reclaim.as_mut()).is_pending(),
+            "an admitted write retains its receipt future after caller cancellation"
+        );
+        fixture.store.retention_receipt_gate.release();
+        let TaskRetentionReclamation::Reclaimed(receipt) =
+            ready(poll_once(reclaim.as_mut())).unwrap()
+        else {
+            panic!("caller cancellation cannot erase an acknowledged reclamation");
+        };
+        let fresh = McpContext::with_state(Cx::for_testing(), 2, fastmcp_core::SessionState::new());
+        let mut retry = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+            &fresh,
+            &target,
+            TaskRetentionReason::SubjectRemoved,
+        ));
+        assert_eq!(
+            ready(poll_once(retry.as_mut())).unwrap(),
+            TaskRetentionReclamation::AlreadyReclaimed(receipt.clone()),
+        );
+        let mut audit = Box::pin(
+            fixture
+                .runtime
+                .task_retention_audit_with_context(&fresh, None, 1),
+        );
+        assert_eq!(ready(poll_once(audit.as_mut())).unwrap().records(), &[receipt]);
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.inner.retained_payload_bytes(), 0);
+        fixture.store.assert_async_only();
+    }
+}
