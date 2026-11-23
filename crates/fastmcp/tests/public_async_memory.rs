@@ -919,6 +919,124 @@ mod interactions {
         }
     }
 
+
+    fn operation_response<'cx>(
+        cx: &'cx Cx,
+        required: &'cx modern::InputRequiredResult,
+    ) -> modern::MrtrResponderFuture<'cx> {
+        Box::pin(async move {
+            assert!(cx.blocking_pool_handle().is_none());
+            // Yield before awaiting the caller's timer so the response cannot
+            // complete in the callback's initial poll.
+            asupersync::runtime::yield_now().await;
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            let mut responses = modern::MrtrInputResponses::new();
+            for request in required.input_requests().unwrap().members() {
+                let response = match request.name.as_str() {
+                    "sample" => json!({
+                        "role": "assistant", "model": "awaited-model",
+                        "content": {"type": "text", "text": "asynchronous sample"},
+                    }),
+                    "roots" => json!({"roots": []}),
+                    "approval" => json!({"action": "accept", "content": {"approved": true}}),
+                    _ => panic!("the real server requested an unexpected input"),
+                };
+                responses.insert(request.name.clone(), response);
+            }
+            Ok(responses)
+        })
+    }
+
+    #[test]
+    fn memory_async_operation_responders_complete_all_verbs_through_the_real_server() {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+                let server = modern::ServerBuilder::new("memory-async-responders", "1")
+                    .tool(MemoryEcho)
+                    .tool(MemoryInteractiveTool)
+                    .resource(MemoryInteractiveResourceResource)
+                    .prompt(MemoryInteractivePromptPrompt)
+                    .build();
+                let (transport, peer) = create_memory_transport_pair_with_capacity(1);
+                let mut serving = cx
+                    .spawn(move |serve_cx| async move {
+                        server.serve_memory(&serve_cx, peer).await
+                    })
+                    .unwrap();
+                let mut client = modern::MemoryClient::builder(ClientInfo {
+                    name: "memory-async-responder-consumer".to_owned(),
+                    version: "1".to_owned(),
+                })
+                .capabilities(serde_json::from_value(json!({
+                    "sampling": {}, "roots": {}, "elicitation": {"form": {}},
+                })).unwrap())
+                .connect(&cx, transport)
+                .await
+                .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let tool = client
+                    .call_tool_with_async_mrtr_retry(
+                        &cx, &cancellation, deadline, "memory_interactive_tool",
+                        json!({"subject": "tool"}), operation_response,
+                    )
+                    .await
+                    .unwrap();
+                let resource = client
+                    .read_resource_with_async_mrtr_retry(
+                        &cx, &cancellation, deadline, "memory://interactive/resource",
+                        operation_response,
+                    )
+                    .await
+                    .unwrap();
+                let prompt = client
+                    .get_prompt_with_async_mrtr_retry(
+                        &cx, &cancellation, deadline, "memory_interactive_prompt",
+                        HashMap::from([("subject".to_owned(), "prompt".to_owned())]),
+                        operation_response,
+                    )
+                    .await
+                    .unwrap();
+                let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = tool else {
+                    panic!("the awaited sample must complete the real tool");
+                };
+                assert_eq!(
+                    serde_json::to_value(result.payload).unwrap()["content"][0]["text"],
+                    "tool:awaited-model",
+                );
+                let CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) = resource else {
+                    panic!("the awaited roots must complete the real resource");
+                };
+                assert_eq!(
+                    serde_json::to_value(result.payload).unwrap()["contents"][0]["text"],
+                    "resource:0",
+                );
+                let CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) = prompt else {
+                    panic!("the awaited consent must complete the real prompt");
+                };
+                assert_eq!(
+                    serde_json::to_value(result.payload).unwrap()["messages"][0]["content"]["text"],
+                    "prompt:true",
+                );
+                client
+                    .call_tool(&cx, &cancellation, "memory_echo", json!({"value": "still live"}))
+                    .await
+                    .unwrap();
+                client.close(&cx).unwrap();
+                serving.join(&cx).await.unwrap().unwrap();
+            })
+            .await
+            .expect("async responders must complete through the shipped public facade");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
     #[cfg(feature = "testing")]
     #[test]
     fn testing_client_handoff_preserves_real_interactions_and_request_ownership() {

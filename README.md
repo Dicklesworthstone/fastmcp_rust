@@ -1766,6 +1766,31 @@ own token acquisition and refresh. Credentials require HTTPS and a modern or
 auto protocol policy. Core-only builds omit Tasks from help and explain
 the required feature when a Tasks command is attempted.
 
+### Awaiting application input during a memory request
+
+The memory client offers `call_tool_with_async_mrtr_retry`,
+`read_resource_with_async_mrtr_retry`, and
+`get_prompt_with_async_mrtr_retry` for operation-local responders that need
+to await consent, model calls, or other asynchronous input sources. Pass the
+caller `Cx`, a request cancellation token, one absolute deadline, and a
+responder returning `MrtrResponderFuture`. The responder receives the same
+caller context and a borrowed `InputRequiredResult`; return
+`Box::pin(async move { ... })` with the complete response map.
+
+Configure the responder's capabilities before connecting. The client admits
+the entire input batch before invoking application code, checks the returned
+keys before sending a continuation, and retains the original request arguments,
+capabilities, and deadline across fresh request IDs. Cancellation, deadline
+expiry, or dropping the operation drops a pending responder. Responders should
+await cooperative operations; blocking inside a future's poll cannot be
+preempted. No responder task or runtime is created.
+
+With `tasks` enabled, use
+`call_tool_final_outcome_with_async_mrtr_retry` to retain explicit Tasks
+negotiation through the same continuation driver. An admitted Task receipt
+still survives cancellation in the same final poll. This method does not
+observe or cancel the resulting Task.
+
 ### Observing a Task returned by a tool
 
 With `tasks` enabled, a Tasks-aware tool call returns

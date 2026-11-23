@@ -23,7 +23,6 @@ use fastmcp_protocol::{
 };
 use serde_json::Value;
 
-use super::interaction::MemoryMrtrResponder;
 use super::{
     MemoryClient, MemoryClientBuilder, MemoryExtensionEvent, MemoryRequestEvent,
     MemoryRequestExecution, checkpoint,
@@ -31,8 +30,9 @@ use super::{
 use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime};
 use crate::{
     FinalCancelTaskResult, FinalGetTaskResult, FinalTask, FinalTaskId, FinalTaskInputResponses,
-    FinalToolCallOutcome, FinalUpdateTaskResult, MrtrInputResponses, RequestTimeoutPolicy,
-    ReverseRequestHandlers, mrtr_operation_deadline,
+    FinalToolCallOutcome, FinalUpdateTaskResult, MrtrInputResponses, MrtrResponderFuture,
+    OperationMrtrResponder, RequestTimeoutPolicy, ReverseRequestHandlers, SyncMrtrResponderFn,
+    mrtr_operation_deadline,
 };
 
 #[derive(Debug)]
@@ -254,8 +254,9 @@ impl MemoryClient {
         self.ensure_open()?;
         checkpoint(cx, cancellation)?;
         self.require_tasks()?;
-        let handlers = self.reverse_request_handlers.clone();
-        if !handlers.has_modern_handlers() {
+        let responder: OperationMrtrResponder =
+            OperationMrtrResponder::Installed(self.reverse_request_handlers.clone());
+        if !responder.has_handler() {
             return self
                 .call_tool_final_outcome(cx, cancellation, name, arguments)
                 .await;
@@ -267,9 +268,7 @@ impl MemoryClient {
             deadline,
             "tools/call",
             serde_json::json!({"name": name, "arguments": arguments}),
-            MemoryMrtrResponder::<fn(&InputRequiredResult) -> McpResult<MrtrInputResponses>>::Installed(
-                handlers,
-            ),
+            responder,
             true,
         )
         .await
@@ -312,7 +311,47 @@ impl MemoryClient {
             deadline,
             "tools/call",
             serde_json::json!({"name": name, "arguments": arguments}),
-            MemoryMrtrResponder::Caller(respond),
+            OperationMrtrResponder::<F>::Caller(respond),
+            true,
+        )
+        .await
+        .and_then(tool_outcome)
+    }
+
+    /// Calls a Tasks-capable tool with a caller-owned asynchronous input responder.
+    ///
+    /// This preserves the bilateral Tasks negotiation and complete result
+    /// contract of [`Self::call_tool_final_outcome_with_mrtr_retry`]. The
+    /// responder may borrow its caller context and input result across awaits.
+    /// Its future is bounded by the original cancellation domain and the earlier
+    /// of `deadline` and the configured absolute timeout. Cancelling, expiring,
+    /// or dropping a pending responder cannot publish a continuation.
+    ///
+    /// A Task receipt already admitted by the receive owner survives a same-poll
+    /// cancellation. The caller owns that Task's later lifecycle; this method
+    /// neither polls the Task nor retries an uncertain creating request.
+    pub async fn call_tool_final_outcome_with_async_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: Value,
+        respond: F,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        self.ensure_open()?;
+        checkpoint(cx, cancellation)?;
+        self.require_tasks()?;
+        self.follow_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            OperationMrtrResponder::<SyncMrtrResponderFn, F>::Async(respond),
             true,
         )
         .await
@@ -1146,6 +1185,255 @@ mod tests {
                 let _peer = server.join(&cx).await.unwrap();
                 client.close(&cx).unwrap();
             }
+        });
+    }
+
+    #[test]
+    fn memory_tasks_async_mrtr_preserves_negotiation_and_exact_receipt() {
+        run(|cx| async move {
+            for create_task in [false, true] {
+                let installed_calls = Arc::new(AtomicUsize::new(0));
+                let observed_installed = Arc::clone(&installed_calls);
+                let handlers = ReverseRequestHandlers::new().with_modern_roots_list(
+                    move |_, _, _| {
+                        observed_installed.fetch_add(1, Ordering::AcqRel);
+                        Box::pin(async {
+                            Ok(crate::FinalEmbeddedRootsListResult { roots: Vec::new() })
+                        })
+                    },
+                );
+                let (mut client, mut peer) = connected_with(
+                    &cx,
+                    MemoryClient::builder(info())
+                        .with_tasks()
+                        .reverse_request_handlers(handlers),
+                )
+                .await;
+                let cancellation = McpRequestCancellation::new();
+                let mut sibling = client
+                    .execute_core(&cx, &cancellation, "tools/list", json!({}))
+                    .await
+                    .unwrap();
+                receive(&cx, &mut peer, "tools/list", Some(2)).await;
+                let mut server = cx
+                    .spawn(move |peer_cx| async move {
+                        let initial = receive(&peer_cx, &mut peer, "tools/call", Some(3)).await;
+                        assert_tasks_metadata(&initial);
+                        let original = initial.params.unwrap();
+                        assert_eq!(original["name"], "interactive");
+                        assert_eq!(original["arguments"], json!({"value":"résumé 東京"}));
+                        for (id, challenge) in [
+                            (3, input_required()),
+                            (
+                                4,
+                                json!({
+                                    "resultType":"input_required",
+                                    "requestState":"async-state-only",
+                                }),
+                            ),
+                        ] {
+                            peer.send_async(&peer_cx, &response(id, challenge.clone()))
+                                .await
+                                .unwrap();
+                            let retry =
+                                receive(&peer_cx, &mut peer, "tools/call", Some(id + 1)).await;
+                            assert_tasks_metadata(&retry);
+                            let mut parameters = retry.params.unwrap();
+                            assert_eq!(
+                                parameters.get("requestState"),
+                                challenge.get("requestState"),
+                            );
+                            let answers =
+                                parameters.as_object_mut().unwrap().remove("inputResponses");
+                            if id == 3 {
+                                assert_eq!(answers, Some(json!({"roots":{"roots":[]}})));
+                            } else {
+                                assert!(answers.is_none());
+                            }
+                            parameters.as_object_mut().unwrap().remove("requestState");
+                            assert_eq!(parameters, original);
+                        }
+                        peer.send_async(&peer_cx, &response(2, tools()))
+                            .await
+                            .unwrap();
+                        let terminal = if create_task {
+                            task_receipt()
+                        } else {
+                            let mut value = task_receipt();
+                            value["resultType"] = json!("complete");
+                            value["content"] = json!([]);
+                            for key in [
+                                "taskId",
+                                "status",
+                                "createdAt",
+                                "lastUpdatedAt",
+                                "ttlMs",
+                            ] {
+                                value.as_object_mut().unwrap().remove(key);
+                            }
+                            value
+                        };
+                        peer.send_async(&peer_cx, &response(5, terminal))
+                            .await
+                            .unwrap();
+                        peer
+                    })
+                    .unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let pending_polls = Arc::new(AtomicUsize::new(0));
+                let observed_calls = Arc::clone(&calls);
+                let observed_pending = Arc::clone(&pending_polls);
+                let expected_task = cx.task_id();
+                let outcome = client
+                    .call_tool_final_outcome_with_async_mrtr_retry(
+                        &cx,
+                        &cancellation,
+                        Instant::now() + Duration::from_secs(3),
+                        "interactive",
+                        json!({"value":"résumé 東京"}),
+                        move |caller, input| {
+                            let calls = Arc::clone(&observed_calls);
+                            let pending = Arc::clone(&observed_pending);
+                            Box::pin(async move {
+                                assert_eq!(caller.task_id(), expected_task);
+                                assert!(caller.blocking_pool_handle().is_none());
+                                calls.fetch_add(1, Ordering::AcqRel);
+                                let mut yielded = false;
+                                poll_fn(|task| {
+                                    assert_eq!(Cx::current().unwrap().task_id(), expected_task);
+                                    if yielded {
+                                        Poll::Ready(())
+                                    } else {
+                                        yielded = true;
+                                        pending.fetch_add(1, Ordering::AcqRel);
+                                        task.waker().wake_by_ref();
+                                        Poll::Pending
+                                    }
+                                })
+                                .await;
+                                assert_eq!(caller.task_id(), expected_task);
+                                Ok(roots_answers(input))
+                            })
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let source = match outcome {
+                    FinalToolCallOutcome::Task(created) if create_task => {
+                        assert_eq!(
+                            created.task.base().task_id.as_str(),
+                            "memory-created-after-input",
+                        );
+                        serde_json::to_string(&created).unwrap()
+                    }
+                    FinalToolCallOutcome::Complete(complete) if !create_task => {
+                        fastmcp_protocol::encode_complete_result(
+                            &complete.meta,
+                            Vec::new(),
+                            &[],
+                            &complete.extras,
+                        )
+                        .unwrap()
+                    }
+                    outcome => panic!("unexpected async Tasks outcome: {outcome:?}"),
+                };
+                assert!(source.contains("7.30e-2"));
+                assert!(source.contains("résumé 東京"));
+                assert_eq!(calls.load(Ordering::Acquire), 2);
+                assert_eq!(pending_polls.load(Ordering::Acquire), 2);
+                assert_eq!(installed_calls.load(Ordering::Acquire), 0);
+                assert!(matches!(
+                    client
+                        .next_event(&cx, &cancellation, &mut sibling)
+                        .await
+                        .unwrap(),
+                    Some(MemoryRequestEvent::Result(result))
+                        if matches!(*result, CoreResult::Final(FinalCoreResult::ToolsList { .. })),
+                ));
+                assert_eq!(client.next_id, 6);
+                assert!(client.tasks_active());
+                assert!(client.take_cancellation_events().is_empty());
+                let _peer = server.join(&cx).await.unwrap();
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn memory_tasks_async_mrtr_pending_cancellation_publishes_no_continuation() {
+        struct ResponderDrop(Arc<AtomicUsize>);
+
+        impl Drop for ResponderDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        run(|cx| async move {
+            let (mut client, mut peer) = connected_with(
+                &cx,
+                MemoryClient::builder(info())
+                    .with_tasks()
+                    .capabilities(serde_json::from_value(json!({"roots":{}})).unwrap()),
+            )
+            .await;
+            peer.send_async(&cx, &response(2, input_required()))
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let started = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let observed_started = Arc::clone(&started);
+            let observed_dropped = Arc::clone(&dropped);
+            {
+                let mut waiting = pin!(client.call_tool_final_outcome_with_async_mrtr_retry(
+                    &cx,
+                    &cancellation,
+                    Instant::now() + Duration::from_secs(3),
+                    "interactive",
+                    json!({}),
+                    move |caller, _| {
+                        let started = Arc::clone(&observed_started);
+                        let guard = ResponderDrop(Arc::clone(&observed_dropped));
+                        Box::pin(async move {
+                            let _guard = guard;
+                            assert!(caller.blocking_pool_handle().is_none());
+                            started.fetch_add(1, Ordering::AcqRel);
+                            std::future::pending::<McpResult<MrtrInputResponses>>().await
+                        })
+                    },
+                ));
+                poll_fn(|task| {
+                    assert!(waiting.as_mut().poll(task).is_pending());
+                    if started.load(Ordering::Acquire) == 1 {
+                        Poll::Ready(())
+                    } else {
+                        task.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                let original = receive(&cx, &mut peer, "tools/call", Some(2)).await;
+                assert_tasks_metadata(&original);
+                cancellation.cancel();
+                assert_eq!(
+                    waiting.await.unwrap_err().code,
+                    McpErrorCode::RequestCancelled,
+                );
+            }
+            assert_eq!(started.load(Ordering::Acquire), 1);
+            assert_eq!(dropped.load(Ordering::Acquire), 1);
+            assert_eq!(client.next_id, 3);
+            assert!(client.tasks_active());
+            assert!(client.take_cancellation_events().is_empty());
+            peer.send_async(&cx, &response(3, tools())).await.unwrap();
+            client
+                .list_tools(&cx, &McpRequestCancellation::new(), None)
+                .await
+                .unwrap();
+            receive(&cx, &mut peer, "tools/list", Some(3)).await;
+            assert!(cx.checkpoint().is_ok());
+            client.close(&cx).unwrap();
         });
     }
 }

@@ -1075,6 +1075,83 @@ pub enum FinalToolCallOutcome {
 /// individual embedded-request schemas.
 pub type MrtrInputResponses = BTreeMap<String, serde_json::Value>;
 
+/// A caller-owned response future for one admitted MRTR input batch.
+///
+/// The future may borrow the caller context and the exact input-required
+/// result for this round. Return one response for every requested key, or an
+/// empty map for a state-only continuation. Async MRTR entrypoints retain and
+/// poll this future under the original caller's cancellation and absolute
+/// deadline; they do not spawn a task or construct a runtime.
+///
+/// Use `Box::pin(async move { ... })` in a responder to await consent, model
+/// calls, or other asynchronous input sources without blocking the executor.
+pub type MrtrResponderFuture<'cx> = ReverseRequestFuture<'cx, MrtrInputResponses>;
+
+pub(crate) type SyncMrtrResponderFn = fn(&InputRequiredResult) -> McpResult<MrtrInputResponses>;
+pub(crate) type AsyncMrtrResponderFn =
+    for<'cx> fn(&'cx Cx, &'cx InputRequiredResult) -> MrtrResponderFuture<'cx>;
+
+/// One operation's responder selection. Generic variants preserve the
+/// caller's Send properties without erasing synchronous callbacks behind a
+/// non-Send trait object or imposing new bounds on existing APIs.
+pub(crate) enum OperationMrtrResponder<F = SyncMrtrResponderFn, A = AsyncMrtrResponderFn> {
+    Installed(ReverseRequestHandlers),
+    Caller(F),
+    Async(A),
+}
+
+impl<F, A> OperationMrtrResponder<F, A>
+where
+    F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    A: for<'cx> FnMut(&'cx Cx, &'cx InputRequiredResult) -> MrtrResponderFuture<'cx>,
+{
+    pub(crate) fn has_handler(&self) -> bool {
+        !matches!(self, Self::Installed(handlers) if !handlers.has_modern_handlers())
+    }
+
+    /// Admits the entire batch before creating or polling application work.
+    /// The transport loop separately admits one continuation round and
+    /// validates the returned response map before publishing the next request.
+    pub(crate) async fn respond(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        deadline: Instant,
+        driver: &mut MrtrDriver<'_>,
+        capabilities: &serde_json::Value,
+        input_required: &InputRequiredResult,
+    ) -> McpResult<MrtrInputResponses> {
+        check_mrtr_operation(cx, cancellation, deadline)?;
+        match self {
+            Self::Installed(_) => driver.admit_input_responses(
+                input_required
+                    .input_requests()
+                    .map_or(0, |requests| requests.members().len()),
+            )?,
+            Self::Caller(_) | Self::Async(_) => {
+                admit_complete_mrtr_input_batch(driver, capabilities, input_required)?;
+            }
+        }
+        wait_for_mrtr_operation(cx, cancellation, deadline, async {
+            match self {
+                Self::Installed(handlers) => {
+                    handlers
+                        .respond_to_input_required_async(
+                            cx,
+                            capabilities,
+                            input_required,
+                            || check_mrtr_operation(cx, cancellation, deadline),
+                        )
+                        .await
+                }
+                Self::Caller(respond) => respond(input_required),
+                Self::Async(respond) => respond(cx, input_required).await,
+            }
+        })
+        .await
+    }
+}
+
 fn final_create_message_params_from_embedded(
     params: FinalEmbeddedCreateMessageParams,
 ) -> FinalCreateMessageParams {
