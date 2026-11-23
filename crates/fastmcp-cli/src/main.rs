@@ -815,12 +815,13 @@ enum Commands {
     /// Test MCP server connectivity.
     ///
     /// Tests negotiation, liveness, and advertised capability catalogs over
-    /// stdio or explicit HTTP endpoints. Subprocess testing also verifies
-    /// cleanup and is Unix-only; HTTP testing does not spawn a process.
+    /// stdio, explicit HTTP endpoints, or modern WebSocket connections.
+    /// Subprocess testing also verifies cleanup and is Unix-only.
     Test {
-        /// Server command or path. Omit when using explicit HTTP endpoints.
+        /// Server command or path. Omit when using explicit network endpoints.
         #[arg(conflicts_with_all = [
             "http_url",
+            "websocket_url",
             "bearer_token_file",
             "legacy_sse_url",
             "legacy_message_url",
@@ -830,6 +831,13 @@ enum Commands {
         /// Explicit modern Streamable HTTP MCP POST endpoint.
         #[arg(long, value_name = "URL")]
         http_url: Option<String>,
+
+        /// Explicit ws:// or wss:// MCP endpoint; requires modern-only and
+        /// the websocket-experimental feature. TLS uses WebPKI trust roots.
+        #[arg(long, value_name = "URL", conflicts_with_all = [
+            "server", "http_url", "bearer_token_file", "legacy_sse_url", "legacy_message_url",
+        ])]
+        websocket_url: Option<String>,
 
         /// Read a bearer token from a regular file (at most 16 KiB); HTTPS only.
         #[arg(long, value_name = "PATH", requires = "http_url")]
@@ -874,8 +882,8 @@ enum Commands {
         /// does not bound the whole CLI or subprocess lifetime. On Unix child
         /// stdio, the request timers bound silent and partial-frame reads;
         /// blocking child-stdin writes cannot be preempted by these timers.
-        /// HTTP also bounds the whole connection handshake and each probe,
-        /// including time spent connecting before request commitment.
+        /// HTTP and WebSocket also bound the whole connection handshake and
+        /// each probe, including time spent connecting before request commitment.
         #[arg(
             long,
             default_value_t = 120,
@@ -1625,6 +1633,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
         Commands::Test {
             server,
             http_url,
+            websocket_url,
             bearer_token_file,
             legacy_sse_url,
             legacy_message_url,
@@ -1653,6 +1662,27 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 ))
                 .await
             }
+            None if websocket_url.is_some() => {
+                let url = websocket_url.as_deref().expect("matched WebSocket endpoint");
+                validate_websocket_cli_policy(protocol_policy)?;
+                #[cfg(feature = "websocket-experimental")]
+                {
+                    Box::pin(websocket::test(
+                        cx,
+                        url,
+                        idle_timeout,
+                        absolute_timeout,
+                        verbose,
+                        json,
+                    ))
+                    .await
+                }
+                #[cfg(not(feature = "websocket-experimental"))]
+                {
+                    let _ = url;
+                    unreachable!("WebSocket feature admission returned an error")
+                }
+            }
             None if http_url.is_some()
                 || legacy_sse_url.is_some()
                 || legacy_message_url.is_some() =>
@@ -1674,7 +1704,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 .await
             }
             None => Err(fastmcp_core::McpError::invalid_params(
-                "test requires a server command or explicit HTTP endpoints",
+                "test requires a server command, explicit HTTP endpoints, or --websocket-url",
             )),
         },
         Commands::Dev {

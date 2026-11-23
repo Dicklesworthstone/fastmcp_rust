@@ -47,6 +47,7 @@ fn websocket_cli_without_feature_refuses_before_contact() {
     let endpoint = format!("ws://{}/mcp", listener.local_addr().unwrap());
     for prefix in [
         vec!["inspect", "--format", "json"],
+        vec!["test", "--json"],
         vec!["call", "echo", "--json"],
         vec!["read", "test://status", "--json"],
         vec!["prompt", "greeting", "--json"],

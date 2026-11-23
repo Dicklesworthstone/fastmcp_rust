@@ -21,6 +21,24 @@ pub(super) enum Connection {
 
 impl Connection {
     async fn connect(cx: &Cx, url: &str, budget: OperationBudget) -> McpResult<Self> {
+        let remaining = budget.remaining(cx)?;
+        let policy = OperationBudget::request_policy(remaining)?;
+        asupersync::time::timeout(
+            cx.now(),
+            remaining,
+            Box::pin(Self::connect_with_policy(cx, url, policy)),
+        )
+        .await
+        .map_err(|_| OperationBudget::timeout_error())?
+    }
+
+    // The caller owns the single setup deadline so it can retain typed local
+    // timeout provenance without inspecting any peer-controlled McpError data.
+    async fn connect_with_policy(
+        cx: &Cx,
+        url: &str,
+        policy: fastmcp_client::RequestTimeoutPolicy,
+    ) -> McpResult<Self> {
         if url.len() > 8192
             || url.chars().any(char::is_control)
             || !(url.starts_with("ws://") || url.starts_with("wss://"))
@@ -35,30 +53,20 @@ impl Connection {
             McpError::invalid_params("--websocket-url must be a valid ws:// or wss:// URL")
         })?;
         if endpoint.tls {
-            let transport = asupersync::time::timeout(
-                cx.now(),
-                budget.remaining(cx)?,
-                AsyncWsClientTransport::connect_wss(cx, url),
-            )
-            .await
-            .map_err(|_| OperationBudget::timeout_error())?
-            .map_err(|_| {
-                McpError::internal_error("could not establish the TLS WebSocket transport")
-            })?;
+            let transport = AsyncWsClientTransport::connect_wss(cx, url)
+                .await
+                .map_err(|_| {
+                    McpError::internal_error("could not establish the TLS WebSocket transport")
+                })?;
             Ok(Self::Tls(Box::new(
-                connect_client(cx, transport, budget).await?,
+                connect_client(cx, transport, policy).await?,
             )))
         } else {
-            let transport = asupersync::time::timeout(
-                cx.now(),
-                budget.remaining(cx)?,
-                AsyncWsClientTransport::connect(cx, url),
-            )
-            .await
-            .map_err(|_| OperationBudget::timeout_error())?
-            .map_err(|_| McpError::internal_error("could not establish the WebSocket transport"))?;
+            let transport = AsyncWsClientTransport::connect(cx, url)
+                .await
+                .map_err(|_| McpError::internal_error("could not establish the WebSocket transport"))?;
             Ok(Self::Plain(Box::new(
-                connect_client(cx, transport, budget).await?,
+                connect_client(cx, transport, policy).await?,
             )))
         }
     }
@@ -101,24 +109,18 @@ impl Connection {
 async fn connect_client<IO>(
     cx: &Cx,
     transport: AsyncWsClientTransport<IO>,
-    budget: OperationBudget,
+    policy: fastmcp_client::RequestTimeoutPolicy,
 ) -> McpResult<WebSocketClient<IO>>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let remaining = budget.remaining(cx)?;
-    asupersync::time::timeout(
-        cx.now(),
-        remaining,
-        Box::pin(
-            ClientBuilder::new()
-                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
-                .request_timeout_policy(OperationBudget::request_policy(remaining)?)
-                .connect_websocket_with_cx(cx, transport),
-        ),
+    Box::pin(
+        ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+            .request_timeout_policy(policy)
+            .connect_websocket_with_cx(cx, transport),
     )
     .await
-    .map_err(|_| OperationBudget::timeout_error())?
     .map_err(|error| operation_failure(error, "WebSocket MCP discovery failed"))
 }
 
@@ -329,6 +331,190 @@ pub(super) async fn inspect(
         format,
         output,
     )
+}
+
+/// Tests the same native connection users inspect and call. The handshake and
+/// each probe have their own absolute bound; the native response waits retain
+/// the selected idle policy. Cleanup settles before any final report is written.
+pub(super) async fn test(
+    cx: &Cx,
+    url: &str,
+    idle_timeout_secs: u64,
+    absolute_timeout_secs: u64,
+    verbose: bool,
+    json_output: bool,
+) -> McpResult<()> {
+    use std::time::{Duration, Instant};
+
+    let total_start = Instant::now();
+    let absolute_timeout = Duration::from_secs(absolute_timeout_secs);
+    let policy = fastmcp_client::RequestTimeoutPolicy::new(
+        Duration::from_secs(idle_timeout_secs),
+        absolute_timeout,
+    )?;
+    let budget = OperationBudget::new(absolute_timeout_secs)?;
+    if !json_output {
+        write_stdout(
+            &format!("Testing server: {}", sanitize_peer_text(url, PEER_FIELD_LIMIT)),
+            "test output",
+            true,
+        )?;
+    }
+    let init_start = Instant::now();
+    let connection = bounded_websocket_test(
+        cx,
+        budget.remaining(cx)?,
+        Connection::connect_with_policy(cx, url, policy),
+    )
+    .await;
+    let mut client = match connection {
+        Ok(client) => client,
+        Err(mut error) => {
+            let result = failed_test_result("initialize", init_start.elapsed(), &error);
+            if !json_output {
+                if let Err(output_error) = print_test_result(&result, verbose) {
+                    return Err(combine_test_failure_with_output(error, output_error));
+                }
+            }
+            let report = TestReport {
+                server: url.to_owned(),
+                success: false,
+                tests: vec![result],
+                total_duration_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            };
+            if let Err(output_error) = write_test_report(&report, json_output) {
+                error = combine_test_failure_with_output(error, output_error);
+            }
+            return Err(error);
+        }
+    };
+    let mut results = vec![TestResult {
+        name: "initialize".to_owned(),
+        success: true,
+        skipped: false,
+        duration_ms: init_start.elapsed().as_secs_f64() * 1000.0,
+        details: Some(format!(
+            "protocol {} over WebSocket",
+            client.session().protocol_version()
+        )),
+        error: None,
+        timeout_source: None,
+        mutation: OutputMutationMetadata::default(),
+        machine_text: None,
+    }];
+    let probes = match &mut client {
+        Connection::Plain(client) => test_probes(cx, client, absolute_timeout).await,
+        Connection::Tls(client) => test_probes(cx, client, absolute_timeout).await,
+    };
+    results.extend(probes);
+    results.push(
+        run_test(cx, "cleanup", async |cx| {
+            client.close(cx).await?;
+            Ok("WebSocket connection closed".to_owned())
+        })
+        .await,
+    );
+    let all_passed = results.iter().all(|result| result.success);
+    let report = TestReport {
+        server: url.to_owned(),
+        success: all_passed,
+        tests: results,
+        total_duration_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+    };
+    if !json_output {
+        for result in &report.tests {
+            print_test_result(result, verbose)?;
+        }
+    }
+    write_test_report(&report, json_output)?;
+    if all_passed {
+        Ok(())
+    } else {
+        Err(McpError::internal_error("Some tests failed"))
+    }
+}
+
+/// Only this locally owned deadline grants a timeout-source classification.
+/// Native MCP errors may contain arbitrary peer data, so their text and data
+/// are replaced rather than treating a forged timeout tuple as local evidence.
+async fn bounded_websocket_test<T>(
+    cx: &Cx,
+    absolute_timeout: std::time::Duration,
+    operation: impl std::future::Future<Output = McpResult<T>>,
+) -> McpResult<T> {
+    asupersync::time::timeout(cx.now(), absolute_timeout, Box::pin(operation))
+        .await
+        .map_err(|_| http_test_timeout_error(fastmcp_client::RequestTimeoutSource::Absolute))?
+        .map_err(|error| McpError::new(error.code, "WebSocket MCP probe failed"))
+}
+
+async fn test_probes<IO>(
+    cx: &Cx,
+    client: &mut WebSocketClient<IO>,
+    absolute_timeout: std::time::Duration,
+) -> Vec<TestResult>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(discovery) = client.session().server_discovery() else {
+        return vec![failed_test_result(
+            "capabilities",
+            std::time::Duration::ZERO,
+            &McpError::internal_error("WebSocket test has no admitted modern discovery"),
+        )];
+    };
+    let capabilities = InspectCapabilities::final_from_discovery(&discovery.capabilities);
+    let mut results = vec![
+        run_test(cx, "ping", async |cx| {
+            // Modern MCP liveness is a fresh server/discover round-trip; the
+            // removed ping method must never be sent on this ModernOnly path.
+            bounded_websocket_test(cx, absolute_timeout, client.ping(cx)).await?;
+            Ok("server responded".to_owned())
+        })
+        .await,
+    ];
+    for (name, capability, method) in [
+        ("list_tools", "tools", "tools/list"),
+        ("list_resources", "resources", "resources/list"),
+        ("list_prompts", "prompts", "prompts/list"),
+    ] {
+        let result = if capabilities.advertises(capability) {
+            run_test(cx, name, async |cx| {
+                client.clear_final_result_cache();
+                let response = bounded_websocket_test(
+                    cx,
+                    absolute_timeout,
+                    client.list_catalog_page(cx, method, serde_json::json!({})),
+                )
+                .await?;
+                let (count, truncated) = match capability {
+                    "tools" => {
+                        let (items, truncated) = inspect_tools_result(response)?;
+                        (items.len(), truncated)
+                    }
+                    "resources" => {
+                        let (items, truncated) = inspect_resources_result(response)?;
+                        (items.len(), truncated)
+                    }
+                    _ => {
+                        let (items, truncated) = inspect_prompts_result(response)?;
+                        (items.len(), truncated)
+                    }
+                };
+                let qualifier = if truncated {
+                    " in the bounded first page; more were omitted"
+                } else {
+                    ""
+                };
+                Ok(format!("{count} {capability}{qualifier}"))
+            })
+            .await
+        } else {
+            skipped_test(name, &format!("server did not advertise {capability}"))
+        };
+        results.push(result);
+    }
+    results
 }
 
 /// Runs an explicit control command for an already accepted Task. Discovery,

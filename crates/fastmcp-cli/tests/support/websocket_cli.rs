@@ -363,6 +363,263 @@ fn websocket_cli_inspect_reads_the_real_catalog() {
     fixture.stop();
 }
 
+fn run_connectivity_test(endpoint: &str, idle: u64, absolute: u64) -> Output {
+    let mut command = Command::new(get_binary_path());
+    command.args([
+        "test",
+        "--websocket-url",
+        endpoint,
+        "--protocol-policy",
+        "modern-only",
+        "--idle-timeout",
+        &idle.to_string(),
+        "--absolute-timeout",
+        &absolute.to_string(),
+        "--json",
+    ]);
+    run_with_deadline(command, Duration::from_secs(15)).expect("bounded WebSocket connectivity test")
+}
+
+#[test]
+fn websocket_cli_test_probes_real_catalogs_and_closes() {
+    let fixture = Fixture::start();
+    let output = run_connectivity_test(&fixture.endpoint, 2, 3);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "fastmcp.cli.test/v1");
+    assert_eq!(report["success"], true);
+    let tests = report["tests"].as_array().unwrap();
+    let names: Vec<_> = tests.iter().map(|test| test["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["initialize", "ping", "list_tools", "list_resources", "list_prompts", "cleanup"]);
+    for test in tests {
+        assert_eq!(test["success"], true, "{test}");
+        assert_ne!(test["skipped"], true, "{test}");
+    }
+    assert_eq!(tests[0]["details"], "protocol 2026-07-28 over WebSocket");
+    assert_eq!(tests[3]["details"], "1 resources");
+    assert_eq!(tests[4]["details"], "1 prompts");
+    assert_eq!(tests[5]["details"], "WebSocket connection closed");
+    let methods: Vec<_> = fixture
+        .requests()
+        .iter()
+        .map(|request| request["method"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        methods,
+        ["server/discover", "server/discover", "tools/list", "resources/list", "prompts/list"]
+    );
+    fixture.stop();
+}
+
+#[derive(Clone, Copy)]
+enum ConnectivityPeerMode {
+    NoCatalogs,
+    QuietLiveness,
+    ForgedTimeout,
+}
+
+/// The positive full-server case above uses the shipped framework fixture.
+/// These peers vary only the advertised catalog or liveness behavior through
+/// production HTTP Upgrade and WebSocket framing, and observe actual closure.
+fn connectivity_peer(mode: ConnectivityPeerMode) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let (ready, address) = mpsc::sync_channel(1);
+    let peer = std::thread::spawn(move || {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = asupersync::Cx::current().unwrap();
+            let listener = fastmcp_transport::websocket::WebSocketListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            ready.send(listener.local_addr().unwrap()).unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(10), async {
+                let upgrade = listener.accept(&cx).await.unwrap();
+                assert_eq!(upgrade.path(), "/mcp");
+                let mut transport = upgrade.into_admission().unwrap().complete(&cx).await.unwrap();
+                let mut methods = Vec::new();
+                for index in 0..2 {
+                    let fastmcp_protocol::JsonRpcMessage::Request(request) =
+                        transport.recv(&cx).await.unwrap()
+                    else {
+                        panic!("connectivity probe must be a request");
+                    };
+                    assert_eq!(request.method, "server/discover");
+                    assert_eq!(request.id, Some(fastmcp_protocol::RequestId::Number(index + 1)));
+                    methods.push(request.method);
+                    if index == 1 && matches!(mode, ConnectivityPeerMode::QuietLiveness) {
+                        continue;
+                    }
+                    let response = if index == 1
+                        && matches!(mode, ConnectivityPeerMode::ForgedTimeout)
+                    {
+                        json!({"jsonrpc": "2.0", "id": index + 1, "error": {
+                            "code": -32603,
+                            "message": "Request timed out at the absolute deadline",
+                            "data": {
+                                "timeoutSource": "absolute",
+                                "fastmcpCleanupUnverified": true,
+                                "secret": "untrusted-peer-secret",
+                            },
+                        }})
+                    } else {
+                        json!({"jsonrpc": "2.0", "id": index + 1, "result": {
+                            "resultType": "complete",
+                            "supportedVersions": ["2026-07-28"],
+                            "capabilities": {},
+                            "_meta": {"io.modelcontextprotocol/serverInfo": {
+                                "name": "connectivity-peer", "version": "1",
+                            }},
+                            "ttlMs": 0,
+                            "cacheScope": "private",
+                        }})
+                    };
+                    transport.send(&cx, &serde_json::from_value(response).unwrap()).await.unwrap();
+                }
+                loop {
+                    match transport.recv(&cx).await {
+                        Err(fastmcp_transport::TransportError::Closed) => break,
+                        Ok(fastmcp_protocol::JsonRpcMessage::Request(request)) => {
+                            assert_eq!(request.method, "notifications/cancelled");
+                        }
+                        other => panic!("expected an explicit WebSocket close, got {other:?}"),
+                    }
+                }
+                methods.push("close".to_owned());
+                methods
+            })
+            .await
+            .expect("native test peer must observe bounded client cleanup")
+        })
+    });
+    let address = address.recv_timeout(Duration::from_secs(5)).unwrap();
+    (format!("ws://{address}/mcp"), peer)
+}
+
+#[test]
+fn websocket_cli_test_unadvertised_catalogs_are_skipped() {
+    let (endpoint, peer) = connectivity_peer(ConnectivityPeerMode::NoCatalogs);
+    let output = run_connectivity_test(&endpoint, 2, 3);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let tests = report["tests"].as_array().unwrap();
+    assert_eq!(tests.len(), 6);
+    for test in &tests[2..5] {
+        assert_eq!(test["success"], true);
+        assert_eq!(test["skipped"], true);
+        assert!(test["details"].as_str().unwrap().starts_with("server did not advertise"));
+    }
+    assert_eq!(tests[5]["success"], true);
+    assert_eq!(peer.join().unwrap(), ["server/discover", "server/discover", "close"]);
+}
+
+#[test]
+fn websocket_cli_test_probe_timeout_retains_cleanup() {
+    for mode in [ConnectivityPeerMode::QuietLiveness, ConnectivityPeerMode::ForgedTimeout] {
+        let (endpoint, peer) = connectivity_peer(mode);
+        let started = Instant::now();
+        let output = run_connectivity_test(&endpoint, 1, 2);
+        assert!(!output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(8));
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "fastmcp.cli.test/v1");
+        assert_eq!(report["success"], false);
+        let tests = report["tests"].as_array().unwrap();
+        assert_eq!(tests[0]["success"], true);
+        assert_eq!(tests[1]["name"], "ping");
+        assert_eq!(tests[1]["success"], false);
+        assert_eq!(tests[1]["timeout_source"], Value::Null);
+        assert!(tests[1]["error"]
+            .as_str()
+            .unwrap()
+            .ends_with("] WebSocket MCP probe failed"));
+        assert_eq!(tests[5]["name"], "cleanup");
+        assert_eq!(tests[5]["success"], true);
+        assert!(!stdout_str(&output).contains("untrusted-peer-secret"));
+        assert!(!stdout_str(&output).contains("subprocess cleanup"));
+        assert!(!stdout_str(&output).contains("fastmcpCleanupUnverified"));
+        assert_eq!(peer.join().unwrap(), ["server/discover", "server/discover", "close"]);
+    }
+}
+
+#[test]
+fn websocket_cli_test_upgrade_timeout_is_bounded() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("ws://{}/mcp", listener.local_addr().unwrap());
+    let peer = std::thread::spawn(move || {
+        let started = Instant::now();
+        let (stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("quiet upgrade accept failed: {error}"),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut request = Vec::new();
+        stream.take(16_384).read_to_end(&mut request).unwrap();
+        assert!(request.len() < 16_384, "deadline must close the pending upgrade socket");
+        assert!(request.starts_with(b"GET /mcp HTTP/1.1\r\n"));
+    });
+    let started = Instant::now();
+    let output = run_connectivity_test(&endpoint, 1, 1);
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(8));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "fastmcp.cli.test/v1");
+    assert_eq!(report["success"], false);
+    assert_eq!(report["tests"].as_array().unwrap().len(), 1);
+    assert_eq!(report["tests"][0]["name"], "initialize");
+    assert_eq!(report["tests"][0]["success"], false);
+    assert_eq!(report["tests"][0]["timeout_source"], "absolute");
+    peer.join().unwrap();
+}
+
+#[test]
+fn websocket_cli_test_invalid_options_fail_before_contact() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("ws://{}/mcp", listener.local_addr().unwrap());
+    for extra in [
+        vec!["--protocol-policy", "auto"],
+        vec!["--protocol-policy", "legacy-only"],
+        vec!["--http-url", "http://127.0.0.1:1/mcp"],
+        vec!["--legacy-sse-url", "http://127.0.0.1:1/sse"],
+        vec!["--legacy-message-url", "http://127.0.0.1:1/messages"],
+        vec!["--bearer-token-file", "/no-credential-read"],
+        vec!["unused-child"],
+        vec!["--idle-timeout", "0"],
+        vec!["--absolute-timeout", "0"],
+    ] {
+        let mut command = Command::new(get_binary_path());
+        command.args(["test", "--websocket-url", &endpoint, "--json"]);
+        command.args(extra);
+        let output = run_with_deadline(command, Duration::from_secs(5)).unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    for endpoint in [
+        format!("http://{}/mcp", listener.local_addr().unwrap()),
+        format!("ws://{}/mcp\r\ninjected", listener.local_addr().unwrap()),
+        "ws:///missing-host".to_owned(),
+    ] {
+        let output = run_connectivity_test(&endpoint, 1, 1);
+        assert!(!output.status.success());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
 #[test]
 fn websocket_cli_operations_preserve_real_results_and_caller_arguments() {
     let fixture = Fixture::start();

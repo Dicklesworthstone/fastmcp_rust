@@ -1392,6 +1392,33 @@ exit status; use `--verbose` for detailed text output.
 **Requirements:**
 - Rust nightly-2026-08-25 (see `rust-toolchain.toml`) for Edition 2024. The last FND-01 evidence snapshot still records `nightly-2026-07-11` until that harness is re-attested.
 
+### Test native WebSocket connectivity (current source tree)
+
+Build the CLI with `websocket-experimental` to run the same connectivity
+diagnostics against a native WebSocket endpoint:
+
+```bash
+cargo run -p fastmcp-cli --features websocket-experimental -- test \
+  --protocol-policy modern-only \
+  --websocket-url wss://mcp.example/mcp \
+  --idle-timeout 10 --absolute-timeout 30 \
+  --json
+```
+
+This path requires explicit `modern-only` and accepts `ws://` or `wss://`.
+Omit a subprocess command, HTTP/legacy endpoint flags, and bearer-token files.
+Invalid transport combinations and unavailable feature builds fail before
+opening a socket.
+
+The command reports negotiation, fresh `server/discover` liveness, one uncached
+page of each advertised tools/resources/prompts catalog, and explicit connection
+cleanup. Unadvertised catalogs are skipped without sending their list requests.
+The absolute bound covers connection setup and each probe; it is not one
+deadline for the whole command. Cleanup retains the native client's bounded
+close procedure, including after probe failure. JSON uses the existing
+`fastmcp.cli.test/v1` schema and records timeout sources only when established
+locally; peer-supplied error metadata cannot impersonate local diagnostics.
+
 ### Caller-owned modern stdio workflows (current source tree, Unix)
 
 The modern stdio facade exposes asynchronous catalog traversal, ordinary
