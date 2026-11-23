@@ -2533,6 +2533,30 @@ pub mod auto {
             }
         }
 
+        /// Registers asynchronous startup owned by the native serving context.
+        #[must_use]
+        pub fn on_startup_async<F, Fut>(self, hook: F) -> Self
+        where
+            F: FnOnce(crate::Cx) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = crate::McpResult<()>> + Send + 'static,
+        {
+            Self {
+                inner: self.inner.on_startup_async(hook),
+            }
+        }
+
+        /// Registers asynchronous cleanup after native request and Task settlement.
+        #[must_use]
+        pub fn on_shutdown_async<F, Fut>(self, hook: F) -> Self
+        where
+            F: FnOnce(crate::Cx) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = crate::McpResult<()>> + Send + 'static,
+        {
+            Self {
+                inner: self.inner.on_shutdown_async(hook),
+            }
+        }
+
         #[must_use]
         pub fn mask_error_details(self, enabled: bool) -> Self {
             Self {
@@ -9170,6 +9194,30 @@ pub mod modern {
             }
         }
 
+        /// Registers asynchronous startup owned by the native serving context.
+        #[must_use]
+        pub fn on_startup_async<F, Fut>(self, hook: F) -> Self
+        where
+            F: FnOnce(crate::Cx) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = crate::McpResult<()>> + Send + 'static,
+        {
+            Self {
+                inner: self.inner.on_startup_async(hook),
+            }
+        }
+
+        /// Registers asynchronous cleanup after native request and Task settlement.
+        #[must_use]
+        pub fn on_shutdown_async<F, Fut>(self, hook: F) -> Self
+        where
+            F: FnOnce(crate::Cx) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = crate::McpResult<()>> + Send + 'static,
+        {
+            Self {
+                inner: self.inner.on_shutdown_async(hook),
+            }
+        }
+
         /// Registers an exact-final proxy catalog without exposing a legacy route.
         #[cfg(feature = "proxy")]
         pub fn proxy(
@@ -10706,6 +10754,30 @@ pub mod legacy_2024 {
         {
             Self {
                 inner: self.inner.on_shutdown(hook),
+            }
+        }
+
+        /// Registers asynchronous startup owned by the native serving context.
+        #[must_use]
+        pub fn on_startup_async<F, Fut>(self, hook: F) -> Self
+        where
+            F: FnOnce(crate::Cx) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = crate::McpResult<()>> + Send + 'static,
+        {
+            Self {
+                inner: self.inner.on_startup_async(hook),
+            }
+        }
+
+        /// Registers asynchronous cleanup after native request and Task settlement.
+        #[must_use]
+        pub fn on_shutdown_async<F, Fut>(self, hook: F) -> Self
+        where
+            F: FnOnce(crate::Cx) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = crate::McpResult<()>> + Send + 'static,
+        {
+            Self {
+                inner: self.inner.on_shutdown_async(hook),
             }
         }
 

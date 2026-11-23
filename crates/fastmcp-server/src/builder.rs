@@ -3156,6 +3156,7 @@ impl ServerBuilder {
         self.lifespan.on_startup = Some(Box::new(move || {
             hook().map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         }));
+        self.lifespan.on_startup_async = None;
         self
     }
 
@@ -3187,6 +3188,47 @@ impl ServerBuilder {
         F: FnOnce() + Send + 'static,
     {
         self.lifespan.on_shutdown = Some(Box::new(hook));
+        self.lifespan.on_shutdown_async = None;
+        self
+    }
+
+    /// Registers caller-owned asynchronous application initialization.
+    ///
+    /// Native HTTP, WebSocket, Memory and asynchronous stdio serving await
+    /// this hook before hosted Task recovery or protocol ingress. The supplied
+    /// context belongs to an owned lifecycle region and retains the caller's
+    /// capabilities and deadline. Each hook has a thirty-second work bound.
+    /// This replaces any synchronous startup hook. Blocking transport runners
+    /// refuse asynchronous lifespan hooks before application or transport work.
+    #[must_use]
+    pub fn on_startup_async<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: FnOnce(asupersync::Cx) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = fastmcp_core::McpResult<()>> + Send + 'static,
+    {
+        self.lifespan.on_startup = None;
+        self.lifespan.on_startup_async = Some(Box::new(move |cx| Box::pin(hook(cx))));
+        self
+    }
+
+    /// Registers asynchronous cleanup after requests and hosted Tasks settle.
+    ///
+    /// Cleanup custody is admitted before startup, so server cancellation does
+    /// not require a new runtime or a new source of authority. Cleanup may
+    /// observe cancellation but never extends the original caller deadline.
+    /// A thirty-second hook timeout reports failure; owned descendants must
+    /// still settle before cleanup is reported complete. HTTP and WebSocket
+    /// bounded settlement handles retain pending cleanup. Dropping a serving
+    /// future requests region cleanup without invoking this hook over live
+    /// request handlers. This replaces any synchronous shutdown hook.
+    #[must_use]
+    pub fn on_shutdown_async<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: FnOnce(asupersync::Cx) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = fastmcp_core::McpResult<()>> + Send + 'static,
+    {
+        self.lifespan.on_shutdown = None;
+        self.lifespan.on_shutdown_async = Some(Box::new(move |cx| Box::pin(hook(cx))));
         self
     }
 
@@ -3473,6 +3515,7 @@ impl ServerBuilder {
             #[cfg(feature = "console")]
             console,
             lifespan: Mutex::new(Some(self.lifespan)),
+            async_lifespan_claimed: std::sync::atomic::AtomicBool::new(false),
             auth_provider: self.auth_provider,
             middleware,
             active_requests: Arc::new(Mutex::new(HashMap::new())),

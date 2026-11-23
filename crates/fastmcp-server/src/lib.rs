@@ -85,6 +85,7 @@ pub mod http_admission;
 mod http_metrics;
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod legacy_2024;
+mod lifespan;
 mod middleware;
 pub mod oauth;
 pub mod oidc;
@@ -147,6 +148,8 @@ pub use handler::{
 };
 use http_metrics::HttpDiagnosticRoute;
 pub use http_metrics::HttpMetricsConfig;
+use lifespan::AsyncLifespanOwner;
+pub use lifespan::{AsyncLifespanFuture, AsyncLifespanHook};
 pub use middleware::continuation_replay::{
     ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
 };
@@ -4268,6 +4271,10 @@ pub struct LifespanHooks {
     pub on_startup: Option<StartupHook>,
     /// Hook called when the server is shutting down.
     pub on_shutdown: Option<ShutdownHook>,
+    /// Asynchronous initialization for native serving lifecycles.
+    pub on_startup_async: Option<AsyncLifespanHook>,
+    /// Asynchronous cleanup, invoked only after serving work quiesces.
+    pub on_shutdown_async: Option<AsyncLifespanHook>,
 }
 
 impl LifespanHooks {
@@ -10042,14 +10049,24 @@ pub struct HttpNonquiescentShutdown {
     server: Arc<Server>,
     listener_error: Option<McpError>,
     shutdown_complete: bool,
+    lifespan: Option<AsyncLifespanOwner>,
 }
 
 impl HttpNonquiescentShutdown {
-    fn finish_shutdown(&mut self) {
+    fn finish_shutdown(&mut self) -> bool {
         if !self.shutdown_complete {
+            if let Some(lifespan) = self.lifespan.as_mut() {
+                lifespan.request_shutdown();
+                match lifespan.poll_result() {
+                    None => return false,
+                    Some(Err(error)) => self.children.terminal_failures.push(error.to_string()),
+                    Some(Ok(())) => {}
+                }
+            }
             self.server.graceful_shutdown_returning();
             self.shutdown_complete = true;
         }
+        true
     }
 
     /// Returns the listener failure that accompanied this shutdown, if any.
@@ -10060,13 +10077,17 @@ impl HttpNonquiescentShutdown {
 
     /// Reaps completed children without waiting for live children.
     ///
-    /// Once all children are terminal, runs the shutdown lifecycle hook
-    /// synchronously, exactly once across settlement observations.
+    /// Once all children are terminal, starts asynchronous cleanup and polls
+    /// its retained owner. `Pending` includes one remaining lifecycle owner
+    /// while cleanup or its child-region close is unfinished. Synchronous
+    /// cleanup still runs exactly once after asynchronous settlement.
     #[must_use]
     pub fn poll_settlement(&mut self) -> HttpShutdownSettlement {
         self.children.reap_finished();
         if self.children.tasks.is_empty() {
-            self.finish_shutdown();
+            if !self.finish_shutdown() {
+                return HttpShutdownSettlement::Pending { remaining: 1 };
+            }
             if self.children.terminal_failures.is_empty() {
                 HttpShutdownSettlement::Settled
             } else {
@@ -10083,8 +10104,9 @@ impl HttpNonquiescentShutdown {
 
     /// Waits no longer than `timeout` for cooperative child completion.
     ///
-    /// Once the children are terminal, shutdown finalization runs synchronously;
-    /// the application's shutdown hook is outside the child-wait bound.
+    /// The bound includes asynchronous cleanup observation. Repeated calls
+    /// retain the same callback future and its original deadline. A legacy
+    /// synchronous hook is still outside this asynchronous observation bound.
     pub async fn settle_for(&mut self, timeout: Duration) -> HttpShutdownSettlement {
         let deadline = Instant::now() + timeout;
         loop {
@@ -10114,7 +10136,11 @@ impl HttpNonquiescentShutdown {
                 Err(error) => failures.push(error.to_string()),
             }
         }
+        if let Some(lifespan) = self.lifespan.as_mut() {
+            let _ = lifespan.finish().await;
+        }
         self.finish_shutdown();
+        failures.extend(std::mem::take(&mut self.children.terminal_failures));
         if failures.is_empty() {
             Ok(())
         } else {
@@ -10409,14 +10435,20 @@ impl BoundHttpServer {
             if let Some(stats) = &server.stats {
                 stats.connection_opened();
             }
-            if !server.run_startup_hook() {
-                server.graceful_shutdown_returning();
-                return Err(McpError::internal_error("HTTP server startup hook failed"));
-            }
+            let mut lifespan = match server.start_native_lifespan(cx).await {
+                Ok(lifespan) => lifespan,
+                Err(error) => {
+                    server.graceful_shutdown_returning();
+                    return Err(error);
+                }
+            };
             #[cfg(feature = "tasks")]
             let hosted_task_service = match server.start_hosted_task_service(cx).await {
                 Ok(hosted) => hosted,
                 Err(error) => {
+                    if let Some(lifespan) = lifespan.as_mut() {
+                        let _ = lifespan.finish().await;
+                    }
                     server.graceful_shutdown_returning();
                     return Err(error);
                 }
@@ -10564,7 +10596,7 @@ impl BoundHttpServer {
             connection_children
                 .tasks
                 .extend(unsettled_modern_dispatches);
-            let connection_shutdown = connection_children.drain_cooperative_shutdown().await;
+            connection_children.drain_cooperative_shutdown().await;
             connection_children
                 .tasks
                 .extend(take_unsettled_retired_modern_http_dispatches(
@@ -10576,30 +10608,35 @@ impl BoundHttpServer {
                 Server::settle_hosted_task_service(hosted_task_service, cx).await;
             #[cfg(not(feature = "tasks"))]
             let task_service_result: McpResult<()> = Ok(());
-            // Live children may need this runtime to finish their cleanup.
-            // Preserve their server lifecycle with the retained settlement
-            // authority instead of synchronously waiting on those same children.
-            if connection_children.tasks.is_empty() {
-                server.graceful_shutdown_returning();
-            }
             let result = result.and(task_service_result);
-            match (connection_shutdown, connection_children.tasks.len()) {
-                (_, 0) if connection_children.terminal_failures.is_empty() => {
-                    result?;
+            let mut shutdown = HttpNonquiescentShutdown {
+                children: connection_children,
+                server,
+                listener_error: result.err(),
+                shutdown_complete: false,
+                lifespan,
+            };
+            // A long cleanup callback is a retained lifecycle owner even
+            // when every socket has already closed. Its deadline is never
+            // restarted by bounded settlement observations.
+            let observation = if shutdown.children.tasks.is_empty() {
+                shutdown.settle_for(HTTP_CONNECTION_SHUTDOWN_TIMEOUT).await
+            } else {
+                shutdown.poll_settlement()
+            };
+            match observation {
+                HttpShutdownSettlement::Settled => {
+                    if let Some(error) = shutdown.listener_error.take() {
+                        return Err(error);
+                    }
                     Ok(HttpServerShutdown::Quiescent)
                 }
-                (_, 0) => Err(McpError::internal_error(format!(
+                HttpShutdownSettlement::Failed { .. } => Err(McpError::internal_error(format!(
                     "HTTP connection shutdown observed terminal child failure(s): {}",
-                    connection_children.terminal_failures.join("; ")
+                    shutdown.children.terminal_failures.join("; ")
                 ))),
-                (_, remaining) => {
-                    debug_assert!(remaining > 0);
-                    Ok(HttpServerShutdown::Nonquiescent(HttpNonquiescentShutdown {
-                        children: connection_children,
-                        server,
-                        listener_error: result.err(),
-                        shutdown_complete: false,
-                    }))
+                HttpShutdownSettlement::Pending { .. } => {
+                    Ok(HttpServerShutdown::Nonquiescent(shutdown))
                 }
             }
         }
@@ -10665,10 +10702,27 @@ pub struct WebSocketNonquiescentShutdown {
     server: Arc<Server>,
     listener_error: Option<McpError>,
     shutdown_complete: bool,
+    lifespan: Option<AsyncLifespanOwner>,
 }
 
 #[cfg(feature = "websocket")]
 impl WebSocketNonquiescentShutdown {
+    fn finish_shutdown(&mut self) -> bool {
+        if !self.shutdown_complete {
+            if let Some(lifespan) = self.lifespan.as_mut() {
+                lifespan.request_shutdown();
+                match lifespan.poll_result() {
+                    None => return false,
+                    Some(Err(error)) => self.children.record_failure(error.to_string()),
+                    Some(Ok(())) => {}
+                }
+            }
+            self.server.graceful_shutdown_returning();
+            self.shutdown_complete = true;
+        }
+        true
+    }
+
     /// Number of accepted connections that still require caller-owned settlement.
     #[must_use]
     pub const fn remaining_connections(&self) -> usize {
@@ -10689,28 +10743,21 @@ impl WebSocketNonquiescentShutdown {
     /// retains caller-owned work.
     pub async fn settle_for(&mut self, timeout: Duration) -> McpResult<bool> {
         let deadline = Instant::now() + timeout;
-        while !self.children.tasks.is_empty() && Instant::now() < deadline {
+        loop {
             self.children.reap_finished();
-            if !self.children.tasks.is_empty() {
-                asupersync::runtime::yield_now().await;
+            if self.children.tasks.is_empty() && self.finish_shutdown() {
+                return if let Some(error) = self.children.terminal_failure() {
+                    Err(error)
+                } else if let Some(error) = self.listener_error.clone() {
+                    Err(error)
+                } else {
+                    Ok(true)
+                };
             }
-        }
-        if self.children.tasks.is_empty() {
-            let terminal_failure = self.children.terminal_failure();
-            let listener_error = self.listener_error.clone();
-            if !self.shutdown_complete {
-                self.server.graceful_shutdown_returning();
-                self.shutdown_complete = true;
+            if Instant::now() >= deadline {
+                return Ok(false);
             }
-            if let Some(error) = terminal_failure {
-                Err(error)
-            } else if let Some(error) = listener_error {
-                Err(error)
-            } else {
-                Ok(true)
-            }
-        } else {
-            Ok(false)
+            asupersync::runtime::yield_now().await;
         }
     }
 
@@ -10724,11 +10771,11 @@ impl WebSocketNonquiescentShutdown {
                 Err(error) => self.children.record_failure(error.to_string()),
             }
         }
-        let terminal_failure = self.children.terminal_failure();
-        if !self.shutdown_complete {
-            self.server.graceful_shutdown_returning();
-            self.shutdown_complete = true;
+        if let Some(lifespan) = self.lifespan.as_mut() {
+            let _ = lifespan.finish().await;
         }
+        self.finish_shutdown();
+        let terminal_failure = self.children.terminal_failure();
         if let Some(error) = terminal_failure {
             return Err(error);
         }
@@ -10755,16 +10802,20 @@ impl BoundWebSocketServer {
         if let Some(stats) = &self.server.stats {
             stats.connection_opened();
         }
-        if !self.server.run_startup_hook() {
-            self.server.graceful_shutdown_returning();
-            return Err(McpError::internal_error(
-                "WebSocket server startup hook failed",
-            ));
-        }
+        let mut lifespan = match self.server.start_native_lifespan(cx).await {
+            Ok(lifespan) => lifespan,
+            Err(error) => {
+                self.server.graceful_shutdown_returning();
+                return Err(error);
+            }
+        };
         #[cfg(feature = "tasks")]
         let hosted_task_service = match self.server.start_hosted_task_service(cx).await {
             Ok(hosted) => hosted,
             Err(error) => {
+                if let Some(lifespan) = lifespan.as_mut() {
+                    let _ = lifespan.finish().await;
+                }
                 self.server.graceful_shutdown_returning();
                 return Err(error);
             }
@@ -10853,24 +10904,21 @@ impl BoundWebSocketServer {
         #[cfg(not(feature = "tasks"))]
         let task_service_result: McpResult<()> = Ok(());
         let accept_result = accept_result.and(task_service_result);
-        if children.tasks.is_empty() {
-            let terminal_failure = children.terminal_failure();
-            self.server.graceful_shutdown_returning();
-            if let Some(error) = terminal_failure {
-                return Err(error);
-            }
-            accept_result?;
-            Ok(WebSocketServerShutdown::Quiescent)
-        } else {
-            Ok(WebSocketServerShutdown::Nonquiescent(
-                WebSocketNonquiescentShutdown {
-                    children,
-                    server: Arc::clone(&self.server),
-                    listener_error: accept_result.err(),
-                    shutdown_complete: false,
-                },
-            ))
+        let mut shutdown = WebSocketNonquiescentShutdown {
+            children,
+            server: Arc::clone(&self.server),
+            listener_error: accept_result.err(),
+            shutdown_complete: false,
+            lifespan,
+        };
+        if shutdown.children.tasks.is_empty()
+            && shutdown
+                .settle_for(WEBSOCKET_CONNECTION_SHUTDOWN_TIMEOUT)
+                .await?
+        {
+            return Ok(WebSocketServerShutdown::Quiescent);
         }
+        Ok(WebSocketServerShutdown::Nonquiescent(shutdown))
     }
 }
 
@@ -17403,6 +17451,9 @@ pub struct Server {
     console: FastMcpConsole,
     /// Lifecycle hooks (wrapped in Option so they can be taken once).
     lifespan: Mutex<Option<LifespanHooks>>,
+    /// Consumed async hooks must not make concurrent or later serves appear
+    /// initialized. Keep this custody outside the public hook configuration.
+    async_lifespan_claimed: AtomicBool,
     /// Optional authentication provider.
     auth_provider: Option<Arc<dyn AuthProvider>>,
     /// Registered middleware.
@@ -21424,6 +21475,10 @@ impl Server {
     /// shutdown hook; running a hook concurrently with a live handler would
     /// violate the hook's quiescence contract.
     pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
+        if let Err(error) = self.admit_blocking_lifespan() {
+            error!(target: targets::SERVER, "{error}");
+            std::process::exit(1);
+        }
         let dispatch_cx = cx.clone();
         let pump_task: Box<dyn FnOnce(Cx) -> i32 + Send> =
             Box::new(move |pump_cx| self.run_stdio_pump(&pump_cx, &dispatch_cx));
@@ -21572,6 +21627,10 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
+        if let Err(error) = self.admit_blocking_lifespan() {
+            error!(target: targets::SERVER, "{error}");
+            std::process::exit(1);
+        }
         #[cfg(feature = "console")]
         self.init_rich_logging();
 
@@ -21695,6 +21754,7 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
+        self.admit_blocking_lifespan()?;
         #[cfg(feature = "console")]
         self.init_rich_logging();
 
@@ -21779,6 +21839,7 @@ impl Server {
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
     {
+        self.admit_blocking_lifespan()?;
         #[cfg(feature = "console")]
         self.init_rich_logging();
         let recv_half = SharedRecvHalf::new(recv_half);
@@ -21880,6 +21941,10 @@ impl Server {
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
     {
+        if let Err(error) = self.admit_blocking_lifespan() {
+            error!(target: targets::SERVER, "{error}");
+            std::process::exit(1);
+        }
         let dispatch_cx = cx.clone();
         let mut pump = match cx.spawn_blocking(move |pump_cx| {
             self.run_split_transport_returning_with_dispatch_cx(
@@ -21944,6 +22009,10 @@ impl Server {
         W: Write + Send + 'static,
         R: Iterator<Item = JsonRpcRequest> + Send + 'static,
     {
+        if let Err(error) = self.admit_blocking_lifespan() {
+            error!(target: targets::SERVER, "{error}");
+            std::process::exit(1);
+        }
         let (recv_half, send_half) =
             SseServerTransport::new(writer, request_source, endpoint_url).into_split();
         self.run_split_transport_with_label(cx, recv_half, send_half, "sse")
@@ -22265,6 +22334,10 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let server = self;
+        if owns_server_lifecycle && server.admit_blocking_lifespan().is_err() {
+            error!(target: targets::SERVER, "Asynchronous lifespan requires native serving");
+            return 1;
+        }
         let auth_custody_generation = websocket_connection_generation;
         #[cfg(not(feature = "console"))]
         let _ = transport_label;
@@ -22789,6 +22862,10 @@ impl Server {
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
+        if owns_server_lifecycle && self.admit_blocking_lifespan().is_err() {
+            error!(target: targets::SERVER, "Asynchronous lifespan requires native serving");
+            return 1;
+        }
         if let Some(ref stats) = self.stats {
             stats.connection_opened();
         }
@@ -24291,6 +24368,7 @@ impl Server {
         R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
+        self.admit_blocking_lifespan()?;
         let server = Arc::new(self);
         #[cfg(feature = "legacy-2024-11-05")]
         let mut session = Session::new(server.info.clone(), server.capabilities.clone());
@@ -30676,6 +30754,7 @@ mod lib_unit_tests {
                 server,
                 listener_error: None,
                 shutdown_complete: false,
+                lifespan: None,
             };
             if retained.remaining_connections() != 1 {
                 return Err("successful retained child was not caller-owned".to_owned());
@@ -30759,6 +30838,7 @@ mod lib_unit_tests {
                 server,
                 listener_error: None,
                 shutdown_complete: false,
+                lifespan: None,
             });
             let WebSocketServerShutdown::Nonquiescent(retained) = retained else {
                 return Err("forced WebSocket retained work did not report Nonquiescent".to_owned());
@@ -30820,6 +30900,7 @@ mod lib_unit_tests {
                 server,
                 listener_error: Some(McpError::internal_error("forced accept-loop failure")),
                 shutdown_complete: false,
+                lifespan: None,
             };
             let error = retained
                 .settle_for(Duration::ZERO)

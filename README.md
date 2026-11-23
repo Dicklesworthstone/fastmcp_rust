@@ -829,6 +829,50 @@ directly when that dependency boundary is required.
 This feature selection does not change the transport qualification boundaries
 described above.
 
+### Asynchronous server startup and cleanup (current source tree)
+
+The modern, Auto and exact-2024 server builders provide `on_startup_async` and
+`on_shutdown_async` for application initialization and cleanup that await I/O.
+Each callback receives an owned `Cx` derived from the serving caller and
+returns a `Send` future with an `McpResult<()>` result:
+
+```rust
+use fastmcp_rust::modern;
+
+let server = modern::ServerBuilder::new("application", "1")
+    .on_startup_async(|cx| async move {
+        // Await initialization using this caller-owned context.
+        let _ = cx;
+        Ok(())
+    })
+    .on_shutdown_async(|cx| async move {
+        // Await application cleanup after request and Task work settles.
+        let _ = cx;
+        Ok(())
+    })
+    .build();
+```
+
+Native memory, stdio, HTTP and WebSocket serving await startup before admitting
+requests or starting the hosted Task service. A startup error prevents protocol
+admission. If the startup callback was entered, configured asynchronous cleanup
+is attempted before that error returns, so partially initialized resources can
+be released. A refusal before startup entry does not invoke cleanup.
+
+Shutdown follows request and hosted Task quiescence. Pending cleanup remains
+owned by the caller's runtime; HTTP and WebSocket shutdown handles retain its
+completion when the transport reports a nonquiescent exit. Each hook has one
+30-second work bound, capped by the original caller deadline. Child-region
+settlement is still awaited or retained after that bound, so a timeout does not
+certify that noncooperative child work finished. Dropping a serve or shutdown
+observer requests abandonment and does not run cleanup over live handlers.
+
+The hooks use the caller's task and timer capabilities and do not create a
+runtime or blocking pool. Synchronous hooks remain available. Registering a
+sync or async hook replaces the previous hook for the same phase. Blocking
+server runners reject asynchronous lifespan configuration before startup;
+use a native serving method for these hooks.
+
 ### Native HTTP readiness and draining (current source tree)
 
 `BoundHttpServer` and `BoundSecuredHttpServer` expose `GET /health` for listener

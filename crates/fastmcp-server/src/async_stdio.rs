@@ -2875,13 +2875,7 @@ impl Server {
         #[cfg(feature = "console")]
         self.init_rich_logging();
         let server = Arc::new(self);
-        if !server.run_startup_hook() {
-            return Err(server_run_error(
-                "startup",
-                "hook",
-                "Server startup hook failed",
-            ));
-        }
+        let mut lifespan = server.start_native_lifespan(cx).await?;
         #[cfg(feature = "tasks")]
         let hosted_tasks = match server.task_service_host.as_ref() {
             // Recovery can invoke application work immediately, so it must
@@ -2890,6 +2884,9 @@ impl Server {
                 Ok(hosted) => Some(hosted),
                 Err(failure) => {
                     // start_ready settles a failed child before returning.
+                    if let Some(lifespan) = lifespan.as_mut() {
+                        let _ = lifespan.finish().await;
+                    }
                     server.run_shutdown_hook();
                     return Err(failure);
                 }
@@ -2918,7 +2915,12 @@ impl Server {
             None => result,
         };
         if request_regions_quiescent {
+            let lifecycle_result = match lifespan.as_mut() {
+                Some(lifespan) => lifespan.finish().await,
+                None => Ok(()),
+            };
             server.run_shutdown_hook();
+            return result.and(lifecycle_result);
         }
         result
     }
@@ -2980,18 +2982,15 @@ impl Server {
         #[cfg(feature = "console")]
         self.init_rich_logging();
         let server = Arc::new(self);
-        if !server.run_startup_hook() {
-            return Err(server_run_error(
-                "startup",
-                "hook",
-                "Server startup hook failed",
-            ));
-        }
+        let mut lifespan = server.start_native_lifespan(cx).await?;
         #[cfg(feature = "tasks")]
         let hosted_tasks = match server.task_service_host.as_ref() {
             Some(host) => match host.start_ready(cx).await {
                 Ok(hosted) => Some(hosted),
                 Err(failure) => {
+                    if let Some(lifespan) = lifespan.as_mut() {
+                        let _ = lifespan.finish().await;
+                    }
                     server.run_shutdown_hook();
                     return Err(failure);
                 }
@@ -3022,7 +3021,12 @@ impl Server {
             None => result,
         };
         if request_regions_quiescent {
+            let lifecycle_result = match lifespan.as_mut() {
+                Some(lifespan) => lifespan.finish().await,
+                None => Ok(()),
+            };
             server.run_shutdown_hook();
+            return result.and(lifecycle_result);
         }
         result
     }
