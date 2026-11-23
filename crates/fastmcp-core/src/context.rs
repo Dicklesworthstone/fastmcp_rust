@@ -1718,6 +1718,8 @@ pub struct McpContext {
     /// This is composed with `cx.budget()` on every read so an inner operation
     /// can tighten, but never relax, the caller's current budget.
     budget_state: Arc<Mutex<FrameworkBudgetState>>,
+    /// Wakes deadline observers when a clone tightens the shared ceiling.
+    deadline_changed: Arc<Notify>,
     /// Debits already included in this Cx's initial budget when request
     /// execution moved into a child region. Later debits remain clone-shared.
     budget_debit_origin: (u32, u64),
@@ -2038,6 +2040,7 @@ impl McpContext {
         Self {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            deadline_changed: Arc::new(Notify::new()),
             budget_debit_origin: (0, 0),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
             framework_mask_released: Arc::new(Notify::new()),
@@ -2089,6 +2092,7 @@ impl McpContext {
         Self {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            deadline_changed: Arc::new(Notify::new()),
             budget_debit_origin: (0, 0),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
             framework_mask_released: Arc::new(Notify::new()),
@@ -2141,6 +2145,7 @@ impl McpContext {
         Self {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            deadline_changed: Arc::new(Notify::new()),
             budget_debit_origin: (0, 0),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
             framework_mask_released: Arc::new(Notify::new()),
@@ -2197,6 +2202,7 @@ impl McpContext {
         Self {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            deadline_changed: Arc::new(Notify::new()),
             budget_debit_origin: (0, 0),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
             framework_mask_released: Arc::new(Notify::new()),
@@ -2419,16 +2425,22 @@ impl McpContext {
     /// tightening one clone is therefore visible to all of them.
     #[must_use]
     pub fn with_budget_ceiling(self, ceiling: Budget) -> Self {
-        {
+        let deadline_changed = {
             let mut current = self
                 .budget_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            current.ceiling = Some(
-                current
-                    .ceiling
-                    .map_or(ceiling, |budget| budget.meet(ceiling)),
-            );
+            let previous = current.ceiling.and_then(|budget| budget.deadline);
+            let next = current.ceiling.map_or(ceiling, |budget| budget.meet(ceiling));
+            current.ceiling = Some(next);
+            previous != next.deadline
+        };
+        if deadline_changed {
+            // The ceiling is committed. Never invoke arbitrary task wakers
+            // under the budget lock or let a waker panic undo the update.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.deadline_changed.notify_waiters();
+            }));
         }
         self
     }
@@ -2890,6 +2902,71 @@ impl McpContext {
         self.framework_mask_released
             .wait_until(|| self.ensure_live().is_err())
             .await;
+    }
+
+    /// Waits for this request's effective deadline to become observable.
+    ///
+    /// Uses the original caller's clock and timer driver, including after a
+    /// clone tightens the shared ceiling. No deadline means no timer. Framework
+    /// masks defer observation until release. This never cancels the caller or
+    /// rewrites the request's cancellation cause. Consumers should poll it only
+    /// while waiting on work that can still be abandoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a future deadline needs unavailable caller time
+    /// authority or a timer driver; no global fallback timer is used.
+    #[doc(hidden)]
+    pub fn request_deadline_elapsed(&self) -> impl Future<Output = McpResult<()>> + Send + '_ {
+        crate::runtime::CallerContextFuture::new(&self.cx, async move {
+            loop {
+                let elapsed = {
+                    let observed_deadline = self.budget().deadline;
+                    let mut changed = std::pin::pin!(self.deadline_changed.wait_until(|| {
+                        self.budget().deadline != observed_deadline
+                    }));
+                    let mut timer = None;
+                    std::future::poll_fn(|poll| {
+                        // The predicate recheck closes the race between reading
+                        // the deadline and registering for a shared tightening.
+                        if changed.as_mut().poll(poll).is_ready() {
+                            return std::task::Poll::Ready(Ok(false));
+                        }
+                        let Some(deadline) = observed_deadline else {
+                            return std::task::Poll::Pending;
+                        };
+                        if self.cx.now() >= deadline {
+                            return std::task::Poll::Ready(Ok(true));
+                        }
+                        let Some(caller) = Cx::current() else {
+                            return std::task::Poll::Ready(Err(McpError::internal_error(
+                                "Request deadline wait has no installed caller",
+                            )));
+                        };
+                        if !caller.capabilities().time || caller.timer_driver().is_none() {
+                            return std::task::Poll::Ready(Err(McpError::internal_error(
+                                "Request deadline wait requires the caller's timer driver",
+                            )));
+                        }
+                        let timer = timer.get_or_insert_with(|| {
+                            Box::pin(asupersync::time::Sleep::new(deadline))
+                        });
+                        timer.as_mut().poll(poll).map(|()| Ok(true))
+                    })
+                    .await?
+                };
+                // The previous timer and change waiter are already dropped.
+                if elapsed {
+                    break;
+                }
+                // Repeated concurrent tightenings cannot monopolize one poll.
+                asupersync::runtime::yield_now().await;
+            }
+            self.framework_mask_released
+                .wait_until(|| self.ensure_live().is_err())
+                .await;
+            Ok(())
+        })
     }
 
     /// Checks terminal request liveness without charging a poll or cost unit.

@@ -770,14 +770,15 @@ impl FinalTaskRuntime {
     }
 }
 
-/// A read may be abandoned when its request loses authority. Arm request-local
-/// cancellation before polling the provider so a parked read is actually woken.
+/// A read may be abandoned when its request loses authority. Arm cancellation
+/// before polling storage, and a deadline timer when storage suspends.
 async fn await_control_read<T>(
     ctx: &McpContext,
     mut future: FinalTaskStoreFuture<'_, T>,
     admit: impl Fn() -> McpResult<()> + Send,
 ) -> McpResult<T> {
     let mut cancelled = Box::pin(ctx.request_cancelled());
+    let mut deadline = Box::pin(ctx.request_deadline_elapsed());
     std::future::poll_fn(move |poll| {
         if let Err(error) = admit() {
             return Poll::Ready(Err(error));
@@ -788,6 +789,17 @@ async fn await_control_read<T>(
         let result = future.as_mut().poll(poll);
         if let Err(error) = admit() {
             return Poll::Ready(Err(error));
+        }
+        // Immediate providers do not require a timer. A suspended provider
+        // cannot rely on storage progress to wake at the caller's deadline.
+        if result.is_pending() {
+            match deadline.as_mut().poll(poll) {
+                Poll::Ready(Ok(())) => {
+                    return Poll::Ready(Err(McpError::request_cancelled()));
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
         }
         result
     })
@@ -804,8 +816,11 @@ async fn await_retention_reclaim(
     admit: impl Fn() -> McpResult<()> + Send,
 ) -> McpResult<TaskRetentionReclamation> {
     let mut cancelled = Box::pin(ctx.request_cancelled());
+    let mut deadline = Some(Box::pin(ctx.request_deadline_elapsed()));
     std::future::poll_fn(move |poll| {
-        if !write_admitted.load(TaskServiceOrdering::Acquire) {
+        if write_admitted.load(TaskServiceOrdering::Acquire) {
+            deadline = None;
+        } else {
             if let Err(error) = admit() {
                 return Poll::Ready(Err(error));
             }
@@ -821,6 +836,22 @@ async fn await_retention_reclaim(
             if cancelled.as_mut().poll(poll).is_ready() {
                 return Poll::Ready(Err(McpError::request_cancelled()));
             }
+            if result.is_pending()
+                && let Some(deadline) = deadline.as_mut()
+            {
+                match deadline.as_mut().poll(poll) {
+                    Poll::Ready(Ok(())) => {
+                        return Poll::Ready(Err(McpError::request_cancelled()));
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {}
+                }
+            }
+        } else {
+            // Admission can occur inside this provider poll. Retire the timer
+            // immediately, but retain the original provider until its receipt
+            // settles; deadline expiry cannot establish rollback.
+            deadline = None;
         }
         result
     })

@@ -1670,7 +1670,6 @@ fn async_retention_committed_receipt_survives_caller_cancellation() {
     }
 }
 
-
 #[test]
 fn async_retention_inspection_preserves_zero_cost_and_sibling_authority() {
     let (fixture, _administrator) = terminal_retention_fixture();
@@ -1761,4 +1760,354 @@ fn async_retention_inspection_observes_clone_shared_quota_after_suspension() {
     assert!(!cx.is_cancel_requested());
     assert!(sibling.checkpoint().is_ok());
     fixture.store.assert_async_only();
+}
+
+fn virtual_deadline_caller() -> (
+    asupersync::runtime::Runtime,
+    Cx,
+    Arc<asupersync::time::VirtualClock>,
+    asupersync::time::TimerDriverHandle,
+) {
+    let clock = Arc::new(asupersync::time::VirtualClock::new());
+    let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .with_timer_driver(timer.clone())
+        .build()
+        .unwrap();
+    let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+    (runtime, caller, clock, timer)
+}
+
+fn advance_virtual_deadline(
+    runtime: &asupersync::runtime::Runtime,
+    clock: &asupersync::time::VirtualClock,
+    timer: &asupersync::time::TimerDriverHandle,
+    nanoseconds: u64,
+) -> usize {
+    // Loan the caller's worker to this turn so it cannot process the virtual
+    // timer between advancing the clock and observing the exact fired count.
+    runtime.block_on(async {
+        clock.advance(nanoseconds);
+        timer.process_timers()
+    })
+}
+
+#[test]
+fn async_control_deadlines_wake_parked_operations_and_follow_shared_tightening() {
+    for operation in 0..4 {
+        let (host, caller, clock, timer) = virtual_deadline_caller();
+        let (mut fixture, _administrator) = terminal_retention_fixture();
+        let target = inspect_retention(&fixture);
+        fixture.ctx = fixture.ctx.clone().with_request_cx(caller.clone());
+        let before = fixture.snapshot();
+        let retained = fixture.store.inner.retained_payload_bytes();
+        fixture.store.metadata_gate.close();
+        fixture.store.payload_gate.close();
+        fixture.store.audit_gate.close();
+        fixture.store.write_gate.close();
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut poll = Context::from_waker(&waker);
+        let mut pending: Pin<Box<dyn Future<Output = McpResult<()>> + Send + '_>> =
+            match operation {
+                0 => Box::pin(async {
+                    fixture
+                        .runtime
+                        .task_for_request_with_cx(
+                            &fixture.ctx,
+                            &fixture.task_id,
+                            TaskAccessAction::Get,
+                        )
+                        .await
+                        .map(|_| ())
+                }),
+                1 => Box::pin(async {
+                    fixture
+                        .runtime
+                        .inspect_task_retention_with_context(&fixture.ctx, &fixture.task_id)
+                        .await
+                        .map(|_| ())
+                }),
+                2 => Box::pin(async {
+                    fixture
+                        .runtime
+                        .task_retention_audit_with_context(&fixture.ctx, None, 1)
+                        .await
+                        .map(|_| ())
+                }),
+                _ => Box::pin(async {
+                    fixture
+                        .runtime
+                        .reclaim_task_retention_with_context(
+                            &fixture.ctx,
+                            &target,
+                            TaskRetentionReason::OperatorRequest,
+                        )
+                        .await
+                        .map(|_| ())
+                }),
+            };
+        assert!(pending.as_mut().poll(&mut poll).is_pending());
+        assert_eq!(timer.pending_count(), 0, "an infinite budget needs no timer");
+        let before_tightening = wakes.0.load(Ordering::SeqCst);
+        let _first_ceiling = fixture.ctx.clone().with_budget_ceiling(
+            Budget::INFINITE.with_deadline(caller.now().saturating_add_nanos(3_000_000_000)),
+        );
+        assert!(wakes.0.load(Ordering::SeqCst) > before_tightening);
+        assert!(pending.as_mut().poll(&mut poll).is_pending());
+        assert!(pending.as_mut().poll(&mut poll).is_pending());
+        assert_eq!(timer.pending_count(), 1);
+        let before_tightening = wakes.0.load(Ordering::SeqCst);
+        let _earlier_ceiling = fixture.ctx.clone().with_budget_ceiling(
+            Budget::INFINITE.with_deadline(caller.now().saturating_add_nanos(1_000_000_000)),
+        );
+        assert!(wakes.0.load(Ordering::SeqCst) > before_tightening);
+        assert!(pending.as_mut().poll(&mut poll).is_pending());
+        assert_eq!(
+            timer.pending_count(),
+            0,
+            "the superseded timer is retired before yielding"
+        );
+        assert!(pending.as_mut().poll(&mut poll).is_pending());
+        assert_eq!(timer.pending_count(), 1);
+        let before_widening = wakes.0.load(Ordering::SeqCst);
+        let _wider_ceiling = fixture.ctx.clone().with_budget_ceiling(
+            Budget::INFINITE.with_deadline(caller.now().saturating_add_nanos(10_000_000_000)),
+        );
+        assert_eq!(wakes.0.load(Ordering::SeqCst), before_widening);
+        let before_expiry = wakes.0.load(Ordering::SeqCst);
+        assert_eq!(
+            advance_virtual_deadline(&host, &clock, &timer, 1_000_000_000),
+            1
+        );
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > before_expiry,
+            "the tightened deadline wakes the caller without storage progress"
+        );
+        let error = ready(pending.as_mut().poll(&mut poll)).unwrap_err();
+        assert_eq!(error.code, McpError::request_cancelled().code);
+        assert!(!error.message.contains("may have committed"));
+        assert!(fixture.ctx.deadline_expired());
+        assert!(!caller.is_cancel_requested());
+        assert!(!fixture.ctx.request_cancellation().is_cancel_requested());
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.store.inner.retained_payload_bytes(), retained);
+        let after = fixture.snapshot();
+        assert_eq!(after.generation(), before.generation());
+        assert!(final_tasks_match_exactly(after.task(), before.task()).unwrap());
+        assert_eq!(timer.pending_count(), 0);
+        let after_completion = wakes.0.load(Ordering::SeqCst);
+        fixture.store.metadata_gate.release();
+        fixture.store.payload_gate.release();
+        fixture.store.audit_gate.release();
+        fixture.store.write_gate.release();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), after_completion);
+        fixture.store.assert_async_only();
+        drop(pending);
+        drop(fixture);
+        drop(caller);
+        assert!(host.shutdown_timeout(StdDuration::from_secs(1)));
+    }
+}
+
+#[test]
+fn request_deadline_wait_defers_expiry_until_framework_mask_release() {
+    let (host, caller, clock, timer) = virtual_deadline_caller();
+    let ctx = McpContext::new(caller.clone(), 1)
+        .with_operation_deadline(Some(caller.now().saturating_add_nanos(1_000_000_000)));
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut poll = Context::from_waker(&waker);
+    let mut elapsed = Box::pin(ctx.request_deadline_elapsed());
+    assert!(elapsed.as_mut().poll(&mut poll).is_pending());
+    assert_eq!(timer.pending_count(), 1);
+    let before_release = ctx
+        .masked(|| {
+            let before_expiry = wakes.0.load(Ordering::SeqCst);
+            assert_eq!(
+                advance_virtual_deadline(&host, &clock, &timer, 1_000_000_000),
+                1
+            );
+            assert!(wakes.0.load(Ordering::SeqCst) > before_expiry);
+            assert!(ctx.ensure_live().is_ok());
+            assert!(elapsed.as_mut().poll(&mut poll).is_pending());
+            assert_eq!(
+                timer.pending_count(),
+                0,
+                "masked expiry retains no expired timer"
+            );
+            wakes.0.load(Ordering::SeqCst)
+        })
+        .unwrap();
+    assert!(wakes.0.load(Ordering::SeqCst) > before_release);
+    ready(elapsed.as_mut().poll(&mut poll)).unwrap();
+    assert!(ctx.deadline_expired());
+    assert!(!caller.is_cancel_requested());
+    assert!(!ctx.request_cancellation().is_cancel_requested());
+    assert_eq!(timer.pending_count(), 0);
+    drop(elapsed);
+    drop(ctx);
+    drop(caller);
+    assert!(host.shutdown_timeout(StdDuration::from_secs(1)));
+}
+
+#[test]
+fn async_control_deadline_uses_caller_clock_and_rejects_lost_time_authority() {
+    use asupersync::cx::cap::CapMask;
+
+    let (caller_runtime, caller, _caller_clock, caller_timer) = virtual_deadline_caller();
+    let (host_runtime, host, host_clock, host_timer) = virtual_deadline_caller();
+    host_clock.advance(10_000_000_000);
+    let (mut fixture, _administrator) = terminal_retention_fixture();
+    fixture.ctx = fixture
+        .ctx
+        .clone()
+        .with_request_cx(caller.clone())
+        .with_operation_deadline(Some(caller.now().saturating_add_nanos(1_000_000_000)));
+    fixture.store.metadata_gate.close();
+    let installed = Cx::set_current(Some(host.clone()));
+    let mut pending = Box::pin(fixture.runtime.task_for_request_with_cx(
+        &fixture.ctx,
+        &fixture.task_id,
+        TaskAccessAction::Get,
+    ));
+    assert!(poll_once(pending.as_mut()).is_pending());
+    assert_eq!(caller_timer.pending_count(), 1);
+    assert_eq!(host_timer.pending_count(), 0);
+    assert_eq!(Cx::current().unwrap().now(), host.now());
+    assert_eq!(
+        advance_virtual_deadline(&host_runtime, &host_clock, &host_timer, 1_000_000_000),
+        0
+    );
+    assert!(
+        poll_once(pending.as_mut()).is_pending(),
+        "the foreign clock cannot expire the caller"
+    );
+    let error = {
+        let _restriction = Cx::push_restriction(CapMask::none());
+        ready(poll_once(pending.as_mut())).unwrap_err()
+    };
+    assert!(error.message.contains("caller's timer driver"));
+    assert_eq!(caller_timer.pending_count(), 0);
+    assert_eq!(host_timer.pending_count(), 0);
+    assert_eq!(fixture.store.payload_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+    fixture.store.assert_async_only();
+    drop(pending);
+    drop(installed);
+    drop(fixture);
+    drop(caller);
+    drop(host);
+    assert!(caller_runtime.shutdown_timeout(StdDuration::from_secs(1)));
+    assert!(host_runtime.shutdown_timeout(StdDuration::from_secs(1)));
+}
+
+#[test]
+fn async_control_timed_driverless_context_allows_ready_storage_but_refuses_pending_storage() {
+    let (mut fixture, _administrator) = terminal_retention_fixture();
+    fixture.ctx = fixture.ctx.clone().with_operation_deadline(Some(
+        fixture.ctx.cx().now().saturating_add_nanos(60_000_000_000),
+    ));
+    assert!(fixture.ctx.cx().timer_driver().is_none());
+    let before = fixture.snapshot();
+    {
+        let mut immediate = Box::pin(fixture.runtime.task_for_request_with_cx(
+            &fixture.ctx,
+            &fixture.task_id,
+            TaskAccessAction::Get,
+        ));
+        let snapshot = ready(poll_once(immediate.as_mut())).unwrap();
+        assert_eq!(snapshot.generation(), before.generation());
+    }
+    fixture.store.metadata_gate.close();
+    let mut pending = Box::pin(fixture.runtime.task_for_request_with_cx(
+        &fixture.ctx,
+        &fixture.task_id,
+        TaskAccessAction::Get,
+    ));
+    let error = ready(poll_once(pending.as_mut())).unwrap_err();
+    assert!(error.message.contains("caller's timer driver"));
+    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.snapshot().generation(), before.generation());
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn async_retention_admitted_write_retires_deadline_and_settles_receipt_after_expiry() {
+    for expire_in_commit_poll in [false, true] {
+        let (host, caller, clock, timer) = virtual_deadline_caller();
+        let (mut fixture, _administrator) = terminal_retention_fixture();
+        let target = inspect_retention(&fixture);
+        fixture.ctx = fixture
+            .ctx
+            .clone()
+            .with_request_cx(caller.clone())
+            .with_operation_deadline(Some(caller.now().saturating_add_nanos(1_000_000_000)));
+        fixture.store.write_gate.close();
+        fixture.store.retention_receipt_gate.close();
+        if expire_in_commit_poll {
+            let clock = Arc::clone(&clock);
+            *fixture.store.after_write.lock().unwrap() = Some(Box::new(move || {
+                clock.advance(1_000_000_000);
+            }));
+        }
+        let mut reclaim = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+            &fixture.ctx,
+            &target,
+            TaskRetentionReason::OperatorRequest,
+        ));
+        assert!(poll_once(reclaim.as_mut()).is_pending());
+        assert_eq!(timer.pending_count(), 1, "a prewrite wait is bounded");
+        fixture.store.write_gate.release();
+        assert!(poll_once(reclaim.as_mut()).is_pending());
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.inner.task_count(), 0);
+        assert_eq!(
+            timer.pending_count(),
+            0,
+            "write admission retires the abandonment timer"
+        );
+        if !expire_in_commit_poll {
+            assert_eq!(
+                advance_virtual_deadline(&host, &clock, &timer, 1_000_000_000),
+                0
+            );
+        }
+        assert!(fixture.ctx.deadline_expired());
+        assert!(!caller.is_cancel_requested());
+        assert!(!fixture.ctx.request_cancellation().is_cancel_requested());
+        assert!(
+            poll_once(reclaim.as_mut()).is_pending(),
+            "expiry cannot abandon an admitted receipt"
+        );
+        fixture.store.retention_receipt_gate.release();
+        let TaskRetentionReclamation::Reclaimed(receipt) =
+            ready(poll_once(reclaim.as_mut())).unwrap()
+        else {
+            panic!("deadline expiry cannot erase a proven reclamation");
+        };
+        let fresh = McpContext::new(caller.clone(), 2);
+        let mut retry = Box::pin(fixture.runtime.reclaim_task_retention_with_context(
+            &fresh,
+            &target,
+            TaskRetentionReason::SubjectRemoved,
+        ));
+        assert_eq!(
+            ready(poll_once(retry.as_mut())).unwrap(),
+            TaskRetentionReclamation::AlreadyReclaimed(receipt.clone()),
+        );
+        let mut audit = Box::pin(fixture.runtime.task_retention_audit_with_context(&fresh, None, 1));
+        assert_eq!(ready(poll_once(audit.as_mut())).unwrap().records(), &[receipt]);
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.inner.retained_payload_bytes(), 0);
+        fixture.store.assert_async_only();
+        drop(audit);
+        drop(retry);
+        drop(reclaim);
+        drop(fresh);
+        drop(fixture);
+        drop(caller);
+        assert!(host.shutdown_timeout(StdDuration::from_secs(1)));
+    }
 }
