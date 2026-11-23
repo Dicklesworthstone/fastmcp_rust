@@ -4,17 +4,19 @@
 //! modern capability leaves. The shared MRTR driver admits the entire input
 //! batch before host effects and keeps every callback and continuation inside
 //! the original cancellation domain and absolute deadline. Low-level core
-//! execution and explicit Tasks calls remain single-request operations.
+//! execution and ordinary explicit Tasks calls remain single-request
+//! operations; the dedicated Tasks MRTR entrypoints retain their original
+//! Tasks negotiation through the same bounded continuation driver.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use asupersync::Cx;
-use fastmcp_core::{McpRequestCancellation, McpResult};
+use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 use fastmcp_protocol::{CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, InputRequiredResult};
 use serde_json::Value;
 
-use super::{MemoryClient, MemoryClientBuilder, checkpoint};
+use super::{MemoryClient, MemoryClientBuilder, MemoryRequestEvent, checkpoint};
 use crate::execution::{MrtrDriver, MrtrDriverLimits};
 use crate::{
     MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses,
@@ -23,9 +25,22 @@ use crate::{
     wait_for_mrtr_operation,
 };
 
-enum MemoryMrtrResponder<F> {
+pub(super) enum MemoryMrtrResponder<F> {
     Installed(ReverseRequestHandlers),
     Caller(F),
+}
+
+#[cfg(feature = "tasks")]
+fn is_task_receipt(result: &CoreResult) -> bool {
+    matches!(
+        result,
+        CoreResult::Final(fastmcp_protocol::FinalCoreResult::ToolsCallTask { .. })
+    )
+}
+
+#[cfg(not(feature = "tasks"))]
+fn is_task_receipt(_result: &CoreResult) -> bool {
+    false
 }
 
 impl MemoryClientBuilder {
@@ -38,8 +53,9 @@ impl MemoryClientBuilder {
     ///
     /// `call_tool`, `read_resource`, and `get_prompt` may then follow admitted
     /// input-required results. A complete batch must be supported before any
-    /// handler runs. `request_core`, owned executions, and explicit Tasks calls
-    /// continue to return each result directly without implicit continuation.
+    /// handler runs. `request_core`, owned executions, and the single-request
+    /// Tasks API continue to return each result directly. The Tasks-specific
+    /// `call_tool_final_outcome_with_handlers` opts into this handler set explicitly.
     #[must_use]
     pub fn reverse_request_handlers(mut self, handlers: ReverseRequestHandlers) -> Self {
         self.reverse_request_handlers = handlers;
@@ -84,6 +100,7 @@ impl MemoryClient {
             "tools/call",
             serde_json::json!({"name": name, "arguments": arguments}),
             MemoryMrtrResponder::Caller(respond),
+            false,
         )
         .await
     }
@@ -113,6 +130,7 @@ impl MemoryClient {
             "resources/read",
             serde_json::json!({"uri": uri}),
             MemoryMrtrResponder::Caller(respond),
+            false,
         )
         .await
     }
@@ -143,6 +161,7 @@ impl MemoryClient {
             "prompts/get",
             serde_json::json!({"name": name, "arguments": arguments}),
             MemoryMrtrResponder::Caller(respond),
+            false,
         )
         .await
     }
@@ -216,11 +235,12 @@ impl MemoryClient {
             MemoryMrtrResponder::<fn(&InputRequiredResult) -> McpResult<MrtrInputResponses>>::Installed(
                 handlers,
             ),
+            false,
         )
         .await
     }
 
-    async fn follow_mrtr<F>(
+    pub(super) async fn follow_mrtr<F>(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
@@ -228,6 +248,7 @@ impl MemoryClient {
         method: &str,
         original_parameters: Value,
         mut responder: MemoryMrtrResponder<F>,
+        allow_tasks: bool,
     ) -> McpResult<CoreResult>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
@@ -242,15 +263,42 @@ impl MemoryClient {
         )?;
         // Freeze the exact capability leaves transmitted on the original
         // request. A peer descriptor or a handler's presence never grants a
-        // capability the request withheld. This ordinary path excludes Tasks.
-        let original_parameters = self.parameters_with_tasks(original_parameters, false)?;
+        // capability the request withheld. Tasks may be retained only by the
+        // explicit Tasks entrypoints, after their local negotiation preflight.
+        let original_parameters = self.parameters_with_tasks(original_parameters, allow_tasks)?;
         let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
-        wait_for_mrtr_operation(cx, Some(cancellation), deadline, async {
+        let mut completed = None;
+        let outcome: McpResult<()> = wait_for_mrtr_operation(cx, Some(cancellation), deadline, async {
             let mut parameters = original_parameters.clone();
             let mut first_round = true;
             loop {
                 driver.before_request()?;
-                let result = if first_round {
+                let result = if allow_tasks {
+                    // Every continuation preserves the original opt-in. Going
+                    // through ordinary request_core would strip Tasks and
+                    // reject a Task that the peer creates after receiving input.
+                    let mut execution = self
+                        .execute_core_admitted(
+                            cx,
+                            cancellation,
+                            method,
+                            parameters,
+                            self.timeout_policy,
+                            true,
+                        )
+                        .await?;
+                    loop {
+                        match self.next_event(cx, cancellation, &mut execution).await? {
+                            Some(MemoryRequestEvent::Result(result)) => break *result,
+                            Some(MemoryRequestEvent::Notification(_)) => {}
+                            None => {
+                                return Err(McpError::internal_error(
+                                    "Memory MRTR execution ended without its result",
+                                ));
+                            }
+                        }
+                    }
+                } else if first_round {
                     first_round = false;
                     self.cached_core_request(cx, cancellation, method, parameters, true)
                         .await?
@@ -259,9 +307,17 @@ impl MemoryClient {
                     self.request_core(cx, cancellation, method, parameters)
                         .await?
                 };
+                if allow_tasks && is_task_receipt(&result) {
+                    // The peer has accepted independently running work. Retain
+                    // its admitted identifier even if cancellation arrives in
+                    // this same poll; no continuation or retry follows it.
+                    completed = Some(result);
+                    return Ok(());
+                }
                 check_mrtr_operation(cx, Some(cancellation), deadline)?;
                 let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
-                    return Ok(result);
+                    completed = Some(result);
+                    return Ok(());
                 };
                 driver.begin_continuation()?;
                 let responses = match &mut responder {
@@ -296,7 +352,16 @@ impl MemoryClient {
                     mrtr_retry_parameters(original_parameters.clone(), input_required, responses)?;
             }
         })
-        .await
+        .await;
+        // The outer deadline guard is deliberately cancellation-first for
+        // callbacks and ordinary results. Its post-poll checkpoint must not
+        // discard an already admitted Task creation receipt.
+        if allow_tasks && completed.as_ref().is_some_and(is_task_receipt) {
+            return completed
+                .ok_or_else(|| McpError::internal_error("Memory Task receipt is absent"));
+        }
+        outcome?;
+        completed.ok_or_else(|| McpError::internal_error("Memory MRTR result is absent"))
     }
 }
 

@@ -1664,6 +1664,24 @@ or input-required outcome from exactly one tool call. It does not invoke
 installed input callbacks. Unix stdio offers the corresponding
 `call_tool_final_outcome_with_cx` method.
 
+In the current source, configure the memory client with
+`MemoryClient::builder(client_info).with_tasks()` before connecting.
+`MemoryClient::call_tool_final_outcome` likewise returns one outcome without
+automatic continuation. Use `call_tool_final_outcome_with_handlers` to fulfill
+MRTR inputs through installed modern sampling, roots, and elicitation handlers,
+or `call_tool_final_outcome_with_mrtr_retry` to supply a responder and an absolute
+deadline for this operation. Advertise the responder's capabilities before
+connecting; supplying it does not expand the connection's capabilities.
+
+Both memory continuation methods retain the original tool, arguments, and Tasks
+negotiation across fresh request IDs. They admit each complete input batch
+before callbacks, bound continuation rounds and answers, and preserve the
+original cancellation domain and operation deadline. A server can complete
+normally or create a Task on any round. Without installed handlers, the handler
+variant returns input-required directly. An already-admitted Task receipt
+survives cancellation in the same final poll; these methods do not poll or
+persist the Task, or repeat a call after uncertain delivery.
+
 Use `FinalTaskHandle::from_created(&created)` to retain that Task on the same
 client without sending an extra `tasks/get` or repeating the tool call.
 The creation receipt remains yours, including its metadata and unknown

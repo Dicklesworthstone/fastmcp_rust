@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
@@ -17,9 +18,12 @@ use fastmcp_protocol::extensions::{
     official_tasks_empty_settings, register_official_tasks_extension,
 };
 use fastmcp_protocol::tasks_extension::{TASK_CANCEL, TASK_GET, TASK_UPDATE};
-use fastmcp_protocol::{CoreResult, ExtensionId, FinalCoreResult, ServerDiscoverResult};
+use fastmcp_protocol::{
+    CoreResult, ExtensionId, FinalCoreResult, InputRequiredResult, ServerDiscoverResult,
+};
 use serde_json::Value;
 
+use super::interaction::MemoryMrtrResponder;
 use super::{
     MemoryClient, MemoryClientBuilder, MemoryExtensionEvent, MemoryRequestEvent,
     MemoryRequestExecution, checkpoint,
@@ -27,7 +31,8 @@ use super::{
 use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime};
 use crate::{
     FinalCancelTaskResult, FinalGetTaskResult, FinalTask, FinalTaskId, FinalTaskInputResponses,
-    FinalToolCallOutcome, FinalUpdateTaskResult, RequestTimeoutPolicy, ReverseRequestHandlers,
+    FinalToolCallOutcome, FinalUpdateTaskResult, MrtrInputResponses, RequestTimeoutPolicy,
+    ReverseRequestHandlers, mrtr_operation_deadline,
 };
 
 #[derive(Debug)]
@@ -88,6 +93,23 @@ fn compatible_tasks_settings(
 
 fn tasks_not_active() -> McpError {
     McpError::invalid_params("Memory Tasks requires explicit opt-in and successful negotiation")
+}
+
+fn tool_outcome(result: CoreResult) -> McpResult<FinalToolCallOutcome> {
+    match result {
+        CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+            Ok(FinalToolCallOutcome::Complete(result))
+        }
+        CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+            Ok(FinalToolCallOutcome::Task(result))
+        }
+        CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+            Ok(FinalToolCallOutcome::InputRequired(result))
+        }
+        _ => Err(McpError::invalid_request(
+            "Memory Tasks tool execution returned another method's result",
+        )),
+    }
 }
 
 impl MemoryClientBuilder {
@@ -198,21 +220,7 @@ impl MemoryClient {
             match self.next_event(cx, cancellation, &mut execution).await? {
                 Some(MemoryRequestEvent::Notification(_)) => {}
                 Some(MemoryRequestEvent::Result(result)) => {
-                    return match *result {
-                        CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
-                            Ok(FinalToolCallOutcome::Complete(result))
-                        }
-                        CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
-                            Ok(FinalToolCallOutcome::Task(result))
-                        }
-                        CoreResult::Final(FinalCoreResult::ToolsCallInputRequired {
-                            result,
-                            ..
-                        }) => Ok(FinalToolCallOutcome::InputRequired(result)),
-                        _ => Err(McpError::invalid_request(
-                            "Memory Tasks tool execution returned another method's result",
-                        )),
-                    };
+                    return tool_outcome(*result);
                 }
                 None => {
                     return Err(McpError::internal_error(
@@ -221,6 +229,94 @@ impl MemoryClient {
                 }
             }
         }
+    }
+
+    /// Calls a Tasks-capable tool and fulfills MRTR inputs with installed handlers.
+    ///
+    /// Unlike [`Self::call_tool_final_outcome`], this explicitly opts into the
+    /// connection's modern sampling, roots, and elicitation handlers. Every
+    /// continuation retains the original name, arguments, capabilities, Tasks
+    /// negotiation, caller cancellation domain, and absolute operation deadline.
+    /// Input batches and cumulative response/round limits are checked before
+    /// host effects. Without installed handlers, input-required is returned.
+    ///
+    /// The server may complete normally or create a Task on any round. An
+    /// admitted Task receipt wins simultaneous cancellation so accepted work
+    /// remains identifiable; this method never polls, persists, or cancels that
+    /// Task. A transport failure or uncertain send never repeats the call.
+    pub async fn call_tool_final_outcome_with_handlers(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: Value,
+    ) -> McpResult<FinalToolCallOutcome> {
+        self.ensure_open()?;
+        checkpoint(cx, cancellation)?;
+        self.require_tasks()?;
+        let handlers = self.reverse_request_handlers.clone();
+        if !handlers.has_modern_handlers() {
+            return self
+                .call_tool_final_outcome(cx, cancellation, name, arguments)
+                .await;
+        }
+        let deadline = mrtr_operation_deadline(cx, self.timeout_policy)?;
+        self.follow_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            MemoryMrtrResponder::<fn(&InputRequiredResult) -> McpResult<MrtrInputResponses>>::Installed(
+                handlers,
+            ),
+            true,
+        )
+        .await
+        .and_then(tool_outcome)
+    }
+
+    /// Calls a Tasks-capable tool with a responder scoped to this MRTR operation.
+    ///
+    /// The explicit Tasks policy and successful bilateral negotiation are
+    /// required before publication. Advertise the responder's capabilities in
+    /// [`MemoryClientBuilder::capabilities`] before connecting. The complete
+    /// input batch must be supported before `respond` runs, and its map must
+    /// answer every requested key. State-only continuations use an empty map.
+    /// Installed reverse handlers are not invoked by this method.
+    ///
+    /// The synchronous callback must return promptly. Cancellation and the
+    /// earlier of `deadline` and the client's absolute timeout are checked
+    /// before and after callbacks. Each continuation receives a fresh ID and
+    /// preserves the original tool, arguments, and Tasks capability. Errors
+    /// never cause retries. Complete results and Task receipts retain metadata
+    /// and open members; the Task lifecycle remains under the caller's control.
+    pub async fn call_tool_final_outcome_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: Value,
+        respond: F,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        self.ensure_open()?;
+        checkpoint(cx, cancellation)?;
+        self.require_tasks()?;
+        self.follow_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            MemoryMrtrResponder::Caller(respond),
+            true,
+        )
+        .await
+        .and_then(tool_outcome)
     }
 
     /// Reads one exact Task ID through the negotiated official extension.
@@ -372,6 +468,7 @@ impl MemoryClient {
 mod tests {
     use std::future::{Future, poll_fn};
     use std::pin::pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Poll;
     use std::time::Duration;
 
@@ -469,19 +566,397 @@ mod tests {
     }
 
     async fn connected(cx: &Cx) -> (MemoryClient, MemoryTransport) {
+        connected_with(cx, MemoryClient::builder(info()).with_tasks()).await
+    }
+
+    async fn connected_with(
+        cx: &Cx,
+        builder: MemoryClientBuilder,
+    ) -> (MemoryClient, MemoryTransport) {
         let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
         peer.send_async(cx, &response(1, discovery(json!({(TASKS): {}}))))
             .await
             .unwrap();
-        let client = MemoryClient::builder(info())
-            .with_tasks()
-            .connect(cx, transport)
-            .await
-            .unwrap();
+        let client = builder.connect(cx, transport).await.unwrap();
         let request = receive(cx, &mut peer, "server/discover", Some(1)).await;
         assert_tasks_metadata(&request);
         assert!(client.tasks_active());
         (client, peer)
+    }
+
+    fn input_required() -> Value {
+        json!({
+            "resultType": "input_required", "requestState": "opaque-first-state",
+            "inputRequests": {"roots": {"method": "roots/list"}},
+        })
+    }
+
+    fn roots_answers(input: &InputRequiredResult) -> MrtrInputResponses {
+        input
+            .input_requests()
+            .into_iter()
+            .flat_map(|requests| requests.members())
+            .map(|member| (member.name.clone(), json!({"roots": []})))
+            .collect()
+    }
+
+    fn task_receipt() -> Value {
+        let mut value = snapshot("memory-created-after-input");
+        value["resultType"] = json!("task");
+        value["ttlMs"] = Value::Null;
+        value["_meta"] = json!({"com.example/receipt": "résumé 東京"});
+        value["com.example/exact"] = Value::Number(serde_json::Number::from_string_unchecked(
+            "7.30e-2".to_owned(),
+        ));
+        value
+    }
+
+    #[test]
+    fn memory_tasks_mrtr_preserves_authority_and_exact_results_across_rounds() {
+        run(|cx| async move {
+            for installed in [false, true] {
+                for create_task in [false, true] {
+                    let handler_calls = Arc::new(AtomicUsize::new(0));
+                    let observed = Arc::clone(&handler_calls);
+                    let handlers = ReverseRequestHandlers::new().with_modern_roots_list(
+                        move |caller, _, _| {
+                            assert!(caller.blocking_pool_handle().is_none());
+                            observed.fetch_add(1, Ordering::AcqRel);
+                            Box::pin(async {
+                                Ok(crate::FinalEmbeddedRootsListResult { roots: Vec::new() })
+                            })
+                        },
+                    );
+                    let (mut client, mut peer) = connected_with(
+                        &cx,
+                        MemoryClient::builder(info())
+                            .with_tasks()
+                            .reverse_request_handlers(handlers),
+                    )
+                    .await;
+                    let cancellation = McpRequestCancellation::new();
+                    let mut sibling = client
+                        .execute_core(&cx, &cancellation, "tools/list", json!({}))
+                        .await
+                        .unwrap();
+                    receive(&cx, &mut peer, "tools/list", Some(2)).await;
+                    let mut server = cx.spawn(move |peer_cx| async move {
+                        let request = receive(&peer_cx, &mut peer, "tools/call", Some(3)).await;
+                        assert_tasks_metadata(&request);
+                        let original = request.params.unwrap();
+                        assert_eq!(original["name"], "interactive");
+                        assert_eq!(original["arguments"], json!({"value": "résumé 東京"}));
+                        for (id, challenge) in [
+                            (3, input_required()),
+                            (4, json!({"resultType": "input_required", "requestState": "opaque-second-state"})),
+                        ] {
+                            peer.send_async(&peer_cx, &response(id, challenge.clone())).await.unwrap();
+                            let retry = receive(&peer_cx, &mut peer, "tools/call", Some(id + 1)).await;
+                            assert_tasks_metadata(&retry);
+                            let mut parameters = retry.params.unwrap();
+                            assert_eq!(parameters.get("requestState"), challenge.get("requestState"));
+                            let answers = parameters.as_object_mut().unwrap().remove("inputResponses");
+                            if id == 3 {
+                                assert_eq!(answers, Some(json!({"roots": {"roots": []}})));
+                            } else {
+                                assert!(answers.is_none(), "state-only round must not reuse an earlier answer");
+                            }
+                            parameters.as_object_mut().unwrap().remove("requestState");
+                            assert_eq!(parameters, original, "continuation must retain the original request and authority");
+                        }
+                        peer.send_async(&peer_cx, &response(2, tools())).await.unwrap();
+                        let terminal = if create_task {
+                            task_receipt()
+                        } else {
+                            let mut value = task_receipt();
+                            value["resultType"] = json!("complete");
+                            value["content"] = json!([]);
+                            for key in ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"] {
+                                value.as_object_mut().unwrap().remove(key);
+                            }
+                            value
+                        };
+                        peer.send_async(&peer_cx, &response(5, terminal)).await.unwrap();
+                        peer
+                    }).unwrap();
+                    let mut responder_calls = 0;
+                    let outcome = if installed {
+                        client
+                            .call_tool_final_outcome_with_handlers(
+                                &cx,
+                                &cancellation,
+                                "interactive",
+                                json!({"value": "résumé 東京"}),
+                            )
+                            .await
+                    } else {
+                        client
+                            .call_tool_final_outcome_with_mrtr_retry(
+                                &cx,
+                                &cancellation,
+                                Instant::now() + Duration::from_secs(3),
+                                "interactive",
+                                json!({"value": "résumé 東京"}),
+                                |input| {
+                                    responder_calls += 1;
+                                    Ok(roots_answers(input))
+                                },
+                            )
+                            .await
+                    }
+                    .unwrap();
+                    let source = match outcome {
+                        FinalToolCallOutcome::Task(created) if create_task => {
+                            assert_eq!(
+                                created.task.base().task_id.as_str(),
+                                "memory-created-after-input"
+                            );
+                            serde_json::to_string(&created).unwrap()
+                        }
+                        FinalToolCallOutcome::Complete(complete) if !create_task => {
+                            fastmcp_protocol::encode_complete_result(
+                                &complete.meta,
+                                Vec::new(),
+                                &[],
+                                &complete.extras,
+                            )
+                            .unwrap()
+                        }
+                        outcome => panic!("unexpected MRTR final outcome: {outcome:?}"),
+                    };
+                    assert!(
+                        source.contains("7.30e-2"),
+                        "exact numeric result spelling survives"
+                    );
+                    assert!(source.contains("résumé 東京"));
+                    assert_eq!(
+                        handler_calls.load(Ordering::Acquire),
+                        usize::from(installed)
+                    );
+                    assert_eq!(responder_calls, if installed { 0 } else { 2 });
+                    assert!(matches!(
+                        client.next_event(&cx, &cancellation, &mut sibling).await.unwrap(),
+                        Some(MemoryRequestEvent::Result(result))
+                            if matches!(*result, CoreResult::Final(FinalCoreResult::ToolsList { .. })),
+                    ));
+                    assert_eq!(
+                        client.next_id, 6,
+                        "one request per admitted round and no implicit task polling"
+                    );
+                    assert!(client.take_cancellation_events().is_empty());
+                    let _peer = server.join(&cx).await.unwrap();
+                    client.close(&cx).unwrap();
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn memory_tasks_mrtr_rejects_unadvertised_input_before_host_effects() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx).await;
+            let mut server = cx.spawn(move |peer_cx| async move {
+                let request = receive(&peer_cx, &mut peer, "tools/call", Some(2)).await;
+                assert_tasks_metadata(&request);
+                assert!(request.params.unwrap()["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                    .get("roots").is_none());
+                peer.send_async(&peer_cx, &response(2, input_required())).await.unwrap();
+                // The next ID belongs to a fresh ordinary request, never a
+                // continuation authorized by unadvertised host capability.
+                receive(&peer_cx, &mut peer, "tools/list", Some(3)).await;
+                peer.send_async(&peer_cx, &response(3, tools())).await.unwrap();
+                peer
+            }).unwrap();
+            let mut calls = 0;
+            let cancellation = McpRequestCancellation::new();
+            let error = client
+                .call_tool_final_outcome_with_mrtr_retry(
+                    &cx,
+                    &cancellation,
+                    Instant::now() + Duration::from_secs(3),
+                    "interactive",
+                    json!({}),
+                    |input| {
+                        calls += 1;
+                        Ok(roots_answers(input))
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(calls, 0);
+            assert_eq!(client.next_id, 3);
+            assert!(client.tasks_active());
+            assert!(client.take_cancellation_events().is_empty());
+            client.list_tools(&cx, &cancellation, None).await.unwrap();
+            let _peer = server.join(&cx).await.unwrap();
+            client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn memory_tasks_mrtr_cancelled_or_invalid_answers_publish_no_continuation() {
+        run(|cx| async move {
+            for cancel in [false, true] {
+                let (mut client, mut peer) = connected_with(
+                    &cx,
+                    MemoryClient::builder(info())
+                        .with_tasks()
+                        .capabilities(serde_json::from_value(json!({"roots": {}})).unwrap()),
+                )
+                .await;
+                let mut server = cx
+                    .spawn(move |peer_cx| async move {
+                        receive(&peer_cx, &mut peer, "tools/call", Some(2)).await;
+                        peer.send_async(&peer_cx, &response(2, input_required()))
+                            .await
+                            .unwrap();
+                        receive(&peer_cx, &mut peer, "tools/list", Some(3)).await;
+                        peer.send_async(&peer_cx, &response(3, tools()))
+                            .await
+                            .unwrap();
+                        peer
+                    })
+                    .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let mut calls = 0;
+                let error = client
+                    .call_tool_final_outcome_with_mrtr_retry(
+                        &cx,
+                        &cancellation,
+                        Instant::now() + Duration::from_secs(3),
+                        "interactive",
+                        json!({}),
+                        |input| {
+                            calls += 1;
+                            if cancel {
+                                cancellation.cancel();
+                                Ok(roots_answers(input))
+                            } else {
+                                Ok(MrtrInputResponses::new())
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    if cancel {
+                        McpErrorCode::RequestCancelled
+                    } else {
+                        McpErrorCode::InvalidParams
+                    }
+                );
+                assert_eq!(calls, 1);
+                assert_eq!(client.next_id, 3);
+                assert!(client.tasks_active());
+                assert!(client.take_cancellation_events().is_empty());
+                client
+                    .list_tools(&cx, &McpRequestCancellation::new(), None)
+                    .await
+                    .unwrap();
+                let _peer = server.join(&cx).await.unwrap();
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn memory_tasks_mrtr_does_not_activate_tasks_for_ordinary_calls() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected_with(
+                &cx,
+                MemoryClient::builder(info())
+                    .with_tasks()
+                    .capabilities(serde_json::from_value(json!({"roots": {}})).unwrap()),
+            )
+            .await;
+            let mut server = cx.spawn(move |peer_cx| async move {
+                for id in [2, 3] {
+                    let request = receive(&peer_cx, &mut peer, "tools/call", Some(id)).await;
+                    assert!(request.params.unwrap()["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                        ["extensions"].get(TASKS).is_none());
+                    peer.send_async(&peer_cx, &response(id, if id == 2 { input_required() } else { task_receipt() }))
+                        .await.unwrap();
+                }
+                receive(&peer_cx, &mut peer, "tools/list", Some(4)).await;
+                peer.send_async(&peer_cx, &response(4, tools())).await.unwrap();
+                peer
+            }).unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let error = client
+                .call_tool_with_mrtr_retry(
+                    &cx,
+                    &cancellation,
+                    Instant::now() + Duration::from_secs(3),
+                    "interactive",
+                    json!({}),
+                    |input| Ok(roots_answers(input)),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(client.next_id, 4);
+            client.list_tools(&cx, &cancellation, None).await.unwrap();
+            let _peer = server.join(&cx).await.unwrap();
+            client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn memory_tasks_mrtr_deadline_retires_only_the_pending_continuation() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected_with(
+                &cx,
+                MemoryClient::builder(info())
+                    .with_tasks()
+                    .capabilities(serde_json::from_value(json!({"roots": {}})).unwrap()),
+            )
+            .await;
+            let mut server = cx
+                .spawn(move |peer_cx| async move {
+                    receive(&peer_cx, &mut peer, "tools/call", Some(2)).await;
+                    peer.send_async(&peer_cx, &response(2, input_required()))
+                        .await
+                        .unwrap();
+                    let retry = receive(&peer_cx, &mut peer, "tools/call", Some(3)).await;
+                    assert_tasks_metadata(&retry);
+                    assert_eq!(retry.params.unwrap()["requestState"], "opaque-first-state");
+                    // No result: the originating operation bound must retire this
+                    // owner even while the ordinary response timer is still live.
+                    let cancel =
+                        receive(&peer_cx, &mut peer, "notifications/cancelled", None).await;
+                    assert_eq!(cancel.params.unwrap()["requestId"], 3);
+                    peer.send_async(&peer_cx, &response(3, task_receipt()))
+                        .await
+                        .unwrap();
+                    receive(&peer_cx, &mut peer, "tools/list", Some(4)).await;
+                    peer.send_async(&peer_cx, &response(4, tools()))
+                        .await
+                        .unwrap();
+                    peer
+                })
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let error = client
+                .call_tool_final_outcome_with_mrtr_retry(
+                    &cx,
+                    &cancellation,
+                    Instant::now() + Duration::from_millis(300),
+                    "interactive",
+                    json!({}),
+                    |input| Ok(roots_answers(input)),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.data.unwrap()["timeoutSource"], "absolute");
+            assert_eq!(client.next_id, 4, "a timeout cannot replay a creating call");
+            assert!(client.tasks_active());
+            client.list_tools(&cx, &cancellation, None).await.unwrap();
+            assert_eq!(client.take_cancellation_events().len(), 1);
+            let _peer = server.join(&cx).await.unwrap();
+            client.close(&cx).unwrap();
+        });
     }
 
     #[test]
