@@ -1144,6 +1144,65 @@ fn enterprise_protected_credential_revoke_wakes_pending_read_and_cannot_cancel_s
 }
 
 #[test]
+fn enterprise_protected_credential_poisoned_lock_still_revokes_and_wakes_pending_owners() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let fixture = CredentialStoreFixture::new(&cx).await;
+        let selected = profile(&["read"]);
+        let mappings = subject_mappings(&selected);
+        let snapshot = mappings.snapshot();
+        let (provider, revision) = provision(
+            &cx,
+            &fixture,
+            binding(&selected, snapshot, EnterpriseCredentialRole::Idp),
+            "test-poisoned-generation-secret",
+        )
+        .await;
+        let pending = provider
+            .select(&selected, snapshot, EnterpriseCredentialRole::Idp)
+            .unwrap();
+        let wake = Arc::new(CountWakes::default());
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut context = Context::from_waker(&waker);
+        let mut notified = Box::pin(pending.revoked());
+        assert!(notified.as_mut().poll(&mut context).is_pending());
+
+        // Simulate the exceptional path in which an application panic poisons
+        // the generation mutex. Selection and rotation must still fail closed,
+        // but revocation must deliver the wakeup to existing leases.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = provider.current.lock().unwrap();
+            panic!("planted generation-lock poison");
+        }));
+        assert!(poisoned.is_err());
+        assert!(provider.current.is_poisoned());
+        let before = wake.0.load(Ordering::Acquire);
+
+        provider.revoke();
+        assert!(wake.0.load(Ordering::Acquire) > before);
+        assert!(notified.as_mut().poll(&mut context).is_ready());
+        assert_eq!(pending.check(), Err(EnterpriseCredentialError::Revoked));
+        assert_eq!(provider.active_generation.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            provider.select(&selected, snapshot, EnterpriseCredentialRole::Idp),
+            Err(EnterpriseCredentialError::StoreUnavailable)
+        ));
+        assert_eq!(
+            provider.rotate(
+                &revision,
+                revision,
+                2,
+                Instant::now() + Duration::from_secs(60),
+            ),
+            Err(EnterpriseCredentialError::StoreUnavailable)
+        );
+        // Repeated revoke stays idempotent and never cancels the caller.
+        provider.revoke();
+        assert!(cx.checkpoint().is_ok());
+    });
+}
+
+#[test]
 fn enterprise_protected_credential_invalid_store_receipt_quarantines_previously_acquired_leases() {
     run(async {
         let cx = Cx::current().unwrap();

@@ -258,14 +258,19 @@ impl EnterpriseClientCredentialProvider {
     /// Irreversibly revokes this provider and wakes its pending acquisitions or
     /// exchanges. It never cancels the caller's shared context or other roles.
     pub fn revoke(&self) {
-        if let Ok(current) = self.current.lock() {
-            self.active_generation.store(0, Ordering::Release);
-            let cancellation = current.cancellation.clone();
-            drop(current);
-            cancellation.cancel();
-        } else {
-            self.active_generation.store(0, Ordering::Release);
-        }
+        // Revocation is the fail-closed path: even a poisoned generation lock
+        // must not strand an already-admitted reader waiting for cancellation.
+        // Keep the generation fence and token snapshot serialized with rotate;
+        // ordinary select/rotate still refuse poisoned state.
+        let current = match self.current.lock() {
+            Ok(current) => current,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.active_generation.store(0, Ordering::Release);
+        let cancellation = current.cancellation.clone();
+        drop(current);
+        // Wake callbacks only after releasing the mutex.
+        cancellation.cancel();
     }
 
     pub(super) fn select(
@@ -285,7 +290,7 @@ impl EnterpriseClientCredentialProvider {
                 .current
                 .lock()
                 .map_err(|_| EnterpriseCredentialError::StoreUnavailable)?;
-            Arc::clone(&current)
+            Arc::clone(&*current)
         };
         let pending = PendingEnterpriseCredential {
             generation,
