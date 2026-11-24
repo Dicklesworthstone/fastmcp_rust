@@ -1170,7 +1170,8 @@ pub use fastmcp_client::{
     MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
     MAX_HTTP_RETAINED_EXECUTION_BYTES, MemoryClient, MemoryClientBuilder, MemoryExtensionEvent,
     MemoryExtensionExecution, MemoryRequestEvent, MemoryRequestExecution, MemorySubscriptionEvent,
-    MemorySubscriptionExecution, OpaquePagination, PaginationBounds, PendingRequestRecord,
+    MemorySubscriptionExecution, MrtrResponderFuture, OpaquePagination, PaginationBounds,
+    PendingRequestRecord,
     ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
     RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
     StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
@@ -1319,7 +1320,8 @@ pub mod auto {
     pub use fastmcp_protocol::schema::FINAL_JSON_SCHEMA_DIALECT;
     pub use fastmcp_protocol::{
         AdmittedSchema, ClientCapabilities, ClientInfo, CoreResult, FinalCallToolResult,
-        FinalCoreResultType, FinalGetPromptResult, FinalReadResourceResult, JsonRpcRequest,
+        FinalCoreResult, FinalCoreResultType, FinalGetPromptResult, FinalReadResourceResult,
+        JsonRpcRequest,
         JsonRpcResponse, RequestId, ReversibleResourceTemplate, SchemaAdmissionError,
         TemplateValue, TemplateValues, UriTemplate, UriTemplateError, UriTemplateExpansionLimits,
         ValidationError, ValidationResult, admit_final_schema, validate_final_core_result,
@@ -1931,6 +1933,116 @@ pub mod auto {
         {
             self.inner
                 .notify_final_extension(cx, extension_id, method, parameters)
+                .await
+        }
+
+
+        /// Calls a modern tool with an asynchronous, operation-local input responder.
+        ///
+        /// The future runs on the supplied context and is dropped on cancellation
+        /// or deadline expiry. Exact-2024 sessions reject before any frame is sent.
+        /// The complete typed result retains its metadata and unknown members.
+        pub async fn call_tool_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<fastmcp_protocol::FinalCoreResult>
+        where
+            F: for<'cx> FnMut(
+                &'cx Cx,
+                &'cx crate::InputRequiredResult,
+            ) -> fastmcp_client::MrtrResponderFuture<'cx>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_with_async_mrtr_retry(
+                    cx, cancellation, deadline, name, arguments, respond,
+                )
+                .await
+        }
+
+        /// Reads a modern resource with a caller-owned asynchronous responder.
+        ///
+        /// Capability admission precedes application work; the original URI,
+        /// cancellation token, and absolute deadline apply to every round.
+        /// Metadata and unknown result members remain available to the caller.
+        pub async fn read_resource_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            deadline: std::time::Instant,
+            uri: &str,
+            respond: F,
+        ) -> McpResult<fastmcp_protocol::FinalCoreResult>
+        where
+            F: for<'cx> FnMut(
+                &'cx Cx,
+                &'cx crate::InputRequiredResult,
+            ) -> fastmcp_client::MrtrResponderFuture<'cx>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .read_resource_with_async_mrtr_retry(cx, cancellation, deadline, uri, respond)
+                .await
+        }
+
+        /// Gets a modern prompt with a caller-owned asynchronous responder.
+        ///
+        /// Invalid or late answers cannot publish a continuation, and a failed
+        /// transport request is never automatically retried. The complete
+        /// typed result preserves metadata and unknown members.
+        pub async fn get_prompt_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            respond: F,
+        ) -> McpResult<fastmcp_protocol::FinalCoreResult>
+        where
+            F: for<'cx> FnMut(
+                &'cx Cx,
+                &'cx crate::InputRequiredResult,
+            ) -> fastmcp_client::MrtrResponderFuture<'cx>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .get_prompt_with_async_mrtr_retry(
+                    cx, cancellation, deadline, name, arguments, respond,
+                )
+                .await
+        }
+
+        /// Calls a Tasks-capable tool with an asynchronous input responder.
+        ///
+        /// A Task receipt already admitted by the native receiver remains
+        /// available even if cancellation arrives in the same receive poll.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<crate::FinalToolCallOutcome>
+        where
+            F: for<'cx> FnMut(
+                &'cx Cx,
+                &'cx crate::InputRequiredResult,
+            ) -> fastmcp_client::MrtrResponderFuture<'cx>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_final_outcome_with_async_mrtr_retry(
+                    cx, cancellation, deadline, name, arguments, respond,
+                )
                 .await
         }
 
@@ -5411,6 +5523,118 @@ pub mod modern {
         {
             self.inner
                 .notify_final_extension(cx, extension_id, method, parameters)
+                .await
+        }
+
+
+        /// Calls a tool with an asynchronous, operation-local input responder.
+        ///
+        /// The responder borrows this round's input and the original caller
+        /// context. Cancellation or deadline expiry drops its pending future
+        /// before another continuation can be sent. The complete typed result
+        /// retains its metadata and unknown members.
+        pub async fn call_tool_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: for<'cx> FnMut(
+                &'cx Cx,
+                &'cx InputRequiredResult,
+            ) -> MrtrResponderFuture<'cx>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_with_async_mrtr_retry(
+                    cx, cancellation, deadline, name, arguments, respond,
+                )
+                .await
+        }
+
+        /// Reads a resource with a caller-owned asynchronous responder.
+        ///
+        /// Complete input admission precedes application work; the original
+        /// URI, cancellation token, and absolute deadline cover every round.
+        /// Metadata and unknown result members remain available to the caller.
+        pub async fn read_resource_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            uri: &str,
+            respond: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: for<'cx> FnMut(
+                &'cx Cx,
+                &'cx InputRequiredResult,
+            ) -> MrtrResponderFuture<'cx>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .read_resource_with_async_mrtr_retry(cx, cancellation, deadline, uri, respond)
+                .await
+        }
+
+        /// Gets a prompt with a caller-owned asynchronous responder.
+        ///
+        /// Invalid or late answers cannot publish a continuation, and a failed
+        /// transport request is never automatically retried. The complete
+        /// typed result preserves metadata and unknown members.
+        pub async fn get_prompt_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            respond: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: for<'cx> FnMut(
+                &'cx Cx,
+                &'cx InputRequiredResult,
+            ) -> MrtrResponderFuture<'cx>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .get_prompt_with_async_mrtr_retry(
+                    cx, cancellation, deadline, name, arguments, respond,
+                )
+                .await
+        }
+
+        /// Calls a Tasks-capable tool with an asynchronous input responder.
+        ///
+        /// Complete, Task, and input-required outcomes retain their distinct
+        /// types. A Task receipt already admitted by the receiver survives
+        /// cancellation in the same receive poll.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<FinalToolCallOutcome>
+        where
+            F: for<'cx> FnMut(
+                &'cx Cx,
+                &'cx InputRequiredResult,
+            ) -> MrtrResponderFuture<'cx>,
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_final_outcome_with_async_mrtr_retry(
+                    cx, cancellation, deadline, name, arguments, respond,
+                )
                 .await
         }
 

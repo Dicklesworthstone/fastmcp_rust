@@ -1766,7 +1766,7 @@ own token acquisition and refresh. Credentials require HTTPS and a modern or
 auto protocol policy. Core-only builds omit Tasks from help and explain
 the required feature when a Tasks command is attempted.
 
-### Awaiting application input during a memory request
+### Awaiting application input during a request
 
 The memory client offers `call_tool_with_async_mrtr_retry`,
 `read_resource_with_async_mrtr_retry`, and
@@ -1790,6 +1790,19 @@ With `tasks` enabled, use
 negotiation through the same continuation driver. An admitted Task receipt
 still survives cancellation in the same final poll. This method does not
 observe or cancel the resulting Task.
+
+With `websocket-experimental` enabled, native WebSocket clients expose the
+same three async responder methods, including the `modern::WebSocketClient`
+and `auto::WebSocketClient` facades. They accept the explicit cancellation
+token and keep one absolute deadline across the entire exchange, capped by the
+configured request timeout. Auto sessions selected to exact 2024 reject these
+modern-only operations before writing a frame.
+
+With `tasks` enabled as well, the WebSocket facades expose
+`call_tool_outcome_with_async_mrtr_retry`; the underlying client calls it
+`call_tool_final_outcome_with_async_mrtr_retry`. Tasks capability negotiation
+and accepted receipt handling follow the same rules as their synchronous
+responder counterparts.
 
 ### Observing a Task returned by a tool
 

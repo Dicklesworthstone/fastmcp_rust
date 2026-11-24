@@ -6546,12 +6546,6 @@ impl WebSocketConnectDeadline {
     }
 }
 
-#[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
-enum WebSocketTaskMrtrResponder<F = fn(&InputRequiredResult) -> McpResult<MrtrInputResponses>> {
-    Installed(ReverseRequestHandlers),
-    Caller(F),
-}
-
 /// Caller-`Cx` asynchronous MCP client over a native WebSocket transport.
 ///
 /// The client owns one source-preserving receive half and one independently
@@ -10443,176 +10437,248 @@ where
 
     /// Calls a modern tool and follows bounded input-required MRTR rounds.
     ///
-    /// The supplied deadline caps every response wait and is checked after
-    /// each synchronous responder returns. A retry cannot restart the caller's
-    /// absolute time budget. Each complete input batch must satisfy the
-    /// original request's advertised capabilities and remaining total input
-    /// budget before `respond` runs; advisory sampling context is retained
-    /// for the caller's policy.
+    /// The earlier of the supplied deadline and the configured absolute timeout
+    /// bounds the whole operation. Each complete input batch must satisfy the
+    /// original advertised capabilities and remaining response budget before
+    /// the synchronous responder runs. Its result is checked for cancellation
+    /// and expiry before any continuation is sent.
     pub async fn call_tool_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
         deadline: Instant,
         name: &str,
         arguments: serde_json::Value,
-        mut respond: F,
+        respond: F,
     ) -> McpResult<FinalCoreResult>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
         IO: Send + 'static,
     {
-        self.require_modern("tools/call")?;
-        let limits =
-            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?;
-        let mut driver = MrtrDriver::new(cx, deadline, limits)?;
-        let original_parameters = serde_json::json!({
-            "name": name,
-            "arguments": arguments,
-        });
-        let original_parameters = self.with_modern_request_metadata(original_parameters)?;
-        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
-        let mut parameters = original_parameters.clone();
+        self.follow_core_mrtr(
+            cx,
+            None,
+            deadline,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            OperationMrtrResponder::<F, AsyncMrtrResponderFn>::Caller(respond),
+        )
+        .await
+    }
 
-        loop {
-            driver.before_request()?;
-            let result = self
-                .request_core_verb_with_options(cx, None, Some(deadline), "tools/call", parameters)
-                .await?;
-            check_mrtr_operation(cx, None, deadline)?;
-            let Some(input_required) = mrtr_input_required_for_method("tools/call", &result) else {
-                let CoreResult::Final(result) = result else {
-                    return Err(McpError::invalid_request(
-                        "Modern WebSocket MRTR received an exact-legacy result",
-                    ));
-                };
-                return require_terminal_websocket_mrtr_result("tools/call", result);
-            };
-            driver.begin_continuation()?;
-            admit_complete_mrtr_input_batch(&mut driver, &capabilities, input_required)?;
-            check_mrtr_operation(cx, None, deadline)?;
-            let input_responses = respond(input_required)?;
-            check_mrtr_operation(cx, None, deadline)?;
-            parameters = mrtr_retry_parameters(
-                original_parameters.clone(),
-                input_required,
-                input_responses,
-            )?;
-        }
+    /// Calls a modern tool with a caller-owned asynchronous input responder.
+    ///
+    /// The complete input batch is admitted before the callback is constructed.
+    /// Its future may borrow the explicit context and input descriptors; every
+    /// poll retains that context's authority. Cancellation, expiry, or dropping
+    /// this operation drops the pending responder without sending a continuation.
+    /// The callback must be cancellation-correct and must not detach its work.
+    ///
+    /// All rounds share one absolute deadline, capped by the configured request
+    /// timeout, and the original arguments and capability advertisement. This
+    /// method does not negotiate Tasks or invoke installed reverse handlers.
+    pub async fn call_tool_with_async_mrtr_retry<A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        respond: A,
+    ) -> McpResult<FinalCoreResult>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        IO: Send + 'static,
+    {
+        self.follow_core_mrtr(
+            cx,
+            Some(cancellation),
+            deadline,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            OperationMrtrResponder::<SyncMrtrResponderFn, A>::Async(respond),
+        )
+        .await
     }
 
     /// Reads a modern resource and follows bounded input-required MRTR rounds.
     ///
-    /// The caller-owned deadline caps response waits in the initial read and
-    /// every retry. Synchronous responder results are rechecked before retrying.
+    /// The complete operation shares the earlier of the supplied deadline and
+    /// configured absolute timeout. Synchronous answers are rechecked before
+    /// retrying, and the original resource URI remains unchanged.
     pub async fn read_resource_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
         deadline: Instant,
         uri: &str,
-        mut respond: F,
+        respond: F,
     ) -> McpResult<FinalCoreResult>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
         IO: Send + 'static,
     {
-        self.require_modern("resources/read")?;
-        let limits =
-            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?;
-        let mut driver = MrtrDriver::new(cx, deadline, limits)?;
-        let original_parameters = serde_json::json!({ "uri": uri });
-        let original_parameters = self.with_modern_request_metadata(original_parameters)?;
-        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
-        let mut parameters = original_parameters.clone();
+        self.follow_core_mrtr(
+            cx,
+            None,
+            deadline,
+            "resources/read",
+            serde_json::json!({"uri": uri}),
+            OperationMrtrResponder::<F, AsyncMrtrResponderFn>::Caller(respond),
+        )
+        .await
+    }
 
-        loop {
-            driver.before_request()?;
-            let result = self
-                .request_core_verb_with_options(
-                    cx,
-                    None,
-                    Some(deadline),
-                    "resources/read",
-                    parameters,
-                )
-                .await?;
-            check_mrtr_operation(cx, None, deadline)?;
-            let Some(input_required) = mrtr_input_required_for_method("resources/read", &result)
-            else {
-                let CoreResult::Final(result) = result else {
-                    return Err(McpError::invalid_request(
-                        "Modern WebSocket MRTR received an exact-legacy result",
-                    ));
-                };
-                return require_terminal_websocket_mrtr_result("resources/read", result);
-            };
-            driver.begin_continuation()?;
-            admit_complete_mrtr_input_batch(&mut driver, &capabilities, input_required)?;
-            check_mrtr_operation(cx, None, deadline)?;
-            let input_responses = respond(input_required)?;
-            check_mrtr_operation(cx, None, deadline)?;
-            parameters = mrtr_retry_parameters(
-                original_parameters.clone(),
-                input_required,
-                input_responses,
-            )?;
-        }
+    /// Reads a resource with an asynchronous responder for this operation.
+    ///
+    /// This preserves the capability, deadline, cancellation and borrowing
+    /// contract of [`Self::call_tool_with_async_mrtr_retry`]. Each continuation
+    /// retains the original URI and receives a fresh request ID.
+    pub async fn read_resource_with_async_mrtr_retry<A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        uri: &str,
+        respond: A,
+    ) -> McpResult<FinalCoreResult>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        IO: Send + 'static,
+    {
+        self.follow_core_mrtr(
+            cx,
+            Some(cancellation),
+            deadline,
+            "resources/read",
+            serde_json::json!({"uri": uri}),
+            OperationMrtrResponder::<SyncMrtrResponderFn, A>::Async(respond),
+        )
+        .await
     }
 
     /// Gets a modern prompt and follows bounded input-required MRTR rounds.
     ///
-    /// The caller-owned deadline caps response waits in the initial prompt
-    /// request and every retry. Synchronous responder results are rechecked
-    /// before retrying.
+    /// The complete operation shares the earlier of the supplied deadline and
+    /// configured absolute timeout. Synchronous answers are rechecked before
+    /// retrying, and the original prompt name and arguments remain unchanged.
     pub async fn get_prompt_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
         deadline: Instant,
         name: &str,
         arguments: std::collections::HashMap<String, String>,
-        mut respond: F,
+        respond: F,
     ) -> McpResult<FinalCoreResult>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
         IO: Send + 'static,
     {
-        self.require_modern("prompts/get")?;
-        let limits =
-            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?;
-        let mut driver = MrtrDriver::new(cx, deadline, limits)?;
-        let original_parameters = serde_json::json!({
-            "name": name,
-            "arguments": arguments,
-        });
+        self.follow_core_mrtr(
+            cx,
+            None,
+            deadline,
+            "prompts/get",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            OperationMrtrResponder::<F, AsyncMrtrResponderFn>::Caller(respond),
+        )
+        .await
+    }
+
+    /// Gets a prompt with an asynchronous responder for this operation.
+    ///
+    /// This preserves the capability, deadline, cancellation and borrowing
+    /// contract of [`Self::call_tool_with_async_mrtr_retry`]. Each continuation
+    /// retains the original prompt and arguments and receives a fresh request ID.
+    pub async fn get_prompt_with_async_mrtr_retry<A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        respond: A,
+    ) -> McpResult<FinalCoreResult>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        IO: Send + 'static,
+    {
+        self.follow_core_mrtr(
+            cx,
+            Some(cancellation),
+            deadline,
+            "prompts/get",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            OperationMrtrResponder::<SyncMrtrResponderFn, A>::Async(respond),
+        )
+        .await
+    }
+
+    async fn follow_core_mrtr<F, A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        deadline: Instant,
+        method: &'static str,
+        original_parameters: serde_json::Value,
+        mut responder: OperationMrtrResponder<F, A>,
+    ) -> McpResult<FinalCoreResult>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        IO: Send + 'static,
+    {
+        self.require_modern(method)?;
+        let deadline = deadline.min(mrtr_operation_deadline(cx, self.request_timeout_policy)?);
+        check_mrtr_operation(cx, cancellation, deadline)?;
         let original_parameters = self.with_modern_request_metadata(original_parameters)?;
         let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         let mut parameters = original_parameters.clone();
+        let mut driver = MrtrDriver::new(
+            cx,
+            deadline,
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?,
+        )?;
 
-        loop {
-            driver.before_request()?;
-            let result = self
-                .request_core_verb_with_options(cx, None, Some(deadline), "prompts/get", parameters)
-                .await?;
-            check_mrtr_operation(cx, None, deadline)?;
-            let Some(input_required) = mrtr_input_required_for_method("prompts/get", &result)
-            else {
-                let CoreResult::Final(result) = result else {
-                    return Err(McpError::invalid_request(
-                        "Modern WebSocket MRTR received an exact-legacy result",
-                    ));
+        fastmcp_core::runtime::CallerContextFuture::new(cx, async {
+            loop {
+                driver.before_request()?;
+                check_mrtr_operation(cx, cancellation, deadline)?;
+                let result = self
+                    .request_core_verb_with_options(
+                        cx,
+                        cancellation,
+                        Some(deadline),
+                        method,
+                        parameters,
+                    )
+                    .await?;
+                check_mrtr_operation(cx, cancellation, deadline)?;
+                let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
+                    let CoreResult::Final(result) = result else {
+                        return Err(McpError::invalid_request(
+                            "Modern WebSocket MRTR received an exact-legacy result",
+                        ));
+                    };
+                    return require_terminal_websocket_mrtr_result(method, result);
                 };
-                return require_terminal_websocket_mrtr_result("prompts/get", result);
-            };
-            driver.begin_continuation()?;
-            admit_complete_mrtr_input_batch(&mut driver, &capabilities, input_required)?;
-            check_mrtr_operation(cx, None, deadline)?;
-            let input_responses = respond(input_required)?;
-            check_mrtr_operation(cx, None, deadline)?;
-            parameters = mrtr_retry_parameters(
-                original_parameters.clone(),
-                input_required,
-                input_responses,
-            )?;
-        }
+                driver.begin_continuation()?;
+                let input_responses = responder
+                    .respond(
+                        cx,
+                        cancellation,
+                        deadline,
+                        &mut driver,
+                        &capabilities,
+                        input_required,
+                    )
+                    .await?;
+                parameters = mrtr_retry_parameters(
+                    original_parameters.clone(),
+                    input_required,
+                    input_responses,
+                )?;
+            }
+        })
+        .await
     }
 
     /// Collects a modern subscription stream through its terminal response.
@@ -12187,8 +12253,8 @@ where
         IO: Send + 'static,
     {
         let deadline = mrtr_operation_deadline(cx, self.request_timeout_policy)?;
-        let responder: WebSocketTaskMrtrResponder =
-            WebSocketTaskMrtrResponder::Installed(self.reverse_request_handlers.clone());
+        let responder: OperationMrtrResponder =
+            OperationMrtrResponder::Installed(self.reverse_request_handlers.clone());
         self.follow_tasks_mrtr(cx, cancellation, deadline, name, arguments, responder)
             .await
     }
@@ -12228,23 +12294,61 @@ where
             deadline,
             name,
             arguments,
-            WebSocketTaskMrtrResponder::Caller(respond),
+            OperationMrtrResponder::<F, AsyncMrtrResponderFn>::Caller(respond),
         )
         .await
     }
 
+    /// Calls a Tasks-capable tool with a caller-owned asynchronous responder.
+    ///
+    /// The callback may borrow the caller context and admitted input descriptors.
+    /// Its pending future is bounded by the original cancellation domain and
+    /// absolute deadline, and is dropped before any rejected continuation can
+    /// be sent. The callback must not detach work or rely on being polled after
+    /// cancellation. Installed reverse handlers are not used by this operation.
+    ///
+    /// Each request preserves the original Tasks negotiation and tool arguments.
+    /// An elected Task creation receipt wins same-poll cancellation, so accepted
+    /// server work remains addressable; this method never polls or replays it.
     #[cfg(feature = "tasks")]
-    async fn follow_tasks_mrtr<F>(
+    pub async fn call_tool_final_outcome_with_async_mrtr_retry<A>(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         deadline: Instant,
         name: &str,
         arguments: serde_json::Value,
-        mut responder: WebSocketTaskMrtrResponder<F>,
+        respond: A,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        IO: Send + 'static,
+    {
+        let deadline = deadline.min(mrtr_operation_deadline(cx, self.request_timeout_policy)?);
+        self.follow_tasks_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            name,
+            arguments,
+            OperationMrtrResponder::<SyncMrtrResponderFn, A>::Async(respond),
+        )
+        .await
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn follow_tasks_mrtr<F, A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        mut responder: OperationMrtrResponder<F, A>,
     ) -> McpResult<FinalToolCallOutcome>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
         IO: Send + 'static,
     {
         self.require_final_tasks_result(OFFICIAL_TASKS_RESULT_DISCRIMINATOR)?;
@@ -12290,46 +12394,20 @@ where
                     }) => result,
                     _ => return Err(unexpected_convenience_result("tools/call")),
                 };
-                if matches!(
-                    &responder,
-                    WebSocketTaskMrtrResponder::Installed(handlers)
-                        if !handlers.has_modern_handlers()
-                ) {
+                if !responder.has_handler() {
                     return Ok(FinalToolCallOutcome::InputRequired(input_required));
                 }
                 driver.begin_continuation()?;
-                let input_responses = match &mut responder {
-                    WebSocketTaskMrtrResponder::Installed(handlers) => {
-                        driver.admit_input_responses(
-                            input_required
-                                .input_requests()
-                                .map_or(0, |inputs| inputs.members().len()),
-                        )?;
-                        wait_for_mrtr_operation(
-                            cx,
-                            Some(cancellation),
-                            deadline,
-                            handlers.respond_to_input_required_async(
-                                cx,
-                                &capabilities,
-                                &input_required,
-                                || check_mrtr_operation(cx, Some(cancellation), deadline),
-                            ),
-                        )
-                        .await?
-                    }
-                    WebSocketTaskMrtrResponder::Caller(respond) => {
-                        admit_complete_mrtr_input_batch(
-                            &mut driver,
-                            &capabilities,
-                            &input_required,
-                        )?;
-                        check_mrtr_operation(cx, Some(cancellation), deadline)?;
-                        let responses = respond(&input_required)?;
-                        check_mrtr_operation(cx, Some(cancellation), deadline)?;
-                        responses
-                    }
-                };
+                let input_responses = responder
+                    .respond(
+                        cx,
+                        Some(cancellation),
+                        deadline,
+                        &mut driver,
+                        &capabilities,
+                        &input_required,
+                    )
+                    .await?;
                 parameters = mrtr_retry_parameters(
                     original_parameters.clone(),
                     &input_required,
@@ -39623,6 +39701,420 @@ exec sleep 2
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
+    async fn websocket_async_responder_fixture(
+        cx: &Cx,
+    ) -> (
+        WebSocketClient<asupersync::net::tcp::VirtualTcpStream>,
+        AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream>,
+    ) {
+        let (client_io, mut peer_io) = async_websocket_pair();
+        write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+        let client = WebSocketClient::connect_with_cx(
+            cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            async_websocket_client_info(),
+            serde_json::from_value(serde_json::json!({"roots": {}})).unwrap(),
+            AsyncWsClientTransport::from_upgraded(client_io),
+        )
+        .await
+        .unwrap();
+        let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+        let JsonRpcMessage::Request(discovery) = peer.recv(cx).await.unwrap() else {
+            panic!("expected discovery request");
+        };
+        assert_eq!(discovery.method, "server/discover");
+        assert_eq!(discovery.id, Some(RequestId::Number(1)));
+        (client, peer)
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn invoke_websocket_async_responder<A>(
+        client: &mut WebSocketClient<asupersync::net::tcp::VirtualTcpStream>,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        method: &str,
+        respond: A,
+    ) -> McpResult<FinalCoreResult>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        match method {
+            "tools/call" => {
+                client
+                    .call_tool_with_async_mrtr_retry(
+                        cx,
+                        cancellation,
+                        deadline,
+                        "interactive",
+                        serde_json::json!({"text": "résumé 東京"}),
+                        respond,
+                    )
+                    .await
+            }
+            "resources/read" => {
+                client
+                    .read_resource_with_async_mrtr_retry(
+                        cx,
+                        cancellation,
+                        deadline,
+                        "config://interactive",
+                        respond,
+                    )
+                    .await
+            }
+            "prompts/get" => {
+                client
+                    .get_prompt_with_async_mrtr_retry(
+                        cx,
+                        cancellation,
+                        deadline,
+                        "interactive",
+                        HashMap::from([("text".to_owned(), "résumé 東京".to_owned())]),
+                        respond,
+                    )
+                    .await
+            }
+            _ => panic!("unexpected test method"),
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn drive_websocket_async_responder_request<F>(
+        cx: &Cx,
+        mut operation: Pin<&mut F>,
+        peer: &mut AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream>,
+    ) -> JsonRpcRequest
+    where
+        F: Future + ?Sized,
+        F::Output: std::fmt::Debug,
+    {
+        let mut incoming = Box::pin(peer.recv(cx));
+        asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(3),
+            std::future::poll_fn(|task| {
+                if let Poll::Ready(result) = operation.as_mut().poll(task) {
+                    panic!("operation ended before the expected request: {result:?}");
+                }
+                match incoming.as_mut().poll(task) {
+                    Poll::Ready(Ok(JsonRpcMessage::Request(request))) => Poll::Ready(request),
+                    Poll::Ready(other) => panic!("expected a request frame, got {other:?}"),
+                    Poll::Pending => Poll::Pending,
+                }
+            }),
+        )
+        .await
+        .expect("the operation must send its expected request within the test bound")
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn drive_websocket_async_responder_until_entered<F>(
+        cx: &Cx,
+        mut operation: Pin<&mut F>,
+        entered: &AtomicBool,
+    )
+    where
+        F: Future + ?Sized,
+        F::Output: std::fmt::Debug,
+    {
+        asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(3),
+            std::future::poll_fn(|task| {
+                if entered.load(Ordering::SeqCst) {
+                    return Poll::Ready(());
+                }
+                if let Poll::Ready(result) = operation.as_mut().poll(task) {
+                    panic!("operation ended before its responder entered: {result:?}");
+                }
+                if entered.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("the responder must enter within the test bound");
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_responder_all_verbs_suspend_and_preserve_request_authority() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        fn respond<'a>(
+            caller: &'a Cx,
+            input: &'a InputRequiredResult,
+            entered: Arc<AtomicBool>,
+            mut release: oneshot::Receiver<()>,
+        ) -> MrtrResponderFuture<'a> {
+            assert!(!caller.capabilities().spawn);
+            assert!(!Cx::current().unwrap().capabilities().spawn);
+            Box::pin(async move {
+                entered.store(true, Ordering::SeqCst);
+                release
+                    .recv(caller)
+                    .await
+                    .map_err(|_| McpError::request_cancelled())?;
+                assert!(!caller.capabilities().spawn);
+                assert!(!Cx::current().unwrap().capabilities().spawn);
+                let requests = input.input_requests().unwrap();
+                assert_eq!(requests.members().len(), 1);
+                assert_eq!(requests.members()[0].name, "roots");
+                Ok(BTreeMap::from([(
+                    "roots".to_owned(),
+                    serde_json::json!({"roots": []}),
+                )]))
+            })
+        }
+
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for method in ["tools/call", "resources/read", "prompts/get"] {
+                let (mut client, mut peer) = websocket_async_responder_fixture(&cx).await;
+                peer.send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(2),
+                        serde_json::json!({
+                            "resultType": "input_required",
+                            "inputRequests": {"roots": {"method": "roots/list"}},
+                            "requestState": "retained-state",
+                        }),
+                    )),
+                )
+                .await
+                .unwrap();
+                let caller = {
+                    let _restriction =
+                        Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+                    Cx::current().unwrap()
+                };
+                let cancellation = McpRequestCancellation::new();
+                let entered = Arc::new(AtomicBool::new(false));
+                let observed = Arc::clone(&entered);
+                let (release, receive) = oneshot::channel();
+                let mut receive = Some(receive);
+                let mut operation = Box::pin(invoke_websocket_async_responder(
+                    &mut client,
+                    &caller,
+                    &cancellation,
+                    Instant::now() + Duration::from_secs(3),
+                    method,
+                    move |caller, input| {
+                        respond(
+                            caller,
+                            input,
+                            Arc::clone(&observed),
+                            receive.take().expect("one admitted input round"),
+                        )
+                    },
+                ));
+                let initial =
+                    drive_websocket_async_responder_request(&cx, operation.as_mut(), &mut peer)
+                        .await;
+                drive_websocket_async_responder_until_entered(
+                    &cx,
+                    operation.as_mut(),
+                    &entered,
+                )
+                .await;
+                assert_eq!(initial.method, method);
+                assert_eq!(initial.id, Some(RequestId::Number(2)));
+                let original = initial.params.unwrap();
+                assert!(original["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"].is_object());
+
+                release.send(&cx, ()).expect("release the pending responder");
+                let retry =
+                    drive_websocket_async_responder_request(&cx, operation.as_mut(), &mut peer)
+                        .await;
+                assert_eq!(retry.method, method);
+                assert_eq!(retry.id, Some(RequestId::Number(3)));
+                let mut parameters = retry.params.unwrap();
+                assert_eq!(
+                    parameters.as_object_mut().unwrap().remove("requestState"),
+                    Some(serde_json::json!("retained-state")),
+                );
+                assert_eq!(
+                    parameters.as_object_mut().unwrap().remove("inputResponses"),
+                    Some(serde_json::json!({"roots": {"roots": []}})),
+                );
+                assert_eq!(parameters, original);
+
+                let terminal = match method {
+                    "tools/call" => serde_json::json!({
+                        "resultType": "complete", "content": [], "isError": false,
+                    }),
+                    "resources/read" => serde_json::json!({
+                        "resultType": "complete",
+                        "contents": [{"uri": "config://interactive", "text": "completed"}],
+                        "ttlMs": 0, "cacheScope": "private",
+                    }),
+                    "prompts/get" => serde_json::json!({
+                        "resultType": "complete", "messages": [],
+                    }),
+                    _ => unreachable!(),
+                };
+                peer.send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(3),
+                        terminal,
+                    )),
+                )
+                .await
+                .unwrap();
+                let result = operation.await.unwrap();
+                assert!(matches!(
+                    (method, result),
+                    ("tools/call", FinalCoreResult::ToolsCall { .. })
+                        | ("resources/read", FinalCoreResult::ResourcesRead { .. })
+                        | ("prompts/get", FinalCoreResult::PromptsGet { .. })
+                ));
+                assert_eq!(client.next_id, 4);
+                assert!(client.retired_requests.is_empty());
+                assert!(client.transient_request.is_none());
+                client.close(&cx).await.unwrap();
+                assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                assert!(!cx.is_cancel_requested());
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_responder_cancellation_deadline_and_drop_preserve_connection() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn respond<'a>(
+            caller: &'a Cx,
+            input: &'a InputRequiredResult,
+            entered: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+        ) -> MrtrResponderFuture<'a> {
+            Box::pin(async move {
+                let _dropped = Dropped(dropped);
+                assert!(caller.checkpoint().is_ok());
+                assert_eq!(input.input_requests().unwrap().members()[0].name, "roots");
+                entered.store(true, Ordering::SeqCst);
+                std::future::pending::<McpResult<MrtrInputResponses>>().await
+            })
+        }
+
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for method in ["tools/call", "resources/read", "prompts/get"] {
+                for stop in ["cancellation", "deadline", "drop"] {
+                    let (mut client, mut peer) = websocket_async_responder_fixture(&cx).await;
+                    client.request_timeout_policy = RequestTimeoutPolicy::new(
+                        Duration::from_secs(1),
+                        if stop == "deadline" {
+                            Duration::from_millis(200)
+                        } else {
+                            Duration::from_secs(2)
+                        },
+                    )
+                    .unwrap();
+                    peer.send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(2),
+                            serde_json::json!({
+                                "resultType": "input_required",
+                                "inputRequests": {"roots": {"method": "roots/list"}},
+                            }),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                    let entered = Arc::new(AtomicBool::new(false));
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let observed = Arc::clone(&entered);
+                    let abandoned = Arc::clone(&dropped);
+                    let cancellation = McpRequestCancellation::new();
+                    let mut operation = Box::pin(invoke_websocket_async_responder(
+                        &mut client,
+                        &cx,
+                        &cancellation,
+                        Instant::now() + Duration::from_secs(5),
+                        method,
+                        move |caller, input| {
+                            respond(
+                                caller,
+                                input,
+                                Arc::clone(&observed),
+                                Arc::clone(&abandoned),
+                            )
+                        },
+                    ));
+                    let initial =
+                        drive_websocket_async_responder_request(&cx, operation.as_mut(), &mut peer)
+                            .await;
+                    assert_eq!(initial.method, method);
+                    assert_eq!(initial.id, Some(RequestId::Number(2)));
+                    drive_websocket_async_responder_until_entered(
+                        &cx,
+                        operation.as_mut(),
+                        &entered,
+                    )
+                    .await;
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    if stop == "drop" {
+                        drop(operation);
+                    } else {
+                        if stop == "cancellation" {
+                            cancellation.cancel();
+                        }
+                        let error = asupersync::time::timeout(
+                            cx.now(),
+                            Duration::from_secs(3),
+                            operation,
+                        )
+                        .await
+                        .expect("a stopped caller wakes a responder that never wakes itself")
+                        .unwrap_err();
+                        if stop == "cancellation" {
+                            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                        } else {
+                            assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+                        }
+                    }
+                    assert!(dropped.load(Ordering::SeqCst));
+                    assert_eq!(client.next_id, 3, "no continuation ID was allocated");
+                    assert!(client.transient_request.is_none());
+                    assert!(client.retired_requests.is_empty());
+                    assert!(!client.closed);
+                    peer.send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(3),
+                            async_modern_tools_list_result(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                    client.list_tools(&cx, None).await.unwrap();
+                    let JsonRpcMessage::Request(sibling) = peer.recv(&cx).await.unwrap() else {
+                        panic!("expected the unaffected next request");
+                    };
+                    assert_eq!(sibling.method, "tools/list");
+                    assert_eq!(sibling.id, Some(RequestId::Number(3)));
+                    client.close(&cx).await.unwrap();
+                    assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                    assert!(!cx.is_cancel_requested());
+                }
+            }
+        });
+    }
+
     #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
     async fn websocket_tasks_mrtr_fixture(
         cx: &Cx,
@@ -40219,6 +40711,150 @@ exec sleep 2
                     .await;
                     assert!(!cx.is_cancel_requested());
                 }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_tasks_async_responder_preserves_same_poll_creation_receipt() {
+        fn respond<'a>(
+            caller: &'a Cx,
+            input: &'a InputRequiredResult,
+            entered: Arc<AtomicBool>,
+            mut release: oneshot::Receiver<()>,
+        ) -> MrtrResponderFuture<'a> {
+            Box::pin(async move {
+                caller.checkpoint().map_err(|_| McpError::request_cancelled())?;
+                entered.store(true, Ordering::SeqCst);
+                release
+                    .recv(caller)
+                    .await
+                    .map_err(|_| McpError::request_cancelled())?;
+                Ok(websocket_tasks_mrtr_answers(input))
+            })
+        }
+
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for create_task in [false, true] {
+                let cancellation = McpRequestCancellation::new();
+                let (mut client_io, mut peer_io) = stalled_cancellation_async_websocket_pair();
+                client_io.text_frames_before_stall = 3;
+                client_io.cancel_request_on_response_read = Some(cancellation.clone());
+                let mut discovery = async_modern_discovery_result();
+                discovery["capabilities"]["extensions"] =
+                    serde_json::json!({"io.modelcontextprotocol/tasks": {}});
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": discovery})
+                        .to_string(),
+                )
+                .await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    serde_json::from_value(serde_json::json!({"roots": {}})).unwrap(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                websocket_tasks_mrtr_request(&cx, &mut peer, "server/discover", 1).await;
+                websocket_tasks_mrtr_reply(
+                    &cx,
+                    &mut peer,
+                    2,
+                    serde_json::json!({
+                        "resultType": "input_required",
+                        "inputRequests": {"roots": {"method": "roots/list"}},
+                        "requestState": "before-task",
+                    }),
+                )
+                .await;
+                let entered = Arc::new(AtomicBool::new(false));
+                let observed = Arc::clone(&entered);
+                let (release, receive) = oneshot::channel();
+                let mut receive = Some(receive);
+                let mut operation =
+                    Box::pin(client.call_tool_final_outcome_with_async_mrtr_retry(
+                        &cx,
+                        &cancellation,
+                        Instant::now() + Duration::from_secs(2),
+                        "interactive",
+                        serde_json::json!({}),
+                        move |caller, input| {
+                            respond(
+                                caller,
+                                input,
+                                Arc::clone(&observed),
+                                receive.take().expect("one admitted input round"),
+                            )
+                        },
+                    ));
+                let initial =
+                    drive_websocket_async_responder_request(&cx, operation.as_mut(), &mut peer)
+                        .await;
+                assert_eq!(initial.method, "tools/call");
+                assert_eq!(initial.id, Some(RequestId::Number(2)));
+                let original = initial.params.unwrap();
+                assert_eq!(
+                    original["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]["io.modelcontextprotocol/tasks"],
+                    serde_json::json!({}),
+                );
+                drive_websocket_async_responder_until_entered(
+                    &cx,
+                    operation.as_mut(),
+                    &entered,
+                )
+                .await;
+                assert!(!cancellation.is_cancel_requested());
+                release.send(&cx, ()).expect("release the pending responder");
+                let retry =
+                    drive_websocket_async_responder_request(&cx, operation.as_mut(), &mut peer)
+                        .await;
+                assert_eq!(retry.method, "tools/call");
+                assert_eq!(retry.id, Some(RequestId::Number(3)));
+                let mut parameters = retry.params.unwrap();
+                assert_eq!(
+                    parameters.as_object_mut().unwrap().remove("requestState"),
+                    Some(serde_json::json!("before-task")),
+                );
+                assert_eq!(
+                    parameters.as_object_mut().unwrap().remove("inputResponses"),
+                    Some(serde_json::json!({"roots": {"roots": []}})),
+                );
+                assert_eq!(parameters, original);
+                assert!(!cancellation.is_cancel_requested());
+                websocket_tasks_mrtr_reply(
+                    &cx,
+                    &mut peer,
+                    3,
+                    websocket_tasks_mrtr_terminal(create_task),
+                )
+                .await;
+                let result =
+                    asupersync::time::timeout(cx.now(), Duration::from_secs(3), operation)
+                        .await
+                        .expect("the elected response cannot attempt a stalled fourth text frame");
+                assert!(cancellation.is_cancel_requested());
+                if create_task {
+                    let FinalToolCallOutcome::Task(receipt) = result.unwrap() else {
+                        panic!("accepted server work must remain addressable");
+                    };
+                    assert_eq!(receipt.task.base().task_id.as_str(), "handle-task");
+                    assert!(serde_json::to_string(&receipt).unwrap().contains("1.20e+4"));
+                } else {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                }
+                assert!(client.transient_request.is_none());
+                assert!(client.retired_requests.is_empty());
+                assert_eq!(client.next_id, 4, "the receipt is never polled or replayed");
+                assert!(!client.closed, "no fourth control frame may be sent");
+                client.close(&cx).await.unwrap();
+                assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                assert!(!cx.is_cancel_requested());
             }
         });
     }
