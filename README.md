@@ -3206,6 +3206,12 @@ initial/resumed fairness, active-task exclusions, and bounded retry work.
 Caller cancellation, deadlines, and permission restrictions are checked even
 when a storage provider never wakes.
 
+A running worker also uses these async hooks for its bulk execution-expiry
+maintenance. While that scan is pending, it renews its own exact dispatch lease
+and lets unrelated tasks progress. Task cancellation returns to the existing
+cooperative cleanup window; lease loss prevents further application polls and
+keeps restoration bound to the original owner and generation.
+
 A returned claim stays under restoration custody while the runtime awaits a
 fresh snapshot and checks its exact Task, generation, owner, principal, and
 originating operation. Cancellation or abandonment during that check restores

@@ -9465,24 +9465,6 @@ impl FinalTaskRuntime {
         Ok(Some(committed))
     }
 
-    fn expire_pending_execution(&self, cx: &Cx) -> McpResult<()> {
-        for turn in 0..MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN {
-            cx.checkpoint()
-                .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let Some(candidate) = self.store.next_expired_execution_snapshot()? else {
-                break;
-            };
-            let candidate = self.validate_loaded_task_snapshot(candidate, None)?;
-            self.expire_execution_snapshot(&candidate)?;
-            if turn + 1 == MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN {
-                // Finish large expiry backlogs in subsequent bounded service
-                // turns. Queued wakeups are hints; the scan remains authoritative.
-                self.signal_task_service(candidate.task().base().task_id.clone());
-            }
-        }
-        Ok(())
-    }
-
     fn load_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<FinalTaskSnapshot> {
         self.load_optional_task_snapshot(task_id)?
             .ok_or_else(|| McpError::invalid_params("Task not found"))
@@ -11396,7 +11378,8 @@ impl FinalTaskHandoffExecutor {
             // application work and before renewing durable ownership.
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
-            self.runtime.expire_pending_execution(cx)?;
+            self.expire_pending_execution_with_lease_heartbeat(cx, guard, cancellation_wake)
+                .await?;
             if guard.retire_if_execution_expired()? {
                 return Ok(());
             }

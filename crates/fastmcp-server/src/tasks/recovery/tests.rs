@@ -98,6 +98,9 @@ struct AsyncRecoveryStore {
     sync_calls: AtomicUsize,
     substitute_read: Mutex<Option<FinalTaskSnapshot>>,
     cancel_after_claim: AtomicBool,
+    expiry_caller: Mutex<Option<Cx>>,
+    parked_worker_expiry: AtomicUsize,
+    refuse_renewal_for: Mutex<Option<FinalTaskId>>,
 }
 
 impl AsyncRecoveryStore {
@@ -128,6 +131,9 @@ impl AsyncRecoveryStore {
             sync_calls: AtomicUsize::new(0),
             substitute_read: Mutex::new(None),
             cancel_after_claim: AtomicBool::new(false),
+            expiry_caller: Mutex::new(None),
+            parked_worker_expiry: AtomicUsize::new(0),
+            refuse_renewal_for: Mutex::new(None),
         }
     }
 
@@ -149,13 +155,39 @@ impl AsyncRecoveryStore {
     async fn enter(&self, cx: &Cx, step: Step) -> McpResult<()> {
         self.caller(cx);
         let call = self.calls[step as usize].fetch_add(1, Ordering::SeqCst) + 1;
-        if !matches!(step, Step::InitialScan)
-            || call >= self.initial_pause_from.load(Ordering::SeqCst)
-        {
+        let pause_initial = !matches!(step, Step::InitialScan)
+            || call >= self.initial_pause_from.load(Ordering::SeqCst);
+        let pause_expiry = !matches!(step, Step::ExpiredScan)
+            || self
+                .expiry_caller
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|target| target.task_id() == cx.task_id());
+        if pause_initial && pause_expiry {
+            if matches!(step, Step::ExpiredScan)
+                && self.is_expiry_caller(cx)
+                && !self.gate(step).open.load(Ordering::SeqCst)
+            {
+                self.parked_worker_expiry.fetch_add(1, Ordering::SeqCst);
+            }
             self.gate(step).wait().await;
         }
         self.caller(cx);
         cx.checkpoint().map_err(|_| McpError::request_cancelled())
+    }
+
+    fn is_expiry_caller(&self, cx: &Cx) -> bool {
+        self.expiry_caller
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|target| target.task_id() == cx.task_id())
+    }
+
+    fn pause_worker_expiry(&self, cx: &Cx) {
+        *self.expiry_caller.lock().unwrap() = Some(cx.clone());
+        self.gate(Step::ExpiredScan).close();
     }
 
     fn synchronous(&self) {
@@ -239,8 +271,12 @@ impl FinalTaskStore for AsyncRecoveryStore {
     }
 
     fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
-        // The existing elected worker's maintenance remains a bounded sync
-        // contract. Direct recovery tests forbid this fallback independently.
+        // The targeted worker must use the asynchronous maintenance hook.
+        // Other trusted synchronous operations retain their existing contract.
+        assert!(
+            !Cx::current().is_some_and(|cx| self.is_expiry_caller(&cx)),
+            "busy worker used synchronous bulk expiry"
+        );
         self.synchronous();
         self.inner.next_expired_execution_snapshot()
     }
@@ -433,6 +469,9 @@ impl FinalTaskStore for AsyncRecoveryStore {
         owner_id: &str,
         dispatch_fence: u64,
     ) -> McpResult<bool> {
+        if self.refuse_renewal_for.lock().unwrap().as_ref() == Some(task_id) {
+            return Ok(false);
+        }
         let renewed = self.inner.renew_handoff_dispatch_if_current(
             task_id,
             generation,
@@ -1130,4 +1169,304 @@ fn task_recovery_async_pending_refill_keeps_active_heartbeat_and_settlement_live
             }
         });
     }
+}
+
+/// A parked maintenance scan belongs to exactly one worker. Other workers and
+/// the outer recovery loop keep their own independent storage progress.
+struct MaintenanceSupervisor {
+    store: Arc<AsyncRecoveryStore>,
+    target: FinalTaskId,
+    live: AtomicUsize,
+    target_started: AtomicBool,
+    target_polls: AtomicUsize,
+    cancellation_seen: AtomicBool,
+    cleanup_finished: AtomicBool,
+    sibling_started: AtomicBool,
+    sibling_finished: AtomicBool,
+    release_sibling: Gate,
+}
+
+impl MaintenanceSupervisor {
+    fn new(store: Arc<AsyncRecoveryStore>, target: FinalTaskId) -> Self {
+        let release_sibling = Gate::new();
+        release_sibling.close();
+        Self {
+            store,
+            target,
+            live: AtomicUsize::new(0),
+            target_started: AtomicBool::new(false),
+            target_polls: AtomicUsize::new(0),
+            cancellation_seen: AtomicBool::new(false),
+            cleanup_finished: AtomicBool::new(false),
+            sibling_started: AtomicBool::new(false),
+            sibling_finished: AtomicBool::new(false),
+            release_sibling,
+        }
+    }
+}
+
+impl ApplicationTaskSupervisor for MaintenanceSupervisor {
+    fn resume<'a>(
+        &'a self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        Box::pin(async move {
+            struct Live<'a>(&'a AtomicUsize);
+            impl Drop for Live<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            self.live.fetch_add(1, Ordering::SeqCst);
+            let _live = Live(&self.live);
+            assert!(cx.blocking_pool_handle().is_none());
+            if final_task_handoff_task_id(&handoff) == &self.target {
+                assert!(!self.target_started.swap(true, Ordering::SeqCst));
+                // The first mandatory maintenance pass has already completed.
+                // Only this worker's next pass will encounter the closed gate.
+                self.store.pause_worker_expiry(cx);
+                std::future::poll_fn(|_| {
+                    self.target_polls.fetch_add(1, Ordering::SeqCst);
+                    let requested = match &handoff {
+                        FinalTaskSupervisorHandoff::Initial(work) => {
+                            work.is_cancellation_requested()
+                        }
+                        FinalTaskSupervisorHandoff::Resumed(work) => {
+                            work.is_cancellation_requested()
+                        }
+                    };
+                    match requested {
+                        Ok(true) => {
+                            self.cancellation_seen.store(true, Ordering::SeqCst);
+                            Poll::Ready(Ok(()))
+                        }
+                        Ok(false) => Poll::Pending,
+                        Err(error) => Poll::Ready(Err(error)),
+                    }
+                })
+                .await?;
+                // Cancellation must return to the existing grace loop so
+                // actual asynchronous cleanup can run before terminalization.
+                asupersync::time::sleep(cx.now(), StdDuration::from_millis(1)).await;
+                self.cleanup_finished.store(true, Ordering::SeqCst);
+                Ok(())
+            } else {
+                assert!(!self.sibling_started.swap(true, Ordering::SeqCst));
+                self.release_sibling.wait().await;
+                let result = serde_json::from_value(serde_json::json!({
+                    "content":[{"type":"text","text":"unrelated task completed"}]
+                }))
+                .unwrap();
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(work) => {
+                        work.complete_task(result, None)?;
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(work) => {
+                        work.complete_task(result, None)?;
+                    }
+                }
+                self.sibling_finished.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+    }
+}
+
+fn elected_lease(store: &AsyncRecoveryStore, task_id: &FinalTaskId) -> (u64, String, u64, Instant) {
+    let state = store.inner.state.lock().unwrap();
+    let lease = state
+        .handoff_leases
+        .get(task_id)
+        .expect("worker retains its exact lease");
+    assert!(lease.dispatch_elected);
+    (
+        lease.generation,
+        lease.owner_id.clone(),
+        lease
+            .dispatch_fence
+            .expect("an elected dispatch has a fence"),
+        lease
+            .recovery_expires_at
+            .expect("a dispatch lease remains finite"),
+    )
+}
+
+#[test]
+fn task_recovery_async_worker_maintenance_renews_and_preserves_cancellation_grace() {
+    run(|caller| async move {
+        let host = Cx::current().unwrap();
+        let fixture = Fixture::new();
+        let target = fixture.seed("a-maintenance-target", false);
+        let sibling = fixture.seed("z-maintenance-sibling", false);
+        let task_id = target.task().base().task_id.clone();
+        let sibling_id = sibling.task().base().task_id.clone();
+        let supervisor = Arc::new(MaintenanceSupervisor::new(
+            Arc::clone(&fixture.store),
+            task_id.clone(),
+        ));
+        let mut runner = fixture
+            .runtime
+            .install_task_service(2, supervisor.clone())
+            .unwrap()
+            .with_max_concurrent_handoffs(2)
+            .unwrap();
+        let mut service = Box::pin(runner.run_service(&caller));
+        drive_until(&host, service.as_mut(), || {
+            fixture.store.parked_worker_expiry.load(Ordering::SeqCst) != 0
+                && supervisor.sibling_started.load(Ordering::SeqCst)
+        })
+        .await;
+
+        let original = elected_lease(&fixture.store, &task_id);
+        let sibling_original = elected_lease(&fixture.store, &sibling_id);
+        let application_polls = supervisor.target_polls.load(Ordering::SeqCst);
+        *fixture.store.clock.lock().unwrap() =
+            original.3.checked_sub(StdDuration::from_millis(1)).unwrap();
+        drive_until(&host, service.as_mut(), || {
+            elected_lease(&fixture.store, &task_id).3 > original.3
+                && elected_lease(&fixture.store, &sibling_id).3 > sibling_original.3
+        })
+        .await;
+        let renewed = elected_lease(&fixture.store, &task_id);
+        assert_eq!(renewed.0, original.0);
+        assert_eq!(renewed.1, original.1);
+        assert_eq!(renewed.2, original.2);
+        assert_eq!(
+            supervisor.target_polls.load(Ordering::SeqCst),
+            application_polls
+        );
+        assert_eq!(fixture.store.parked_worker_expiry.load(Ordering::SeqCst), 1);
+
+        // Cross the old lease boundary. A helper that merely waits for storage
+        // would now lose the owner and advance the record generation.
+        *fixture.store.clock.lock().unwrap() = original.3 + StdDuration::from_millis(1);
+        let current = fixture
+            .store
+            .inner
+            .get_task_snapshot(&task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.generation(), target.generation());
+        assert_eq!(elected_lease(&fixture.store, &task_id).2, original.2);
+        assert!(
+            !fixture
+                .store
+                .gate(Step::ExpiredScan)
+                .open
+                .load(Ordering::SeqCst)
+        );
+
+        supervisor.release_sibling.release();
+        drive_until(&host, service.as_mut(), || {
+            supervisor.sibling_finished.load(Ordering::SeqCst)
+        })
+        .await;
+        assert!(matches!(
+            fixture.store.inner.get_task(&sibling_id).unwrap(),
+            Some(FinalTask::Completed { .. }),
+        ));
+        assert!(!supervisor.cancellation_seen.load(Ordering::SeqCst));
+        assert!(
+            !fixture
+                .store
+                .gate(Step::ExpiredScan)
+                .open
+                .load(Ordering::SeqCst)
+        );
+
+        fixture.runtime.cancel_task(&task_id).unwrap();
+        drive_until(&host, service.as_mut(), || {
+            supervisor.cleanup_finished.load(Ordering::SeqCst)
+                && supervisor.live.load(Ordering::SeqCst) == 0
+                && fixture.store.inner.active_task_count() == 0
+        })
+        .await;
+        assert!(supervisor.cancellation_seen.load(Ordering::SeqCst));
+        assert!(matches!(
+            fixture.store.inner.get_task(&task_id).unwrap(),
+            Some(FinalTask::Cancelled(_)),
+        ));
+        assert!(
+            fixture
+                .store
+                .gate(Step::ExpiredScan)
+                .abandoned
+                .load(Ordering::SeqCst)
+                > 0
+        );
+        assert!(
+            !fixture
+                .store
+                .gate(Step::ExpiredScan)
+                .open
+                .load(Ordering::SeqCst)
+        );
+        assert!(
+            caller.checkpoint().is_ok(),
+            "Task cancellation cannot cancel its service"
+        );
+        drop(service);
+        assert!(!fixture.runtime.is_task_service_ready());
+    });
+}
+
+#[test]
+fn task_recovery_async_worker_maintenance_stops_on_lease_loss_without_application_poll() {
+    run(|caller| async move {
+        let host = Cx::current().unwrap();
+        let fixture = Fixture::new();
+        let target = fixture.seed("maintenance-lost-lease", false);
+        let task_id = target.task().base().task_id.clone();
+        let supervisor = Arc::new(MaintenanceSupervisor::new(
+            Arc::clone(&fixture.store),
+            task_id.clone(),
+        ));
+        let mut runner = fixture
+            .runtime
+            .install_task_service(2, supervisor.clone())
+            .unwrap()
+            .with_max_concurrent_handoffs(2)
+            .unwrap();
+        let mut service = Box::pin(runner.run_service(&caller));
+        drive_until(&host, service.as_mut(), || {
+            fixture.store.parked_worker_expiry.load(Ordering::SeqCst) != 0
+        })
+        .await;
+        let application_polls = supervisor.target_polls.load(Ordering::SeqCst);
+        *fixture.store.refuse_renewal_for.lock().unwrap() = Some(task_id.clone());
+        let result =
+            asupersync::time::timeout(host.now(), StdDuration::from_secs(3), service.as_mut())
+                .await
+                .expect("lease refusal must not wait for the maintenance provider");
+        assert!(result.is_err());
+        drop(service);
+        assert_eq!(
+            supervisor.target_polls.load(Ordering::SeqCst),
+            application_polls
+        );
+        assert!(!supervisor.cancellation_seen.load(Ordering::SeqCst));
+        assert!(!supervisor.cleanup_finished.load(Ordering::SeqCst));
+        assert_eq!(supervisor.live.load(Ordering::SeqCst), 0);
+        assert!(!fixture.runtime.is_task_service_ready());
+        assert!(
+            fixture
+                .store
+                .gate(Step::ExpiredScan)
+                .abandoned
+                .load(Ordering::SeqCst)
+                > 0
+        );
+        fixture.assert_recoverable(&target, false);
+        assert!(
+            fixture
+                .store
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .handoff_leases
+                .is_empty()
+        );
+    });
 }
