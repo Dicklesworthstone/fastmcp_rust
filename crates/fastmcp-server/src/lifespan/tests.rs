@@ -766,3 +766,135 @@ fn async_lifespan_native_websocket_gates_upgrade_and_awaits_cleanup() {
         assert_eq!(shutdown.entered.load(Ordering::Acquire), 1);
     });
 }
+
+async fn settle_http_after_gated_child(
+    cx: &Cx,
+    listener_error: Option<McpError>,
+    child_panics: bool,
+    cleanup_fails: bool,
+) -> McpResult<()> {
+    let child_gate = Arc::new(Gate::default());
+    let child_work = Arc::clone(&child_gate);
+    let child_finished = Arc::new(AtomicBool::new(false));
+    let child_observer = Arc::clone(&child_finished);
+    let cleanup = Arc::new(Gate::default());
+    let cleanup_work = Arc::clone(&cleanup);
+    let sync_cleanup = Arc::new(AtomicUsize::new(0));
+    let sync_observer = Arc::clone(&sync_cleanup);
+    let server = Arc::new(
+        Server::new("http-consuming-settlement", "1")
+            .on_shutdown_async(move |_| async move {
+                cleanup_work.enter().await;
+                if cleanup_fails {
+                    Err(McpError::internal_error("planted HTTP cleanup failure"))
+                } else {
+                    Ok(())
+                }
+            })
+            .on_shutdown(move || {
+                sync_observer.fetch_add(1, Ordering::AcqRel);
+            })
+            .build(),
+    );
+    let lifespan = server.start_native_lifespan(cx).await.unwrap();
+    let child = cx
+        .spawn(move |_| async move {
+            child_work.enter().await;
+            child_observer.store(true, Ordering::Release);
+            assert!(!child_panics, "planted HTTP child failure");
+        })
+        .unwrap();
+    child_gate.started().await;
+    let retained = crate::HttpNonquiescentShutdown {
+        children: crate::HttpConnectionChildren {
+            tasks: vec![child],
+            terminal_failures: Vec::new(),
+        },
+        server,
+        listener_error,
+        shutdown_complete: false,
+        lifespan,
+    };
+    let mut settlement = Box::pin(retained.settle(cx));
+    assert!(
+        poll_fn(|task| Poll::Ready(settlement.as_mut().poll(task)))
+            .await
+            .is_pending(),
+        "listener failure must not release a still-live child"
+    );
+    assert_eq!(cleanup.entered.load(Ordering::Acquire), 0);
+    assert_eq!(sync_cleanup.load(Ordering::Acquire), 0);
+    child_gate.release();
+    let mut cleanup_started = Box::pin(cleanup.started());
+    poll_fn(|task| {
+        assert!(
+            settlement.as_mut().poll(task).is_pending(),
+            "settlement must retain pending asynchronous cleanup"
+        );
+        cleanup_started.as_mut().poll(task)
+    })
+    .await;
+    assert!(child_finished.load(Ordering::Acquire));
+    assert_eq!(cleanup.entered.load(Ordering::Acquire), 1);
+    assert_eq!(sync_cleanup.load(Ordering::Acquire), 0);
+    cleanup.release();
+    let result = settlement.await;
+    assert_eq!(cleanup.entered.load(Ordering::Acquire), 1);
+    assert_eq!(sync_cleanup.load(Ordering::Acquire), 1);
+    assert!(cx.checkpoint().is_ok());
+    result
+}
+
+#[test]
+fn http_consuming_settlement_preserves_listener_failure_after_cleanup() {
+    run(|cx| async move {
+        settle_http_after_gated_child(&cx, None, false, false)
+            .await
+            .unwrap();
+        let error = settle_http_after_gated_child(
+            &cx,
+            Some(McpError::internal_error("planted HTTP listener failure")),
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.message, "planted HTTP listener failure");
+    });
+}
+
+#[test]
+fn http_consuming_settlement_prioritizes_child_failure_after_cleanup() {
+    run(|cx| async move {
+        let error = settle_http_after_gated_child(
+            &cx,
+            Some(McpError::internal_error("planted HTTP listener failure")),
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("nonquiescent HTTP child settlement failed")
+        );
+        assert!(!error.message.contains("planted HTTP listener failure"));
+    });
+}
+
+#[test]
+fn http_consuming_settlement_prioritizes_lifespan_failure_after_cleanup() {
+    run(|cx| async move {
+        let error = settle_http_after_gated_child(
+            &cx,
+            Some(McpError::internal_error("planted HTTP listener failure")),
+            false,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("planted HTTP cleanup failure"));
+        assert!(!error.message.contains("planted HTTP listener failure"));
+    });
+}

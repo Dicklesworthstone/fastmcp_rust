@@ -2373,3 +2373,233 @@ fn https_native_metrics_are_opt_in_and_route_collisions_fail_before_binding() {
         running.stop(&cx).await;
     });
 }
+
+#[derive(Default)]
+struct LifespanGate {
+    entered: AtomicUsize,
+    released: std::sync::atomic::AtomicBool,
+    changed: asupersync::sync::Notify,
+}
+
+impl LifespanGate {
+    async fn enter(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+        self.changed
+            .wait_until(|| self.released.load(Ordering::SeqCst))
+            .await;
+    }
+
+    async fn started(&self, cx: &Cx) {
+        asupersync::time::timeout(
+            cx.now(),
+            EXCHANGE_TIMEOUT,
+            self.changed
+                .wait_until(|| self.entered.load(Ordering::SeqCst) > 0),
+        )
+        .await
+        .expect("native HTTPS must drive the configured async lifecycle hook");
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+}
+
+#[test]
+fn https_native_async_lifespan_gates_dispatch_and_retains_cleanup() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let startup = Arc::new(LifespanGate::default());
+        let shutdown = Arc::new(LifespanGate::default());
+        let sync_shutdown = Arc::new(AtomicUsize::new(0));
+        let start = Arc::clone(&startup);
+        let stop = Arc::clone(&shutdown);
+        let sync_stop = Arc::clone(&sync_shutdown);
+        let server = Server::new("native-https-lifespan", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .auth_provider(probe.clone())
+            .tool(probe.clone())
+            .on_startup_async(move |_| async move {
+                start.enter().await;
+                Ok(())
+            })
+            .on_shutdown_async(move |_| async move {
+                stop.enter().await;
+                Ok(())
+            })
+            .on_shutdown(move || {
+                sync_stop.fetch_add(1, Ordering::SeqCst);
+            })
+            .build();
+        let mut running =
+            Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+        startup.started(&cx).await;
+        let address = running.address;
+        let mut request_task = cx
+            .spawn(move |peer| async move { exchange(&peer, address, request(false)).await })
+            .unwrap();
+        asupersync::runtime::yield_now().await;
+        assert!(!request_task.is_finished());
+        assert_eq!(probe.counts(), (0, 0));
+        let snapshot = OperatorSnapshot::capture(&running.operator).unwrap();
+        assert_eq!(snapshot.lifecycle(), OperatorLifecycle::Starting);
+        assert_eq!(snapshot.connections().in_use(), 0);
+
+        startup.release();
+        let response = request_task.join(&cx).await.unwrap().unwrap();
+        success(&decode_wire(&response), false);
+        assert_eq!(probe.counts(), (1, 1));
+        running
+            .owner
+            .cancel_with(CancelKind::User, Some("async HTTPS lifespan test complete"));
+        shutdown.started(&cx).await;
+        let outcome = asupersync::time::timeout(
+            cx.now(),
+            EXCHANGE_TIMEOUT,
+            running.task.as_mut().unwrap().join(&cx),
+        )
+        .await
+        .expect("listener must return retained cleanup within its observation bound")
+        .unwrap()
+        .unwrap();
+        running.task = None;
+        let HttpServerShutdown::Nonquiescent(mut retained) = outcome else {
+            panic!("pending async cleanup must remain caller-owned");
+        };
+        assert_eq!(sync_shutdown.load(Ordering::SeqCst), 0);
+        assert_eq!(shutdown.entered.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            retained.poll_settlement(),
+            fastmcp_server::HttpShutdownSettlement::Pending { remaining: 1 }
+        ));
+        assert!(matches!(
+            retained.settle_for(Duration::from_millis(5)).await,
+            fastmcp_server::HttpShutdownSettlement::Pending { remaining: 1 }
+        ));
+        assert_eq!(shutdown.entered.load(Ordering::SeqCst), 1);
+        shutdown.release();
+        asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, retained.settle(&cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(startup.entered.load(Ordering::SeqCst), 1);
+        assert_eq!(shutdown.entered.load(Ordering::SeqCst), 1);
+        assert_eq!(sync_shutdown.load(Ordering::SeqCst), 1);
+        assert!(cx.checkpoint().is_ok());
+    });
+}
+
+#[test]
+fn https_native_failed_async_startup_cleans_up_without_opening_admission() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let cleanup = Arc::new(LifespanGate::default());
+        let sync_shutdown = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::clone(&cleanup);
+        let sync_stop = Arc::clone(&sync_shutdown);
+        let server = Server::new("native-https-failed-startup", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .auth_provider(probe.clone())
+            .tool(probe.clone())
+            .on_startup_async(|_| async {
+                Err(fastmcp_core::McpError::internal_error(
+                    "planted HTTPS startup failure",
+                ))
+            })
+            .on_shutdown_async(move |_| async move {
+                stop.enter().await;
+                Ok(())
+            })
+            .on_shutdown(move || {
+                sync_stop.fetch_add(1, Ordering::SeqCst);
+            })
+            .build();
+        let mut running =
+            Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+        cleanup.started(&cx).await;
+        let address = running.address;
+        let mut request_task = cx
+            .spawn(move |peer| async move { exchange(&peer, address, request(false)).await })
+            .unwrap();
+        asupersync::runtime::yield_now().await;
+        assert!(!running.task.as_ref().unwrap().is_finished());
+        assert_eq!(sync_shutdown.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.counts(), (0, 0));
+        let snapshot = OperatorSnapshot::capture(&running.operator).unwrap();
+        assert_eq!(snapshot.lifecycle(), OperatorLifecycle::Starting);
+        assert_eq!(snapshot.connections().in_use(), 0);
+
+        cleanup.release();
+        let result = asupersync::time::timeout(
+            cx.now(),
+            EXCHANGE_TIMEOUT,
+            running.task.as_mut().unwrap().join(&cx),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        running.task = None;
+        let error = result.err().expect("failed startup must fail the listener");
+        assert!(error.message.contains("planted HTTPS startup failure"));
+        assert!(request_task.join(&cx).await.unwrap().is_err());
+        assert_eq!(cleanup.entered.load(Ordering::SeqCst), 1);
+        assert_eq!(sync_shutdown.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.counts(), (0, 0));
+        assert!(cx.checkpoint().is_ok());
+    });
+}
+
+#[test]
+fn https_native_async_cleanup_failure_cannot_report_quiescent_success() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&cleanup_calls);
+        let server = Server::new("native-https-failed-cleanup", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .auth_provider(probe.clone())
+            .tool(probe.clone())
+            .on_shutdown_async(move |_| async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err(fastmcp_core::McpError::internal_error(
+                    "planted HTTPS cleanup failure",
+                ))
+            })
+            .build();
+        let mut running =
+            Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+        let response = exchange(&cx, running.address, request(false)).await.unwrap();
+        success(&decode_wire(&response), false);
+        running
+            .owner
+            .cancel_with(CancelKind::User, Some("failing HTTPS cleanup test complete"));
+        let result = asupersync::time::timeout(
+            cx.now(),
+            EXCHANGE_TIMEOUT,
+            running.task.as_mut().unwrap().join(&cx),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        running.task = None;
+        let error = match result {
+            Err(error) => error,
+            Ok(HttpServerShutdown::Nonquiescent(retained)) => {
+                asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, retained.settle(&cx))
+                    .await
+                    .unwrap()
+                    .expect_err("retained cleanup failure must reach the caller")
+            }
+            Ok(HttpServerShutdown::Quiescent) => panic!("failed cleanup is not successful shutdown"),
+        };
+        assert!(error.message.contains("planted HTTPS cleanup failure"));
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.counts(), (1, 1));
+        assert!(cx.checkpoint().is_ok());
+    });
+}

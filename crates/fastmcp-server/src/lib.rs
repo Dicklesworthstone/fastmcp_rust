@@ -10128,6 +10128,10 @@ impl HttpNonquiescentShutdown {
     /// This is intentionally an explicit caller choice: synchronous code can
     /// ignore cancellation indefinitely, so FastMCP never performs this
     /// unbounded join inside the public listener shutdown path.
+    ///
+    /// Child or lifecycle failures take precedence over an earlier listener
+    /// failure. Once cleanup succeeds, any retained listener or hosted Task
+    /// service failure is returned unchanged instead of becoming success.
     pub async fn settle(mut self, cx: &Cx) -> McpResult<()> {
         self.children.reap_finished();
         let mut failures = std::mem::take(&mut self.children.terminal_failures);
@@ -10142,14 +10146,16 @@ impl HttpNonquiescentShutdown {
         }
         self.finish_shutdown();
         failures.extend(std::mem::take(&mut self.children.terminal_failures));
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(McpError::internal_error(format!(
+        if !failures.is_empty() {
+            return Err(McpError::internal_error(format!(
                 "nonquiescent HTTP child settlement failed: {}",
                 failures.join("; ")
-            )))
+            )));
         }
+        if let Some(error) = self.listener_error.take() {
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
