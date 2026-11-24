@@ -20,10 +20,13 @@
 //! - Local revocation is shared by every clone. It stops subsequent header
 //!   construction and wakes managed response readers without changing another
 //!   independently bound credential.
+//! - Each retained token clone uses zeroizing storage. Returned header strings
+//!   remain owned by their callers and are not erased by dropping a credential.
 
 use core::fmt;
 use std::time::Instant;
 
+use asupersync::security::SecretString;
 use fastmcp_core::{AccessToken, McpRequestCancellation};
 
 pub(crate) mod caller;
@@ -114,7 +117,7 @@ impl std::error::Error for BearerBindingError {}
 #[derive(Clone)]
 pub struct BoundBearerCredential {
     resource: CanonicalHttpUrl,
-    token: String,
+    token: SecretString,
     expires_at: Option<Instant>,
     revoked: McpRequestCancellation,
     owner_cancellation: Option<McpRequestCancellation>,
@@ -152,17 +155,19 @@ impl BoundBearerCredential {
         resource: CanonicalHttpUrl,
         token: impl Into<String>,
     ) -> Result<Self, BearerBindingError> {
+        // Take custody before any refusal so both accepted and rejected owned
+        // inputs are wiped when their protected allocation is released.
+        let token = SecretString::from_string(token.into());
         if !resource.as_str().starts_with("https://") {
             return Err(BearerBindingError::CleartextResource);
         }
-        let token = token.into();
         if token.is_empty() {
             return Err(BearerBindingError::EmptyToken);
         }
         // A safe header string is not necessarily a valid Bearer credential.
         // Share the server's grammar and byte cap so direct binding cannot
         // emit a token rejected before the verifier is even called.
-        if !AccessToken::is_valid_token68(&token) {
+        if !AccessToken::is_valid_token68(token.as_str()) {
             return Err(BearerBindingError::InvalidTokenBytes);
         }
         Ok(Self {
@@ -337,7 +342,7 @@ impl BoundBearerCredential {
             && self.expires_at.is_none_or(|deadline| now < deadline)
             && !self.is_revoked()
         {
-            let authorization = format!("Bearer {}", self.token);
+            let authorization = format!("Bearer {}", self.token.as_str());
             // Revocation during allocation must not be ignored. As with any
             // admission check, revocation after this load cannot recall the
             // header returned to its caller.
@@ -350,23 +355,24 @@ impl BoundBearerCredential {
     /// Detects a peer reflecting this credential into an error's diagnostics.
     /// Inspect decoded strings so JSON escaping cannot hide the token.
     pub(crate) fn is_reflected_by_error(&self, error: &fastmcp_protocol::JsonRpcError) -> bool {
-        error.message.contains(&self.token)
+        let token = self.token.as_str();
+        error.message.contains(token)
             || error
                 .data
                 .as_ref()
-                .is_some_and(|data| self.is_reflected_by_value(data))
+                .is_some_and(|data| Self::is_reflected_by_value(data, token))
     }
 
-    fn is_reflected_by_value(&self, value: &serde_json::Value) -> bool {
+    fn is_reflected_by_value(value: &serde_json::Value, token: &str) -> bool {
         match value {
-            serde_json::Value::String(text) => text.contains(&self.token),
+            serde_json::Value::String(text) => text.contains(token),
             serde_json::Value::Array(values) => {
-                values.iter().any(|value| self.is_reflected_by_value(value))
+                values.iter().any(|value| Self::is_reflected_by_value(value, token))
             }
-            serde_json::Value::Object(values) => values
-                .iter()
-                .any(|(key, value)| key.contains(&self.token) || self.is_reflected_by_value(value)),
-            value => value.to_string().contains(&self.token),
+            serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+                key.contains(token) || Self::is_reflected_by_value(value, token)
+            }),
+            value => value.to_string().contains(token),
         }
     }
 }

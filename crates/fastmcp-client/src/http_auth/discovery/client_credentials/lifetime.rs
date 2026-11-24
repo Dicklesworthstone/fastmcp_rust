@@ -235,8 +235,14 @@ impl ClientCredentialsClient {
                     return Ok(ClientCredentialsRemoteRevocation::RegistrationUnavailable);
                 }
             };
-            let grant =
-                prepare_revocation(self, cx, deadline, &endpoint, &token.bearer.token).await?;
+            let grant = prepare_revocation(
+                self,
+                cx,
+                deadline,
+                &endpoint,
+                token.bearer.token.as_str(),
+            )
+            .await?;
             let mut headers = vec![
                 (
                     "Content-Type".to_owned(),

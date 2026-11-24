@@ -169,7 +169,7 @@ impl OAuthClient {
                 cx,
                 deadline,
                 endpoint,
-                &credentials.access.token,
+                credentials.access.token.as_str(),
                 "access_token",
             )
             .await

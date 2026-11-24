@@ -442,10 +442,10 @@ impl DpopSession {
         let proof = self.key.resource_proof(
             method,
             target,
-            &credential.bound.token,
+            credential.bound.token.as_str(),
             self.resource_nonce.as_ref(),
         )?;
-        let authorization = format!("DPoP {}", credential.bound.token);
+        let authorization = format!("DPoP {}", credential.bound.token.as_str());
         // Signing/allocation must not publish a credential whose admission
         // expired or was revoked while this operation was in progress.
         require_credential(credential)?;
