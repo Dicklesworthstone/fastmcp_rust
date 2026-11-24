@@ -500,6 +500,207 @@ fn https_native_authenticated_json_and_sse_preserve_principal_progress_and_paylo
     });
 }
 
+fn subscription_request() -> HttpRequest {
+    HttpRequest::new(HttpMethod::Post, "/mcp")
+        .with_header("host", "localhost")
+        .with_header("origin", ORIGIN)
+        .with_header("authorization", format!("Bearer {TOKEN}"))
+        .with_header("content-type", "application/json")
+        .with_header("accept", "text/event-stream")
+        .with_header("mcp-protocol-version", FINAL_PROTOCOL_VERSION)
+        .with_header("mcp-method", "subscriptions/listen")
+        .with_body(serde_json::to_vec(&json!({
+            "jsonrpc":"2.0", "id":947, "method":"subscriptions/listen",
+            "params": {
+                "notifications":{"toolsListChanged":true},
+                "_meta":{
+                    "io.modelcontextprotocol/protocolVersion":FINAL_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities":{},
+                },
+            },
+        })).unwrap())
+}
+
+async fn subscription_wire_prefix<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    ending: &[u8],
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(ending) {
+        let mut byte = [0_u8; 1];
+        reader.read_exact(&mut byte).await.unwrap();
+        bytes.push(byte[0]);
+        assert!(bytes.len() <= 8192, "bounded subscription response head");
+    }
+    bytes
+}
+
+async fn subscription_wire_chunk<R: AsyncRead + Unpin>(cx: &Cx, reader: &mut R) -> Vec<u8> {
+    asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, async {
+        let size = subscription_wire_prefix(reader, b"\r\n").await;
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&size[..size.len() - 2]).unwrap(), 16,
+        ).unwrap();
+        assert!(size <= 8192, "bounded subscription SSE chunk");
+        let mut bytes = vec![0_u8; size + 2];
+        reader.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[size..], b"\r\n");
+        bytes.truncate(size);
+        bytes
+    }).await.expect("subscription chunk must meet its read deadline")
+}
+
+fn subscription_wire_notification(bytes: &[u8]) -> Value {
+    let frame = std::str::from_utf8(bytes).unwrap();
+    assert!(frame.starts_with("event: message\n"));
+    assert!(frame.ends_with("\n\n"));
+    assert!(!frame.lines().any(|line| line.starts_with("id:") || line.starts_with("retry:")));
+    let data = frame.lines().filter_map(|line| line.strip_prefix("data: ")).collect::<Vec<_>>();
+    assert_eq!(data.len(), 1);
+    serde_json::from_str(data[0]).unwrap()
+}
+
+#[test]
+fn https_native_subscription_keepalives_preserve_quiet_stream_and_graceful_terminal() {
+    run(|cx| async move {
+        for enabled in [true, false] {
+            let probe = Probe::new();
+            let server = Server::new("https-subscription-keepalive", "1")
+                .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+                .http_config(HttpServerConfig::new().subscription_keepalive_interval(
+                    enabled.then_some(Duration::from_millis(40)),
+                ))
+                .auth_provider(probe.clone()).tool(probe.clone()).build();
+            let running = Running::configured(&cx, server, policy(), EXCHANGE_TIMEOUT).await;
+            let tcp = TcpStream::connect(running.address).await.unwrap();
+            let mut peer = connector(true, vec![b"http/1.1".to_vec()])
+                .connect("localhost", tcp).await.unwrap();
+            peer.write_all(&encode(subscription_request())).await.unwrap();
+            peer.flush().await.unwrap();
+            let head = asupersync::time::timeout(
+                cx.now(), EXCHANGE_TIMEOUT, subscription_wire_prefix(&mut peer, b"\r\n\r\n"),
+            ).await.unwrap();
+            assert!(head.starts_with(b"HTTP/1.1 200"));
+            assert!(String::from_utf8(head).unwrap().to_ascii_lowercase().contains("content-type: text/event-stream"));
+            let acknowledgement = subscription_wire_notification(&subscription_wire_chunk(&cx, &mut peer).await);
+            assert_eq!(acknowledgement["method"], "notifications/subscriptions/acknowledged");
+            assert_eq!(acknowledgement["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 947);
+            if enabled {
+                for _ in 0..2 {
+                    assert_eq!(subscription_wire_chunk(&cx, &mut peer).await, b": keepalive\n\n");
+                }
+            } else {
+                let mut byte = [0_u8; 1];
+                assert!(asupersync::time::timeout(
+                    cx.now(), Duration::from_millis(200), peer.read(&mut byte),
+                ).await.is_err(), "disabled keepalives must leave a quiet stream open and silent");
+            }
+            assert_eq!(OperatorSnapshot::capture(&running.operator).unwrap().connections().active, 1);
+            running.owner.cancel_with(CancelKind::User, Some("HTTPS subscription terminal"));
+            let mut terminal_seen = false;
+            let mut closed = false;
+            for _ in 0..16 {
+                let bytes = subscription_wire_chunk(&cx, &mut peer).await;
+                if bytes.is_empty() {
+                    assert!(terminal_seen);
+                    closed = true;
+                    break;
+                }
+                assert!(!terminal_seen, "neither heartbeat nor data may follow the terminal");
+                if bytes == b": keepalive\n\n" {
+                    assert!(enabled);
+                    continue;
+                }
+                let terminal = subscription_wire_notification(&bytes);
+                assert_eq!(terminal["method"], "notifications/cancelled");
+                assert_eq!(terminal["params"]["requestId"], 947);
+                assert_eq!(terminal["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 947);
+                assert!(terminal.get("result").is_none());
+                terminal_seen = true;
+            }
+            assert!(closed);
+            drop(peer);
+            running.stop(&cx).await;
+            assert_eq!(probe.counts(), (1, 0));
+        }
+    });
+}
+
+#[test]
+fn https_native_subscription_revocation_stops_idle_keepalives_and_releases_capacity() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let server = Server::new("https-subscription-revocation", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+            .http_config(HttpServerConfig::new().subscription_keepalive_interval(
+                Some(Duration::from_millis(40)),
+            ))
+            .auth_provider(probe.clone()).tool(probe.clone()).build();
+        let running = Running::configured(&cx, server, policy(), EXCHANGE_TIMEOUT).await;
+        let tcp = TcpStream::connect(running.address).await.unwrap();
+        let mut peer = connector(true, vec![b"http/1.1".to_vec()])
+            .connect("localhost", tcp).await.unwrap();
+        peer.write_all(&encode(subscription_request())).await.unwrap();
+        peer.flush().await.unwrap();
+        let head = asupersync::time::timeout(
+            cx.now(), EXCHANGE_TIMEOUT, subscription_wire_prefix(&mut peer, b"\r\n\r\n"),
+        ).await.unwrap();
+        assert!(head.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(
+            subscription_wire_notification(&subscription_wire_chunk(&cx, &mut peer).await)["method"],
+            "notifications/subscriptions/acknowledged",
+        );
+        assert_eq!(subscription_wire_chunk(&cx, &mut peer).await, b": keepalive\n\n");
+        assert!(probe.verifier.revoke_token(TOKEN).unwrap());
+        let buffered = asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, async {
+            let mut buffered = Vec::new();
+            let mut bytes = [0_u8; 1024];
+            loop {
+                match peer.read(&mut bytes).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        buffered.extend_from_slice(&bytes[..count]);
+                        assert!(buffered.len() <= 8192, "revoked stream kept producing output");
+                    }
+                }
+            }
+            buffered
+        })
+        .await
+        .expect("revoked quiet stream must close without another application event");
+        // Bytes committed before revocation can already be in the socket. A
+        // revoked partial write may also leave an incomplete last comment.
+        // The per-poll guard tests separately prove that it never resumes.
+        let comment = b"D\r\n: keepalive\n\n\r\n";
+        assert!(
+            buffered.iter().enumerate().all(|(index, byte)| *byte == comment[index % comment.len()]),
+            "revoked stream delivered something other than buffered comment bytes",
+        );
+        wait_operator(&running.operator, |snapshot| snapshot.connections().active == 0).await;
+        assert!(running.owner.checkpoint().is_ok());
+        drop(peer);
+        running.stop(&cx).await;
+        assert_eq!(probe.counts(), (1, 0));
+    });
+}
+
+#[test]
+fn native_http_and_https_reject_zero_subscription_keepalive_before_binding() {
+    run(|cx| async move {
+        let make_server = || Server::new("invalid-keepalive", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+            .http_config(HttpServerConfig::new().subscription_keepalive_interval(Some(Duration::ZERO)))
+            .build();
+        let ordinary = make_server().bind_http(&cx, "127.0.0.1:0").await;
+        let secured = Box::pin(make_server().bind_secured_http(&cx, "127.0.0.1:0", policy())).await;
+        let tls = Box::pin(make_server().bind_secured_https(&cx, "127.0.0.1:0", policy(), acceptor())).await;
+        for error in [ordinary.err().unwrap(), secured.err().unwrap(), tls.err().unwrap()] {
+            assert!(error.message.contains("keepalive interval must be nonzero"));
+        }
+        assert!(cx.checkpoint().is_ok());
+    });
+}
+
 #[test]
 fn https_native_enterprise_declaration_preserves_core_dispatch_without_rpc_descriptor() {
     const ENTERPRISE: &str = "io.modelcontextprotocol/enterprise-managed-authorization";

@@ -28,6 +28,7 @@ use super::{
 use crate::{
     AuthDispatchCustody, DualEraHttpEndpointError, DualEraHttpSseResponse,
     FinalSubscriptionTerminalDelivery, Framed, HttpListenerShutdown, HttpNativeConnectionAdmission,
+    HttpSseKeepalive,
     InboundRequestContext, InboundRequestTransport, JsonRpcRequest, LiveModernHttpSession,
     LiveModernHttpSessionRegistry, ModernSseDispatchElection, ModernSseOutcomeGate,
     NativeHttp1Codec, OwnedModernHttpDispatch, Server, ServerHttpEndpoint, ServerHttpEndpointError,
@@ -35,7 +36,8 @@ use crate::{
     close_detached_modern_http_session,
     dispatch_modern_http_request_with_cancellation_and_transport_authorization,
     final_subscription_terminal_event, final_subscription_terminal_response_event, finish_sse_body,
-    guard_subscription_sse_write, h1_request_to_transport, h1_transport_authorization,
+    guard_http_sse_keepalive, guard_subscription_sse_write, h1_request_to_transport,
+    h1_transport_authorization,
     http_endpoint_error_response, http_endpoint_response_to_static, http_request_accepts_sse,
     native_http1_codec, next_live_modern_http_response_body_generation,
     next_modern_http_stream_generation, pop_guarded_sse_body_event, request_id_to_u64,
@@ -791,6 +793,11 @@ async fn sse(
     let sender = response.sender();
     let cancellation = sender.request_cancellation();
     let terminal = Arc::new(FinalSubscriptionTerminalDelivery::default());
+    let mut keepalive = HttpSseKeepalive::new(
+        &server.http_config,
+        request.method == "subscriptions/listen",
+        cx.now(),
+    );
     let (gate, mut election) = ModernSseOutcomeGate::new();
     if request.method == "subscriptions/listen" {
         subscription_drain.register(
@@ -862,6 +869,7 @@ async fn sse(
         guard_response(cx, &mut lease, write_parts(cx, &mut writer, &[&head], io))
             .await
             .map_err(|_| ())??;
+        keepalive.last_write = cx.now();
         let (terminal_control, terminal_response) = loop {
             if let Some(lease) = lease.as_mut() {
                 lease.check_async(cx).await.map_err(|_| ())?;
@@ -887,6 +895,7 @@ async fn sse(
                     )
                     .await
                     .map_err(|_| ())??;
+                    keepalive.event_written(&event, cx.now());
                     if control || complete {
                         break (control, complete);
                     }
@@ -900,7 +909,30 @@ async fn sse(
                     terminal.mark_failed();
                     break (false, false);
                 }
-                Ok(None) => asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await,
+                Ok(None) => {
+                    if let Some(chunk) = keepalive.due_chunk(cx.now()) {
+                        // A heartbeat uses the same authorization lease and
+                        // finite write budget as data. It has no right to
+                        // survive cancellation or a terminal election.
+                        if guard_response(
+                            cx,
+                            &mut lease,
+                            guard_http_sse_keepalive(
+                                cx,
+                                shutdown,
+                                &cancellation,
+                                &terminal,
+                                write_parts(cx, &mut writer, &[chunk], io),
+                            ),
+                        )
+                        .await
+                        .map_err(|_| ())??
+                        {
+                            keepalive.last_write = cx.now();
+                        }
+                    }
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
                 Err(DualEraHttpEndpointError::Transport(TransportError::Closed))
                     if response.is_finished() =>
                 {
@@ -1444,6 +1476,7 @@ mod tests {
 
     #[derive(Default)]
     struct SecuredPeerControl {
+        admit_before_wait: AtomicBool,
         released: [AtomicBool; 2],
         started: [AtomicUsize; 2],
         effects: [AtomicUsize; 2],
@@ -1524,6 +1557,11 @@ mod tests {
                 };
                 self.control.started[slot].fetch_add(1, Ordering::SeqCst);
                 self.events.send(SecuredPeerEvent::Started(slot)).unwrap();
+                if self.control.admit_before_wait.load(Ordering::Acquire)
+                    && arguments["stream"] == true
+                {
+                    ctx.report_progress_exact(0.into(), Some(1.into()), Some("waiting for release"));
+                }
                 loop {
                     if ctx.checkpoint().is_err() || request_cx.is_cancel_requested() {
                         return fastmcp_core::Outcome::Cancelled(asupersync::CancelReason::user(
@@ -1761,6 +1799,94 @@ mod tests {
     fn secured_native_http_half_close_preserves_json_and_sse() {
         for sse in [false, true] {
             run_secured_native_peer_case(sse, None);
+        }
+    }
+
+    #[test]
+    fn secured_native_quiet_sse_probes_preserve_half_close_and_retire_departed_peer() {
+        use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
+        use std::io::{Read, Write};
+
+        for depart in [false, true] {
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+                .blocking_threads(1, 4)
+                .build().unwrap().block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let control = Arc::new(SecuredPeerControl::default());
+                    control.admit_before_wait.store(true, Ordering::Release);
+                    let (events, received) = std::sync::mpsc::channel();
+                    let verifier = crate::StaticTokenVerifier::new([(
+                        "secured-peer-token",
+                        fastmcp_core::AuthContext::with_subject("secured-quiet-peer"),
+                    )]).unwrap();
+                    let policy = HttpSecurityPolicy::new(
+                        HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 4096).unwrap()).unwrap(),
+                        "https://service.example", vec![],
+                    ).unwrap();
+                    let bound = Box::pin(Server::new("secured-quiet-peer", "1")
+                        .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly).unwrap()
+                        .http_config(crate::HttpServerConfig::new().subscription_keepalive_interval(None))
+                        .auth_provider(crate::TokenAuthProvider::new(verifier))
+                        .tool(SecuredPeerTool { control: Arc::clone(&control), events })
+                        .build().bind_secured_http(&cx, "127.0.0.1:0", policy)).await.unwrap();
+                    let address = bound.local_addr().unwrap();
+                    let caller = cx.clone();
+                    let observed = Arc::clone(&control);
+                    let client = std::thread::spawn(move || {
+                        struct Stop(Cx);
+                        impl Drop for Stop {
+                            fn drop(&mut self) {
+                                self.0.cancel_with(asupersync::types::CancelKind::User, Some("quiet SSE peer complete"));
+                            }
+                        }
+                        let _stop = Stop(caller.clone());
+                        let mut peer = std::net::TcpStream::connect(address).unwrap();
+                        peer.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+                        peer.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                        peer.write_all(&secured_peer_request(0, true)).unwrap();
+                        peer.flush().unwrap();
+                        peer.shutdown(std::net::Shutdown::Write).unwrap();
+                        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), SecuredPeerEvent::Started(0));
+                        let mut response = Vec::new();
+                        while !response.windows(4).any(|bytes| bytes == b"\n\n\r\n") {
+                            let mut byte = [0_u8; 1];
+                            peer.read_exact(&mut byte).unwrap();
+                            response.push(byte[0]);
+                            assert!(response.len() < 8192);
+                        }
+                        assert!(String::from_utf8_lossy(&response).contains("notifications/progress"));
+                        assert_eq!(observed.effects[0].load(Ordering::Acquire), 0);
+                        if depart {
+                            peer.shutdown(std::net::Shutdown::Both).unwrap();
+                            drop(peer);
+                            assert_eq!(received.recv_timeout(Duration::from_secs(6)).unwrap(), SecuredPeerEvent::Cancelled(0));
+                            assert_eq!(observed.effects[0].load(Ordering::Acquire), 0);
+                            assert!(caller.checkpoint().is_ok());
+                        } else {
+                            while !response.windows(7).any(|bytes| bytes == b"2\r\n:\n\r\n") {
+                                let mut byte = [0_u8; 1];
+                                peer.read_exact(&mut byte).unwrap();
+                                response.push(byte[0]);
+                                assert!(response.len() < 8192);
+                            }
+                            assert!(!observed.cancelled[0].load(Ordering::Acquire));
+                            observed.released[0].store(true, Ordering::Release);
+                            peer.take(65537).read_to_end(&mut response).unwrap();
+                            assert!(response.len() < 65537);
+                            assert_secured_peer_response(&response, 0, true);
+                        }
+                    });
+                    let shutdown = Box::pin(bound.serve(&cx)).await.unwrap();
+                    let transcript = client.join();
+                    if let crate::HttpServerShutdown::Nonquiescent(shutdown) = shutdown {
+                        shutdown.settle(&cx).await.unwrap();
+                    }
+                    transcript.unwrap();
+                    assert_eq!(control.started[0].load(Ordering::Acquire), 1);
+                    assert_eq!(control.effects[0].load(Ordering::Acquire), usize::from(!depart));
+                    assert_eq!(control.cancelled[0].load(Ordering::Acquire), depart);
+                });
         }
     }
 

@@ -4455,6 +4455,16 @@ pub struct HttpServerConfig {
     /// that stops reading loses its connection and the requests it owns when
     /// an outstanding write reaches this deadline.
     pub response_write_timeout: Duration,
+    /// Native-listener idle interval between comments on an acknowledged modern
+    /// subscription SSE response (default: 15 seconds). `None` disables comments.
+    ///
+    /// Comments keep quiet subscriptions observable without inventing an MCP
+    /// event, event ID, replay cursor, or notification. They also let the
+    /// bounded writer discover departed peers and release their subscriptions.
+    /// They never extend request, credential, or response-write deadlines.
+    /// A configured interval must be nonzero. Ordinary request SSE responses
+    /// retain their separate two-second, progress-neutral liveness probe.
+    pub subscription_keepalive_interval: Option<Duration>,
     /// Inner HTTP handler configuration (endpoint path, CORS, and body size).
     pub handler_config: HttpHandlerConfig,
     /// Maximum requests buffered for one live HTTP session.
@@ -4550,6 +4560,7 @@ impl Default for HttpServerConfig {
             max_connections: 64,
             request_read_timeout: DEFAULT_HTTP_REQUEST_READ_TIMEOUT,
             response_write_timeout: DEFAULT_HTTP_RESPONSE_WRITE_TIMEOUT,
+            subscription_keepalive_interval: Some(Duration::from_secs(15)),
             handler_config: HttpHandlerConfig {
                 base_path: "/mcp".to_string(),
                 ..HttpHandlerConfig::default()
@@ -4648,6 +4659,17 @@ impl HttpServerConfig {
     #[must_use]
     pub fn response_write_timeout(mut self, timeout: Duration) -> Self {
         self.response_write_timeout = timeout;
+        self
+    }
+
+    /// Configures idle comments for modern HTTP/HTTPS subscription responses.
+    ///
+    /// `None` disables comments; a zero interval is rejected before binding.
+    /// An acknowledgement is always flushed first, and a successful event or
+    /// comment restarts only this idle interval, never the request's lifetime.
+    #[must_use]
+    pub fn subscription_keepalive_interval(mut self, interval: Option<Duration>) -> Self {
+        self.subscription_keepalive_interval = interval;
         self
     }
 
@@ -4773,6 +4795,15 @@ pub struct ServerHttpEndpoint {
 fn validate_server_http_route_configuration(
     server: &Server,
 ) -> Result<(), ServerHttpEndpointError> {
+    if server
+        .http_config
+        .subscription_keepalive_interval
+        .is_some_and(|interval| interval.is_zero())
+    {
+        return Err(ServerHttpEndpointError::InvalidConfiguration(
+            "HTTP subscription keepalive interval must be nonzero".to_owned(),
+        ));
+    }
     let mut occupied = vec![server.http_config.handler_config.base_path.as_str()];
     #[cfg(feature = "legacy-2024-11-05")]
     {
@@ -5381,6 +5412,127 @@ where
             return std::task::Poll::Ready(Err(()));
         }
         polled
+    })
+    .await
+}
+
+/// Native writers share one idle schedule, but ordinary responses deliberately
+/// omit the blank line: their liveness probe must not reset a progress-based
+/// client idle deadline. Subscription comments are complete SSE keepalives.
+struct HttpSseKeepalive {
+    interval: Option<Duration>,
+    subscription: bool,
+    acknowledged: bool,
+    last_write: asupersync::Time,
+}
+
+impl HttpSseKeepalive {
+    fn new(config: &HttpServerConfig, subscription: bool, now: asupersync::Time) -> Self {
+        Self {
+            interval: if subscription {
+                config.subscription_keepalive_interval
+            } else {
+                Some(Duration::from_secs(2))
+            },
+            subscription,
+            acknowledged: !subscription,
+            last_write: now,
+        }
+    }
+
+    fn event_written(&mut self, event: &SseEvent, now: asupersync::Time) {
+        if !self.acknowledged {
+            self.acknowledged = matches!(
+                subscription_sse_message(event),
+                Some(JsonRpcMessage::Request(notification))
+                    if final_subscription_acknowledgement_notification(&notification)
+            );
+        }
+        self.last_write = now;
+    }
+
+    fn due_chunk(&self, now: asupersync::Time) -> Option<&'static [u8]> {
+        let interval = self.interval?;
+        if !self.acknowledged
+            || u128::from(now.duration_since(self.last_write)) < interval.as_nanos()
+        {
+            return None;
+        }
+        Some(if self.subscription {
+            b"D\r\n: keepalive\n\n\r\n"
+        } else {
+            b"2\r\n:\n\r\n"
+        })
+    }
+}
+
+/// A heartbeat has no terminal-drain authority. Recheck its original request
+/// and subscription on every write poll; a late election suppresses an unpolled
+/// comment, while a potentially partial comment fails the body rather than
+/// splicing a cancellation frame into it. No lock crosses the actual I/O poll.
+async fn guard_http_sse_keepalive<F>(
+    cx: &Cx,
+    shutdown: &HttpListenerShutdown,
+    cancellation: &McpRequestCancellation,
+    delivery: &FinalSubscriptionTerminalDelivery,
+    write: F,
+) -> Result<bool, ()>
+where
+    F: Future<Output = Result<(), ()>>,
+{
+    let admission = delivery
+        .subscription_admission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let authority = || {
+        if shutdown.is_requested()
+            || cancellation.is_cancel_requested()
+            || delivery.is_settled()
+            || delivery.completion_state.load(Ordering::Acquire) != FINAL_TERMINAL_OPEN
+            || delivery.subscription_request.load(Ordering::Acquire)
+                && delivery.state.load(Ordering::Acquire) != FINAL_TERMINAL_OPEN
+        {
+            return Ok(false);
+        }
+        cx.checkpoint().map_err(|_| ())?;
+        if delivery.subscription_request.load(Ordering::Acquire) && admission.is_none() {
+            return Ok(false);
+        }
+        if let Some(admission) = &admission {
+            if admission.refused.load(Ordering::Acquire)
+                || Server::request_context_error(&admission.resources.context).is_some()
+            {
+                return Err(());
+            }
+            let phase = admission
+                .election
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !matches!(
+                *phase,
+                FinalSubscriptionPhase::Active | FinalSubscriptionPhase::EventDelivery(_)
+            ) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    let mut write = std::pin::pin!(write);
+    let mut polled = false;
+    std::future::poll_fn(|task| {
+        match authority() {
+            Ok(true) => {}
+            Ok(false) if !polled => return std::task::Poll::Ready(Ok(false)),
+            Ok(false) | Err(()) => return std::task::Poll::Ready(Err(())),
+        }
+        polled = true;
+        let result = write.as_mut().poll(task);
+        if !matches!(authority(), Ok(true)) {
+            return std::task::Poll::Ready(Err(()));
+        }
+        result.map(|result| result.map(|()| true))
     })
     .await
 }
@@ -15747,7 +15899,11 @@ async fn send_modern_sse_stream(
     response: DualEraHttpSseResponse,
 ) -> Result<(), ()> {
     let sender = response.sender();
-    let ordinary_request = request.method != SUBSCRIPTIONS_LISTEN;
+    let mut keepalive = HttpSseKeepalive::new(
+        &server.http_config,
+        request.method == SUBSCRIPTIONS_LISTEN,
+        cx.now(),
+    );
     let request_cancellation = sender.request_cancellation();
     let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
     // Every modern SSE representation waits for this request-owned election.
@@ -15814,7 +15970,7 @@ async fn send_modern_sse_stream(
             &[&response_head],
         )
         .await?;
-        let mut last_frame_write = cx.now();
+        keepalive.last_write = cx.now();
         let (terminal_control, terminal_response) = loop {
             // A failed request-scoped progress/log/terminal commit retires
             // this body even when response finalization had already claimed
@@ -15847,7 +16003,7 @@ async fn send_modern_sse_stream(
                         ),
                     )
                     .await?;
-                    last_frame_write = cx.now();
+                    keepalive.event_written(&event, cx.now());
                     if terminal_control || terminal_response {
                         // The listener must still own this response while
                         // its terminating HTTP chunk is pending or partial.
@@ -15885,28 +16041,27 @@ async fn send_modern_sse_stream(
                         // used by the header, partial frames and HTTP trailer.
                         asupersync::runtime::yield_now().await;
                     } else {
-                        if ordinary_request
-                            && cx.now().duration_since(last_frame_write) >= 2_000_000_000
-                        {
-                            // A quiet handler still needs an output write to
-                            // observe a peer that has closed its response body.
-                            // One inert comment line every two idle seconds
-                            // detects that closure without treating a legal
-                            // request write-half EOF as cancellation. No blank
-                            // line is added: this consumes one caller keepalive
-                            // line and cannot create an MCP event or reset an
-                            // ordinary response's progress-based idle deadline.
-                            // Subscriptions retain their separate long-lived
-                            // activity and keepalive policies.
-                            write_native_http_response_parts(
+                        if let Some(chunk) = keepalive.due_chunk(cx.now()) {
+                            // Keep one pinned, bounded write. In particular,
+                            // shutdown cannot turn an idle comment into an
+                            // elected subscription terminal's drain prefix.
+                            if guard_http_sse_keepalive(
                                 cx,
                                 listener_shutdown,
-                                Some(&terminal_delivery),
-                                &mut writer,
-                                &[b"2\r\n:\n\r\n"],
+                                &request_cancellation,
+                                &terminal_delivery,
+                                write_native_http_response_parts(
+                                    cx,
+                                    listener_shutdown,
+                                    Some(&terminal_delivery),
+                                    &mut writer,
+                                    &[chunk],
+                                ),
                             )
-                            .await?;
-                            last_frame_write = cx.now();
+                            .await?
+                            {
+                                keepalive.last_write = cx.now();
+                            }
                         }
                         asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                     }
@@ -31709,6 +31864,11 @@ mod lib_unit_tests {
             remaining = &suffix[2..];
             let event = std::str::from_utf8(chunk)
                 .map_err(|error| format!("live SSE event was not UTF-8: {error}"))?;
+            if matches!(event, ": keepalive\n\n" | ":\n") {
+                // Native liveness comments carry no message. Keep the parser
+                // strict about chunk framing and all actual JSON-RPC events.
+                continue;
+            }
             if !event.starts_with("event: message\n") || !event.ends_with("\n\n") {
                 return Err(format!(
                     "live SSE chunk was not one message event: {event:?}"
@@ -31730,6 +31890,57 @@ mod lib_unit_tests {
                 data[0],
             ));
         }
+    }
+
+    #[test]
+    fn live_http_sse_keepalive_parser_preserves_strict_framing_and_message_counts() {
+        fn framed(chunks: &[&[u8]]) -> Vec<u8> {
+            let mut response =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            for chunk in chunks {
+                response.extend_from_slice(format!("{:X}\r\n", chunk.len()).as_bytes());
+                response.extend_from_slice(chunk);
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+            response
+        }
+
+        let message = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
+        let bare = live_http_chunked_sse_messages(&framed(&[message])).unwrap();
+        let with_comments = live_http_chunked_sse_messages(&framed(&[
+            b": keepalive\n\n",
+            message,
+            b":\n",
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&with_comments).unwrap(),
+            serde_json::to_value(&bare).unwrap(),
+        );
+        assert_eq!(with_comments.len(), 1);
+        let repeated = live_http_chunked_sse_messages(&framed(&[
+            message,
+            b": keepalive\n\n",
+            message,
+        ]))
+        .unwrap();
+        assert_eq!(repeated.len(), 2, "comments cannot hide a second RPC frame");
+
+        for invalid in [
+            b": keepalive\n\ndata: hidden\n\n".as_slice(),
+            b": keepalive\n\nid: forged\n\n".as_slice(),
+            b":\nretry: 1\n\n".as_slice(),
+            b"event: message\ndata: not-json\n\n".as_slice(),
+        ] {
+            assert!(live_http_chunked_sse_messages(&framed(&[invalid])).is_err());
+        }
+        let mut trailing = framed(&[message]);
+        trailing.extend_from_slice(b"D\r\n: keepalive\n\n\r\n");
+        assert!(live_http_chunked_sse_messages(&trailing).is_err());
+        let malformed_size =
+            b"HTTP/1.1 200 OK\r\n\r\nE\r\n: keepalive\n\n\r\n0\r\n\r\n";
+        assert!(live_http_chunked_sse_messages(malformed_size).is_err());
     }
 
     fn live_http_response_header(response: &[u8], name: &str) -> Result<String, String> {
@@ -56530,6 +56741,172 @@ mod lib_unit_tests {
         });
     }
 
+    async fn live_http_subscription_keepalive_probe(
+        cx: &Cx,
+        enabled: bool,
+        depart: bool,
+    ) -> Result<(), String> {
+        let bound = Server::new("subscription-keepalive", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .http_config(HttpServerConfig::new().subscription_keepalive_interval(
+                enabled.then_some(Duration::from_millis(40)),
+            ))
+            .build()
+            .bind_http(cx, "127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = bound.local_addr().map_err(|error| error.to_string())?;
+        let registry = Arc::clone(&bound.endpoint.server.final_subscriptions);
+        let limiter = Arc::clone(&bound.connection_limiter);
+        let client_registry = Arc::clone(&registry);
+        let client_limiter = Arc::clone(&limiter);
+        let owner = cx.clone();
+        let controller = thread::spawn(move || {
+            struct Stop(Cx);
+            impl Drop for Stop {
+                fn drop(&mut self) {
+                    self.0.cancel_with(CancelKind::User, Some("keepalive peer settled"));
+                }
+            }
+            fn line(peer: &mut std::net::TcpStream, ending: &[u8]) -> Vec<u8> {
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(ending) {
+                    let mut byte = [0_u8; 1];
+                    std::io::Read::read_exact(peer, &mut byte).unwrap();
+                    bytes.push(byte[0]);
+                    assert!(bytes.len() <= 8192);
+                }
+                bytes
+            }
+            fn chunk(peer: &mut std::net::TcpStream) -> Vec<u8> {
+                let size = line(peer, b"\r\n");
+                let size = usize::from_str_radix(
+                    std::str::from_utf8(&size[..size.len() - 2]).unwrap(), 16,
+                ).unwrap();
+                assert!(size <= 8192);
+                let mut bytes = vec![0_u8; size + 2];
+                std::io::Read::read_exact(peer, &mut bytes).unwrap();
+                assert_eq!(&bytes[size..], b"\r\n");
+                bytes.truncate(size);
+                bytes
+            }
+            fn notification(bytes: &[u8]) -> JsonRpcMessage {
+                let frame = std::str::from_utf8(bytes).unwrap();
+                assert!(frame.starts_with("event: message\n"));
+                assert!(frame.ends_with("\n\n"));
+                assert!(!frame.lines().any(|line| line.starts_with("id:") || line.starts_with("retry:")));
+                let data = frame.lines().filter_map(|line| line.strip_prefix("data: "))
+                    .collect::<Vec<_>>();
+                assert_eq!(data.len(), 1);
+                Codec::new().decode_complete_message(data[0].as_bytes()).unwrap()
+            }
+            let _stop = Stop(owner.clone());
+            let mut peer = std::net::TcpStream::connect(address).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let body = serde_json::to_vec(&JsonRpcRequest::new(
+                SUBSCRIPTIONS_LISTEN,
+                Some(serde_json::json!({
+                    "notifications": {"toolsListChanged": true},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                947_i64,
+            )).unwrap();
+            std::io::Write::write_all(&mut peer, &live_http_post("/mcp", &body, &[
+                ("Accept", "text/event-stream"),
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", SUBSCRIPTIONS_LISTEN),
+            ])).unwrap();
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            let head = line(&mut peer, b"\r\n\r\n");
+            assert!(head.starts_with(b"HTTP/1.1 200"));
+            let acknowledgement = notification(&chunk(&mut peer));
+            assert!(matches!(
+                acknowledgement,
+                JsonRpcMessage::Request(ref value)
+                    if final_subscription_acknowledgement_notification(value),
+            ));
+
+            if depart {
+                peer.shutdown(std::net::Shutdown::Both).unwrap();
+                drop(peer);
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !client_registry.inner.lock().unwrap().entries.is_empty()
+                    || client_limiter.active.load(Ordering::Acquire) != 0
+                    || client_registry.admission.lock().unwrap().total != 0
+                {
+                    assert!(Instant::now() < deadline, "quiet departed peer retained capacity");
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert!(owner.checkpoint().is_ok());
+                assert_eq!(client_registry.admission.lock().unwrap().total, 0);
+                return;
+            }
+            if enabled {
+                for _ in 0..2 {
+                    assert_eq!(chunk(&mut peer), b": keepalive\n\n");
+                }
+            } else {
+                peer.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                let mut byte = [0_u8; 1];
+                let error = std::io::Read::read(&mut peer, &mut byte).unwrap_err();
+                assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+                peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            }
+            assert_eq!(client_registry.inner.lock().unwrap().entries.len(), 1);
+            owner.cancel_with(CancelKind::User, Some("keepalive graceful terminal"));
+            let mut terminal_seen = false;
+            for _ in 0..16 {
+                let bytes = chunk(&mut peer);
+                if bytes.is_empty() {
+                    assert!(terminal_seen);
+                    let mut byte = [0_u8; 1];
+                    assert_eq!(std::io::Read::read(&mut peer, &mut byte).unwrap(), 0);
+                    return;
+                }
+                assert!(!terminal_seen, "no heartbeat or data may follow the terminal");
+                if bytes == b": keepalive\n\n" {
+                    assert!(enabled);
+                    continue;
+                }
+                assert!(subscription_cancellation_for(&notification(&bytes), 947));
+                terminal_seen = true;
+            }
+            panic!("keepalive stream did not finish its terminal framing");
+        });
+        let serving = bound.serve(cx).await.map_err(|error| error.to_string())?;
+        controller.join().map_err(|_| "keepalive peer panicked".to_owned())?;
+        require_quiescent_http_shutdown(serving, "subscription keepalive").await?;
+        assert_eq!(limiter.active.load(Ordering::Acquire), 0);
+        assert_eq!(registry.admission.lock().unwrap().total, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn live_http_subscription_keepalives_follow_acknowledgement_and_end_at_terminal() {
+        run_live_http_test(|cx| async move {
+            live_http_subscription_keepalive_probe(&cx, true, false).await
+        });
+    }
+
+    #[test]
+    fn live_http_subscription_keepalives_can_be_disabled_without_closing_the_stream() {
+        run_live_http_test(|cx| async move {
+            live_http_subscription_keepalive_probe(&cx, false, false).await
+        });
+    }
+
+    #[test]
+    fn live_http_subscription_keepalives_reclaim_departed_peer_without_stopping_listener() {
+        run_live_http_test(|cx| async move {
+            live_http_subscription_keepalive_probe(&cx, true, true).await
+        });
+    }
+
     #[test]
     fn live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware() {
         run_live_http_test(|cx| async move {
@@ -59477,6 +59854,154 @@ mod lib_unit_tests {
             "notifications/message",
             Some(serde_json::json!({"level": level, "data": "request-owned log"})),
         )
+    }
+
+    #[test]
+    fn http_sse_keepalive_requires_acknowledgement_and_keeps_distinct_idle_semantics() {
+        let config = HttpServerConfig::new();
+        assert_eq!(config.subscription_keepalive_interval, Some(Duration::from_secs(15)));
+        let mut subscription = HttpSseKeepalive::new(&config, true, asupersync::Time::ZERO);
+        assert!(subscription.due_chunk(asupersync::Time::from_secs(60)).is_none());
+        let acknowledgement = SseEvent::message(
+            serde_json::to_string(&JsonRpcRequest::notification(
+                "notifications/subscriptions/acknowledged",
+                Some(serde_json::json!({
+                    "notifications": {"toolsListChanged": true},
+                    "_meta": {FINAL_SUBSCRIPTION_ID_META_KEY: 937},
+                })),
+            ))
+            .unwrap(),
+        );
+        subscription.event_written(&acknowledgement, asupersync::Time::from_secs(60));
+        assert!(subscription.due_chunk(asupersync::Time::from_secs(74)).is_none());
+        assert_eq!(
+            subscription.due_chunk(asupersync::Time::from_secs(75)),
+            Some(b"D\r\n: keepalive\n\n\r\n".as_slice()),
+        );
+        subscription.event_written(
+            &SseEvent::message("an application event was flushed"),
+            asupersync::Time::from_secs(75),
+        );
+        assert!(subscription.due_chunk(asupersync::Time::from_secs(89)).is_none());
+        assert!(subscription.due_chunk(asupersync::Time::from_secs(90)).is_some());
+
+        let disabled = config.subscription_keepalive_interval(None);
+        let mut subscription = HttpSseKeepalive::new(&disabled, true, asupersync::Time::ZERO);
+        subscription.event_written(&acknowledgement, asupersync::Time::ZERO);
+        assert!(subscription.due_chunk(asupersync::Time::from_secs(60)).is_none());
+        let ordinary = HttpSseKeepalive::new(&disabled, false, asupersync::Time::ZERO);
+        assert!(ordinary.due_chunk(asupersync::Time::from_secs(1)).is_none());
+        assert_eq!(
+            ordinary.due_chunk(asupersync::Time::from_secs(2)),
+            Some(b"2\r\n:\n\r\n".as_slice()),
+            "ordinary probes have no blank line and do not reset progress-based idle",
+        );
+    }
+
+    #[test]
+    fn http_sse_keepalive_late_authority_loss_never_resumes_a_partial_chunk() {
+        for boundary in 0..5 {
+            for partial in [false, true] {
+                let cx = Cx::for_testing();
+                let listener = Cx::for_testing();
+                let shutdown = HttpListenerShutdown::new(&listener);
+                let fixture = request_notification_admission_fixture(&cx, None, None);
+                let cancellation = fixture.admission.request_cancellation.clone();
+                let revoked = McpRequestCancellation::new();
+                assert!(fixture.context.set_auth(
+                    fastmcp_core::AuthContext::with_subject("keepalive-owner")
+                        .with_verification_cancellation(revoked.clone()),
+                ));
+                let polls = AtomicUsize::new(0);
+                let written = Mutex::new(Vec::new());
+                let operation = std::future::poll_fn(|_| {
+                    let count = polls.fetch_add(1, Ordering::AcqRel);
+                    written.lock().unwrap().extend_from_slice(if count == 0 {
+                        b"D\r\n: keep".as_slice()
+                    } else {
+                        b"alive\n\n\r\n".as_slice()
+                    });
+                    if count == 0 {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                });
+                let mut write = Box::pin(guard_http_sse_keepalive(
+                    &cx,
+                    &shutdown,
+                    &cancellation,
+                    &fixture.delivery,
+                    operation,
+                ));
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                if partial {
+                    assert!(write.as_mut().poll(&mut task).is_pending());
+                    assert_eq!(polls.load(Ordering::Acquire), 1);
+                }
+                match boundary {
+                    0 => {}
+                    1 => { cancellation.cancel_by_peer(); }
+                    2 => { assert!(fixture.delivery.mark_cancellation_enqueued()); }
+                    3 => { shutdown.request(); }
+                    _ => { revoked.cancel(); }
+                }
+                if boundary == 0 {
+                    if !partial {
+                        assert!(write.as_mut().poll(&mut task).is_pending());
+                    }
+                    assert_eq!(write.as_mut().poll(&mut task), std::task::Poll::Ready(Ok(true)));
+                    assert_eq!(written.lock().unwrap().as_slice(), b"D\r\n: keepalive\n\n\r\n");
+                    assert_eq!(polls.load(Ordering::Acquire), 2);
+                } else {
+                    let expected = if partial || boundary == 4 { Err(()) } else { Ok(false) };
+                    assert_eq!(write.as_mut().poll(&mut task), std::task::Poll::Ready(expected));
+                    assert_eq!(polls.load(Ordering::Acquire), usize::from(partial));
+                    assert_eq!(
+                        written.lock().unwrap().as_slice(),
+                        if partial { b"D\r\n: keep".as_slice() } else { b"".as_slice() },
+                        "revoked output cannot append either a comment suffix or a terminal",
+                    );
+                }
+                assert!(cx.checkpoint().is_ok());
+                assert!(listener.checkpoint().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn http_sse_keepalive_refuses_unacknowledged_and_expired_request_authority() {
+        for boundary in 0..3 {
+            let cx = Cx::for_testing();
+            let shutdown = HttpListenerShutdown::new(&cx);
+            let mut fixture = request_notification_admission_fixture(&cx, None, None);
+            let cancellation = fixture.admission.request_cancellation.clone();
+            match boundary {
+                0 => {
+                    *fixture.admission.election.phase.lock().unwrap() =
+                        FinalSubscriptionPhase::Opening;
+                }
+                1 => { drop(fixture.scope.take()); }
+                _ => {
+                    assert!(fixture.context.set_auth(
+                        fastmcp_core::AuthContext::with_subject("expired-keepalive")
+                            .with_verification_valid_until(Instant::now()),
+                    ));
+                }
+            }
+            let polls = AtomicUsize::new(0);
+            let mut write = Box::pin(guard_http_sse_keepalive(
+                &cx, &shutdown, &cancellation, &fixture.delivery,
+                async { polls.fetch_add(1, Ordering::AcqRel); Ok(()) },
+            ));
+            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+            assert_eq!(
+                write.as_mut().poll(&mut task),
+                std::task::Poll::Ready(if boundary == 0 { Ok(false) } else { Err(()) }),
+            );
+            assert_eq!(polls.load(Ordering::Acquire), 0);
+            assert!(cx.checkpoint().is_ok());
+        }
     }
 
     #[test]
