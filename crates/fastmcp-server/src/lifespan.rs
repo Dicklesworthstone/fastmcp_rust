@@ -372,7 +372,11 @@ impl Server {
         };
         if let Some(owner) = owner.as_mut() {
             if let Err(error) = owner.ready().await {
-                return match owner.finish().await {
+                let cleanup = owner.finish().await;
+                if owner.signal.startup_entered.load(Ordering::Acquire) {
+                    self.run_shutdown_hook();
+                }
+                return match cleanup {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(McpError::internal_error(format!(
                         "Asynchronous server startup failed: {}; cleanup failed: {}",
@@ -382,10 +386,13 @@ impl Server {
             }
         }
         if !self.run_startup_hook() {
-            if let Some(owner) = owner.as_mut() {
-                owner.finish().await?;
-            }
-            return Err(lifecycle_error("startup hook failed"));
+            let cleanup = match owner.as_mut() {
+                Some(owner) => owner.finish().await,
+                None => Ok(()),
+            };
+            self.run_shutdown_hook();
+            cleanup?;
+            return Err(McpError::internal_error("Server startup hook failed"));
         }
         Ok(owner)
     }

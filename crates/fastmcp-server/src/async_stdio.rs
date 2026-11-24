@@ -4822,6 +4822,198 @@ mod tests {
         }
     }
 
+    mod startup_rollback_tests {
+        use super::*;
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use fastmcp_transport::memory::create_memory_transport_pair_with_capacity;
+
+        #[derive(Clone, Copy)]
+        enum Transport {
+            Stdio,
+            Memory,
+        }
+
+        async fn rejected_startup(cx: &Cx, server: Server, transport: Transport) -> McpError {
+            match transport {
+                Transport::Stdio => {
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    io.feed(&encoded(&discover(1)));
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(3),
+                        server.serve_stdio_io(
+                            cx,
+                            ProbeReader(Arc::clone(&io)),
+                            ProbeWriter(Arc::clone(&io)),
+                        ),
+                    )
+                    .await
+                    .expect("startup rollback must finish")
+                    .expect_err("startup must reject this connection");
+                    let state = io.0.lock().unwrap();
+                    assert_eq!(state.reads, 0);
+                    assert_eq!(state.writes, 0);
+                    assert!(state.reader_dropped && state.writer_dropped);
+                    error
+                }
+                Transport::Memory => {
+                    let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+                    peer.send_async(cx, &discover(1)).await.unwrap();
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(3),
+                        server.serve_memory(cx, transport),
+                    )
+                    .await
+                    .expect("startup rollback must finish")
+                    .expect_err("startup must reject this connection");
+                    assert!(matches!(
+                        peer.recv_async(cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                    error
+                }
+            }
+        }
+
+        #[test]
+        fn native_startup_failure_runs_synchronous_cleanup_once_before_ingress() {
+            run(|cx| async move {
+                for transport in [Transport::Stdio, Transport::Memory] {
+                    for asynchronous in [false, true] {
+                        let startups = Arc::new(AtomicUsize::new(0));
+                        let observed_startup = Arc::clone(&startups);
+                        let shutdowns = Arc::new(AtomicUsize::new(0));
+                        let observed_shutdown = Arc::clone(&shutdowns);
+                        let builder = Server::new("startup-rollback", "1")
+                            .protocol_policy(ProtocolPolicy::ModernOnly)
+                            .unwrap()
+                            .on_shutdown(move || {
+                                observed_shutdown.fetch_add(1, Ordering::AcqRel);
+                            });
+                        let server = if asynchronous {
+                            builder.on_startup_async(move |_| async move {
+                                observed_startup.fetch_add(1, Ordering::AcqRel);
+                                Err(McpError::internal_error(
+                                    "planted asynchronous startup failure",
+                                ))
+                            })
+                        } else {
+                            builder.on_startup(move || {
+                                observed_startup.fetch_add(1, Ordering::AcqRel);
+                                Err(io::Error::other("planted synchronous startup failure"))
+                            })
+                        }
+                        .build();
+                        let error = rejected_startup(&cx, server, transport).await;
+                        assert_eq!(
+                            error.message,
+                            if asynchronous {
+                                "planted asynchronous startup failure"
+                            } else {
+                                "Server startup hook failed"
+                            }
+                        );
+                        assert_eq!(startups.load(Ordering::Acquire), 1);
+                        assert_eq!(shutdowns.load(Ordering::Acquire), 1);
+                        assert!(cx.checkpoint().is_ok());
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn native_startup_admission_refusal_does_not_invoke_synchronous_cleanup() {
+            run(|cx| async move {
+                for transport in [Transport::Stdio, Transport::Memory] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let startup = Arc::clone(&calls);
+                    let shutdown = Arc::clone(&calls);
+                    let server = Server::new("startup-admission", "1")
+                        .protocol_policy(ProtocolPolicy::ModernOnly)
+                        .unwrap()
+                        .on_startup_async(move |_| {
+                            startup.fetch_add(1, Ordering::AcqRel);
+                            async { Ok(()) }
+                        })
+                        .on_shutdown(move || {
+                            shutdown.fetch_add(1, Ordering::AcqRel);
+                        })
+                        .build();
+                    let error = {
+                        let _restriction =
+                            Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+                        rejected_startup(&cx, server, transport).await
+                    };
+                    assert!(
+                        error
+                            .message
+                            .contains("requires caller-owned task admission")
+                    );
+                    assert_eq!(calls.load(Ordering::Acquire), 0);
+                    assert!(cx.checkpoint().is_ok());
+                }
+            });
+        }
+
+        #[test]
+        fn native_partial_startup_settles_descendants_before_synchronous_cleanup() {
+            run(|cx| async move {
+                for transport in [Transport::Stdio, Transport::Memory] {
+                    let work = Arc::new(Gate::default());
+                    let startup_work = Arc::clone(&work);
+                    let cleanup_work = Arc::clone(&work);
+                    let shutdowns = Arc::new(AtomicUsize::new(0));
+                    let observed_shutdown = Arc::clone(&shutdowns);
+                    let (started, mut receiver) = asupersync::channel::oneshot::channel();
+                    let server = Server::new("partial-startup-rollback", "1")
+                        .protocol_policy(ProtocolPolicy::ModernOnly)
+                        .unwrap()
+                        .on_startup_async(move |owned| async move {
+                            let child_work = Arc::clone(&startup_work);
+                            let _child = owned
+                                .spawn(move |child_cx| async move {
+                                    child_work.entered.fetch_add(1, Ordering::AcqRel);
+                                    child_work.changed.notify_waiters();
+                                    started.send_blocking(child_cx).unwrap();
+                                    child_work
+                                        .changed
+                                        .wait_until(|| child_work.released.load(Ordering::Acquire))
+                                        .await;
+                                    child_work.dropped.fetch_add(1, Ordering::AcqRel);
+                                })
+                                .unwrap();
+                            startup_work
+                                .changed
+                                .wait_until(|| startup_work.entered.load(Ordering::Acquire) == 1)
+                                .await;
+                            Err(McpError::internal_error("partial startup failed"))
+                        })
+                        .on_shutdown(move || {
+                            assert_eq!(cleanup_work.dropped.load(Ordering::Acquire), 1);
+                            observed_shutdown.fetch_add(1, Ordering::AcqRel);
+                        })
+                        .build();
+                    let mut serving = cx
+                        .spawn(move |owned| async move {
+                            rejected_startup(&owned, server, transport).await
+                        })
+                        .unwrap();
+                    let child = receiver.recv(&cx).await.unwrap();
+                    until(&cx, || child.is_cancel_requested()).await;
+                    assert!(!serving.is_finished());
+                    assert_eq!(shutdowns.load(Ordering::Acquire), 0);
+                    work.release();
+                    let error = serving.join(&cx).await.unwrap();
+                    assert_eq!(error.message, "partial startup failed");
+                    assert_eq!(shutdowns.load(Ordering::Acquire), 1);
+                    assert!(cx.checkpoint().is_ok());
+                }
+            });
+        }
+    }
+
     #[test]
     fn stdio_operator_observes_real_backpressure_and_eof_drain() {
         run(|cx| async move {
@@ -6677,6 +6869,74 @@ mod tests {
                 assert_eq!(state.reads, 0);
                 assert_eq!(state.writes, 0);
                 assert!(state.reader_dropped && state.writer_dropped);
+            });
+        }
+
+        #[test]
+        fn async_stdio_hosted_task_admission_failure_awaits_lifespan_cleanup() {
+            run(|cx| async move {
+                let probe = Arc::new(TaskProbe::default());
+                let runtime = FinalTaskRuntime::in_memory(
+                    FinalTaskRuntimeConfig::new(60_000, Some(1_000)).unwrap(),
+                    Arc::new(|_| {}),
+                );
+                let service_runtime = runtime.clone();
+                let shutdown = Arc::new(Gate::default());
+                let cleanup = Arc::clone(&shutdown);
+                let io = Arc::new(IoProbe::default());
+                io.allow(usize::MAX);
+                io.feed(&encoded(&discover(1)));
+                let server_io = Arc::clone(&io);
+                let supervisor = Arc::new(TaskSupervisor(Arc::clone(&probe)));
+                let mut serving = cx
+                    .spawn(move |serve_cx| async move {
+                        let cancellation = serve_cx.clone();
+                        let server = Server::new("cancel-before-hosted-tasks", "1")
+                            .protocol_policy(ProtocolPolicy::ModernOnly)
+                            .unwrap()
+                            .final_tasks(service_runtime)
+                            .unwrap()
+                            .task_supervisor(supervisor)
+                            .on_startup(move || {
+                                cancellation.cancel_with(
+                                    CancelKind::User,
+                                    Some("cancel after startup before Task admission"),
+                                );
+                                Ok::<(), io::Error>(())
+                            })
+                            .on_shutdown_async(move |_| async move {
+                                cleanup.entered.fetch_add(1, Ordering::AcqRel);
+                                cleanup.changed.notify_waiters();
+                                cleanup
+                                    .changed
+                                    .wait_until(|| cleanup.released.load(Ordering::Acquire))
+                                    .await;
+                                cleanup.dropped.fetch_add(1, Ordering::AcqRel);
+                                Ok(())
+                            })
+                            .build();
+                        server
+                            .serve_stdio_io(
+                                &serve_cx,
+                                ProbeReader(Arc::clone(&server_io)),
+                                ProbeWriter(server_io),
+                            )
+                            .await
+                    })
+                    .unwrap();
+                until(&cx, || shutdown.entered.load(Ordering::Acquire) == 1).await;
+                assert!(!serving.is_finished());
+                assert!(!runtime.is_task_service_ready());
+                assert_eq!(probe.initial.load(Ordering::Acquire), 0);
+                shutdown.release();
+                let error = serving.join(&cx).await.unwrap().unwrap_err();
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert_eq!(shutdown.dropped.load(Ordering::Acquire), 1);
+                let state = io.0.lock().unwrap();
+                assert_eq!(state.reads, 0);
+                assert_eq!(state.writes, 0);
+                assert!(state.reader_dropped && state.writer_dropped);
+                assert!(cx.checkpoint().is_ok());
             });
         }
     }
