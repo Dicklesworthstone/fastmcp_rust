@@ -17,7 +17,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use asupersync::Cx;
+use asupersync::{Cx, types::Time};
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{
     CoreRequest, CoreResult, FINAL_PROTOCOL_VERSION, FinalCoreRequest, FinalCoreResult, RequestId,
@@ -235,13 +235,43 @@ impl ManagedResourceClient {
         cancellation: &McpRequestCancellation,
         request: CoreRequest,
         next_id: I,
-        mut observe: O,
+        observe: O,
     ) -> Result<ManagedResourceRead, ManagedResourceError>
     where
         I: FnOnce() -> Result<RequestId, ManagedResourceError>,
         O: FnMut(Box<ServerNotification>) -> Result<(), ManagedResourceError>,
     {
         let deadline = call_deadline(cx, cancellation, self.limits.core.timeout)?;
+        Box::pin(self.read_with_binding(
+            cx,
+            cancellation,
+            request,
+            next_id,
+            observe,
+            None,
+            deadline,
+        ))
+        .await
+    }
+
+    // A watch owns the credential that opened its change feed. Neither a
+    // sibling renewal nor a reread may substitute another grant for it.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_with_binding<I, O>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        next_id: I,
+        mut observe: O,
+        binding: Option<&OAuthCredentialSnapshot>,
+        deadline: Time,
+    ) -> Result<ManagedResourceRead, ManagedResourceError>
+    where
+        I: FnOnce() -> Result<RequestId, ManagedResourceError>,
+        O: FnMut(Box<ServerNotification>) -> Result<(), ManagedResourceError>,
+    {
+        let deadline = deadline.min(call_deadline(cx, cancellation, self.limits.core.timeout)?);
         let (uri, reusable) = read_identity(&request)?;
         let uri = uri.to_owned();
         // The shared encoder/profile check precedes even a cache hit or token
@@ -254,14 +284,20 @@ impl ManagedResourceClient {
         )?;
         let result_set = FinalCacheResultSet::Resource(uri.clone());
         let captured = self.cache()?.begin_fetch(&result_set);
-        bounded_wait(cx, cancellation, deadline, async {
+        Box::pin(bounded_wait(cx, cancellation, deadline, async {
             Ok(async {
-                let credential = self
-                    .session
-                    .credential_with_cancellation(cx, cancellation)
-                    .await
-                    .map_err(ManagedCoreError::from)?;
-                require_credential(&credential)?;
+                let acquired_credential;
+                let credential = if let Some(credential) = binding {
+                    credential
+                } else {
+                    acquired_credential = self
+                        .session
+                        .credential_with_cancellation(cx, cancellation)
+                        .await
+                        .map_err(ManagedCoreError::from)?;
+                    &acquired_credential
+                };
+                require_credential(credential)?;
                 self.require_generation(&result_set, captured)?;
                 let key = if reusable {
                     Some(cache_key(
@@ -296,18 +332,21 @@ impl ManagedResourceClient {
                 } else {
                     let id = next_id()?;
                     check_call(cx, cancellation, deadline)?;
-                    require_credential(&credential)?;
+                    require_credential(credential)?;
                     self.require_generation(&result_set, captured)?;
-                    let mut call = Box::pin(self.session.request_core_with_cancellation(
+                    let mut call = Box::pin(self.session.request_core_with_snapshot(
                         cx,
                         cancellation,
                         request,
                         id,
                         self.limits.core,
+                        credential,
+                        deadline,
                     ))
                     .await?;
-                    // A read may race another caller's renewal, but it must not
-                    // populate or return a result in the prior token partition.
+                    // Dispatch itself uses the admitted snapshot. A generation
+                    // check after POST alone would be too late to prevent a
+                    // concurrent renewal from substituting its authority.
                     if call.credential_generation() != credential.generation() {
                         return Err(ManagedResourceError::CredentialChanged);
                     }
@@ -318,13 +357,13 @@ impl ManagedResourceClient {
                             .await?
                             .ok_or(ManagedResourceError::InvalidResult)?;
                         check_call(cx, cancellation, deadline)?;
-                        require_credential(&credential)?;
+                        require_credential(credential)?;
                         match event {
                             ManagedCoreEvent::Notification(notification) => {
                                 self.invalidate_notification(&notification)?;
                                 observe(notification)?;
                                 check_call(cx, cancellation, deadline)?;
-                                require_credential(&credential)?;
+                                require_credential(credential)?;
                                 self.require_generation(&result_set, captured)?;
                             }
                             ManagedCoreEvent::Result(result) => break *result,
@@ -341,7 +380,7 @@ impl ManagedResourceClient {
                     if cache.begin_fetch(&result_set) != captured {
                         return Err(ManagedResourceError::Invalidated);
                     }
-                    require_credential(&credential)?;
+                    require_credential(credential)?;
                     if complete && !cache_hit && cache.is_enabled() {
                         if let Some(key) = key {
                             if cache.insert_if_current_at(key, captured, result.clone(), receipt)
@@ -353,7 +392,7 @@ impl ManagedResourceClient {
                     }
                 }
                 check_call(cx, cancellation, deadline)?;
-                require_credential(&credential)?;
+                require_credential(credential)?;
                 self.require_generation(&result_set, captured)?;
                 Ok(ManagedResourceRead {
                     uri,
@@ -363,7 +402,7 @@ impl ManagedResourceClient {
                 })
             }
             .await)
-        })
+        }))
         .await?
     }
 

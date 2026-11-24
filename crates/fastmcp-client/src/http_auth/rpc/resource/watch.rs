@@ -179,6 +179,8 @@ impl ManagedResourceClient {
     /// Cancellation owns the entire watch. A local invalidation interrupts only
     /// its obsolete read; the subscription, login and caller context survive.
     /// The opening token lifetime is never extended by shared-session renewal.
+    /// Listen and read POSTs retain that same opening credential even when a
+    /// sibling renews the shared session while the watch is active.
     #[allow(clippy::too_many_arguments)]
     pub async fn watch_with_cancellation<I, O>(
         &self,
@@ -225,6 +227,7 @@ impl ManagedResourceClient {
         let observer = Observer {
             callback: Mutex::new(observe),
             stopped: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
         };
         let set = FinalCacheResultSet::Resource(uri.clone());
         let _gap = InvalidateOnExit {
@@ -243,12 +246,14 @@ impl ManagedResourceClient {
                 let listen_id = issue_id(&ids)?;
                 check_binding(cx, cancellation, deadline, &binding)?;
                 admit_listen_size(&listen, &listen_id, request_bytes)?;
-                let mut subscription = Box::pin(self.session.subscribe_core_with_cancellation(
+                let mut subscription = Box::pin(self.session.subscribe_core_with_snapshot(
                     cx,
                     cancellation,
+                    &binding,
                     listen,
                     listen_id,
                     stream_limits,
+                    deadline,
                 ))
                 .await?;
                 if subscription.credential_generation() != binding.generation() {
@@ -312,7 +317,7 @@ impl ManagedResourceClient {
                         };
                         let generation = self.cache()?.begin_fetch(&set);
                         attempts += 1;
-                        let read = Box::pin(self.read_with_cancellation(
+                        let read = Box::pin(self.read_with_binding(
                             cx,
                             &local,
                             request.clone(),
@@ -337,10 +342,16 @@ impl ManagedResourceClient {
                                     Err(ManagedResourceError::AbortedByHost)
                                 }
                             },
+                            Some(&binding),
+                            deadline,
                         ))
                         .await;
                         signal.finish()?;
                         check_binding(cx, cancellation, deadline, &binding)?;
+                        // An inline invalidation cancels the local read. That
+                        // cancellation must not turn a failed host callback
+                        // into permission to issue another read.
+                        observer.check_failure()?;
                         if observer.stopped.load(Ordering::Acquire) {
                             return Ok(ManagedResourceWatchOutcome::StoppedByHost);
                         }
@@ -356,6 +367,20 @@ impl ManagedResourceClient {
                         if read.credential_generation() != binding.generation() {
                             return Err(ManagedResourceError::CredentialChanged.into());
                         }
+                        // A decoded challenge is a host decision, not a stale
+                        // snapshot. Deliver it before yielding to the change
+                        // feed so a simultaneous update cannot discard it and
+                        // automatically repeat the ordinary read.
+                        if !read.is_complete() {
+                            let continuing =
+                                observer.emit(ManagedResourceWatchEvent::InputRequired(read))?;
+                            check_binding(cx, cancellation, deadline, &binding)?;
+                            return Ok(if continuing {
+                                ManagedResourceWatchOutcome::InputRequired
+                            } else {
+                                ManagedResourceWatchOutcome::StoppedByHost
+                            });
+                        }
                         // Retain the monitor's pending stream read across this
                         // yield. Dropping it here would silently close the feed.
                         yield_once().await;
@@ -364,19 +389,10 @@ impl ManagedResourceClient {
                             continue;
                         }
                         self.require_generation(&set, generation)?;
-                        let complete = read.is_complete();
-                        let event = if complete {
-                            ManagedResourceWatchEvent::Snapshot(read)
-                        } else {
-                            ManagedResourceWatchEvent::InputRequired(read)
-                        };
-                        let continuing = observer.emit(event)?;
+                        let continuing = observer.emit(ManagedResourceWatchEvent::Snapshot(read))?;
                         check_binding(cx, cancellation, deadline, &binding)?;
                         if !continuing {
                             return Ok(ManagedResourceWatchOutcome::StoppedByHost);
-                        }
-                        if !complete {
-                            return Ok(ManagedResourceWatchOutcome::InputRequired);
                         }
                         published = Some(revision);
                     }
@@ -492,6 +508,7 @@ fn issue_id<I: FnMut() -> Result<RequestId, ManagedResourceError>>(
 struct Observer<O> {
     callback: Mutex<O>,
     stopped: AtomicBool,
+    failed: AtomicBool,
 }
 impl<O> Observer<O>
 where
@@ -500,14 +517,28 @@ where
     ) -> Result<ManagedResourceWatchControl, ManagedResourceError>,
 {
     fn emit(&self, event: ManagedResourceWatchEvent) -> Result<bool, ManagedResourceError> {
-        let control = (self
-            .callback
-            .lock()
-            .map_err(|_| ManagedResourceError::CacheUnavailable)?)(event)?;
+        let result = match self.callback.lock() {
+            Ok(mut callback) => callback(event),
+            Err(_) => Err(ManagedResourceError::CacheUnavailable),
+        };
+        let control = match result {
+            Ok(control) => control,
+            Err(error) => {
+                self.failed.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
         if control == ManagedResourceWatchControl::Stop {
             self.stopped.store(true, Ordering::Release);
         }
         Ok(control == ManagedResourceWatchControl::Continue)
+    }
+
+    fn check_failure(&self) -> Result<(), ManagedResourceError> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(ManagedResourceError::AbortedByHost);
+        }
+        Ok(())
     }
 }
 #[derive(Default)]
