@@ -949,7 +949,13 @@ fn e2e_cli_test_help() {
     assert!(normalized.contains("peer traffic does not reset their idle timers."));
     assert!(normalized.contains("It does not bound the whole CLI or subprocess lifetime."));
     assert!(normalized.contains(
-        "Subprocess testing also verifies cleanup and is Unix-only; HTTP testing does not spawn a process."
+        "Tests negotiation, liveness, and advertised capability catalogs over stdio, explicit HTTP endpoints, or modern WebSocket connections."
+    ));
+    assert!(normalized.contains("Subprocess testing also verifies cleanup and is Unix-only."));
+    assert!(stdout.contains("--http-url"));
+    assert!(stdout.contains("--websocket-url"));
+    assert!(normalized.contains(
+        "HTTP and WebSocket also bound the whole connection handshake and each probe, including time spent connecting before request commitment."
     ));
     assert!(
         normalized.contains(

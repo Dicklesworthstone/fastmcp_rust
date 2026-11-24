@@ -6845,13 +6845,12 @@ impl ClientHttpConnection {
     /// Sends one request and returns its strictly admitted response together
     /// with the lossless JSON source of its `result` member.
     ///
-    /// A modern JSON response returns `Some(source)` when it has a result. The
-    /// source is retained without re-serialization, preserving its member
-    /// order and JSON-number lexemes. The response and source originate from
-    /// the same admitted body, and the response ID is correlated to
-    /// `request_id` before either is returned. Exact legacy SSE responses
-    /// retain their established typed behavior and therefore return `None`.
-    /// Use [`Self::request_json`] when the source sidecar is not needed.
+    /// Successful modern JSON/SSE and exact legacy SSE responses return
+    /// `Some(source)`. The source is retained without re-serialization,
+    /// preserving member order and JSON-number lexemes. The response and
+    /// source originate from the same admitted body, and the response ID is
+    /// correlated to `request_id` before either is returned. Error responses
+    /// have no result source. Use [`Self::request_json`] when it is not needed.
     pub async fn request_json_with_result_source(
         &mut self,
         cx: &Cx,
@@ -7125,7 +7124,8 @@ impl ClientHttpConnection {
         match response {
             #[cfg(feature = "legacy-2024-11-05")]
             ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => {
-                Ok((response, None, Instant::now(), Vec::new(), Vec::new()))
+                let result_source = response.retained_result_source().map(str::to_owned);
+                Ok((response, result_source, Instant::now(), Vec::new(), Vec::new()))
             }
             #[cfg(feature = "legacy-2024-11-05")]
             ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
@@ -12701,9 +12701,31 @@ async fn next_legacy_sse_message(
 ) -> Result<Option<JsonRpcMessage>, LegacySseHttpClientError> {
     match stream.next_event(cx).await? {
         Some(LegacySseEvent::Message(payload)) => {
-            decode_strict_jsonrpc_message(payload.as_bytes(), MAX_LEGACY_SSE_MESSAGE_BYTES)
-                .map(Some)
-                .map_err(|_| LegacySseHttpClientError::MessageDecodeFailed)
+            let message =
+                decode_strict_jsonrpc_message(payload.as_bytes(), MAX_LEGACY_SSE_MESSAGE_BYTES)
+                    .map_err(|_| LegacySseHttpClientError::MessageDecodeFailed)?;
+            let JsonRpcMessage::Response(response) = message else {
+                return Ok(Some(message));
+            };
+            let admission =
+                decode_strict_jsonrpc_response(payload.as_bytes(), MAX_LEGACY_SSE_MESSAGE_BYTES)
+                    .map_err(|_| LegacySseHttpClientError::MessageDecodeFailed)?;
+            if admission.response() != &response {
+                return Err(LegacySseHttpClientError::MessageDecodeFailed);
+            }
+            let (_, result_source) = admission.into_parts();
+            let response = match result_source {
+                Some(source) => JsonRpcResponse::success_with_raw_result(
+                    response
+                        .id
+                        .ok_or(LegacySseHttpClientError::MessageDecodeFailed)?,
+                    source,
+                    MAX_LEGACY_SSE_MESSAGE_BYTES,
+                )
+                .map_err(|_| LegacySseHttpClientError::MessageDecodeFailed)?,
+                None => response,
+            };
+            Ok(Some(JsonRpcMessage::Response(response)))
         }
         Some(LegacySseEvent::Endpoint(_)) => Err(LegacySseHttpClientError::UnexpectedEndpointEvent),
         None => Ok(None),
@@ -23865,7 +23887,7 @@ mod tests {
             "a raw legacy connection has not yet validated an initialize wire version"
         );
 
-        let response = runtime_block_on(connection.request_json(
+        let (response, source) = runtime_block_on(connection.request_json_with_result_source(
             &cx,
             "ping",
             serde_json::json!({}),
@@ -23873,6 +23895,8 @@ mod tests {
             4_096,
         ))
         .expect("legacy request posts then waits for its exact SSE response");
+        assert_eq!(source.as_deref(), Some("{}"));
+        assert_eq!(response.retained_result_source(), source.as_deref());
         assert!(
             response
                 .id

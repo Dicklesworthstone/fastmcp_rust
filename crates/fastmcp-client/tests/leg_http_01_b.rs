@@ -3170,3 +3170,89 @@ fn leg_http_01_b_planted_negative() {
     );
     log.assert_legacy_hygiene("guarded idle lifetime at the bound");
 }
+
+#[test]
+fn legacy_sse_preserves_completion_source_without_changing_other_frames() {
+    const SOURCE: &str = r#"{"completion":{ "values":["z-last","a-first"],"total":2,"hasMore":false },"_meta":{"z-last":1,"a-first":2}}"#;
+    const NULL: &str = r#"{"jsonrpc":"2.0","id":10,"result":null}"#;
+    const ERROR: &str = r#"{"jsonrpc":"2.0","id":8,"error":{"code":-32602,"message":"invalid argument","data":{"retry":false}}}"#;
+    const REQUEST: &str = r#"{"jsonrpc":"2.0","id":9,"method":"roots/list","params":{}}"#;
+    const NOTIFICATION: &str =
+        r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}"#;
+    let peer = Peer::serve(|target| {
+        vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![
+                    endpoint_event(target),
+                    message_event(&format!(
+                        r#"{{"jsonrpc":"2.0","id":7,"result":{SOURCE}}}"#
+                    )),
+                    message_event(NULL),
+                    message_event(ERROR),
+                    message_event(REQUEST),
+                    message_event(NOTIFICATION),
+                ],
+                end: true,
+            },
+        ]
+    });
+    runtime_block_on(async {
+        let cx = Cx::for_request();
+        let mut legacy = open_legacy(&cx, &peer).await.expect("open legacy SSE");
+        let Some(JsonRpcMessage::Response(mut response)) =
+            legacy.next_message(&cx).await.expect("read completion")
+        else {
+            panic!("the successful completion must remain a response");
+        };
+        assert_eq!(response.id, Some(RequestId::Number(7)));
+        assert_eq!(response.retained_result_source(), Some(SOURCE));
+        assert!(
+            serde_json::to_string(&response)
+                .expect("encode completion")
+                .contains(SOURCE),
+            "SSE ingress must preserve result member order and whitespace"
+        );
+        response.result.as_mut().expect("successful result")["_meta"]["z-last"] =
+            serde_json::json!(3);
+        assert!(response.retained_result_source().is_none());
+        assert_eq!(
+            serde_json::to_value(&response).expect("encode changed result")["result"]["_meta"]
+                ["z-last"],
+            serde_json::json!(3),
+            "editing the public result must not serialize the old source"
+        );
+
+        let Some(JsonRpcMessage::Response(null)) =
+            legacy.next_message(&cx).await.expect("read explicit null")
+        else {
+            panic!("an explicit null result must remain a successful response");
+        };
+        assert_eq!(null.id, Some(RequestId::Number(10)));
+        assert_eq!(null.result, Some(serde_json::Value::Null));
+        assert_eq!(null.retained_result_source(), Some("null"));
+        for (expected, is_response) in [(ERROR, true), (REQUEST, false), (NOTIFICATION, false)] {
+            let message = legacy
+                .next_message(&cx)
+                .await
+                .expect("read following frame")
+                .expect("following frame exists");
+            match (&message, is_response) {
+                (JsonRpcMessage::Response(response), true) => {
+                    assert!(response.retained_result_source().is_none());
+                }
+                (JsonRpcMessage::Request(_), false) => {}
+                _ => panic!("source preservation must not reclassify other frames"),
+            }
+            assert_eq!(
+                serde_json::to_value(&message).expect("encode following frame"),
+                serde_json::from_str::<serde_json::Value>(expected).expect("fixture JSON")
+            );
+        }
+        assert!(legacy.next_message(&cx).await.expect("stream EOF").is_none());
+    });
+    let log = peer.finish();
+    assert!(log.posts.is_empty());
+    log.assert_legacy_hygiene("source-preserving legacy responses");
+}

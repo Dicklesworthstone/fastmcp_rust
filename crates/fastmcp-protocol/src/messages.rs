@@ -5114,7 +5114,9 @@ fn decode_legacy_result<T: DeserializeOwned>(
     if has_final_only_metadata(&value) {
         return Err(CoreDispatchError::CrossEraResultMetadata { method });
     }
-    serde_json::from_value(value).map_err(|_| CoreDispatchError::InvalidResult {
+    // The Value is only the era-validation view. Decode from source so
+    // ordered opaque metadata and duplicate fields reach the typed decoder.
+    serde_json::from_str(input).map_err(|_| CoreDispatchError::InvalidResult {
         era: ProtocolEra::Legacy2024,
         method,
     })
@@ -7718,6 +7720,47 @@ mod tests {
 
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
+    fn legacy_sampling_result_preserves_metadata_order_and_rejects_duplicates() {
+        let request = CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            SAMPLING_CREATE_MESSAGE,
+            Some(&serde_json::json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}],
+                "maxTokens": 8
+            })),
+        )
+        .expect("legacy sampling request");
+        let wire = r#"{"content":{"type":"text","text":"summary"},"role":"assistant","model":"legacy","_meta":{"z-last":1,"a-first":2}}"#;
+        let result = request.decode_result(wire).expect("legacy sampling result");
+        let CoreResult::Legacy(LegacyCoreResult::SamplingCreateMessage(sampling)) = &result else {
+            panic!("legacy sampling result");
+        };
+        assert_eq!(
+            sampling
+                .meta
+                .as_ref()
+                .unwrap()
+                .entries()
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["z-last", "a-first"]
+        );
+        let encoded = result.encode().unwrap();
+        assert!(encoded.find("\"z-last\"").unwrap() < encoded.find("\"a-first\"").unwrap());
+        let duplicate = r#"{"content":{"type":"text","text":"summary"},"role":"assistant","model":"legacy","_meta":{"z-last":1,"a-first":2,"z-last":3}}"#;
+        assert!(matches!(
+            request.decode_result(duplicate),
+            Err(CoreDispatchError::InvalidResult {
+                era: ProtocolEra::Legacy2024,
+                method: SAMPLING_CREATE_MESSAGE,
+            })
+        ));
+        assert_eq!(result.encode().unwrap(), encoded);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
     fn legacy_sampling_rejects_one_final_result_field_without_mutating_its_baseline() {
         let request = CoreRequest::decode(
             ProtocolEra::Legacy2024,
@@ -10141,11 +10184,61 @@ mod tests {
             Some(&serde_json::json!({"attempt": 1}))
         );
         assert_eq!(
-            serde_json::from_str::<Value>(&result.encode().expect("legacy completion re-encodes"))
-                .expect("legacy completion encoding is JSON"),
-            serde_json::from_str::<Value>(wire).expect("legacy completion fixture is JSON"),
-            "legacy completion _meta is retained without asserting source member order"
+            metadata
+                .entries()
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["trace", "cache"],
+            "opaque metadata retains received member order"
         );
+        let encoded = result.encode().expect("legacy completion re-encodes");
+        assert_eq!(
+            serde_json::from_str::<Value>(&encoded).expect("legacy completion encoding is JSON"),
+            serde_json::from_str::<Value>(wire).expect("legacy completion fixture is JSON"),
+            "legacy completion metadata retains its values"
+        );
+        assert!(encoded.find("\"trace\"").unwrap() < encoded.find("\"cache\"").unwrap());
+
+        for duplicate in [
+            r#"{"completion":{"values":["staging"]},"_meta":{"trace":{"attempt":1},"cache":"private","trace":{"attempt":2}}}"#,
+            r#"{"completion":{"values":["staging"]},"_meta":{"trace":{"attempt":1},"cache":"private","tr\u0061ce":{"attempt":2}}}"#,
+        ] {
+            assert!(matches!(
+                request.decode_result(duplicate),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Legacy2024,
+                    method: COMPLETION_COMPLETE,
+                })
+            ));
+        }
+
+        let mut response = JsonRpcResponse::success_with_raw_result(
+            RequestId::Number(7),
+            wire.to_owned(),
+            wire.len(),
+        )
+        .expect("bounded source-preserving response");
+        assert_eq!(response.retained_result_source(), Some(wire));
+        assert_eq!(
+            request
+                .decode_response_result(&response, wire)
+                .expect("matching source is admitted")
+                .encode()
+                .expect("source-preserving completion re-encodes"),
+            encoded
+        );
+        response.result.as_mut().expect("success result")["_meta"]["trace"]["attempt"] =
+            serde_json::json!(2);
+        assert!(response.retained_result_source().is_none());
+        assert!(matches!(
+            request.decode_response_result(&response, wire),
+            Err(CoreDispatchError::InvalidResult {
+                era: ProtocolEra::Legacy2024,
+                method: COMPLETION_COMPLETE,
+            })
+        ));
+        assert_eq!(result.encode().unwrap(), encoded);
     }
 
     fn assert_resource_subscription_admission(

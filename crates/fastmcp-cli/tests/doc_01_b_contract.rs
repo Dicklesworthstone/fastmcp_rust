@@ -67,6 +67,7 @@ const PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX: &str = concat!(
     "call Invoke one MCP tool ",
     "read Read one MCP resource ",
     "prompt Render one MCP prompt ",
+    "complete Complete one prompt argument or resource-template variable ",
     "install Install server configuration into Claude Desktop or other clients ",
     "list List configured MCP servers ",
     "test Test MCP server connectivity ",
@@ -85,6 +86,7 @@ const PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX: &str = concat!(
     "call Invoke one MCP tool ",
     "read Read one MCP resource ",
     "prompt Render one MCP prompt ",
+    "complete Complete one prompt argument or resource-template variable ",
     "tasks Get, watch, update, or cancel an official MCP task ",
     "install Install server configuration into Claude Desktop or other clients ",
     "list List configured MCP servers ",
@@ -406,6 +408,24 @@ fn doc_01_b_public_binary_planted_negative() {
             "a rejected availability mutation must preserve the accepted oracle and bytes"
         );
     }
+
+    let normalized = normalized_stdout(&long_help);
+    let completion_command =
+        "complete Complete one prompt argument or resource-template variable ";
+    assert!(normalized.contains(completion_command));
+    let completion_command_mutation = PublicHelpCandidate {
+        oracle: baseline.oracle,
+        stdout: normalized.replacen(completion_command, "", 1).into_bytes(),
+    };
+    assert_eq!(
+        admit_public_root_help(&mut state, completion_command_mutation),
+        Err(PublicHelpRefusal::RootHelpFrameMismatch),
+        "removing the shipped completion command must be rejected"
+    );
+    assert_eq!(
+        state, accepted_before,
+        "a rejected completion mutation must preserve the accepted oracle and bytes"
+    );
 
     let tasks_command_mutation = PublicHelpCandidate {
         oracle: baseline.oracle,
