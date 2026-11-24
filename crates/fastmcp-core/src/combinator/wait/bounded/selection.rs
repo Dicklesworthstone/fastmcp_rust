@@ -13,6 +13,7 @@ use asupersync::Cx;
 use super::super::ambient_capability_ceiling;
 use super::{Batch, LivenessClock, admit_limits, allocation_error, live};
 use crate::combinator::{BoxFuture, QuorumResult};
+use crate::runtime::CallerContextFuture;
 use crate::{McpContext, McpError, McpResult};
 
 struct Selection<'a, T> {
@@ -211,15 +212,17 @@ impl McpContext {
     /// Use this for explicitly independent alternatives or replicas: started
     /// work may already have committed effects which dropping cannot undo.
     /// Work spawned independently by a branch is not drained by this operation.
-    pub async fn quorum_bounded<'a, T: Send + 'a>(
+    pub fn quorum_bounded<'a, T: Send + 'a>(
         &'a self,
         concurrency: usize,
         required: usize,
         futures: Vec<BoxFuture<'a, McpResult<T>>>,
-    ) -> McpResult<QuorumResult<T>> {
-        select(self, concurrency, required, futures)
-            .await
-            .map(|selected| selected.quorum)
+    ) -> impl Future<Output = McpResult<QuorumResult<T>>> + Send + 'a {
+        CallerContextFuture::new(self.cx(), async move {
+            select(self, concurrency, required, futures)
+                .await
+                .map(|selected| selected.quorum)
+        })
     }
 
     /// Tries bounded concurrent alternatives and returns the first observed success.
@@ -236,29 +239,31 @@ impl McpContext {
     /// Losing and unstarted futures are dropped before the winner is returned.
     /// A successful tool payload with `is_error` set is still an `Ok` value;
     /// classify application-level failures explicitly in the supplied futures.
-    pub async fn first_ok_bounded<'a, T: Send + 'a>(
+    pub fn first_ok_bounded<'a, T: Send + 'a>(
         &'a self,
         concurrency: usize,
         futures: Vec<BoxFuture<'a, McpResult<T>>>,
-    ) -> McpResult<T> {
-        if futures.is_empty() {
-            return Err(McpError::invalid_params(
-                "Bounded first success requires at least one input",
-            ));
-        }
-        let selected = select(self, concurrency, 1, futures).await?;
-        if selected.quorum.quorum_met {
-            Ok(selected
-                .quorum
-                .successes
-                .into_iter()
-                .next()
-                .expect("one selected success"))
-        } else {
-            Err(selected
-                .last_error
-                .expect("every input failed before first-success refusal"))
-        }
+    ) -> impl Future<Output = McpResult<T>> + Send + 'a {
+        CallerContextFuture::new(self.cx(), async move {
+            if futures.is_empty() {
+                return Err(McpError::invalid_params(
+                    "Bounded first success requires at least one input",
+                ));
+            }
+            let selected = select(self, concurrency, 1, futures).await?;
+            if selected.quorum.quorum_met {
+                Ok(selected
+                    .quorum
+                    .successes
+                    .into_iter()
+                    .next()
+                    .expect("one selected success"))
+            } else {
+                Err(selected
+                    .last_error
+                    .expect("every input failed before first-success refusal"))
+            }
+        })
     }
 }
 

@@ -14,6 +14,7 @@ use asupersync::{Cx, Time};
 use super::ambient_capability_ceiling;
 use crate::combinator::BoxFuture;
 use crate::context::{ResourceReadResult, ToolCallResult};
+use crate::runtime::CallerContextFuture;
 use crate::{McpContext, McpError, McpResult};
 
 const MAX_BATCH_OPERATIONS: usize = 4_096;
@@ -270,10 +271,12 @@ impl McpContext {
     /// Scheduling still depends on the caller driving its runtime. The caller
     /// must supply a timer driver and time capability for any nonempty batch.
     ///
-    /// All futures are polled inline under the caller's runtime and the current
-    /// ambient capability ceiling. No tasks, threads or runtimes are created.
+    /// All futures are polled inline under the caller's runtime. The capability
+    /// ceiling is captured when this operation is constructed and can only
+    /// narrow on later polls or cleanup. No tasks, threads or runtimes are created.
     /// Dropping the batch drops queued and active futures and unregisters its
-    /// timer/wakeups. It cannot undo committed effects or drain work that a
+    /// timer/wakeups under that same caller, including before the first poll.
+    /// It cannot undo committed effects or drain work that a
     /// supplied future spawned independently. Polls and destructors must not block.
     ///
     /// # Errors
@@ -283,53 +286,55 @@ impl McpContext {
     /// Returns the exact first child error, or request cancellation on liveness
     /// or poll-budget refusal. Existing `join_all` wait-for-all semantics remain
     /// unchanged; this is the explicitly bounded, fail-fast operation.
-    pub async fn try_join_all_bounded<'a, T: Send + 'a>(
+    pub fn try_join_all_bounded<'a, T: Send + 'a>(
         &'a self,
         concurrency: usize,
         futures: Vec<BoxFuture<'a, McpResult<T>>>,
-    ) -> McpResult<Vec<T>> {
-        admit_limits(concurrency, futures.len())?;
-        live(self)?;
-        if futures.is_empty() {
-            return Ok(Vec::new());
-        }
-        if self.cx().timer_driver().is_none() {
-            return Err(McpError::internal_error(
-                "Bounded batch requires the caller's timer driver",
-            ));
-        }
-        let mut batch = Batch::new(concurrency, futures)?;
-        let mut cancelled = pin!(self.request_cancelled());
-        let mut clock = LivenessClock::default();
-        poll_fn(|task| {
-            let ceiling = ambient_capability_ceiling();
-            let _caller = Cx::set_current(Some(self.cx().clone()));
-            let _restriction = Cx::push_restriction(ceiling);
-            let result = (|| {
-                live(self)?;
-                if !Cx::current().is_some_and(|cx| cx.capabilities().time) {
-                    return Err(McpError::internal_error(
-                        "Bounded batch requires time capability",
-                    ));
-                }
-                batch.wake.register(task.waker());
-                if cancelled.as_mut().poll(task).is_ready() {
-                    return Err(McpError::request_cancelled());
-                }
-                clock.poll(self, task);
-                live(self)?;
-                batch.poll_round(self)
-            })();
-            match result {
-                Ok(None) => Poll::Pending,
-                result => {
-                    // Retire children while the admitted caller is still current.
-                    batch.retire();
-                    Poll::Ready(result.map(|output| output.expect("terminal batch result")))
-                }
+    ) -> impl Future<Output = McpResult<Vec<T>>> + Send + 'a {
+        CallerContextFuture::new(self.cx(), async move {
+            admit_limits(concurrency, futures.len())?;
+            live(self)?;
+            if futures.is_empty() {
+                return Ok(Vec::new());
             }
+            if self.cx().timer_driver().is_none() {
+                return Err(McpError::internal_error(
+                    "Bounded batch requires the caller's timer driver",
+                ));
+            }
+            let mut batch = Batch::new(concurrency, futures)?;
+            let mut cancelled = pin!(self.request_cancelled());
+            let mut clock = LivenessClock::default();
+            poll_fn(|task| {
+                let ceiling = ambient_capability_ceiling();
+                let _caller = Cx::set_current(Some(self.cx().clone()));
+                let _restriction = Cx::push_restriction(ceiling);
+                let result = (|| {
+                    live(self)?;
+                    if !Cx::current().is_some_and(|cx| cx.capabilities().time) {
+                        return Err(McpError::internal_error(
+                            "Bounded batch requires time capability",
+                        ));
+                    }
+                    batch.wake.register(task.waker());
+                    if cancelled.as_mut().poll(task).is_ready() {
+                        return Err(McpError::request_cancelled());
+                    }
+                    clock.poll(self, task);
+                    live(self)?;
+                    batch.poll_round(self)
+                })();
+                match result {
+                    Ok(None) => Poll::Pending,
+                    result => {
+                        // Retire children while the admitted caller is still current.
+                        batch.retire();
+                        Poll::Ready(result.map(|output| output.expect("terminal batch result")))
+                    }
+                }
+            })
+            .await
         })
-        .await
     }
 
     /// Calls several local tools with bounded request-owned concurrency.
@@ -348,23 +353,25 @@ impl McpContext {
     /// The limits, caller timer requirement, cancellation and cleanup contract
     /// of [`Self::try_join_all_bounded`] apply. This is handler composition, not
     /// a JSON-RPC wire batch and not a substitute for router authorization.
-    pub async fn call_tools_bounded(
+    pub fn call_tools_bounded(
         &self,
         concurrency: usize,
         calls: Vec<(String, serde_json::Value)>,
-    ) -> McpResult<Vec<ToolCallResult>> {
-        admit_limits(concurrency, calls.len())?;
-        live(self)?;
-        let mut futures: Vec<BoxFuture<'_, McpResult<ToolCallResult>>> = Vec::new();
-        futures
-            .try_reserve_exact(calls.len())
-            .map_err(|_| allocation_error())?;
-        for (name, arguments) in calls {
-            futures.push(Box::pin(
-                async move { self.call_tool(&name, arguments).await },
-            ));
-        }
-        self.try_join_all_bounded(concurrency, futures).await
+    ) -> impl Future<Output = McpResult<Vec<ToolCallResult>>> + Send + '_ {
+        CallerContextFuture::new(self.cx(), async move {
+            admit_limits(concurrency, calls.len())?;
+            live(self)?;
+            let mut futures: Vec<BoxFuture<'_, McpResult<ToolCallResult>>> = Vec::new();
+            futures
+                .try_reserve_exact(calls.len())
+                .map_err(|_| allocation_error())?;
+            for (name, arguments) in calls {
+                futures.push(Box::pin(
+                    async move { self.call_tool(&name, arguments).await },
+                ));
+            }
+            self.try_join_all_bounded(concurrency, futures).await
+        })
     }
 
     /// Reads several resources with bounded request-owned concurrency.
@@ -378,21 +385,23 @@ impl McpContext {
     /// The limits, caller timer requirement, cancellation and cleanup contract
     /// of [`Self::try_join_all_bounded`] apply. Resource providers must still use
     /// nonblocking futures and retain ownership of any work they spawn elsewhere.
-    pub async fn read_resources_bounded(
+    pub fn read_resources_bounded(
         &self,
         concurrency: usize,
         uris: Vec<String>,
-    ) -> McpResult<Vec<ResourceReadResult>> {
-        admit_limits(concurrency, uris.len())?;
-        live(self)?;
-        let mut futures: Vec<BoxFuture<'_, McpResult<ResourceReadResult>>> = Vec::new();
-        futures
-            .try_reserve_exact(uris.len())
-            .map_err(|_| allocation_error())?;
-        for uri in uris {
-            futures.push(Box::pin(async move { self.read_resource(&uri).await }));
-        }
-        self.try_join_all_bounded(concurrency, futures).await
+    ) -> impl Future<Output = McpResult<Vec<ResourceReadResult>>> + Send + '_ {
+        CallerContextFuture::new(self.cx(), async move {
+            admit_limits(concurrency, uris.len())?;
+            live(self)?;
+            let mut futures: Vec<BoxFuture<'_, McpResult<ResourceReadResult>>> = Vec::new();
+            futures
+                .try_reserve_exact(uris.len())
+                .map_err(|_| allocation_error())?;
+            for uri in uris {
+                futures.push(Box::pin(async move { self.read_resource(&uri).await }));
+            }
+            self.try_join_all_bounded(concurrency, futures).await
+        })
     }
 }
 
@@ -504,7 +513,7 @@ mod tests {
         (observed, futures)
     }
 
-    fn poll<T>(future: Pin<&mut impl Future<Output = T>>, waker: &Waker) -> Poll<T> {
+    fn poll<T>(future: Pin<&mut (impl Future<Output = T> + ?Sized)>, waker: &Waker) -> Poll<T> {
         future.poll(&mut Context::from_waker(waker))
     }
 
@@ -844,10 +853,218 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy)]
+    enum BoundedOperation {
+        All,
+        Quorum,
+        First,
+    }
+
+    fn operation<'a>(
+        kind: BoundedOperation,
+        ctx: &'a McpContext,
+        futures: Vec<BoxFuture<'a, McpResult<usize>>>,
+    ) -> BoxFuture<'a, McpResult<Vec<usize>>> {
+        match kind {
+            BoundedOperation::All => Box::pin(ctx.try_join_all_bounded(1, futures)),
+            BoundedOperation::Quorum => {
+                let selection = ctx.quorum_bounded(1, 1, futures);
+                Box::pin(async move { selection.await.map(|result| result.successes) })
+            }
+            BoundedOperation::First => {
+                let selection = ctx.first_ok_bounded(1, futures);
+                Box::pin(async move { selection.await.map(|value| vec![value]) })
+            }
+        }
+    }
+
+    type AuthorityEvents = Arc<Mutex<Vec<(&'static str, usize, bool, bool, bool)>>>;
+
+    struct AuthorityProbe {
+        probe: Probe,
+        caller: Cx,
+        events: AuthorityEvents,
+    }
+
+    impl AuthorityProbe {
+        fn observe(&self, phase: &'static str) {
+            let current = Cx::current();
+            self.events.lock().unwrap().push((
+                phase,
+                self.probe.index,
+                current
+                    .as_ref()
+                    .is_some_and(|cx| cx.task_id() == self.caller.task_id()),
+                current.as_ref().is_some_and(|cx| cx.capabilities().io),
+                current.as_ref().is_some_and(|cx| cx.capabilities().remote),
+            ));
+        }
+    }
+
+    impl Future for AuthorityProbe {
+        type Output = McpResult<usize>;
+
+        fn poll(mut self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Self::Output> {
+            self.observe("poll");
+            Pin::new(&mut self.probe).poll(task)
+        }
+    }
+
+    impl Drop for AuthorityProbe {
+        fn drop(&mut self) {
+            self.observe("drop");
+        }
+    }
+
+    fn authority_probes(ctx: &McpContext, events: &AuthorityEvents) -> Probes {
+        let observed: Vec<_> = (0..2).map(|_| Arc::new(Observed::default())).collect();
+        let futures = observed
+            .iter()
+            .enumerate()
+            .map(|(index, observed)| {
+                Box::pin(AuthorityProbe {
+                    probe: Probe {
+                        index,
+                        failure: false,
+                        observed: Arc::clone(observed),
+                    },
+                    caller: ctx.cx().clone(),
+                    events: Arc::clone(events),
+                }) as BoxFuture<'static, McpResult<usize>>
+            })
+            .collect();
+        (observed, futures)
+    }
+
+    #[test]
+    fn bounded_operations_capture_caller_before_first_poll_and_abandonment() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        for kind in [
+            BoundedOperation::All,
+            BoundedOperation::Quorum,
+            BoundedOperation::First,
+        ] {
+            // Cover unstarted ownership, parked active/queued ownership, and
+            // rejection before admission using the same caller and inputs.
+            for lifecycle in 0..3 {
+                let (runtime, _, timer, ctx) = environment();
+                let host = Cx::for_testing();
+                let _host = Cx::set_current(Some(host.clone()));
+                let events = AuthorityEvents::default();
+                let (observed, futures) = authority_probes(&ctx, &events);
+                let admission = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+                let mut future = operation(kind, &ctx, futures);
+                drop(admission);
+                if lifecycle == 1 {
+                    assert!(poll(future.as_mut(), Waker::noop()).is_pending());
+                    assert_eq!(counts(&observed), vec![1, 0]);
+                } else if lifecycle == 2 {
+                    ctx.request_cancellation().cancel();
+                    assert_eq!(
+                        completed(poll(future.as_mut(), Waker::noop()))
+                            .unwrap_err()
+                            .code,
+                        McpErrorCode::RequestCancelled
+                    );
+                    assert_eq!(counts(&observed), vec![0, 0]);
+                }
+                drop(future);
+                all_dropped(&observed);
+                let events = events.lock().unwrap();
+                assert_eq!(events.iter().filter(|event| event.0 == "drop").count(), 2);
+                assert!(events.iter().all(|event| event.2 && !event.3 && event.4));
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(Cx::current().unwrap().task_id(), host.task_id());
+                assert!(Cx::current().unwrap().capabilities().io);
+                assert!(!host.is_cancel_requested());
+                assert!(!ctx.cx().is_cancel_requested());
+                drop(ctx);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_operations_retain_restrictions_across_resumed_polls_and_cleanup() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        for kind in [
+            BoundedOperation::All,
+            BoundedOperation::Quorum,
+            BoundedOperation::First,
+        ] {
+            let (runtime, _, timer, ctx) = environment();
+            let _host = Cx::set_current(Some(Cx::for_testing()));
+            let events = AuthorityEvents::default();
+            let (observed, futures) = authority_probes(&ctx, &events);
+            let mut future = operation(kind, &ctx, futures);
+            assert!(poll(future.as_mut(), Waker::noop()).is_pending());
+            for mask in [
+                CapSet::<true, true, true, false, true>::MASK,
+                CapSet::<true, true, true, true, false>::MASK,
+            ] {
+                let _restriction = Cx::push_restriction(mask);
+                observed[0]
+                    .waker
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .wake_by_ref();
+                assert!(poll(future.as_mut(), Waker::noop()).is_pending());
+            }
+            observed.iter().for_each(|probe| probe.finish());
+            let mut result = poll(future.as_mut(), Waker::noop());
+            if matches!(kind, BoundedOperation::All) {
+                assert!(result.is_pending());
+                result = poll(future.as_mut(), Waker::noop());
+            }
+            let result = completed(result).unwrap();
+            assert_eq!(
+                result,
+                if matches!(kind, BoundedOperation::All) {
+                    vec![0, 1]
+                } else {
+                    vec![0]
+                }
+            );
+            drop(future);
+            all_dropped(&observed);
+            let events = events.lock().unwrap();
+            let active_polls: Vec<_> = events
+                .iter()
+                .filter(|event| event.0 == "poll" && event.1 == 0)
+                .map(|event| (event.2, event.3, event.4))
+                .collect();
+            assert_eq!(
+                active_polls,
+                vec![
+                    (true, true, true),
+                    (true, false, true),
+                    (true, false, false),
+                    (true, false, false)
+                ]
+            );
+            assert!(
+                events
+                    .iter()
+                    .filter(|event| event.0 == "drop")
+                    .all(|event| event.2 && !event.3 && !event.4)
+            );
+            assert_eq!(timer.pending_count(), 0);
+            assert!(Cx::current().unwrap().capabilities().io);
+            assert!(Cx::current().unwrap().capabilities().remote);
+            drop(ctx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
     type Visit = (&'static str, String, Value, u32);
 
     #[derive(Default)]
     struct RoutedProvider {
+        expected_io: Option<bool>,
         visits: Mutex<Vec<Visit>>,
         released: Mutex<HashSet<String>>,
         waiters: Mutex<HashMap<String, Waker>>,
@@ -873,6 +1090,9 @@ mod tests {
         ) {
             assert_eq!(ctx.request_id(), 7);
             assert_eq!(Cx::current().unwrap().task_id(), ctx.cx().task_id());
+            if let Some(expected) = self.expected_io {
+                assert_eq!(Cx::current().unwrap().capabilities().io, expected);
+            }
             self.visits
                 .lock()
                 .unwrap()
@@ -1005,6 +1225,53 @@ mod tests {
             }
         }
         panic!("ready routed batch did not finish within its test poll ceiling");
+    }
+
+    #[test]
+    fn bounded_composition_captures_authority_when_constructed_before_first_poll() {
+        use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+
+        for kind in [Composition::Tools, Composition::Resources] {
+            for restricted in [false, true] {
+                let (runtime, _, timer, ctx) = environment();
+                let provider = Arc::new(RoutedProvider {
+                    expected_io: Some(!restricted),
+                    ..RoutedProvider::default()
+                });
+                let ctx = ctx
+                    .with_tool_caller(provider.clone())
+                    .with_resource_reader(provider.clone());
+                let host = Cx::for_testing();
+                let _host = Cx::set_current(Some(host.clone()));
+                let admission = Cx::push_restriction(if restricted {
+                    CapSet::<true, true, true, false, true>::MASK
+                } else {
+                    CapMask::all()
+                });
+                // Construct the public operation here. An async helper that
+                // constructs it on first poll would hide this boundary.
+                let mut operation: BoxFuture<'_, McpResult<()>> = match kind {
+                    Composition::Tools => {
+                        let call = ctx.call_tools_bounded(1, vec![("one".to_owned(), json!({}))]);
+                        Box::pin(async move { call.await.map(|_| ()) })
+                    }
+                    Composition::Resources => {
+                        let read = ctx.read_resources_bounded(1, vec!["one".to_owned()]);
+                        Box::pin(async move { read.await.map(|_| ()) })
+                    }
+                };
+                drop(admission);
+                completed(poll(operation.as_mut(), Waker::noop())).unwrap();
+                drop(operation);
+                assert_eq!(provider.visits.lock().unwrap().len(), 1);
+                assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(Cx::current().unwrap().task_id(), host.task_id());
+                assert!(Cx::current().unwrap().capabilities().io);
+                drop(ctx);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
     }
 
     #[test]
