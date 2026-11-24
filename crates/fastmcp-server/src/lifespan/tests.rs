@@ -708,7 +708,16 @@ fn async_lifespan_secured_http_gates_ingress_and_settles_cleanup() {
                 .unwrap();
             let control = receiver.recv(&cx).await.unwrap();
             startup.started().await;
-            let stream = send_http_discovery(address, "service.example").await;
+            let mut stream = send_http_discovery(address, "service.example").await;
+            let mut byte = [0_u8; 1];
+            let mut receive = Box::pin(stream.read(&mut byte));
+            assert!(
+                poll_fn(|task| Poll::Ready(receive.as_mut().poll(task)))
+                    .await
+                    .is_pending(),
+                "a queued real request must not pass pending startup"
+            );
+            drop(receive);
             let snapshot = OperatorSnapshot::capture(&operator).unwrap();
             assert_eq!(snapshot.lifecycle(), OperatorLifecycle::Starting);
             assert_eq!(snapshot.counters().accepted, 0);
@@ -737,7 +746,22 @@ fn async_lifespan_secured_http_gates_ingress_and_settles_cleanup() {
                     retained.poll_settlement(),
                     crate::HttpShutdownSettlement::Pending { remaining: 1 }
                 ));
+                for _ in 0..2 {
+                    assert_eq!(
+                        retained.settle_for(Duration::from_millis(5)).await,
+                        crate::HttpShutdownSettlement::Pending { remaining: 1 }
+                    );
+                }
+                assert_eq!(shutdown.entered.load(Ordering::Acquire), 1);
                 shutdown.release();
+                assert_eq!(
+                    retained.settle_for(Duration::from_secs(1)).await,
+                    crate::HttpShutdownSettlement::Settled
+                );
+                assert_eq!(
+                    retained.poll_settlement(),
+                    crate::HttpShutdownSettlement::Settled
+                );
                 retained.settle(&cx).await.unwrap();
             } else {
                 assert!(matches!(outcome, crate::HttpServerShutdown::Quiescent));
@@ -766,6 +790,7 @@ fn async_lifespan_secured_http_startup_failure_awaits_cleanup_before_returning()
             .await
             .unwrap();
         let operator = bound.operator_handle();
+        let address = bound.local_addr().unwrap();
         let mut serving = cx
             .spawn(move |owned| async move { bound.serve(&owned).await })
             .unwrap();
@@ -775,13 +800,74 @@ fn async_lifespan_secured_http_startup_failure_awaits_cleanup_before_returning()
             OperatorLifecycle::Starting
         );
         assert!(!serving.is_finished());
+        let mut stream = send_http_discovery(address, "service.example").await;
+        let mut byte = [0_u8; 1];
+        let mut receive = Box::pin(stream.read(&mut byte));
+        assert!(
+            poll_fn(|task| Poll::Ready(receive.as_mut().poll(task)))
+                .await
+                .is_pending(),
+            "failed startup must not serve the queued discovery request"
+        );
+        drop(receive);
         shutdown.release();
         let error = serving.join(&cx).await.unwrap().err().unwrap();
         assert!(error.message.contains("secured startup failed"));
+        assert!(matches!(stream.read(&mut byte).await, Ok(0) | Err(_)));
         let stopped = OperatorSnapshot::capture(&operator).unwrap();
         assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
         assert_eq!(stopped.counters().accepted, 0);
         assert_eq!(shutdown.entered.load(Ordering::Acquire), 1);
+    });
+}
+
+#[test]
+fn async_lifespan_secured_http_quiescent_shutdown_orders_hooks() {
+    run(|cx| async move {
+        let stage = Arc::new(AtomicUsize::new(0));
+        let start = Arc::clone(&stage);
+        let stop = Arc::clone(&stage);
+        let server = Server::new("secured-mixed-lifespan", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .on_startup(move || {
+                assert_eq!(start.fetch_add(1, Ordering::AcqRel), 0);
+                Ok::<(), std::io::Error>(())
+            })
+            .on_shutdown_async(move |owned| async move {
+                assert!(owned.timer_driver().is_some());
+                assert!(owned.blocking_pool_handle().is_none());
+                assert_eq!(stop.fetch_add(1, Ordering::AcqRel), 1);
+                asupersync::runtime::yield_now().await;
+                assert_eq!(stop.fetch_add(1, Ordering::AcqRel), 2);
+                Ok(())
+            })
+            .build();
+        let bound = Box::pin(server.bind_secured_http(&cx, "127.0.0.1:0", secured_http_policy()))
+            .await
+            .unwrap();
+        let operator = bound.operator_handle();
+        let (sender, mut receiver) = asupersync::channel::oneshot::channel();
+        let mut serving = cx
+            .spawn(move |owned| async move {
+                sender.send_blocking(owned.clone()).unwrap();
+                bound.serve(&owned).await
+            })
+            .unwrap();
+        let control = receiver.recv(&cx).await.unwrap();
+        while OperatorSnapshot::capture(&operator).unwrap().lifecycle()
+            != OperatorLifecycle::Running
+        {
+            asupersync::runtime::yield_now().await;
+        }
+        assert_eq!(stage.load(Ordering::Acquire), 1);
+        control.cancel_with(CancelKind::User, Some("mixed lifespan test stopping"));
+        assert!(matches!(
+            serving.join(&cx).await.unwrap().unwrap(),
+            crate::HttpServerShutdown::Quiescent
+        ));
+        assert_eq!(stage.load(Ordering::Acquire), 3);
+        assert!(cx.checkpoint().is_ok());
     });
 }
 

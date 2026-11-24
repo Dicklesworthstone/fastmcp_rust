@@ -2408,6 +2408,125 @@ impl LifespanGate {
 }
 
 #[test]
+fn native_https_async_lifespan_waits_for_noncooperative_handler() {
+    use std::sync::atomic::AtomicBool;
+
+    struct HeldTool {
+        probe: Probe,
+        entered: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+
+    impl ToolHandler for HeldTool {
+        fn definition(&self) -> Tool {
+            self.probe.definition()
+        }
+
+        fn call(&self, cx: &McpContext, arguments: Value) -> McpResult<Vec<Content>> {
+            self.entered.store(true, Ordering::Release);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !self.released.load(Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "test handler release timed out"
+                );
+                // Deliberately ignore cancellation; this is synchronous work
+                // retained in the caller's blocking pool, not an async spin.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let result = self.probe.call(cx, arguments);
+            self.finished.store(true, Ordering::Release);
+            result
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    run(|cx| async move {
+        asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+            let probe = Probe::new();
+            let entered = Arc::new(AtomicBool::new(false));
+            let released = Arc::new(AtomicBool::new(false));
+            let finished = Arc::new(AtomicBool::new(false));
+            let _release_on_failure = ReleaseOnDrop(Arc::clone(&released));
+            let cleanup_calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&cleanup_calls);
+            let observed_finish = Arc::clone(&finished);
+            let server = Server::new("native-https-retained-handler", "1")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
+                .auth_provider(probe.clone())
+                .tool(HeldTool {
+                    probe: probe.clone(),
+                    entered: Arc::clone(&entered),
+                    released: Arc::clone(&released),
+                    finished: Arc::clone(&finished),
+                })
+                .on_shutdown_async(move |_| async move {
+                    assert!(
+                        observed_finish.load(Ordering::Acquire),
+                        "application cleanup must not run over a live handler"
+                    );
+                    observed_calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                })
+                .build();
+            let mut running =
+                Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+            let address = running.address;
+            let mut peer = cx
+                .spawn(move |owned| async move { exchange(&owned, address, request(false)).await })
+                .unwrap();
+            while !entered.load(Ordering::Acquire) {
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert_eq!(probe.counts(), (1, 0));
+            running
+                .owner
+                .cancel_with(CancelKind::User, Some("retained HTTPS handler test"));
+            let outcome = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(4),
+                running.task.as_mut().unwrap().join(&cx),
+            )
+            .await
+            .expect("noncooperative work must not make listener shutdown unbounded")
+            .unwrap()
+            .unwrap();
+            running.task = None;
+            let HttpServerShutdown::Nonquiescent(mut retained) = outcome else {
+                panic!("a live blocking handler must remain caller-owned shutdown debt")
+            };
+            assert_eq!(cleanup_calls.load(Ordering::Acquire), 0);
+            assert!(!finished.load(Ordering::Acquire));
+            assert!(matches!(
+                retained.settle_for(Duration::from_millis(10)).await,
+                fastmcp_server::HttpShutdownSettlement::Pending { .. }
+            ));
+            assert_eq!(cleanup_calls.load(Ordering::Acquire), 0);
+            released.store(true, Ordering::Release);
+            retained.settle(&cx).await.unwrap();
+            assert!(finished.load(Ordering::Acquire));
+            assert_eq!(cleanup_calls.load(Ordering::Acquire), 1);
+            assert_eq!(probe.counts(), (1, 1));
+            // Cancellation may close the socket without a terminal response;
+            // the peer's result cannot stand in for actual handler settlement.
+            let _peer_result = peer.join(&cx).await.unwrap();
+            assert!(cx.checkpoint().is_ok());
+        })
+        .await
+        .expect("retained HTTPS work and cleanup must settle within the test bound");
+    });
+}
+
+#[test]
 fn https_native_async_lifespan_gates_dispatch_and_retains_cleanup() {
     run(|cx| async move {
         let probe = Probe::new();

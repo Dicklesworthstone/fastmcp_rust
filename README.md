@@ -853,16 +853,20 @@ let server = modern::ServerBuilder::new("application", "1")
     .build();
 ```
 
-Native memory, stdio, HTTP and WebSocket serving await startup before admitting
-requests or starting the hosted Task service. A startup error prevents protocol
-admission. If the startup callback was entered, configured asynchronous cleanup
-is attempted before that error returns, so partially initialized resources can
-be released. A refusal before startup entry does not invoke cleanup.
+Native memory, stdio, HTTP (including secured HTTP/HTTPS) and WebSocket serving
+await startup before admitting requests or starting the hosted Task service.
+`bind_secured_http` and `bind_secured_https` only bind and validate configuration;
+their `serve` method awaits startup before accepting connections or TLS
+handshakes. A startup error prevents protocol admission. If the startup callback
+was entered, configured asynchronous cleanup is attempted before that error
+returns, so partially initialized resources can be released. A refusal before
+startup entry does not invoke cleanup.
 
 Shutdown follows request and hosted Task quiescence. Pending cleanup remains
 owned by the caller's runtime; HTTP and WebSocket shutdown handles retain its
-completion when the transport reports a nonquiescent exit. Each hook has one
-30-second work bound, capped by the original caller deadline. Child-region
+completion when the transport reports a nonquiescent exit. Secured HTTP/HTTPS
+also retains pending cleanup when every connection has already closed. Each hook
+has one 30-second work bound, capped by the original caller deadline. Child-region
 settlement is still awaited or retained after that bound, so a timeout does not
 certify that noncooperative child work finished. Dropping a serve or shutdown
 observer requests abandonment and does not run cleanup over live handlers.
