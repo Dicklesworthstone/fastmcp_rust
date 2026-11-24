@@ -14,8 +14,9 @@
 //!   default. [`crate::ServerBuilder::task_supervisor`] installs one for an
 //!   [`ApplicationTaskSupervisor`], and every serve path then hosts its runner
 //!   as a child of the serve scope: started and ready before traffic,
-//!   awaited through quiescence before the serve returns, reporting a failure
-//!   if settlement exceeds its grace period. An embedding that owns
+//!   awaited through quiescence or retained in a native listener's
+//!   nonquiescent shutdown handle, reporting a failure if settlement exceeds
+//!   its grace period. An embedding that owns
 //!   its own region may instead call [`FinalTaskRuntime::install_task_service`]
 //!   and poll [`AuthorizedTaskServiceRunner::run_service`] itself. Without
 //!   either, a task-creating request is refused with "Final task creation
@@ -11638,7 +11639,7 @@ pub(crate) const HOSTED_TASK_SERVICE_QUEUE_CAPACITY: usize = 64;
 /// How long a serve path waits for its hosted Task service to become ready.
 pub(crate) const HOSTED_TASK_SERVICE_STARTUP_BOUND: StdDuration = StdDuration::from_secs(2);
 /// Grace period before settlement records a deadline failure. The service
-/// remains owned and awaited until it actually exits after this threshold.
+/// remains owned until it exits, including in a nonquiescent listener handle.
 pub(crate) const HOSTED_TASK_SERVICE_SETTLEMENT_BOUND: StdDuration = StdDuration::from_secs(4);
 const HOSTED_TASK_SERVICE_POLL: StdDuration = StdDuration::from_millis(1);
 
@@ -11649,8 +11650,9 @@ type HostedRunnerSlot = Arc<Mutex<Option<AuthorizedTaskServiceRunner>>>;
 ///
 /// Between serves the runner waits in its slot. [`Self::start`] moves it into
 /// a child task of the serving `Cx`, and a drop guard returns it when that
-/// child finishes, is cancelled or is dropped. A runner therefore cannot
-/// outlive the serve that started it, and a later serve can re-enter it.
+/// child finishes, is cancelled or is dropped. A nonquiescent native listener
+/// retains the child until that retirement, and a later serve can then
+/// re-enter the returned runner.
 #[derive(Clone)]
 pub(crate) struct TaskServiceHost {
     runtime: FinalTaskRuntime,
@@ -11658,11 +11660,13 @@ pub(crate) struct TaskServiceHost {
 }
 
 /// The hosted Task service child of one serve.
-#[must_use = "a hosted Task service must be settled before its serve returns"]
+#[must_use = "settle the hosted Task service or retain it in the listener shutdown handle"]
 pub(crate) struct HostedTaskService {
     runtime: FinalTaskRuntime,
     handle: asupersync::runtime::TaskHandle<McpResult<()>>,
     failure_signal: Arc<AtomicBool>,
+    settlement_expired: bool,
+    settlement_result: Option<McpResult<()>>,
 }
 
 struct ReturnRunnerOnDrop {
@@ -11759,6 +11763,8 @@ impl TaskServiceHost {
             runtime: self.runtime.clone(),
             handle,
             failure_signal,
+            settlement_expired: false,
+            settlement_result: None,
         })
     }
 
@@ -11844,31 +11850,38 @@ impl HostedTaskService {
         Ok(())
     }
 
-    /// Cancels the child and waits for it to finish. Crossing the settlement
-    /// bound records an error, but retains the child until it actually exits:
-    /// an uncooperative application future must never outlive a returning
-    /// serve operation. The runner is back in its slot before this returns.
-    pub(crate) async fn settle(mut self, cx: &Cx) -> McpResult<()> {
-        self.handle.abort();
-        let deadline = cx.now() + HOSTED_TASK_SERVICE_SETTLEMENT_BOUND;
-        let mut exceeded_bound = false;
-        loop {
-            // Joining through an already cancelled serve context can stop the
-            // wait before the service has retired its readiness lease. Poll
-            // completion without that cancellation gate while retaining the
-            // independent, finite settlement deadline.
-            exceeded_bound |= cx.now() >= deadline;
-            let joined = match self.handle.try_join() {
-                Ok(Some(result)) => Some(result),
-                Ok(None) => None,
-                Err(error) => Some(hosted_task_service_exit(Err(error))),
+    /// Observes actual retirement once, preserving its result on later polls.
+    /// An expired grace period remains an error after eventual completion.
+    pub(crate) fn poll_settlement(&mut self) -> Option<McpResult<()>> {
+        if self.settlement_result.is_none() {
+            let result = match self.handle.try_join() {
+                Ok(Some(result)) => result,
+                Ok(None) => return None,
+                Err(error) => hosted_task_service_exit(Err(error)),
             };
-            if let Some(result) = joined {
-                return if exceeded_bound {
-                    Err(hosted_task_service_unsettled())
-                } else {
-                    result
-                };
+            self.settlement_result = Some(if self.settlement_expired {
+                Err(hosted_task_service_unsettled())
+            } else {
+                result
+            });
+        }
+        self.settlement_result.clone()
+    }
+
+    /// Cancels the service and observes it for its finite grace period.
+    /// A pending result retains the original handle and its elapsed-bound
+    /// failure. The caller must transfer that ownership or keep awaiting it.
+    pub(crate) async fn settle_bounded(&mut self, cx: &Cx) -> Option<McpResult<()>> {
+        self.handle.abort();
+        if self.settlement_expired {
+            return self.poll_settlement();
+        }
+        let deadline = cx.now() + HOSTED_TASK_SERVICE_SETTLEMENT_BOUND;
+        loop {
+            self.settlement_expired |= cx.now() >= deadline;
+            let result = self.poll_settlement();
+            if result.is_some() || self.settlement_expired {
+                return result;
             }
             // Sleep completes immediately in a cancelled ambient Cx. Always
             // yield independently so settlement cannot spin on that Ready
@@ -11878,24 +11891,29 @@ impl HostedTaskService {
         }
     }
 
+    /// Cancels the child and waits for actual retirement, even after its grace
+    /// period. The runner is back in its slot before this returns.
+    pub(crate) async fn settle(mut self, cx: &Cx) -> McpResult<()> {
+        if let Some(result) = self.settle_bounded(cx).await {
+            return result;
+        }
+        loop {
+            if let Some(result) = self.poll_settlement() {
+                return result;
+            }
+            asupersync::runtime::yield_now().await;
+            asupersync::time::sleep(cx.now(), HOSTED_TASK_SERVICE_POLL).await;
+        }
+    }
+
     /// Blocking form of [`Self::settle`] for the synchronous serve loops.
     pub(crate) fn settle_blocking(mut self) -> McpResult<()> {
         self.handle.abort();
         let deadline = Instant::now() + HOSTED_TASK_SERVICE_SETTLEMENT_BOUND;
-        let mut exceeded_bound = false;
         loop {
-            exceeded_bound |= Instant::now() >= deadline;
-            let joined = match self.handle.try_join() {
-                Ok(Some(result)) => Some(result),
-                Ok(None) => None,
-                Err(error) => Some(hosted_task_service_exit(Err(error))),
-            };
-            if let Some(result) = joined {
-                return if exceeded_bound {
-                    Err(hosted_task_service_unsettled())
-                } else {
-                    result
-                };
+            self.settlement_expired |= Instant::now() >= deadline;
+            if let Some(result) = self.poll_settlement() {
+                return result;
             }
             std::thread::sleep(HOSTED_TASK_SERVICE_POLL);
         }
@@ -11928,7 +11946,7 @@ fn hosted_task_service_not_ready() -> McpError {
     McpError::internal_error("The hosted Task service did not become ready within its bound")
 }
 
-fn hosted_task_service_unsettled() -> McpError {
+pub(crate) fn hosted_task_service_unsettled() -> McpError {
     McpError::internal_error("The hosted Task service did not settle within its bound")
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use asupersync::runtime::{RuntimeBuilder, TaskHandle};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Gate {
@@ -351,7 +352,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(resumed: bool) -> (Self, FinalTaskSupervisorHandoff) {
+    fn pending(resumed: bool) -> Self {
         let store = Arc::new(AsyncWorkerStore::new());
         let registration = Arc::new(());
         let task_id = FinalTaskId::parse("async-worker-task").unwrap();
@@ -423,21 +424,27 @@ impl Fixture {
         runtime
             .install_execution_authorizer(permission.clone())
             .unwrap();
+        Self {
+            store,
+            runtime,
+            permission,
+            task_id,
+            _registration: registration,
+        }
+    }
+
+    fn new(resumed: bool) -> (Self, FinalTaskSupervisorHandoff) {
+        let fixture = Self::pending(resumed);
         let handoff = if resumed {
-            FinalTaskSupervisorHandoff::Resumed(runtime.recover_accepted_input().unwrap().unwrap())
+            FinalTaskSupervisorHandoff::Resumed(
+                fixture.runtime.recover_accepted_input().unwrap().unwrap(),
+            )
         } else {
-            FinalTaskSupervisorHandoff::Initial(runtime.recover_initial_work().unwrap().unwrap())
+            FinalTaskSupervisorHandoff::Initial(
+                fixture.runtime.recover_initial_work().unwrap().unwrap(),
+            )
         };
-        (
-            Self {
-                store,
-                runtime,
-                permission,
-                task_id,
-                _registration: registration,
-            },
-            handoff,
-        )
+        (fixture, handoff)
     }
 
     fn elect(&self, handoff: &mut FinalTaskSupervisorHandoff) -> FinalTaskExecutionGuard {
@@ -727,6 +734,330 @@ enum ReceiptInterruption {
     Revoked,
     Expired,
     ProviderError,
+}
+
+struct ListenerReceiptGuard<T> {
+    store: Arc<AsyncWorkerStore>,
+    listener: Option<TaskHandle<McpResult<T>>>,
+}
+
+impl<T> Drop for ListenerReceiptGuard<T> {
+    fn drop(&mut self) {
+        // A failing assertion or observation timeout must not strand an
+        // admitted write while the test runtime closes its child region.
+        self.store.receipt_gate.release();
+        if let Some(listener) = self.listener.as_mut() {
+            listener.abort();
+        }
+    }
+}
+
+#[test]
+fn async_worker_http_shutdown_retains_pending_receipt_and_defers_cleanup() {
+    use crate::http_admission::security::HttpSecurityPolicy;
+    use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
+    use crate::{HttpServerShutdown, HttpShutdownSettlement, Server};
+    use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+
+    for secured in [false, true] {
+        for hold_receipt in [false, true] {
+            let runtime = RuntimeBuilder::current_thread()
+                .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::pending(false);
+                fixture.store.receipt_gate.close();
+                let effects = Arc::new(AtomicUsize::new(0));
+                let outcome = Arc::new(Mutex::new(None));
+                let cleanups = Arc::new(AtomicUsize::new(0));
+                let cleanup_count = Arc::clone(&cleanups);
+                let cleanup_runtime = fixture.runtime.clone();
+                let server = Server::new("http-hosted-worker-receipt", "1")
+                    .protocol_policy(ProtocolPolicy::ModernOnly)
+                    .unwrap()
+                    .final_tasks(fixture.runtime.clone())
+                    .unwrap()
+                    .task_supervisor(Arc::new(CompletingSupervisor {
+                        effects_after_await: Arc::clone(&effects),
+                        outcome: Arc::clone(&outcome),
+                    }))
+                    .on_shutdown_async(move |_| async move {
+                        assert!(
+                            !cleanup_runtime.is_task_service_ready(),
+                            "cleanup cannot run over an owned Task service"
+                        );
+                        cleanup_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .build();
+                let serving = Arc::new(Mutex::new(None));
+                let serving_context = Arc::clone(&serving);
+                let listener = cx
+                    .spawn(move |serve_cx| async move {
+                        *serving_context.lock().unwrap() = Some(serve_cx.clone());
+                        if secured {
+                            let policy = HttpSecurityPolicy::new(
+                                HttpEndpointConfig::new(
+                                    "/mcp",
+                                    HttpAdmissionLimits::new(32, 8192, 65536).unwrap(),
+                                )
+                                .unwrap(),
+                                "https://localhost",
+                                Vec::new(),
+                            )
+                            .unwrap();
+                            server
+                                .bind_secured_http(&serve_cx, "127.0.0.1:0", policy)
+                                .await?
+                                .serve(&serve_cx)
+                                .await
+                        } else {
+                            server
+                                .bind_http(&serve_cx, "127.0.0.1:0")
+                                .await?
+                                .serve(&serve_cx)
+                                .await
+                        }
+                    })
+                    .unwrap();
+                let mut running = ListenerReceiptGuard {
+                    store: Arc::clone(&fixture.store),
+                    listener: Some(listener),
+                };
+                asupersync::time::timeout(
+                    cx.now(),
+                    StdDuration::from_secs(5),
+                    fixture.store.committed.wait(),
+                )
+                .await
+                .expect("the hosted service must recover and commit its pending work");
+                assert_eq!(fixture.store.writes.load(Ordering::SeqCst), 1);
+                assert_eq!(effects.load(Ordering::SeqCst), 0);
+                assert!(fixture.runtime.is_task_service_ready());
+
+                if !hold_receipt {
+                    // The paired control differs only in when the same
+                    // committed operation's receipt becomes available.
+                    fixture.store.receipt_gate.release();
+                    asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), async {
+                        while effects.load(Ordering::SeqCst) == 0 {
+                            asupersync::time::sleep(cx.now(), StdDuration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .expect("the released receipt must reach the application");
+                }
+
+                let stopping = Instant::now();
+                serving
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .cancel_with(CancelKind::User, Some("HTTP receipt shutdown regression"));
+                let joined = asupersync::time::timeout(
+                    cx.now(),
+                    StdDuration::from_secs(12),
+                    running.listener.as_mut().unwrap().join(&cx),
+                )
+                .await
+                .expect("HTTP shutdown must return ownership within its observation bound");
+                running.listener = None;
+                let shutdown = joined.unwrap().unwrap();
+                if hold_receipt {
+                    assert!(stopping.elapsed() >= HOSTED_TASK_SERVICE_SETTLEMENT_BOUND);
+                    let HttpServerShutdown::Nonquiescent(mut retained) = shutdown else {
+                        panic!(
+                            "a pending worker receipt must remain caller-owned: secured={secured}"
+                        );
+                    };
+                    let expected = "The hosted Task service did not settle within its bound";
+                    assert_eq!(retained.listener_error().unwrap().message, expected);
+                    assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+                    assert!(fixture.runtime.is_task_service_ready());
+                    assert!(matches!(
+                        retained.poll_settlement(),
+                        HttpShutdownSettlement::Pending { remaining: 1 }
+                    ));
+                    assert!(matches!(
+                        retained.settle_for(StdDuration::from_millis(5)).await,
+                        HttpShutdownSettlement::Pending { remaining: 1 }
+                    ));
+                    assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+                    assert_eq!(effects.load(Ordering::SeqCst), 0);
+                    fixture.store.receipt_gate.release();
+                    if secured {
+                        assert!(matches!(
+                            retained.settle_for(StdDuration::from_secs(5)).await,
+                            HttpShutdownSettlement::Settled
+                        ));
+                        assert!(matches!(
+                            retained.poll_settlement(),
+                            HttpShutdownSettlement::Settled
+                        ));
+                        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+                    }
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        StdDuration::from_secs(5),
+                        retained.settle(&cx),
+                    )
+                    .await
+                    .expect("releasing the receipt must settle its original owner")
+                    .unwrap_err();
+                    assert_eq!(error.message, expected);
+                } else {
+                    assert!(matches!(shutdown, HttpServerShutdown::Quiescent));
+                }
+                assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+                assert!(!fixture.runtime.is_task_service_ready());
+                assert_eq!(effects.load(Ordering::SeqCst), usize::from(!hold_receipt));
+                assert_eq!(outcome.lock().unwrap().is_some(), !hold_receipt);
+                assert_eq!(fixture.store.writes.load(Ordering::SeqCst), 1);
+                assert!(
+                    fixture
+                        .store
+                        .inner
+                        .next_initial_work_snapshot_after(None)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(matches!(
+                    fixture.snapshot().task(),
+                    FinalTask::Completed { .. }
+                ));
+                assert!(cx.checkpoint().is_ok());
+            });
+            assert!(runtime.shutdown_timeout(StdDuration::from_secs(2)));
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+#[test]
+fn async_worker_websocket_shutdown_retains_pending_receipt_and_defers_cleanup() {
+    use crate::{Server, WebSocketServerShutdown};
+    use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+        .blocking_threads(0, 0)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cx = Cx::current().unwrap();
+        let fixture = Fixture::pending(false);
+        fixture.store.receipt_gate.close();
+        let effects = Arc::new(AtomicUsize::new(0));
+        let outcome = Arc::new(Mutex::new(None));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let cleanup_count = Arc::clone(&cleanups);
+        let cleanup_runtime = fixture.runtime.clone();
+        let server = Server::new("websocket-hosted-worker-receipt", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .final_tasks(fixture.runtime.clone())
+            .unwrap()
+            .task_supervisor(Arc::new(CompletingSupervisor {
+                effects_after_await: Arc::clone(&effects),
+                outcome: Arc::clone(&outcome),
+            }))
+            .on_shutdown_async(move |_| async move {
+                assert!(!cleanup_runtime.is_task_service_ready());
+                cleanup_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .build();
+        let serving = Arc::new(Mutex::new(None));
+        let serving_context = Arc::clone(&serving);
+        let listener = cx
+            .spawn(move |serve_cx| async move {
+                *serving_context.lock().unwrap() = Some(serve_cx.clone());
+                server
+                    .bind_websocket(&serve_cx, "127.0.0.1:0")
+                    .await?
+                    .serve(&serve_cx)
+                    .await
+            })
+            .unwrap();
+        let mut running = ListenerReceiptGuard {
+            store: Arc::clone(&fixture.store),
+            listener: Some(listener),
+        };
+        asupersync::time::timeout(
+            cx.now(),
+            StdDuration::from_secs(5),
+            fixture.store.committed.wait(),
+        )
+        .await
+        .expect("the WebSocket-hosted service must commit its pending work");
+        assert_eq!(fixture.store.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        serving.lock().unwrap().as_ref().unwrap().cancel_with(
+            CancelKind::User,
+            Some("WebSocket receipt shutdown regression"),
+        );
+        // WebSocket retains its five-second child/cleanup observation after
+        // the four-second Task settlement grace. Leave ample scheduling margin.
+        let joined = asupersync::time::timeout(
+            cx.now(),
+            StdDuration::from_secs(20),
+            running.listener.as_mut().unwrap().join(&cx),
+        )
+        .await
+        .expect("WebSocket shutdown must return its pending Task owner");
+        running.listener = None;
+        let WebSocketServerShutdown::Nonquiescent(mut retained) = joined.unwrap().unwrap() else {
+            panic!("the WebSocket listener must retain the pending worker receipt");
+        };
+        let expected = "The hosted Task service did not settle within its bound";
+        assert_eq!(retained.remaining_connections(), 0);
+        assert_eq!(retained.listener_error().unwrap().message, expected);
+        assert!(fixture.runtime.is_task_service_ready());
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+        assert!(
+            !retained
+                .settle_for(StdDuration::from_millis(5))
+                .await
+                .unwrap()
+        );
+        assert_eq!(cleanups.load(Ordering::SeqCst), 0);
+        fixture.store.receipt_gate.release();
+        let error = retained
+            .settle_for(StdDuration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, expected);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        assert!(!fixture.runtime.is_task_service_ready());
+        assert_eq!(
+            retained
+                .settle_for(StdDuration::ZERO)
+                .await
+                .unwrap_err()
+                .message,
+            expected
+        );
+        let error =
+            asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), retained.settle(&cx))
+                .await
+                .expect("the completed WebSocket shutdown owner must remain settled")
+                .unwrap_err();
+        assert_eq!(error.message, expected);
+        assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert!(outcome.lock().unwrap().is_none());
+        assert_eq!(fixture.store.writes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            fixture.snapshot().task(),
+            FinalTask::Completed { .. }
+        ));
+        assert!(cx.checkpoint().is_ok());
+    });
+    assert!(runtime.shutdown_timeout(StdDuration::from_secs(2)));
 }
 
 #[test]

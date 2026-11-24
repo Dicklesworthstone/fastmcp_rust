@@ -964,6 +964,8 @@ async fn settle_http_after_gated_child(
         listener_error,
         shutdown_complete: false,
         lifespan,
+        #[cfg(feature = "tasks")]
+        hosted_task_service: None,
     };
     let mut settlement = Box::pin(retained.settle(cx));
     assert!(

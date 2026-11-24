@@ -10179,7 +10179,7 @@ enum HttpConnectionShutdown {
 /// asupersync region. It was neither detached nor transferred to global state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpShutdownSettlement {
-    /// Every retained connection child has completed and been observed.
+    /// Every retained connection, hosted Task service and cleanup has settled.
     Settled,
     /// Every retained child has reached a terminal state, but one or more
     /// children panicked or violated the handle's single-consumption contract.
@@ -10190,8 +10190,8 @@ pub enum HttpShutdownSettlement {
 
 /// Caller-owned settlement authority for a bounded, nonquiescent HTTP stop.
 ///
-/// This handle retains every connection child that did not cooperate with the
-/// listener's shutdown cancellation before its bounded drain elapsed. Call
+/// This handle retains connection children and the hosted Task service that
+/// outlive the listener's bounded shutdown drain. Call
 /// [`Self::poll_settlement`] or [`Self::settle_for`] for bounded observation,
 /// or [`Self::settle`] when the caller deliberately elects to await eventual
 /// quiescence. Dropping the handle does not create FastMCP global retention;
@@ -10203,6 +10203,8 @@ pub struct HttpNonquiescentShutdown {
     listener_error: Option<McpError>,
     shutdown_complete: bool,
     lifespan: Option<AsyncLifespanOwner>,
+    #[cfg(feature = "tasks")]
+    hosted_task_service: Option<tasks::HostedTaskService>,
 }
 
 impl HttpNonquiescentShutdown {
@@ -10230,14 +10232,23 @@ impl HttpNonquiescentShutdown {
 
     /// Reaps completed children without waiting for live children.
     ///
-    /// Once all children are terminal, starts asynchronous cleanup and polls
-    /// its retained owner. `Pending` includes one remaining lifecycle owner
-    /// while cleanup or its child-region close is unfinished. Synchronous
-    /// cleanup still runs exactly once after asynchronous settlement.
+    /// Once all children and the hosted Task service are terminal, starts
+    /// asynchronous cleanup and polls its retained owner. `Pending` counts a
+    /// retained service, or one lifecycle owner while cleanup or its
+    /// child-region close is unfinished. Synchronous cleanup still runs
+    /// exactly once after asynchronous settlement.
     #[must_use]
     pub fn poll_settlement(&mut self) -> HttpShutdownSettlement {
         self.children.reap_finished();
-        if self.children.tasks.is_empty() {
+        #[cfg(feature = "tasks")]
+        let service_pending = usize::from(!Server::poll_hosted_task_service(
+            &mut self.hosted_task_service,
+            &mut self.listener_error,
+        ));
+        #[cfg(not(feature = "tasks"))]
+        let service_pending = 0;
+        let remaining = self.children.tasks.len() + service_pending;
+        if remaining == 0 {
             if !self.finish_shutdown() {
                 return HttpShutdownSettlement::Pending { remaining: 1 };
             }
@@ -10249,9 +10260,7 @@ impl HttpNonquiescentShutdown {
                 }
             }
         } else {
-            HttpShutdownSettlement::Pending {
-                remaining: self.children.tasks.len(),
-            }
+            HttpShutdownSettlement::Pending { remaining }
         }
     }
 
@@ -10293,6 +10302,12 @@ impl HttpNonquiescentShutdown {
                 Err(error) => failures.push(error.to_string()),
             }
         }
+        #[cfg(feature = "tasks")]
+        if let Err(error) =
+            Server::settle_hosted_task_service(self.hosted_task_service.take(), cx).await
+        {
+            self.listener_error.get_or_insert(error);
+        }
         if let Some(lifespan) = self.lifespan.as_mut() {
             let _ = lifespan.finish().await;
         }
@@ -10318,10 +10333,10 @@ impl HttpNonquiescentShutdown {
 /// to the caller, preserving structured ownership without a global registry.
 #[must_use = "a nonquiescent HTTP shutdown transfers child handles that must be settled"]
 pub enum HttpServerShutdown {
-    /// The listener stopped and every connection child was joined.
+    /// The listener stopped and all connections, hosted Tasks and cleanup settled.
     Quiescent,
-    /// The listener stopped, but this caller now owns explicit settlement of
-    /// the retained connection children.
+    /// The listener stopped and transferred its remaining connection, hosted
+    /// Task service or cleanup ownership to the caller.
     Nonquiescent(HttpNonquiescentShutdown),
 }
 
@@ -10372,8 +10387,10 @@ impl HttpListenerLifespan {
         cx: &Cx,
     ) -> McpResult<HttpServerShutdown> {
         #[cfg(feature = "tasks")]
-        let result =
-            result.and(Server::settle_hosted_task_service(self.hosted_task_service, cx).await);
+        let mut hosted_task_service = self.hosted_task_service;
+        #[cfg(feature = "tasks")]
+        let result = result
+            .and(Server::settle_hosted_task_service_bounded(&mut hosted_task_service, cx).await);
         #[cfg(not(feature = "tasks"))]
         let _ = cx;
         let mut shutdown = HttpNonquiescentShutdown {
@@ -10382,6 +10399,8 @@ impl HttpListenerLifespan {
             listener_error: result.err(),
             shutdown_complete: false,
             lifespan: self.owner,
+            #[cfg(feature = "tasks")]
+            hosted_task_service,
         };
         // After the connection drain, cleanup gets one bounded observation.
         // A slow callback stays in this handle, even if no sockets remain.
@@ -10672,6 +10691,9 @@ impl BoundHttpServer {
     /// the bounded connection-shutdown wait instead of claiming a clean
     /// shutdown. The caller owns the returned settlement handle and chooses a
     /// further bounded observation or eventual join.
+    /// A hosted Task service receives its four-second shutdown grace period.
+    /// If it remains live, the same nonquiescent handle retains the service
+    /// and defers application cleanup until the service actually retires.
     ///
     /// The returned future is `Send`; this crate verifies that contract so
     /// downstream runtimes need not expand the listener's internal task graph.
@@ -10881,7 +10903,8 @@ pub enum WebSocketServerShutdown {
     Nonquiescent(WebSocketNonquiescentShutdown),
 }
 
-/// Caller-owned WebSocket connection work that outlived bounded shutdown.
+/// Caller-owned WebSocket connections, hosted Tasks and pending cleanup that
+/// outlived bounded shutdown.
 #[cfg(feature = "websocket")]
 #[must_use = "settle retained WebSocket connection children before discarding this outcome"]
 pub struct WebSocketNonquiescentShutdown {
@@ -10890,6 +10913,8 @@ pub struct WebSocketNonquiescentShutdown {
     listener_error: Option<McpError>,
     shutdown_complete: bool,
     lifespan: Option<AsyncLifespanOwner>,
+    #[cfg(feature = "tasks")]
+    hosted_task_service: Option<tasks::HostedTaskService>,
 }
 
 #[cfg(feature = "websocket")]
@@ -10911,6 +10936,9 @@ impl WebSocketNonquiescentShutdown {
     }
 
     /// Number of accepted connections that still require caller-owned settlement.
+    ///
+    /// A zero count can still leave a hosted Task service or cleanup pending;
+    /// use [`Self::settle_for`] to observe the complete shutdown.
     #[must_use]
     pub const fn remaining_connections(&self) -> usize {
         self.children.tasks.len()
@@ -10932,7 +10960,14 @@ impl WebSocketNonquiescentShutdown {
         let deadline = Instant::now() + timeout;
         loop {
             self.children.reap_finished();
-            if self.children.tasks.is_empty() && self.finish_shutdown() {
+            #[cfg(feature = "tasks")]
+            let service_settled = Server::poll_hosted_task_service(
+                &mut self.hosted_task_service,
+                &mut self.listener_error,
+            );
+            #[cfg(not(feature = "tasks"))]
+            let service_settled = true;
+            if self.children.tasks.is_empty() && service_settled && self.finish_shutdown() {
                 return if let Some(error) = self.children.terminal_failure() {
                     Err(error)
                 } else if let Some(error) = self.listener_error.clone() {
@@ -10957,6 +10992,12 @@ impl WebSocketNonquiescentShutdown {
                 Ok(Err(error)) => self.children.record_failure(error.to_string()),
                 Err(error) => self.children.record_failure(error.to_string()),
             }
+        }
+        #[cfg(feature = "tasks")]
+        if let Err(error) =
+            Server::settle_hosted_task_service(self.hosted_task_service.take(), cx).await
+        {
+            self.listener_error.get_or_insert(error);
         }
         if let Some(lifespan) = self.lifespan.as_mut() {
             let _ = lifespan.finish().await;
@@ -10997,7 +11038,7 @@ impl BoundWebSocketServer {
             }
         };
         #[cfg(feature = "tasks")]
-        let hosted_task_service = match self.server.start_hosted_task_service(cx).await {
+        let mut hosted_task_service = match self.server.start_hosted_task_service(cx).await {
             Ok(hosted) => hosted,
             Err(error) => {
                 if let Some(lifespan) = lifespan.as_mut() {
@@ -11087,7 +11128,8 @@ impl BoundWebSocketServer {
             }
         }
         #[cfg(feature = "tasks")]
-        let task_service_result = Server::settle_hosted_task_service(hosted_task_service, cx).await;
+        let task_service_result =
+            Server::settle_hosted_task_service_bounded(&mut hosted_task_service, cx).await;
         #[cfg(not(feature = "tasks"))]
         let task_service_result: McpResult<()> = Ok(());
         let accept_result = accept_result.and(task_service_result);
@@ -11097,6 +11139,8 @@ impl BoundWebSocketServer {
             listener_error: accept_result.err(),
             shutdown_complete: false,
             lifespan,
+            #[cfg(feature = "tasks")]
+            hosted_task_service,
         };
         if shutdown.children.tasks.is_empty()
             && shutdown
@@ -17792,6 +17836,41 @@ impl Server {
             Some(hosted) => hosted.settle(cx).await,
             None => Ok(()),
         }
+    }
+
+    /// Records grace expiry while retaining the service in its slot.
+    /// Native listeners transfer that slot to their nonquiescent outcome.
+    #[cfg(feature = "tasks")]
+    async fn settle_hosted_task_service_bounded(
+        hosted: &mut Option<tasks::HostedTaskService>,
+        cx: &Cx,
+    ) -> McpResult<()> {
+        let Some(service) = hosted.as_mut() else {
+            return Ok(());
+        };
+        let Some(result) = service.settle_bounded(cx).await else {
+            return Err(tasks::hosted_task_service_unsettled());
+        };
+        *hosted = None;
+        result
+    }
+
+    #[cfg(feature = "tasks")]
+    fn poll_hosted_task_service(
+        hosted: &mut Option<tasks::HostedTaskService>,
+        listener_error: &mut Option<McpError>,
+    ) -> bool {
+        let Some(service) = hosted.as_mut() else {
+            return true;
+        };
+        let Some(result) = service.poll_settlement() else {
+            return false;
+        };
+        *hosted = None;
+        if let Err(error) = result {
+            listener_error.get_or_insert(error);
+        }
+        true
     }
 
     #[cfg(feature = "tasks")]
@@ -30951,6 +31030,8 @@ mod lib_unit_tests {
                 listener_error: None,
                 shutdown_complete: false,
                 lifespan: None,
+                #[cfg(feature = "tasks")]
+                hosted_task_service: None,
             };
             if retained.remaining_connections() != 1 {
                 return Err("successful retained child was not caller-owned".to_owned());
@@ -31035,6 +31116,8 @@ mod lib_unit_tests {
                 listener_error: None,
                 shutdown_complete: false,
                 lifespan: None,
+                #[cfg(feature = "tasks")]
+                hosted_task_service: None,
             });
             let WebSocketServerShutdown::Nonquiescent(retained) = retained else {
                 return Err("forced WebSocket retained work did not report Nonquiescent".to_owned());
@@ -31097,6 +31180,8 @@ mod lib_unit_tests {
                 listener_error: Some(McpError::internal_error("forced accept-loop failure")),
                 shutdown_complete: false,
                 lifespan: None,
+                #[cfg(feature = "tasks")]
+                hosted_task_service: None,
             };
             let error = retained
                 .settle_for(Duration::ZERO)
