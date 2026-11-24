@@ -209,6 +209,9 @@ impl Peer {
         json_reply(&mut tls, r#"{"access_token":"typed-access","token_type":"Bearer","expires_in":300,"refresh_token":"typed-refresh"}"#).await;
     }
     pub async fn listen(&self, id: i64) -> TlsStream<TcpStream> {
+        self.listen_with_coverage(id, true).await
+    }
+    pub async fn listen_with_coverage(&self, id: i64, covered: bool) -> TlsStream<TcpStream> {
         let (mut tls, request) = self.request("/mcp").await;
         let request: Value = serde_json::from_slice(&request).unwrap();
         assert_eq!(request["id"], id);
@@ -218,8 +221,9 @@ impl Peer {
             json!({"toolsListChanged":true})
         );
         tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        let notifications = if covered { json!({"toolsListChanged":true}) } else { json!({}) };
         chunk(&mut tls, &json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",
-            "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":id},"notifications":{"toolsListChanged":true}}
+            "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":id},"notifications":notifications}
         }).to_string(), false).await;
         tls
     }

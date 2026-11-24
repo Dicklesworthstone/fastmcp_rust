@@ -1,8 +1,9 @@
 //! Live, schema-bound tool handles owned by a caller-driven catalog watch.
 //!
 //! This composes the existing managed catalog collector/watcher and tool-call
-//! owner. It creates no transport, runtime, reconnect loop or automatic tool
-//! invocation. Catalog definitions and annotations never grant execution or
+//! owner. Opt-in recovery uses the same bounded catalog recovery driver; it
+//! creates no runtime, background work or automatic tool invocation.
+//! Catalog definitions and annotations never grant execution or
 //! header-disclosure permission; the host still approves each invocation.
 //!
 //! Every snapshot has one shared invalidation flag. An observed tools change
@@ -30,7 +31,8 @@ use fastmcp_protocol::{
 use super::{ManagedOAuthSession, ManagedToolClient, ManagedToolError, ToolContract};
 use crate::http_auth::rpc::catalog::watch::{
     ManagedCatalogWatchControl, ManagedCatalogWatchError, ManagedCatalogWatchEvent,
-    ManagedCatalogWatchLimits, ManagedCatalogWatchOutcome,
+    ManagedCatalogWatchLimits, ManagedCatalogWatchOutcome, ManagedCatalogWatchRecoveryEvent,
+    ManagedCatalogWatchRecoveryPolicy,
 };
 use crate::http_auth::rpc::catalog::{
     CollectedCatalog, ManagedCatalogClient, ManagedCatalogError, ManagedCatalogLimits,
@@ -120,6 +122,14 @@ pub enum ManagedToolCatalogEvent {
     Acknowledged { accepted_filter: SubscriptionFilter },
     Notification(Box<ServerNotification>),
     Snapshot(ManagedToolCatalogSnapshot),
+}
+
+/// Recovery is observable before another subscription or catalog request.
+/// Every previously issued tool handle is invalid before the host sees Gap.
+/// A fresh acknowledged, fully admitted catalog is required to issue new ones.
+pub enum ManagedToolCatalogRecoveryEvent {
+    Watch(ManagedToolCatalogEvent),
+    Gap { reconnect_attempt: usize },
 }
 
 type Contracts = BTreeMap<String, Arc<ToolContract>>;
@@ -251,31 +261,7 @@ impl ManagedOAuthSession {
         let result = collector
             .watch_with_cancellation(cx, cancellation, request, limits.watch, next_id, |event| {
                 let delivered = (|| {
-                    let event = match event {
-                        ManagedCatalogWatchEvent::Acknowledged { accepted_filter } => {
-                            ManagedToolCatalogEvent::Acknowledged { accepted_filter }
-                        }
-                        ManagedCatalogWatchEvent::Notification(notification) => {
-                            active.observe_notification(&notification);
-                            ManagedToolCatalogEvent::Notification(notification)
-                        }
-                        ManagedCatalogWatchEvent::Snapshot(catalog) => {
-                            // Retire first, including when replacement admission
-                            // fails. Failed refresh must never restore old handles.
-                            active.invalidate();
-                            let (contracts, invalidated) =
-                                admit_contracts(catalog.pages(), limits)?;
-                            active.install_contracts(Arc::clone(&invalidated), &contracts);
-                            ManagedToolCatalogEvent::Snapshot(ManagedToolCatalogSnapshot(Arc::new(
-                                Snapshot {
-                                    session: self.clone(),
-                                    catalog,
-                                    contracts,
-                                    invalidated,
-                                },
-                            )))
-                        }
-                    };
+                    let event = active.project(self, event, limits)?;
                     observe(event)
                 })();
                 match delivered {
@@ -295,12 +281,149 @@ impl ManagedOAuthSession {
             None => result.map_err(ManagedToolCatalogError::Watch),
         }
     }
+
+    /// Watches schema-bound tools with explicitly bounded subscription recovery.
+    ///
+    /// An observed interruption retires every old handle before Gap is emitted.
+    /// Returning Stop at Gap prevents reconnection. Recovery requires a fresh
+    /// listen ID, acknowledgment and complete cursorless catalog traversal; one
+    /// invalid definition refuses the entire replacement. Tool calls are never
+    /// replayed, and missed changes or server snapshot isolation are not claimed.
+    ///
+    /// The original credential, deadline, request-ID registry, collection count
+    /// and subscription-record limits cover every attempt and backoff. No new
+    /// login or credential lookup occurs on reconnect. Keep this caller-owned
+    /// future alive and polled while using the snapshots it delivers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn watch_tool_catalog_recovering<I, O>(
+        &self,
+        cx: &Cx,
+        request: CoreRequest,
+        limits: ManagedToolCatalogLimits,
+        recovery: ManagedCatalogWatchRecoveryPolicy,
+        next_id: I,
+        observe: O,
+    ) -> Result<ManagedCatalogWatchOutcome, ManagedToolCatalogError>
+    where
+        I: FnMut() -> Result<RequestId, ManagedCatalogError>,
+        O: FnMut(
+            ManagedToolCatalogRecoveryEvent,
+        ) -> Result<ManagedCatalogWatchControl, ManagedToolCatalogError>,
+    {
+        Box::pin(self.watch_tool_catalog_recovering_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            limits,
+            recovery,
+            next_id,
+            observe,
+        ))
+        .await
+    }
+
+    /// Cancellation and Drop retire the active handles, subscription, traversal
+    /// and any pending backoff. They do not cancel the caller or shared login.
+    /// The synchronous observer runs without a catalog lock and must cooperate.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn watch_tool_catalog_recovering_with_cancellation<I, O>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        limits: ManagedToolCatalogLimits,
+        recovery: ManagedCatalogWatchRecoveryPolicy,
+        next_id: I,
+        mut observe: O,
+    ) -> Result<ManagedCatalogWatchOutcome, ManagedToolCatalogError>
+    where
+        I: FnMut() -> Result<RequestId, ManagedCatalogError>,
+        O: FnMut(
+            ManagedToolCatalogRecoveryEvent,
+        ) -> Result<ManagedCatalogWatchControl, ManagedToolCatalogError>,
+    {
+        if request.era() != ProtocolEra::Modern2026 || request.method() != "tools/list" {
+            return Err(ManagedToolCatalogError::NotToolsList);
+        }
+        let collector = ManagedCatalogClient::new(self.clone(), limits.catalog);
+        let mut active = ActiveCatalog::default();
+        let mut callback_error = None;
+        let result = Box::pin(collector.watch_recovering_with_cancellation(
+            cx,
+            cancellation,
+            request,
+            limits.watch,
+            recovery,
+            next_id,
+            |event| {
+                let delivered = (|| {
+                    let event = match event {
+                        ManagedCatalogWatchRecoveryEvent::Watch(event) => {
+                            ManagedToolCatalogRecoveryEvent::Watch(
+                                active.project(self, event, limits)?,
+                            )
+                        }
+                        ManagedCatalogWatchRecoveryEvent::Gap { reconnect_attempt } => {
+                            // Revocation is visible before any host effect or
+                            // backoff, including when the observer stops/fails.
+                            active.invalidate();
+                            ManagedToolCatalogRecoveryEvent::Gap { reconnect_attempt }
+                        }
+                    };
+                    observe(event)
+                })();
+                match delivered {
+                    Ok(control) => Ok(control),
+                    Err(error) => {
+                        callback_error = Some(error);
+                        Err(ManagedCatalogError::AbortedByHost)
+                    }
+                }
+            },
+        ))
+        .await;
+        drop(active);
+        match callback_error {
+            Some(error) => Err(error),
+            None => result.map_err(ManagedToolCatalogError::Watch),
+        }
+    }
 }
 
 #[derive(Default)]
 struct ActiveCatalog(Option<Arc<AtomicBool>>, Vec<McpRequestCancellation>);
 
 impl ActiveCatalog {
+    fn project(
+        &mut self,
+        session: &ManagedOAuthSession,
+        event: ManagedCatalogWatchEvent,
+        limits: ManagedToolCatalogLimits,
+    ) -> Result<ManagedToolCatalogEvent, ManagedToolCatalogError> {
+        Ok(match event {
+            ManagedCatalogWatchEvent::Acknowledged { accepted_filter } => {
+                ManagedToolCatalogEvent::Acknowledged { accepted_filter }
+            }
+            ManagedCatalogWatchEvent::Notification(notification) => {
+                self.observe_notification(&notification);
+                ManagedToolCatalogEvent::Notification(notification)
+            }
+            ManagedCatalogWatchEvent::Snapshot(catalog) => {
+                // Retire first, including when replacement admission fails.
+                // A failed refresh must never restore the previous handles.
+                self.invalidate();
+                let (contracts, invalidated) = admit_contracts(catalog.pages(), limits)?;
+                self.install_contracts(Arc::clone(&invalidated), &contracts);
+                ManagedToolCatalogEvent::Snapshot(ManagedToolCatalogSnapshot(Arc::new(Snapshot {
+                    session: session.clone(),
+                    catalog,
+                    contracts,
+                    invalidated,
+                })))
+            }
+        })
+    }
+
     fn invalidate(&mut self) {
         if let Some(invalidated) = self.0.take() {
             // Publish group invalidity before waking any single tool. A waker
