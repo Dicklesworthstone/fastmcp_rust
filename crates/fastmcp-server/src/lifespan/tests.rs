@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicUsize;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::types::CancelKind;
+use fastmcp_core::{OperatorLifecycle, OperatorSnapshot};
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
@@ -519,16 +520,23 @@ fn async_lifespan_native_stdio_gates_real_discovery_and_eof_cleanup() {
     });
 }
 
-async fn http_discovery(address: std::net::SocketAddr) -> Vec<u8> {
+async fn send_http_discovery(
+    address: std::net::SocketAddr,
+    host: &str,
+) -> asupersync::net::TcpStream {
     let body = serde_json::to_vec(&discover()).unwrap();
     let request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json\r\nMCP-Protocol-Version: {FINAL_PROTOCOL_VERSION}\r\nMCP-Method: server/discover\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nAccept: application/json\r\nMCP-Protocol-Version: {FINAL_PROTOCOL_VERSION}\r\nMCP-Method: server/discover\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len(),
     );
     let mut stream = asupersync::net::TcpStream::connect(address).await.unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
     stream.write_all(&body).await.unwrap();
     stream.flush().await.unwrap();
+    stream
+}
+
+async fn read_http_response(mut stream: asupersync::net::TcpStream) -> Vec<u8> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 4096];
     loop {
@@ -561,7 +569,9 @@ fn async_lifespan_native_http_retains_cleanup_in_bounded_settlement() {
             .unwrap();
         let control = receiver.recv(&cx).await.unwrap();
         let mut request = cx
-            .spawn(move |_| async move { http_discovery(address).await })
+            .spawn(move |_| async move {
+                read_http_response(send_http_discovery(address, &address.to_string()).await).await
+            })
             .unwrap();
         startup.started().await;
         assert!(!request.is_finished());
@@ -591,6 +601,118 @@ fn async_lifespan_native_http_retains_cleanup_in_bounded_settlement() {
         retained.settle(&cx).await.unwrap();
         assert_eq!(shutdown.entered.load(Ordering::Acquire), 1);
         assert!(cx.checkpoint().is_ok());
+    });
+}
+
+fn secured_http_policy() -> crate::http_admission::security::HttpSecurityPolicy {
+    use crate::http_admission::{
+        HttpAdmissionLimits, HttpEndpointConfig, security::HttpSecurityPolicy,
+    };
+
+    let limits = HttpAdmissionLimits::new(32, 8192, 65536).unwrap();
+    HttpSecurityPolicy::new(
+        HttpEndpointConfig::new("/mcp", limits).unwrap(),
+        "https://service.example",
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn async_lifespan_secured_http_gates_ingress_and_settles_cleanup() {
+    run(|cx| async move {
+        for hold_cleanup in [false, true] {
+            let startup = Arc::new(Gate::default());
+            let shutdown = Arc::new(Gate::default());
+            let bound = gated_server(&startup, &shutdown)
+                .bind_secured_http(&cx, "127.0.0.1:0", secured_http_policy())
+                .await
+                .unwrap();
+            let operator = bound.operator_handle();
+            let address = bound.local_addr().unwrap();
+            let (sender, mut receiver) = asupersync::channel::oneshot::channel();
+            let mut serving = cx
+                .spawn(move |owned| async move {
+                    sender.send_blocking(owned.clone()).unwrap();
+                    bound.serve(&owned).await
+                })
+                .unwrap();
+            let control = receiver.recv(&cx).await.unwrap();
+            startup.started().await;
+            let stream = send_http_discovery(address, "service.example").await;
+            let snapshot = OperatorSnapshot::capture(&operator).unwrap();
+            assert_eq!(snapshot.lifecycle(), OperatorLifecycle::Starting);
+            assert_eq!(snapshot.counters().accepted, 0);
+            startup.release();
+            let response = read_http_response(stream).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 200"),
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            assert!(String::from_utf8_lossy(&response).contains("\"resultType\":\"complete\""));
+
+            if !hold_cleanup {
+                shutdown.release();
+            }
+            control.cancel_with(
+                CancelKind::User,
+                Some("secured HTTP lifecycle test stopping"),
+            );
+            let outcome = serving.join(&cx).await.unwrap().unwrap();
+            if hold_cleanup {
+                let crate::HttpServerShutdown::Nonquiescent(mut retained) = outcome else {
+                    panic!("pending secured HTTP cleanup must remain caller-owned");
+                };
+                assert!(matches!(
+                    retained.poll_settlement(),
+                    crate::HttpShutdownSettlement::Pending { remaining: 1 }
+                ));
+                shutdown.release();
+                retained.settle(&cx).await.unwrap();
+            } else {
+                assert!(matches!(outcome, crate::HttpServerShutdown::Quiescent));
+            }
+            assert_eq!(startup.entered.load(Ordering::Acquire), 1);
+            assert_eq!(shutdown.entered.load(Ordering::Acquire), 1);
+        }
+    });
+}
+
+#[test]
+fn async_lifespan_secured_http_startup_failure_awaits_cleanup_before_returning() {
+    run(|cx| async move {
+        let shutdown = Arc::new(Gate::default());
+        let stop = Arc::clone(&shutdown);
+        let bound = Server::new("secured-startup-failure", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .on_startup_async(|_| async { Err(McpError::internal_error("secured startup failed")) })
+            .on_shutdown_async(move |_| async move {
+                stop.enter().await;
+                Ok(())
+            })
+            .build()
+            .bind_secured_http(&cx, "127.0.0.1:0", secured_http_policy())
+            .await
+            .unwrap();
+        let operator = bound.operator_handle();
+        let mut serving = cx
+            .spawn(move |owned| async move { bound.serve(&owned).await })
+            .unwrap();
+        shutdown.started().await;
+        assert_eq!(
+            OperatorSnapshot::capture(&operator).unwrap().lifecycle(),
+            OperatorLifecycle::Starting
+        );
+        assert!(!serving.is_finished());
+        shutdown.release();
+        let error = serving.join(&cx).await.unwrap().err().unwrap();
+        assert!(error.message.contains("secured startup failed"));
+        let stopped = OperatorSnapshot::capture(&operator).unwrap();
+        assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+        assert_eq!(stopped.counters().accepted, 0);
+        assert_eq!(shutdown.entered.load(Ordering::Acquire), 1);
     });
 }
 

@@ -10167,6 +10167,89 @@ pub enum HttpServerShutdown {
     Nonquiescent(HttpNonquiescentShutdown),
 }
 
+/// Application resources owned by a serving HTTP or HTTPS listener.
+struct HttpListenerLifespan {
+    owner: Option<AsyncLifespanOwner>,
+    #[cfg(feature = "tasks")]
+    hosted_task_service: Option<tasks::HostedTaskService>,
+}
+
+impl HttpListenerLifespan {
+    async fn start(server: &Server, cx: &Cx) -> McpResult<Self> {
+        #[cfg(feature = "console")]
+        server.init_rich_logging();
+        if let Some(stats) = &server.stats {
+            stats.connection_opened();
+        }
+        let owner = match server.start_native_lifespan(cx).await {
+            Ok(owner) => owner,
+            Err(error) => {
+                server.graceful_shutdown_returning();
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "tasks")]
+        let hosted_task_service = match server.start_hosted_task_service(cx).await {
+            Ok(hosted) => hosted,
+            Err(error) => {
+                if let Some(mut owner) = owner {
+                    let _ = owner.finish().await;
+                }
+                server.graceful_shutdown_returning();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            owner,
+            #[cfg(feature = "tasks")]
+            hosted_task_service,
+        })
+    }
+
+    async fn finish(
+        self,
+        server: Arc<Server>,
+        children: HttpConnectionChildren,
+        result: McpResult<()>,
+        cx: &Cx,
+    ) -> McpResult<HttpServerShutdown> {
+        #[cfg(feature = "tasks")]
+        let result =
+            result.and(Server::settle_hosted_task_service(self.hosted_task_service, cx).await);
+        #[cfg(not(feature = "tasks"))]
+        let _ = cx;
+        let mut shutdown = HttpNonquiescentShutdown {
+            children,
+            server,
+            listener_error: result.err(),
+            shutdown_complete: false,
+            lifespan: self.owner,
+        };
+        // After the connection drain, cleanup gets one bounded observation.
+        // A slow callback stays in this handle, even if no sockets remain.
+        let observation = if shutdown.children.tasks.is_empty() {
+            shutdown.settle_for(HTTP_CONNECTION_SHUTDOWN_TIMEOUT).await
+        } else {
+            shutdown.poll_settlement()
+        };
+        match observation {
+            HttpShutdownSettlement::Settled => {
+                if let Some(error) = shutdown.listener_error.take() {
+                    return Err(error);
+                }
+                Ok(HttpServerShutdown::Quiescent)
+            }
+            HttpShutdownSettlement::Failed { .. } => Err(McpError::internal_error(format!(
+                "HTTP connection shutdown observed terminal child failure(s): {}",
+                shutdown.children.terminal_failures.join("; ")
+            ))),
+            HttpShutdownSettlement::Pending { .. } => {
+                Ok(HttpServerShutdown::Nonquiescent(shutdown))
+            }
+        }
+    }
+}
+
 impl HttpConnectionChildren {
     fn reap_finished(&mut self) {
         let mut active = Vec::with_capacity(self.tasks.len());
@@ -10391,6 +10474,16 @@ pub struct BoundHttpServer {
 }
 
 impl BoundHttpServer {
+    // Both accept loops wake at HTTP_ACCEPT_CANCEL_POLL. Reaping there avoids
+    // joining a separate timer task during listener shutdown (bd-f2ndd).
+    fn reap_sessions_if_due(&self, now: asupersync::Time, last_reap: &mut asupersync::Time) {
+        if Duration::from_nanos(now.duration_since(*last_reap)) >= MODERN_HTTP_SESSION_REAP_INTERVAL
+        {
+            expire_live_modern_http_sessions(&self.modern_sessions);
+            *last_reap = now;
+        }
+    }
+
     /// Retains bounded listener observations and optional real connection probes.
     ///
     /// A bound listener reports `Starting` until `serve` completes startup.
@@ -10431,39 +10524,11 @@ impl BoundHttpServer {
     pub fn serve(self, cx: &Cx) -> impl Future<Output = McpResult<HttpServerShutdown>> + Send + '_ {
         async move {
             let server = Arc::clone(&self.endpoint.server);
-            #[cfg(feature = "console")]
-            server.init_rich_logging();
-            if let Some(stats) = &server.stats {
-                stats.connection_opened();
-            }
-            let mut lifespan = match server.start_native_lifespan(cx).await {
-                Ok(lifespan) => lifespan,
-                Err(error) => {
-                    server.graceful_shutdown_returning();
-                    return Err(error);
-                }
-            };
-            #[cfg(feature = "tasks")]
-            let hosted_task_service = match server.start_hosted_task_service(cx).await {
-                Ok(hosted) => hosted,
-                Err(error) => {
-                    if let Some(lifespan) = lifespan.as_mut() {
-                        let _ = lifespan.finish().await;
-                    }
-                    server.graceful_shutdown_returning();
-                    return Err(error);
-                }
-            };
+            let lifespan = HttpListenerLifespan::start(&server, cx).await?;
 
             let connection_scope = cx.scope();
             let connection_shutdown = HttpListenerShutdown::new(cx)
                 .with_response_write_timeout(server.http_config.response_write_timeout);
-            // Expired modern sessions are reaped from this accept loop, which
-            // already wakes every HTTP_ACCEPT_CANCEL_POLL. A dedicated reaper
-            // task had to be aborted and joined during shutdown, and that join
-            // parked the whole listener shutdown (bd-f2ndd).
-            let reap_interval_nanos =
-                u64::try_from(MODERN_HTTP_SESSION_REAP_INTERVAL.as_nanos()).unwrap_or(u64::MAX);
             let mut last_session_reap = cx.now();
             let mut connection_children = HttpConnectionChildren::default();
             self.connection_limiter.start_serving(cx);
@@ -10473,16 +10538,12 @@ impl BoundHttpServer {
                     break Ok(());
                 }
                 #[cfg(feature = "tasks")]
-                if let Some(hosted) = hosted_task_service.as_ref()
+                if let Some(hosted) = lifespan.hosted_task_service.as_ref()
                     && let Err(error) = hosted.check_running()
                 {
                     break Err(error);
                 }
-                let now = cx.now();
-                if now.duration_since(last_session_reap) >= reap_interval_nanos {
-                    last_session_reap = now;
-                    expire_live_modern_http_sessions(&self.modern_sessions);
-                }
+                self.reap_sessions_if_due(cx.now(), &mut last_session_reap);
                 #[cfg(test)]
                 lib_unit_tests::record_live_http_listener_wait();
                 let accepted = match asupersync::time::timeout(
@@ -10604,42 +10665,9 @@ impl BoundHttpServer {
                     &self.modern_sessions,
                 ));
             connection_children.reap_finished();
-            #[cfg(feature = "tasks")]
-            let task_service_result =
-                Server::settle_hosted_task_service(hosted_task_service, cx).await;
-            #[cfg(not(feature = "tasks"))]
-            let task_service_result: McpResult<()> = Ok(());
-            let result = result.and(task_service_result);
-            let mut shutdown = HttpNonquiescentShutdown {
-                children: connection_children,
-                server,
-                listener_error: result.err(),
-                shutdown_complete: false,
-                lifespan,
-            };
-            // A long cleanup callback is a retained lifecycle owner even
-            // when every socket has already closed. Its deadline is never
-            // restarted by bounded settlement observations.
-            let observation = if shutdown.children.tasks.is_empty() {
-                shutdown.settle_for(HTTP_CONNECTION_SHUTDOWN_TIMEOUT).await
-            } else {
-                shutdown.poll_settlement()
-            };
-            match observation {
-                HttpShutdownSettlement::Settled => {
-                    if let Some(error) = shutdown.listener_error.take() {
-                        return Err(error);
-                    }
-                    Ok(HttpServerShutdown::Quiescent)
-                }
-                HttpShutdownSettlement::Failed { .. } => Err(McpError::internal_error(format!(
-                    "HTTP connection shutdown observed terminal child failure(s): {}",
-                    shutdown.children.terminal_failures.join("; ")
-                ))),
-                HttpShutdownSettlement::Pending { .. } => {
-                    Ok(HttpServerShutdown::Nonquiescent(shutdown))
-                }
-            }
+            lifespan
+                .finish(server, connection_children, result, cx)
+                .await
         }
     }
 }

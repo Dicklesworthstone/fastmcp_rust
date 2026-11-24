@@ -31,10 +31,9 @@ use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use super::super::HttpSecurityPolicy;
 use crate::{
     BoundHttpServer, HTTP_ACCEPT_CANCEL_POLL, HTTP_HEALTH_IO_TIMEOUT, HttpConnectionChildren,
-    HttpHealthControlPermit, HttpListenerShutdown, HttpNativeConnectionAdmission,
-    HttpNonquiescentShutdown, HttpOperatorHandle, HttpServerShutdown,
-    MODERN_HTTP_SESSION_REAP_INTERVAL, Server, detach_live_modern_http_sessions,
-    expire_live_modern_http_sessions, finish_live_modern_http_sessions,
+    HttpHealthControlPermit, HttpListenerLifespan, HttpListenerShutdown,
+    HttpNativeConnectionAdmission, HttpOperatorHandle, HttpServerShutdown, Server,
+    detach_live_modern_http_sessions, finish_live_modern_http_sessions,
     take_unsettled_retired_modern_http_dispatches,
 };
 
@@ -321,7 +320,8 @@ impl BoundSecuredHttpServer {
     /// additional sockets are dropped without spawning error-writing tasks.
     /// TLS handshakes consume their admitted capacity and remain in the same child
     /// inventory. Shutdown retains the native two-phase terminal drain and
-    /// transfers noncooperating children to `HttpServerShutdown::Nonquiescent`.
+    /// transfers noncooperating children or pending asynchronous lifespan cleanup
+    /// to `HttpServerShutdown::Nonquiescent`.
     ///
     /// No legacy session, runtime, detached task or process-global retention is
     /// created. The listener and all connection children stay in the caller's
@@ -331,56 +331,11 @@ impl BoundSecuredHttpServer {
         async move {
             let bound = self.inner;
             let server = Arc::clone(&bound.endpoint.server);
-            #[cfg(feature = "console")]
-            server.init_rich_logging();
-            if let Some(stats) = &server.stats {
-                stats.connection_opened();
-            }
-            if !server.run_startup_hook() {
-                server.graceful_shutdown_returning();
-                return Err(McpError::internal_error("secured HTTP startup hook failed"));
-            }
-            #[cfg(feature = "tasks")]
-            let hosted_task_service = match server.start_hosted_task_service(cx).await {
-                Ok(hosted) => hosted,
-                Err(error) => {
-                    server.graceful_shutdown_returning();
-                    return Err(error);
-                }
-            };
+            let lifespan = HttpListenerLifespan::start(&server, cx).await?;
             let scope = cx.scope();
             let shutdown = HttpListenerShutdown::new(cx);
-            let sessions = Arc::clone(&bound.modern_sessions);
+            let mut last_session_reap = cx.now();
             let mut children = HttpConnectionChildren::default();
-            let reaper = cx.spawn_in(&scope, move |reaper_cx| async move {
-                let chunk = Duration::from_millis(100);
-                let mut parked = Duration::ZERO;
-                loop {
-                    asupersync::time::sleep(reaper_cx.now(), chunk).await;
-                    if reaper_cx.checkpoint().is_err() {
-                        break;
-                    }
-                    parked += chunk;
-                    if parked >= MODERN_HTTP_SESSION_REAP_INTERVAL {
-                        parked = Duration::ZERO;
-                        expire_live_modern_http_sessions(&sessions);
-                    }
-                }
-            });
-            let mut reaper = match reaper {
-                Ok(reaper) => reaper,
-                Err(_) => {
-                    #[cfg(feature = "tasks")]
-                    let task_service_result =
-                        Server::settle_hosted_task_service(hosted_task_service, cx).await;
-                    server.graceful_shutdown_returning();
-                    #[cfg(feature = "tasks")]
-                    task_service_result?;
-                    return Err(McpError::internal_error(
-                        "secured HTTP reaper admission failed",
-                    ));
-                }
-            };
             // The bound limiter refuses every connection until serving starts,
             // as on the plain HTTP listener; it captures this caller's
             // cancellation and deadline for its connection-slot probes.
@@ -391,11 +346,12 @@ impl BoundSecuredHttpServer {
                     break Ok(());
                 }
                 #[cfg(feature = "tasks")]
-                if let Some(hosted) = hosted_task_service.as_ref()
+                if let Some(hosted) = lifespan.hosted_task_service.as_ref()
                     && let Err(error) = hosted.check_running()
                 {
                     break Err(error);
                 }
+                bound.reap_sessions_if_due(cx.now(), &mut last_session_reap);
                 let accepted = match asupersync::time::timeout(
                     cx.now(),
                     HTTP_ACCEPT_CANCEL_POLL,
@@ -521,8 +477,6 @@ impl BoundSecuredHttpServer {
             shutdown.request();
             let _ = server.router.close_stateless_mrtr_exchanges();
             let terminal = server.final_subscriptions.terminate_with_receipt();
-            reaper.abort();
-            let _ = reaper.join(cx).await;
             let closing = detach_live_modern_http_sessions(&bound.modern_sessions);
             children.drain_terminal_controls(&terminal).await;
             children
@@ -536,29 +490,7 @@ impl BoundSecuredHttpServer {
                     &bound.modern_sessions,
                 ));
             children.reap_finished();
-            #[cfg(feature = "tasks")]
-            let task_service_result =
-                Server::settle_hosted_task_service(hosted_task_service, cx).await;
-            #[cfg(not(feature = "tasks"))]
-            let task_service_result: McpResult<()> = Ok(());
-            let result = result.and(task_service_result);
-            if children.tasks.is_empty() {
-                server.graceful_shutdown_returning();
-                if !children.terminal_failures.is_empty() {
-                    return Err(McpError::internal_error(
-                        "secured HTTP child settlement failed",
-                    ));
-                }
-                result?;
-                Ok(HttpServerShutdown::Quiescent)
-            } else {
-                Ok(HttpServerShutdown::Nonquiescent(HttpNonquiescentShutdown {
-                    children,
-                    server,
-                    listener_error: result.err(),
-                    shutdown_complete: false,
-                }))
-            }
+            lifespan.finish(server, children, result, cx).await
         }
     }
 }
