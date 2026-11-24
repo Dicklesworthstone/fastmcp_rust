@@ -9366,6 +9366,7 @@ fn http_diagnostic_response(
                 http_readiness_response(operator, http_task_store_observation(server))
             }
             HttpDiagnosticRoute::Metrics => http_metrics::metrics_response(
+                server,
                 operator,
                 server.http_config.metrics.as_ref().is_some_and(|metrics| {
                     metrics.authorizes(

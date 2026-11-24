@@ -943,17 +943,21 @@ snapshot returns 503. Metrics share the single bounded diagnostic lane with
 health/readiness and release protocol admission before capture. Secured HTTP
 and HTTPS preserve their Host, Origin, framing, and diagnostic I/O limits.
 
-The same `prometheus_text()` and `prometheus_text_with_limit(bytes)` methods
-are available on HTTP, client-executor, and stdio-output snapshots for
-application-owned exporters. Each contributor has 30 fixed series, prefixed
-`fastmcp_operator_http_`, `fastmcp_operator_executor_`, or
-`fastmcp_operator_stdio_`. The only label is the closed protocol `profile`;
-configuration generations, schema versions, lifecycle, readiness, capacity,
-and overflow are values. No endpoint, tool, principal, request, token, or error
-text becomes a metric label. Encoding performs no I/O, takes no admission
-permit, and never writes to protocol stdout. The built-in route exports the
-HTTP connection contributor; it does not infer Task, authentication, or
-upstream health from that snapshot.
+With the `tasks` feature, add `.with_task_store()` to the metrics configuration
+to include Task state counts, retained payload and reservation bytes, execution
+slots, and reclamation receipt storage in the same scrape. The Task series use
+the prefix `fastmcp_operator_tasks_`. Counts of saturated owner partitions
+let operators distinguish an individual quota from a full store without
+exposing owner identities. A missing or busy Task observer returns 503 when
+this option is enabled. The combined response shares the 16 KiB ceiling.
+
+Application-owned exporters can use `prometheus_text()` and
+`prometheus_text_with_limit(bytes)` on HTTP, client-executor, stdio-output,
+and Task-store snapshots. The existing 30-series HTTP, executor, and stdio
+contributors retain their prefixes `fastmcp_operator_http_`,
+`fastmcp_operator_executor_`, and `fastmcp_operator_stdio_`. Each snapshot
+carries its own protocol profile and configuration generation. Encoding uses
+fixed metric names and takes no admission permit.
 
 ### Modern subscription admission (current source tree)
 

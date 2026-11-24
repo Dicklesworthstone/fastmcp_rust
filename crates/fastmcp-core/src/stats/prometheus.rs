@@ -21,7 +21,7 @@ use std::fmt::{self, Write};
 
 use super::{
     OperatorExecutorCapacity, OperatorHttpConnections, OperatorLifecycle, OperatorProfile,
-    OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorStdioOutput,
+    OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorStdioOutput, OperatorTaskStore,
 };
 
 /// Hard encoded-byte ceiling for one operational Prometheus exposition.
@@ -70,6 +70,14 @@ struct MetricsWriter {
     profile: &'static str,
 }
 
+fn profile_label(profile: OperatorProfile) -> &'static str {
+    match profile {
+        OperatorProfile::Modern => "modern",
+        OperatorProfile::Legacy2024 => "legacy_2024",
+        OperatorProfile::Auto => "auto",
+    }
+}
+
 impl MetricsWriter {
     fn new(
         limit: usize,
@@ -87,11 +95,7 @@ impl MetricsWriter {
             output,
             limit,
             prefix,
-            profile: match profile {
-                OperatorProfile::Modern => "modern",
-                OperatorProfile::Legacy2024 => "legacy_2024",
-                OperatorProfile::Auto => "auto",
-            },
+            profile: profile_label(profile),
         })
     }
 
@@ -223,6 +227,22 @@ impl OperatorSnapshot<OperatorHttpConnections> {
         Ok(writer.output)
     }
 
+    /// Encodes a listener and its independently captured Task store in a single
+    /// bounded scrape. Each contributor retains its own generation and profile.
+    pub fn prometheus_text_with_tasks(
+        &self,
+        tasks: &OperatorSnapshot<OperatorTaskStore>,
+    ) -> Result<String, OperatorMetricsError> {
+        let mut writer = MetricsWriter::new(MAX_OPERATOR_PROMETHEUS_BYTES, "fastmcp_operator_http", self.profile())?;
+        self.write_prometheus(&mut writer)
+            .map_err(|_| OperatorMetricsError::ByteLimitExceeded)?;
+        writer.prefix = "fastmcp_operator_tasks";
+        writer.profile = profile_label(tasks.profile());
+        tasks.write_prometheus(&mut writer)
+            .map_err(|_| OperatorMetricsError::ByteLimitExceeded)?;
+        Ok(writer.output)
+    }
+
     fn write_prometheus(&self, writer: &mut MetricsWriter) -> fmt::Result {
         common(
             self,
@@ -317,6 +337,65 @@ impl OperatorSnapshot<OperatorHttpConnections> {
                     .checked_add(connections.reserved)
                     .is_none(),
         )
+    }
+}
+
+impl OperatorSnapshot<OperatorTaskStore> {
+    /// Encodes the Task store's state counts and resource charges as fixed
+    /// series, including zero counts. Owner partitions are aggregate gauges.
+    pub fn prometheus_text(&self) -> Result<String, OperatorMetricsError> {
+        self.prometheus_text_with_limit(MAX_OPERATOR_PROMETHEUS_BYTES)
+    }
+
+    /// Renders the complete Task contributor within the given byte limit.
+    pub fn prometheus_text_with_limit(
+        &self,
+        max_bytes: usize,
+    ) -> Result<String, OperatorMetricsError> {
+        let mut writer = MetricsWriter::new(max_bytes, "fastmcp_operator_tasks", self.profile())?;
+        self.write_prometheus(&mut writer).map_err(|_| OperatorMetricsError::ByteLimitExceeded)?;
+        Ok(writer.output)
+    }
+
+    fn write_prometheus(&self, writer: &mut MetricsWriter) -> fmt::Result {
+        common(self, writer, &[
+            (OperatorReason::TaskStorageCapacitySaturated, "reason_storage_saturated"),
+            (OperatorReason::TaskExecutionCapacitySaturated, "reason_execution_saturated"),
+            (OperatorReason::TaskRetentionCapacitySaturated, "reason_retention_saturated"),
+        ])?;
+        let task = self.contributor();
+        let storage = task.storage;
+        let execution = task.execution;
+        let retention = task.retention;
+        for (name, help, value) in [
+            ("working", "Retained working Tasks, including queued work.", task.states.working),
+            ("input_required", "Tasks awaiting peer input.", task.states.input_required),
+            ("completed", "Retained completed results.", task.states.completed),
+            ("failed", "Retained failed results.", task.states.failed),
+            ("cancelled", "Retained cancelled Tasks.", task.states.cancelled),
+            ("storage_task_limit", "Store record limit.", storage.task_limit),
+            ("storage_retained_tasks", "Records charged to storage.", storage.retained_tasks),
+            ("storage_byte_limit", "Store payload and reservation byte limit.", storage.byte_limit),
+            ("storage_retained_bytes", "Charged payload bytes.", storage.retained_bytes),
+            ("storage_reserved_terminal_bytes", "Headroom reserved for mandatory retirement.", storage.reserved_terminal_bytes),
+            ("storage_charged_bytes", "Retained and reserved bytes.", storage.charged_bytes()),
+            ("storage_owner_task_limit", "Record limit per owner partition.", storage.owner_task_limit),
+            ("storage_owner_byte_limit", "Byte limit per owner partition.", storage.owner_byte_limit),
+            ("storage_owner_partitions", "Owner partitions retaining records.", storage.owner_partitions),
+            ("storage_saturated_owner_partitions", "Partitions at a storage limit.", storage.saturated_owner_partitions),
+            ("execution_limit", "Store execution slot limit.", execution.limit),
+            ("execution_reserved", "Execution slots held by claims or live work.", execution.reserved),
+            ("execution_owner_limit", "Execution slot limit per partition.", execution.owner_limit),
+            ("execution_owner_partitions", "Partitions holding execution slots.", execution.owner_partitions),
+            ("execution_saturated_owner_partitions", "Partitions at their execution limit.", execution.saturated_owner_partitions),
+            ("retention_record_limit", "Reclamation receipt count limit.", retention.record_limit),
+            ("retention_retained_records", "Retained reclamation receipts.", retention.retained_records),
+            ("retention_byte_limit", "Reclamation receipt byte limit.", retention.byte_limit),
+            ("retention_retained_bytes", "Charged reclamation receipt bytes.", retention.retained_bytes),
+        ] {
+            writer.gauge(name, help, value)?;
+        }
+        writer.flag("arithmetic_overflowed", "Whether the charged byte sum overflowed.", storage.overflowed())
     }
 }
 
@@ -636,6 +715,39 @@ mod tests {
 
     fn value(samples: &BTreeMap<String, u128>, name: &str) -> u128 {
         samples[&format!("{name}{{profile=\"modern\"}}")]
+    }
+
+    #[test]
+    fn task_scrape_preserves_store_profile_charges_and_total_byte_bound() {
+        use crate::stats::{OperatorTaskExecution, OperatorTaskStorage};
+        let task = OperatorSnapshot::task_store(Instant::now(), 73, OperatorTaskStore {
+            storage: OperatorTaskStorage {
+                retained_tasks: 7, task_limit: 12,
+                retained_bytes: usize::MAX, reserved_terminal_bytes: 1,
+                byte_limit: usize::MAX, saturated_owner_partitions: 2,
+                ..Default::default()
+            },
+            execution: OperatorTaskExecution { limit: 3, reserved: 1, ..Default::default() },
+            ..Default::default()
+        });
+        let http = OperatorSnapshot::http_connections(Instant::now(), 37, OperatorProfile::Auto,
+            OperatorLifecycle::Running,
+            OperatorConnectionCapacity { limit: 1, active: 0, reserved: 0 },
+            OperatorConnectionCounters::default());
+        let http_text = http.prometheus_text().unwrap();
+        let task_text = task.prometheus_text().unwrap();
+        let combined = http.prometheus_text_with_tasks(&task).unwrap();
+        assert_eq!(combined.strip_prefix(&http_text), Some(task_text.as_str()));
+        assert!(combined.len() <= MAX_OPERATOR_PROMETHEUS_BYTES);
+        assert!(http_text.contains("profile=\"auto\""));
+        for (name, value) in [("storage_retained_tasks", 7), ("storage_saturated_owner_partitions", 2),
+            ("reason_storage_saturated", 1), ("reason_execution_saturated", 0),
+            ("execution_reserved", 1), ("arithmetic_overflowed", 1), ("configuration_generation", 73)] {
+            assert!(task_text.lines().any(|line| line == format!("fastmcp_operator_tasks_{name}{{profile=\"modern\"}} {value}")));
+        }
+        assert_eq!(task.prometheus_text_with_limit(task_text.len()).unwrap(), task_text);
+        assert_eq!(task.prometheus_text_with_limit(task_text.len() - 1),
+            Err(OperatorMetricsError::ByteLimitExceeded));
     }
 
     #[test]

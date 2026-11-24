@@ -140,6 +140,7 @@ pub(super) async fn serve(
                     crate::http_task_store_observation(&endpoint.server),
                 ),
                 crate::HttpDiagnosticRoute::Metrics => crate::http_metrics::metrics_response(
+                    &endpoint.server,
                     endpoint.http_operator.as_ref(),
                     authorized,
                 ),
