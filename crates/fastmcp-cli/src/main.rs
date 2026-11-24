@@ -695,10 +695,11 @@ enum Commands {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         max_pages: u32,
 
-        /// Total network connection and catalog acquisition budget in seconds (1-900).
-        /// Includes TCP/TLS setup and every page; no partial report is published
-        /// on expiry. Applies to explicit HTTP and WebSocket endpoints.
-        #[arg(long, default_value_t = 120, conflicts_with = "server",
+        /// Total acquisition budget in seconds (1-900) for Unix child stdio,
+        /// HTTP, or WebSocket. Covers connection setup and all catalog pages.
+        /// Expiry discards the partial report. Child cleanup can finish afterward.
+        #[cfg_attr(not(unix), arg(conflicts_with = "server"))]
+        #[arg(long, default_value_t = 120,
             value_parser = clap::value_parser!(u64).range(1..=900))]
         timeout: u64,
 
@@ -1611,6 +1612,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                     output.as_deref(),
                     protocol_policy,
                     max_pages,
+                    timeout,
                 ))
                 .await
             }
@@ -8957,14 +8959,33 @@ async fn cmd_inspect(
     output: Option<&std::path::Path>,
     protocol_policy: CliProtocolPolicy,
     max_pages: u32,
+    timeout_secs: u64,
 ) -> McpResult<()> {
     validate_cli_protocol_policy(protocol_policy)?;
     let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-
-    // Connect to the server
+    let budget = OperationBudget::new(timeout_secs)?;
+    let remaining = budget.remaining(cx)?;
+    // The builder owns provisional children, including both Auto negotiation
+    // attempts. Let it finish explicit cleanup if discovery times out.
     let mut client = client_builder_for_protocol_policy(protocol_policy)?
+        .owned_process_group(cfg!(unix))
+        .connection_retry_policy(
+            1,
+            std::time::Duration::ZERO,
+            remaining.min(std::time::Duration::from_secs(120)),
+        )?
         .connect_stdio_with_cx(cx, server, &args_refs)
-        .await?;
+        .await
+        .map_err(|error| {
+            if std::time::Instant::now() >= budget.deadline
+                && error.code != fastmcp_core::McpErrorCode::RequestCancelled
+                && !fastmcp_client::is_cleanup_unverified(&error)
+            {
+                inspect_stdio_timeout_error()
+            } else {
+                error
+            }
+        })?;
     let negotiated_protocol_version = client.protocol_version().to_owned();
 
     // Preserve the negotiated era's capability model. Modern discovery is an
@@ -8993,8 +9014,10 @@ async fn cmd_inspect(
             prompts,
             acquisition_truncated,
         ))
-    }
-    .await;
+    };
+    // Race only catalog acquisition. Keep ownership of the client outside
+    // the timer so a stalled page follows the same explicit cleanup path.
+    let inspection = bounded_stdio_catalogs(cx, budget, inspection).await;
     let (
         server_info,
         capabilities,
@@ -9018,6 +9041,35 @@ async fn cmd_inspect(
         protocol_status,
         format,
         output,
+    )
+}
+
+async fn bounded_stdio_catalogs<T>(
+    cx: &Cx,
+    budget: OperationBudget,
+    catalogs: impl std::future::Future<Output = McpResult<T>>,
+) -> McpResult<T> {
+    cx.checkpoint()
+        .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+    let remaining = budget
+        .deadline
+        .saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(inspect_stdio_timeout_error());
+    }
+    let result = asupersync::time::timeout(cx.now(), remaining, Box::pin(catalogs)).await;
+    cx.checkpoint()
+        .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+    // Decoding an already-buffered page can finish in the timer's last poll.
+    if std::time::Instant::now() >= budget.deadline {
+        return Err(inspect_stdio_timeout_error());
+    }
+    result.map_err(|_| inspect_stdio_timeout_error())?
+}
+
+fn inspect_stdio_timeout_error() -> fastmcp_core::McpError {
+    fastmcp_core::McpError::internal_error(
+        "stdio inspect reached --timeout before catalog acquisition completed; no report was published",
     )
 }
 
@@ -16691,7 +16743,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                         }).unwrap();
                         let args = vec!["-c".to_owned(), script];
                         let outcome = if inspect {
-                            Box::pin(cmd_inspect(&cx, "sh", &args, InspectFormat::Json, None, policy, 1)).await
+                            Box::pin(cmd_inspect(
+                                &cx,
+                                "sh",
+                                &args,
+                                InspectFormat::Json,
+                                None,
+                                policy,
+                                1,
+                                COMMAND_REQUEST_TIMEOUT_SECS,
+                            ))
+                            .await
                         } else {
                             Box::pin(cmd_test(
                                 &cx,
@@ -17706,8 +17768,9 @@ IFS= read -r end
                     .is_err()
                 );
             }
-            assert!(
-                Cli::try_parse_from(["fastmcp", "inspect", "--timeout", "1", "./server",]).is_err()
+            assert_eq!(
+                Cli::try_parse_from(["fastmcp", "inspect", "--timeout", "1", "./server"]).is_ok(),
+                cfg!(unix),
             );
         }
 

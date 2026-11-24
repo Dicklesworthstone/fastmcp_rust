@@ -3693,6 +3693,71 @@ fn e2e_cli_test_http_timeout_reports_source_and_retires_the_exchange() {
 }
 
 #[test]
+fn e2e_cli_inspect_stdio_timeout_covers_discovery_and_all_pages() {
+    // The child logs each admitted request. Each page delay fits a one-second
+    // timeout on its own, but the complete paginated exchange exceeds it.
+    let fixture = r#"
+while IFS= read -r request; do
+    printf 'FASTMCP_E2E_WIRE %s\n' "$request" >&2
+    case "$request" in
+        *'"method":"server/discover"'*)
+            sleep "$1"
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"}}'
+            ;;
+        *'"method":"tools/list"'*'"cursor":"second-page"'*)
+            sleep "$3"
+            printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[{"name":"second-tool","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}'
+            ;;
+        *'"method":"tools/list"'*)
+            sleep "$2"
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"first-tool","inputSchema":{"type":"object"}}],"nextCursor":"second-page","ttlMs":0,"cacheScope":"private"}}'
+            ;;
+        *) exit 1 ;;
+    esac
+done
+"#;
+    for (startup_delay, first_page, second_page, timeout, requests, success) in [
+        ("0", "0", "0", "8", 3, true),
+        ("12", "0", "0", "1", 1, false),
+        ("0", "0.3", "0.85", "1", 3, false),
+    ] {
+        let mut command = Command::new(fastmcp_bin());
+        command.args([
+            "inspect",
+            "--protocol-policy",
+            "modern-only",
+            "--timeout",
+            timeout,
+            "--max-pages",
+            "2",
+            "--format",
+            "json",
+            "/bin/sh",
+            "--",
+            "-c",
+            fixture,
+            "inspect-fixture",
+            startup_delay,
+            first_page,
+            second_page,
+        ]);
+        let output = run_with_deadline(command, Duration::from_secs(10))
+            .expect("inspection must settle and close child/group output pipes");
+        assert_eq!(
+            observed_protocol_wire(&output).len(),
+            requests,
+            "{}",
+            stderr_str(&output)
+        );
+        if success {
+            assert_inspect_complete_catalog(&output);
+        } else {
+            assert_inspect_timeout(&output);
+        }
+    }
+}
+
+#[test]
 fn e2e_cli_inspect_http_timeout_bounds_discovery_and_later_pages() {
     for withheld_response in [None, Some(0), Some(2)] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3719,10 +3784,10 @@ fn e2e_cli_inspect_http_timeout_bounds_discovery_and_later_pages() {
         ]);
         wait_for_loopback_fixture(fixture, "HTTP inspect deadline");
         if let Some(response) = withheld_response {
-            assert_http_inspect_timeout(&output);
+            assert_inspect_timeout(&output);
             assert_eq!(retired_response.load(Ordering::SeqCst), response + 1);
         } else {
-            assert_http_inspect_complete_catalog(&output);
+            assert_inspect_complete_catalog(&output);
             assert_eq!(retired_response.load(Ordering::SeqCst), 0);
         }
     }
@@ -3762,10 +3827,10 @@ fn e2e_cli_inspect_http_timeout_does_not_refresh_after_successful_pages() {
         ]);
         wait_for_loopback_fixture(fixture, "HTTP inspect cumulative deadline");
         if timeout == "2" {
-            assert_http_inspect_complete_catalog(&output);
+            assert_inspect_complete_catalog(&output);
             assert_eq!(retired_response.load(Ordering::SeqCst), 0);
         } else {
-            assert_http_inspect_timeout(&output);
+            assert_inspect_timeout(&output);
             assert_eq!(
                 retired_response.load(Ordering::SeqCst),
                 3,
@@ -3833,7 +3898,7 @@ fn e2e_cli_inspect_http_timeout_preserves_output_and_never_downgrades_auto() {
     std::fs::remove_file(&output_path).expect("remove the test's temporary output");
     wait_for_loopback_fixture(fixture, "Auto inspect final-page timeout");
     stop_forbidden_http_contact_observer(observer, "HTTP inspect timeout legacy fallback");
-    assert_http_inspect_timeout(&output);
+    assert_inspect_timeout(&output);
     assert_eq!(retired_response.load(Ordering::SeqCst), 3);
     assert_eq!(retained_output.unwrap(), sentinel);
     assert_eq!(legacy_contacts.load(Ordering::SeqCst), 0);
@@ -3977,7 +4042,7 @@ fn spawn_http_inspect_deadline_fixture(
     )
 }
 
-fn assert_http_inspect_complete_catalog(output: &Output) {
+fn assert_inspect_complete_catalog(output: &Output) {
     assert!(output.status.success(), "{}", stderr_str(output));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema"], "fastmcp.cli.inspect/v2");
@@ -3988,7 +4053,7 @@ fn assert_http_inspect_complete_catalog(output: &Output) {
     assert_eq!(report["truncated"], false);
 }
 
-fn assert_http_inspect_timeout(output: &Output) {
+fn assert_inspect_timeout(output: &Output) {
     assert!(!output.status.success());
     let failure: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("timeout emits one complete error document without a partial catalog");
@@ -4078,7 +4143,7 @@ fn e2e_cli_inspect_http_timeout_retires_stalled_tls_setup() {
         "json",
     ]);
     wait_for_loopback_fixture(fixture, "stalled inspect TLS handshake");
-    assert_http_inspect_timeout(&output);
+    assert_inspect_timeout(&output);
 }
 
 #[test]
