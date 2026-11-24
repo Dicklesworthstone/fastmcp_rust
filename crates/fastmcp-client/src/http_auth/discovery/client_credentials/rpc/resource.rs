@@ -226,7 +226,28 @@ impl ClientCredentialsResourceClient {
         cancellation: &McpRequestCancellation,
         request: CoreRequest,
         next_ids: I,
+        observe: O,
+    ) -> Result<ClientCredentialsResourceRead, ClientCredentialsResourceError>
+    where
+        I: FnOnce() -> Result<(RequestId, RequestId), ClientCredentialsResourceError>,
+        O: FnMut(Box<ServerNotification>) -> Result<(), ClientCredentialsResourceError>,
+    {
+        self.read_with_binding(cx, cancellation, request, next_ids, observe, None, None)
+            .await
+    }
+
+    // Watches retain their opening grant. Its expiry and the original watch
+    // deadline still bound every cache hit, discovery and resource response.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_with_binding<I, O>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        next_ids: I,
         mut observe: O,
+        binding: Option<&ClientCredentialsSnapshot>,
+        outer_deadline: Option<Time>,
     ) -> Result<ClientCredentialsResourceRead, ClientCredentialsResourceError>
     where
         I: FnOnce() -> Result<(RequestId, RequestId), ClientCredentialsResourceError>,
@@ -237,6 +258,7 @@ impl ClientCredentialsResourceClient {
             self.limits.core.timeout().min(self.client.inner.timeout),
         )
         .map_err(ClientCredentialsError::from)?;
+        let deadline = outer_deadline.map_or(deadline, |outer| outer.min(deadline));
         let (uri, reusable) = read_identity(&request)?;
         let result_set = FinalCacheResultSet::Resource(uri.to_owned());
         let uri = uri.to_owned();
@@ -252,12 +274,16 @@ impl ClientCredentialsResourceClient {
         let (_, stamped) = prepare(self.client.resource(), &request, &RequestId::Number(1))?;
         let captured = self.cache()?.begin_fetch(&result_set);
         let owner = &self.client.inner.closed;
-        active(cx, deadline, owner, cancellation, None, async {
+        active(cx, deadline, owner, cancellation, binding, async {
             Ok(async {
-                let credential = self
-                    .client
-                    .credential_with_cancellation(cx, cancellation)
-                    .await?;
+                let credential = match binding {
+                    Some(credential) => super::super::acquisition::copy_snapshot(credential),
+                    None => {
+                        self.client
+                            .credential_with_cancellation(cx, cancellation)
+                            .await?
+                    }
+                };
                 self.check(
                     cx,
                     cancellation,
@@ -313,6 +339,18 @@ impl ClientCredentialsResourceClient {
                         &request_id,
                         self.limits.core,
                     )?;
+                    if binding.is_none() {
+                        let current = Box::pin(active(
+                            cx,
+                            deadline,
+                            owner,
+                            cancellation,
+                            Some(&credential),
+                            self.client.credential_with_cancellation(cx, cancellation),
+                        ))
+                        .await?;
+                        require_same_credential(&credential, &current)?;
+                    }
                     let mut call = active(
                         cx,
                         deadline,
@@ -322,13 +360,15 @@ impl ClientCredentialsResourceClient {
                         async {
                             Ok(self
                                 .client
-                                .request_core_with_cancellation(
+                                .request_core_with_binding(
                                     cx,
                                     cancellation,
                                     request,
                                     discovery_id,
                                     request_id,
                                     self.limits.core,
+                                    Some(&credential),
+                                    Some(deadline),
                                 )
                                 .await)
                         },
@@ -368,18 +408,20 @@ impl ClientCredentialsResourceClient {
                     (result, Instant::now())
                 };
                 let complete = admit_result(&result, self.limits.maximum_contents)?;
-                // A different caller may have renewed while we decoded. Check
-                // current custody on hits too, rather than trusting a cache key.
-                let current = Box::pin(active(
-                    cx,
-                    deadline,
-                    owner,
-                    cancellation,
-                    Some(&credential),
-                    self.client.credential_with_cancellation(cx, cancellation),
-                ))
-                .await?;
-                require_same_credential(&credential, &current)?;
+                if binding.is_none() {
+                    // Standalone reads retain their generation fence on hits
+                    // and misses. Watches check original custody below.
+                    let current = Box::pin(active(
+                        cx,
+                        deadline,
+                        owner,
+                        cancellation,
+                        Some(&credential),
+                        self.client.credential_with_cancellation(cx, cancellation),
+                    ))
+                    .await?;
+                    require_same_credential(&credential, &current)?;
+                }
                 self.check(
                     cx,
                     cancellation,

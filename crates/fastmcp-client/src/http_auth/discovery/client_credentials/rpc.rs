@@ -127,8 +127,36 @@ impl ClientCredentialsClient {
         request_id: RequestId,
         limits: ManagedCoreLimits,
     ) -> Result<ClientCredentialsCoreCall, ClientCredentialsCoreError> {
+        self.request_core_with_binding(
+            cx,
+            cancellation,
+            request,
+            discovery_id,
+            request_id,
+            limits,
+            None,
+            None,
+        )
+        .await
+    }
+
+    // Private composition boundary: only owners within this module can supply
+    // a previously selected snapshot. Independent RPCs retain normal renewal.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_core_with_binding(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        discovery_id: RequestId,
+        request_id: RequestId,
+        limits: ManagedCoreLimits,
+        binding: Option<&ClientCredentialsSnapshot>,
+        outer_deadline: Option<Time>,
+    ) -> Result<ClientCredentialsCoreCall, ClientCredentialsCoreError> {
         let deadline = discovery_deadline(cx, limits.timeout().min(self.inner.timeout))
             .map_err(ClientCredentialsError::from)?;
+        let deadline = outer_deadline.map_or(deadline, |outer| outer.min(deadline));
         preflight(
             self.resource(),
             &request,
@@ -141,7 +169,7 @@ impl ClientCredentialsClient {
             deadline,
             &self.inner.closed,
             cancellation,
-            None,
+            binding,
             self.execute_core_with_cancellation_and_discovery_limit(
                 cx,
                 cancellation,
@@ -149,6 +177,7 @@ impl ClientCredentialsClient {
                 discovery_id,
                 request_id,
                 limits.frame_bytes(),
+                binding,
             ),
         ))
         .await?;

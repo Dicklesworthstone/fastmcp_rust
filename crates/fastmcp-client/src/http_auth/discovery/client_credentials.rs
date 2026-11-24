@@ -665,12 +665,14 @@ impl ClientCredentialsClient {
             discovery_id,
             request_id,
             MAX_MANAGED_MCP_MESSAGE_BYTES,
+            None,
         ))
         .await
     }
 
     // Typed callers carry their frame bound through negotiation as well as the
     // eventual response. The raw API uses the ordinary MCP message maximum.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_core_with_cancellation_and_discovery_limit(
         &self,
         cx: &Cx,
@@ -679,6 +681,7 @@ impl ClientCredentialsClient {
         discovery_id: RequestId,
         request_id: RequestId,
         maximum_discovery_bytes: usize,
+        binding: Option<&ClientCredentialsSnapshot>,
     ) -> Result<ClientCredentialsResponse, ClientCredentialsError> {
         if !(1..=MAX_MANAGED_MCP_MESSAGE_BYTES).contains(&maximum_discovery_bytes) {
             return Err(ClientCredentialsError::InvalidRequest);
@@ -704,9 +707,15 @@ impl ClientCredentialsClient {
             deadline,
             &self.inner.closed,
             cancellation,
-            None,
+            binding,
             async {
-                let snapshot = self.credential_with_cancellation(cx, cancellation).await?;
+                // Compound operations retain their original authority. A later
+                // shared-cache renewal cannot replace the token used by their
+                // cursor, resource read, or subscription-bound reconciliation.
+                let snapshot = match binding {
+                    Some(snapshot) => acquisition::copy_snapshot(snapshot),
+                    None => self.credential_with_cancellation(cx, cancellation).await?,
+                };
                 let executor = self.resource_http_executor();
                 let discovery_wire = authorize(&snapshot, discovery_wire)?;
                 let response = active(

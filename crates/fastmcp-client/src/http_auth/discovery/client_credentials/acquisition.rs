@@ -121,7 +121,7 @@ impl Drop for GrantLeader {
     }
 }
 
-fn copy_snapshot(snapshot: &ClientCredentialsSnapshot) -> ClientCredentialsSnapshot {
+pub(super) fn copy_snapshot(snapshot: &ClientCredentialsSnapshot) -> ClientCredentialsSnapshot {
     ClientCredentialsSnapshot {
         bearer: snapshot.bearer.clone(),
         scopes: snapshot.scopes.clone(),

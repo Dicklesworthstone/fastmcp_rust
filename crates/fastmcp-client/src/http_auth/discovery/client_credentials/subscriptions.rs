@@ -282,6 +282,12 @@ impl ClientCredentialsCoreSubscription {
     pub fn credential_generation(&self) -> u64 {
         self.snapshot.generation()
     }
+
+    // A watch must retain the listen's actual authority, not reacquire whatever
+    // happens to be current after the HTTP response arrives.
+    pub(super) fn credential_snapshot(&self) -> ClientCredentialsSnapshot {
+        super::acquisition::copy_snapshot(&self.snapshot)
+    }
     pub fn accepted_filter(&self) -> Option<&SubscriptionFilter> {
         self.accepted_filter.as_ref()
     }

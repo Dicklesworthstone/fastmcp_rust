@@ -222,9 +222,30 @@ impl ClientCredentialsCatalogClient {
         &self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        next_ids: I,
+        observe: O,
+    ) -> Result<CollectedMachineCatalog, ClientCredentialsCatalogError>
+    where
+        I: FnMut() -> Result<(RequestId, RequestId), ClientCredentialsCatalogError>,
+        O: FnMut(Box<ServerNotification>) -> Result<(), ClientCredentialsCatalogError>,
+    {
+        self.collect_with_binding(cx, cancellation, request, next_ids, observe, None, None)
+            .await
+    }
+
+    // A watch supplies its listen's actual snapshot and remaining lifetime.
+    // Standalone collections still refuse renewal, before dispatching a cursor.
+    #[allow(clippy::too_many_arguments)]
+    async fn collect_with_binding<I, O>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
         mut request: CoreRequest,
         mut next_ids: I,
         mut observe: O,
+        binding: Option<&ClientCredentialsSnapshot>,
+        outer_deadline: Option<Time>,
     ) -> Result<CollectedMachineCatalog, ClientCredentialsCatalogError>
     where
         I: FnMut() -> Result<(RequestId, RequestId), ClientCredentialsCatalogError>,
@@ -232,13 +253,14 @@ impl ClientCredentialsCatalogClient {
     {
         let deadline = discovery_deadline(cx, self.limits.core.timeout())
             .map_err(ClientCredentialsError::from)?;
+        let deadline = outer_deadline.map_or(deadline, |outer| outer.min(deadline));
         let kind = CatalogKind::of(&request)?;
         let mut state = Traversal::new(list_params(&request)?.cursor.as_deref(), self.limits)?;
         let generation = self.fences()?.begin_fetch(&kind.result_set());
         let owner = &self.client.inner.closed;
-        Box::pin(active(cx, deadline, owner, cancellation, None, async {
+        Box::pin(active(cx, deadline, owner, cancellation, binding, async {
             Ok(async {
-                let mut pinned: Option<ClientCredentialsSnapshot> = None;
+                let mut pinned = binding.map(super::super::acquisition::copy_snapshot);
                 let mut pages = Vec::new();
                 loop {
                     self.check(
@@ -286,17 +308,33 @@ impl ClientCredentialsCatalogClient {
                         kind,
                         generation,
                     )?;
+                    if binding.is_none() {
+                        if let Some(credential) = &pinned {
+                            let current = Box::pin(active(
+                                cx,
+                                deadline,
+                                owner,
+                                cancellation,
+                                Some(credential),
+                                self.client.credential_with_cancellation(cx, cancellation),
+                            ))
+                            .await?;
+                            require_same_credential(credential, &current)?;
+                        }
+                    }
                     let mut call =
                         active(cx, deadline, owner, cancellation, pinned.as_ref(), async {
                             Ok(self
                                 .client
-                                .request_core_with_cancellation(
+                                .request_core_with_binding(
                                     cx,
                                     cancellation,
                                     request.clone(),
                                     discovery_id,
                                     request_id,
                                     self.limits.core,
+                                    pinned.as_ref(),
+                                    Some(deadline),
                                 )
                                 .await)
                         })
@@ -304,12 +342,7 @@ impl ClientCredentialsCatalogClient {
                     if let Some(credential) = &pinned {
                         require_same_credential(credential, &call.snapshot)?;
                     } else {
-                        pinned = Some(ClientCredentialsSnapshot {
-                            bearer: call.snapshot.bearer.clone(),
-                            scopes: call.snapshot.scopes.clone(),
-                            expires_at: call.snapshot.expires_at,
-                            generation: call.snapshot.generation,
-                        });
+                        pinned = Some(super::super::acquisition::copy_snapshot(&call.snapshot));
                     }
                     // Never extend the per-POST/native deadline when imposing
                     // the enclosing collection lifetime.
@@ -368,18 +401,20 @@ impl ClientCredentialsCatalogClient {
                     list_params_mut(&mut request)?.cursor = Some(cursor);
                 }
                 let pinned = pinned.ok_or(ManagedCatalogError::InvalidPage)?;
-                // Detect another caller's renewal before publishing a complete
-                // collection; no cached path can bypass current token custody.
-                let current = Box::pin(active(
-                    cx,
-                    deadline,
-                    owner,
-                    cancellation,
-                    Some(&pinned),
-                    self.client.credential_with_cancellation(cx, cancellation),
-                ))
-                .await?;
-                require_same_credential(&pinned, &current)?;
+                if binding.is_none() {
+                    // Standalone collections retain their generation fence.
+                    // Watches remain bound to the still-valid listen snapshot.
+                    let current = Box::pin(active(
+                        cx,
+                        deadline,
+                        owner,
+                        cancellation,
+                        Some(&pinned),
+                        self.client.credential_with_cancellation(cx, cancellation),
+                    ))
+                    .await?;
+                    require_same_credential(&pinned, &current)?;
+                }
                 self.check(cx, cancellation, deadline, Some(&pinned), kind, generation)?;
                 Ok(CollectedMachineCatalog {
                     kind,

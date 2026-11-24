@@ -164,8 +164,9 @@ impl From<ClientCredentialsCoreSubscriptionError> for ClientCredentialsCatalogWa
 impl ClientCredentialsCatalogClient {
     /// Watches a complete catalog, delivering an initial inventory and bounded
     /// replacements after observed changes. A live feed is acknowledged before
-    /// any list is dispatched. The same machine credential generation must own
-    /// the subscription and every published inventory; renewal ends the watch.
+    /// any list is dispatched. Its opening grant owns every page and published
+    /// inventory. A sibling renewal cannot replace this authority or extend the
+    /// original token expiry and watch deadline.
     ///
     /// The ID supplier returns fresh discovery/operation pairs. Both synchronous
     /// callbacks must cooperate and return promptly. Neither runs under the
@@ -269,13 +270,7 @@ impl ClientCredentialsCatalogClient {
                     subscription_limits,
                 ))
                 .await?;
-                let binding = self
-                    .client
-                    .credential_with_cancellation(cx, cancellation)
-                    .await?;
-                if binding.generation() != subscription.credential_generation() {
-                    return Err(ManagedCatalogError::CredentialChanged.into());
-                }
+                let binding = subscription.credential_snapshot();
                 active(cx, deadline, owner, cancellation, Some(&binding), async {
                     Ok(async {
                         let Some(ModernHttpSubscriptionListenEvent::Acknowledged {
@@ -361,7 +356,7 @@ impl ClientCredentialsCatalogClient {
                                 };
                                 let generation = self.fences()?.begin_fetch(&kind.result_set());
                                 attempts += 1;
-                                let result = Box::pin(self.collect_with_cancellation(
+                                let result = Box::pin(self.collect_with_binding(
                                     cx,
                                     &local_cancel,
                                     request.clone(),
@@ -417,6 +412,8 @@ impl ClientCredentialsCatalogClient {
                                             Err(ManagedCatalogError::AbortedByHost.into())
                                         }
                                     },
+                                    Some(&binding),
+                                    Some(deadline),
                                 ))
                                 .await;
                                 signal.finish()?;

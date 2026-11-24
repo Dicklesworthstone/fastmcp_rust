@@ -160,7 +160,8 @@ impl From<ClientCredentialsCoreSubscriptionError> for ClientCredentialsResourceW
 
 impl ClientCredentialsResourceClient {
     /// Opens and acknowledges the change feed before the first read. The same
-    /// machine credential generation must own the feed and every delivered read.
+    /// opening grant owns the feed and every delivered read. Sibling renewal
+    /// cannot replace it or extend the original expiry and watch deadline.
     /// Both callbacks are synchronous and must cooperate with the caller runtime.
     /// Fresh discovery/operation pairs are required across the entire watch.
     pub async fn watch<I, O>(
@@ -254,10 +255,7 @@ impl ClientCredentialsResourceClient {
                 let mut subscription = Box::pin(self.client.subscribe_core_with_cancellation(
                     cx, cancellation, metadata, discovery_id, listen_id, filter, stream_limits,
                 )).await?;
-                let binding = self.client.credential_with_cancellation(cx, cancellation).await?;
-                if subscription.credential_generation() != binding.generation() {
-                    return Err(ManagedResourceError::CredentialChanged.into());
-                }
+                let binding = subscription.credential_snapshot();
                 active(cx, deadline, owner, cancellation, Some(&binding), async {
                     Ok(async {
                         let Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) = subscription.next_event(cx).await? else {
@@ -298,7 +296,7 @@ impl ClientCredentialsResourceClient {
                                 let Some(local) = signal.begin(revision)? else { continue };
                                 let generation = self.cache()?.begin_fetch(&set);
                                 attempts += 1;
-                                let read = Box::pin(self.read_with_cancellation(cx, &local, request.clone(), || {
+                                let read = Box::pin(self.read_with_binding(cx, &local, request.clone(), || {
                                     check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                     let pair = issue_pair(&ids)?;
                                     check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
@@ -310,7 +308,7 @@ impl ClientCredentialsResourceClient {
                                     let continuing = observer.emit(ClientCredentialsResourceWatchEvent::Notification(notification))?;
                                     check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                     if continuing { Ok(()) } else { Err(ManagedResourceError::AbortedByHost.into()) }
-                                })).await;
+                                }, Some(&binding), Some(deadline))).await;
                                 signal.finish()?;
                                 check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                 // Local cancellation may replace the callback's

@@ -1627,3 +1627,323 @@ fn machine_catalog_watch_stops_after_inline_observer_stop() {
 fn machine_catalog_watch_caller_cancellation_wins_over_inline_observer_failure() {
     run_machine_catalog_observer(MachineCatalogObserverCase::Cancel);
 }
+
+async fn renew_machine_credential(
+    peer: &Peer,
+    cx: &Cx,
+    client: &ClientCredentialsClient,
+    original: &fastmcp_client::http_auth::discovery::client_credentials::ClientCredentialsSnapshot,
+) {
+    // Admission clamps renewal leeway to half the remaining grant lifetime.
+    // Waiting past half of what remains now also passes that original renewal
+    // threshold, regardless of how long discovery and the opening TLS took.
+    let remaining = original
+        .expires_at()
+        .saturating_duration_since(Instant::now());
+    assert!(
+        !remaining.is_zero(),
+        "opening grant expired before sibling renewal"
+    );
+    let wait = remaining / 2 + (remaining / 4).min(Duration::from_millis(50));
+    Sleep::new(cx.now().saturating_add_nanos(wait.as_nanos() as u64)).await;
+    assert!(
+        Instant::now() < original.expires_at(),
+        "opening grant expired while waiting to renew"
+    );
+    pair(peer.grant("access-two", 300), async {
+        let renewed = client.credential(cx).await.unwrap();
+        assert_eq!(renewed.generation(), 2, "renewal must acquire a new grant");
+    })
+    .await;
+    assert!(Instant::now() < original.expires_at());
+}
+
+#[derive(Clone, Copy)]
+enum MachineCatalogBindingCase {
+    Watch,
+    ExpireWatch,
+    Standalone,
+}
+
+fn run_machine_catalog_binding(case: MachineCatalogBindingCase) {
+    use std::cell::Cell;
+
+    use fastmcp_client::http_auth::discovery::client_credentials::rpc::ClientCredentialsCoreError;
+    use fastmcp_client::http_auth::discovery::client_credentials::rpc::catalog::watch::{
+        ClientCredentialsCatalogWatchControl as Control,
+        ClientCredentialsCatalogWatchError as WatchError,
+        ClientCredentialsCatalogWatchEvent as WatchEvent, ClientCredentialsCatalogWatchLimits,
+        ClientCredentialsCatalogWatchOutcome as Outcome,
+    };
+    use fastmcp_client::http_auth::discovery::client_credentials::rpc::catalog::{
+        ClientCredentialsCatalogClient, ClientCredentialsCatalogError,
+        ClientCredentialsCatalogLimits, ManagedCatalogError,
+    };
+    use fastmcp_client::http_auth::discovery::client_credentials::subscriptions::ClientCredentialsCoreSubscriptionError;
+    use fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY;
+
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(Box::pin(async {
+            let cx = Cx::current().unwrap();
+            let scenario = async {
+                let peer = Peer::new().await;
+                let plan = peer
+                    .plan(Duration::from_secs(15))
+                    .with_renewal_leeway(Duration::from_secs(3))
+                    .unwrap();
+                let ((), client) = pair(peer.metadata(Case::Complete), plan.discover(&cx)).await;
+                let client = client.unwrap();
+                let ((), original) = pair(peer.grant("access-one", 6), client.credential(&cx)).await;
+                let original = original.unwrap();
+                let catalog = ClientCredentialsCatalogClient::new(
+                    client.clone(),
+                    ClientCredentialsCatalogLimits::default(),
+                );
+                let completed = McpRequestCancellation::new();
+                let ids = Cell::new(0_i64);
+                let acknowledgments = Cell::new(0);
+                let snapshots = Cell::new(0);
+                let standalone = matches!(case, MachineCatalogBindingCase::Standalone);
+                let server = async {
+                    let mut listen = if standalone {
+                        None
+                    } else {
+                        peer.discovery(1, "access-one", DISCOVERY).await;
+                        let mut listen = peer.rpc(2, "subscriptions/listen", "access-one").await;
+                        listen.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                            .await.unwrap();
+                        event(&mut listen, &json!({"jsonrpc":"2.0",
+                            "method":"notifications/subscriptions/acknowledged", "params":{
+                                "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):2},
+                                "notifications":{"toolsListChanged":true}
+                            }}).to_string(), false).await;
+                        Some(listen)
+                    };
+                    let first = if standalone { 1 } else { 3 };
+                    peer.discovery(first, "access-one", DISCOVERY).await;
+                    let mut page = peer.rpc(first + 1, "tools/list", "access-one").await;
+                    renew_machine_credential(&peer, &cx, &client, &original).await;
+                    json_reply(&mut page, &terminal(first + 1,
+                        r#"{"resultType":"complete","tools":[],"nextCursor":"tenant-one-cursor","ttlMs":0,"cacheScope":"private"}"#)).await;
+                    drop(page);
+                    if standalone {
+                        let mut done = Box::pin(completed.cancelled());
+                        poll_fn(|task| {
+                            assert!(peer.listener.poll_accept(task).is_pending(),
+                                "a changed generation must refuse before any continuation POST");
+                            done.as_mut().poll(task)
+                        }).await;
+                    } else {
+                        // A replacement grant is live, but both discovery and
+                        // cursor dispatch must still use the listen's original.
+                        peer.discovery(5, "access-one", DISCOVERY).await;
+                        let mut page = peer.rpc(6, "tools/list", "access-one").await;
+                        if matches!(case, MachineCatalogBindingCase::ExpireWatch) {
+                            page.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                                .await.unwrap();
+                            page.flush().await.unwrap();
+                            let mut closing = Box::pin(pair(closed(page), closed(listen.take().unwrap())));
+                            poll_fn(|task| {
+                                assert!(peer.listener.poll_accept(task).is_pending(),
+                                    "original expiry must not authorize replacement-token work");
+                                closing.as_mut().poll(task)
+                            }).await;
+                        } else {
+                            json_reply(&mut page, &terminal(6, LIST)).await;
+                            drop(page);
+                            closed(listen.take().unwrap()).await;
+                        }
+                    }
+                };
+                let application = async {
+                    let next_ids = || {
+                        let first = ids.get() + 1;
+                        ids.set(first + 1);
+                        Ok((RequestId::Number(first), RequestId::Number(first + 1)))
+                    };
+                    if standalone {
+                        let result = catalog.collect(&cx, core("tools/list"), next_ids, |_| Ok(())).await;
+                        assert!(matches!(result,
+                            Err(ClientCredentialsCatalogError::Catalog(ManagedCatalogError::CredentialChanged))));
+                    } else {
+                        let result = catalog.watch(&cx, core("tools/list"),
+                            ClientCredentialsCatalogWatchLimits::new(Duration::from_secs(12), 1, 6, 4096, 16).unwrap(),
+                            next_ids, |event| {
+                                match event {
+                                    WatchEvent::Acknowledged { .. } => {
+                                        acknowledgments.set(acknowledgments.get() + 1);
+                                    }
+                                    WatchEvent::Snapshot(snapshot) => {
+                                        assert_eq!(snapshot.credential_generation(), 1);
+                                        assert_eq!(snapshot.pages().len(), 2);
+                                        assert_eq!(snapshot.item_count(), 0);
+                                        snapshots.set(snapshots.get() + 1);
+                                        return Ok(Control::Stop);
+                                    }
+                                    WatchEvent::Notification(_) => panic!("no change was sent"),
+                                }
+                                Ok(Control::Continue)
+                            }).await;
+                        if matches!(case, MachineCatalogBindingCase::ExpireWatch) {
+                            assert!(matches!(result,
+                                Err(WatchError::Catalog(ClientCredentialsCatalogError::Core(
+                                    ClientCredentialsCoreError::Authentication(Error::Expired
+                                        | Error::Discovery(OAuthDiscoveryError::TimedOut)))))
+                                | Err(WatchError::Subscription(ClientCredentialsCoreSubscriptionError::Authentication(
+                                    Error::Expired | Error::Discovery(OAuthDiscoveryError::TimedOut))))));
+                        } else {
+                            assert_eq!(result.unwrap(), Outcome::StoppedByHost);
+                        }
+                    }
+                    completed.cancel();
+                };
+                pair(server, application).await;
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
+                assert_eq!(peer.rpcs.load(Ordering::SeqCst), if standalone { 2 } else { 6 });
+                assert_eq!(ids.get(), if standalone { 4 } else { 6 });
+                assert_eq!(acknowledgments.get(), usize::from(!standalone));
+                assert_eq!(snapshots.get(), usize::from(matches!(case, MachineCatalogBindingCase::Watch)));
+                assert_eq!(client.credential(&cx).await.unwrap().generation(), 2);
+                assert!(cx.checkpoint().is_ok());
+                peer.quiet();
+            };
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)
+                .await
+                .expect("machine catalog binding must settle within its bound");
+        }));
+}
+
+#[test]
+fn machine_catalog_binding_watch_keeps_original_token_between_pages() {
+    run_machine_catalog_binding(MachineCatalogBindingCase::Watch);
+}
+
+#[test]
+fn machine_catalog_binding_standalone_refuses_renewal_before_cursor_dispatch() {
+    run_machine_catalog_binding(MachineCatalogBindingCase::Standalone);
+}
+
+#[test]
+fn machine_catalog_binding_watch_ends_at_original_expiry_after_sibling_renewal() {
+    run_machine_catalog_binding(MachineCatalogBindingCase::ExpireWatch);
+}
+
+#[test]
+fn machine_resource_binding_watch_keeps_original_token_after_sibling_renewal() {
+    use std::cell::Cell;
+
+    use fastmcp_client::http_auth::discovery::client_credentials::rpc::resource::watch::{
+        ClientCredentialsResourceWatchControl as Control,
+        ClientCredentialsResourceWatchEvent as WatchEvent, ClientCredentialsResourceWatchLimits,
+        ClientCredentialsResourceWatchOutcome as Outcome,
+    };
+    use fastmcp_client::http_auth::discovery::client_credentials::rpc::resource::{
+        ClientCredentialsResourceClient, ClientCredentialsResourceLimits,
+    };
+    use fastmcp_client::http_auth::discovery::client_credentials::rpc::{
+        ManagedCoreEvent, ManagedCoreLimits,
+    };
+    use fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY;
+
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(Box::pin(async {
+            let cx = Cx::current().unwrap();
+            let scenario = async {
+                const URI: &str = "file:///machine-resource";
+                let peer = Peer::new().await;
+                let plan = peer.plan(Duration::from_secs(15))
+                    .with_renewal_leeway(Duration::from_secs(3)).unwrap();
+                let ((), client) = pair(peer.metadata(Case::Complete), plan.discover(&cx)).await;
+                let client = client.unwrap();
+                let ((), original) = pair(peer.grant("access-one", 6), client.credential(&cx)).await;
+                let original = original.unwrap();
+                let resource = ClientCredentialsResourceClient::new(
+                    client.clone(), ClientCredentialsResourceLimits::default(),
+                ).with_cache_limits(4, 16 * 1024).unwrap();
+                let mut params = core("tools/list").encode_params().unwrap().unwrap();
+                params["uri"] = json!(URI);
+                let request = CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params)).unwrap();
+                let first_snapshot = McpRequestCancellation::new();
+                let ids = Cell::new(0_i64);
+                let snapshots = Cell::new(0);
+                let notifications = Cell::new(0);
+                let server = async {
+                    peer.discovery(1, "access-one", DISCOVERY).await;
+                    let mut listen = peer.rpc(2, "subscriptions/listen", "access-one").await;
+                    listen.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await.unwrap();
+                    event(&mut listen, &json!({"jsonrpc":"2.0",
+                        "method":"notifications/subscriptions/acknowledged", "params":{
+                            "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):2},
+                            "notifications":{"resourcesListChanged":true,"resourceSubscriptions":[URI]}
+                        }}).to_string(), false).await;
+                    let result = |text: &str| json!({"resultType":"complete",
+                        "contents":[{"uri":URI,"text":text}],"ttlMs":60000,"cacheScope":"private"}).to_string();
+                    peer.operation(3, "resources/read", "access-one", &result("first")).await;
+                    first_snapshot.cancelled().await;
+                    renew_machine_credential(&peer, &cx, &client, &original).await;
+                    event(&mut listen, &json!({"jsonrpc":"2.0",
+                        "method":"notifications/resources/updated", "params":{
+                            "uri":URI,"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):2}
+                        }}).to_string(), false).await;
+                    peer.operation(5, "resources/read", "access-one", &result("second")).await;
+                    closed(listen).await;
+                };
+                let application = async {
+                    let result = resource.watch(&cx, request,
+                        ClientCredentialsResourceWatchLimits::new(Duration::from_secs(12), 2, 4096, 16).unwrap(),
+                        || {
+                            let first = ids.get() + 1;
+                            ids.set(first + 1);
+                            Ok((RequestId::Number(first), RequestId::Number(first + 1)))
+                        }, |event| {
+                            match event {
+                                WatchEvent::Acknowledged { accepted_filter } => {
+                                    assert_eq!(accepted_filter.resource_subscriptions, Some(vec![URI.to_owned()]));
+                                }
+                                WatchEvent::Notification(_) => notifications.set(notifications.get() + 1),
+                                WatchEvent::Snapshot(snapshot) => {
+                                    assert_eq!(snapshot.credential_generation(), 1);
+                                    assert!(!snapshot.is_cache_hit());
+                                    snapshots.set(snapshots.get() + 1);
+                                    let expected = if snapshots.get() == 1 { "first" } else { "second" };
+                                    assert!(snapshot.result().encode().unwrap().contains(expected));
+                                    if snapshots.get() == 1 {
+                                        first_snapshot.cancel();
+                                    } else {
+                                        return Ok(Control::Stop);
+                                    }
+                                }
+                                WatchEvent::InputRequired(_) => panic!("no challenge was sent"),
+                            }
+                            Ok(Control::Continue)
+                        }).await;
+                    assert_eq!(result.unwrap(), Outcome::StoppedByHost);
+                };
+                pair(server, application).await;
+                assert_eq!(ids.get(), 6);
+                assert_eq!(snapshots.get(), 2);
+                assert_eq!(notifications.get(), 1);
+                // Independent RPCs still use the current generation normally.
+                let ((), call) = pair(peer.operation(7, "tools/list", "access-two", LIST),
+                    client.request_core(&cx, core("tools/list"), RequestId::Number(7),
+                        RequestId::Number(8), ManagedCoreLimits::default())).await;
+                let mut call = call.unwrap();
+                assert_eq!(call.credential_generation(), 2);
+                assert!(matches!(call.next_event(&cx).await.unwrap(), Some(ManagedCoreEvent::Result(_))));
+                assert_eq!(peer.rpcs.load(Ordering::SeqCst), 8);
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
+                assert!(cx.checkpoint().is_ok());
+                peer.quiet();
+            };
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)
+                .await
+                .expect("machine resource binding must settle within its bound");
+        }));
+}
