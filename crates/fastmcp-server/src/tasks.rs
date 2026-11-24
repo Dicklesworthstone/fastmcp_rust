@@ -46,6 +46,7 @@
 mod authorization;
 mod control;
 mod creation;
+mod recovery;
 mod worker;
 pub use authorization::{
     FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
@@ -1605,10 +1606,10 @@ pub trait FinalTaskStore: Send + Sync {
     /// `ctx.request_cancelled()` when a pending operation must settle after
     /// request-local cancellation. A write that may have committed must report
     /// that uncertainty instead of treating cancellation as proof of rollback.
-    /// Worker mutations also have explicit asynchronous entrypoints. Service
-    /// recovery, lease maintenance, and drop-time restoration remain bounded
-    /// synchronous operations; these hooks do not establish a persistent or
-    /// completely asynchronous Task backend.
+    /// Worker mutations and service recovery also have asynchronous entrypoints.
+    /// Dispatch election, lease maintenance, and drop-time restoration remain
+    /// bounded synchronous operations; these hooks do not establish a persistent
+    /// or completely asynchronous Task backend.
     fn get_task_access_metadata_with_context<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -1704,6 +1705,130 @@ pub trait FinalTaskStore: Send + Sync {
             ctx.checkpoint()
                 .map_err(|_| McpError::request_cancelled())?;
             self.is_cancellation_requested(task_id)
+        })
+    }
+
+    /// Reads a snapshot for service recovery on the application's caller.
+    ///
+    /// This is distinct from request authorization through `McpContext`.
+    /// Preserve the complete snapshot and its private authority bindings.
+    /// The default delegates to bounded synchronous storage; I/O-backed stores
+    /// may suspend without blocking the service or its active handoffs.
+    fn get_task_snapshot_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.get_task_snapshot(task_id)
+        })
+    }
+
+    /// Reads redacted authority for service-owned notification delivery.
+    /// Each observer is fenced again after any earlier application callback;
+    /// asynchronous overrides must preserve the exact current incarnation.
+    fn get_task_access_metadata_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAccessMetadata>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.get_task_access_metadata(task_id)
+        })
+    }
+
+    /// Scans initial work asynchronously, preserving the exclusive cursor,
+    /// wraparound, execution bounds, and claimable-candidate contract of
+    /// [`Self::next_initial_work_snapshot_after`]. This does not claim work.
+    fn next_initial_work_snapshot_after_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        after_task_id: Option<&'a FinalTaskId>,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.next_initial_work_snapshot_after(after_task_id)
+        })
+    }
+
+    /// Scans accepted input asynchronously without consuming its private
+    /// handoff. Preserve [`Self::next_accepted_input_snapshot_after`]'s exact
+    /// cursor and claimability semantics, including exclusion of exhausted work.
+    fn next_accepted_input_snapshot_after_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        after_task_id: Option<&'a FinalTaskId>,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.next_accepted_input_snapshot_after(after_task_id)
+        })
+    }
+
+    /// Reads an execution-expiry candidate on the service's caller context.
+    /// The candidate is still subject to the exact atomic expiry comparison.
+    fn next_expired_execution_snapshot_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.next_expired_execution_snapshot()
+        })
+    }
+
+    /// Commits execution expiry under the service caller. Check cancellation
+    /// immediately before the first write after any suspension. Return the
+    /// actual atomic commit snapshot, preserving its notification and authority
+    /// bindings even if cancellation arrives with that receipt. Abandoning an
+    /// uncertain operation must never undo a committed terminal transition.
+    fn expire_task_execution_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        expected: &'a FinalTaskSnapshot,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.expire_task_execution_if_current(expected)
+        })
+    }
+
+    /// Claims initial work under the caller without blocking its runtime.
+    ///
+    /// Check cancellation immediately before the first write after suspension.
+    /// The owner, generation, execution attempt and finite recovery lease must
+    /// be acquired atomically, retaining the original work until dispatch is
+    /// finished or restored. If this future is dropped with an unknown claim
+    /// outcome, that lease and payload must remain recoverable after expiry;
+    /// cancellation is not evidence that the claim failed. Forward the original
+    /// claim receipt intact, including any private execution-custody receipt.
+    fn take_initial_work_handoff_for_owner_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        expected: &'a FinalTaskSnapshot,
+        owner_id: &'a str,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskInitialWorkClaim>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.take_initial_work_handoff_for_owner_if_current(expected, owner_id)
+        })
+    }
+
+    /// Claims accepted input under the same asynchronous custody contract as
+    /// [`Self::take_initial_work_handoff_for_owner_if_current_with_cx`]. Retain
+    /// both the originating descriptor and exact input map behind the original
+    /// owner lease until dispatch completes, restoration wins, or it expires.
+    fn take_input_handoff_for_owner_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        expected: &'a FinalTaskSnapshot,
+        owner_id: &'a str,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAcceptedInputClaim>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.take_input_handoff_for_owner_if_current(expected, owner_id)
         })
     }
 
@@ -7779,6 +7904,14 @@ struct FinalTaskConcurrentHandoff<'a> {
     stop: Arc<AtomicBool>,
 }
 
+enum FinalTaskConcurrentStorageError {
+    Storage(McpError),
+    Handoff {
+        kind: FinalTaskRecoveryKind,
+        error: McpError,
+    },
+}
+
 /// The caller observes this task; its region owns admission and settlement.
 /// Dropping an observer requests cancellation without dropping an outstanding
 /// raw child-region opening or releasing its execution reservation.
@@ -8374,76 +8507,6 @@ impl FinalTaskRuntime {
         ))
     }
 
-    /// Service-only accepted-input recovery with a cancellation checkpoint
-    /// directly before every durable handoff claim.
-    fn recover_accepted_input_excluding(
-        &self,
-        cx: &Cx,
-        owner_id: &str,
-        recovery_cursor: &mut Option<FinalTaskId>,
-        excluded_task_ids: &BTreeSet<FinalTaskId>,
-    ) -> McpResult<Option<FinalTaskAcceptedInput>> {
-        let mut skipped = BTreeSet::new();
-        let mut lost_comparisons = 0;
-        let mut work_steps = 0;
-        for _ in 0..MAX_FINAL_TASK_RECOVERY_CAS_RETRIES + excluded_task_ids.len() {
-            cx.checkpoint()
-                .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let Some(candidate) = self
-                .store
-                .next_accepted_input_snapshot_after(recovery_cursor.as_ref())?
-            else {
-                return Ok(None);
-            };
-            let candidate = self.validate_loaded_task_snapshot(candidate, None)?;
-            let task_id = candidate.task().base().task_id.clone();
-            if excluded_task_ids.contains(&task_id) {
-                if !skipped.insert(task_id.clone()) {
-                    return Ok(None);
-                }
-                *recovery_cursor = Some(task_id);
-                continue;
-            }
-            work_steps += 1;
-            if self.expire_execution_snapshot(&candidate)?.is_some() {
-                *recovery_cursor = Some(task_id);
-                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
-                    break;
-                }
-                continue;
-            }
-            if !matches!(candidate.task(), FinalTask::Working(_)) {
-                return Err(McpError::internal_error(
-                    "Final task store returned a non-working accepted-input recovery candidate",
-                ));
-            }
-            cx.checkpoint()
-                .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let Some(claim) = self
-                .store
-                .take_input_handoff_for_owner_if_current(&candidate, owner_id)?
-            else {
-                lost_comparisons += 1;
-                if work_steps == MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
-                    break;
-                }
-                continue;
-            };
-            return self
-                .validate_accepted_input_claim(&candidate, owner_id, claim)
-                .map(Some);
-        }
-        if lost_comparisons < MAX_FINAL_TASK_RECOVERY_CAS_RETRIES {
-            if let Some(task_id) = recovery_cursor.as_ref() {
-                self.signal_task_service(task_id.clone());
-            }
-            return Ok(None);
-        }
-        Err(McpError::internal_error(
-            "Accepted-input recovery exceeded bounded lost-CAS retries",
-        ))
-    }
-
     /// Atomically recovers one initial task operation that has never reached
     /// the application supervisor.
     #[cfg(test)]
@@ -8478,6 +8541,7 @@ impl FinalTaskRuntime {
 
     /// Service-only initial-work recovery with a cancellation checkpoint
     /// directly before every durable work claim.
+    #[cfg(test)]
     fn recover_initial_work_excluding(
         &self,
         cx: &Cx,
@@ -8559,46 +8623,6 @@ impl FinalTaskRuntime {
             &mut after_task_id.cloned(),
             &BTreeSet::new(),
         )
-    }
-
-    fn take_initial_work_with_checkpoint(
-        &self,
-        cx: &Cx,
-        task_id: &FinalTaskId,
-        owner_id: &str,
-    ) -> McpResult<Option<FinalTaskInitialWork>> {
-        // Wakeups are advisory: retention may remove a task after its ID was
-        // queued. Its absence must not stop recovery of other durable work.
-        let Some(current) = self.load_optional_task_snapshot(task_id)? else {
-            return Ok(None);
-        };
-        cx.checkpoint()
-            .map_err(|error| McpError::internal_error(error.to_string()))?;
-        let claim = self
-            .store
-            .take_initial_work_handoff_for_owner_if_current(&current, owner_id)?;
-        claim
-            .map(|claim| self.validate_initial_work_claim(&current, owner_id, claim))
-            .transpose()
-    }
-
-    fn take_accepted_input_with_checkpoint(
-        &self,
-        cx: &Cx,
-        task_id: &FinalTaskId,
-        owner_id: &str,
-    ) -> McpResult<Option<FinalTaskAcceptedInput>> {
-        let Some(current) = self.load_optional_task_snapshot(task_id)? else {
-            return Ok(None);
-        };
-        cx.checkpoint()
-            .map_err(|error| McpError::internal_error(error.to_string()))?;
-        let claim = self
-            .store
-            .take_input_handoff_for_owner_if_current(&current, owner_id)?;
-        claim
-            .map(|claim| self.validate_accepted_input_claim(&current, owner_id, claim))
-            .transpose()
     }
 
     /// Refuses bare Tasks because no originating application work can be
@@ -9529,6 +9553,7 @@ impl FinalTaskRuntime {
 
     /// Validates a store-returned initial-work claim before application code
     /// can observe its descriptor.
+    #[cfg(test)]
     fn validate_initial_work_claim(
         &self,
         expected: &FinalTaskSnapshot,
@@ -9563,6 +9588,7 @@ impl FinalTaskRuntime {
 
     /// Validates a store-returned accepted-input claim before application code
     /// can observe either the originating descriptor or private input map.
+    #[cfg(test)]
     fn validate_accepted_input_claim(
         &self,
         expected: &FinalTaskSnapshot,
@@ -9604,6 +9630,7 @@ impl FinalTaskRuntime {
     /// Re-reads the durable record after a handoff claim so even a legacy
     /// claim implementation cannot pass work to the application after its
     /// expected active generation has changed.
+    #[cfg(test)]
     fn validate_claim_snapshot_still_current(&self, expected: &FinalTaskSnapshot) -> McpResult<()> {
         // This read checks the claim attestation only. Deadline retirement is
         // performed by dispatch election, where it is a normal completed
@@ -10535,9 +10562,26 @@ impl AuthorizedTaskServiceRunner {
                 Self::settle_active_handoffs(&mut active).await;
                 return Err(error);
             }
-            if let Err(error) = self.runtime.expire_pending_execution(cx) {
-                Self::settle_active_handoffs(&mut active).await;
-                return Err(error);
+            // Even a full worker set must retire expired queued/input work.
+            // Drive its asynchronous store operation alongside existing workers.
+            let maintenance = Self::await_storage_with_active(
+                cx,
+                self.runtime.expire_pending_execution_with_cx(cx),
+                &mut active,
+                &mut attempted_initial_cursor,
+                &mut attempted_accepted_cursor,
+            )
+            .await;
+            if let Err(error) = maintenance {
+                return self
+                    .finish_concurrent_storage_error(
+                        cx,
+                        &mut active,
+                        attempted_initial_cursor,
+                        attempted_accepted_cursor,
+                        error,
+                    )
+                    .await;
             }
             let mut scanned = 0;
             while active.len() < self.max_concurrent_handoffs
@@ -10547,19 +10591,29 @@ impl AuthorizedTaskServiceRunner {
                     .iter()
                     .map(|handoff| handoff.task_id.clone())
                     .collect();
-                let (kind, handoff) =
-                    match self.next_recovery_handoff_excluding(cx, &excluded_task_ids) {
-                        Ok(Some(recovered)) => recovered,
-                        Ok(None) => break,
-                        Err(_) if cx.checkpoint().is_err() => {
-                            Self::settle_active_handoffs(&mut active).await;
-                            return Ok(());
-                        }
-                        Err(error) => {
-                            Self::settle_active_handoffs(&mut active).await;
-                            return Err(error);
-                        }
-                    };
+                let recovery = Self::await_storage_with_active(
+                    cx,
+                    self.next_recovery_handoff_excluding(cx, &excluded_task_ids),
+                    &mut active,
+                    &mut attempted_initial_cursor,
+                    &mut attempted_accepted_cursor,
+                )
+                .await;
+                let (kind, handoff) = match recovery {
+                    Ok(Some(recovered)) => recovered,
+                    Ok(None) => break,
+                    Err(error) => {
+                        return self
+                            .finish_concurrent_storage_error(
+                                cx,
+                                &mut active,
+                                attempted_initial_cursor,
+                                attempted_accepted_cursor,
+                                error,
+                            )
+                            .await;
+                    }
+                };
                 scanned += 1;
                 let task_id = final_task_handoff_task_id(&handoff).clone();
                 // Construct the restoration guard before the future enters
@@ -10645,20 +10699,17 @@ impl AuthorizedTaskServiceRunner {
                     // wake registration before the next slot is admitted.
                     let completed = active.remove(index);
                     if let Err(error) = result {
-                        if cx.checkpoint().is_err() {
-                            Self::settle_active_handoffs(&mut active).await;
-                            return Ok(());
-                        }
-                        // Admission may have scanned past unpolled futures
-                        // of either recovery kind. Restore both execution
-                        // checkpoints: keeping the other kind's speculative
-                        // cursor can alternate failures forever around an
-                        // unpolled sibling when initial and resumed work mix.
-                        self.initial_recovery_cursor = attempted_initial_cursor;
-                        self.accepted_recovery_cursor = attempted_accepted_cursor;
-                        self.next_recovery_kind = completed.kind.other();
-                        Self::settle_active_handoffs(&mut active).await;
-                        return Err(error);
+                        let kind = completed.kind;
+                        drop(completed);
+                        return self
+                            .finish_concurrent_storage_error(
+                                cx,
+                                &mut active,
+                                attempted_initial_cursor,
+                                attempted_accepted_cursor,
+                                FinalTaskConcurrentStorageError::Handoff { kind, error },
+                            )
+                            .await;
                     }
                     drop(completed);
                 }
@@ -10690,6 +10741,129 @@ impl AuthorizedTaskServiceRunner {
         }
     }
 
+    /// Keeps existing attempts live while one recovery or maintenance
+    /// operation waits on storage. There is only one provider future: a worker
+    /// wake never discards or restarts its pending read or claim.
+    async fn await_storage_with_active<'cx, T, F>(
+        cx: &'cx Cx,
+        operation: F,
+        active: &mut Vec<FinalTaskConcurrentHandoff<'cx>>,
+        attempted_initial_cursor: &mut Option<FinalTaskId>,
+        attempted_accepted_cursor: &mut Option<FinalTaskId>,
+    ) -> Result<T, FinalTaskConcurrentStorageError>
+    where
+        T: Send,
+        F: Future<Output = McpResult<T>> + Send,
+    {
+        let mut operation = std::pin::pin!(operation);
+        let mut wake = std::pin::pin!(asupersync::time::sleep(
+            cx.now(),
+            FINAL_TASK_RECOVERY_WAKE_INTERVAL,
+        ));
+        std::future::poll_fn(|context| {
+            if cx.checkpoint().is_err() {
+                return std::task::Poll::Ready(Err(FinalTaskConcurrentStorageError::Storage(
+                    McpError::request_cancelled(),
+                )));
+            }
+            // Refuse a narrowed caller before polling its timer, so Sleep
+            // cannot borrow an unrelated driver or start a fallback timer.
+            if let Err(error) = final_task_service_caller(cx) {
+                return std::task::Poll::Ready(Err(FinalTaskConcurrentStorageError::Storage(
+                    error,
+                )));
+            }
+            let mut index = 0;
+            while index < active.len() {
+                let handoff = &mut active[index];
+                handoff.wake.register_parent(context.waker());
+                if !handoff.wake.ready.swap(false, TaskServiceOrdering::AcqRel) {
+                    index += 1;
+                    continue;
+                }
+                let waker = std::task::Waker::from(Arc::clone(&handoff.wake));
+                let mut handoff_context = std::task::Context::from_waker(&waker);
+                match handoff.kind {
+                    FinalTaskRecoveryKind::Initial => {
+                        *attempted_initial_cursor = Some(handoff.task_id.clone());
+                    }
+                    FinalTaskRecoveryKind::Resumed => {
+                        *attempted_accepted_cursor = Some(handoff.task_id.clone());
+                    }
+                }
+                let result = handoff.future.as_mut().poll(&mut handoff_context);
+                if let std::task::Poll::Ready(result) = result {
+                    let completed = active.remove(index);
+                    let kind = completed.kind;
+                    drop(completed);
+                    if let Err(error) = result {
+                        return std::task::Poll::Ready(Err(
+                            FinalTaskConcurrentStorageError::Handoff { kind, error },
+                        ));
+                    }
+                } else {
+                    index += 1;
+                }
+                // A handoff may stop the enclosing service in this same poll.
+                // Do not admit another store operation or application sibling.
+                if cx.checkpoint().is_err() {
+                    return std::task::Poll::Ready(Err(FinalTaskConcurrentStorageError::Storage(
+                        McpError::request_cancelled(),
+                    )));
+                }
+            }
+            if let std::task::Poll::Ready(result) = operation.as_mut().poll(context) {
+                return std::task::Poll::Ready(
+                    result.map_err(FinalTaskConcurrentStorageError::Storage),
+                );
+            }
+            // A provider is allowed to remain pending without arranging a
+            // wake. Cancellation and caller authority still have a finite
+            // observation interval, using only this service's timer driver.
+            if wake.as_mut().poll(context).is_ready() {
+                wake.set(asupersync::time::sleep(
+                    cx.now(),
+                    FINAL_TASK_RECOVERY_WAKE_INTERVAL,
+                ));
+                context.waker().wake_by_ref();
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
+    async fn finish_concurrent_storage_error(
+        &mut self,
+        cx: &Cx,
+        active: &mut Vec<FinalTaskConcurrentHandoff<'_>>,
+        attempted_initial_cursor: Option<FinalTaskId>,
+        attempted_accepted_cursor: Option<FinalTaskId>,
+        failure: FinalTaskConcurrentStorageError,
+    ) -> McpResult<()> {
+        if cx.checkpoint().is_err() {
+            Self::settle_active_handoffs(active).await;
+            return Ok(());
+        }
+        let error = match failure {
+            FinalTaskConcurrentStorageError::Storage(error) => error,
+            FinalTaskConcurrentStorageError::Handoff { kind, error } => {
+                // Admission may have scanned past unpolled futures of either
+                // recovery kind. Keep both last-polled checkpoints so repeated
+                // failures cannot alternate around an unpolled sibling.
+                self.initial_recovery_cursor = attempted_initial_cursor;
+                self.accepted_recovery_cursor = attempted_accepted_cursor;
+                self.next_recovery_kind = kind.other();
+                error
+            }
+        };
+        // The storage future has been dropped before this call. Unknown
+        // claims retain their recoverable lease; a known receipt's provisional
+        // guard restores only its exact generation. Settle application children
+        // before allowing the caller to restart the service.
+        Self::settle_active_handoffs(active).await;
+        Err(error)
+    }
+
     async fn settle_active_handoffs(active: &mut Vec<FinalTaskConcurrentHandoff<'_>>) {
         for handoff in active.iter() {
             handoff.stop.store(true, TaskServiceOrdering::Release);
@@ -10715,43 +10889,49 @@ impl AuthorizedTaskServiceRunner {
         .await;
     }
 
-    fn next_recovery_handoff(
+    async fn next_recovery_handoff(
         &mut self,
         cx: &Cx,
     ) -> McpResult<Option<(FinalTaskRecoveryKind, FinalTaskSupervisorHandoff)>> {
         self.next_recovery_handoff_excluding(cx, &BTreeSet::new())
+            .await
     }
 
-    fn next_recovery_handoff_excluding(
+    async fn next_recovery_handoff_excluding(
         &mut self,
         cx: &Cx,
         excluded_task_ids: &BTreeSet<FinalTaskId>,
     ) -> McpResult<Option<(FinalTaskRecoveryKind, FinalTaskSupervisorHandoff)>> {
         final_task_service_caller(cx)?;
-        self.runtime.expire_pending_execution(cx)?;
+        self.runtime.expire_pending_execution_with_cx(cx).await?;
         // These are admission scan cursors, distinct from the concurrent
         // runner's last-polled checkpoints. Skipping cleanup-owned tasks
         // cannot spend an attempt or advance application execution progress.
         let recovered = match self.next_recovery_kind {
             FinalTaskRecoveryKind::Initial => {
-                if let Some(handoff) = self.runtime.recover_initial_work_excluding(
-                    cx,
-                    &self.dispatch_owner,
-                    &mut self.initial_recovery_cursor,
-                    excluded_task_ids,
-                )? {
+                if let Some(handoff) = self
+                    .runtime
+                    .recover_initial_work_excluding_with_cx(
+                        cx,
+                        &self.dispatch_owner,
+                        &mut self.initial_recovery_cursor,
+                        excluded_task_ids,
+                    )
+                    .await?
+                {
                     Some((
                         FinalTaskRecoveryKind::Initial,
                         FinalTaskSupervisorHandoff::Initial(handoff),
                     ))
                 } else {
                     self.runtime
-                        .recover_accepted_input_excluding(
+                        .recover_accepted_input_excluding_with_cx(
                             cx,
                             &self.dispatch_owner,
                             &mut self.accepted_recovery_cursor,
                             excluded_task_ids,
-                        )?
+                        )
+                        .await?
                         .map(|handoff| {
                             (
                                 FinalTaskRecoveryKind::Resumed,
@@ -10761,24 +10941,29 @@ impl AuthorizedTaskServiceRunner {
                 }
             }
             FinalTaskRecoveryKind::Resumed => {
-                if let Some(handoff) = self.runtime.recover_accepted_input_excluding(
-                    cx,
-                    &self.dispatch_owner,
-                    &mut self.accepted_recovery_cursor,
-                    excluded_task_ids,
-                )? {
+                if let Some(handoff) = self
+                    .runtime
+                    .recover_accepted_input_excluding_with_cx(
+                        cx,
+                        &self.dispatch_owner,
+                        &mut self.accepted_recovery_cursor,
+                        excluded_task_ids,
+                    )
+                    .await?
+                {
                     Some((
                         FinalTaskRecoveryKind::Resumed,
                         FinalTaskSupervisorHandoff::Resumed(handoff),
                     ))
                 } else {
                     self.runtime
-                        .recover_initial_work_excluding(
+                        .recover_initial_work_excluding_with_cx(
                             cx,
                             &self.dispatch_owner,
                             &mut self.initial_recovery_cursor,
                             excluded_task_ids,
-                        )?
+                        )
+                        .await?
                         .map(|handoff| {
                             (
                                 FinalTaskRecoveryKind::Initial,
@@ -10804,7 +10989,7 @@ impl AuthorizedTaskServiceRunner {
         let mut first_retryable_error = None;
         let mut retried_handoffs = BTreeSet::new();
         for _ in 0..MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN {
-            let Some((kind, handoff)) = self.next_recovery_handoff(cx)? else {
+            let Some((kind, handoff)) = self.next_recovery_handoff(cx).await? else {
                 break;
             };
             let task_id = final_task_handoff_task_id(&handoff).clone();
@@ -10842,9 +11027,10 @@ impl AuthorizedTaskServiceRunner {
         final_task_service_caller(cx)?;
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        if let Some(initial) =
-            self.runtime
-                .take_initial_work_with_checkpoint(cx, task_id, &self.dispatch_owner)?
+        if let Some(initial) = self
+            .runtime
+            .take_initial_work_with_cx(cx, task_id, &self.dispatch_owner)
+            .await?
         {
             self.resume_handoff(cx, FinalTaskSupervisorHandoff::Initial(initial))
                 .await?;
@@ -10852,9 +11038,10 @@ impl AuthorizedTaskServiceRunner {
         }
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        if let Some(accepted) =
-            self.runtime
-                .take_accepted_input_with_checkpoint(cx, task_id, &self.dispatch_owner)?
+        if let Some(accepted) = self
+            .runtime
+            .take_accepted_input_with_cx(cx, task_id, &self.dispatch_owner)
+            .await?
         {
             self.resume_handoff(cx, FinalTaskSupervisorHandoff::Resumed(accepted))
                 .await?;
@@ -11233,7 +11420,11 @@ impl FinalTaskHandoffExecutor {
                 // A backend may have committed and parked its receipt. Settle
                 // only that provider before checking the now-consumed lease;
                 // all application checkpoints below still apply afterward.
-                if guard.pending_write.poll_settlement(task_context, false).is_pending() {
+                if guard
+                    .pending_write
+                    .poll_settlement(task_context, false)
+                    .is_pending()
+                {
                     return std::task::Poll::Pending;
                 }
                 if guard.pending_write.outcome_uncertain() {

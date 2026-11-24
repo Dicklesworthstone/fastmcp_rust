@@ -3183,10 +3183,43 @@ not leave detached writes running after returning. The bounded
 `retention_clock_now` hook must remain nonblocking and perform no storage I/O.
 
 The built-in in-memory store uses bounded synchronous defaults for these
-hooks. Service recovery, claim election, lease maintenance, and final store
-cleanup still use their existing bounded synchronous interfaces. These worker
-transitions do not provide restart persistence or a fully asynchronous Task
-service.
+hooks. Worker dispatch election, lease maintenance, and final store cleanup
+still use their existing bounded synchronous interfaces.
+
+### Asynchronous Task service recovery
+
+Application stores can suspend startup and periodic recovery, signaled Task
+lookups, and owner-bound handoff claims on the service's caller-owned `Cx`.
+Override the `FinalTaskStore` hooks `next_initial_work_snapshot_after_with_cx`,
+`next_accepted_input_snapshot_after_with_cx`,
+`next_expired_execution_snapshot_with_cx`, `get_task_snapshot_with_cx`,
+`take_initial_work_handoff_for_owner_if_current_with_cx`,
+`take_input_handoff_for_owner_if_current_with_cx`, and
+`expire_task_execution_if_current_with_cx`. Notification delivery also uses
+`get_task_access_metadata_with_cx` to recheck each observer's current Task
+incarnation without a synchronous metadata read. The default implementations
+retain the bounded in-memory behavior.
+
+The runner keeps existing handoffs progressing while recovery storage is
+pending, including at full configured concurrency. It preserves scan cursors,
+initial/resumed fairness, active-task exclusions, and bounded retry work.
+Caller cancellation, deadlines, and permission restrictions are checked even
+when a storage provider never wakes.
+
+A returned claim stays under restoration custody while the runtime awaits a
+fresh snapshot and checks its exact Task, generation, owner, principal, and
+originating operation. Cancellation or abandonment during that check restores
+only the known claim through the existing fenced cleanup path. If a provider
+is dropped before its claim outcome is known, it must keep the original
+payload behind its finite owner lease so another service can recover it after
+expiry. It must not treat cancellation as proof of rollback or start detached
+writes. A committed execution-expiry result remains committed if notification
+delivery is cancelled or an observer fails.
+
+Dispatch election, per-attempt execution monitoring and lease renewal, and
+drop-time restoration remain bounded synchronous backend operations. These
+recovery hooks do not provide restart persistence or a completely asynchronous
+Task backend.
 
 ### Tasks retention administration
 
