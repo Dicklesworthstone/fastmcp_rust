@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
+use fastmcp_core::{McpError, McpRequestCancellation};
 use fastmcp_protocol::http_headers::ParameterHeaderBinding;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, FinalCoreResult};
@@ -13,7 +13,7 @@ use super::{ReviewedToolHeaders, ToolHeaderDispatchError};
 use crate::{
     ClientHttpConnectionError, FinalCacheResultSet, HttpClient, HttpClientError,
     MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES, ModernHttpClientError,
-    mrtr_input_required_for_method, mrtr_retry_parameters,
+    mrtr_input_required_for_method, mrtr_retry_parameters, wait_for_http_operation,
 };
 
 const MAX_REVIEWED_HEADER_REFRESH_PAGES: usize = 64;
@@ -125,23 +125,14 @@ impl HttpClient {
         });
         let deadline =
             now.saturating_add_nanos(u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX));
-        match asupersync::time::timeout_at(
+        wait_for_http_operation(
+            cx,
+            cancellation,
             deadline,
+            "Reviewed tool call absolute timeout exceeded",
             self.drive_reviewed_tool_call(cx, cancellation, arguments, reviewed, review),
         )
         .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                checkpoint(cx, cancellation)?;
-                Err(McpError::with_data(
-                    McpErrorCode::InternalError,
-                    "Reviewed tool call absolute timeout exceeded",
-                    json!({"timeoutSource":"absolute"}),
-                )
-                .into())
-            }
-        }
     }
 
     async fn drive_reviewed_tool_call(
@@ -287,14 +278,18 @@ impl HttpClient {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashSet, VecDeque};
+    use std::future::{Future, poll_fn};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
 
-    use fastmcp_core::CanonicalHttpUrl;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::time::{TimerDriverHandle, VirtualClock};
+    use fastmcp_core::{CanonicalHttpUrl, McpErrorCode};
     use fastmcp_protocol::{
         ClientCapabilities, DiscoveryCacheHints, HEADER_MISMATCH_ERROR_CODE,
         HEADER_MISMATCH_MESSAGE, ServerBehavior, ServerBehaviorRegistry,
@@ -559,6 +554,30 @@ mod tests {
         }
     }
 
+    async fn connect_client(peer: &Peer, cx: &Cx, handlers: ReverseRequestHandlers) -> HttpClient {
+        let plan = ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(peer.endpoint.clone()),
+            None,
+            None,
+            "test-anonymous".into(),
+            "test-local".into(),
+            "native-http".into(),
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        let capabilities: ClientCapabilities = serde_json::from_value(json!({"roots":{}})).unwrap();
+        ClientBuilder::new()
+            .protocol_plan(plan)
+            .capabilities(capabilities)
+            .reverse_request_handlers(handlers)
+            .connect_http_client_with_cx(cx)
+            .await
+            .unwrap()
+    }
+
     fn exercise(
         replies: Vec<Reply>,
         with_handlers: bool,
@@ -590,28 +609,7 @@ mod tests {
             .unwrap();
         let outcome = runtime.block_on(async {
             let cx = Cx::current().unwrap();
-            let plan = ClientProtocolPlan::http(
-                ProtocolPolicy::ModernOnly,
-                Some(peer.endpoint.clone()),
-                None,
-                None,
-                "test-anonymous".into(),
-                "test-local".into(),
-                "native-http".into(),
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-            let capabilities: ClientCapabilities =
-                serde_json::from_value(json!({"roots":{}})).unwrap();
-            let mut client = ClientBuilder::new()
-                .protocol_plan(plan)
-                .capabilities(capabilities)
-                .reverse_request_handlers(handlers)
-                .connect_http_client_with_cx(&cx)
-                .await
-                .unwrap();
+            let mut client = connect_client(&peer, &cx, handlers).await;
             let arguments = json!({"region":"east","bodyOnly":"private"});
             if pre_cancel {
                 let cancelled = Cx::for_testing();
@@ -645,6 +643,237 @@ mod tests {
             .filter_map(|line| line.split_once(':'))
             .find(|(name, _)| name.eq_ignore_ascii_case(field))
             .map(|(_, value)| value.trim().to_owned())
+    }
+
+    #[test]
+    fn live_loopback_reviewed_exchange_keeps_caller_clock_through_repair_and_mrtr() {
+        let peer = Peer::start(vec![mismatch(), catalog(), input_required(), complete()]);
+        let reviewed = ReviewedToolHeaders::new_for_loopback_http(
+            peer.endpoint.clone(),
+            "lookup",
+            schema("OldRegion"),
+            |_| true,
+        )
+        .unwrap();
+        let caller_clock = Arc::new(VirtualClock::new());
+        let caller_timer = TimerDriverHandle::with_virtual_clock(caller_clock);
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .with_timer_driver(caller_timer)
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        let ambient_clock = Arc::new(VirtualClock::new());
+        let ambient_timer = TimerDriverHandle::with_virtual_clock(ambient_clock.clone());
+        let ambient_runtime = RuntimeBuilder::current_thread()
+            .with_timer_driver(ambient_timer.clone())
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let ambient = ambient_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let reviews = AtomicUsize::new(0);
+
+        let outcome = runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let expected_task = cx.task_id();
+            assert_ne!(expected_task, ambient.task_id());
+            let observed_callbacks = callbacks.clone();
+            let handlers =
+                ReverseRequestHandlers::new().with_modern_roots_list(move |callback_cx, _, _| {
+                    assert_eq!(callback_cx.task_id(), expected_task);
+                    assert_eq!(Cx::current().unwrap().task_id(), expected_task);
+                    observed_callbacks.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        asupersync::runtime::yield_now().await;
+                        assert_eq!(Cx::current().unwrap().task_id(), expected_task);
+                        Ok(serde_json::from_value(json!({"roots":[]})).unwrap())
+                    })
+                });
+            let mut client = connect_client(&peer, &cx, handlers).await;
+            let foreign_now = cx.now()
+                + client.request_timeout_policy.absolute_timeout()
+                + Duration::from_secs(1);
+            ambient_clock.advance_to(foreign_now);
+            let reviewer = |_: &ParameterHeaderBinding| {
+                assert_eq!(Cx::current().unwrap().task_id(), expected_task);
+                reviews.fetch_add(1, Ordering::SeqCst);
+                true
+            };
+            let cancellation = McpRequestCancellation::new();
+            let mut operation =
+                std::pin::pin!(client.call_tool_with_reviewed_headers_and_cancellation(
+                    &cx,
+                    &cancellation,
+                    json!({"region":"east","bodyOnly":"private"}),
+                    &reviewed,
+                    &reviewer,
+                ));
+            poll_fn(|task| {
+                let _ambient = Cx::set_current(Some(ambient.clone()));
+                let result = operation.as_mut().poll(task);
+                assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
+                assert_eq!(ambient_timer.pending_count(), 0);
+                result
+            })
+            .await
+        });
+
+        assert!(matches!(
+            outcome,
+            Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+        ));
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(reviews.load(Ordering::SeqCst), 1);
+        let captured = peer.finish();
+        assert_eq!(captured.len(), 5);
+        assert_eq!(
+            mirrored(&captured[1], "Mcp-Param-OldRegion").as_deref(),
+            Some("east")
+        );
+        for index in [3, 4] {
+            assert_eq!(
+                mirrored(&captured[index], "Mcp-Param-Region").as_deref(),
+                Some("east")
+            );
+            assert_eq!(mirrored(&captured[index], "Mcp-Param-OldRegion"), None);
+            assert_eq!(
+                captured[index].body["params"]["arguments"],
+                json!({"region":"east","bodyOnly":"private"})
+            );
+        }
+        assert_eq!(
+            captured[4].body["params"]["inputResponses"]["roots"]["roots"],
+            json!([])
+        );
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        assert!(ambient_runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn live_loopback_reviewed_exchange_wakes_silent_callback_and_retires_without_retry() {
+        #[derive(Default)]
+        struct CountWake(AtomicUsize);
+
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct CallbackDrop(Arc<AtomicUsize>);
+
+        impl Drop for CallbackDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for stop in ["request", "caller", "deadline"] {
+            let peer = Peer::start(vec![input_required()]);
+            let reviewed = ReviewedToolHeaders::new_for_loopback_http(
+                peer.endpoint.clone(),
+                "lookup",
+                schema("Region"),
+                |_| true,
+            )
+            .unwrap();
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(clock.clone());
+            let runtime = RuntimeBuilder::current_thread()
+                .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+                .with_timer_driver(timer.clone())
+                .blocking_threads(0, 2)
+                .build()
+                .unwrap();
+            let entered = Arc::new(AtomicBool::new(false));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                let callback_entered = entered.clone();
+                let callback_dropped = dropped.clone();
+                let handlers =
+                    ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+                        let entered = callback_entered.clone();
+                        let dropped = callback_dropped.clone();
+                        Box::pin(async move {
+                            let _drop = CallbackDrop(dropped);
+                            entered.store(true, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
+                            Ok(serde_json::from_value(json!({"roots":[]})).unwrap())
+                        })
+                    });
+                let mut client = connect_client(&peer, &cx, handlers).await;
+                let timeout = client.request_timeout_policy.absolute_timeout();
+                let cancellation = McpRequestCancellation::new();
+                let reviewer = |_: &ParameterHeaderBinding| true;
+                let mut operation =
+                    Box::pin(client.call_tool_with_reviewed_headers_and_cancellation(
+                        &cx,
+                        &cancellation,
+                        json!({"region":"east"}),
+                        &reviewed,
+                        &reviewer,
+                    ));
+                // Wait for real HTTP input_required and a polled Host callback.
+                // No time advances after it parks until the selected signal.
+                poll_fn(|task| {
+                    assert!(operation.as_mut().poll(task).is_pending());
+                    if entered.load(Ordering::SeqCst) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                let wakes = Arc::new(CountWake::default());
+                let waker = Waker::from(wakes.clone());
+                let mut task = Context::from_waker(&waker);
+                assert!(operation.as_mut().poll(&mut task).is_pending());
+                assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+
+                match stop {
+                    "request" => {
+                        cancellation.cancel();
+                    }
+                    "caller" => cx.cancel_fast(asupersync::types::CancelKind::User),
+                    "deadline" => {
+                        clock.advance(u64::try_from(timeout.as_nanos()).unwrap() + 1);
+                        let _ = timer.process_timers();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    wakes.0.load(Ordering::SeqCst) > 0,
+                    "{stop} must wake the call without a Host callback wake"
+                );
+                let Poll::Ready(Err(HttpClientError::CoreResult(error))) =
+                    operation.as_mut().poll(&mut task)
+                else {
+                    panic!("{stop} must retire the pending reviewed call");
+                };
+                if stop == "deadline" {
+                    assert_eq!(error.code, McpErrorCode::InternalError);
+                    assert_eq!(
+                        error.message,
+                        "Reviewed tool call absolute timeout exceeded"
+                    );
+                    assert_eq!(error.data.unwrap()["timeoutSource"], "absolute");
+                } else {
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                }
+                drop(operation);
+                assert_eq!(dropped.load(Ordering::SeqCst), 1);
+                assert_eq!(timer.pending_count(), 0);
+            });
+            assert_eq!(peer.finish().len(), 2, "{stop} sends no continuation");
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
     }
 
     #[test]
