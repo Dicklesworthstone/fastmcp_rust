@@ -293,7 +293,7 @@ pub struct MemoryClient {
     receiver: MemoryRecvHalf,
     sender: MemorySendHalf,
     executor: MemoryExecutor,
-    owner: Arc<()>,
+    pub(super) owner: Arc<()>,
     session: ClientSession,
     next_id: i64,
     timeout_policy: RequestTimeoutPolicy,

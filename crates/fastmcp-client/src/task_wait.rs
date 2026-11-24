@@ -267,6 +267,7 @@ impl FinalTaskDriver {
         client: &mut HttpClient,
         cancellation: &McpRequestCancellation,
     ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+        self.handle.ensure_task_owner(&client.task_owner)?;
         drive_task(
             self,
             cx,
@@ -285,6 +286,7 @@ impl FinalTaskDriver {
         client: &mut Client,
         cancellation: &McpRequestCancellation,
     ) -> McpResult<FinalTaskWaitOutcome> {
+        self.handle.ensure_task_owner(&client.task_owner)?;
         drive_task(self, cx, client, cancellation).await
     }
 
@@ -296,6 +298,7 @@ impl FinalTaskDriver {
         client: &mut MemoryClient,
         cancellation: &McpRequestCancellation,
     ) -> McpResult<FinalTaskWaitOutcome> {
+        self.handle.ensure_task_owner(&client.owner)?;
         drive_task(self, cx, client, cancellation).await
     }
 
@@ -320,6 +323,7 @@ impl FinalTaskDriver {
         cancellation: &McpRequestCancellation,
         limits: crate::sse::SseLimits,
     ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+        self.handle.ensure_task_owner(&client.task_owner)?;
         drive_task_watching(
             self,
             cx,
@@ -343,6 +347,7 @@ impl FinalTaskDriver {
         client: &mut MemoryClient,
         cancellation: &McpRequestCancellation,
     ) -> McpResult<FinalTaskWaitOutcome> {
+        self.handle.ensure_task_owner(&client.owner)?;
         drive_task_watching(self, cx, client, cancellation, ()).await
     }
 
@@ -367,6 +372,7 @@ impl FinalTaskDriver {
         client: &mut Client,
         cancellation: &McpRequestCancellation,
     ) -> McpResult<FinalTaskWaitOutcome> {
+        self.handle.ensure_task_owner(&client.task_owner)?;
         Box::pin(drive_task_watching(self, cx, client, cancellation, ())).await
     }
 
@@ -390,6 +396,7 @@ impl FinalTaskDriver {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.handle.ensure_task_owner(&client.task_owner)?;
         Box::pin(drive_task_watching(self, cx, client, cancellation, ())).await
     }
 
@@ -404,6 +411,7 @@ impl FinalTaskDriver {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.handle.ensure_task_owner(&client.task_owner)?;
         drive_task(self, cx, client, cancellation).await
     }
 }
@@ -427,8 +435,9 @@ impl FinalTaskHandle {
     ///
     /// Expired snapshots remain available: terminal data has already been
     /// delivered, while waiting and input submission enforce live retention.
-    /// This handoff is not authentication, cross-client binding, persistence,
-    /// or proof of durable recovery.
+    /// The receipt contains no client identity. The first client operation
+    /// selects the owner for this handle and its clones. Supply the originating
+    /// client on first use. Later operations require that same instance.
     pub fn from_created(result: &fastmcp_protocol::CreateTaskResult) -> McpResult<Self> {
         use fastmcp_protocol::tasks_extension::TaskStatus;
 
@@ -504,6 +513,7 @@ impl FinalTaskHandle {
         cancellation: &McpRequestCancellation,
         policy: FinalTaskWaitPolicy,
     ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+        self.ensure_task_owner(&client.task_owner)?;
         wait_for_task(self, cx, client, cancellation, policy).await
     }
 
@@ -521,6 +531,7 @@ impl FinalTaskHandle {
         cancellation: &McpRequestCancellation,
         policy: FinalTaskWaitPolicy,
     ) -> McpResult<FinalTaskWaitOutcome> {
+        self.ensure_task_owner(&client.task_owner)?;
         wait_for_task(self, cx, client, cancellation, policy).await
     }
 
@@ -539,6 +550,7 @@ impl FinalTaskHandle {
         cancellation: &McpRequestCancellation,
         policy: FinalTaskWaitPolicy,
     ) -> McpResult<FinalTaskWaitOutcome> {
+        self.ensure_task_owner(&client.owner)?;
         wait_for_task(self, cx, client, cancellation, policy).await
     }
 
@@ -555,6 +567,7 @@ impl FinalTaskHandle {
         client: &mut MemoryClient,
         cancellation: &McpRequestCancellation,
     ) -> McpResult<&FinalTask> {
+        self.ensure_task_owner(&client.owner)?;
         if self.is_terminal() {
             return Ok(&self.task);
         }
@@ -582,6 +595,7 @@ impl FinalTaskHandle {
         cancellation: &McpRequestCancellation,
         input_responses: FinalTaskInputResponses,
     ) -> McpResult<FinalUpdateTaskResult> {
+        self.ensure_task_owner(&client.owner)?;
         client
             .update_task_final(cx, cancellation, &self.task, input_responses)
             .await
@@ -604,6 +618,7 @@ impl FinalTaskHandle {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.ensure_task_owner(&client.task_owner)?;
         Box::pin(wait_for_task(self, cx, client, cancellation, policy)).await
     }
 
@@ -621,6 +636,7 @@ impl FinalTaskHandle {
         client: &mut Client,
         cancellation: &McpRequestCancellation,
     ) -> McpResult<&FinalTask> {
+        self.ensure_task_owner(&client.task_owner)?;
         if self.is_terminal() {
             return Ok(&self.task);
         }
@@ -651,6 +667,7 @@ impl FinalTaskHandle {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.ensure_task_owner(&client.task_owner)?;
         if self.is_terminal() {
             return Ok(&self.task);
         }
@@ -690,6 +707,7 @@ impl FinalTaskHandle {
         cancellation: &McpRequestCancellation,
         input_responses: FinalTaskInputResponses,
     ) -> McpResult<FinalUpdateTaskResult> {
+        self.ensure_task_owner(&client.task_owner)?;
         client
             .update_task_final_with_cx(cx, cancellation, &self.task, input_responses)
             .await
@@ -714,6 +732,7 @@ impl FinalTaskHandle {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.ensure_task_owner(&client.task_owner)?;
         let caller = with_caller(cx, || {
             Cx::current().expect("Task operation caller is installed")
         });
@@ -753,6 +772,7 @@ impl FinalTaskHandle {
         client: &'client mut Client,
         cancellation: &McpRequestCancellation,
     ) -> McpResult<FinalTaskStreamWatch<'client, 'handle, Client>> {
+        self.ensure_task_owner(&client.task_owner)?;
         open_task_stream_watch(self, cx, client, cancellation).await
     }
 
@@ -775,6 +795,7 @@ impl FinalTaskHandle {
         cancellation: &McpRequestCancellation,
     ) -> McpResult<FinalTaskStreamWatch<'client, 'handle, MemoryClient, MemorySubscriptionExecution>>
     {
+        self.ensure_task_owner(&client.owner)?;
         open_task_stream_watch(self, cx, client, cancellation).await
     }
 
@@ -795,6 +816,7 @@ impl FinalTaskHandle {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.ensure_task_owner(&client.task_owner)?;
         open_task_stream_watch(self, cx, client, cancellation).await
     }
 }
@@ -1545,7 +1567,7 @@ impl MemoryClient {
     ) -> McpResult<FinalTaskHandle> {
         self.get_task_final(cx, cancellation, task_id)
             .await
-            .map(|result| FinalTaskHandle::new(result.task))
+            .map(|result| FinalTaskHandle::attached(result.task, &self.owner))
     }
 }
 
@@ -1562,7 +1584,7 @@ impl Client {
     ) -> McpResult<FinalTaskHandle> {
         self.get_task_final_with_cx(cx, cancellation, task_id)
             .await
-            .map(|result| FinalTaskHandle::new(result.task))
+            .map(|result| FinalTaskHandle::attached(result.task, &self.task_owner))
     }
 }
 
@@ -1621,7 +1643,7 @@ where
         let cx = &caller;
         guard_websocket_task_operation(cx, cancellation, self.get_task_final(cx, task_id))
             .await
-            .map(|result| FinalTaskHandle::new(result.task))
+            .map(|result| FinalTaskHandle::attached(result.task, &self.task_owner))
     }
 }
 

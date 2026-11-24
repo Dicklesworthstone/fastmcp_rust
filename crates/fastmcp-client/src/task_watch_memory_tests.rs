@@ -1676,3 +1676,73 @@ mod watch_caller_lifetime {
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 }
+
+#[test]
+fn attached_task_rejects_other_clients_before_requests_or_input_work() {
+    run(|cx| async move {
+        // Both peers use the same Task ID, creation time and input state.
+        let initial = input_task(1, false);
+        let (mut first, mut handle, first_peer) = attached(&cx, initial.clone()).await;
+        let (mut other, _, other_peer) = attached(&cx, initial).await;
+        let cancellation = McpRequestCancellation::new();
+        let assert_foreign = |error: McpError| {
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(error.message, "Task handle belongs to a different client");
+        };
+        assert_foreign(handle.poll_with_memory(&cx, &mut other, &cancellation).await.unwrap_err());
+        assert_foreign(
+            handle
+                .resume_input_with_memory(&cx, &mut other, &cancellation, FinalTaskInputResponses::new())
+                .await
+                .unwrap_err(),
+        );
+        let mut driver = handle.clone().into_driver(drive_policy());
+        assert_foreign(
+            driver
+                .drive_watching_with_memory(&cx, &mut other, &cancellation)
+                .await
+                .unwrap_err(),
+        );
+        assert!(!driver.input_resolution_interrupted());
+        assert_eq!(
+            handle
+                .wait_with_memory(&cx, &mut first, &cancellation, FinalTaskWaitPolicy::default())
+                .await
+                .unwrap(),
+            FinalTaskWaitOutcome::InputRequired,
+        );
+
+        // Every refused operation preserved both peers' next request ID.
+        finish(&cx, &mut first, first_peer, vec![], 3).await;
+        finish(&cx, &mut other, other_peer, vec![], 3).await;
+    });
+}
+
+#[test]
+fn created_task_clones_share_the_first_selected_client() {
+    run(|cx| async move {
+        let initial = input_task(1, false);
+        let (mut origin, attached_handle, origin_peer) = attached(&cx, initial.clone()).await;
+        let (mut other, _, other_peer) = attached(&cx, initial).await;
+        let receipt = fastmcp_protocol::CreateTaskResult {
+            task: attached_handle.task().clone(),
+            meta: None,
+            additional: Default::default(),
+        };
+        let mut handle = FinalTaskHandle::from_created(&receipt).unwrap();
+        let mut cloned_before_selection = handle.clone();
+        let cancellation = McpRequestCancellation::new();
+        let policy = FinalTaskWaitPolicy::default();
+        assert_eq!(
+            handle.wait_with_memory(&cx, &mut origin, &cancellation, policy).await.unwrap(),
+            FinalTaskWaitOutcome::InputRequired,
+        );
+        let error = cloned_before_selection
+            .wait_with_memory(&cx, &mut other, &cancellation, policy)
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "Task handle belongs to a different client");
+        finish(&cx, &mut origin, origin_peer, vec![], 3).await;
+        finish(&cx, &mut other, other_peer, vec![], 3).await;
+    });
+}

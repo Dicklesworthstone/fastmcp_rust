@@ -6585,6 +6585,8 @@ where
     live_catalog_subscription: Option<LiveWebSocketCatalogSubscription>,
     #[cfg(feature = "tasks")]
     live_task_subscription: Option<LiveWebSocketTaskSubscription>,
+    #[cfg(feature = "tasks")]
+    task_owner: Arc<()>,
     next_id: u64,
     closed: bool,
     close_settled: bool,
@@ -6891,6 +6893,8 @@ where
                 live_catalog_subscription: None,
                 #[cfg(feature = "tasks")]
                 live_task_subscription: None,
+                #[cfg(feature = "tasks")]
+                task_owner: Arc::new(()),
                 next_id: 2,
                 closed: false,
                 close_settled: false,
@@ -15831,6 +15835,8 @@ pub struct HttpClient {
     /// and Tasks listen use separate SSE POSTs, so both may be live.
     #[cfg(feature = "tasks")]
     live_task_subscription: Option<ModernHttpSubscriptionListener>,
+    #[cfg(feature = "tasks")]
+    task_owner: Arc<()>,
     /// Modern request-only `io.modelcontextprotocol/logLevel`. Absent until
     /// [`Self::set_log_level_typed`] stores a severity; never sent as the
     /// removed final `logging/setLevel` RPC.
@@ -16082,17 +16088,41 @@ impl HttpSubscriptionListener<'_> {
 /// terminal outcome. Each operation receives the owning HTTP, Unix stdio or
 /// WebSocket client, so every wire request uses that client's sole monotonic
 /// JSON-RPC ID allocator.
-/// This in-process handle does not persist or resume Tasks across a restart.
+/// Handles returned by an attach operation retain that client instance. Other
+/// clients are refused before any requests or callbacks, even if both peers
+/// report the same Task identifier and creation time. To resume on a fresh
+/// connection, explicitly attach by ID and use its authoritative snapshot.
 #[cfg(feature = "tasks")]
 #[derive(Clone, Debug)]
 pub struct FinalTaskHandle {
     task: FinalTask,
+    // Clones of a creation receipt share its first client selection.
+    owner: Arc<std::sync::OnceLock<Arc<()>>>,
 }
 
 #[cfg(feature = "tasks")]
 impl FinalTaskHandle {
     fn new(task: FinalTask) -> Self {
-        Self { task }
+        Self {
+            task,
+            owner: Arc::default(),
+        }
+    }
+
+    fn attached(task: FinalTask, owner: &Arc<()>) -> Self {
+        Self {
+            task,
+            owner: Arc::new(std::sync::OnceLock::from(Arc::clone(owner))),
+        }
+    }
+
+    fn ensure_task_owner(&self, owner: &Arc<()>) -> McpResult<()> {
+        let retained = self.owner.get_or_init(|| Arc::clone(owner));
+        if Arc::ptr_eq(retained, owner) {
+            Ok(())
+        } else {
+            Err(McpError::invalid_request("Task handle belongs to a different client"))
+        }
     }
 
     /// Returns the last task snapshot admitted for this handle.
@@ -16169,6 +16199,7 @@ impl FinalTaskHandle {
         cx: &Cx,
         client: &mut HttpClient,
     ) -> Result<&FinalTask, HttpClientError> {
+        self.ensure_task_owner(&client.task_owner)?;
         if self.is_terminal() {
             return Ok(&self.task);
         }
@@ -16192,6 +16223,7 @@ impl FinalTaskHandle {
         client: &mut HttpClient,
         input_responses: FinalTaskInputResponses,
     ) -> Result<FinalUpdateTaskResult, HttpClientError> {
+        self.ensure_task_owner(&client.task_owner)?;
         client
             .submit_final_task_input(cx, &self.task, input_responses)
             .await
@@ -16207,6 +16239,7 @@ impl FinalTaskHandle {
         cx: &Cx,
         client: &mut HttpClient,
     ) -> Result<FinalCancelTaskResult, HttpClientError> {
+        self.ensure_task_owner(&client.task_owner)?;
         client.cancel_final_task(cx, self.task_id().clone()).await
     }
 
@@ -16232,6 +16265,7 @@ impl FinalTaskHandle {
         client: &'client mut HttpClient,
         limits: sse::SseLimits,
     ) -> Result<FinalTaskWatch<'client, 'handle>, HttpClientError> {
+        self.ensure_task_owner(&client.task_owner)?;
         if self.is_terminal() {
             return Ok(FinalTaskWatch {
                 listener: None,
@@ -16871,6 +16905,8 @@ impl HttpClient {
             live_subscription: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
+            #[cfg(feature = "tasks")]
+            task_owner: Arc::new(()),
             final_log_level: None,
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
@@ -19580,7 +19616,7 @@ impl HttpClient {
     ) -> Result<FinalTaskHandle, HttpClientError> {
         self.get_final_task_snapshot(cx, task_id)
             .await
-            .map(FinalTaskHandle::new)
+            .map(|task| FinalTaskHandle::attached(task, &self.task_owner))
     }
 
     /// Requests cancellation for one exact final Tasks identifier.
@@ -20896,6 +20932,8 @@ pub struct Client {
     /// listener surface.  It is driven by this client's sole ingress method.
     #[cfg(feature = "tasks")]
     live_task_subscription: Option<LiveStdioTaskSubscription>,
+    #[cfg(all(unix, feature = "tasks"))]
+    task_owner: Arc<()>,
     /// At most one live final catalog subscription owns the incremental stdio
     /// listener surface. It is driven by this client's sole ingress method so
     /// ordinary requests can still complete while events are drained.
@@ -21406,6 +21444,8 @@ impl Client {
             multiplexed_executor: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
+            #[cfg(all(unix, feature = "tasks"))]
+            task_owner: Arc::new(()),
             live_catalog_subscription: None,
             cx,
             session: ClientSession::new_placeholder(
@@ -21618,6 +21658,8 @@ impl Client {
             multiplexed_executor: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
+            #[cfg(all(unix, feature = "tasks"))]
+            task_owner: Arc::new(()),
             live_catalog_subscription: None,
             cx,
             session,
@@ -21692,6 +21734,8 @@ impl Client {
             multiplexed_executor: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
+            #[cfg(all(unix, feature = "tasks"))]
+            task_owner: Arc::new(()),
             live_catalog_subscription: None,
             cx,
             session,
