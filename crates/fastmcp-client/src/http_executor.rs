@@ -12418,23 +12418,44 @@ async fn open_legacy_sse_generation(
         return Err(LegacySseHttpClientError::InvalidEndpointConfiguration);
     }
 
-    let response = native_http_client()
-        .request_streaming(
-            cx,
-            Method::Get,
-            &sse_target,
-            vec![
-                ("Accept".to_owned(), "text/event-stream".to_owned()),
-                (
-                    "Accept-Encoding".to_owned(),
-                    MODERN_MCP_ACCEPT_ENCODING.to_owned(),
-                ),
-            ],
-            Vec::new(),
-        )
-        .await
-        .map_err(map_transport_error)
-        .map_err(LegacySseHttpClientError::Executor)?;
+    let client = native_http_client();
+    let mut exchange = std::pin::pin!(client.request_streaming(
+        cx,
+        Method::Get,
+        &sse_target,
+        vec![
+            ("Accept".to_owned(), "text/event-stream".to_owned()),
+            (
+                "Accept-Encoding".to_owned(),
+                MODERN_MCP_ACCEPT_ENCODING.to_owned(),
+            ),
+        ],
+        Vec::new(),
+    ));
+    // The generation starts before the GET. A peer that accepts the socket
+    // and never sends headers must remain subject to the same absolute limit
+    // and caller cancellation as one that stalls mid-event.
+    let deadline = legacy_sse_stream_deadline(opened_at, lifetimes.absolute);
+    let mut expiry = std::pin::pin!(asupersync::time::sleep_until(deadline));
+    let (_cancellation_guard, mut signal) = oneshot::channel::<()>();
+    let mut cancelled = std::pin::pin!(signal.recv(cx));
+    let response = poll_fn(|task_cx| {
+        if cancelled.as_mut().poll(task_cx).is_ready() {
+            return Poll::Ready(Err(LegacySseHttpClientError::Cancelled));
+        }
+        {
+            let _caller = Cx::set_current(Some(cx.clone()));
+            if cx.now() >= deadline || expiry.as_mut().poll(task_cx).is_ready() {
+                return Poll::Ready(Err(LegacySseHttpClientError::SseStreamLifetimeExpired));
+            }
+        }
+        exchange.as_mut().poll(task_cx).map(|response| {
+            response
+                .map_err(map_transport_error)
+                .map_err(LegacySseHttpClientError::Executor)
+        })
+    })
+    .await?;
     validate_legacy_sse_response_head(response.head.status, &response.head.headers)?;
 
     let mut stream = LegacySseResponseStream::new(response, opened_at, lifetimes);

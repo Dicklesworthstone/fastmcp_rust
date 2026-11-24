@@ -545,6 +545,8 @@ enum Step {
         events: Vec<Vec<u8>>,
         end: bool,
     },
+    /// Accepts the GET and retains its socket without writing a response head.
+    HoldGet,
     /// A legacy SSE GET answered with a bare status.
     GetStatus(u16),
     /// Legacy SSE GETs, each answered with one `endpoint` event for the next
@@ -770,6 +772,12 @@ impl Peer {
                         } else {
                             held.push(stream);
                         }
+                    }
+                    Step::HoldGet => {
+                        let mut stream = accept_bounded(&listener);
+                        let (head, _) = read_request(&mut stream);
+                        log.heads.push(head);
+                        held.push(stream);
                     }
                     Step::GetStatus(status) => {
                         let mut stream = accept_bounded(&listener);
@@ -1218,6 +1226,71 @@ fn ready_legacy_sse_last_waiter_retirement_disarms_idle_guard() {
     assert_eq!(log.posts.len(), 4);
     assert_eq!(log.held_closed_by_client, Some(true));
     log.assert_legacy_hygiene("last waiter retirement");
+}
+
+#[test]
+fn legacy_sse_open_cancellation_closes_get_before_response_headers() {
+    let (seen, received) = mpsc::channel();
+    let peer = Peer::serve(|_| {
+        vec![
+            Step::ModernProbe,
+            Step::HoldGet,
+            Step::Signal(seen),
+            Step::ExpectHeldClosed,
+        ]
+    });
+    let cx = Cx::for_request();
+    let controller = cx.clone();
+    let cancel = thread::spawn(move || {
+        received.recv_timeout(Duration::from_secs(20)).unwrap();
+        controller.cancel_with(CancelKind::User, Some("cancel pending legacy SSE GET"));
+    });
+    let result = runtime_block_on(
+        ClientBuilder::new()
+            .protocol_plan(plan(&peer.modern, &peer.sse, &peer.message))
+            .connect_http_with_cx(&cx),
+    );
+    assert!(matches!(
+        result,
+        Err(ClientHttpConnectionError::Legacy(LegacySseHttpClientError::Cancelled))
+    ));
+    cancel.join().unwrap();
+    let log = peer.finish();
+    assert_eq!(log.held_closed_by_client, Some(true));
+    assert!(log.posts.is_empty());
+    log.assert_legacy_hygiene("cancelled legacy opening");
+}
+
+#[test]
+fn legacy_sse_reconnect_absolute_lifetime_includes_response_headers() {
+    let peer = Peer::serve(|message| {
+        vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![endpoint_event(message)],
+                end: false,
+            },
+            Step::HoldGet,
+            Step::ExpectHeldClosed,
+        ]
+    });
+    runtime_block_on(Box::pin(async {
+        let cx = Cx::current().unwrap();
+        let mut client = open_legacy(&cx, &peer).await.unwrap();
+        client.set_stream_lifetime(Duration::from_millis(250)).unwrap();
+        assert!(matches!(
+            client.reconnect(&cx).await,
+            Err(LegacySseHttpClientError::SseStreamLifetimeExpired)
+        ));
+        assert_eq!(client.stream_generation(), 1);
+        assert_eq!(client.reconnect_attempts(), 1);
+        assert_eq!(client.advertised_message_post_target(), peer.message);
+    }));
+    let log = peer.finish();
+    assert_eq!(log.held_closed_by_client, Some(true));
+    assert!(log.posts.is_empty());
+    log.assert_legacy_hygiene("expired legacy reconnect");
 }
 
 #[test]
