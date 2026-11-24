@@ -304,6 +304,8 @@ const FASTMCP_WEBSOCKET_READ_CHUNK_SIZE: usize = 4096;
 // immediately ready partial reads. Share this work allowance across both so
 // one peer cannot keep a receive poll from returning to the caller's scheduler.
 const FASTMCP_WEBSOCKET_MAX_RECEIVE_WORK_PER_TURN: usize = 64;
+// A legal frame can still require millions of immediately ready short writes.
+const FASTMCP_WEBSOCKET_MAX_WRITE_CALLS_PER_TURN: usize = 64;
 const FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE: usize =
     FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + FASTMCP_WEBSOCKET_MAX_CLIENT_FRAME_ENVELOPE_SIZE;
 const FASTMCP_WEBSOCKET_MAX_PENDING_WRITE_BYTES: usize =
@@ -2311,7 +2313,14 @@ where
             started: false,
             complete: false,
         };
+        let mut remaining_writes = FASTMCP_WEBSOCKET_MAX_WRITE_CALLS_PER_TURN;
         while !self.write_buf.is_empty() {
+            if remaining_writes == 0 {
+                // Retain the serialized writer and its original commitment.
+                // The next I/O poll rechecks cancellation and terminal state.
+                asupersync::runtime::yield_now().await;
+                remaining_writes = FASTMCP_WEBSOCKET_MAX_WRITE_CALLS_PER_TURN;
+            }
             let written = poll_server_io(cx, &self.io, terminal, expected_state, |io, task_cx| {
                 Pin::new(io).poll_write(task_cx, &self.write_buf)
             })
@@ -2324,6 +2333,7 @@ where
             }
             commit.started = true;
             let _ = self.write_buf.split_to(written);
+            remaining_writes -= 1;
         }
         poll_server_io(cx, &self.io, terminal, expected_state, |io, task_cx| {
             Pin::new(io).poll_flush(task_cx)
@@ -4458,6 +4468,49 @@ mod tests {
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct ReadyWebSocketWriteIo {
+        maximum_write: usize,
+        output: Arc<std::sync::Mutex<Vec<u8>>>,
+        writes: Arc<AtomicUsize>,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for ReadyWebSocketWriteIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ReadyWebSocketWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let written = bytes.len().min(this.maximum_write);
+            this.output
+                .lock()
+                .expect("captured ready write")
+                .extend_from_slice(&bytes[..written]);
+            this.writes.fetch_add(1, Ordering::AcqRel);
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().flushes.fetch_add(1, Ordering::AcqRel);
             Poll::Ready(Ok(()))
         }
 
@@ -6639,6 +6692,141 @@ mod tests {
     #[test]
     fn async_server_split_drop_after_first_byte_permanently_fails_connection() {
         run_test(|| async { assert_server_split_dropped_write(1).await });
+    }
+
+    async fn assert_server_ready_writes_cooperate(maximum_write: usize) {
+        let cx = Cx::current().expect("runtime root context");
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut server = AsyncWsServerTransport::from_upgraded(ReadyWebSocketWriteIo {
+            maximum_write,
+            output: Arc::clone(&output),
+            writes: Arc::clone(&writes),
+            flushes: Arc::clone(&flushes),
+        });
+        let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+            RequestId::Number(916),
+            serde_json::json!({"payload": "x".repeat(256)}),
+        ));
+        let expected_source = serde_json::to_vec(&message).expect("expected JSON-RPC source");
+        let wake_count = Arc::new(ClientControlWake(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&wake_count));
+        let mut send = Box::pin(server.send(&cx, &message));
+        let first = send.as_mut().poll(&mut Context::from_waker(&waker));
+        if maximum_write == 1 {
+            assert!(
+                first.is_pending(),
+                "ready partial writes must not monopolize one send poll"
+            );
+            assert_eq!(
+                writes.load(Ordering::Acquire),
+                FASTMCP_WEBSOCKET_MAX_WRITE_CALLS_PER_TURN
+            );
+            assert_eq!(flushes.load(Ordering::Acquire), 0);
+            assert!(wake_count.0.load(Ordering::Acquire) > 0);
+            send.await.expect("resume the same frame after yielding");
+        } else {
+            match first {
+                Poll::Ready(Ok(())) => {}
+                other => panic!("one ready whole-frame write must complete immediately: {other:?}"),
+            }
+            drop(send);
+            assert_eq!(writes.load(Ordering::Acquire), 1);
+        }
+        assert!(!server.is_closed());
+        assert_eq!(flushes.load(Ordering::Acquire), 1);
+        let bytes = output.lock().expect("complete server frame").clone();
+        let mut encoded = BytesMut::from(bytes.as_slice());
+        let frame = FrameCodec::client()
+            .decode(&mut encoded)
+            .expect("valid unmasked server frame")
+            .expect("one complete frame");
+        assert_eq!(frame.opcode, Opcode::Text);
+        assert!(frame.fin);
+        assert_eq!(frame.payload.as_ref(), expected_source.as_slice());
+        assert!(encoded.is_empty(), "yielding must not duplicate frame bytes");
+        if maximum_write == 1 {
+            assert_eq!(writes.load(Ordering::Acquire), bytes.len());
+        }
+    }
+
+    #[test]
+    fn async_server_ready_partial_writes_yield_and_preserve_frame() {
+        run_test(|| async { assert_server_ready_writes_cooperate(1).await });
+    }
+
+    #[test]
+    fn async_server_ready_whole_frame_write_remains_immediately_ready() {
+        run_test(|| async { assert_server_ready_writes_cooperate(usize::MAX).await });
+    }
+
+    async fn assert_server_ready_write_yield_fences(cancel: bool) {
+        let sibling = Cx::current().expect("runtime root context");
+        let caller = Cx::for_testing();
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let server = AsyncWsServerTransport::from_upgraded(ReadyWebSocketWriteIo {
+            maximum_write: 1,
+            output: Arc::clone(&output),
+            writes: Arc::clone(&writes),
+            flushes: Arc::clone(&flushes),
+        });
+        let (mut receiver, mut sender) = server.into_split();
+        let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+            RequestId::Number(917),
+            serde_json::json!({"payload": "x".repeat(256)}),
+        ));
+        let mut send = Box::pin(sender.send(&caller, &message));
+        std::future::poll_fn(|task_cx| {
+            assert!(send.as_mut().poll(task_cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let prefix = output.lock().expect("committed prefix before yield").clone();
+        assert_eq!(prefix.len(), FASTMCP_WEBSOCKET_MAX_WRITE_CALLS_PER_TURN);
+        assert_eq!(writes.load(Ordering::Acquire), prefix.len());
+        if cancel {
+            caller.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel at send yield"),
+            );
+            assert!(matches!(send.await, Err(TransportError::Cancelled)));
+        } else {
+            drop(send);
+        }
+        assert!(receiver.is_closed());
+        assert!(sender.is_closed());
+        assert_eq!(flushes.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            sender.send(&sibling, &message).await,
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            sender.close(&sibling).await,
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            receiver.recv(&sibling).await,
+            Err(TransportError::Closed)
+        ));
+        assert_eq!(
+            *output.lock().expect("no resumed or spliced frame suffix"),
+            prefix
+        );
+        assert_eq!(writes.load(Ordering::Acquire), prefix.len());
+        assert!(sibling.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn async_server_ready_write_yield_rechecks_cancellation_before_more_bytes() {
+        run_test(|| async { assert_server_ready_write_yield_fences(true).await });
+    }
+
+    #[test]
+    fn async_server_ready_write_yield_drop_fences_the_committed_prefix() {
+        run_test(|| async { assert_server_ready_write_yield_fences(false).await });
     }
 
     #[test]
