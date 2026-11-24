@@ -21,6 +21,7 @@ use crate::http_auth::enterprise::policy::{
     TOKEN_EXCHANGE_GRANT,
 };
 use crate::http_auth::enterprise::replay::tests::ExchangeReplayFixture;
+use asupersync::cx::CapSetRuntimeMask;
 use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
 use serde_json::{Value, json};
 

@@ -12432,7 +12432,7 @@ exec sleep 10
 
     fn run_view_operation_deadline_lab(operation: impl Future<Output = ()> + Send + 'static) {
         let mut lab = asupersync::lab::LabRuntime::new(
-            asupersync::lab::LabConfig::new(859_04)
+            asupersync::lab::LabConfig::new(85_904)
                 .with_auto_advance()
                 .max_steps(512),
         );

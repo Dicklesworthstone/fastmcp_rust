@@ -280,12 +280,13 @@ impl EnterpriseClientCredentialProvider {
         {
             return Err(EnterpriseCredentialError::BindingMismatch);
         }
-        let generation = Arc::clone(
-            &self
+        let generation = {
+            let current = self
                 .current
                 .lock()
-                .map_err(|_| EnterpriseCredentialError::StoreUnavailable)?,
-        );
+                .map_err(|_| EnterpriseCredentialError::StoreUnavailable)?;
+            Arc::clone(&current)
+        };
         let pending = PendingEnterpriseCredential {
             generation,
             active_generation: Arc::clone(&self.active_generation),

@@ -31730,15 +31730,17 @@ impl Client {
         let deadline = mrtr_operation_deadline(cx, self.timeout_policy)?;
         let responder: OperationMrtrResponder =
             OperationMrtrResponder::Installed(self.reverse_request_handlers.clone());
-        self.follow_mrtr_with_cx(
+        // Keep the installed responder's nested Send proof inside this crate
+        // instead of imposing its depth on downstream callers.
+        let operation: ReverseRequestFuture<'_, CoreResult> = Box::pin(self.follow_mrtr_with_cx(
             cx,
             cancellation,
             deadline,
             method,
             original_parameters,
             responder,
-        )
-        .await
+        ));
+        operation.await
     }
 
     #[cfg(unix)]
