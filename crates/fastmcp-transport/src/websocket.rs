@@ -300,6 +300,10 @@ fn websocket_invalid_data(message: impl Into<String>) -> TransportError {
 const FASTMCP_WEBSOCKET_MAX_CLIENT_FRAME_ENVELOPE_SIZE: usize = 14;
 const FASTMCP_WEBSOCKET_MAX_SERVER_FRAME_ENVELOPE_SIZE: usize = 10;
 const FASTMCP_WEBSOCKET_READ_CHUNK_SIZE: usize = 4096;
+// Byte limits do not bound empty control/continuation frames or the number of
+// immediately ready partial reads. Share this work allowance across both so
+// one peer cannot keep a receive poll from returning to the caller's scheduler.
+const FASTMCP_WEBSOCKET_MAX_RECEIVE_WORK_PER_TURN: usize = 64;
 const FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE: usize =
     FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + FASTMCP_WEBSOCKET_MAX_CLIENT_FRAME_ENVELOPE_SIZE;
 const FASTMCP_WEBSOCKET_MAX_PENDING_WRITE_BYTES: usize =
@@ -1933,6 +1937,10 @@ where
     }
 
     /// Receives one bounded, server-role text message with its original JSON bytes.
+    ///
+    /// Ready control frames, empty fragments and partial reads share a bounded
+    /// work allowance before yielding to the caller's scheduler. Buffered frame
+    /// and message state survives both that yield and a dropped receive future.
     pub async fn recv_with_source(
         &mut self,
         cx: &Cx,
@@ -1942,8 +1950,9 @@ where
         }
         websocket_checkpoint(cx)?;
 
+        let mut remaining_work = FASTMCP_WEBSOCKET_MAX_RECEIVE_WORK_PER_TURN;
         loop {
-            let frame = match self.read_frame(cx).await {
+            let frame = match self.read_frame(cx, &mut remaining_work).await {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
                     self.terminal.set(WebSocketTerminalState::Closed);
@@ -2099,8 +2108,19 @@ where
         Ok(())
     }
 
-    async fn read_frame(&mut self, cx: &Cx) -> Result<Option<Frame>, (CloseCode, TransportError)> {
+    async fn read_frame(
+        &mut self,
+        cx: &Cx,
+        remaining_work: &mut usize,
+    ) -> Result<Option<Frame>, (CloseCode, TransportError)> {
         loop {
+            if *remaining_work == 0 {
+                asupersync::runtime::yield_now().await;
+                *remaining_work = FASTMCP_WEBSOCKET_MAX_RECEIVE_WORK_PER_TURN;
+            }
+            *remaining_work -= 1;
+            // Recheck after the cooperative yield: another ready task may
+            // have cancelled this caller or closed the paired sender.
             if self.is_closed() {
                 return Err((CloseCode::Abnormal, TransportError::Closed));
             }
@@ -4400,6 +4420,52 @@ mod tests {
         }
     }
 
+    /// An always-ready source with a caller-selected maximum read size. It
+    /// exercises the production decoder without relying on socket scheduling.
+    struct ReadyWebSocketReadIo {
+        input: Vec<u8>,
+        position: usize,
+        maximum_read: usize,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for ReadyWebSocketReadIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let count = this
+                .maximum_read
+                .min(buf.remaining())
+                .min(this.input.len() - this.position);
+            let end = this.position + count;
+            buf.put_slice(&this.input[this.position..end]);
+            this.position = end;
+            this.reads.fetch_add(1, Ordering::AcqRel);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ReadyWebSocketReadIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     struct WriteCountingIo {
         writes: Arc<AtomicUsize>,
     }
@@ -6085,6 +6151,208 @@ mod tests {
                 assert!(!cx.is_cancel_requested());
             }
         });
+    }
+
+    async fn assert_server_ready_control_burst_yields(opcode: u8) {
+        let cx = Cx::current().expect("runtime root context");
+        let (mut peer, server_socket) = virtual_socket_pair();
+        let source = br#"{"jsonrpc":"2.0","id":900,"result":{"zeta":1.20e+4,"alpha":2}}"#;
+        let control_count = FASTMCP_WEBSOCKET_MAX_RECEIVE_WORK_PER_TURN + 1;
+        let mut inbound = Vec::new();
+        for _ in 0..control_count {
+            inbound.extend(build_masked_frame(opcode, true, b"p"));
+        }
+        inbound.extend(build_masked_frame(0x01, true, source));
+        let server = AsyncWsServerTransport::from_upgraded_with_initial_bytes(
+            server_socket,
+            inbound.into_boxed_slice(),
+        )
+        .expect("bounded ready control frames");
+        let (mut receiver, sender) = server.into_split();
+        let wake_count = Arc::new(ClientControlWake(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&wake_count));
+        let mut receive = Box::pin(receiver.recv_with_source(&cx));
+        assert!(
+            receive
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending(),
+            "ready controls must not monopolize one receive poll"
+        );
+        assert!(
+            wake_count.0.load(Ordering::Acquire) > 0,
+            "cooperative yielding must schedule the next receive turn"
+        );
+        assert_eq!(
+            receive.await.expect("resume buffered message").source(),
+            source
+        );
+        assert!(!receiver.is_closed());
+        assert!(!sender.is_closed());
+        if opcode == 0x09 {
+            let mut pongs = vec![0; control_count * 3];
+            peer.read_exact(&mut pongs)
+                .await
+                .expect("every Ping retains its unmasked Pong");
+            assert_eq!(pongs, [0x8A, 0x01, b'p'].repeat(control_count));
+        }
+    }
+
+    #[test]
+    fn async_server_ready_ping_burst_yields_and_preserves_pongs() {
+        run_test(|| async { assert_server_ready_control_burst_yields(0x09).await });
+    }
+
+    #[test]
+    fn async_server_ready_pong_burst_yields_and_preserves_source() {
+        run_test(|| async { assert_server_ready_control_burst_yields(0x0A).await });
+    }
+
+    #[test]
+    fn async_server_short_buffered_message_remains_immediately_ready() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (_peer, server_socket) = virtual_socket_pair();
+            let source = br#"{"jsonrpc":"2.0","id":900,"result":{"short":true}}"#;
+            let mut server = AsyncWsServerTransport::from_upgraded_with_initial_bytes(
+                server_socket,
+                build_masked_frame(0x01, true, source).into_boxed_slice(),
+            )
+            .expect("one short buffered message");
+            let mut receive = Box::pin(server.recv_with_source(&cx));
+            std::future::poll_fn(|task_cx| {
+                let Poll::Ready(Ok(frame)) = receive.as_mut().poll(task_cx) else {
+                    panic!("an ordinary buffered message should finish in its first poll");
+                };
+                assert_eq!(frame.source(), source);
+                Poll::Ready(())
+            })
+            .await;
+        });
+    }
+
+    async fn assert_server_fragment_budget_preserves_state(continuation: bool) {
+        let cx = Cx::current().expect("runtime root context");
+        let (mut peer, server_socket) = virtual_socket_pair();
+        let source = br#"{"jsonrpc":"2.0","id":900,"result":{"zeta":1.20e+4,"alpha":2}}"#;
+        let midpoint = source.len() / 2;
+        let mut inbound = build_masked_frame(0x01, false, &source[..midpoint]);
+        for _ in 1..FASTMCP_WEBSOCKET_MAX_RECEIVE_WORK_PER_TURN {
+            inbound.extend(build_masked_frame(0x00, false, b""));
+        }
+        inbound.extend(build_masked_frame(0x09, true, b"p"));
+        #[allow(clippy::bool_to_int_with_if)]
+        let final_opcode = if continuation { 0x00 } else { 0x01 };
+        inbound.extend(build_masked_frame(final_opcode, true, &source[midpoint..]));
+        let server = AsyncWsServerTransport::from_upgraded_with_initial_bytes(
+            server_socket,
+            inbound.into_boxed_slice(),
+        )
+        .expect("bounded empty continuation frames");
+        let (mut receiver, sender) = server.into_split();
+        let mut receive = Box::pin(receiver.recv_with_source(&cx));
+        std::future::poll_fn(|task_cx| {
+            assert!(receive.as_mut().poll(task_cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(receive);
+        assert!(receiver.fragmented_text);
+        assert_eq!(receiver.fragment_buffer, &source[..midpoint]);
+
+        let received = receiver.recv_with_source(&cx).await;
+        let mut pong = [0; 3];
+        peer.read_exact(&mut pong).await.expect("interleaved Pong");
+        assert_eq!(pong, [0x8A, 0x01, b'p']);
+        if continuation {
+            assert_eq!(
+                received.expect("original fragmented source").source(),
+                source
+            );
+            assert!(!receiver.is_closed());
+            assert!(!sender.is_closed());
+        } else {
+            assert!(matches!(
+                received,
+                Err(TransportError::Io(ref error)) if error.kind() == io::ErrorKind::InvalidData
+            ));
+            assert!(receiver.is_closed());
+            assert!(sender.is_closed());
+            let mut close = [0; 4];
+            peer.read_exact(&mut close)
+                .await
+                .expect("protocol-error Close");
+            assert_eq!(close, [0x88, 0x02, 0x03, 0xEA]);
+        }
+    }
+
+    #[test]
+    fn async_server_receive_budget_preserves_fragments_across_future_drop() {
+        run_test(|| async { assert_server_fragment_budget_preserves_state(true).await });
+    }
+
+    #[test]
+    fn async_server_receive_budget_preserves_interleaved_text_refusal() {
+        run_test(|| async { assert_server_fragment_budget_preserves_state(false).await });
+    }
+
+    async fn assert_server_ready_partial_reads_yield(cancel: bool) {
+        let sibling = Cx::current().expect("runtime root context");
+        let caller = Cx::for_testing();
+        let source = br#"{"jsonrpc":"2.0","id":900,"result":{"zeta":1.20e+4,"alpha":{"second":2,"first":1}}}"#;
+        let input = build_masked_frame(0x01, true, source);
+        assert!(input.len() > FASTMCP_WEBSOCKET_MAX_RECEIVE_WORK_PER_TURN);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let server = AsyncWsServerTransport::from_upgraded(ReadyWebSocketReadIo {
+            input,
+            position: 0,
+            maximum_read: 1,
+            reads: Arc::clone(&reads),
+        });
+        let (mut receiver, sender) = server.into_split();
+        let mut receive = Box::pin(receiver.recv_with_source(&caller));
+        std::future::poll_fn(|task_cx| {
+            assert!(receive.as_mut().poll(task_cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            reads.load(Ordering::Acquire),
+            FASTMCP_WEBSOCKET_MAX_RECEIVE_WORK_PER_TURN,
+            "partial frames must share the same finite work allowance"
+        );
+        if cancel {
+            caller.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel at receive yield"),
+            );
+            assert!(matches!(receive.await, Err(TransportError::Cancelled)));
+            assert_eq!(
+                reads.load(Ordering::Acquire),
+                FASTMCP_WEBSOCKET_MAX_RECEIVE_WORK_PER_TURN,
+                "cancellation must win before another ready read"
+            );
+            assert!(receiver.is_closed());
+            assert!(sender.is_closed());
+            assert!(!sibling.is_cancel_requested());
+        } else {
+            assert_eq!(
+                receive.await.expect("complete partial frame").source(),
+                source
+            );
+            assert!(!receiver.is_closed());
+            assert!(!sender.is_closed());
+        }
+    }
+
+    #[test]
+    fn async_server_receive_budget_yields_during_ready_partial_reads() {
+        run_test(|| async { assert_server_ready_partial_reads_yield(false).await });
+    }
+
+    #[test]
+    fn async_server_receive_budget_rechecks_cancellation_before_more_reads() {
+        run_test(|| async { assert_server_ready_partial_reads_yield(true).await });
     }
 
     #[test]
