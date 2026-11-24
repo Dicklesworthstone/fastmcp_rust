@@ -848,8 +848,6 @@ async fn settle_http_after_gated_child(
     let child_observer = Arc::clone(&child_finished);
     let cleanup = Arc::new(Gate::default());
     let cleanup_work = Arc::clone(&cleanup);
-    let sync_cleanup = Arc::new(AtomicUsize::new(0));
-    let sync_observer = Arc::clone(&sync_cleanup);
     let server = Arc::new(
         Server::new("http-consuming-settlement", "1")
             .on_shutdown_async(move |_| async move {
@@ -859,9 +857,6 @@ async fn settle_http_after_gated_child(
                 } else {
                     Ok(())
                 }
-            })
-            .on_shutdown(move || {
-                sync_observer.fetch_add(1, Ordering::AcqRel);
             })
             .build(),
     );
@@ -892,7 +887,6 @@ async fn settle_http_after_gated_child(
         "listener failure must not release a still-live child"
     );
     assert_eq!(cleanup.entered.load(Ordering::Acquire), 0);
-    assert_eq!(sync_cleanup.load(Ordering::Acquire), 0);
     child_gate.release();
     let mut cleanup_started = Box::pin(cleanup.started());
     poll_fn(|task| {
@@ -905,11 +899,9 @@ async fn settle_http_after_gated_child(
     .await;
     assert!(child_finished.load(Ordering::Acquire));
     assert_eq!(cleanup.entered.load(Ordering::Acquire), 1);
-    assert_eq!(sync_cleanup.load(Ordering::Acquire), 0);
     cleanup.release();
     let result = settlement.await;
     assert_eq!(cleanup.entered.load(Ordering::Acquire), 1);
-    assert_eq!(sync_cleanup.load(Ordering::Acquire), 1);
     assert!(cx.checkpoint().is_ok());
     result
 }

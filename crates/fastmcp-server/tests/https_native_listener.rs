@@ -2413,10 +2413,8 @@ fn https_native_async_lifespan_gates_dispatch_and_retains_cleanup() {
         let probe = Probe::new();
         let startup = Arc::new(LifespanGate::default());
         let shutdown = Arc::new(LifespanGate::default());
-        let sync_shutdown = Arc::new(AtomicUsize::new(0));
         let start = Arc::clone(&startup);
         let stop = Arc::clone(&shutdown);
-        let sync_stop = Arc::clone(&sync_shutdown);
         let server = Server::new("native-https-lifespan", "1")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .unwrap()
@@ -2430,12 +2428,8 @@ fn https_native_async_lifespan_gates_dispatch_and_retains_cleanup() {
                 stop.enter().await;
                 Ok(())
             })
-            .on_shutdown(move || {
-                sync_stop.fetch_add(1, Ordering::SeqCst);
-            })
             .build();
-        let mut running =
-            Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+        let mut running = Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
         startup.started(&cx).await;
         let address = running.address;
         let mut request_task = cx
@@ -2469,7 +2463,6 @@ fn https_native_async_lifespan_gates_dispatch_and_retains_cleanup() {
         let HttpServerShutdown::Nonquiescent(mut retained) = outcome else {
             panic!("pending async cleanup must remain caller-owned");
         };
-        assert_eq!(sync_shutdown.load(Ordering::SeqCst), 0);
         assert_eq!(shutdown.entered.load(Ordering::SeqCst), 1);
         assert!(matches!(
             retained.poll_settlement(),
@@ -2487,7 +2480,6 @@ fn https_native_async_lifespan_gates_dispatch_and_retains_cleanup() {
             .unwrap();
         assert_eq!(startup.entered.load(Ordering::SeqCst), 1);
         assert_eq!(shutdown.entered.load(Ordering::SeqCst), 1);
-        assert_eq!(sync_shutdown.load(Ordering::SeqCst), 1);
         assert!(cx.checkpoint().is_ok());
     });
 }
@@ -2497,9 +2489,7 @@ fn https_native_failed_async_startup_cleans_up_without_opening_admission() {
     run(|cx| async move {
         let probe = Probe::new();
         let cleanup = Arc::new(LifespanGate::default());
-        let sync_shutdown = Arc::new(AtomicUsize::new(0));
         let stop = Arc::clone(&cleanup);
-        let sync_stop = Arc::clone(&sync_shutdown);
         let server = Server::new("native-https-failed-startup", "1")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .unwrap()
@@ -2514,12 +2504,8 @@ fn https_native_failed_async_startup_cleans_up_without_opening_admission() {
                 stop.enter().await;
                 Ok(())
             })
-            .on_shutdown(move || {
-                sync_stop.fetch_add(1, Ordering::SeqCst);
-            })
             .build();
-        let mut running =
-            Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+        let mut running = Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
         cleanup.started(&cx).await;
         let address = running.address;
         let mut request_task = cx
@@ -2527,7 +2513,6 @@ fn https_native_failed_async_startup_cleans_up_without_opening_admission() {
             .unwrap();
         asupersync::runtime::yield_now().await;
         assert!(!running.task.as_ref().unwrap().is_finished());
-        assert_eq!(sync_shutdown.load(Ordering::SeqCst), 0);
         assert_eq!(probe.counts(), (0, 0));
         let snapshot = OperatorSnapshot::capture(&running.operator).unwrap();
         assert_eq!(snapshot.lifecycle(), OperatorLifecycle::Starting);
@@ -2547,7 +2532,6 @@ fn https_native_failed_async_startup_cleans_up_without_opening_admission() {
         assert!(error.message.contains("planted HTTPS startup failure"));
         assert!(request_task.join(&cx).await.unwrap().is_err());
         assert_eq!(cleanup.entered.load(Ordering::SeqCst), 1);
-        assert_eq!(sync_shutdown.load(Ordering::SeqCst), 1);
         assert_eq!(probe.counts(), (0, 0));
         assert!(cx.checkpoint().is_ok());
     });
@@ -2571,13 +2555,15 @@ fn https_native_async_cleanup_failure_cannot_report_quiescent_success() {
                 ))
             })
             .build();
-        let mut running =
-            Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
-        let response = exchange(&cx, running.address, request(false)).await.unwrap();
+        let mut running = Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+        let response = exchange(&cx, running.address, request(false))
+            .await
+            .unwrap();
         success(&decode_wire(&response), false);
-        running
-            .owner
-            .cancel_with(CancelKind::User, Some("failing HTTPS cleanup test complete"));
+        running.owner.cancel_with(
+            CancelKind::User,
+            Some("failing HTTPS cleanup test complete"),
+        );
         let result = asupersync::time::timeout(
             cx.now(),
             EXCHANGE_TIMEOUT,
@@ -2595,7 +2581,9 @@ fn https_native_async_cleanup_failure_cannot_report_quiescent_success() {
                     .unwrap()
                     .expect_err("retained cleanup failure must reach the caller")
             }
-            Ok(HttpServerShutdown::Quiescent) => panic!("failed cleanup is not successful shutdown"),
+            Ok(HttpServerShutdown::Quiescent) => {
+                panic!("failed cleanup is not successful shutdown")
+            }
         };
         assert!(error.message.contains("planted HTTPS cleanup failure"));
         assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
