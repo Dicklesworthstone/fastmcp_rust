@@ -8996,48 +8996,6 @@ fn nested_resource_content_from_final(contents: EmbeddedResourceContents) -> Res
     }
 }
 
-fn nested_tool_content_from_final(block: ContentBlock) -> ToolContentItem {
-    match block {
-        ContentBlock::Text { text, .. } => ToolContentItem::Text { text },
-        ContentBlock::Image {
-            data, mime_type, ..
-        } => ToolContentItem::Image { data, mime_type },
-        ContentBlock::Audio {
-            data, mime_type, ..
-        } => ToolContentItem::Audio { data, mime_type },
-        ContentBlock::Resource { resource, .. } => match resource {
-            EmbeddedResourceContents::Text {
-                uri,
-                text,
-                mime_type,
-                ..
-            } => ToolContentItem::Resource {
-                uri: uri.as_str().to_owned(),
-                mime_type,
-                text: Some(text),
-                blob: None,
-            },
-            EmbeddedResourceContents::Blob {
-                uri,
-                blob,
-                mime_type,
-                ..
-            } => ToolContentItem::Resource {
-                uri: uri.as_str().to_owned(),
-                mime_type,
-                text: None,
-                blob: Some(blob),
-            },
-        },
-        ContentBlock::ResourceLink { uri, mime_type, .. } => ToolContentItem::Resource {
-            uri: uri.as_str().to_owned(),
-            mime_type,
-            text: None,
-            blob: None,
-        },
-    }
-}
-
 /// A wrapper that implements `ResourceReader` for a shared `Router`.
 ///
 /// This allows handlers to read resources from within tool/resource/prompt
@@ -9472,22 +9430,8 @@ impl RouterToolCaller {
             Outcome::Ok(content) => Ok(ToolCallResult::success(
                 content
                     .into_iter()
-                    .map(|content| match content {
-                        Content::Text { text } => ToolContentItem::Text { text },
-                        Content::Image { data, mime_type } => {
-                            ToolContentItem::Image { data, mime_type }
-                        }
-                        Content::Audio { data, mime_type } => {
-                            ToolContentItem::Audio { data, mime_type }
-                        }
-                        Content::Resource { resource } => ToolContentItem::Resource {
-                            uri: resource.uri,
-                            mime_type: resource.mime_type,
-                            text: resource.text,
-                            blob: resource.blob,
-                        },
-                    })
-                    .collect(),
+                    .map(|content| ToolContentItem::from_serializable(&content))
+                    .collect::<McpResult<Vec<_>>>()?,
             )),
             Outcome::Err(error) => {
                 let error = sanitize_handler_error(parent_ctx.cx(), "tool", error);
@@ -9594,16 +9538,18 @@ impl RouterToolCaller {
                     final_registration
                         .schemas
                         .validate_complete_output(&complete.payload)?;
-                    Ok(ToolCallResult {
-                        content: complete
-                            .payload
-                            .content
-                            .into_iter()
-                            .map(nested_tool_content_from_final)
-                            .collect(),
-                        structured_content: complete.payload.structured_content,
-                        is_error: complete.payload.is_error,
-                    })
+                    // Public content variants can be constructed locally.
+                    // Validate the payload through its canonical decoder;
+                    // serialization alone does not validate binary content.
+                    let payload = serde_json::to_value(&complete.payload)
+                        .map_err(|_| McpError::internal_error("Invalid nested tool content"))?;
+                    let _: FinalCallToolResult = serde_json::from_value(payload)
+                        .map_err(|_| McpError::internal_error("Invalid nested tool content"))?;
+                    // The final result codec owns envelope admission. Retain
+                    // its complete representation after payload validation.
+                    serde_json::from_value(encode_final_tools_call_result(Ok(complete))?).map_err(
+                        |_| McpError::internal_error("Invalid nested tool result representation"),
+                    )
                 }
                 FinalToolOutcome::InputRequired(_) => Err(McpError::internal_error(
                     "nested tool call cannot complete an input_required outcome",
@@ -9888,17 +9834,17 @@ impl RouterPromptCaller {
             description,
             messages: messages
                 .into_iter()
-                .map(|message| PromptMessageItem {
-                    role: match message.role {
-                        Role::User => PromptMessageRole::User,
-                        Role::Assistant => PromptMessageRole::Assistant,
-                    },
-                    text: match message.content {
-                        Content::Text { text } => Some(text),
-                        _ => None,
-                    },
+                .map(|message| {
+                    Ok(PromptMessageItem {
+                        role: match message.role {
+                            Role::User => PromptMessageRole::User,
+                            Role::Assistant => PromptMessageRole::Assistant,
+                        },
+                        content: ToolContentItem::from_serializable(&message.content)?,
+                    })
                 })
-                .collect(),
+                .collect::<McpResult<Vec<_>>>()?,
+            additional: BTreeMap::new(),
         })
     }
 
@@ -9984,26 +9930,14 @@ impl RouterPromptCaller {
                 "nested prompt get cannot complete an input_required outcome",
             ));
         };
-        Ok(PromptGetResult {
-            description: complete.payload.description,
-            messages: complete
-                .payload
-                .messages
-                .into_iter()
-                .map(|message| PromptMessageItem {
-                    role: match message.role {
-                        Role::User => PromptMessageRole::User,
-                        Role::Assistant => PromptMessageRole::Assistant,
-                    },
-                    text: match message.content {
-                        fastmcp_protocol::common_types::ContentBlock::Text { text, .. } => {
-                            Some(text)
-                        }
-                        _ => None,
-                    },
-                })
-                .collect(),
-        })
+        // Validate locally constructed content with the canonical payload
+        // decoder, then retain the final codec's complete admitted envelope.
+        let payload = serde_json::to_value(&complete.payload)
+            .map_err(|_| McpError::internal_error("Invalid nested prompt content"))?;
+        let _: FinalGetPromptResult = serde_json::from_value(payload)
+            .map_err(|_| McpError::internal_error("Invalid nested prompt content"))?;
+        serde_json::from_value(encode_final_prompts_get_result(Ok(complete))?)
+            .map_err(|_| McpError::internal_error("Invalid nested prompt result representation"))
     }
 }
 
@@ -10745,6 +10679,277 @@ mod router_tests {
             is_error: false,
             structured_content: Some(serde_json::json!({"weather":"clear"})),
         })
+    }
+
+    const NESTED_MULTIMODAL_CONTENT: &str = r#"[
+        {
+            "type": "image", "data": "aGk=", "mimeType": "image/png",
+            "annotations": {
+                "audience": ["assistant"], "priority": 0.75,
+                "lastModified": "2026-11-24T00:00:00Z",
+                "com.example/annotation": {"preserved": true}
+            },
+            "_meta": {"com.example/image": {"width": 2}},
+            "com.example/sequence": 9007199254740993123456789
+        },
+        {
+            "type": "text", "text": "modern nested text",
+            "annotations": {"audience": ["user"], "priority": 0.25},
+            "_meta": {"com.example/text": null},
+            "com.example/exponent": 1.234567890123456789e+100
+        },
+        {
+            "type": "audio", "data": "aGk=", "mimeType": "audio/wav",
+            "annotations": {"priority": 0.5},
+            "_meta": {"com.example/audio": {"transcript": "hi"}},
+            "com.example/audio-field": [false, null]
+        },
+        {
+            "type": "resource_link",
+            "uri": "https://example.test/linked-report", "name": "report",
+            "title": "Linked report", "description": "Open the complete report",
+            "mimeType": "text/plain", "size": 17,
+            "icons": [{
+                "src": "https://example.test/report.png",
+                "mimeType": "image/png", "sizes": ["48x48"], "theme": "light"
+            }],
+            "annotations": {"audience": ["assistant"], "priority": 1.0},
+            "_meta": {"com.example/link": "retained"},
+            "com.example/link-field": {"opaque": true}
+        },
+        {
+            "type": "resource",
+            "resource": {
+                "uri": "https://example.test/embedded-text",
+                "mimeType": "text/plain", "text": "embedded text",
+                "_meta": {"com.example/inner": "text metadata"},
+                "com.example/inner-sequence": 9007199254740993123456789
+            },
+            "annotations": {"priority": 0.0},
+            "_meta": {"com.example/outer": "text resource metadata"},
+            "com.example/resource-field": {"keep": true}
+        },
+        {
+            "type": "resource",
+            "resource": {
+                "uri": "https://example.test/embedded-blob",
+                "mimeType": "application/octet-stream", "blob": "aGk=",
+                "_meta": {"com.example/inner": "blob metadata"},
+                "com.example/inner-exponent": 1.234567890123456789e+100
+            },
+            "annotations": {"audience": ["user"], "priority": 0.5},
+            "_meta": {"com.example/outer": "blob resource metadata"},
+            "com.example/blob-field": [1, "two"]
+        }
+    ]"#;
+
+    fn nested_multimodal_legacy_content() -> Vec<Content> {
+        serde_json::from_str(
+            r#"[
+                {"type": "image", "data": "aGk=", "mimeType": "image/png"},
+                {"type": "text", "text": "legacy nested text"},
+                {"type": "audio", "data": "aGk=", "mimeType": "audio/wav"},
+                {"type": "resource", "resource": {
+                    "uri": "https://example.test/legacy-text",
+                    "mimeType": "text/plain", "text": "legacy embedded text"
+                }},
+                {"type": "resource", "resource": {
+                    "uri": "https://example.test/legacy-blob",
+                    "mimeType": "application/octet-stream", "blob": "aGk="
+                }}
+            ]"#,
+        )
+        .expect("legacy application content fixture is valid")
+    }
+
+    fn nested_multimodal_complete_result(prompt: bool) -> CoreResult {
+        let mut wire: serde_json::Value = serde_json::from_str(
+            r#"{
+                "resultType": "complete",
+                "_meta": {
+                    "com.example/result": {"source": "nested handler"},
+                    "com.example/result-sequence": 9007199254740993123456789
+                },
+                "com.example/envelope-sequence": 9007199254740993123456789,
+                "com.example/envelope-exponent": 1.234567890123456789e+100
+            }"#,
+        )
+        .expect("complete envelope fixture is valid JSON");
+        let content: Vec<serde_json::Value> = serde_json::from_str(NESTED_MULTIMODAL_CONTENT)
+            .expect("multimodal fixture is valid JSON");
+        let method = if prompt {
+            wire["description"] = serde_json::json!("modern nested prompt");
+            wire["messages"] = serde_json::Value::Array(
+                content
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, content)| {
+                        serde_json::json!({
+                            "role": if index % 2 == 0 { "assistant" } else { "user" },
+                            "content": content,
+                        })
+                    })
+                    .collect(),
+            );
+            "prompts/get"
+        } else {
+            wire["content"] = serde_json::Value::Array(content);
+            wire["structuredContent"] = serde_json::Value::Null;
+            "tools/call"
+        };
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+            "name": "nested-multimodal",
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params))
+            .expect("nested multimodal request is admitted");
+        request
+            .decode_result(&serde_json::to_string(&wire).expect("complete result serializes"))
+            .expect("canonical multimodal complete result is admitted")
+    }
+
+    #[derive(Clone, Default)]
+    struct NestedMultimodalHandler {
+        final_calls: Arc<AtomicUsize>,
+        legacy_calls: Arc<AtomicUsize>,
+        invalid_content: Arc<AtomicUsize>,
+    }
+
+    impl NestedMultimodalHandler {
+        fn mutate_content(&self, content: &mut ContentBlock) {
+            // Mutate only after canonical fixture admission, modelling an
+            // application constructing a public content variant directly.
+            match (self.invalid_content.load(Ordering::SeqCst), content) {
+                (1, ContentBlock::Image { data, .. }) | (2, ContentBlock::Audio { data, .. }) => {
+                    *data = "invalid-base64".to_owned();
+                }
+                (
+                    3,
+                    ContentBlock::Text {
+                        annotations: Some(annotations),
+                        ..
+                    },
+                ) => annotations.priority = Some(2.0),
+                (
+                    4,
+                    ContentBlock::Resource {
+                        resource: EmbeddedResourceContents::Blob { blob, .. },
+                        ..
+                    },
+                ) => *blob = "invalid-base64".to_owned(),
+                _ => {}
+            }
+        }
+    }
+
+    impl ToolHandler for NestedMultimodalHandler {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "nested-multimodal".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(nested_multimodal_legacy_content())
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            let CoreResult::Final(FinalCoreResult::ToolsCall { mut result, .. }) =
+                nested_multimodal_complete_result(false)
+            else {
+                panic!("tools/call selects its canonical result");
+            };
+            for content in &mut result.payload.content {
+                self.mutate_content(content);
+            }
+            Ok(FinalToolOutcome::Complete(result))
+        }
+    }
+
+    impl PromptHandler for NestedMultimodalHandler {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "nested-multimodal".to_owned(),
+                description: Some("legacy nested prompt".to_owned()),
+                arguments: Vec::new(),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(nested_multimodal_legacy_content()
+                .into_iter()
+                .enumerate()
+                .map(|(index, content)| PromptMessage {
+                    role: if index % 2 == 0 {
+                        Role::Assistant
+                    } else {
+                        Role::User
+                    },
+                    content,
+                })
+                .collect())
+        }
+
+        fn get_final(
+            &self,
+            _ctx: &McpContext,
+            _args: HashMap<String, String>,
+        ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            let CoreResult::Final(FinalCoreResult::PromptsGet { mut result, .. }) =
+                nested_multimodal_complete_result(true)
+            else {
+                panic!("prompts/get selects its canonical result");
+            };
+            for message in &mut result.payload.messages {
+                self.mutate_content(&mut message.content);
+            }
+            Ok(result)
+        }
+    }
+
+    fn nested_multimodal_context(handler: NestedMultimodalHandler) -> McpContext {
+        let mut router = Router::new();
+        router
+            .add_tool(handler.clone())
+            .expect("multimodal tool registration succeeds");
+        router
+            .add_prompt_with_behavior(handler, crate::DuplicateBehavior::Error)
+            .expect("multimodal prompt registration succeeds");
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        request_context(&cx, 147, Budget::INFINITE, &state)
+            .with_final_request_surface(true)
+            .with_tool_caller(Arc::new(RouterToolCaller::new(
+                Arc::clone(&router),
+                state.clone(),
+            )))
+            .with_prompt_caller(Arc::new(RouterPromptCaller::new(router, state)))
     }
 
     struct NestedStructuredTool {
@@ -19047,7 +19252,7 @@ mod router_tests {
         let result = block_on(request_ctx.get_prompt("prompt-argument-boundary", HashMap::new()))
             .expect("legacy nested get_prompt retains unvalidated argument behavior");
         assert_eq!(
-            result.messages[0].text.as_deref(),
+            result.messages[0].as_text(),
             Some("legacy prompt-argument-boundary result")
         );
         assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
@@ -19095,7 +19300,7 @@ mod router_tests {
         let accepted = block_on(request_ctx.get_prompt("prompt-argument-boundary", required))
             .expect("the complete required nested argument is accepted");
         assert_eq!(
-            accepted.messages[0].text.as_deref(),
+            accepted.messages[0].as_text(),
             Some("final prompt-argument-boundary result")
         );
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
@@ -22409,6 +22614,226 @@ mod router_tests {
             serde_json::json!({"weather": "clear"})
         );
         assert_eq!(MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    fn assert_nested_multimodal_content(actual: &[&ToolContentItem]) {
+        let expected: Vec<ContentBlock> = serde_json::from_str(NESTED_MULTIMODAL_CONTENT)
+            .expect("canonical content fixture is valid");
+        assert_eq!(actual.len(), 6);
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual.as_value(),
+                &serde_json::to_value(expected).expect("canonical content serializes"),
+                "all members of content block {index} survive nesting"
+            );
+            assert_eq!(
+                &actual
+                    .decode::<ContentBlock>()
+                    .expect("typed content extraction succeeds"),
+                expected
+            );
+        }
+        assert_eq!(actual[0].kind(), Some("image"));
+        assert_eq!(actual[2].kind(), Some("audio"));
+        assert_eq!(actual[3].kind(), Some("resource_link"));
+        assert_eq!(actual[4].kind(), Some("resource"));
+        assert_eq!(actual[5].kind(), Some("resource"));
+        assert!(actual[3].as_text().is_none());
+        assert_eq!(
+            actual[0].as_value()["com.example/sequence"].to_string(),
+            "9007199254740993123456789"
+        );
+        assert_eq!(
+            actual[1].as_value()["com.example/exponent"].to_string(),
+            "1.234567890123456789e+100"
+        );
+        assert_eq!(
+            actual[4].as_value()["resource"]["com.example/inner-sequence"].to_string(),
+            "9007199254740993123456789"
+        );
+        assert_eq!(
+            actual[5].as_value()["resource"]["com.example/inner-exponent"].to_string(),
+            "1.234567890123456789e+100"
+        );
+        assert_eq!(
+            actual[4].as_value()["resource"]["_meta"]["com.example/inner"],
+            serde_json::json!("text metadata")
+        );
+        assert_eq!(
+            actual[5].as_value()["resource"]["_meta"]["com.example/inner"],
+            serde_json::json!("blob metadata")
+        );
+    }
+
+    fn assert_nested_multimodal_envelope(additional: &BTreeMap<String, serde_json::Value>) {
+        assert_eq!(additional["resultType"], serde_json::json!("complete"));
+        assert_eq!(
+            additional["_meta"]["com.example/result"],
+            serde_json::json!({"source": "nested handler"})
+        );
+        assert_eq!(
+            additional["_meta"]["com.example/result-sequence"].to_string(),
+            "9007199254740993123456789"
+        );
+        assert_eq!(
+            additional["com.example/envelope-sequence"].to_string(),
+            "9007199254740993123456789"
+        );
+        assert_eq!(
+            additional["com.example/envelope-exponent"].to_string(),
+            "1.234567890123456789e+100"
+        );
+    }
+
+    fn assert_nested_legacy_content(actual: &[&ToolContentItem]) {
+        let expected = nested_multimodal_legacy_content();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            let expected = serde_json::to_value(expected).expect("legacy content serializes");
+            assert_eq!(actual.as_value(), &expected);
+            assert_eq!(
+                serde_json::to_value(
+                    actual
+                        .decode::<Content>()
+                        .expect("legacy content remains typed"),
+                )
+                .expect("extracted legacy content serializes"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn nested_multimodal_tool_results_preserve_content_envelope_and_surface() {
+        let handler = NestedMultimodalHandler::default();
+        let ctx = nested_multimodal_context(handler.clone());
+        let result = block_on(ctx.call_tool("nested-multimodal", serde_json::json!({})))
+            .expect("modern nested tool returns all content");
+
+        assert_nested_multimodal_content(&result.content.iter().collect::<Vec<_>>());
+        assert_nested_multimodal_envelope(&result.additional);
+        assert_eq!(result.first_text(), Some("modern nested text"));
+        assert_eq!(result.structured_content, Some(serde_json::Value::Null));
+        assert!(!result.is_error);
+        assert_eq!(handler.final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler.legacy_calls.load(Ordering::SeqCst), 0);
+
+        let legacy_ctx = ctx.with_final_request_surface(false);
+        let legacy = block_on(legacy_ctx.call_tool("nested-multimodal", serde_json::json!({})))
+            .expect("selected legacy handler returns its own complete content");
+        assert_nested_legacy_content(&legacy.content.iter().collect::<Vec<_>>());
+        assert_eq!(legacy.first_text(), Some("legacy nested text"));
+        assert!(legacy.structured_content.is_none());
+        assert!(legacy.additional.is_empty());
+        assert_eq!(handler.final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler.legacy_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn nested_multimodal_prompt_results_preserve_content_envelope_and_surface() {
+        let handler = NestedMultimodalHandler::default();
+        let ctx = nested_multimodal_context(handler.clone());
+        let result = block_on(ctx.get_prompt("nested-multimodal", HashMap::new()))
+            .expect("modern nested prompt returns every multimodal message");
+
+        assert_nested_multimodal_content(
+            &result
+                .messages
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>(),
+        );
+        assert_nested_multimodal_envelope(&result.additional);
+        assert_eq!(result.description.as_deref(), Some("modern nested prompt"));
+        assert_eq!(result.first_text(), Some("modern nested text"));
+        for (index, message) in result.messages.iter().enumerate() {
+            assert_eq!(
+                message.role,
+                if index % 2 == 0 {
+                    PromptMessageRole::Assistant
+                } else {
+                    PromptMessageRole::User
+                }
+            );
+        }
+        assert_eq!(handler.final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler.legacy_calls.load(Ordering::SeqCst), 0);
+
+        let legacy_ctx = ctx.with_final_request_surface(false);
+        let legacy = block_on(legacy_ctx.get_prompt("nested-multimodal", HashMap::new()))
+            .expect("selected legacy prompt retains its multimodal messages");
+        assert_nested_legacy_content(
+            &legacy
+                .messages
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(legacy.description.as_deref(), Some("legacy nested prompt"));
+        assert_eq!(legacy.first_text(), Some("legacy nested text"));
+        assert!(legacy.additional.is_empty());
+        for (index, message) in legacy.messages.iter().enumerate() {
+            assert_eq!(
+                message.role,
+                if index % 2 == 0 {
+                    PromptMessageRole::Assistant
+                } else {
+                    PromptMessageRole::User
+                }
+            );
+        }
+        assert_eq!(handler.final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler.legacy_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn nested_multimodal_results_reject_invalid_local_content_without_losing_valid_results() {
+        let handler = NestedMultimodalHandler::default();
+        let ctx = nested_multimodal_context(handler.clone());
+        let tool = block_on(ctx.call_tool("nested-multimodal", serde_json::json!({})))
+            .expect("valid tool result is the baseline");
+        let prompt = block_on(ctx.get_prompt("nested-multimodal", HashMap::new()))
+            .expect("valid prompt result is the baseline");
+        let mut expected_calls = 2;
+        for (mutation, dimension) in [
+            (1, "image Base64"),
+            (2, "audio Base64"),
+            (3, "annotation priority"),
+            (4, "embedded blob Base64"),
+        ] {
+            handler.invalid_content.store(mutation, Ordering::SeqCst);
+            let tool_error = block_on(ctx.call_tool("nested-multimodal", serde_json::json!({})))
+                .expect_err("invalid locally authored tool content must not escape admission");
+            let prompt_error = block_on(ctx.get_prompt("nested-multimodal", HashMap::new()))
+                .expect_err("invalid locally authored prompt content must not escape admission");
+            assert_eq!(tool_error.code, McpErrorCode::InternalError, "{dimension}");
+            assert_eq!(
+                prompt_error.code,
+                McpErrorCode::InternalError,
+                "{dimension}"
+            );
+            assert!(!tool_error.message.contains("invalid-base64"));
+            assert!(!prompt_error.message.contains("invalid-base64"));
+            expected_calls += 2;
+            assert_eq!(handler.final_calls.load(Ordering::SeqCst), expected_calls);
+            assert_eq!(handler.legacy_calls.load(Ordering::SeqCst), 0);
+
+            handler.invalid_content.store(0, Ordering::SeqCst);
+            assert_eq!(
+                block_on(ctx.call_tool("nested-multimodal", serde_json::json!({})))
+                    .expect("rejection does not alter subsequent valid tool output"),
+                tool
+            );
+            assert_eq!(
+                block_on(ctx.get_prompt("nested-multimodal", HashMap::new()))
+                    .expect("rejection does not alter subsequent valid prompt output"),
+                prompt
+            );
+            expected_calls += 2;
+            assert_eq!(handler.final_calls.load(Ordering::SeqCst), expected_calls);
+            assert_eq!(handler.legacy_calls.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(expected_calls, 18);
     }
 
     #[test]

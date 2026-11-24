@@ -1141,69 +1141,90 @@ pub trait ResourceReader: Send + Sync {
 /// Maximum depth for nested tool calls to prevent infinite recursion.
 pub const MAX_TOOL_CALL_DEPTH: u32 = 10;
 
-/// A single item of content returned from a tool call.
+/// Complete content returned from a local tool call or prompt message.
 ///
-/// Mirrors the protocol's Content type but lives in core to avoid
-/// circular dependencies.
-#[derive(Debug, Clone)]
-pub enum ToolContentItem {
-    /// Text content.
-    Text {
-        /// The text content.
-        text: String,
-    },
-    /// Image content (base64-encoded).
-    Image {
-        /// Base64-encoded image data.
-        data: String,
-        /// MIME type of the image.
-        mime_type: String,
-    },
-    /// Audio content (base64-encoded).
-    Audio {
-        /// Base64-encoded audio data.
-        data: String,
-        /// MIME type of the audio.
-        mime_type: String,
-    },
-    /// Embedded resource reference.
-    Resource {
-        /// Resource URI.
-        uri: String,
-        /// MIME type.
-        mime_type: Option<String>,
-        /// Text content.
-        text: Option<String>,
-        /// Binary content (base64 blob).
-        blob: Option<String>,
-    },
-}
+/// Modern router calls validate content with the protocol's canonical codec.
+/// This protocol-independent container retains that JSON value, including
+/// annotations, metadata, resource-link fields and embedded-resource members.
+/// It does not redefine a narrower content schema or turn a resource link into
+/// an embedded resource.
+///
+/// Use [`Self::decode`] to obtain the protocol crate's canonical `ContentBlock`
+/// (or the selected legacy content type). This core crate cannot depend on
+/// protocol types because the protocol crate already depends on core.
+/// Serialization retains the canonical JSON value, not original whitespace,
+/// key order, or every equivalent number spelling. The workspace's arbitrary-
+/// precision representation avoids narrowing open numeric values to floating
+/// point. Deserializing this local container alone is not protocol admission.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ToolContentItem(serde_json::Value);
 
 impl ToolContentItem {
     /// Creates a text content item.
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
-        Self::Text { text: text.into() }
+        Self(serde_json::json!({"type": "text", "text": text.into()}))
+    }
+
+    /// Retains the complete JSON representation of a locally supplied value.
+    ///
+    /// This conversion does not validate a protocol schema. Application callers
+    /// remain responsible for selecting and validating their protocol type;
+    /// this conversion grants no wire authority.
+    pub fn from_serializable<T: serde::Serialize + ?Sized>(content: &T) -> McpResult<Self> {
+        serde_json::to_value(content).map(Self).map_err(|_| {
+            McpError::internal_error("Nested content could not be represented as JSON")
+        })
+    }
+
+    /// Decodes the complete content into a canonical protocol or application type.
+    ///
+    /// A wrong content shape is an error; it never falls back to text or drops
+    /// non-text fields to make the requested type fit.
+    pub fn decode<T: serde::de::DeserializeOwned>(&self) -> McpResult<T> {
+        T::deserialize(&self.0).map_err(|_| {
+            McpError::internal_error("Nested content does not match the requested content type")
+        })
+    }
+
+    /// Borrows every retained content member without a second serialization.
+    #[must_use]
+    pub const fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+
+    /// Takes the complete content value without cloning its payload.
+    #[must_use]
+    pub fn into_value(self) -> serde_json::Value {
+        self.0
+    }
+
+    /// Returns the exact content discriminator, including `resource_link`.
+    #[must_use]
+    pub fn kind(&self) -> Option<&str> {
+        self.0.get("type").and_then(serde_json::Value::as_str)
     }
 
     /// Returns the text content, if this is a text item.
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Self::Text { text } => Some(text),
-            _ => None,
+        if self.is_text() {
+            self.0.get("text").and_then(serde_json::Value::as_str)
+        } else {
+            None
         }
     }
 
     /// Returns true if this is a text content item.
     #[must_use]
     pub fn is_text(&self) -> bool {
-        matches!(self, Self::Text { .. })
+        self.kind() == Some("text")
     }
 }
 
 /// Result of calling a tool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallResult {
     /// The content items returned by the tool.
     pub content: Vec<ToolContentItem>,
@@ -1213,9 +1234,36 @@ pub struct ToolCallResult {
     /// the tool did not provide structured content. Legacy calls leave this
     /// absent. Modern local calls validate any declared output schema before
     /// returning this value to the calling handler.
+    #[serde(
+        rename = "structuredContent",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nested_structured_content"
+    )]
     pub structured_content: Option<serde_json::Value>,
     /// Whether the tool returned an error.
+    #[serde(
+        rename = "isError",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub is_error: bool,
+    /// All remaining admitted result-envelope fields.
+    ///
+    /// Modern calls retain `resultType`, cache hints, `_meta`, and inert open
+    /// members here. These values are data, never authorization. Legacy calls
+    /// and locally constructed results leave this empty.
+    #[serde(flatten)]
+    pub additional: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+fn deserialize_nested_structured_content<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <serde_json::Value as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 impl ToolCallResult {
@@ -1226,6 +1274,7 @@ impl ToolCallResult {
             content,
             structured_content: None,
             is_error: false,
+            additional: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1236,6 +1285,7 @@ impl ToolCallResult {
             content: vec![ToolContentItem::text(text)],
             structured_content: None,
             is_error: false,
+            additional: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1246,6 +1296,7 @@ impl ToolCallResult {
             content: vec![ToolContentItem::text(message)],
             structured_content: None,
             is_error: true,
+            additional: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1259,7 +1310,7 @@ impl ToolCallResult {
     /// Returns the first text content, if present.
     #[must_use]
     pub fn first_text(&self) -> Option<&str> {
-        self.content.first().and_then(|c| c.as_text())
+        self.content.iter().find_map(ToolContentItem::as_text)
     }
 }
 
@@ -1302,7 +1353,8 @@ pub trait ToolCaller: Send + Sync {
 pub const MAX_PROMPT_GET_DEPTH: u32 = 10;
 
 /// Role of one prompt message returned through [`McpContext::get_prompt`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PromptMessageRole {
     /// User-authored prompt turn.
     User,
@@ -1311,12 +1363,12 @@ pub enum PromptMessageRole {
 }
 
 /// One prompt message returned through [`McpContext::get_prompt`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PromptMessageItem {
     /// Message role.
     pub role: PromptMessageRole,
-    /// Text content when the handler authored a text block.
-    pub text: Option<String>,
+    /// Complete content block, including non-text content and its metadata.
+    pub content: ToolContentItem,
 }
 
 impl PromptMessageItem {
@@ -1325,24 +1377,29 @@ impl PromptMessageItem {
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
             role: PromptMessageRole::User,
-            text: Some(text.into()),
+            content: ToolContentItem::text(text),
         }
     }
 
     /// Returns the text content, if present.
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
-        self.text.as_deref()
+        self.content.as_text()
     }
 }
 
 /// Result of getting a prompt from within a handler.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PromptGetResult {
     /// Optional prompt description from the catalog definition.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Messages returned by the prompt handler.
     pub messages: Vec<PromptMessageItem>,
+    /// Remaining admitted result-envelope fields, including modern cache
+    /// hints, `_meta`, `resultType`, and inert open members.
+    #[serde(flatten)]
+    pub additional: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl PromptGetResult {
@@ -1352,6 +1409,7 @@ impl PromptGetResult {
         Self {
             description: None,
             messages,
+            additional: std::collections::BTreeMap::new(),
         }
     }
 
@@ -6970,34 +7028,97 @@ mod tests {
 
     #[test]
     fn test_tool_content_item_image() {
-        let item = ToolContentItem::Image {
-            data: "base64img".to_string(),
-            mime_type: "image/png".to_string(),
-        };
+        let value = serde_json::json!({
+            "type": "image",
+            "data": "aGk=",
+            "mimeType": "image/png",
+            "annotations": {"priority": 0.75},
+            "_meta": {"com.example/source": "camera"},
+        });
+        let item = ToolContentItem::from_serializable(&value).expect("image content serializes");
         assert!(item.as_text().is_none());
         assert!(!item.is_text());
+        assert_eq!(item.kind(), Some("image"));
+        assert_eq!(item.decode::<serde_json::Value>().unwrap(), value);
     }
 
     #[test]
     fn test_tool_content_item_audio() {
-        let item = ToolContentItem::Audio {
-            data: "base64audio".to_string(),
-            mime_type: "audio/wav".to_string(),
-        };
+        let value = serde_json::json!({
+            "type": "audio",
+            "data": "aGk=",
+            "mimeType": "audio/wav",
+            "com.example/transcript": "hi",
+        });
+        let item = ToolContentItem::from_serializable(&value).expect("audio content serializes");
         assert!(item.as_text().is_none());
         assert!(!item.is_text());
+        assert_eq!(item.kind(), Some("audio"));
+        assert_eq!(item.into_value(), value);
     }
 
     #[test]
     fn test_tool_content_item_resource() {
-        let item = ToolContentItem::Resource {
-            uri: "file://test".to_string(),
-            mime_type: Some("text/plain".to_string()),
-            text: Some("embedded".to_string()),
-            blob: None,
-        };
+        let value = serde_json::json!({
+            "type": "resource",
+            "resource": {
+                "uri": "https://example.test/resource",
+                "mimeType": "text/plain",
+                "text": "embedded",
+                "_meta": {"com.example/revision": 7},
+            },
+            "text": "inert sibling, not a text content block",
+        });
+        let item = ToolContentItem::from_serializable(&value).expect("resource content serializes");
         assert!(item.as_text().is_none());
         assert!(!item.is_text());
+        assert_eq!(item.kind(), Some("resource"));
+        assert_eq!(item.as_value(), &value);
+        assert!(item.decode::<String>().is_err());
+    }
+
+    #[test]
+    fn nested_content_retains_wide_numbers_and_absent_structured_content() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{
+                "type": "resource_link",
+                "uri": "https://example.test/link",
+                "name": "report",
+                "com.example/sequence": 9007199254740993123456789,
+                "_meta": {"com.example/cost": 1.234567890123456789e+100}
+            }"#,
+        )
+        .expect("arbitrary-precision content parses");
+        let item = ToolContentItem::from_serializable(&value).expect("link content serializes");
+        assert_eq!(item.kind(), Some("resource_link"));
+        assert_eq!(item.decode::<serde_json::Value>().unwrap(), value);
+        assert_eq!(
+            item.as_value()["com.example/sequence"].to_string(),
+            "9007199254740993123456789"
+        );
+        assert_eq!(
+            item.as_value()["_meta"]["com.example/cost"].to_string(),
+            "1.234567890123456789e+100"
+        );
+
+        let result = ToolCallResult::success(vec![item, ToolContentItem::text("later text")]);
+        assert_eq!(result.first_text(), Some("later text"));
+        let absent = serde_json::to_value(&result).expect("nested result serializes");
+        assert!(absent.get("structuredContent").is_none());
+        assert_eq!(
+            serde_json::from_value::<ToolCallResult>(absent.clone())
+                .unwrap()
+                .structured_content,
+            None
+        );
+        let mut explicit_null = absent;
+        explicit_null["structuredContent"] = serde_json::Value::Null;
+        assert_eq!(
+            serde_json::from_value::<ToolCallResult>(explicit_null)
+                .unwrap()
+                .structured_content,
+            Some(serde_json::Value::Null)
+        );
     }
 
     // ========================================================================
