@@ -119,20 +119,34 @@ impl AsyncLifespanOwner {
     }
 
     async fn ready(&mut self) -> McpResult<()> {
-        loop {
-            if let Some(result) = self.signal.startup_result() {
-                return result;
-            }
-            if let Some(result) = self.poll_result() {
-                return result.and(Err(lifecycle_error("ended before startup completed")));
-            }
-            self.signal
+        let signal = Arc::clone(&self.signal);
+        let mut published = std::pin::pin!(
+            signal
                 .changed
-                .wait_until(|| {
-                    self.signal.startup_result().is_some() || self.custodian.is_finished()
-                })
-                .await;
+                .wait_until(|| signal.startup_result().is_some())
+        );
+        // A custodian cancelled before its first poll cannot publish startup.
+        // Register for retirement as well as publication so either wakes us.
+        let outcome = poll_fn(|task| {
+            if published.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Ok(()));
+            }
+            self.poll_completion(task)
+        })
+        .await;
+        signal
+            .startup_result()
+            .unwrap_or_else(|| outcome.and(Err(lifecycle_error("ended before startup completed"))))
+    }
+
+    fn poll_completion(&mut self, task: &mut std::task::Context<'_>) -> Poll<McpResult<()>> {
+        if let Some(result) = &self.result {
+            return Poll::Ready(result.clone());
         }
+        let result = std::task::ready!(self.custodian.poll_join(task))
+            .unwrap_or_else(|_| Err(lifecycle_error("custodian did not settle normally")));
+        self.result = Some(result.clone());
+        Poll::Ready(result)
     }
 
     pub(crate) fn request_shutdown(&self) {
@@ -156,14 +170,7 @@ impl AsyncLifespanOwner {
     /// successful cleanup receipt. Dropping this observer requests abandonment.
     pub(crate) async fn finish(&mut self) -> McpResult<()> {
         self.request_shutdown();
-        if let Some(result) = self.result.clone() {
-            return result;
-        }
-        let result = poll_fn(|task| self.custodian.poll_join(task))
-            .await
-            .unwrap_or_else(|_| Err(lifecycle_error("custodian did not settle normally")));
-        self.result = Some(result.clone());
-        result
+        poll_fn(|task| self.poll_completion(task)).await
     }
 }
 

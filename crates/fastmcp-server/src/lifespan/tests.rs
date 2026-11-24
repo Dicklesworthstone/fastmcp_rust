@@ -97,6 +97,75 @@ fn assert_discovery(message: JsonRpcMessage) {
 }
 
 #[test]
+fn async_lifespan_custodian_retirement_wakes_parked_startup() {
+    use std::task::{Context, Wake, Waker};
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    run(|cx| async move {
+        let region = cx
+            .open_child_region(ChildRegionSpec::inherit())
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let startup = Arc::clone(&calls);
+        let shutdown = Arc::clone(&calls);
+        let mut owner = AsyncLifespanOwner::admit(
+            region.cx(),
+            Some(Box::new(move |_| {
+                startup.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Ok(()) })
+            })),
+            Some(Box::new(move |_| {
+                shutdown.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Ok(()) })
+            })),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let signal = Arc::clone(&owner.signal);
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        {
+            let mut ready = std::pin::pin!(owner.ready());
+            assert!(
+                ready
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let initial_wakes = wakes.0.load(Ordering::Acquire);
+
+            // The current-thread executor has not yielded since admission.
+            // Close from the parent without polling the readiness waiter again.
+            region
+                .cancel(CancelReason::user("cancel before the custodian first runs"))
+                .unwrap();
+            region.close().await.unwrap();
+            assert!(signal.startup_result().is_none());
+            assert!(
+                wakes.0.load(Ordering::Acquire) > initial_wakes,
+                "custodian retirement must wake a parked startup observer"
+            );
+            assert!(matches!(
+                ready.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Err(_))
+            ));
+        }
+        assert!(owner.finish().await.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(cx.checkpoint().is_ok());
+    });
+}
+
+#[test]
 fn async_lifespan_claim_is_not_startup_success_and_cleanup_is_retained() {
     run(|cx| async move {
         let startup = Arc::new(Gate::default());
