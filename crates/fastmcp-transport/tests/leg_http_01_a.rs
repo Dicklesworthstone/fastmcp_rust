@@ -489,3 +489,103 @@ fn leg_http_01_a_post_wait_observes_caller_deadline_and_latches_closed() {
         Err(TransportError::Closed)
     ));
 }
+
+#[test]
+fn legacy_server_receives_reverse_call_reply_on_its_advertised_post() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = format!("http://{address}/messages");
+    let advertised = endpoint.clone();
+    let server = ServerThread::spawn(move || {
+        let socket = accept_loopback(&listener);
+        let get = read_http_request(socket.try_clone().unwrap());
+        assert!(get.starts_with("GET /sse HTTP/1.1\r\n"));
+        let posted = std::iter::once_with(|| {
+            let mut socket = accept_loopback(&listener);
+            let post = read_http_request(socket.try_clone().unwrap());
+            let (head, body) = post.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("POST /messages HTTP/1.1\r\n"));
+            let message = fastmcp_transport::Codec::new()
+                .decode_complete_message(body.as_bytes())
+                .unwrap();
+            socket.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+            message
+        });
+        let server_cx = Cx::for_testing();
+        let mut server = LegacySseServerTransport::from_messages(socket, posted, advertised);
+        server
+            .send(
+                &server_cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::new("roots/list", None, 7_i64)),
+            )
+            .unwrap();
+        assert!(matches!(
+            server.recv(&server_cx),
+            Ok(JsonRpcMessage::Response(reply))
+                if reply.id == Some(RequestId::Number(7))
+                    && reply.result == Some(serde_json::json!({"roots": []}))
+        ));
+    });
+
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket.set_read_timeout(Some(LOOPBACK_PEER_BOUND)).unwrap();
+    socket.write_all(b"GET /sse HTTP/1.1\r\nHost: loopback\r\n\r\n").unwrap();
+    let cx = Cx::for_testing();
+    let mut client = LegacySseClientTransport::new(socket, LegacySseHttpPostSink::new());
+    let Ok(JsonRpcMessage::Request(call)) = client.recv(&cx) else {
+        panic!("the client's first receive must establish the stream and deliver the reverse call");
+    };
+    assert_eq!(client.advertised_endpoint(), Some(endpoint.as_str()));
+    assert_eq!(call.method, "roots/list");
+    client
+        .send(&cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
+            call.id.unwrap(),
+            serde_json::json!({"roots": []}),
+        )))
+        .unwrap();
+    server.join();
+}
+
+#[test]
+fn legacy_receive_rejects_missing_or_repeated_endpoint_before_delivering_messages() {
+    let message = SseEvent::message(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    let endpoint = SseEvent::endpoint("/messages");
+    for events in [
+        vec![message.clone(), endpoint.clone()],
+        vec![endpoint.clone(), endpoint, message],
+    ] {
+        let wire: Vec<u8> = events.into_iter().flat_map(|event| event.to_bytes().unwrap()).collect();
+        let mut client = LegacySseClientTransport::new(Cursor::new(wire), LegacySseHttpPostSink::new());
+        let cx = Cx::for_testing();
+        assert!(matches!(client.recv(&cx), Err(TransportError::Io(ref error))
+            if error.kind() == std::io::ErrorKind::InvalidData));
+        assert!(matches!(client.recv(&cx), Err(TransportError::Closed)));
+        assert!(matches!(client.send(&cx, &legacy_post_request()), Err(TransportError::Closed)));
+    }
+}
+
+#[test]
+fn split_server_advertises_endpoint_before_waiting_for_its_first_post() {
+    use fastmcp_transport::{TransportRecvHalf, sse::SseServerTransport};
+
+    let mut output = Vec::new();
+    let mut invalid = JsonRpcResponse::success(RequestId::Number(19), serde_json::json!({}));
+    invalid.result = None;
+    let incoming = [JsonRpcMessage::Response(invalid), legacy_post_request()];
+    let cx = Cx::for_testing();
+    let (mut receiver, sender) = SseServerTransport::from_messages(
+        &mut output,
+        incoming.into_iter(),
+        "/messages",
+    )
+    .open_into_split(&cx)
+    .unwrap();
+    // Seeing the endpoint cannot require an application message in either direction.
+    drop(sender);
+    assert_eq!(output, SseEvent::endpoint("/messages").to_bytes().unwrap());
+    assert!(matches!(receiver.recv(&cx), Err(TransportError::Codec(_))));
+    assert!(matches!(
+        receiver.recv(&cx),
+        Ok(JsonRpcMessage::Request(request)) if request.method == "tools/list"
+    ));
+}

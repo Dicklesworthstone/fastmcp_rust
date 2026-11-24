@@ -1828,6 +1828,12 @@ pub enum JsonRpcMessage {
     Response(JsonRpcResponse),
 }
 
+impl From<JsonRpcRequest> for JsonRpcMessage {
+    fn from(request: JsonRpcRequest) -> Self {
+        Self::Request(request)
+    }
+}
+
 // A derived untagged Deserialize buffers its input in serde's private
 // `Content`, and a `RawValue` cannot be read back from that buffer. Since
 // `JsonRpcRequest` keeps its params as their exact source (`RawValue`), every

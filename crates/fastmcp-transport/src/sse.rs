@@ -1495,8 +1495,21 @@ impl<R: Read, P: LegacySsePostSink> Transport for LegacySseClientTransport<R, P>
         if self.closed {
             return Err(TransportError::Closed);
         }
-        match self.reader.read_message(cx) {
-            Ok(Some(message)) => Ok(message),
+        if self.advertised_endpoint.is_none() {
+            self.establish(cx)?;
+        }
+        match self.reader.read_event(cx) {
+            Ok(Some(event)) if event.event_type == SseEventType::Message => self
+                .codec
+                .decode_complete_message(event.data.as_bytes())
+                .map_err(TransportError::Codec),
+            Ok(Some(_)) => {
+                self.closed = true;
+                Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "legacy SSE endpoint cannot be advertised again on an established stream",
+                )))
+            }
             Ok(None) => {
                 self.closed = true;
                 Err(TransportError::Closed)
@@ -1541,7 +1554,21 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> LegacySseServerTransport<W, R
             inner: SseServerTransport::new(writer, request_source, endpoint_url),
         }
     }
+}
 
+#[cfg(feature = "legacy-2024-11-05")]
+impl<W: Write, R: Iterator<Item = JsonRpcMessage>> LegacySseServerTransport<W, R> {
+    /// Creates a server adapter that accepts calls, notifications and replies on its POST endpoint.
+    #[must_use]
+    pub fn from_messages(writer: W, messages: R, endpoint_url: impl Into<String>) -> Self {
+        Self {
+            inner: SseServerTransport::from_messages(writer, messages, endpoint_url),
+        }
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<W: Write, R: Iterator> LegacySseServerTransport<W, R> {
     /// Opens the SSE body by sending its mandatory first endpoint event.
     pub fn open(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.inner.closed || self.inner.writer.closed {
@@ -1553,7 +1580,10 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> LegacySseServerTransport<W, R
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
-impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for LegacySseServerTransport<W, R> {
+impl<W: Write, R: Iterator> Transport for LegacySseServerTransport<W, R>
+where
+    R::Item: Into<JsonRpcMessage>,
+{
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         self.open(cx)?;
         self.inner.send(cx, message)
@@ -1630,6 +1660,22 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> SseServerTransport<W, R> {
     /// * `endpoint_url` - The URL to advertise for client POST requests
     #[must_use]
     pub fn new(writer: W, request_source: R, endpoint_url: impl Into<String>) -> Self {
+        Self::with_source(writer, request_source, endpoint_url)
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<W: Write, R: Iterator<Item = JsonRpcMessage>> SseServerTransport<W, R> {
+    /// Creates a transport whose POST handler can deliver replies as well as requests.
+    #[must_use]
+    pub fn from_messages(writer: W, messages: R, endpoint_url: impl Into<String>) -> Self {
+        Self::with_source(writer, messages, endpoint_url)
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<W: Write, R: Iterator> SseServerTransport<W, R> {
+    fn with_source(writer: W, request_source: R, endpoint_url: impl Into<String>) -> Self {
         Self {
             writer: SseWriter::new(writer),
             request_codec: Codec::new(),
@@ -1647,6 +1693,19 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> SseServerTransport<W, R> {
             self.endpoint_sent = true;
         }
         Ok(())
+    }
+
+    /// Advertises the POST endpoint before the receive half can wait for the
+    /// client's first message. Call this on the owner of the blocking writer.
+    pub fn open_into_split(
+        mut self,
+        cx: &Cx,
+    ) -> Result<(SseServerRecvHalf<R>, SseServerSendHalf<W>), TransportError> {
+        if self.closed || self.writer.closed {
+            return Err(TransportError::Closed);
+        }
+        self.ensure_endpoint_sent(cx)?;
+        Ok(self.into_split())
     }
 
     /// Separates typed POST ingress from SSE response egress.
@@ -1673,7 +1732,10 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> SseServerTransport<W, R> {
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
-impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransport<W, R> {
+impl<W: Write, R: Iterator> Transport for SseServerTransport<W, R>
+where
+    R::Item: Into<JsonRpcMessage>,
+{
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         if self.closed || self.writer.closed {
             self.closed = true;
@@ -1688,21 +1750,12 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransp
             self.closed = true;
             return Err(TransportError::Closed);
         }
-        sse_checkpoint(cx)?;
-
-        // Get next request from the request source (POST handler)
-        match self.request_source.next() {
-            Some(request) => {
-                // Iterator-backed typed ingress otherwise bypasses all wire
-                // validation and per-message size admission.
-                self.request_codec.encode_request(&request)?;
-                Ok(JsonRpcMessage::Request(request))
-            }
-            None => {
-                self.closed = true;
-                Err(TransportError::Closed)
-            }
-        }
+        recv_sse_post(
+            cx,
+            &mut self.request_source,
+            &self.request_codec,
+            &mut self.closed,
+        )
     }
 
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
@@ -1714,6 +1767,29 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransp
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
+fn recv_sse_post<R: Iterator>(
+    cx: &Cx,
+    source: &mut R,
+    codec: &Codec,
+    closed: &mut bool,
+) -> Result<JsonRpcMessage, TransportError>
+where
+    R::Item: Into<JsonRpcMessage>,
+{
+    sse_checkpoint(cx)?;
+    let Some(message) = source.next().map(Into::into) else {
+        *closed = true;
+        return Err(TransportError::Closed);
+    };
+    // Iterator-backed POST ingress still needs envelope and size validation.
+    match &message {
+        JsonRpcMessage::Request(request) => codec.encode_request(request)?,
+        JsonRpcMessage::Response(response) => codec.encode_response(response)?,
+    };
+    Ok(message)
+}
+
 /// Independently owned typed POST ingress for an SSE server transport.
 #[cfg(feature = "legacy-2024-11-05")]
 pub struct SseServerRecvHalf<R> {
@@ -1723,23 +1799,20 @@ pub struct SseServerRecvHalf<R> {
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
-impl<R: Iterator<Item = JsonRpcRequest>> TransportRecvHalf for SseServerRecvHalf<R> {
+impl<R: Iterator> TransportRecvHalf for SseServerRecvHalf<R>
+where
+    R::Item: Into<JsonRpcMessage>,
+{
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
         if self.closed {
             return Err(TransportError::Closed);
         }
-        sse_checkpoint(cx)?;
-
-        match self.request_source.next() {
-            Some(request) => {
-                self.request_codec.encode_request(&request)?;
-                Ok(JsonRpcMessage::Request(request))
-            }
-            None => {
-                self.closed = true;
-                Err(TransportError::Closed)
-            }
-        }
+        recv_sse_post(
+            cx,
+            &mut self.request_source,
+            &self.request_codec,
+            &mut self.closed,
+        )
     }
 
     fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {

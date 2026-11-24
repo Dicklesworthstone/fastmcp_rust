@@ -21929,60 +21929,6 @@ impl Server {
         combine_split_transport_results(run_result, recv_close, send_close)
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
-    async fn run_split_transport_with_label<R, S>(
-        self,
-        cx: &Cx,
-        recv_half: R,
-        send_half: S,
-        transport_label: &'static str,
-    ) -> !
-    where
-        R: TransportRecvHalf + Send + 'static,
-        S: TransportSendHalf + 'static,
-    {
-        if let Err(error) = self.admit_blocking_lifespan() {
-            error!(target: targets::SERVER, "{error}");
-            std::process::exit(1);
-        }
-        let dispatch_cx = cx.clone();
-        let mut pump = match cx.spawn_blocking(move |pump_cx| {
-            self.run_split_transport_returning_with_dispatch_cx(
-                &pump_cx,
-                &dispatch_cx,
-                recv_half,
-                send_half,
-            )
-        }) {
-            Ok(pump) => pump,
-            Err(error) => {
-                error!(
-                    target: targets::SERVER,
-                    "Could not admit the {transport_label} split transport pump into the caller runtime: {error}"
-                );
-                std::process::exit(1);
-            }
-        };
-        let exit_code = match pump.join(cx).await {
-            Ok(Ok(())) => 0,
-            Ok(Err(error)) => {
-                error!(
-                    target: targets::SERVER,
-                    "{transport_label} split transport pump failed: {error}"
-                );
-                1
-            }
-            Err(error) => {
-                error!(
-                    target: targets::SERVER,
-                    "Caller-owned {transport_label} split transport pump ended without a final status: {error:?}"
-                );
-                1
-            }
-        };
-        std::process::exit(exit_code)
-    }
-
     /// Runs the server using SSE transport with a provided Cx.
     ///
     /// ```compile_fail
@@ -22009,14 +21955,74 @@ impl Server {
         W: Write + Send + 'static,
         R: Iterator<Item = JsonRpcRequest> + Send + 'static,
     {
+        self.run_sse_messages_with_cx(
+            cx,
+            writer,
+            request_source.map(JsonRpcMessage::Request),
+            endpoint_url,
+        )
+        .await
+    }
+
+    /// Runs an embedded SSE server with typed ingress from the advertised POST
+    /// handler. Client replies to server requests use the same ingress as
+    /// calls and notifications.
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub async fn run_sse_messages_with_cx<W, R>(
+        self,
+        cx: &Cx,
+        writer: W,
+        messages: R,
+        endpoint_url: impl Into<String>,
+    ) -> !
+    where
+        W: Write + Send + 'static,
+        R: Iterator<Item = JsonRpcMessage> + Send + 'static,
+    {
         if let Err(error) = self.admit_blocking_lifespan() {
             error!(target: targets::SERVER, "{error}");
             std::process::exit(1);
         }
-        let (recv_half, send_half) =
-            SseServerTransport::new(writer, request_source, endpoint_url).into_split();
-        self.run_split_transport_with_label(cx, recv_half, send_half, "sse")
-            .await
+        let transport = SseServerTransport::from_messages(writer, messages, endpoint_url);
+        let dispatch_cx = cx.clone();
+        let mut pump = match cx.spawn_blocking(move |pump_cx| {
+            let (recv_half, send_half) = transport
+                .open_into_split(&pump_cx)
+                .map_err(|error| transport_run_error("sse_open", &error))?;
+            self.run_split_transport_returning_with_dispatch_cx(
+                &pump_cx,
+                &dispatch_cx,
+                recv_half,
+                send_half,
+            )
+        }) {
+            Ok(pump) => pump,
+            Err(error) => {
+                error!(
+                    target: targets::SERVER,
+                    "Could not admit the SSE split transport pump into the caller runtime: {error}"
+                );
+                std::process::exit(1);
+            }
+        };
+        let exit_code = match pump.join(cx).await {
+            Ok(Ok(())) => 0,
+            Ok(Err(error)) => {
+                error!(
+                    target: targets::SERVER,
+                    "SSE split transport pump failed: {error}"
+                );
+                1
+            }
+            Err(error) => {
+                error!(
+                    target: targets::SERVER,
+                    "Caller-owned SSE split transport pump ended without a final status: {error:?}"
+                );
+                1
+            }
+        };
+        std::process::exit(exit_code)
     }
 
     // =========================================================================
