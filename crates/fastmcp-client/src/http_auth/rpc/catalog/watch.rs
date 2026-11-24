@@ -638,16 +638,18 @@ impl ManagedCatalogClient {
                                 Ok(id)
                             },
                             |notification| {
-                                // collect has already invalidated before calling
-                                // this observer. Coalesce scheduling, not delivery.
-                                if relevant(kind, &notification) {
-                                    signal.changed()?;
-                                }
+                                // collect has already invalidated the cache. Let
+                                // the host decide before local cancellation can
+                                // replace its failure with a retryable stop.
+                                let changed = relevant(kind, &notification);
                                 check_binding(cx, cancellation, deadline, binding)?;
                                 let continuing = observer
                                     .emit(ManagedCatalogWatchEvent::Notification(notification))?;
                                 check_binding(cx, cancellation, deadline, binding)?;
                                 if continuing {
+                                    if changed {
+                                        signal.changed()?;
+                                    }
                                     Ok(())
                                 } else {
                                     Err(ManagedCatalogError::AbortedByHost)

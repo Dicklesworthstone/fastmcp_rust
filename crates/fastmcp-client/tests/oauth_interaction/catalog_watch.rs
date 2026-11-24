@@ -25,6 +25,8 @@ enum WatchCase {
     Prompts,
     DuringPage,
     ChangeOnPage,
+    PageHostFailure,
+    PageHostStop,
     NarrowAck,
     Gap,
     Terminal,
@@ -217,6 +219,18 @@ async fn closed(mut tls: TlsStream<TcpStream>) {
     );
 }
 
+async fn closed_without_request(peer: &Peer, tls: TlsStream<TcpStream>) {
+    let mut closing = Box::pin(closed(tls));
+    poll_fn(|task| {
+        assert!(
+            peer.listener.poll_accept(task).is_pending(),
+            "a host failure or stop must not start another request"
+        );
+        closing.as_mut().poll(task)
+    })
+    .await;
+}
+
 fn run_watch(case: WatchCase) {
     RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(Box::pin(async {
         let cx = Cx::current().unwrap();
@@ -286,11 +300,15 @@ fn run_watch(case: WatchCase) {
                     closed(listen).await;
                     return;
                 }
-                if matches!(case, WatchCase::ChangeOnPage) {
+                if matches!(case, WatchCase::ChangeOnPage | WatchCase::PageHostFailure | WatchCase::PageHostStop) {
                     let mut page = accept_page(&peer, method, 2, None).await;
                     sse_head(&mut page).await;
                     event(&mut page, &notification(method), false).await;
                     closed(page).await;
+                    if matches!(case, WatchCase::PageHostFailure | WatchCase::PageHostStop) {
+                        closed_without_request(&peer, listen).await;
+                        return;
+                    }
                     serve_page(&peer, method, 3, None, "fresh-one", None).await;
                     closed(listen).await;
                     return;
@@ -355,6 +373,12 @@ fn run_watch(case: WatchCase) {
                             WatchEvent::Notification(_) => {
                                 notices.set(notices.get() + 1);
                                 assert!(client.cache_stats().unwrap().invalidations > 0);
+                                if matches!(case, WatchCase::PageHostFailure) {
+                                    return Err(ManagedCatalogError::AbortedByHost);
+                                }
+                                if matches!(case, WatchCase::PageHostStop) {
+                                    return Ok(Control::Stop);
+                                }
                             }
                             WatchEvent::Snapshot(catalog) => {
                                 let count = snapshots.get() + 1;
@@ -400,8 +424,11 @@ fn run_watch(case: WatchCase) {
                 }
                 let result = watching.await;
                 match case {
-                    WatchCase::Live | WatchCase::WholeLive | WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts | WatchCase::DuringPage | WatchCase::ChangeOnPage | WatchCase::StopAck | WatchCase::ScopedCache => {
+                    WatchCase::Live | WatchCase::WholeLive | WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts | WatchCase::DuringPage | WatchCase::ChangeOnPage | WatchCase::PageHostStop | WatchCase::StopAck | WatchCase::ScopedCache => {
                         assert_eq!(result.unwrap(), Outcome::StoppedByHost);
+                    }
+                    WatchCase::PageHostFailure => {
+                        assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::AbortedByHost))));
                     }
                     WatchCase::Terminal | WatchCase::PeerCancellation => assert_eq!(result.unwrap(), Outcome::SubscriptionEnded),
                     WatchCase::ForeignCancellation => assert!(matches!(result, Err(WatchError::Subscription(fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionError::InvalidResponse)))),
@@ -438,6 +465,12 @@ fn run_watch(case: WatchCase) {
             assert_eq!(peer.posts.load(Ordering::SeqCst), expected);
             assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);
             peer.quiet(); // No automatic resubscribe, refresh or arbitrary retry.
+            if matches!(case, WatchCase::PageHostFailure | WatchCase::PageHostStop) {
+                assert_eq!(notices.get(), 1);
+                assert_eq!(snapshots.get(), 0);
+                assert_eq!(ids.get(), 2);
+                assert_eq!(client.cache_stats().unwrap().fills, 0);
+            }
             if matches!(case, WatchCase::ScopedCache) {
                 let cached = Box::pin(client.collect(&cx, request("prompts/list"), || panic!("unrelated catalog was not cleared"), |_| Ok(()))).await.unwrap();
                 assert_eq!(cached.item_count(), 1);
@@ -496,6 +529,17 @@ fn change_on_a_catalog_response_reconciles_without_restarting_the_listen() {
     isolated_watch(
         "change_on_a_catalog_response_reconciles_without_restarting_the_listen",
         WatchCase::ChangeOnPage,
+    );
+}
+
+#[test]
+fn catalog_page_notification_host_failure_and_stop_end_the_watch() {
+    isolated_catalog_case(
+        "catalog_page_notification_host_failure_and_stop_end_the_watch",
+        || {
+            run_watch(WatchCase::PageHostFailure);
+            run_watch(WatchCase::PageHostStop);
+        },
     );
 }
 #[test]
@@ -667,6 +711,8 @@ enum RecoveryCase {
     CatalogProtocol,
     CatalogTransport,
     ResyncCatalogTransport,
+    ResyncPageHostFailure,
+    ResyncPageHostStop,
     Auth,
     ReplacementAuth,
     InitialEof,
@@ -1020,6 +1066,14 @@ fn run_recovery(case: RecoveryCase) {
                         closed(listen).await;
                         return;
                     }
+                    if matches!(case, RecoveryCase::ResyncPageHostFailure | RecoveryCase::ResyncPageHostStop) {
+                        let mut page = accept_page(&peer, "tools/list", replacement_id + 1, None).await;
+                        sse_head(&mut page).await;
+                        event(&mut page, &notification("tools/list"), false).await;
+                        closed(page).await;
+                        closed_without_request(&peer, listen).await;
+                        return;
+                    }
                     if matches!(case, RecoveryCase::ReconnectLimit) {
                         serve_page(&peer, "tools/list", replacement_id + 1, None, "after-gap", None)
                             .await;
@@ -1110,6 +1164,17 @@ fn run_recovery(case: RecoveryCase) {
                                     }
                                 }
                                 RecoveryEvent::Watch(WatchEvent::Notification(_)) => {
+                                    if matches!(case, RecoveryCase::ResyncPageHostFailure | RecoveryCase::ResyncPageHostStop) {
+                                        assert_eq!(snapshots.get(), 1);
+                                        assert_eq!(acknowledgments.get(), 2);
+                                        assert!(stats.invalidations > 0);
+                                        events.borrow_mut().push("notification");
+                                        return if matches!(case, RecoveryCase::ResyncPageHostFailure) {
+                                            Err(ManagedCatalogError::AbortedByHost)
+                                        } else {
+                                            Ok(Control::Stop)
+                                        };
+                                    }
                                     panic!("no admitted notification is expected in this fixture");
                                 }
                                 RecoveryEvent::Watch(WatchEvent::Snapshot(catalog)) => {
@@ -1180,7 +1245,7 @@ fn run_recovery(case: RecoveryCase) {
                     let result = watching.await;
                     match case {
                         RecoveryCase::Gap | RecoveryCase::DuringPage
-                        | RecoveryCase::StopGap | RecoveryCase::Generation => {
+                        | RecoveryCase::StopGap | RecoveryCase::Generation | RecoveryCase::ResyncPageHostStop => {
                             assert_eq!(result.unwrap(), Outcome::StoppedByHost);
                         }
                         RecoveryCase::Terminal | RecoveryCase::PeerCancellation => {
@@ -1239,7 +1304,7 @@ fn run_recovery(case: RecoveryCase) {
                         RecoveryCase::InitialEof => {
                             assert!(matches!(result, Err(WatchError::Subscription(_))));
                         }
-                        RecoveryCase::Host | RecoveryCase::GapHost => {
+                        RecoveryCase::Host | RecoveryCase::GapHost | RecoveryCase::ResyncPageHostFailure => {
                             assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::AbortedByHost))));
                         }
                         RecoveryCase::Drop | RecoveryCase::Preflight => unreachable!(),
@@ -1253,7 +1318,8 @@ fn run_recovery(case: RecoveryCase) {
                     RecoveryCase::Gap | RecoveryCase::Generation => 5,
                     RecoveryCase::DuringPage => 6,
                     RecoveryCase::CollectionLimit | RecoveryCase::RecordLimit | RecoveryCase::ReplacementAuth => 3,
-                    RecoveryCase::ReconnectLimit | RecoveryCase::ResyncCatalogTransport => 4,
+                    RecoveryCase::ReconnectLimit | RecoveryCase::ResyncCatalogTransport
+                    | RecoveryCase::ResyncPageHostFailure | RecoveryCase::ResyncPageHostStop => 4,
                     _ => 2,
                 };
                 assert_eq!(peer.posts.load(Ordering::SeqCst), expected_posts, "{case:?}");
@@ -1280,6 +1346,11 @@ fn run_recovery(case: RecoveryCase) {
                         assert_eq!(acknowledgments.get(), 2);
                         assert_eq!(snapshots.get(), 1);
                         assert_eq!(ids.get(), 3);
+                    }
+                    RecoveryCase::ResyncPageHostFailure | RecoveryCase::ResyncPageHostStop => {
+                        assert_eq!(*events.borrow(), ["ack", "snapshot", "gap", "ack", "notification"]);
+                        assert_eq!(ids.get(), 4);
+                        assert_eq!(snapshots.get(), 1);
                     }
                     RecoveryCase::Protocol | RecoveryCase::CatalogProtocol
                     | RecoveryCase::CatalogTransport | RecoveryCase::Auth
@@ -1368,6 +1439,17 @@ fn catalog_watch_recovery_rejects_protocol_auth_and_host_failures() {
             ] {
                 run_recovery(case);
             }
+        },
+    );
+}
+
+#[test]
+fn recovered_catalog_page_notification_host_failure_and_stop_are_terminal() {
+    isolated_catalog_case(
+        "recovered_catalog_page_notification_host_failure_and_stop_are_terminal",
+        || {
+            run_recovery(RecoveryCase::ResyncPageHostFailure);
+            run_recovery(RecoveryCase::ResyncPageHostStop);
         },
     );
 }
