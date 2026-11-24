@@ -102,6 +102,32 @@ pub const MODERN_MCP_ACCEPT: &str = "application/json, text/event-stream";
 pub const MODERN_MCP_ACCEPT_ENCODING: &str = "identity";
 pub const MODERN_MCP_CONTENT_TYPE: &str = "application/json";
 
+// SSE byte and event limits do not bound how many immediately ready body
+// frames a reader may consume before returning to the caller's scheduler.
+// Comments, inert fields, empty frames and partial events all spend this
+// allowance without requiring a dispatched MCP message.
+const MAX_READY_SSE_BODY_FRAMES_PER_TURN: usize = 64;
+
+fn poll_sse_body_frame<B: Body + Unpin>(
+    body: &mut B,
+    remaining_frames: &mut usize,
+    task_cx: &mut Context<'_>,
+) -> Poll<Option<Result<Frame<B::Data>, B::Error>>> {
+    if *remaining_frames == 0 {
+        *remaining_frames = MAX_READY_SSE_BODY_FRAMES_PER_TURN;
+        task_cx.waker().wake_by_ref();
+        return Poll::Pending;
+    }
+    let frame = Pin::new(body).poll_frame(task_cx);
+    match &frame {
+        Poll::Ready(Some(_)) => *remaining_frames -= 1,
+        Poll::Ready(None) | Poll::Pending => {
+            *remaining_frames = MAX_READY_SSE_BODY_FRAMES_PER_TURN;
+        }
+    }
+    frame
+}
+
 fn is_modern_http_final_server_notification(request: &JsonRpcRequest) -> bool {
     request.id.is_none()
         && final_2026_07_28_method(&request.method)
@@ -3837,6 +3863,8 @@ impl ModernHttpSseResponseStream {
     ///
     /// The returned payload is not JSON-RPC-admitted. Its caller must decode
     /// it through the protocol's strict response/notification admission path.
+    /// Ready body frames share a finite polling allowance, so comment-only
+    /// traffic cannot prevent cancellation or sibling work from being polled.
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<String>, ModernHttpExecutorError> {
         if self.is_closed() {
             return Err(ModernHttpExecutorError::SseStreamClosed);
@@ -3856,6 +3884,7 @@ impl ModernHttpSseResponseStream {
             return Ok(None);
         }
         let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
+        let mut remaining_frames = MAX_READY_SSE_BODY_FRAMES_PER_TURN;
 
         loop {
             if let Err(error) = check_modern_http_effects(cx) {
@@ -3874,7 +3903,10 @@ impl ModernHttpSseResponseStream {
                         check_modern_http_context(cx)?;
                         return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                     }
-                    match Pin::new(&mut response.body).poll_frame(task_cx) {
+                    if remaining_frames == 0 {
+                        response.body.check_deadline()?;
+                    }
+                    match poll_sse_body_frame(&mut response.body, &mut remaining_frames, task_cx) {
                         Poll::Ready(frame) => Poll::Ready(Ok(frame)),
                         Poll::Pending => Poll::Pending,
                     }
@@ -13160,6 +13192,7 @@ impl LegacySseResponseStream {
         &mut self,
         cx: &Cx,
     ) -> Result<Option<LegacySseEvent>, LegacySseHttpClientError> {
+        let mut remaining_frames = MAX_READY_SSE_BODY_FRAMES_PER_TURN;
         loop {
             if cx.checkpoint().is_err() {
                 self.close_for_cancellation();
@@ -13219,7 +13252,9 @@ impl LegacySseResponseStream {
                 if cx.now() >= wake_at {
                     return Poll::Ready(Err(LegacySseWaitInterrupt::DeadlineReached));
                 }
-                if let Poll::Ready(frame) = Pin::new(&mut response.body).poll_frame(task_cx) {
+                if let Poll::Ready(frame) =
+                    poll_sse_body_frame(&mut response.body, &mut remaining_frames, task_cx)
+                {
                     return Poll::Ready(Ok(frame));
                 }
                 let _caller = Cx::set_current(Some(cx.clone()));
@@ -14379,6 +14414,361 @@ mod tests {
     use crate::{
         CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolPolicy, ReverseRequestHandlers,
     };
+
+    mod sse_body_budget_tests {
+        use std::collections::VecDeque;
+        use std::future::{Future, poll_fn};
+        use std::io;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Waker};
+
+        use asupersync::bytes::Buf;
+        use asupersync::http::Body;
+        use asupersync::http::h1::{ClientIncomingBody, Http1Client, Method, Request};
+        use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
+        use asupersync::runtime::RuntimeBuilder;
+
+        use super::CountingWake;
+        use crate::http_executor::{MAX_READY_SSE_BODY_FRAMES_PER_TURN, poll_sse_body_frame};
+        #[cfg(feature = "legacy-2024-11-05")]
+        use crate::http_executor::{LegacySseEvent, LegacySseParser};
+        use crate::sse::{BoundedSseParser, SseLimits};
+
+        const SOURCE: &str =
+            r#"{"jsonrpc":"2.0","id":71,"result":{"zeta":1.20e+4,"alpha":{"second":2,"first":1}}}"#;
+
+        enum ReadStep {
+            Data(Vec<u8>),
+            Pending,
+        }
+
+        // Each scripted read carries one complete HTTP chunk. The real native
+        // body parser therefore returns deterministically ready frames without
+        // relying on TCP buffering or substituting a test-only SSE body.
+        struct ScriptedSseIo {
+            steps: VecDeque<ReadStep>,
+            offset: usize,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl AsyncRead for ScriptedSseIo {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                task_cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                match this.steps.front_mut() {
+                    Some(ReadStep::Pending) => {
+                        this.steps.pop_front();
+                        task_cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Some(ReadStep::Data(bytes)) => {
+                        let count = (bytes.len() - this.offset).min(buf.remaining());
+                        let end = this.offset + count;
+                        buf.put_slice(&bytes[this.offset..end]);
+                        this.offset = end;
+                        if end == bytes.len() {
+                            this.steps.pop_front();
+                            this.offset = 0;
+                        }
+                        this.reads.fetch_add(1, Ordering::SeqCst);
+                        Poll::Ready(Ok(()))
+                    }
+                    None => Poll::Ready(Ok(())),
+                }
+            }
+        }
+
+        impl AsyncWrite for ScriptedSseIo {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _task_cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(bytes.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _task_cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _task_cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        type NativeBody = ClientIncomingBody<ScriptedSseIo>;
+        type NativeBodyError = <NativeBody as Body>::Error;
+
+        fn native_body(steps: Vec<ReadStep>) -> (NativeBody, Arc<AtomicUsize>) {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let mut steps = VecDeque::from(steps);
+            steps.push_front(ReadStep::Data(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    .to_vec(),
+            ));
+            let io = ScriptedSseIo {
+                steps,
+                offset: 0,
+                reads: Arc::clone(&reads),
+            };
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .expect("native body fixture runtime");
+            let response = runtime
+                .block_on(Http1Client::request_streaming(
+                    io,
+                    Request::builder(Method::Get, "/events")
+                        .header("Host", "example.test")
+                        .build(),
+                ))
+                .expect("native chunked response head");
+            reads.store(0, Ordering::SeqCst);
+            (response.body, reads)
+        }
+
+        fn chunk(bytes: &[u8]) -> ReadStep {
+            assert!(!bytes.is_empty(), "an HTTP zero chunk ends the body");
+            let mut wire = format!("{:x}\r\n", bytes.len()).into_bytes();
+            wire.extend_from_slice(bytes);
+            wire.extend_from_slice(b"\r\n");
+            ReadStep::Data(wire)
+        }
+
+        fn payload_chunk() -> ReadStep {
+            chunk(format!("data: {SOURCE}\n\n").as_bytes())
+        }
+
+        fn modern_parser() -> BoundedSseParser {
+            BoundedSseParser::new(SseLimits::new(4096, 4096, 4096).unwrap())
+        }
+
+        fn modern_payload(parser: &mut BoundedSseParser, bytes: &[u8]) -> Option<String> {
+            let mut payloads = parser.push(bytes).expect("bounded modern SSE bytes");
+            assert!(payloads.len() <= 1, "fixture dispatches at most one event");
+            payloads.pop()
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        fn legacy_payload(parser: &mut LegacySseParser, bytes: &[u8]) -> Option<String> {
+            let mut payload = None;
+            parser
+                .push_with(bytes, |event| {
+                    let LegacySseEvent::Message(message) = event else {
+                        panic!("fixture only dispatches message events");
+                    };
+                    assert!(payload.is_none(), "fixture dispatches at most one event");
+                    payload = Some(message);
+                    Ok(())
+                })
+                .expect("bounded legacy SSE bytes");
+            payload
+        }
+
+        async fn next_payload(
+            body: &mut NativeBody,
+            mut parse: impl FnMut(&[u8]) -> Option<String>,
+        ) -> Result<Option<String>, NativeBodyError> {
+            let mut remaining = MAX_READY_SSE_BODY_FRAMES_PER_TURN;
+            loop {
+                let Some(frame) =
+                    poll_fn(|task_cx| poll_sse_body_frame(body, &mut remaining, task_cx)).await
+                else {
+                    return Ok(None);
+                };
+                let Some(mut bytes) = frame?.into_data() else {
+                    continue;
+                };
+                while bytes.has_remaining() {
+                    let data = bytes.chunk();
+                    let payload = parse(data);
+                    bytes.advance(data.len());
+                    if payload.is_some() {
+                        return Ok(payload);
+                    }
+                }
+            }
+        }
+
+        fn assert_ready_burst_yields(
+            steps: Vec<ReadStep>,
+            mut parse: impl FnMut(&[u8]) -> Option<String>,
+            drop_wait: bool,
+        ) {
+            let (mut body, reads) = native_body(steps);
+            let wakes = Arc::new(CountingWake::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut task_cx = Context::from_waker(&waker);
+            let mut wait = Box::pin(next_payload(&mut body, &mut parse));
+            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                MAX_READY_SSE_BODY_FRAMES_PER_TURN,
+                "one poll must stop before reading another ready HTTP chunk"
+            );
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            let resumed = if drop_wait {
+                drop(wait);
+                let mut resumed = Box::pin(next_payload(&mut body, &mut parse));
+                resumed.as_mut().poll(&mut task_cx)
+            } else {
+                wait.as_mut().poll(&mut task_cx)
+            };
+            let Poll::Ready(Ok(Some(payload))) = resumed else {
+                panic!("the remaining finite native stream must produce its payload: {resumed:?}");
+            };
+            assert_eq!(payload.as_bytes(), SOURCE.as_bytes());
+        }
+
+        fn fragmented_payload_steps() -> Vec<ReadStep> {
+            let mut steps = vec![chunk(b"data: ")];
+            steps.extend(SOURCE.as_bytes().iter().map(|byte| chunk(&[*byte])));
+            steps.push(chunk(b"\n\n"));
+            assert!(steps.len() > MAX_READY_SSE_BODY_FRAMES_PER_TURN);
+            assert!(steps.len() < MAX_READY_SSE_BODY_FRAMES_PER_TURN * 2);
+            steps
+        }
+
+        #[test]
+        fn sse_body_budget_short_native_event_is_immediately_ready() {
+            let (mut body, reads) = native_body(vec![payload_chunk()]);
+            let mut parser = modern_parser();
+            let wakes = Arc::new(CountingWake::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut wait = Box::pin(next_payload(&mut body, |bytes| {
+                modern_payload(&mut parser, bytes)
+            }));
+            let Poll::Ready(Ok(Some(payload))) =
+                wait.as_mut().poll(&mut Context::from_waker(&waker))
+            else {
+                panic!("an ordinary ready event should complete in its first poll");
+            };
+            assert_eq!(payload.as_bytes(), SOURCE.as_bytes());
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn sse_body_budget_modern_ready_inert_frames_yield_and_resume() {
+            // Blank SSE events and inert fields need a work bound just as
+            // comments do, even though none of them dispatches a message.
+            for inert in [b": keepalive\n\n".as_slice(), b"\n", b"ignored: value\n\n"] {
+                let mut steps = (0..=MAX_READY_SSE_BODY_FRAMES_PER_TURN)
+                    .map(|_| chunk(inert))
+                    .collect::<Vec<_>>();
+                steps.push(payload_chunk());
+                let mut parser = modern_parser();
+                assert_ready_burst_yields(
+                    steps,
+                    |bytes| modern_payload(&mut parser, bytes),
+                    false,
+                );
+            }
+        }
+
+        #[test]
+        fn sse_body_budget_dropped_modern_wait_preserves_partial_event() {
+            let mut parser = modern_parser();
+            assert_ready_burst_yields(
+                fragmented_payload_steps(),
+                |bytes| modern_payload(&mut parser, bytes),
+                true,
+            );
+            assert_eq!(parser.buffered_bytes(), 0);
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn sse_body_budget_legacy_ready_ignored_events_yield_and_resume() {
+            let mut steps = (0..=MAX_READY_SSE_BODY_FRAMES_PER_TURN)
+                .map(|_| chunk(b"event: unrelated\ndata: ignored\n\n"))
+                .collect::<Vec<_>>();
+            steps.push(payload_chunk());
+            let mut parser = LegacySseParser::default();
+            assert_ready_burst_yields(
+                steps,
+                |bytes| legacy_payload(&mut parser, bytes),
+                false,
+            );
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn sse_body_budget_dropped_legacy_wait_preserves_partial_event() {
+            let mut parser = LegacySseParser::default();
+            assert_ready_burst_yields(
+                fragmented_payload_steps(),
+                |bytes| legacy_payload(&mut parser, bytes),
+                true,
+            );
+            assert!(parser.line.is_empty());
+            assert!(parser.data.is_empty());
+        }
+
+        #[test]
+        fn sse_body_budget_native_pending_resets_the_next_turn_allowance() {
+            let mut steps = (0..3).map(|_| chunk(b": keepalive\n\n")).collect::<Vec<_>>();
+            steps.push(ReadStep::Pending);
+            steps.extend((0..MAX_READY_SSE_BODY_FRAMES_PER_TURN).map(|_| chunk(b"\n")));
+            steps.push(payload_chunk());
+            let (mut body, reads) = native_body(steps);
+            let mut parser = modern_parser();
+            let wakes = Arc::new(CountingWake::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut task_cx = Context::from_waker(&waker);
+            let mut wait = Box::pin(next_payload(&mut body, |bytes| {
+                modern_payload(&mut parser, bytes)
+            }));
+            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(reads.load(Ordering::SeqCst), 3);
+            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                3 + MAX_READY_SSE_BODY_FRAMES_PER_TURN,
+                "a real body Pending must restore the complete next-turn allowance"
+            );
+            let Poll::Ready(Ok(Some(payload))) = wait.as_mut().poll(&mut task_cx) else {
+                panic!("the event immediately after the allowance must remain readable");
+            };
+            assert_eq!(payload.as_bytes(), SOURCE.as_bytes());
+        }
+
+        #[test]
+        fn sse_body_budget_preserves_native_framing_error_and_clean_eof() {
+            for malformed in [false, true] {
+                let mut steps = (0..MAX_READY_SSE_BODY_FRAMES_PER_TURN)
+                    .map(|_| chunk(b": keepalive\n\n"))
+                    .collect::<Vec<_>>();
+                steps.push(ReadStep::Data(if malformed {
+                    b"invalid-chunk-size\r\n".to_vec()
+                } else {
+                    b"0\r\nX-Test-Trailer: retained\r\n\r\n".to_vec()
+                }));
+                let (mut body, reads) = native_body(steps);
+                let mut parser = modern_parser();
+                let mut wait = Box::pin(next_payload(&mut body, |bytes| {
+                    modern_payload(&mut parser, bytes)
+                }));
+                let mut task_cx = Context::from_waker(Waker::noop());
+                assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+                assert_eq!(reads.load(Ordering::SeqCst), MAX_READY_SSE_BODY_FRAMES_PER_TURN);
+                let result = wait.as_mut().poll(&mut task_cx);
+                if malformed {
+                    assert!(matches!(result, Poll::Ready(Err(_))), "{result:?}");
+                } else {
+                    assert!(matches!(result, Poll::Ready(Ok(None))), "{result:?}");
+                }
+            }
+        }
+    }
 
     mod modern_http_authority_tests {
         use super::*;
