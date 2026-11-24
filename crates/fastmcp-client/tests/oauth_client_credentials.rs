@@ -1425,3 +1425,205 @@ fn machine_resource_ca_cannot_authorize_issuer_metadata_tls() {
                 .expect("machine issuer TLS refusal must settle within its bound");
         }));
 }
+
+#[derive(Clone, Copy)]
+enum MachineCatalogObserverCase {
+    Continue,
+    Fail,
+    Stop,
+    Cancel,
+}
+
+fn run_machine_catalog_observer(case: MachineCatalogObserverCase) {
+    use std::cell::Cell;
+
+    use fastmcp_client::http_auth::discovery::client_credentials::rpc::ClientCredentialsCoreError;
+    use fastmcp_client::http_auth::discovery::client_credentials::rpc::catalog::watch::{
+        ClientCredentialsCatalogWatchControl as Control,
+        ClientCredentialsCatalogWatchError as WatchError,
+        ClientCredentialsCatalogWatchEvent as WatchEvent, ClientCredentialsCatalogWatchLimits,
+        ClientCredentialsCatalogWatchOutcome as Outcome,
+    };
+    use fastmcp_client::http_auth::discovery::client_credentials::rpc::catalog::{
+        ClientCredentialsCatalogClient, ClientCredentialsCatalogError,
+        ClientCredentialsCatalogLimits, ManagedCatalogError,
+    };
+    use fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY;
+
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(Box::pin(async {
+            let cx = Cx::current().unwrap();
+            let scenario = async {
+                let peer = Peer::new().await;
+                let plan = peer.plan(Duration::from_secs(15));
+                let ((), client) = pair(peer.metadata(Case::Complete), plan.discover(&cx)).await;
+                let client = client.unwrap();
+                acquire(&peer, &cx, &client, "access-one", 300).await;
+                let catalog = ClientCredentialsCatalogClient::new(
+                    client.clone(),
+                    ClientCredentialsCatalogLimits::default(),
+                );
+                let cancellation = McpRequestCancellation::new();
+                let acknowledgments = Cell::new(0);
+                let notifications = Cell::new(0);
+                let snapshots = Cell::new(0);
+                let ids = Cell::new(0_i64);
+                let server = async {
+                    peer.discovery(1, "access-one", DISCOVERY).await;
+                    let mut listen = peer.rpc(2, "subscriptions/listen", "access-one").await;
+                    listen
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    event(
+                        &mut listen,
+                        &json!({"jsonrpc":"2.0",
+                            "method":"notifications/subscriptions/acknowledged", "params":{
+                                "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):2},
+                                "notifications":{"toolsListChanged":true}
+                            }}).to_string(),
+                        false,
+                    )
+                    .await;
+                    peer.discovery(3, "access-one", DISCOVERY).await;
+                    let mut page = peer.rpc(4, "tools/list", "access-one").await;
+                    page.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    // The same inline invalidation exercises the positive and
+                    // refusal cases. Only the host's decision differs.
+                    event(&mut page, NOTICE, false).await;
+                    if matches!(case, MachineCatalogObserverCase::Continue) {
+                        closed(page).await;
+                        peer.operation(5, "tools/list", "access-one", LIST).await;
+                        closed(listen).await;
+                    } else {
+                        let mut closing = Box::pin(pair(closed(page), closed(listen)));
+                        poll_fn(|task| {
+                            assert!(
+                                peer.listener.poll_accept(task).is_pending(),
+                                "a refused observer must not start another discovery or list POST"
+                            );
+                            closing.as_mut().poll(task)
+                        })
+                        .await;
+                    }
+                };
+                let application = async {
+                    let result = catalog
+                        .watch_with_cancellation(
+                            &cx,
+                            &cancellation,
+                            core("tools/list"),
+                            ClientCredentialsCatalogWatchLimits::new(
+                                Duration::from_secs(10),
+                                2,
+                                6,
+                                4096,
+                                16,
+                            )
+                            .unwrap(),
+                            || {
+                                let first = ids.get() + 1;
+                                ids.set(first + 1);
+                                Ok((RequestId::Number(first), RequestId::Number(first + 1)))
+                            },
+                            |event| {
+                                match event {
+                                    WatchEvent::Acknowledged { accepted_filter } => {
+                                        assert_eq!(accepted_filter.tools_list_changed, Some(true));
+                                        acknowledgments.set(acknowledgments.get() + 1);
+                                    }
+                                    WatchEvent::Notification(_) => {
+                                        notifications.set(notifications.get() + 1);
+                                        match case {
+                                            MachineCatalogObserverCase::Continue => {}
+                                            MachineCatalogObserverCase::Fail => {
+                                                return Err(ManagedCatalogError::StateLimit.into());
+                                            }
+                                            MachineCatalogObserverCase::Stop => {
+                                                return Ok(Control::Stop);
+                                            }
+                                            MachineCatalogObserverCase::Cancel => {
+                                                cancellation.cancel();
+                                                return Err(ManagedCatalogError::StateLimit.into());
+                                            }
+                                        }
+                                    }
+                                    WatchEvent::Snapshot(snapshot) => {
+                                        snapshots.set(snapshots.get() + 1);
+                                        assert_eq!(acknowledgments.get(), 1);
+                                        assert_eq!(snapshot.credential_generation(), 1);
+                                        assert_eq!(snapshot.item_count(), 0);
+                                        assert_eq!(snapshot.pages().len(), 1);
+                                        let encoded = snapshot.pages()[0].encode().unwrap();
+                                        assert!(encoded.contains("900719925474099312345"));
+                                        assert!(encoded.contains("1.20e+4"));
+                                        return Ok(Control::Stop);
+                                    }
+                                }
+                                Ok(Control::Continue)
+                            },
+                        )
+                        .await;
+                    match case {
+                        MachineCatalogObserverCase::Continue | MachineCatalogObserverCase::Stop => {
+                            assert_eq!(result.unwrap(), Outcome::StoppedByHost);
+                        }
+                        MachineCatalogObserverCase::Fail => assert!(matches!(
+                            result,
+                            Err(WatchError::Catalog(ClientCredentialsCatalogError::Catalog(
+                                ManagedCatalogError::StateLimit
+                            )))
+                        )),
+                        MachineCatalogObserverCase::Cancel => assert!(matches!(
+                            result,
+                            Err(WatchError::Catalog(ClientCredentialsCatalogError::Core(
+                                ClientCredentialsCoreError::Authentication(Error::Discovery(
+                                    OAuthDiscoveryError::Cancelled
+                                ))
+                            )))
+                        )),
+                    }
+                };
+                pair(server, application).await;
+                let continued = matches!(case, MachineCatalogObserverCase::Continue);
+                let expected_requests = if continued { 6 } else { 4 };
+                assert_eq!(peer.rpcs.load(Ordering::SeqCst), expected_requests);
+                assert_eq!(ids.get(), expected_requests as i64);
+                assert_eq!(acknowledgments.get(), 1);
+                assert_eq!(notifications.get(), 1);
+                assert_eq!(snapshots.get(), usize::from(continued));
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+                assert!(cx.checkpoint().is_ok());
+                assert_eq!(client.credential(&cx).await.unwrap().generation(), 1);
+                peer.quiet();
+            };
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)
+                .await
+                .expect("machine catalog observer handling must settle within its bound");
+        }));
+}
+
+#[test]
+fn machine_catalog_watch_rebuilds_after_accepted_inline_change() {
+    run_machine_catalog_observer(MachineCatalogObserverCase::Continue);
+}
+
+#[test]
+fn machine_catalog_watch_preserves_inline_observer_failure() {
+    run_machine_catalog_observer(MachineCatalogObserverCase::Fail);
+}
+
+#[test]
+fn machine_catalog_watch_stops_after_inline_observer_stop() {
+    run_machine_catalog_observer(MachineCatalogObserverCase::Stop);
+}
+
+#[test]
+fn machine_catalog_watch_caller_cancellation_wins_over_inline_observer_failure() {
+    run_machine_catalog_observer(MachineCatalogObserverCase::Cancel);
+}

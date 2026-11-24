@@ -384,10 +384,11 @@ impl ClientCredentialsCatalogClient {
                                         Ok(pair)
                                     },
                                     |notification| {
-                                        // collect invalidates before this callback.
-                                        if relevant(kind, &notification) {
-                                            signal.changed()?;
-                                        }
+                                        // collect already invalidated the catalog.
+                                        // Deliver the host decision before local
+                                        // cancellation can mask a callback failure
+                                        // as permission to rebuild the traversal.
+                                        let changed = relevant(kind, &notification);
                                         check_binding(
                                             cx,
                                             cancellation,
@@ -408,6 +409,9 @@ impl ClientCredentialsCatalogClient {
                                             Some(&binding),
                                         )?;
                                         if continuing {
+                                            if changed {
+                                                signal.changed()?;
+                                            }
                                             Ok(())
                                         } else {
                                             Err(ManagedCatalogError::AbortedByHost.into())
