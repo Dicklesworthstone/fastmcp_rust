@@ -34,7 +34,6 @@ use fastmcp_protocol::{
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::{CoreResult, ExtensionDirection, FinalCoreResult};
 
-#[cfg(feature = "tasks")]
 use super::OAuthCredentialSnapshot;
 use super::{
     MAX_MANAGED_MCP_MESSAGE_BYTES, ManagedOAuthResponse, ManagedOAuthSession, OAuthSessionError,
@@ -240,6 +239,67 @@ impl ManagedOAuthSession {
         .await
     }
 
+    // Catalog recovery must keep the opening credential even if another caller
+    // renews the shared login. No replacement grant is acquired on this path.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::http_auth) async fn subscribe_core_with_snapshot(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &OAuthCredentialSnapshot,
+        request: CoreRequest,
+        request_id: RequestId,
+        limits: ManagedSubscriptionLimits,
+        deadline: Time,
+    ) -> Result<ManagedSubscription, ManagedSubscriptionError> {
+        self.check(cx, cancellation)?;
+        let deadline = deadline.min(deadline_after(cx, limits.timeout)?);
+        let (wire, requested) = prepare(self.resource().as_str(), request, &request_id, limits)?;
+        let response = Box::pin(self.execute_subscription_snapshot(
+            cx,
+            cancellation,
+            deadline,
+            credential,
+            &wire,
+        ))
+        .await?;
+        Box::pin(ManagedSubscription::open_response(
+            cx,
+            response,
+            request_id,
+            requested,
+            limits,
+            deadline,
+            SubscriptionProfile::Core,
+        ))
+        .await
+    }
+
+    // Use the managed owner's existing cancellation, expiry, revocation and
+    // session-closure wakes while idle. Backoff never needs a token lookup.
+    pub(in crate::http_auth) async fn wait_subscription_backoff(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &OAuthCredentialSnapshot,
+        deadline: Time,
+        delay: Duration,
+    ) -> Result<(), OAuthSessionError> {
+        let until = deadline_after(cx, delay)?;
+        self.await_credential(
+            cx,
+            cancellation,
+            deadline,
+            credential.expires_at,
+            &credential.credential.revoked,
+            async {
+                asupersync::time::Sleep::new(until).await;
+                Ok(())
+            },
+        )
+        .await
+    }
+
     /// Opens an official Tasks listen, optionally composed with core filters.
     /// The typed request must advertise exactly `io.modelcontextprotocol/tasks`
     /// with empty settings and contain a present `taskIds` filter. Empty and
@@ -353,7 +413,6 @@ impl ManagedOAuthSession {
         .await
     }
 
-    #[cfg(feature = "tasks")]
     async fn execute_subscription_snapshot(
         &self,
         cx: &Cx,
@@ -362,45 +421,13 @@ impl ManagedOAuthSession {
         credential: &OAuthCredentialSnapshot,
         wire: &ModernHttpRequest,
     ) -> Result<ManagedOAuthResponse, ManagedSubscriptionError> {
-        self.check(cx, cancellation)?;
-        // All callers construct this wire against this session's exact resource.
-        super::admit_target(self.resource(), wire.target())?;
-        // Both discovery and listen require the selected live credential;
-        // withholding its header must not silently dispatch anonymously.
-        let wire = credential.authorize_request(wire)?;
-        let head_deadline =
-            deadline.min(deadline_after(cx, self.inner.policy.response_head_timeout)?);
-        let executor = self.inner.client.resource_http_executor();
-        let response = self
-            .await_credential(
-                cx,
-                cancellation,
-                head_deadline,
-                credential.expires_at,
-                &credential.credential.revoked,
-                async {
-                    executor
-                        .execute_with_cancellation(cx, cancellation, &wire)
-                        .await
-                        .map_err(OAuthSessionError::Http)
-                },
-            )
-            .await?;
-        if matches!(response.metadata().status(), 401 | 403) {
-            return Err(OAuthSessionError::AuthorizationRejected {
-                status: response.metadata().status(),
-            }
-            .into());
-        }
+        let response =
+            Box::pin(self.execute_with_snapshot(cx, cancellation, wire, credential, deadline))
+                .await?;
         if response.metadata().status() != 200 {
             return Err(ManagedSubscriptionError::InvalidResponse);
         }
-        Ok(ManagedOAuthResponse::from_snapshot(
-            response,
-            self.clone(),
-            cancellation.clone(),
-            credential,
-        ))
+        Ok(response)
     }
 }
 

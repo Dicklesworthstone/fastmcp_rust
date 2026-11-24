@@ -33,7 +33,8 @@ use fastmcp_protocol::{
 use serde::Deserialize;
 
 use super::managed::{
-    ManagedOAuthResponse, ManagedOAuthSession, ManagedOAuthSseStream, OAuthSessionError,
+    ManagedOAuthResponse, ManagedOAuthSession, ManagedOAuthSseStream, OAuthCredentialSnapshot,
+    OAuthSessionError,
 };
 use crate::http_executor::{ModernHttpRequest, ModernHttpResponseKind};
 use crate::sse::SseLimits;
@@ -241,6 +242,30 @@ impl ManagedOAuthSession {
                 .await
                 .map_err(ManagedCoreError::from)
         })
+        .await?;
+        ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)
+    }
+
+    // A watched catalog and its subscription share one opening credential.
+    // Reuse ordinary RPC admission/decoding without acquiring a newer grant.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_core_with_snapshot(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        request_id: RequestId,
+        limits: ManagedCoreLimits,
+        snapshot: &OAuthCredentialSnapshot,
+        deadline: Time,
+    ) -> Result<ManagedCoreCall, ManagedCoreError> {
+        let deadline = deadline.min(call_deadline(cx, cancellation, limits.timeout)?);
+        let (wire, decoder) = prepare(self.resource().as_str(), request, request_id, limits)?;
+        let response = Box::pin(bounded_wait(cx, cancellation, deadline, async {
+            Box::pin(self.execute_with_snapshot(cx, cancellation, &wire, snapshot, deadline))
+                .await
+                .map_err(ManagedCoreError::from)
+        }))
         .await?;
         ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)
     }

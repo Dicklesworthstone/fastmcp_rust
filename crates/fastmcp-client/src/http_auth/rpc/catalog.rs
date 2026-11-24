@@ -28,7 +28,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use asupersync::Cx;
+use asupersync::{Cx, types::Time};
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{
     CacheScope, CoreRequest, CoreResult, FINAL_PROTOCOL_VERSION, FinalCoreRequest, FinalCoreResult,
@@ -45,6 +45,7 @@ use crate::cache::{
     MAX_FINAL_CACHE_MAX_BYTES, final_cache_hints,
 };
 use crate::http_auth::BoundBearerCredential;
+use crate::http_auth::managed::{OAuthCredentialSnapshot, OAuthSessionError};
 
 /// Subscription-driven full-catalog reconciliation with bounded restart policy.
 pub mod watch;
@@ -304,15 +305,45 @@ impl ManagedCatalogClient {
         &self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
-        mut request: CoreRequest,
-        mut next_id: I,
-        mut observe: O,
+        request: CoreRequest,
+        next_id: I,
+        observe: O,
     ) -> Result<CollectedCatalog, ManagedCatalogError>
     where
         I: FnMut() -> Result<RequestId, ManagedCatalogError>,
         O: FnMut(Box<ServerNotification>) -> Result<(), ManagedCatalogError>,
     {
         let deadline = call_deadline(cx, cancellation, self.limits.core.timeout)?;
+        Box::pin(self.collect_with_binding(
+            cx,
+            cancellation,
+            request,
+            next_id,
+            observe,
+            None,
+            deadline,
+        ))
+        .await
+    }
+
+    // A live catalog watch cannot switch credentials between its listen and
+    // page POSTs. Standalone collection retains its existing renewal checks.
+    #[allow(clippy::too_many_arguments)]
+    async fn collect_with_binding<I, O>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        mut request: CoreRequest,
+        mut next_id: I,
+        mut observe: O,
+        binding: Option<&OAuthCredentialSnapshot>,
+        deadline: Time,
+    ) -> Result<CollectedCatalog, ManagedCatalogError>
+    where
+        I: FnMut() -> Result<RequestId, ManagedCatalogError>,
+        O: FnMut(Box<ServerNotification>) -> Result<(), ManagedCatalogError>,
+    {
+        let deadline = deadline.min(call_deadline(cx, cancellation, self.limits.core.timeout)?);
         let kind = CatalogKind::of(&request)?;
         let maximum_rebuilds = match self.consistency {
             ManagedCatalogConsistency::PerPage => None,
@@ -334,12 +365,29 @@ impl ManagedCatalogClient {
         let mut state = Traversal::new(list_params(&request)?.cursor.as_deref(), self.limits)?;
         Box::pin(bounded_wait(cx, cancellation, deadline, async {
             Ok(async {
-                let credential = self
-                    .session
-                    .credential_with_cancellation(cx, cancellation)
-                    .await
-                    .map_err(ManagedCoreError::from)?;
-                require_unrevoked(credential.credential())?;
+                let acquired_credential;
+                let credential = if let Some(credential) = binding {
+                    credential
+                } else {
+                    acquired_credential = self
+                        .session
+                        .credential_with_cancellation(cx, cancellation)
+                        .await
+                        .map_err(ManagedCoreError::from)?;
+                    &acquired_credential
+                };
+                let require_credential = || -> Result<(), ManagedCatalogError> {
+                    require_unrevoked(credential.credential())?;
+                    // Bound collection must fail before POSTs, cache fills and
+                    // publication rather than renewing the watch's credential.
+                    if binding.is_some() && Instant::now() >= credential.expires_at() {
+                        return Err(
+                            ManagedCoreError::Session(OAuthSessionError::LoginRequired).into()
+                        );
+                    }
+                    Ok(())
+                };
+                require_credential()?;
                 let generation = credential.generation();
                 let result_set = kind.result_set();
                 let mut rebuilds = 0;
@@ -353,7 +401,7 @@ impl ManagedCatalogClient {
                     let attempt = async {
                         loop {
                             check_call(cx, cancellation, deadline)?;
-                            require_unrevoked(credential.credential())?;
+                            require_credential()?;
                             self.require_generation(&result_set, cache_generation)?;
                             if state.pages >= self.limits.maximum_pages {
                                 return Err(ManagedCatalogError::PageLimit);
@@ -398,12 +446,23 @@ impl ManagedCatalogClient {
                                     check_call(cx, cancellation, deadline)?;
                                     // Host callbacks can revoke a shared credential or
                                     // invalidate this catalog without yielding first.
-                                    require_unrevoked(credential.credential())?;
+                                    require_credential()?;
                                     self.require_generation(&result_set, cache_generation)?;
                                     state.reserve_id(&id, self.limits.maximum_state_bytes)?;
                                     // This is the existing one-POST core API, not a new
                                     // response parser. Carry its counters across pages.
-                                    let mut call =
+                                    let mut call = if binding.is_some() {
+                                        Box::pin(self.session.request_core_with_snapshot(
+                                            cx,
+                                            cancellation,
+                                            request.clone(),
+                                            id,
+                                            self.limits.core,
+                                            credential,
+                                            deadline,
+                                        ))
+                                        .await?
+                                    } else {
                                         Box::pin(self.session.request_core_with_cancellation(
                                             cx,
                                             cancellation,
@@ -411,7 +470,8 @@ impl ManagedCatalogClient {
                                             id,
                                             self.limits.core,
                                         ))
-                                        .await?;
+                                        .await?
+                                    };
                                     if call.credential_generation() != generation {
                                         return Err(ManagedCatalogError::CredentialChanged);
                                     }
@@ -426,14 +486,14 @@ impl ManagedCatalogClient {
                                         state.bytes = call.decoder.bytes;
                                         state.notifications = call.decoder.notifications;
                                         check_call(cx, cancellation, deadline)?;
-                                        require_unrevoked(credential.credential())?;
+                                        require_credential()?;
                                         match event {
                                             ManagedCoreEvent::Notification(notification) => {
                                                 self.invalidate_notification(&notification)?;
                                                 observe(notification)
                                                     .inspect_err(|_| host_failed = true)?;
                                                 check_call(cx, cancellation, deadline)?;
-                                                require_unrevoked(credential.credential())?;
+                                                require_credential()?;
                                                 self.require_generation(
                                                     &result_set,
                                                     cache_generation,
@@ -456,7 +516,7 @@ impl ManagedCatalogClient {
                                 if cache.begin_fetch(&result_set) != cache_generation {
                                     return Err(ManagedCatalogError::Invalidated);
                                 }
-                                require_unrevoked(credential.credential())?;
+                                require_credential()?;
                                 if state.cache_ambiguous && cache_writes {
                                     if maximum_rebuilds.is_some() && !bypass_cache {
                                         // A cached cycle cannot authorize mixing its
@@ -483,26 +543,29 @@ impl ManagedCatalogClient {
                                     }
                                 }
                             }
-                            require_unrevoked(credential.credential())?;
+                            require_credential()?;
                             pages.push(result);
                             let Some(cursor) = next else { break };
                             list_params_mut(&mut request)?.cursor = Some(cursor);
                         }
-                        // Verify that a cached collection did not outlive its login or
-                        // cross a renewal while callbacks/other page fetches were active.
-                        require_unrevoked(credential.credential())?;
-                        let current = self
-                            .session
-                            .credential_with_cancellation(cx, cancellation)
-                            .await
-                            .map_err(ManagedCoreError::from)?;
-                        if current.generation() != generation {
-                            return Err(ManagedCatalogError::CredentialChanged);
+                        require_credential()?;
+                        if binding.is_none() {
+                            // Standalone collection retains its generation fence.
+                            // A bound watch instead keeps its original live grant,
+                            // even if a sibling has renewed the shared session.
+                            let current = self
+                                .session
+                                .credential_with_cancellation(cx, cancellation)
+                                .await
+                                .map_err(ManagedCoreError::from)?;
+                            if current.generation() != generation {
+                                return Err(ManagedCatalogError::CredentialChanged);
+                            }
+                            require_unrevoked(current.credential())?;
                         }
                         self.require_generation(&result_set, cache_generation)?;
                         check_call(cx, cancellation, deadline)?;
-                        require_unrevoked(credential.credential())?;
-                        require_unrevoked(current.credential())?;
+                        require_credential()?;
                         Ok(CollectedCatalog {
                             kind,
                             pages,
@@ -517,7 +580,7 @@ impl ManagedCatalogClient {
                             if maximum_rebuilds.is_some() && !host_failed =>
                         {
                             check_call(cx, cancellation, deadline)?;
-                            require_unrevoked(credential.credential())?;
+                            require_credential()?;
                             if rebuilds >= maximum_rebuilds.unwrap_or(0) {
                                 return Err(ManagedCatalogError::RebuildLimit);
                             }

@@ -3,10 +3,12 @@
 //! traverse native HTTP/SSE. The parent target requires native-tls-roots.
 use super::*;
 use fastmcp_client::http_auth::managed::OAuthSessionError;
+use fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionError;
 use fastmcp_client::http_auth::rpc::catalog::watch::{
     ManagedCatalogWatchControl as Control, ManagedCatalogWatchError as WatchError,
     ManagedCatalogWatchEvent as WatchEvent, ManagedCatalogWatchLimits,
-    ManagedCatalogWatchOutcome as Outcome,
+    ManagedCatalogWatchOutcome as Outcome, ManagedCatalogWatchRecoveryEvent as RecoveryEvent,
+    ManagedCatalogWatchRecoveryPolicy as RecoveryPolicy,
 };
 use fastmcp_client::http_auth::rpc::catalog::{
     ManagedCatalogClient, ManagedCatalogConsistency, ManagedCatalogError, ManagedCatalogLimits,
@@ -47,9 +49,13 @@ enum WatchCase {
 }
 
 fn isolated_watch(name: &str, case: WatchCase) {
+    isolated_catalog_case(name, || run_watch(case));
+}
+
+fn isolated_catalog_case(name: &str, run: impl FnOnce()) {
     if let Ok(selected) = std::env::var(WATCH_CHILD) {
         assert_eq!(selected, name);
-        run_watch(case);
+        run();
         return;
     }
     let roots = RootFile::create();
@@ -637,5 +643,739 @@ fn whole_catalog_policy_preserves_the_external_clear_publication_fence() {
     isolated_watch(
         "whole_catalog_policy_preserves_the_external_clear_publication_fence",
         WatchCase::WholeClearPublication,
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RecoveryCase {
+    Gap,
+    DuringPage,
+    ReconnectLimit,
+    CollectionLimit,
+    IdLimit,
+    IdBytes,
+    RepeatedId,
+    RecordLimit,
+    Cancel,
+    Drop,
+    StopGap,
+    Deadline,
+    Revoked,
+    SessionClose,
+    Expired,
+    Protocol,
+    CatalogProtocol,
+    CatalogTransport,
+    ResyncCatalogTransport,
+    Auth,
+    ReplacementAuth,
+    InitialEof,
+    Terminal,
+    PeerCancellation,
+    Host,
+    GapHost,
+    Generation,
+    Preflight,
+}
+
+async fn accept_recovery_listen(peer: &Peer, id: i64) -> TlsStream<TcpStream> {
+    let (tls, body) = peer.request(false).await;
+    let wire: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(wire["id"], id, "each replacement has a fresh listen ID");
+    assert_eq!(wire["method"], "subscriptions/listen");
+    assert_eq!(
+        wire["params"],
+        json!({
+            "_meta": request("tools/list").encode_params().unwrap().unwrap()["_meta"],
+            "notifications": filter("tools/list"),
+        })
+    );
+    tls
+}
+
+async fn acknowledge_recovery_listen(
+    peer: &Peer,
+    cx: &Cx,
+    tls: &mut TlsStream<TcpStream>,
+    id: i64,
+) {
+    sse_head(tls).await;
+    tls.flush().await.unwrap();
+    Sleep::new(cx.now().saturating_add_nanos(20_000_000)).await;
+    peer.quiet(); // A previous ACK or cached page cannot admit a replacement list.
+    event(
+        tls,
+        &json!({
+            "jsonrpc":"2.0",
+            "method":"notifications/subscriptions/acknowledged",
+            "params":{
+                "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):id},
+                "notifications":filter("tools/list"),
+            }
+        })
+        .to_string(),
+        false,
+    )
+    .await;
+}
+
+async fn deny_recovery_listen(mut tls: TlsStream<TcpStream>) {
+    tls.write_all(
+        b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    )
+    .await
+    .unwrap();
+    tls.flush().await.unwrap();
+}
+
+async fn interrupt_catalog_page(peer: &Peer, id: i64) {
+    let mut tls = accept_page(peer, "tools/list", id, None).await;
+    tls.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{",
+    )
+    .await
+    .unwrap();
+    tls.flush().await.unwrap();
+    // The advertised body is truncated. A list body failure is not a listen gap.
+}
+
+// The parent fixture intentionally admits only authorization-code token POSTs.
+// This one scenario explicitly admits a refresh exchange and rotates the bearer.
+async fn refresh_recovery_login(peer: &Peer) {
+    let (socket, _) = peer.listener.accept().await.unwrap();
+    let mut tls = peer.acceptor.accept(socket).await.unwrap();
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 2048];
+    let end = loop {
+        let count = tls.read(&mut chunk).await.unwrap();
+        assert!(count > 0 && bytes.len() + count <= 32 * 1024);
+        bytes.extend_from_slice(&chunk[..count]);
+        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let head = std::str::from_utf8(&bytes[..end]).unwrap();
+    assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
+    let headers: BTreeMap<String, String> = head
+        .lines()
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+        })
+        .collect();
+    assert!(!headers.contains_key("authorization"));
+    let size: usize = headers["content-length"].parse().unwrap();
+    assert!(end + size <= 32 * 1024);
+    while bytes.len() < end + size {
+        let count = tls.read(&mut chunk).await.unwrap();
+        assert!(count > 0 && bytes.len() + count <= 32 * 1024);
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    assert_eq!(bytes.len(), end + size);
+    let fields = form(std::str::from_utf8(&bytes[end..]).unwrap());
+    assert_eq!(fields["grant_type"], "refresh_token");
+    assert_eq!(fields["refresh_token"], "interaction-refresh");
+    assert_eq!(fields["resource"], peer.resource());
+    peer.tokens.fetch_add(1, Ordering::SeqCst);
+    json_reply(
+        &mut tls,
+        &json!({
+            "access_token":"replacement-access", "token_type":"Bearer",
+            "expires_in":300, "refresh_token":"replacement-refresh",
+        })
+        .to_string(),
+    )
+    .await;
+}
+
+fn run_recovery(case: RecoveryCase) {
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(Box::pin(async {
+            let cx = Cx::current().unwrap();
+            let scenario = Box::pin(async {
+                let peer = Peer::new().await;
+                let login = async {
+                    let (mut tls, _) = peer.request(true).await;
+                    let seconds = match case {
+                        RecoveryCase::Expired => 2,
+                        RecoveryCase::Generation => 8,
+                        _ => 300,
+                    };
+                    json_reply(
+                        &mut tls,
+                        &json!({
+                            "access_token":"interaction-access", "token_type":"Bearer",
+                            "expires_in":seconds, "refresh_token":"interaction-refresh",
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                };
+                let policy = OAuthSessionPolicy::new(
+                    if matches!(case, RecoveryCase::Generation) {
+                        Duration::from_secs(4)
+                    } else {
+                        Duration::ZERO
+                    },
+                    Duration::from_secs(30),
+                    Duration::from_secs(15),
+                    64,
+                )
+                .unwrap();
+                let ((), session) = pair(
+                    Box::pin(login),
+                    Box::pin(ManagedOAuthSession::authorize(&cx, peer.client(), policy, browser)),
+                )
+                .await;
+                let session = session.unwrap();
+                let credential = session.credential(&cx).await.unwrap();
+                let limits = ManagedCatalogLimits::new(
+                    ManagedCoreLimits::new(4096, 4096, 65536, 16, Duration::from_secs(15))
+                        .unwrap(),
+                    16,
+                    128,
+                    16384,
+                )
+                .unwrap();
+                let client = ManagedCatalogClient::new(session.clone(), limits)
+                    .with_cache_limits(16, 1048576)
+                    .unwrap();
+                let watch_limits = ManagedCatalogWatchLimits::new(
+                    if matches!(case, RecoveryCase::Deadline) {
+                        Duration::from_secs(1)
+                    } else {
+                        Duration::from_secs(15)
+                    },
+                    if matches!(case, RecoveryCase::CollectionLimit) { 1 } else { 8 },
+                    if matches!(case, RecoveryCase::IdLimit) { 2 } else { 64 },
+                    if matches!(case, RecoveryCase::IdBytes) { 2 } else { 16384 },
+                    if matches!(case, RecoveryCase::RecordLimit) { 2 } else { 128 },
+                )
+                .unwrap();
+                let backoff = if matches!(
+                    case,
+                    RecoveryCase::Deadline
+                        | RecoveryCase::Expired
+                        | RecoveryCase::Cancel
+                        | RecoveryCase::Revoked
+                        | RecoveryCase::SessionClose
+                ) {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(20)
+                };
+                let recovery = RecoveryPolicy::new(
+                    if matches!(case, RecoveryCase::ReconnectLimit) { 1 } else { 3 },
+                    backoff,
+                    backoff,
+                )
+                .unwrap();
+                let snapshots = Cell::new(0_usize);
+                let acknowledgments = Cell::new(0_usize);
+                let gaps = Cell::new(0_usize);
+                let ids = Cell::new(0_i64);
+                let events = std::cell::RefCell::new(Vec::new());
+                let cancellation = McpRequestCancellation::new();
+                let (first_tx, mut first_rx) = oneshot::channel::<()>();
+                let (second_tx, mut second_rx) = oneshot::channel::<()>();
+                let mut first_tx = Some(first_tx);
+                let mut second_tx = Some(second_tx);
+
+                let server = Box::pin(async {
+                    if matches!(case, RecoveryCase::Preflight) {
+                        return;
+                    }
+                    let mut listen = accept_recovery_listen(&peer, 1).await;
+                    if matches!(case, RecoveryCase::Auth) {
+                        deny_recovery_listen(listen).await;
+                        return;
+                    }
+                    if matches!(case, RecoveryCase::InitialEof) {
+                        sse_head(&mut listen).await;
+                        listen.flush().await.unwrap();
+                        return;
+                    }
+                    acknowledge_recovery_listen(&peer, &cx, &mut listen, 1).await;
+                    if matches!(case, RecoveryCase::Host) {
+                        closed(listen).await;
+                        return;
+                    }
+                    if matches!(case, RecoveryCase::Protocol) {
+                        let pending = accept_page(&peer, "tools/list", 2, None).await;
+                        event(
+                            &mut listen,
+                            &json!({
+                                "jsonrpc":"2.0", "method":"notifications/tools/list_changed",
+                                "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):999}},
+                            })
+                            .to_string(),
+                            false,
+                        )
+                        .await;
+                        closed(pending).await;
+                        closed(listen).await;
+                        return;
+                    }
+                    if matches!(case, RecoveryCase::CatalogProtocol) {
+                        let mut page = accept_page(&peer, "tools/list", 2, None).await;
+                        json_reply(
+                            &mut page,
+                            &terminal(2, r#"{"resultType":"complete","wrong":[],"ttlMs":0,"cacheScope":"private"}"#),
+                        )
+                        .await;
+                        drop(page);
+                        closed(listen).await;
+                        return;
+                    }
+                    if matches!(case, RecoveryCase::CatalogTransport) {
+                        interrupt_catalog_page(&peer, 2).await;
+                        closed(listen).await;
+                        return;
+                    }
+                    let replacement_id = if matches!(case, RecoveryCase::DuringPage) {
+                        serve_page(&peer, "tools/list", 2, None, "obsolete-prefix", Some("old-tail"))
+                            .await;
+                        let pending = accept_page(&peer, "tools/list", 3, Some("old-tail")).await;
+                        drop(listen);
+                        closed(pending).await;
+                        4
+                    } else {
+                        serve_page(&peer, "tools/list", 2, None, "before-gap", None).await;
+                        first_rx.recv(&cx).await.unwrap();
+                        if matches!(case, RecoveryCase::Terminal) {
+                            event(
+                                &mut listen,
+                                &terminal(1, &json!({
+                                    "resultType":"complete",
+                                    "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):1},
+                                }).to_string()),
+                                true,
+                            ).await;
+                            return;
+                        }
+                        if matches!(case, RecoveryCase::PeerCancellation) {
+                            event(
+                                &mut listen,
+                                &json!({
+                                    "jsonrpc":"2.0", "method":"notifications/cancelled",
+                                    "params":{
+                                        "requestId":1,
+                                        "reason":"catalog watch complete",
+                                        "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):1},
+                                    },
+                                }).to_string(),
+                                false,
+                            ).await;
+                            closed(listen).await;
+                            return;
+                        }
+                        if matches!(case, RecoveryCase::Generation) {
+                            // Renewal is permitted halfway through this 8-second
+                            // grant. Keep ample original lifetime for recovery.
+                            let refresh_at = credential.expires_at()
+                                .checked_sub(Duration::from_millis(3800)).unwrap();
+                            let wait = refresh_at.saturating_duration_since(Instant::now());
+                            Sleep::new(cx.now().saturating_add_nanos(
+                                u64::try_from(wait.as_nanos()).unwrap(),
+                            )).await;
+                        }
+                        drop(listen);
+                        3
+                    };
+
+                    if matches!(
+                        case,
+                        RecoveryCase::IdLimit
+                            | RecoveryCase::IdBytes
+                            | RecoveryCase::RepeatedId
+                            | RecoveryCase::Cancel
+                            | RecoveryCase::Drop
+                            | RecoveryCase::StopGap
+                            | RecoveryCase::Deadline
+                            | RecoveryCase::Revoked
+                            | RecoveryCase::SessionClose
+                            | RecoveryCase::Expired
+                            | RecoveryCase::GapHost
+                    ) {
+                        return;
+                    }
+                    if matches!(case, RecoveryCase::Generation) {
+                        refresh_recovery_login(&peer).await;
+                    }
+                    let mut listen = accept_recovery_listen(&peer, replacement_id).await;
+                    if matches!(case, RecoveryCase::ReplacementAuth) {
+                        deny_recovery_listen(listen).await;
+                        return;
+                    }
+                    acknowledge_recovery_listen(&peer, &cx, &mut listen, replacement_id).await;
+                    if matches!(case, RecoveryCase::CollectionLimit | RecoveryCase::RecordLimit) {
+                        closed(listen).await;
+                        return;
+                    }
+                    if matches!(case, RecoveryCase::ResyncCatalogTransport) {
+                        interrupt_catalog_page(&peer, replacement_id + 1).await;
+                        closed(listen).await;
+                        return;
+                    }
+                    if matches!(case, RecoveryCase::ReconnectLimit) {
+                        serve_page(&peer, "tools/list", replacement_id + 1, None, "after-gap", None)
+                            .await;
+                        second_rx.recv(&cx).await.unwrap();
+                        drop(listen);
+                        return;
+                    }
+                    serve_page(&peer, "tools/list", replacement_id + 1, None, "after-gap-one", Some(""))
+                        .await;
+                    serve_page(&peer, "tools/list", replacement_id + 2, Some(""), "after-gap-two", None)
+                        .await;
+                    closed(listen).await;
+                });
+
+                let application = Box::pin(async {
+                    if matches!(case, RecoveryCase::Preflight) {
+                        let mut params = request("tools/list").encode_params().unwrap().unwrap();
+                        params["cursor"] = json!("");
+                        let suffix = CoreRequest::decode(
+                            ProtocolEra::Modern2026, "tools/list", Some(&params),
+                        ).unwrap();
+                        assert!(matches!(
+                            Box::pin(client.watch_recovering(
+                                &cx, suffix, watch_limits, recovery,
+                                || panic!("no ID for a catalog suffix"),
+                                |_| panic!("no callback for a catalog suffix"),
+                            )).await,
+                            Err(WatchError::CursorNotAllowed),
+                        ));
+                        assert!(matches!(
+                            Box::pin(client.watch_recovering(
+                                &cx, core("tools/call", false), watch_limits, recovery,
+                                || panic!("no ID for a mutation"),
+                                |_| panic!("no callback for a mutation"),
+                            )).await,
+                            Err(WatchError::Catalog(ManagedCatalogError::NotCatalog)),
+                        ));
+                        cancellation.cancel();
+                        assert!(matches!(
+                            Box::pin(client.watch_recovering_with_cancellation(
+                                &cx, &cancellation, request("tools/list"), watch_limits, recovery,
+                                || panic!("no ID after cancellation"),
+                                |_| panic!("no callback after cancellation"),
+                            )).await,
+                            Err(WatchError::Catalog(ManagedCatalogError::Core(ManagedCoreError::Cancelled))),
+                        ));
+                        return;
+                    }
+                    let mut watching = Box::pin(client.watch_recovering_with_cancellation(
+                        &cx,
+                        &cancellation,
+                        request("tools/list"),
+                        watch_limits,
+                        recovery,
+                        || {
+                            let id = ids.get() + 1;
+                            ids.set(id);
+                            if matches!(case, RecoveryCase::RepeatedId) && id == 3 {
+                                Ok(serde_json::from_str("1e0").unwrap())
+                            } else {
+                                Ok(RequestId::Number(id))
+                            }
+                        },
+                        |event| {
+                            // Every callback can inspect the cache without deadlock.
+                            let stats = client.cache_stats().unwrap();
+                            match event {
+                                RecoveryEvent::Gap { reconnect_attempt } => {
+                                    gaps.set(gaps.get() + 1);
+                                    assert_eq!(reconnect_attempt, gaps.get());
+                                    assert_eq!(acknowledgments.get(), gaps.get());
+                                    assert!(stats.invalidations > 0);
+                                    events.borrow_mut().push("gap");
+                                    if matches!(case, RecoveryCase::StopGap) {
+                                        return Ok(Control::Stop);
+                                    }
+                                    if matches!(case, RecoveryCase::GapHost) {
+                                        return Err(ManagedCatalogError::AbortedByHost);
+                                    }
+                                }
+                                RecoveryEvent::Watch(WatchEvent::Acknowledged { accepted_filter }) => {
+                                    acknowledgments.set(acknowledgments.get() + 1);
+                                    assert_eq!(acknowledgments.get(), gaps.get() + 1);
+                                    assert_eq!(serde_json::to_value(accepted_filter).unwrap(), filter("tools/list"));
+                                    events.borrow_mut().push("ack");
+                                    if matches!(case, RecoveryCase::Host) {
+                                        return Err(ManagedCatalogError::AbortedByHost);
+                                    }
+                                }
+                                RecoveryEvent::Watch(WatchEvent::Notification(_)) => {
+                                    panic!("no admitted notification is expected in this fixture");
+                                }
+                                RecoveryEvent::Watch(WatchEvent::Snapshot(catalog)) => {
+                                    let count = snapshots.get() + 1;
+                                    snapshots.set(count);
+                                    assert_eq!(catalog.credential_generation(), 1);
+                                    assert_eq!(catalog.method(), "tools/list");
+                                    events.borrow_mut().push("snapshot");
+                                    for page in catalog.pages() {
+                                        let encoded = page.encode().unwrap();
+                                        assert!(encoded.contains("900719925474099312345"));
+                                        assert!(encoded.contains("1.20e+4"));
+                                        assert!(!encoded.contains("obsolete"));
+                                        assert_eq!(encoded.contains("after-gap"), gaps.get() > 0);
+                                    }
+                                    if gaps.get() > 0 && !matches!(case, RecoveryCase::ReconnectLimit) {
+                                        assert_eq!(catalog.item_count(), 2);
+                                    } else {
+                                        assert_eq!(catalog.item_count(), 1);
+                                    }
+                                    if count == 1 {
+                                        if let Some(sender) = first_tx.take() {
+                                            sender.send(&cx, ()).unwrap();
+                                        }
+                                    } else if let Some(sender) = second_tx.take() {
+                                        sender.send(&cx, ()).unwrap();
+                                    }
+                                    if gaps.get() > 0 && !matches!(case, RecoveryCase::ReconnectLimit) {
+                                        return Ok(Control::Stop);
+                                    }
+                                }
+                            }
+                            Ok(Control::Continue)
+                        },
+                    ));
+                    if matches!(
+                        case,
+                        RecoveryCase::Cancel
+                            | RecoveryCase::Drop
+                            | RecoveryCase::Revoked
+                            | RecoveryCase::SessionClose
+                            | RecoveryCase::Generation
+                    ) {
+                        poll_fn(|task| {
+                            assert!(watching.as_mut().poll(task).is_pending());
+                            if gaps.get() == 1 { Poll::Ready(()) } else { Poll::Pending }
+                        }).await;
+                        match case {
+                            RecoveryCase::Cancel => { cancellation.cancel(); }
+                            RecoveryCase::Drop => {
+                                drop(watching);
+                                Sleep::new(cx.now().saturating_add_nanos(80_000_000)).await;
+                                peer.quiet();
+                                return;
+                            }
+                            RecoveryCase::Revoked => credential.credential().revoke(),
+                            RecoveryCase::SessionClose => session.close(),
+                            RecoveryCase::Generation => {
+                                let current = session.credential(&cx).await.unwrap();
+                                assert_eq!(current.generation(), 2);
+                                assert!(!credential.credential().is_revoked());
+                                // Peer::request checks every MCP POST still uses
+                                // interaction-access, never replacement-access.
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    let result = watching.await;
+                    match case {
+                        RecoveryCase::Gap | RecoveryCase::DuringPage
+                        | RecoveryCase::StopGap | RecoveryCase::Generation => {
+                            assert_eq!(result.unwrap(), Outcome::StoppedByHost);
+                        }
+                        RecoveryCase::Terminal | RecoveryCase::PeerCancellation => {
+                            assert_eq!(result.unwrap(), Outcome::SubscriptionEnded);
+                        }
+                        RecoveryCase::ReconnectLimit => {
+                            assert!(matches!(result, Err(WatchError::ReconnectLimit)));
+                        }
+                        RecoveryCase::CollectionLimit => {
+                            assert!(matches!(result, Err(WatchError::CollectionLimit)));
+                        }
+                        RecoveryCase::IdLimit | RecoveryCase::IdBytes => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::StateLimit))));
+                        }
+                        RecoveryCase::RepeatedId => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::RepeatedRequestId))));
+                        }
+                        RecoveryCase::RecordLimit => {
+                            assert!(matches!(result, Err(WatchError::Subscription(ManagedSubscriptionError::RecordLimit))));
+                        }
+                        RecoveryCase::Cancel => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Core(ManagedCoreError::Cancelled)))));
+                        }
+                        RecoveryCase::Deadline => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Core(
+                                ManagedCoreError::TimedOut | ManagedCoreError::Session(OAuthSessionError::TimedOut)
+                            )))));
+                        }
+                        RecoveryCase::Revoked => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::CredentialRevoked))
+                                | Err(WatchError::Catalog(ManagedCatalogError::Core(ManagedCoreError::Session(OAuthSessionError::LoginRequired))))));
+                        }
+                        RecoveryCase::SessionClose => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::CredentialRevoked))
+                                | Err(WatchError::Catalog(ManagedCatalogError::Core(ManagedCoreError::Session(OAuthSessionError::Closed))))));
+                        }
+                        RecoveryCase::Expired => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Core(
+                                ManagedCoreError::Session(OAuthSessionError::LoginRequired)
+                            )))));
+                        }
+                        RecoveryCase::Protocol => {
+                            assert!(matches!(result, Err(WatchError::Subscription(ManagedSubscriptionError::InvalidResponse))));
+                        }
+                        RecoveryCase::CatalogProtocol => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Core(ManagedCoreError::InvalidResult)))));
+                        }
+                        RecoveryCase::CatalogTransport | RecoveryCase::ResyncCatalogTransport => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Core(_)))));
+                        }
+                        RecoveryCase::Auth | RecoveryCase::ReplacementAuth => {
+                            assert!(matches!(result, Err(WatchError::Subscription(ManagedSubscriptionError::Session(
+                                OAuthSessionError::AuthorizationRejected { status: 401 }
+                            )))));
+                        }
+                        RecoveryCase::InitialEof => {
+                            assert!(matches!(result, Err(WatchError::Subscription(_))));
+                        }
+                        RecoveryCase::Host | RecoveryCase::GapHost => {
+                            assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::AbortedByHost))));
+                        }
+                        RecoveryCase::Drop | RecoveryCase::Preflight => unreachable!(),
+                    }
+                });
+                pair(server, application).await;
+                assert!(cx.checkpoint().is_ok(), "recovery must not cancel the caller context");
+                let expected_posts = match case {
+                    RecoveryCase::Preflight => 0,
+                    RecoveryCase::Auth | RecoveryCase::InitialEof | RecoveryCase::Host => 1,
+                    RecoveryCase::Gap | RecoveryCase::Generation => 5,
+                    RecoveryCase::DuringPage => 6,
+                    RecoveryCase::CollectionLimit | RecoveryCase::RecordLimit | RecoveryCase::ReplacementAuth => 3,
+                    RecoveryCase::ReconnectLimit | RecoveryCase::ResyncCatalogTransport => 4,
+                    _ => 2,
+                };
+                assert_eq!(peer.posts.load(Ordering::SeqCst), expected_posts, "{case:?}");
+                assert_eq!(peer.tokens.load(Ordering::SeqCst), if matches!(case, RecoveryCase::Generation) { 2 } else { 1 });
+                peer.quiet();
+                match case {
+                    RecoveryCase::Gap | RecoveryCase::Generation => {
+                        assert_eq!(*events.borrow(), ["ack", "snapshot", "gap", "ack", "snapshot"]);
+                        assert_eq!(ids.get(), 5);
+                    }
+                    RecoveryCase::DuringPage => {
+                        assert_eq!(*events.borrow(), ["ack", "gap", "ack", "snapshot"]);
+                        assert_eq!(ids.get(), 6);
+                    }
+                    RecoveryCase::ReconnectLimit => {
+                        assert_eq!(gaps.get(), 1);
+                        assert_eq!(acknowledgments.get(), 2);
+                        assert_eq!(snapshots.get(), 2);
+                        assert_eq!(ids.get(), 4);
+                    }
+                    RecoveryCase::IdLimit => assert_eq!(ids.get(), 2),
+                    RecoveryCase::IdBytes | RecoveryCase::RepeatedId => assert_eq!(ids.get(), 3),
+                    RecoveryCase::CollectionLimit | RecoveryCase::RecordLimit => {
+                        assert_eq!(acknowledgments.get(), 2);
+                        assert_eq!(snapshots.get(), 1);
+                        assert_eq!(ids.get(), 3);
+                    }
+                    RecoveryCase::Protocol | RecoveryCase::CatalogProtocol
+                    | RecoveryCase::CatalogTransport | RecoveryCase::Auth
+                    | RecoveryCase::InitialEof | RecoveryCase::Terminal
+                    | RecoveryCase::PeerCancellation | RecoveryCase::Host | RecoveryCase::Preflight => {
+                        assert_eq!(gaps.get(), 0, "terminal failures must not schedule recovery");
+                    }
+                    _ => assert_eq!(gaps.get(), 1),
+                }
+                session.close();
+            });
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)
+                .await
+                .expect("catalog recovery TLS fixture must settle");
+        }));
+}
+
+#[test]
+fn catalog_watch_recovers_gap_with_fresh_ack_and_cursorless_snapshot() {
+    isolated_catalog_case(
+        "catalog_watch_recovers_gap_with_fresh_ack_and_cursorless_snapshot",
+        || {
+            run_recovery(RecoveryCase::Gap);
+            run_recovery(RecoveryCase::DuringPage);
+        },
+    );
+}
+
+#[test]
+fn catalog_watch_recovery_keeps_cumulative_attempt_and_request_id_bounds() {
+    isolated_catalog_case(
+        "catalog_watch_recovery_keeps_cumulative_attempt_and_request_id_bounds",
+        || {
+            for case in [
+                RecoveryCase::ReconnectLimit,
+                RecoveryCase::CollectionLimit,
+                RecoveryCase::IdLimit,
+                RecoveryCase::IdBytes,
+                RecoveryCase::RepeatedId,
+                RecoveryCase::RecordLimit,
+            ] {
+                run_recovery(case);
+            }
+        },
+    );
+}
+
+#[test]
+fn catalog_watch_recovery_keeps_original_deadline_and_cancellation() {
+    isolated_catalog_case(
+        "catalog_watch_recovery_keeps_original_deadline_and_cancellation",
+        || {
+            for case in [
+                RecoveryCase::Cancel,
+                RecoveryCase::Drop,
+                RecoveryCase::StopGap,
+                RecoveryCase::Deadline,
+                RecoveryCase::Revoked,
+                RecoveryCase::SessionClose,
+                RecoveryCase::Expired,
+            ] {
+                run_recovery(case);
+            }
+        },
+    );
+}
+
+#[test]
+fn catalog_watch_recovery_rejects_protocol_auth_and_host_failures() {
+    isolated_catalog_case(
+        "catalog_watch_recovery_rejects_protocol_auth_and_host_failures",
+        || {
+            for case in [
+                RecoveryCase::Protocol,
+                RecoveryCase::CatalogProtocol,
+                RecoveryCase::CatalogTransport,
+                RecoveryCase::ResyncCatalogTransport,
+                RecoveryCase::Auth,
+                RecoveryCase::ReplacementAuth,
+                RecoveryCase::InitialEof,
+                RecoveryCase::Terminal,
+                RecoveryCase::PeerCancellation,
+                RecoveryCase::Host,
+                RecoveryCase::GapHost,
+                RecoveryCase::Preflight,
+            ] {
+                run_recovery(case);
+            }
+        },
+    );
+}
+
+#[test]
+fn catalog_watch_recovery_keeps_opening_credential_after_sibling_renewal() {
+    isolated_catalog_case(
+        "catalog_watch_recovery_keeps_opening_credential_after_sibling_renewal",
+        || run_recovery(RecoveryCase::Generation),
     );
 }

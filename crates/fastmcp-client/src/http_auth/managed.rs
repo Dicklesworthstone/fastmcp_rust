@@ -519,8 +519,25 @@ impl ManagedOAuthSession {
         self.check(cx, cancellation)?;
         admit_target(&self.inner.resource, request.target())?;
         let snapshot = self.credential_with_cancellation(cx, cancellation).await?;
-        let request = snapshot.authorize_request(request)?;
         let deadline = deadline_after(cx, self.inner.policy.response_head_timeout)?;
+        Box::pin(self.execute_with_snapshot(cx, cancellation, request, &snapshot, deadline)).await
+    }
+
+    // Related operations can retain their opening credential without a new
+    // lookup or renewal between POSTs. This is not a public credential-injection
+    // API: all callers are part of the managed HTTP owner.
+    pub(super) async fn execute_with_snapshot(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: &ModernHttpRequest,
+        snapshot: &OAuthCredentialSnapshot,
+        deadline: Time,
+    ) -> Result<ManagedOAuthResponse, OAuthSessionError> {
+        self.check(cx, cancellation)?;
+        admit_target(&self.inner.resource, request.target())?;
+        let request = snapshot.authorize_request(request)?;
+        let deadline = deadline.min(deadline_after(cx, self.inner.policy.response_head_timeout)?);
         let executor = self.inner.client.resource_http_executor();
         let response = self
             .await_credential(
@@ -545,7 +562,7 @@ impl ManagedOAuthSession {
             response,
             self.clone(),
             cancellation.clone(),
-            &snapshot,
+            snapshot,
         ))
     }
 

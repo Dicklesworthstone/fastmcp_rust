@@ -2,20 +2,21 @@
 //!
 //! CACHE-03/SUB-03: acknowledge the change feed before fetching a full catalog,
 //! invalidate before observing a change, and cancel an obsolete page traversal.
-//! Only observed invalidation permits a bounded new traversal. A transport,
-//! protocol, authorization or arbitrary host failure never triggers a retry.
+//! Ordinary watches restart a traversal only after observed invalidation.
+//! Explicit recovery can replace an acknowledged, interrupted listen, report a
+//! gap and collect afresh after a new ACK. It cannot recover missed history.
 //!
 //! Both futures are polled in the caller's task. No runtime, worker, unbounded
-//! event queue, detached refresh, automatic reconnect or missed-event replay is
-//! created. Snapshots are consistent with changes observed by this driver, not
+//! event queue, detached refresh or missed-event replay is created. Reconnects
+//! require the opt-in recovery API. Snapshots reflect observed changes, not
 //! an atomic server-side snapshot or a promise of perpetual freshness. The host
-//! owns already-delivered snapshots and must retire them when the watch ends.
+//! owns already-delivered snapshots and must retire them on a gap or watch end.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
@@ -31,9 +32,11 @@ use super::{
     Traversal, bounded_wait, call_deadline, check_call, list_params, prepare, require_unrevoked,
 };
 use crate::http_auth::managed::subscriptions::{
-    ManagedSubscriptionError, ManagedSubscriptionEvent, ManagedSubscriptionLimits,
+    ManagedSubscription, ManagedSubscriptionError, ManagedSubscriptionEvent,
+    ManagedSubscriptionLimits,
 };
 use crate::http_auth::managed::{OAuthCredentialSnapshot, OAuthSessionError};
+use crate::http_executor::ModernHttpExecutorError;
 
 /// Whole-watch bounds. Each traversal additionally retains its collector's
 /// page/item/payload/notification limits; the subscription retains native HTTP
@@ -88,6 +91,75 @@ impl ManagedCatalogWatchLimits {
     }
 }
 
+/// Opt-in, finite reconnect policy for an acknowledged catalog change feed.
+///
+/// Only an interrupted subscription body or EOF without a valid terminal can
+/// reconnect. Initial/replacement listen admission failures, MCP/SSE admission
+/// errors, authorization errors, catalog-call failures and host failures remain
+/// terminal. A valid peer completion/cancellation is not an interruption.
+/// Reconnects use capped exponential backoff under the original watch deadline
+/// and credential lifetime. Defaults apply only when passed to a recovery API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagedCatalogWatchRecoveryPolicy {
+    maximum_reconnects: usize,
+    initial_backoff: Duration,
+    maximum_backoff: Duration,
+}
+
+impl Default for ManagedCatalogWatchRecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            maximum_reconnects: 3,
+            initial_backoff: Duration::from_millis(250),
+            maximum_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
+impl ManagedCatalogWatchRecoveryPolicy {
+    /// At most 64 replacement listens, with nonzero backoff capped at 60 seconds.
+    /// The reconnect count never resets after a successful replacement snapshot.
+    /// Use the ordinary watch API when no reconnect is desired.
+    pub fn new(
+        maximum_reconnects: usize,
+        initial_backoff: Duration,
+        maximum_backoff: Duration,
+    ) -> Result<Self, ManagedCatalogWatchError> {
+        if !(1..=64).contains(&maximum_reconnects)
+            || initial_backoff.is_zero()
+            || initial_backoff > maximum_backoff
+            || maximum_backoff > Duration::from_secs(60)
+        {
+            return Err(ManagedCatalogWatchError::InvalidRecoveryPolicy);
+        }
+        Ok(Self {
+            maximum_reconnects,
+            initial_backoff,
+            maximum_backoff,
+        })
+    }
+
+    fn delay(self, reconnect: usize) -> Duration {
+        let mut delay = self.initial_backoff;
+        for _ in 1..reconnect.min(self.maximum_reconnects) {
+            delay = delay.saturating_mul(2).min(self.maximum_backoff);
+        }
+        delay
+    }
+}
+
+/// Recovery observations keep the ordinary watch event vocabulary intact.
+pub enum ManagedCatalogWatchRecoveryEvent {
+    Watch(ManagedCatalogWatchEvent),
+    /// The previous listen and any pending page response have been dropped and
+    /// this catalog's cache invalidated. Retire previously published snapshots.
+    /// Continuing permits the numbered replacement attempt after backoff. Its
+    /// fresh ACK precedes a cursorless full collection, not missed-event replay.
+    Gap {
+        reconnect_attempt: usize,
+    },
+}
+
 /// Changes are delivered after invalidation and before any replacement snapshot.
 /// Snapshot pages retain their exact typed payloads; no merged TTL is invented.
 pub enum ManagedCatalogWatchEvent {
@@ -115,9 +187,11 @@ pub enum ManagedCatalogWatchOutcome {
 #[derive(Debug)]
 pub enum ManagedCatalogWatchError {
     InvalidLimits,
+    InvalidRecoveryPolicy,
     CursorNotAllowed,
     CoverageRefused,
     CollectionLimit,
+    ReconnectLimit,
     UnexpectedEvent,
     Catalog(ManagedCatalogError),
     Subscription(ManagedSubscriptionError),
@@ -127,11 +201,13 @@ impl fmt::Display for ManagedCatalogWatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidLimits => f.write_str("invalid catalog watch limits"),
+            Self::InvalidRecoveryPolicy => f.write_str("invalid catalog watch recovery policy"),
             Self::CursorNotAllowed => f.write_str("catalog watch must start at the first page"),
             Self::CoverageRefused => {
                 f.write_str("subscription did not accept the catalog change filter")
             }
             Self::CollectionLimit => f.write_str("catalog watch reconciliation limit exceeded"),
+            Self::ReconnectLimit => f.write_str("catalog watch reconnect limit exceeded"),
             Self::UnexpectedEvent => f.write_str("unexpected catalog subscription event"),
             Self::Catalog(error) => fmt::Display::fmt(error, f),
             Self::Subscription(error) => fmt::Display::fmt(error, f),
@@ -163,6 +239,8 @@ impl ManagedCatalogClient {
     /// traversal and schedule a fresh one from the first page. Requests preserve
     /// the list's metadata and filters. A single ID history spans listen plus
     /// every traversal, including numerically equivalent ID representations.
+    /// Listen and page POSTs use the same opening credential; a sibling's
+    /// renewal never rebinds the watch or extends that credential's expiry.
     ///
     /// The callback is synchronous and must cooperate. It runs without the
     /// cache lock and may inspect/clear the shared cache. Stop, failure, deadline,
@@ -182,14 +260,14 @@ impl ManagedCatalogClient {
             ManagedCatalogWatchEvent,
         ) -> Result<ManagedCatalogWatchControl, ManagedCatalogError>,
     {
-        self.watch_with_cancellation(
+        Box::pin(self.watch_with_cancellation(
             cx,
             &McpRequestCancellation::new(),
             request,
             limits,
             next_id,
             observe,
-        )
+        ))
         .await
     }
 
@@ -214,6 +292,216 @@ impl ManagedCatalogClient {
         ) -> Result<ManagedCatalogWatchControl, ManagedCatalogError>,
     {
         let deadline = call_deadline(cx, cancellation, limits.timeout)?;
+        let ids = Mutex::new(WatchIds {
+            next: next_id,
+            history: Traversal::default(),
+            limits,
+        });
+        let observer = Observer {
+            callback: Mutex::new(observe),
+            stopped: AtomicBool::new(false),
+        };
+        let collections = AtomicUsize::new(0);
+        let records = AtomicUsize::new(0);
+        let acknowledged = AtomicBool::new(false);
+        Box::pin(self.watch_attempt(
+            cx,
+            cancellation,
+            request,
+            limits,
+            &ids,
+            &observer,
+            WatchLifetime {
+                deadline,
+                binding: None,
+                collections: &collections,
+                records: &records,
+                acknowledged: &acknowledged,
+            },
+        ))
+        .await
+    }
+
+    /// Watches a complete catalog with explicit, bounded stream-gap recovery.
+    ///
+    /// A gap retires the old subscription, in-flight traversal and cached pages.
+    /// The host receives Gap before backoff and can stop there. A replacement
+    /// uses a fresh ID, must acknowledge coverage again, and collects from the
+    /// first page. Listen/page IDs, collection attempts, subscription records,
+    /// the original deadline and original credential span the whole operation.
+    /// Concurrent renewal never substitutes a different grant or extends expiry.
+    ///
+    /// Only the subscription's interrupted HTTP body or missing terminal is
+    /// recoverable after ACK. Native body-read failures can include HTTP framing
+    /// failures; malformed MCP/SSE records remain terminal. Failed catalog calls
+    /// are never retried as gaps. No mutation or previous request is replayed.
+    /// Observed-gap recovery cannot supply server-side snapshot isolation or
+    /// guarantee delivery of every change while a connection was absent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn watch_recovering<I, O>(
+        &self,
+        cx: &Cx,
+        request: CoreRequest,
+        limits: ManagedCatalogWatchLimits,
+        recovery: ManagedCatalogWatchRecoveryPolicy,
+        next_id: I,
+        observe: O,
+    ) -> Result<ManagedCatalogWatchOutcome, ManagedCatalogWatchError>
+    where
+        I: FnMut() -> Result<RequestId, ManagedCatalogError>,
+        O: FnMut(
+            ManagedCatalogWatchRecoveryEvent,
+        ) -> Result<ManagedCatalogWatchControl, ManagedCatalogError>,
+    {
+        Box::pin(self.watch_recovering_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            request,
+            limits,
+            recovery,
+            next_id,
+            observe,
+        ))
+        .await
+    }
+
+    /// The caller owns the reconnect loop, including cancellable backoff. Drop,
+    /// stop, session closure, token revocation/expiry or the original deadline
+    /// release its responses without background tasks or a new token lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn watch_recovering_with_cancellation<I, O>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        limits: ManagedCatalogWatchLimits,
+        recovery: ManagedCatalogWatchRecoveryPolicy,
+        next_id: I,
+        observe: O,
+    ) -> Result<ManagedCatalogWatchOutcome, ManagedCatalogWatchError>
+    where
+        I: FnMut() -> Result<RequestId, ManagedCatalogError>,
+        O: FnMut(
+            ManagedCatalogWatchRecoveryEvent,
+        ) -> Result<ManagedCatalogWatchControl, ManagedCatalogError>,
+    {
+        let deadline = call_deadline(cx, cancellation, limits.timeout)?;
+        let kind = CatalogKind::of(&request)?;
+        let listen = listen_request(&request)?;
+        let _ = prepare(
+            self.session.resource().as_str(),
+            request.clone(),
+            RequestId::Number(0),
+            self.limits.core,
+        )?;
+        admit_listen_size(
+            &listen,
+            &RequestId::Number(0),
+            self.limits.core.request_bytes.min(64 * 1024),
+        )?;
+        let ids = Mutex::new(WatchIds {
+            next: next_id,
+            history: Traversal::default(),
+            limits,
+        });
+        let observer = Observer {
+            callback: Mutex::new(observe),
+            stopped: AtomicBool::new(false),
+        };
+        let relay = Observer {
+            callback: Mutex::new(|event: ManagedCatalogWatchEvent| {
+                observer
+                    .emit(ManagedCatalogWatchRecoveryEvent::Watch(event))
+                    .map(control)
+            }),
+            stopped: AtomicBool::new(false),
+        };
+        let collections = AtomicUsize::new(0);
+        let records = AtomicUsize::new(0);
+        let _gap = InvalidateOnExit { client: self, kind };
+        self.cache()?.invalidate_result_set(&kind.result_set());
+        Box::pin(bounded_wait(cx, cancellation, deadline, async {
+            Ok(async {
+                let binding = self
+                    .session
+                    .credential_with_cancellation(cx, cancellation)
+                    .await
+                    .map_err(ManagedCoreError::from)?;
+                let mut reconnects = 0;
+                loop {
+                    check_binding(cx, cancellation, deadline, &binding)?;
+                    let acknowledged = AtomicBool::new(false);
+                    let result = Box::pin(self.watch_attempt(
+                        cx,
+                        cancellation,
+                        request.clone(),
+                        limits,
+                        &ids,
+                        &relay,
+                        WatchLifetime {
+                            deadline,
+                            binding: Some(&binding),
+                            collections: &collections,
+                            records: &records,
+                            acknowledged: &acknowledged,
+                        },
+                    ))
+                    .await;
+                    check_binding(cx, cancellation, deadline, &binding)?;
+                    match result {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(error)
+                            if acknowledged.load(Ordering::Acquire)
+                                && is_subscription_gap(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                    if reconnects >= recovery.maximum_reconnects {
+                        return Err(ManagedCatalogWatchError::ReconnectLimit);
+                    }
+                    reconnects += 1;
+                    let continuing = observer.emit(ManagedCatalogWatchRecoveryEvent::Gap {
+                        reconnect_attempt: reconnects,
+                    })?;
+                    check_binding(cx, cancellation, deadline, &binding)?;
+                    if !continuing {
+                        return Ok(ManagedCatalogWatchOutcome::StoppedByHost);
+                    }
+                    self.session
+                        .wait_subscription_backoff(
+                            cx,
+                            cancellation,
+                            &binding,
+                            deadline,
+                            recovery.delay(reconnects),
+                        )
+                        .await
+                        .map_err(ManagedCoreError::from)?;
+                }
+            }
+            .await)
+        }))
+        .await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn watch_attempt<I, O>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: CoreRequest,
+        limits: ManagedCatalogWatchLimits,
+        ids: &Mutex<WatchIds<I>>,
+        observer: &Observer<O>,
+        lifetime: WatchLifetime<'_>,
+    ) -> Result<ManagedCatalogWatchOutcome, ManagedCatalogWatchError>
+    where
+        I: FnMut() -> Result<RequestId, ManagedCatalogError>,
+        O: FnMut(
+            ManagedCatalogWatchEvent,
+        ) -> Result<ManagedCatalogWatchControl, ManagedCatalogError>,
+    {
+        let deadline = lifetime.deadline;
+        check_call(cx, cancellation, deadline)?;
         let kind = CatalogKind::of(&request)?;
         let listen = listen_request(&request)?;
         let _ = prepare(
@@ -230,16 +518,10 @@ impl ManagedCatalogClient {
             limits.timeout,
         )?;
         admit_listen_size(&listen, &RequestId::Number(0), request_bytes)?;
-        let ids = Mutex::new(WatchIds {
-            next: next_id,
-            history: Traversal::default(),
-            limits,
-        });
-        let observer = Observer {
-            callback: Mutex::new(observe),
-            stopped: AtomicBool::new(false),
-        };
-        let listen_id = issue_id(&ids, cx, cancellation, deadline)?;
+        if lifetime.records.load(Ordering::Acquire) >= limits.subscription_records {
+            return Err(ManagedSubscriptionError::RecordLimit.into());
+        }
+        let listen_id = issue_id(ids, cx, cancellation, deadline)?;
         admit_listen_size(&listen, &listen_id, request_bytes)?;
         // Install cleanup before any I/O. It also fences fills from a sibling
         // traversal when this watch is abandoned during acknowledgment/read.
@@ -247,46 +529,67 @@ impl ManagedCatalogClient {
         self.cache()?.invalidate_result_set(&kind.result_set());
         Box::pin(bounded_wait(cx, cancellation, deadline, async {
             Ok(async {
-                let binding = self
-                    .session
-                    .credential_with_cancellation(cx, cancellation)
-                    .await
-                    .map_err(ManagedCoreError::from)?;
-                check_binding(cx, cancellation, deadline, &binding)?;
-                let mut subscription = Box::pin(self.session.subscribe_core_with_cancellation(
+                let acquired_binding;
+                let binding = if let Some(binding) = lifetime.binding {
+                    binding
+                } else {
+                    acquired_binding = self
+                        .session
+                        .credential_with_cancellation(cx, cancellation)
+                        .await
+                        .map_err(ManagedCoreError::from)?;
+                    &acquired_binding
+                };
+                check_binding(cx, cancellation, deadline, binding)?;
+                let mut subscription = Box::pin(self.session.subscribe_core_with_snapshot(
                     cx,
                     cancellation,
+                    binding,
                     listen,
                     listen_id,
                     subscription_limits,
+                    deadline,
                 ))
                 .await?;
                 if subscription.credential_generation() != binding.generation() {
                     return Err(ManagedCatalogError::CredentialChanged.into());
                 }
                 let Some(ManagedSubscriptionEvent::Acknowledged { accepted_filter }) =
-                    subscription.next_event(cx).await?
+                    subscription_event(
+                        cx,
+                        &mut subscription,
+                        lifetime.records,
+                        limits.subscription_records,
+                    )
+                    .await?
                 else {
                     return Err(ManagedCatalogWatchError::UnexpectedEvent);
                 };
                 if !covers(kind, &accepted_filter) {
                     return Err(ManagedCatalogWatchError::CoverageRefused);
                 }
-                check_binding(cx, cancellation, deadline, &binding)?;
+                check_binding(cx, cancellation, deadline, binding)?;
                 // An old cache cannot bridge the pre-acknowledgment blind window.
                 self.cache()?.invalidate_result_set(&kind.result_set());
+                lifetime.acknowledged.store(true, Ordering::Release);
                 let continuing =
                     observer.emit(ManagedCatalogWatchEvent::Acknowledged { accepted_filter })?;
-                check_binding(cx, cancellation, deadline, &binding)?;
+                check_binding(cx, cancellation, deadline, binding)?;
                 if !continuing {
                     return Ok(ManagedCatalogWatchOutcome::StoppedByHost);
                 }
                 let signal = ChangeSignal::default();
                 let monitor = async {
                     loop {
-                        check_binding(cx, cancellation, deadline, &binding)?;
-                        let event = subscription.next_event(cx).await?;
-                        check_binding(cx, cancellation, deadline, &binding)?;
+                        check_binding(cx, cancellation, deadline, binding)?;
+                        let event = subscription_event(
+                            cx,
+                            &mut subscription,
+                            lifetime.records,
+                            limits.subscription_records,
+                        )
+                        .await?;
+                        check_binding(cx, cancellation, deadline, binding)?;
                         match event {
                             Some(ManagedSubscriptionEvent::Notification(notification)) => {
                                 self.invalidate_notification(&notification)?;
@@ -295,7 +598,7 @@ impl ManagedCatalogClient {
                                 }
                                 let continuing = observer
                                     .emit(ManagedCatalogWatchEvent::Notification(notification))?;
-                                check_binding(cx, cancellation, deadline, &binding)?;
+                                check_binding(cx, cancellation, deadline, binding)?;
                                 if !continuing {
                                     return Ok(ManagedCatalogWatchOutcome::StoppedByHost);
                                 }
@@ -312,25 +615,26 @@ impl ManagedCatalogClient {
                 };
                 let reconcile = async {
                     let mut last_published = None;
-                    let mut attempts = 0;
                     loop {
                         let revision = signal.wait_after(last_published).await?;
-                        check_binding(cx, cancellation, deadline, &binding)?;
-                        if attempts >= limits.maximum_collections {
+                        check_binding(cx, cancellation, deadline, binding)?;
+                        if lifetime.collections.load(Ordering::Acquire)
+                            >= limits.maximum_collections
+                        {
                             return Err(ManagedCatalogWatchError::CollectionLimit);
                         }
                         let Some(local_cancel) = signal.begin(revision)? else {
                             continue;
                         };
-                        attempts += 1;
-                        let result = Box::pin(self.collect_with_cancellation(
+                        lifetime.collections.fetch_add(1, Ordering::AcqRel);
+                        let result = Box::pin(self.collect_with_binding(
                             cx,
                             &local_cancel,
                             request.clone(),
                             || {
-                                check_binding(cx, cancellation, deadline, &binding)?;
-                                let id = issue_id(&ids, cx, cancellation, deadline)?;
-                                check_binding(cx, cancellation, deadline, &binding)?;
+                                check_binding(cx, cancellation, deadline, binding)?;
+                                let id = issue_id(ids, cx, cancellation, deadline)?;
+                                check_binding(cx, cancellation, deadline, binding)?;
                                 Ok(id)
                             },
                             |notification| {
@@ -339,20 +643,22 @@ impl ManagedCatalogClient {
                                 if relevant(kind, &notification) {
                                     signal.changed()?;
                                 }
-                                check_binding(cx, cancellation, deadline, &binding)?;
+                                check_binding(cx, cancellation, deadline, binding)?;
                                 let continuing = observer
                                     .emit(ManagedCatalogWatchEvent::Notification(notification))?;
-                                check_binding(cx, cancellation, deadline, &binding)?;
+                                check_binding(cx, cancellation, deadline, binding)?;
                                 if continuing {
                                     Ok(())
                                 } else {
                                     Err(ManagedCatalogError::AbortedByHost)
                                 }
                             },
+                            Some(binding),
+                            deadline,
                         ))
                         .await;
                         signal.finish()?;
-                        check_binding(cx, cancellation, deadline, &binding)?;
+                        check_binding(cx, cancellation, deadline, binding)?;
                         if observer.stopped.load(Ordering::Acquire) {
                             return Ok(ManagedCatalogWatchOutcome::StoppedByHost);
                         }
@@ -383,7 +689,7 @@ impl ManagedCatalogClient {
                         // before publishing a candidate. Crucially, its pending
                         // read is never dropped just because a list completed.
                         yield_once().await;
-                        check_binding(cx, cancellation, deadline, &binding)?;
+                        check_binding(cx, cancellation, deadline, binding)?;
                         if signal.revision()? != revision {
                             continue;
                         }
@@ -393,7 +699,7 @@ impl ManagedCatalogClient {
                         last_published = Some(revision);
                         let continuing =
                             observer.emit(ManagedCatalogWatchEvent::Snapshot(catalog))?;
-                        check_binding(cx, cancellation, deadline, &binding)?;
+                        check_binding(cx, cancellation, deadline, binding)?;
                         if !continuing {
                             return Ok(ManagedCatalogWatchOutcome::StoppedByHost);
                         }
@@ -407,7 +713,7 @@ impl ManagedCatalogClient {
                 let mut monitor = Box::pin(monitor);
                 let mut reconcile = Box::pin(reconcile);
                 poll_fn(|task| {
-                    check_binding(cx, cancellation, deadline, &binding)?;
+                    check_binding(cx, cancellation, deadline, binding)?;
                     if let Poll::Ready(result) = monitor.as_mut().poll(task) {
                         return Poll::Ready(result);
                     }
@@ -419,6 +725,52 @@ impl ManagedCatalogClient {
         }))
         .await?
     }
+}
+
+struct WatchLifetime<'a> {
+    deadline: Time,
+    binding: Option<&'a OAuthCredentialSnapshot>,
+    collections: &'a AtomicUsize,
+    records: &'a AtomicUsize,
+    acknowledged: &'a AtomicBool,
+}
+
+fn control(continuing: bool) -> ManagedCatalogWatchControl {
+    if continuing {
+        ManagedCatalogWatchControl::Continue
+    } else {
+        ManagedCatalogWatchControl::Stop
+    }
+}
+
+// Only subscription-side failures can authorize reconnect. In particular, an
+// identical transport error inside Catalog never retries a list POST.
+fn is_subscription_gap(error: &ManagedCatalogWatchError) -> bool {
+    matches!(
+        error,
+        ManagedCatalogWatchError::Subscription(
+            ManagedSubscriptionError::MissingTerminal
+                | ManagedSubscriptionError::Session(OAuthSessionError::Http(
+                    ModernHttpExecutorError::ResponseBodyReadFailed
+                ))
+        )
+    )
+}
+
+async fn subscription_event(
+    cx: &Cx,
+    subscription: &mut ManagedSubscription,
+    records: &AtomicUsize,
+    maximum: usize,
+) -> Result<Option<ManagedSubscriptionEvent>, ManagedSubscriptionError> {
+    if records.load(Ordering::Acquire) >= maximum {
+        return Err(ManagedSubscriptionError::RecordLimit);
+    }
+    let event = subscription.next_event(cx).await?;
+    if event.is_some() {
+        records.fetch_add(1, Ordering::AcqRel);
+    }
+    Ok(event)
 }
 
 fn listen_request(request: &CoreRequest) -> Result<CoreRequest, ManagedCatalogWatchError> {
@@ -546,11 +898,11 @@ struct Observer<O> {
     callback: Mutex<O>,
     stopped: AtomicBool,
 }
-impl<O> Observer<O>
-where
-    O: FnMut(ManagedCatalogWatchEvent) -> Result<ManagedCatalogWatchControl, ManagedCatalogError>,
-{
-    fn emit(&self, event: ManagedCatalogWatchEvent) -> Result<bool, ManagedCatalogError> {
+impl<O> Observer<O> {
+    fn emit<E>(&self, event: E) -> Result<bool, ManagedCatalogError>
+    where
+        O: FnMut(E) -> Result<ManagedCatalogWatchControl, ManagedCatalogError>,
+    {
         let control = (self
             .callback
             .lock()
@@ -693,6 +1045,63 @@ mod tests {
             })),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn recovery_policy_is_finite_and_backoff_saturates_at_its_cap() {
+        for (attempts, initial, maximum) in [
+            (0, Duration::from_millis(1), Duration::from_secs(1)),
+            (65, Duration::from_millis(1), Duration::from_secs(1)),
+            (1, Duration::ZERO, Duration::from_secs(1)),
+            (1, Duration::from_secs(2), Duration::from_secs(1)),
+            (1, Duration::from_secs(1), Duration::from_secs(61)),
+        ] {
+            assert!(matches!(
+                ManagedCatalogWatchRecoveryPolicy::new(attempts, initial, maximum),
+                Err(ManagedCatalogWatchError::InvalidRecoveryPolicy)
+            ));
+        }
+        let policy = ManagedCatalogWatchRecoveryPolicy::new(
+            64,
+            Duration::from_millis(1),
+            Duration::from_millis(3),
+        )
+        .unwrap();
+        assert_eq!(policy.delay(1), Duration::from_millis(1));
+        assert_eq!(policy.delay(2), Duration::from_millis(2));
+        assert_eq!(policy.delay(3), Duration::from_millis(3));
+        assert_eq!(policy.delay(usize::MAX), Duration::from_millis(3));
+    }
+
+    #[test]
+    fn only_subscription_interruption_is_a_recovery_candidate() {
+        assert!(is_subscription_gap(
+            &ManagedCatalogWatchError::Subscription(ManagedSubscriptionError::MissingTerminal)
+        ));
+        assert!(is_subscription_gap(
+            &ManagedCatalogWatchError::Subscription(ManagedSubscriptionError::Session(
+                OAuthSessionError::Http(ModernHttpExecutorError::ResponseBodyReadFailed)
+            ))
+        ));
+        assert!(!is_subscription_gap(&ManagedCatalogWatchError::Catalog(
+            ManagedCoreError::Session(OAuthSessionError::Http(
+                ModernHttpExecutorError::ResponseBodyReadFailed,
+            ))
+            .into(),
+        )));
+        for error in [
+            ManagedSubscriptionError::InvalidResponse,
+            ManagedSubscriptionError::RecordLimit,
+            ManagedSubscriptionError::Session(OAuthSessionError::LoginRequired),
+            ManagedSubscriptionError::Session(OAuthSessionError::Cancelled),
+            ManagedSubscriptionError::Session(OAuthSessionError::AuthorizationRejected {
+                status: 401,
+            }),
+        ] {
+            assert!(!is_subscription_gap(
+                &ManagedCatalogWatchError::Subscription(error)
+            ));
+        }
     }
 
     #[test]
