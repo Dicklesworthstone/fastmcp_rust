@@ -6472,6 +6472,90 @@ pub mod modern {
             )
         }
 
+        /// Calls a tool over native stdio with an asynchronous operation-local responder.
+        ///
+        /// The responder may borrow the caller and input result across awaits.
+        /// Advertise its capabilities before connecting. Deferred initialization,
+        /// every continuation, and responder work share one cancellation domain
+        /// and the earlier of the supplied and configured absolute deadlines.
+        /// Installed handlers are not invoked; the full final envelope is retained.
+        #[cfg(unix)]
+        pub async fn call_tool_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        {
+            final_stdio_mrtr_result(
+                "tools/call",
+                self.inner
+                    .call_tool_with_async_mrtr_retry_with_cx(
+                        cx, cancellation, deadline, name, arguments, respond,
+                    )
+                    .await?,
+            )
+        }
+
+        /// Reads a resource with an asynchronous operation-local responder.
+        ///
+        /// Shares the caller, cancellation, and deadline contract of
+        /// [Self::call_tool_with_async_mrtr_retry]. Continuations remain uncached.
+        #[cfg(unix)]
+        pub async fn read_resource_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            uri: &str,
+            respond: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        {
+            final_stdio_mrtr_result(
+                "resources/read",
+                self.inner
+                    .read_resource_with_async_mrtr_retry_with_cx(
+                        cx, cancellation, deadline, uri, respond,
+                    )
+                    .await?,
+            )
+        }
+
+        /// Gets a prompt with an asynchronous operation-local responder.
+        ///
+        /// Shares the caller, cancellation, and deadline contract of
+        /// [Self::call_tool_with_async_mrtr_retry] and retains final metadata
+        /// and unknown members.
+        #[cfg(unix)]
+        pub async fn get_prompt_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            respond: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        {
+            final_stdio_mrtr_result(
+                "prompts/get",
+                self.inner
+                    .get_prompt_with_async_mrtr_retry_with_cx(
+                        cx, cancellation, deadline, name, arguments, respond,
+                    )
+                    .await?,
+            )
+        }
+
         /// Completes an argument through one yielding modern stdio request.
         #[cfg(unix)]
         pub async fn complete_with_cx(

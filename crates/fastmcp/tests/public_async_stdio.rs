@@ -2438,7 +2438,73 @@ while IFS= read -r unexpected; do exit 34; done
 
     #[test]
     fn modern_async_content_follows_yielding_handlers_and_preserves_unhandled_input() {
-        for installed in [false, true] {
+        fn operation_response<'cx>(
+            caller: &'cx Cx,
+            input: &'cx modern::InputRequiredResult,
+            calls: Arc<AtomicUsize>,
+            sibling_ran: Arc<AtomicBool>,
+            worker: std::thread::ThreadId,
+        ) -> modern::MrtrResponderFuture<'cx> {
+            Box::pin(async move {
+                assert_eq!(std::thread::current().id(), worker);
+                assert!(caller.blocking_pool_handle().is_none());
+                calls.fetch_add(1, Ordering::AcqRel);
+                while !sibling_ran.load(Ordering::Acquire) {
+                    asupersync::runtime::yield_now().await;
+                }
+                asupersync::time::sleep(caller.now(), Duration::from_millis(1)).await;
+                assert_eq!(input.request_state(), Some("opaque continuation"));
+                assert!(input.input_requests().unwrap().get("roots-input").is_some());
+                Ok(modern::MrtrInputResponses::from([(
+                    "roots-input".to_owned(),
+                    json!({"roots": []}),
+                )]))
+            })
+        }
+
+        async fn operation_content<F>(
+            client: &mut modern::Client,
+            cx: &Cx,
+            cancellation: &modern::McpRequestCancellation,
+            method: &str,
+            respond: F,
+        ) -> modern::McpResult<modern::FinalCoreResult>
+        where
+            F: for<'a> FnMut(&'a Cx, &'a modern::InputRequiredResult) -> modern::MrtrResponderFuture<'a>,
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            match method {
+                "tools/call" => {
+                    client
+                        .call_tool_with_async_mrtr_retry(
+                            cx, cancellation, deadline, "echo", json!({"subject": "retained"}), respond,
+                        )
+                        .await
+                }
+                "resources/read" => {
+                    client
+                        .read_resource_with_async_mrtr_retry(
+                            cx, cancellation, deadline, "test://retained", respond,
+                        )
+                        .await
+                }
+                "prompts/get" => {
+                    client
+                        .get_prompt_with_async_mrtr_retry(
+                            cx, cancellation, deadline, "greet",
+                            HashMap::from([("subject".to_owned(), "retained".to_owned())]),
+                            respond,
+                        )
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        for mode in ["unhandled", "installed", "operation-local"] {
+            let installed = mode == "installed";
+            let operation_local = mode == "operation-local";
+            let handled = mode != "unhandled";
             run(|cx| async move {
                 let mut script = DISCOVER.to_owned();
                 for (method, original, completed) in [
@@ -2465,7 +2531,7 @@ while IFS= read -r unexpected; do exit 34; done
                          case \"$request\" in *'requestState'*|*'inputResponses'*|*'io.modelcontextprotocol/tasks'*) exit 42 ;; esac\n\
                          printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"resultType\":\"input_required\",\"inputRequests\":{{\"roots-input\":{{\"method\":\"roots/list\"}}}},\"requestState\":\"opaque continuation\",\"vendorDecimal\":1.2300e+400}}}}\\n' \"$id\"\n"
                     ));
-                    if installed {
+                    if handled {
                         script.push_str(&format!(
                             "read_request\n\
                              case \"$request\" in *'\"method\":\"{method}\"'*) ;; *) exit 43 ;; esac\n\
@@ -2511,11 +2577,14 @@ while IFS= read -r unexpected; do exit 50; done
                             },
                         ),
                     )
+                } else if operation_local {
+                    modern::ClientBuilder::new()
+                        .capabilities(serde_json::from_value(json!({"roots": {}})).unwrap())
                 } else {
                     modern::ClientBuilder::new()
                 };
                 let mut client = connect(&cx, &script, builder).await;
-                let mut sibling = installed.then(|| {
+                let mut sibling = handled.then(|| {
                     let calls = Arc::clone(&calls);
                     let sibling_ran = Arc::clone(&sibling_ran);
                     cx.spawn(move |_| async move {
@@ -2529,26 +2598,46 @@ while IFS= read -r unexpected; do exit 50; done
                 });
                 let cancellation = modern::McpRequestCancellation::new();
                 for method in ["tools/call", "resources/read", "prompts/get"] {
-                    let result = require_send(content(&mut client, &cx, &cancellation, method))
+                    let result = if operation_local {
+                        let calls = Arc::clone(&calls);
+                        let sibling_ran = Arc::clone(&sibling_ran);
+                        require_send(operation_content(
+                            &mut client,
+                            &cx,
+                            &cancellation,
+                            method,
+                            move |caller, input| {
+                                operation_response(
+                                    caller,
+                                    input,
+                                    Arc::clone(&calls),
+                                    Arc::clone(&sibling_ran),
+                                    worker,
+                                )
+                            },
+                        ))
                         .await
-                        .unwrap();
+                    } else {
+                        require_send(content(&mut client, &cx, &cancellation, method)).await
+                    }
+                    .unwrap();
                     assert_eq!(result.method(), method);
                     let extras = match &result {
-                        modern::FinalCoreResult::ToolsCall { result, .. } if installed => {
+                        modern::FinalCoreResult::ToolsCall { result, .. } if handled => {
                             assert_eq!(
                                 result.payload.content,
                                 vec![modern::ContentBlock::text("tool complete")]
                             );
                             &result.extras
                         }
-                        modern::FinalCoreResult::ResourcesRead { result, .. } if installed => {
+                        modern::FinalCoreResult::ResourcesRead { result, .. } if handled => {
                             assert_eq!(
                                 serde_json::to_value(&result.payload.contents).unwrap(),
                                 json!([{"uri": "test://retained", "text": "resource complete"}])
                             );
                             &result.extras
                         }
-                        modern::FinalCoreResult::PromptsGet { result, .. } if installed => {
+                        modern::FinalCoreResult::PromptsGet { result, .. } if handled => {
                             assert_eq!(
                                 serde_json::to_value(&result.payload.messages).unwrap(),
                                 json!([{"role": "user", "content": {"type": "text", "text": "prompt complete"}}])
@@ -2558,7 +2647,7 @@ while IFS= read -r unexpected; do exit 50; done
                         modern::FinalCoreResult::ToolsCallInputRequired { result, .. }
                         | modern::FinalCoreResult::ResourcesReadInputRequired { result, .. }
                         | modern::FinalCoreResult::PromptsGetInputRequired { result, .. }
-                            if !installed =>
+                            if !handled =>
                         {
                             assert_eq!(result.request_state(), Some("opaque continuation"));
                             assert!(
@@ -2579,7 +2668,7 @@ while IFS= read -r unexpected; do exit 50; done
                 if let Some(sibling) = sibling.as_mut() {
                     sibling.join(&cx).await.unwrap();
                 }
-                assert_eq!(calls.load(Ordering::Acquire), if installed { 3 } else { 0 });
+                assert_eq!(calls.load(Ordering::Acquire), if handled { 3 } else { 0 });
                 let completion = require_send(
                     client.complete_with_cx(
                         &cx,

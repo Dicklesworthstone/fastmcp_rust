@@ -31514,7 +31514,42 @@ impl Client {
             deadline,
             "tools/call",
             serde_json::json!({"name": name, "arguments": arguments}),
-            Some(respond),
+            OperationMrtrResponder::<F>::Caller(respond),
+        )
+        .await
+    }
+
+    /// Calls a tool with a caller-owned asynchronous MRTR responder over stdio.
+    ///
+    /// This shares the capability and complete-map contract of
+    /// [`Self::call_tool_with_mrtr_retry_with_cx`]. The responder can borrow its
+    /// caller context and input result across awaits without a blocking worker
+    /// or private runtime. Deferred initialization, all rounds, and the responder
+    /// share the original cancellation domain and one absolute deadline.
+    ///
+    /// Cancelling, expiring, or dropping pending responder work publishes no
+    /// continuation. Installed handlers are not invoked, Tasks are not
+    /// advertised, and exact legacy results return without a callback.
+    #[cfg(unix)]
+    pub async fn call_tool_with_async_mrtr_retry_with_cx<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        self.follow_mrtr_with_cx(
+            cx,
+            cancellation,
+            deadline,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            OperationMrtrResponder::<SyncMrtrResponderFn, F>::Async(respond),
         )
         .await
     }
@@ -31545,7 +31580,36 @@ impl Client {
             deadline,
             "resources/read",
             serde_json::json!({"uri": uri}),
-            Some(respond),
+            OperationMrtrResponder::<F>::Caller(respond),
+        )
+        .await
+    }
+
+    /// Reads a resource with a caller-owned asynchronous MRTR responder.
+    ///
+    /// This shares [`Self::call_tool_with_async_mrtr_retry_with_cx`]'s caller,
+    /// cancellation, and deadline contract. The original URI remains unchanged;
+    /// complete initial results honor the typed cache and pending invalidations.
+    /// Input-required results and all continuation results remain uncached.
+    #[cfg(unix)]
+    pub async fn read_resource_with_async_mrtr_retry_with_cx<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        uri: &str,
+        respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        self.follow_mrtr_with_cx(
+            cx,
+            cancellation,
+            deadline,
+            "resources/read",
+            serde_json::json!({"uri": uri}),
+            OperationMrtrResponder::<SyncMrtrResponderFn, F>::Async(respond),
         )
         .await
     }
@@ -31576,7 +31640,37 @@ impl Client {
             deadline,
             "prompts/get",
             serde_json::json!({"name": name, "arguments": arguments}),
-            Some(respond),
+            OperationMrtrResponder::<F>::Caller(respond),
+        )
+        .await
+    }
+
+    /// Gets a prompt with a caller-owned asynchronous MRTR responder.
+    ///
+    /// The responder may borrow its caller context and input result while
+    /// awaiting under [`Self::call_tool_with_async_mrtr_retry_with_cx`]'s bounds.
+    /// Every continuation retains the original name, arguments, and metadata,
+    /// adding only the latest admitted response map and opaque request state.
+    #[cfg(unix)]
+    pub async fn get_prompt_with_async_mrtr_retry_with_cx<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        self.follow_mrtr_with_cx(
+            cx,
+            cancellation,
+            deadline,
+            "prompts/get",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            OperationMrtrResponder::<SyncMrtrResponderFn, F>::Async(respond),
         )
         .await
     }
@@ -31590,29 +31684,32 @@ impl Client {
         original_parameters: serde_json::Value,
     ) -> McpResult<CoreResult> {
         let deadline = mrtr_operation_deadline(cx, self.timeout_policy)?;
-        self.follow_mrtr_with_cx::<fn(&InputRequiredResult) -> McpResult<MrtrInputResponses>>(
+        let responder: OperationMrtrResponder =
+            OperationMrtrResponder::Installed(self.reverse_request_handlers.clone());
+        self.follow_mrtr_with_cx(
             cx,
             cancellation,
             deadline,
             method,
             original_parameters,
-            None,
+            responder,
         )
         .await
     }
 
     #[cfg(unix)]
-    async fn follow_mrtr_with_cx<F>(
+    async fn follow_mrtr_with_cx<F, A>(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         deadline: Instant,
         method: &str,
         original_parameters: serde_json::Value,
-        mut respond: Option<F>,
+        mut responder: OperationMrtrResponder<F, A>,
     ) -> McpResult<CoreResult>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
     {
         let deadline = deadline.min(mrtr_operation_deadline(cx, self.timeout_policy)?);
         check_mrtr_operation(cx, Some(cancellation), deadline)?;
@@ -31621,7 +31718,6 @@ impl Client {
         let limits =
             MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?;
         let mut driver = MrtrDriver::new(cx, deadline, limits)?;
-        let handlers = self.reverse_request_handlers.clone();
         let original_parameters = self.prepare_request_parameters(original_parameters)?;
         #[cfg(feature = "tasks")]
         let original_parameters = {
@@ -31630,8 +31726,7 @@ impl Client {
             original_parameters
         };
         let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
-        let check = || check_mrtr_operation(cx, Some(cancellation), deadline);
-        let operation = async {
+        let operation = fastmcp_core::runtime::CallerContextFuture::new(cx, async {
             let mut parameters = original_parameters.clone();
             let mut first_round = true;
             loop {
@@ -31668,30 +31763,24 @@ impl Client {
                 let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
                     return Ok(result);
                 };
-                if respond.is_none() && !handlers.has_modern_handlers() {
+                if !responder.has_handler() {
                     return Ok(result);
                 }
                 driver.begin_continuation()?;
-                let responses = if let Some(respond) = respond.as_mut() {
-                    admit_complete_mrtr_input_batch(&mut driver, &capabilities, input_required)?;
-                    check()?;
-                    let responses = respond(input_required)?;
-                    check()?;
-                    responses
-                } else {
-                    driver.admit_input_responses(
-                        input_required
-                            .input_requests()
-                            .map_or(0, |inputs| inputs.members().len()),
-                    )?;
-                    handlers
-                        .respond_to_input_required_async(cx, &capabilities, input_required, check)
-                        .await?
-                };
+                let responses = responder
+                    .respond(
+                        cx,
+                        Some(cancellation),
+                        deadline,
+                        &mut driver,
+                        &capabilities,
+                        input_required,
+                    )
+                    .await?;
                 parameters =
                     mrtr_retry_parameters(original_parameters.clone(), input_required, responses)?;
             }
-        };
+        });
         wait_for_mrtr_operation(cx, Some(cancellation), deadline, operation).await
     }
 

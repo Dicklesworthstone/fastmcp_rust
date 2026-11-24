@@ -1804,6 +1804,14 @@ With `tasks` enabled as well, the WebSocket facades expose
 and accepted receipt handling follow the same rules as their synchronous
 responder counterparts.
 
+On Unix, `modern::Client` exposes the same three async responder methods
+over native stdio. The underlying `Client` and the Auto client expose them
+with a `_with_cx` suffix. Deferred initialization and every continuation share
+the caller's cancellation token and absolute deadline. Exact legacy results
+pass through the underlying and Auto clients without invoking the responder;
+the Modern facade retains the complete modern result envelope. Ordinary
+stdio responder operations do not opt into Tasks.
+
 ### Observing a Task returned by a tool
 
 With `tasks` enabled, a Tasks-aware tool call returns
